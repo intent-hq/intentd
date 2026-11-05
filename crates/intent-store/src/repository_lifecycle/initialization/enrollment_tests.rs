@@ -318,12 +318,14 @@ async fn private_native_enrollment_valid_values_immutable_and_identity_lifetime(
         } else {
             "changed"
         };
-        sqlx::query(&format!("UPDATE agent_session SET {column}=? WHERE id=?"))
-            .bind(value)
-            .bind(&f.agent.id.0)
-            .execute(f.store.write_pool())
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE agent_session SET {column}=? WHERE id=?"
+        )))
+        .bind(value)
+        .bind(&f.agent.id.0)
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
         assert!(f
             .store
             .get_review_context_enrollment(&f.workspace.id, &f.agent.id, "original")

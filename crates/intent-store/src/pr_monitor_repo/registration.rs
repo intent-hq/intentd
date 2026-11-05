@@ -70,7 +70,7 @@ impl Store {
              AND target_provenance IS ?18 AND target_unresolved_reason IS ?19",
             pause_preserving_last_error_sql("NULL", "?5", "?4"),
         );
-        let mut query = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&owner.0)
             .bind(baseline)
             .bind(baseline.map(|_| now))

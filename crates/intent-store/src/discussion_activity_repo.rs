@@ -65,7 +65,7 @@ impl Store {
         message: &str,
         agent: &AgentId,
     ) -> Result<DiscussionActivityReceipt> {
-        let row=sqlx::query(&format!("{SELECT} WHERE m.workspace_id=? AND m.conversation_id=? AND a.message_id=? AND a.agent_id=?"))
+        let row=sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE m.workspace_id=? AND m.conversation_id=? AND a.message_id=? AND a.agent_id=?")))
             .bind(ws.as_str()).bind(conversation).bind(message).bind(agent.as_str()).fetch_optional(self.read_pool()).await.map_err(|e| db(&e))?
             .ok_or_else(|| Error::NotFound("Discussion invocation not found".into()))?;
         receipt(&row)
@@ -86,7 +86,7 @@ impl Store {
         if changed == 0 {
             return Ok(None);
         }
-        let row = sqlx::query(&format!("{SELECT} WHERE a.turn_id=?"))
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE a.turn_id=?")))
             .bind(turn)
             .fetch_one(&mut *tx)
             .await
@@ -118,7 +118,7 @@ impl Store {
         retry: bool,
     ) -> Result<(DiscussionActivityReceipt, bool)> {
         let mut tx = self.write_pool().begin().await.map_err(|e| db(&e))?;
-        let row=sqlx::query(&format!("{SELECT} WHERE m.workspace_id=? AND m.conversation_id=? AND a.message_id=? AND a.agent_id=?"))
+        let row=sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE m.workspace_id=? AND m.conversation_id=? AND a.message_id=? AND a.agent_id=?")))
             .bind(ws.as_str()).bind(conversation).bind(message).bind(agent.as_str()).fetch_optional(&mut *tx).await.map_err(|e| db(&e))?
             .ok_or_else(|| Error::NotFound("Discussion invocation not found".into()))?;
         let old = receipt(&row)?;
@@ -171,7 +171,7 @@ impl Store {
             sqlx::query("INSERT INTO discussion_agent_delivery(message_id,agent_id,workspace_id) VALUES(?,?,?)").bind(message).bind(agent.as_str()).bind(ws.as_str()).execute(&mut *tx).await.map_err(|e| db(&e))?;
         }
         refresh(&mut tx, message).await?;
-        let row = sqlx::query(&format!("{SELECT} WHERE a.turn_id=?"))
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!("{SELECT} WHERE a.turn_id=?")))
             .bind(&turn)
             .fetch_one(&mut *tx)
             .await

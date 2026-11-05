@@ -56,7 +56,7 @@ async fn insert_rows(
     for chunk in rows.chunks(ROWS_PER_STATEMENT) {
         let placeholders = vec![row_placeholders.as_str(); chunk.len()].join(",");
         let sql = format!("INSERT INTO agent_queue ({QUEUE_COLUMNS}) VALUES {placeholders}");
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for (id, position, payload, created_at, turn_id) in chunk {
             query = query
                 .bind(id)

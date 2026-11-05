@@ -152,7 +152,7 @@ fn note_fts_ranked_sql(options: &NoteFtsOptions<'_>) -> String {
     )
 }
 
-type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
+type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>;
 
 /// Bind [`note_fts_ranked_sql`]'s parameters, in its order.
 fn bind_ranked<'q>(
@@ -160,7 +160,7 @@ fn bind_ranked<'q>(
     match_expr: &'q str,
     options: &NoteFtsOptions<'q>,
 ) -> Result<SqliteQuery<'q>> {
-    let mut query = sqlx::query(sql)
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(options.prefer_workspace_id.map(|id| id.0.as_str()))
         .bind(match_expr);
     if let Some(id) = options.workspace_id {

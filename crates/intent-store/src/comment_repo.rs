@@ -163,7 +163,7 @@ impl Store {
             "INSERT INTO comment ({COMMENT_COLUMNS}, workspace_id) \
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&c.id)
             .bind(&c.thread_id)
             .bind(c.note_id.as_ref().map(|n| n.0.clone()))
@@ -251,7 +251,7 @@ impl Store {
                 "INSERT INTO comment ({COMMENT_COLUMNS}, workspace_id) \
                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&c.id)
                 .bind(&c.thread_id)
                 .bind(c.note_id.as_ref().map(|n| n.0.clone()))
@@ -304,7 +304,7 @@ impl Store {
     /// Returns `Error::NotFound` if the comment does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_comment(&self, id: &str) -> Result<Comment> {
         let sql = format!("SELECT {COMMENT_COLUMNS} FROM comment WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .fetch_optional(self.read_pool())
             .await
@@ -484,7 +484,7 @@ impl Store {
         let sql = format!(
             "SELECT {COMMENT_COLUMNS} FROM comment WHERE note_id = ? ORDER BY created_at, id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&note_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -510,7 +510,7 @@ impl Store {
             "SELECT {COMMENT_COLUMNS} FROM comment \
              WHERE note_id = ? AND workspace_id = ? ORDER BY created_at, id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&note_id.0)
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
@@ -524,7 +524,7 @@ impl Store {
         let sql = format!(
             "SELECT {COMMENT_COLUMNS} FROM comment WHERE thread_id = ? ORDER BY created_at, id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(thread_id)
             .fetch_all(self.read_pool())
             .await

@@ -601,7 +601,7 @@ pub(crate) async fn fetch_agent_usage_rows(
     } else {
         let agent_ids_json = serde_json::to_string(&fallback_agent_ids)
             .map_err(|e| Error::Internal(format!("encode fallback agent ids failed: {e}")))?;
-        sqlx::query(&fallback_message_usage_sql())
+        sqlx::query(sqlx::AssertSqlSafe(fallback_message_usage_sql()))
             .bind(agent_ids_json)
             .fetch_all(&mut *conn)
             .await
@@ -1073,10 +1073,10 @@ fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<String>>> {
 /// lives in one place. The harness stamp (`harness_version` /
 /// `harness_features`) binds from the session struct itself.
 fn bind_session_insert<'q>(
-    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
     s: &'q AgentSession,
     task_graph_enabled: bool,
-) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>> {
+) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>> {
     Ok(query
         .bind(&s.id.0)
         .bind(&s.workspace_id.0)
@@ -1207,7 +1207,11 @@ impl Store {
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
              (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
-        let query = bind_session_insert(sqlx::query(&sql), s, task_graph_enabled)?;
+        let query = bind_session_insert(
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str())),
+            s,
+            task_graph_enabled,
+        )?;
         match tx.as_mut() {
             Some(tx) => query.execute(&mut **tx).await,
             None => query.execute(self.write_pool()).await,
@@ -1286,7 +1290,7 @@ impl Store {
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
                  (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
-            bind_session_insert(sqlx::query(&session_sql), s, false)?
+            bind_session_insert(sqlx::query(sqlx::AssertSqlSafe(session_sql.as_str())), s, false)?
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
@@ -1321,7 +1325,7 @@ impl Store {
                     UsageMessageOrigin::Agent => agent_messages += 1,
                     UsageMessageOrigin::Excluded => {}
                 }
-                sqlx::query(&insert_sql)
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql.as_str()))
                     .bind(&id)
                     .bind(&s.id.0)
                     .bind(i64::try_from(idx).unwrap_or(i64::MAX))
@@ -1392,7 +1396,7 @@ impl Store {
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_with_transcript(&self, id: &AgentId) -> Result<AgentSession> {
         let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .fetch_optional(self.read_pool())
             .await
@@ -1420,7 +1424,7 @@ impl Store {
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_without_messages(&self, id: &AgentId) -> Result<AgentSession> {
         let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .fetch_optional(self.read_pool())
             .await
@@ -1443,7 +1447,7 @@ impl Store {
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_agent_session_summary(&self, id: &AgentId) -> Result<AgentSessionSummary> {
         let sql = format!("SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .fetch_optional(self.read_pool())
             .await
@@ -1477,7 +1481,7 @@ impl Store {
         for chunk in ids.chunks(IDS_PER_STATEMENT) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!("SELECT id, status FROM agent_session WHERE id IN ({placeholders})");
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(&id.0);
             }
@@ -1626,7 +1630,7 @@ impl Store {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql =
                 format!("SELECT id, updated_at FROM agent_session WHERE id IN ({placeholders})");
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(&id.0);
             }
@@ -1668,7 +1672,7 @@ impl Store {
         let sql = format!(
             "SELECT {SESSION_COLUMNS} FROM agent_session WHERE workspace_id = ? ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1699,7 +1703,7 @@ impl Store {
         let sql = format!(
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session WHERE workspace_id = ? ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1726,7 +1730,7 @@ impl Store {
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
              WHERE workspace_id IN ({placeholders}) ORDER BY workspace_id, created_at"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
@@ -1759,7 +1763,7 @@ impl Store {
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
              WHERE workspace_id = ? AND retired_at IS NULL ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1785,7 +1789,7 @@ impl Store {
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
              WHERE workspace_id = ? AND retired_at IS NOT NULL ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1837,7 +1841,7 @@ impl Store {
     ) -> Result<Vec<AgentSessionSummary>> {
         let sql = scoped_session_summaries_sql(scope);
         let (_, extra_bind) = scope_predicate(scope);
-        let mut query = sqlx::query(&sql).bind(&workspace_id.0);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&workspace_id.0);
         if let Some(bind) = extra_bind {
             query = query.bind(bind);
         }
@@ -1893,7 +1897,7 @@ impl Store {
         workspace_id: &WorkspaceId,
     ) -> Result<AgentDelegatedCounts> {
         let sql = delegated_counts_sql();
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -2053,7 +2057,7 @@ impl Store {
         extra_bind: Option<&str>,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
         let sql = session_message_projections_sql(filter);
-        let mut query = sqlx::query(&sql).bind(&workspace_id.0);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&workspace_id.0);
         if let Some(bind) = extra_bind {
             query = query.bind(bind);
         }
@@ -2157,7 +2161,7 @@ impl Store {
         workspace_id: &WorkspaceId,
     ) -> Result<bool> {
         let sql = unread_workspace_probe_sql();
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_one(self.read_pool())
             .await
@@ -2181,7 +2185,7 @@ impl Store {
         &self,
     ) -> Result<std::collections::HashSet<String>> {
         let sql = unread_workspaces_batch_sql();
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("batch workspace unread probe failed: {e}")))?;
@@ -2210,7 +2214,7 @@ impl Store {
              FROM agent_session INDEXED BY {UNREAD_TOP_LEVEL_SESSION_INDEX} \
              WHERE workspace_id IN ({placeholders}) AND {UNREAD_TOP_LEVEL_SESSION_PREDICATE}"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
@@ -2256,7 +2260,7 @@ impl Store {
                AND (json_type(s.metadata, '$.pendingQuestionsMessageId') IS NULL \
                     OR json_type(s.metadata, '$.pendingQuestionsMessageId') != 'text')"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
@@ -2577,10 +2581,10 @@ impl Store {
             })?;
             let res = match expected_model {
                 Some(expected) => {
-                    sqlx::query(&format!(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
                         "UPDATE agent_session SET resolved_model=? \
                          WHERE id=? AND workspace_id=? AND {NORMALIZED_MODEL_SQL} = ?"
-                    ))
+                    )))
                     .bind(resolved)
                     .bind(&id.0)
                     .bind(&workspace_id.0)
@@ -2589,10 +2593,10 @@ impl Store {
                     .await
                 }
                 None => {
-                    sqlx::query(&format!(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
                         "UPDATE agent_session SET resolved_model=? \
                          WHERE id=? AND workspace_id=? AND {NORMALIZED_MODEL_SQL} IS NULL"
-                    ))
+                    )))
                     .bind(resolved)
                     .bind(&id.0)
                     .bind(&workspace_id.0)
@@ -3000,7 +3004,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_agent_sessions(&self) -> Result<Vec<AgentSession>> {
         let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session ORDER BY created_at");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list all agent sessions failed: {e}")))?;
@@ -3179,7 +3183,7 @@ impl Store {
              reasoning_effort=? \
              WHERE id=? AND workspace_id=?"
         );
-        let query = sqlx::query(&sql)
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
             .bind(&s.acp_session_id)
             .bind(&s.name)
@@ -3924,7 +3928,7 @@ impl Store {
             daemon_owned_preserving_metadata("?", "?", "1")
         );
         let (metadata_raw, metadata_object) = whole_metadata_binds(metadata)?;
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&metadata_object)
             .bind(&metadata_raw)
             .bind(updated_at)
@@ -4374,10 +4378,10 @@ impl Store {
         } else {
             "retired_at IS NOT NULL"
         };
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE agent_session SET retired_at=?, updated_at=? \
              WHERE id=? AND workspace_id=? AND {guard}"
-        ))
+        )))
         .bind(retired_at)
         .bind(updated_at)
         .bind(&id.0)
@@ -5085,7 +5089,7 @@ pub(crate) async fn delete_in_bounded_batches(
     let mut batches = 0u64;
     loop {
         let removed = crate::with_write_txn_retry(|| async {
-            sqlx::query(sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql))
                 .bind(scope_id)
                 .bind(batch)
                 .execute(pool)
@@ -5621,7 +5625,7 @@ impl Store {
     ) -> Result<Vec<MessageFtsMatch>> {
         let sql =
             search_messages_fts_sql(workspace_id.is_some(), agent_id.is_some(), role.is_some());
-        let mut query = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(prefer_workspace_id.map(|w| w.0.as_str()))
             .bind(PREFER_WORKSPACE_BOOST)
             .bind(ARCHIVED_WORKSPACE_PENALTY)
@@ -6028,7 +6032,7 @@ impl Store {
             && stale_keys.is_empty()
             && origin == UsageMessageOrigin::Excluded
         {
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(id)
                 .bind(&agent_id.0)
                 .bind(seq)
@@ -6058,7 +6062,7 @@ impl Store {
                 let mut tx = pool.begin().await.map_err(|e| {
                     Error::Internal(format!("append agent message begin failed: {e}"))
                 })?;
-                sqlx::query(&sql)
+                sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                     .bind(id)
                     .bind(&agent_id.0)
                     .bind(seq)
@@ -6087,7 +6091,7 @@ impl Store {
                     })?;
                 }
                 if let (Some((_, value)), Some(update_sql)) = (&preview_update, &update_sql) {
-                    sqlx::query(update_sql)
+                    sqlx::query(sqlx::AssertSqlSafe(update_sql.as_str()))
                         .bind(value.as_str())
                         .bind(role)
                         .bind(id)
@@ -6204,7 +6208,7 @@ impl Store {
             ),
         };
         let mut tx = self.begin_read_snapshot().await?;
-        let mut query = sqlx::query(&sql).bind(&agent_id.0);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&agent_id.0);
         if let Some(n) = limit {
             query = query.bind(n);
         }
@@ -6270,7 +6274,7 @@ impl Store {
                 crate::message_payload::KIND_TOOL_USE_INPUT,
                 crate::message_payload::KIND_TOOL_RESULT_OUTPUT
             );
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(id);
             }
@@ -6341,7 +6345,7 @@ impl Store {
             "SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? ORDER BY seq ASC"
         );
         let mut tx = self.begin_read_snapshot().await?;
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&agent_id.0)
             .fetch_all(&mut *tx)
             .await
@@ -6368,7 +6372,7 @@ impl Store {
         );
         let mut after_rowid: i64 = 0;
         loop {
-            let rows = sqlx::query(&page_sql)
+            let rows = sqlx::query(sqlx::AssertSqlSafe(page_sql.as_str()))
                 .bind(&agent_id.0)
                 .bind(after_rowid)
                 .bind(ROWS_PER_PAGE)
@@ -6469,7 +6473,7 @@ impl Store {
         let mut total: u64 = 0;
         let mut after_rowid: i64 = 0;
         loop {
-            let rows = sqlx::query(&scan_sql)
+            let rows = sqlx::query(sqlx::AssertSqlSafe(scan_sql.as_str()))
                 .bind(after_rowid)
                 .bind(cutoff_iso)
                 .bind(CHUNK)
@@ -6655,7 +6659,7 @@ impl Store {
              WHERE agent_id = ? AND role != 'system' ORDER BY seq DESC LIMIT 1"
         );
         let mut tx = self.begin_read_snapshot().await?;
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&agent_id.0)
             .fetch_optional(&mut *tx)
             .await
@@ -6748,7 +6752,7 @@ impl Store {
     ) -> Result<Option<AgentMessage>> {
         let sql =
             format!("SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? AND id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&agent_id.0)
             .bind(message_id)
             .fetch_optional(&mut **tx)
@@ -6841,7 +6845,7 @@ impl Store {
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session INDEXED BY idx_agent_parent \
              WHERE parent_agent_id = ? ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&parent_agent_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -7002,7 +7006,7 @@ impl Store {
              SELECT {MESSAGE_COLUMNS} FROM bounded \
              WHERE COALESCE(preceding_bytes, 0) < ? ORDER BY seq DESC"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(agent_id.as_str())
             .bind(before_seq.unwrap_or(i64::MAX))
             .bind(i64::try_from(limit.clamp(1, 8)).unwrap_or(8))
@@ -7028,7 +7032,7 @@ impl Store {
             "SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? \
              ORDER BY seq ASC LIMIT ? OFFSET ?"
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&agent_id.0)
             .bind(limit.max(0))
             .bind(offset.max(0))
@@ -7109,7 +7113,7 @@ impl Store {
              FROM agent_message m \
              WHERE m.agent_id = ? AND m.role = 'user' {before_sql} {order_sql}"
         );
-        let mut query = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(i64::try_from(preview_chars).unwrap_or(i64::MAX))
             .bind(&agent_id.0);
         if let Some(page) = page {
@@ -7194,7 +7198,7 @@ impl Store {
                AND m.id IN ({placeholders})",
             crate::message_payload::KIND_THUMBNAILS
         );
-        let mut query = sqlx::query(&sql).bind(&agent_id.0);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&agent_id.0);
         for id in message_ids {
             query = query.bind(id);
         }
@@ -7442,7 +7446,7 @@ impl Store {
                         _ => Some("excluded"),
                     }
                 };
-                sqlx::query(&insert_sql)
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql.as_str()))
                     .bind(&id)
                     .bind(&agent_id.0)
                     .bind(seq)
@@ -7591,7 +7595,7 @@ impl Store {
             // body — no payload hydration needed here.
             let mut newest: Vec<AgentMessage> = Vec::with_capacity(2);
             for role in ["assistant", "user"] {
-                let row = sqlx::query(&newest_of_role_sql)
+                let row = sqlx::query(sqlx::AssertSqlSafe(newest_of_role_sql.as_str()))
                     .bind(&agent_id.0)
                     .bind(role)
                     .fetch_optional(&mut *tx)
@@ -8079,7 +8083,7 @@ mod tests {
                 ),
             ),
         ] {
-            let details: Vec<String> = sqlx::query(&sql)
+            let details: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind("ws-plan")
                 .fetch_all(store.read_pool())
                 .await
@@ -8157,7 +8161,7 @@ mod tests {
         }
         for (label, sql, bind) in statements {
             let plan_sql = format!("EXPLAIN QUERY PLAN {sql}");
-            let mut plan = sqlx::query(&plan_sql).bind("ws-plan");
+            let mut plan = sqlx::query(sqlx::AssertSqlSafe(plan_sql.as_str())).bind("ws-plan");
             if let Some(bind) = &bind {
                 plan = plan.bind(bind);
             }
@@ -8690,8 +8694,8 @@ mod tests {
         ] {
             let plan_sql = format!("EXPLAIN QUERY PLAN {sql}");
             let bytecode_sql = format!("EXPLAIN {sql}");
-            let mut plan = sqlx::query(&plan_sql);
-            let mut bytecode = sqlx::query(&bytecode_sql);
+            let mut plan = sqlx::query(sqlx::AssertSqlSafe(plan_sql.as_str()));
+            let mut bytecode = sqlx::query(sqlx::AssertSqlSafe(bytecode_sql.as_str()));
             if bind {
                 plan = plan.bind("ws-plan");
                 bytecode = bytecode.bind("ws-plan");
@@ -8755,19 +8759,20 @@ mod tests {
             .replace("'$.lastSeenMessageId'", "'$.lastSeenMessageId')");
         assert_ne!(control_sql, unread_workspaces_batch_sql());
         let control_bytecode_sql = format!("EXPLAIN {control_sql}");
-        let ops: Vec<(String, i64, i64)> = sqlx::query(&control_bytecode_sql)
-            .fetch_all(store.read_pool())
-            .await
-            .expect("explain control bytecode")
-            .iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("opcode"),
-                    row.get::<i64, _>("p1"),
-                    row.get::<i64, _>("p2"),
-                )
-            })
-            .collect();
+        let ops: Vec<(String, i64, i64)> =
+            sqlx::query(sqlx::AssertSqlSafe(control_bytecode_sql.as_str()))
+                .fetch_all(store.read_pool())
+                .await
+                .expect("explain control bytecode")
+                .iter()
+                .map(|row| {
+                    (
+                        row.get::<String, _>("opcode"),
+                        row.get::<i64, _>("p1"),
+                        row.get::<i64, _>("p2"),
+                    )
+                })
+                .collect();
         let opcodes: Vec<&str> = ops.iter().map(|(op, _, _)| op.as_str()).collect();
         assert!(
             opcodes.contains(&"Function"),
@@ -11493,11 +11498,13 @@ mod tests {
     }
 
     async fn count_rows(store: &Store, table: &str, agent_id: &AgentId) -> i64 {
-        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE agent_id = ?"))
-            .bind(&agent_id.0)
-            .fetch_one(store.read_pool())
-            .await
-            .expect("count rows")
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE agent_id = ?"
+        )))
+        .bind(&agent_id.0)
+        .fetch_one(store.read_pool())
+        .await
+        .expect("count rows")
     }
 
     /// intent-hq/intent#3827: deleting a session with a history far larger
@@ -13672,7 +13679,7 @@ mod tests {
             .filter(|row| !intent_core::token_usage_reported(row.3.as_ref(), row.2.as_ref()))
             .map(|row| row.0.as_str())
             .collect::<Vec<_>>();
-        let fetched_ids = sqlx::query(&fallback_message_usage_sql())
+        let fetched_ids = sqlx::query(sqlx::AssertSqlSafe(fallback_message_usage_sql()))
             .bind(serde_json::to_string(&fallback_ids).unwrap())
             .fetch_all(store.read_pool())
             .await
@@ -13819,7 +13826,7 @@ mod tests {
         // a plan that scans agent_message loads and parses every body, which is
         // exactly the cost this read is supposed to avoid.
         let plan_sql = format!("EXPLAIN QUERY PLAN {}", fallback_message_usage_sql());
-        let plan: String = sqlx::query(&plan_sql)
+        let plan: String = sqlx::query(sqlx::AssertSqlSafe(plan_sql.as_str()))
             .bind(serde_json::to_string(&[&cost_only.0]).unwrap())
             .fetch_all(store.read_pool())
             .await
@@ -15857,7 +15864,7 @@ mod tests {
             ),
         ];
         for (name, sql) in statements {
-            let plan_rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+            let plan_rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
                 .bind("ws-any")
                 .fetch_all(store.read_pool())
                 .await
@@ -15881,9 +15888,9 @@ mod tests {
     async fn agent_has_assistant_message_is_a_covering_index_seek() {
         let tmp = TempDb::new("test-assistant-probe-plan");
         let store = Store::open(&tmp).await.expect("create test store");
-        let plan_rows = sqlx::query(&format!(
+        let plan_rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "EXPLAIN QUERY PLAN {AGENT_HAS_ASSISTANT_MESSAGE_SQL}"
-        ))
+        )))
         .bind("agent-any")
         .fetch_all(store.read_pool())
         .await
@@ -16019,9 +16026,9 @@ mod tests {
     async fn agent_has_assistant_after_last_user_is_a_covering_index_seek() {
         let tmp = TempDb::new("test-assistant-after-user-plan");
         let store = Store::open(&tmp).await.expect("create test store");
-        let plan_rows = sqlx::query(&format!(
+        let plan_rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "EXPLAIN QUERY PLAN {AGENT_HAS_ASSISTANT_AFTER_LAST_USER_SQL}"
-        ))
+        )))
         .bind("agent-any")
         .fetch_all(store.read_pool())
         .await
@@ -18495,10 +18502,12 @@ mod tests {
         // migration added), then re-run the migration file verbatim via
         // raw_sql — no statement re-parsing (PR #742 review).
         for column in ["last_assistant_preview", "last_user_preview"] {
-            sqlx::query(&format!("ALTER TABLE agent_session DROP COLUMN {column}"))
-                .execute(store.write_pool())
-                .await
-                .expect("drop preview column");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE agent_session DROP COLUMN {column}"
+            )))
+            .execute(store.write_pool())
+            .await
+            .expect("drop preview column");
         }
         sqlx::raw_sql(include_str!(
             "../migrations/0066_agent_session_last_message_previews.sql"
@@ -21058,7 +21067,7 @@ mod tests {
             "EXPLAIN QUERY PLAN {}",
             search_messages_fts_sql(true, true, true)
         );
-        let plan: Vec<String> = sqlx::query(&sql)
+        let plan: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind("ws-plan")
             .bind(PREFER_WORKSPACE_BOOST)
             .bind(ARCHIVED_WORKSPACE_PENALTY)

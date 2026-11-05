@@ -79,9 +79,9 @@ impl StorePool {
     /// Returns an acquisition or transaction-begin error.
     pub async fn begin_with(
         &self,
-        statement: impl Into<std::borrow::Cow<'static, str>>,
+        statement: impl sqlx::SqlSafeStr,
     ) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
-        Transaction::begin(self.acquire().await?, Some(statement.into())).await
+        Transaction::begin(self.acquire().await?, Some(statement.into_sql_str())).await
     }
 
     /// Take an existing idle connection without opening a new one.
@@ -178,11 +178,11 @@ impl<'c> Executor<'c> for &'c StorePool {
         Box::pin(async move { (&mut *self.acquire().await?).fetch_optional(query).await })
     }
 
-    fn prepare_with<'e, 'q: 'e>(
+    fn prepare_with<'e>(
         self,
-        sql: &'q str,
+        sql: sqlx::SqlStr,
         parameters: &'e [SqliteTypeInfo],
-    ) -> BoxFuture<'e, Result<SqliteStatement<'q>, sqlx::Error>>
+    ) -> BoxFuture<'e, Result<SqliteStatement, sqlx::Error>>
     where
         'c: 'e,
     {
@@ -193,10 +193,7 @@ impl<'c> Executor<'c> for &'c StorePool {
         })
     }
 
-    fn describe<'e, 'q: 'e>(
-        self,
-        sql: &'q str,
-    ) -> BoxFuture<'e, Result<Describe<Sqlite>, sqlx::Error>>
+    fn describe<'e>(self, sql: sqlx::SqlStr) -> BoxFuture<'e, Result<Describe<Sqlite>, sqlx::Error>>
     where
         'c: 'e,
     {

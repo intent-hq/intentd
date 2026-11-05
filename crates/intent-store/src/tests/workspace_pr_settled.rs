@@ -160,9 +160,9 @@ async fn malformed_pr_snapshots_are_not_settled() {
         .unwrap()
         .contains(&id));
     for column in ["active_pull_request", "pull_requests"] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE workspace SET {column} = 'not json' WHERE id = ?"
-        ))
+        )))
         .bind(&id.0)
         .execute(store.write_pool())
         .await
@@ -175,9 +175,9 @@ async fn malformed_pr_snapshots_are_not_settled() {
                 .is_empty(),
             "{column}"
         );
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE workspace SET {column} = NULL WHERE id = ?"
-        ))
+        )))
         .bind(&id.0)
         .execute(store.write_pool())
         .await

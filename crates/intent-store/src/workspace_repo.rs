@@ -265,7 +265,7 @@ impl Store {
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
              (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
-        let query = sqlx::query(&sql)
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&ws.id.0)
             .bind(&ws.title)
             .bind(&ws.branch)
@@ -334,7 +334,7 @@ impl Store {
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_workspace(&self, id: &WorkspaceId) -> Result<Workspace> {
         let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .fetch_optional(self.read_pool())
             .await
@@ -866,7 +866,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_workspace_unread_if_all_seen(&self, id: &WorkspaceId) -> Result<bool> {
         let sql = clear_workspace_unread_if_all_seen_sql();
-        let res = sqlx::query(&sql)
+        let res = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .execute(self.write_pool())
             .await
@@ -1587,7 +1587,7 @@ impl Store {
             "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND ({predicate}) \
              ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(CHIEF_WORKSPACE_ID)
             .bind(&retired)
             .fetch_all(self.read_pool())
@@ -1625,7 +1625,9 @@ impl Store {
             "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND ({predicate}){keyset} \
              ORDER BY created_at, id LIMIT ?"
         );
-        let mut query = sqlx::query(&sql).bind(CHIEF_WORKSPACE_ID).bind(&retired);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(CHIEF_WORKSPACE_ID)
+            .bind(&retired);
         if let Some((created_at, id)) = after {
             query = query.bind(created_at).bind(created_at).bind(id);
         }
@@ -1867,7 +1869,7 @@ impl Store {
              SELECT 1 FROM json_each(workspace.pull_requests) AS je \
              WHERE je.value ->> '$.url' = ? COLLATE NOCASE))) ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(CHIEF_WORKSPACE_ID)
             .bind(url)
             .bind(url)
@@ -2010,7 +2012,7 @@ fn active_pr_from_db(s: Option<String>) -> Result<Option<PullRequestInfo>> {
 /// [`Store::update_workspace_pr_linkage_rebased`].
 fn pr_linkage_update(
     ws: &Workspace,
-) -> Result<sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'_>>> {
+) -> Result<sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>> {
     Ok(sqlx::query(
         "UPDATE workspace SET pr_number=?, pr_url=?, pr_status=?, \
          active_pull_request=?, pull_requests=?, updated_at=? WHERE id=?",

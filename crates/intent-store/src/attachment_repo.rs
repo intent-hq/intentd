@@ -87,7 +87,7 @@ impl Store {
                     "replace expired attachment idempotency key failed: {e}"
                 ))
             })?;
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&a.id)
                 .bind(&a.workspace_id.0)
                 .bind(&a.file_name)
@@ -159,7 +159,7 @@ impl Store {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .bind(key)
             .bind(expired_before)
@@ -210,7 +210,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_attachment(&self, a: &AttachmentRecord) -> Result<()> {
         let sql = format!("INSERT INTO attachments ({COLUMNS}) VALUES (?,?,?,?,?,?,?)");
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&a.id)
             .bind(&a.workspace_id.0)
             .bind(&a.file_name)
@@ -231,7 +231,7 @@ impl Store {
     /// Returns `Error::NotFound` if the attachment does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_attachment(&self, id: &str) -> Result<AttachmentRecord> {
         let sql = format!("SELECT {COLUMNS} FROM attachments WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .fetch_optional(self.read_pool())
             .await
@@ -251,7 +251,7 @@ impl Store {
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AttachmentRecord>> {
         let sql = format!("SELECT {COLUMNS} FROM attachments WHERE workspace_id = ? ORDER BY id");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await

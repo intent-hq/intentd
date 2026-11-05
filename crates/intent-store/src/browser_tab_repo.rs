@@ -125,10 +125,10 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_browser_tabs(&self, id: &WorkspaceId) -> Result<Vec<BrowserTab>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM browser_tab \
              WHERE workspace_id = ? AND closed_at IS NULL ORDER BY created_at, tab_id"
-        ))
+        )))
         .bind(&id.0)
         .fetch_all(self.read_pool())
         .await
@@ -144,10 +144,10 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_browser_tabs_by_host(&self, host: &ClientId) -> Result<Vec<BrowserTab>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM browser_tab \
              WHERE host_client_id = ? AND closed_at IS NULL ORDER BY created_at, tab_id"
-        ))
+        )))
         .bind(&host.0)
         .fetch_all(self.read_pool())
         .await
@@ -407,12 +407,12 @@ impl Store {
             let displayed = displayed.clone();
             async move {
                 let mut tx = begin(&pool, "reassign claimed browser tabs").await?;
-                let rows = sqlx::query(&format!(
+                let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "SELECT {COLUMNS} FROM browser_tab \
                      WHERE workspace_id = ? AND closed_at IS NULL \
                      AND owner_agent_id IS NOT NULL AND host_client_id <> ? \
                      ORDER BY created_at, tab_id"
-                ))
+                )))
                 .bind(&id.0)
                 .bind(&new_host.0)
                 .fetch_all(&mut *tx)
@@ -472,7 +472,7 @@ impl Store {
                      WHERE closed_at IS NULL AND host_client_id IN ({placeholders}) \
                      ORDER BY created_at, tab_id"
                 );
-                let mut query = sqlx::query(&sql);
+                let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
                 for host in &old_hosts {
                     query = query.bind(&host.0);
                 }
@@ -547,10 +547,10 @@ impl Store {
                         Some(StoredTab { tab, .. }) => result.drop.push(tab.tab_id),
                     }
                 }
-                let rows = sqlx::query(&format!(
+                let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "SELECT {COLUMNS} FROM browser_tab WHERE host_client_id = ? \
                      ORDER BY created_at, tab_id"
-                ))
+                )))
                 .bind(&host.0)
                 .fetch_all(&mut *tx)
                 .await
@@ -601,9 +601,9 @@ async fn fetch_stored(
     tab_id: &str,
     displayed: &DisplayedOverlay,
 ) -> Result<Option<StoredTab>> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM browser_tab WHERE tab_id = ?"
-    ))
+    )))
     .bind(tab_id)
     .fetch_optional(conn)
     .await

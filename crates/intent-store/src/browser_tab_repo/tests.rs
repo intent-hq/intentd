@@ -744,11 +744,11 @@ async fn failed_sync_persists_nothing() {
 #[tokio::test]
 async fn list_by_workspace_is_one_ordered_partial_index_scan() {
     let f = fixture().await;
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "EXPLAIN QUERY PLAN SELECT {} FROM browser_tab \
          WHERE workspace_id = ? AND closed_at IS NULL ORDER BY created_at, tab_id",
         super::COLUMNS
-    ))
+    )))
     .bind(&f.ws.0)
     .fetch_all(f.store.read_pool())
     .await

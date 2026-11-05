@@ -72,7 +72,7 @@ impl Store {
         for chunk in ids.chunks(IDS_PER_STATEMENT) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = session_sql(&placeholders);
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(&id.0);
             }
@@ -111,7 +111,7 @@ impl Store {
                 );
             }
             let sql = hooks_sql(&placeholders);
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(&id.0);
             }
@@ -133,7 +133,7 @@ impl Store {
                 }
             }
             let sql = monitors_sql(&placeholders);
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(&id.0);
             }
@@ -179,7 +179,7 @@ mod tests {
             (hooks_sql("?,?"), "idx_hook_agent"),
             (monitors_sql("?,?"), "idx_pr_monitor_agent"),
         ] {
-            let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+            let plan = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
                 .bind("agent-a")
                 .bind("agent-b")
                 .fetch_all(store.read_pool())

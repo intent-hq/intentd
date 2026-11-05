@@ -196,7 +196,7 @@ impl Store {
             "UPDATE executor_credential SET last_used_at = ? \
              WHERE token_hash = ? AND revoked_at IS NULL RETURNING {CREDENTIAL_COLUMNS}"
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(now_iso())
             .bind(token_hash)
             .fetch_optional(self.write_pool())
@@ -215,7 +215,7 @@ impl Store {
         id: &ExecutorCredentialId,
     ) -> Result<Option<ExecutorCredential>> {
         let sql = format!("SELECT {CREDENTIAL_COLUMNS} FROM executor_credential WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id.as_str())
             .fetch_optional(self.read_pool())
             .await
@@ -233,7 +233,7 @@ impl Store {
             "SELECT {CREDENTIAL_COLUMNS} FROM executor_credential WHERE revoked_at IS NULL \
              ORDER BY created_at, id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(db)?;
@@ -450,7 +450,7 @@ impl Store {
     /// `Internal` on database failure or a corrupt row.
     pub async fn get_exposed_machine(&self, id: &str) -> Result<Option<ExposedMachine>> {
         let sql = format!("SELECT {MACHINE_COLUMNS} FROM exposed_machine WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .fetch_optional(self.read_pool())
             .await
@@ -465,7 +465,7 @@ impl Store {
     /// `Internal` on database failure or a corrupt row.
     pub async fn list_exposed_machines(&self) -> Result<Vec<ExposedMachine>> {
         let sql = format!("SELECT {MACHINE_COLUMNS} FROM exposed_machine ORDER BY added_at, id");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(db)?;

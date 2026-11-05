@@ -86,7 +86,7 @@ pub(crate) async fn capture(
             "SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE id IN ({})",
             vec!["?"; chunk.len()].join(",")
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in chunk {
             query = query.bind(id.as_str());
         }

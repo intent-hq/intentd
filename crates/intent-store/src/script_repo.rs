@@ -75,7 +75,7 @@ impl Store {
             "INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? \
              WHERE ? = 0 OR NOT EXISTS (SELECT 1 FROM script WHERE id = ? AND workspace_id != ?)"
         );
-        let result = sqlx::query(&sql)
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&s.id)
             .bind(&s.workspace_id)
             .bind(&s.name)
@@ -189,7 +189,7 @@ impl Store {
             let placeholders = vec![row.as_str(); chunk.len()].join(",");
             let sql =
                 format!("INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) VALUES {placeholders}");
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for s in chunk {
                 query = query
                     .bind(&s.id)
@@ -276,7 +276,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_scripts(&self) -> Result<Vec<Script>> {
         let sql = format!("SELECT {SCRIPT_COLUMNS} FROM script ORDER BY created_at, id");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list scripts failed: {e}")))?;
@@ -290,7 +290,7 @@ impl Store {
         let sql = format!(
             "SELECT {SCRIPT_COLUMNS} FROM script WHERE archived_at IS NULL ORDER BY created_at,id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
@@ -301,7 +301,7 @@ impl Store {
     /// Returns database or decoding errors.
     pub async fn get_active_script(&self, ws: &WorkspaceId, id: &str) -> Result<Option<Script>> {
         let sql=format!("SELECT {SCRIPT_COLUMNS} FROM script WHERE workspace_id=? AND id=? AND archived_at IS NULL");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(ws.as_str())
             .bind(id)
             .fetch_optional(self.read_pool())
@@ -320,7 +320,7 @@ impl Store {
         id: &str,
     ) -> Result<Option<Script>> {
         let sql = format!("SELECT {SCRIPT_COLUMNS} FROM script WHERE id = ? AND workspace_id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .bind(&workspace_id.0)
             .fetch_optional(self.read_pool())

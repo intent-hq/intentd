@@ -254,7 +254,7 @@ impl Store {
              UNION SELECT workspace_id FROM script_monitor WHERE state='active' \
              AND workspace_id IN ({placeholders})"
         );
-        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql.as_str()));
         for _ in 0..2 {
             for id in workspace_ids {
                 query = query.bind(id.as_str());

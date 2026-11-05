@@ -165,7 +165,7 @@ impl Store {
             "INSERT INTO hook ({COLUMNS}) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&h.hook_id.0)
             .bind(&h.workspace_id.0)
             .bind(&h.agent_id.0)
@@ -198,7 +198,7 @@ impl Store {
     /// Returns `Error::NotFound` if the hook does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_hook(&self, hook_id: &HookId) -> Result<Hook> {
         let sql = format!("SELECT {COLUMNS} FROM hook WHERE hook_id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&hook_id.0)
             .fetch_optional(self.read_pool())
             .await
@@ -219,7 +219,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_hooks_by_workspace(&self, workspace_id: &WorkspaceId) -> Result<Vec<Hook>> {
         let sql = format!("SELECT {COLUMNS} FROM hook WHERE workspace_id = ? ORDER BY created_at");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -255,7 +255,11 @@ impl Store {
             .await
     }
 
-    async fn active_hook_metadata(&self, sql: &str, id: &str) -> Result<Vec<ActiveHookMetadata>> {
+    async fn active_hook_metadata(
+        &self,
+        sql: &'static str,
+        id: &str,
+    ) -> Result<Vec<ActiveHookMetadata>> {
         let read = async {
             let rows = sqlx::query(sql)
                 .bind(id)
@@ -309,7 +313,7 @@ impl Store {
             "SELECT {LIST_COLUMNS} FROM hook WHERE workspace_id = ?{agent_clause}{state_clause} \
              ORDER BY created_at"
         );
-        let mut query = sqlx::query(&sql).bind(&workspace_id.0);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&workspace_id.0);
         if let Some(a) = agent_id {
             query = query.bind(&a.0);
         }
@@ -349,7 +353,7 @@ impl Store {
             "SELECT {LIST_COLUMNS} FROM hook WHERE workspace_id = ?{state_clause}{after_clause} \
              ORDER BY created_at, hook_id LIMIT ?"
         );
-        let mut query = sqlx::query(&sql).bind(&workspace_id.0);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&workspace_id.0);
         if let Some((created_at, hook_id)) = after {
             query = query.bind(created_at).bind(hook_id);
         }
@@ -433,7 +437,7 @@ impl Store {
             "SELECT DISTINCT workspace_id FROM hook WHERE workspace_id IN ({placeholders}) \
              AND state IN ('scheduled', 'running')"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
@@ -453,7 +457,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_hooks_by_agent(&self, agent_id: &AgentId) -> Result<Vec<Hook>> {
         let sql = format!("SELECT {COLUMNS} FROM hook WHERE agent_id = ? ORDER BY created_at");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&agent_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -719,7 +723,7 @@ impl Store {
             "SELECT {COLUMNS} FROM hook WHERE state IN ('scheduled', 'running') \
              ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("load active hooks failed: {e}")))?;
@@ -742,13 +746,17 @@ mod projection_tests {
             (ACTIVE_BY_AGENT_SQL, "idx_hook_active_agent"),
             (ACTIVE_BY_WORKSPACE_SQL, "idx_hook_active_workspace"),
         ] {
-            let description = store.read_pool().describe(sql).await.unwrap();
+            let description = store
+                .read_pool()
+                .describe(sqlx::SqlStr::from_static(sql))
+                .await
+                .unwrap();
             let columns: Vec<_> = description.columns().iter().map(Column::name).collect();
             assert_eq!(
                 columns,
                 ["agent_id", "hook_id", "name", "next_run_at", "expires_at"]
             );
-            let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+            let plan = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
                 .bind("missing")
                 .fetch_all(store.read_pool())
                 .await

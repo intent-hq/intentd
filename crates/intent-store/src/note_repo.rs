@@ -60,7 +60,7 @@ impl Store {
     pub async fn list_notes(&self, workspace_id: &WorkspaceId) -> Result<Vec<Note>> {
         let sql =
             format!("SELECT {NOTE_COLUMNS} FROM note WHERE workspace_id = ? ORDER BY created_at");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -271,7 +271,7 @@ impl Store {
             "SELECT workspace_id, MAX(updated_at) AS updated_at FROM note \
              WHERE workspace_id IN ({placeholders}) GROUP BY workspace_id"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
@@ -297,7 +297,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_notes(&self) -> Result<Vec<Note>> {
         let sql = format!("SELECT {NOTE_COLUMNS} FROM note ORDER BY created_at");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list all notes failed: {e}")))?;
@@ -319,7 +319,7 @@ impl Store {
     pub async fn get_note(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
         let sql = format!("SELECT {NOTE_COLUMNS} FROM note WHERE id = ? AND workspace_id = ?");
         let row = crate::with_read_retry(|| async {
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&id.0)
                 .bind(&workspace_id.0)
                 .fetch_optional(self.read_pool())
@@ -340,9 +340,9 @@ impl Store {
     /// Returns `NotFound` for an absent note, or a database/decoding error.
     pub async fn get_note_metadata(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
         let columns = NOTE_COLUMNS.replace(" content,", " '' AS content,");
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {columns} FROM note WHERE id = ? AND workspace_id = ?"
-        ))
+        )))
         .bind(id.as_str())
         .bind(workspace_id.as_str())
         .fetch_optional(self.read_pool())
@@ -600,7 +600,7 @@ impl Store {
             "SELECT {NOTE_COLUMNS} FROM note WHERE workspace_id = ? AND task_json IS NOT NULL \
              ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -744,7 +744,7 @@ impl Store {
              FROM note WHERE workspace_id IN ({placeholders}) AND \
                 (id = 'spec' OR (task_json IS NOT NULL AND id != 'spec' AND parent_id = 'spec'))"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
@@ -974,7 +974,7 @@ pub(crate) async fn exec_insert_note(
         .map(encode_task_json)
         .transpose()?;
     let sql = format!("INSERT INTO note ({NOTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&note.id.0)
         .bind(&note.workspace_id.0)
         .bind(&note.title)
@@ -1055,7 +1055,7 @@ async fn exec_update_note_with_link_guard(
         );
     }
     sql.push_str(" RETURNING rev");
-    let mut query = sqlx::query(&sql).bind(&note.title);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&note.title);
     if scope == NoteUpdateScope::FullRow {
         query = query
             .bind(&note.content)

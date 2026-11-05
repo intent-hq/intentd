@@ -354,7 +354,7 @@ async fn large_note_save_does_not_block_an_unrelated_write() {
 /// Seed `rows` retired page-index rows under one head for note `n`, as a
 /// released daemon would have left them.
 async fn seed_retired_index(store: &Store, rows: u32) {
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         r"
         INSERT INTO workspace(id,title,branch,created_at,updated_at) VALUES ('ws','W','main','c','u');
         INSERT INTO note(id,workspace_id,title,content,rev,created_at,updated_at)
@@ -365,7 +365,7 @@ async fn seed_retired_index(store: &Store, rows: u32) {
         INSERT INTO note_page_entry(workspace_id,note_id,collection,position,value,source_start,source_end)
           SELECT 'ws','n','blocks',i,printf('entry %d with some indexed text',i),i,i+1 FROM seq;
         "
-    ))
+    )))
     .execute(store.write_pool())
     .await
     .unwrap();

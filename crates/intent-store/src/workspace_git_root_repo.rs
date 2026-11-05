@@ -34,7 +34,7 @@ fn agent_ids_from_db(s: &str) -> Result<Vec<AgentId>> {
 /// [`Store::update_workspace_git_root_pr_rebased`].
 fn root_pr_update(
     root: &WorkspaceGitRoot,
-) -> Result<sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'_>>> {
+) -> Result<sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>> {
     Ok(sqlx::query(
         "UPDATE workspace_git_root SET pr_number = ?, pr_url = ?, pr_status = ?, \
          pull_requests = ?, updated_at = ? WHERE id = ?",
@@ -149,7 +149,7 @@ impl Store {
             let sql = format!(
                 "SELECT {COLUMNS} FROM workspace_git_root WHERE workspace_id = ? AND path = ?"
             );
-            let existing = sqlx::query(&sql)
+            let existing = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&root.workspace_id.0)
                 .bind(&root.path)
                 .fetch_optional(&mut *tx)
@@ -203,7 +203,7 @@ impl Store {
                     "INSERT INTO workspace_git_root ({COLUMNS}) \
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                 );
-                sqlx::query(&sql)
+                sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                     .bind(&fresh.id.0)
                     .bind(&fresh.workspace_id.0)
                     .bind(&fresh.path)
@@ -244,7 +244,7 @@ impl Store {
         id: &WorkspaceGitRootId,
     ) -> Result<WorkspaceGitRoot> {
         let sql = format!("SELECT {COLUMNS} FROM workspace_git_root WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .fetch_optional(self.read_pool())
             .await
@@ -267,7 +267,7 @@ impl Store {
     ) -> Result<Option<WorkspaceGitRoot>> {
         let sql =
             format!("SELECT {COLUMNS} FROM workspace_git_root WHERE workspace_id = ? AND path = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .bind(path)
             .fetch_optional(self.read_pool())
@@ -288,7 +288,7 @@ impl Store {
         let sql = format!(
             "SELECT {COLUMNS} FROM workspace_git_root WHERE workspace_id = ? ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -320,7 +320,7 @@ impl Store {
             "SELECT {COLUMNS} FROM workspace_git_root WHERE pull_requests IS NOT NULL\
              {archived_filter} ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| {
@@ -353,7 +353,7 @@ impl Store {
              AND EXISTS (SELECT 1 FROM json_each(workspace_git_root.pull_requests) AS je \
              WHERE je.value ->> '$.url' = ? COLLATE NOCASE))) ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(url)
             .bind(url)
             .fetch_all(self.read_pool())

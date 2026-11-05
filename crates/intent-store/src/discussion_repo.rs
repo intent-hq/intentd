@@ -151,7 +151,7 @@ impl Store {
              FROM workspace_discussion_message m WHERE workspace_id=? AND conversation_id=? AND sequence {comparison} ? \
              ORDER BY sequence {order} LIMIT ?"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(viewer.and_then(DiscussionActor::principal_id))
             .bind(viewer.and_then(DiscussionActor::agent_id))
             .bind(workspace_id.as_str())

@@ -21,7 +21,7 @@ async fn authorize_human(
     principal: &PrincipalId,
 ) -> Result<()> {
     let sql = format!("SELECT EXISTS(SELECT 1 FROM principal p JOIN workspace w ON w.id=? WHERE p.id=? AND {} AND (?='default' OR EXISTS(SELECT 1 FROM workspace_discussion_conversation wdc WHERE wdc.workspace_id=w.id AND wdc.id=?5 AND wdc.deleted_at IS NULL) OR EXISTS(SELECT 1 FROM discussion_participant d WHERE d.workspace_id=w.id AND d.conversation_id=? AND d.principal_id=p.id)))", super::discussion_conversation_repo::ELIGIBLE);
-    let allowed: bool = sqlx::query_scalar(&sql)
+    let allowed: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(ws.as_str())
         .bind(principal.as_str())
         .bind(ws.as_str())

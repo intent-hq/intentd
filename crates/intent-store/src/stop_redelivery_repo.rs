@@ -79,7 +79,7 @@ impl Store {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql =
                 format!("DELETE FROM agent_stop_redelivery WHERE agent_id IN ({placeholders})");
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(&id.0);
             }

@@ -143,7 +143,7 @@ impl Store {
                     "DELETE FROM completion_watch WHERE group_id = ? \
                      AND child_agent_id NOT IN ({placeholders})"
                 );
-                let mut query = sqlx::query(&sql).bind(group_id);
+                let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(group_id);
                 for child_id in &retained {
                     query = query.bind(child_id);
                 }
