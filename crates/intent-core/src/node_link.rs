@@ -405,7 +405,7 @@ pub struct LaunchCommand {
     /// What the node prepares in the checkout before the agent starts; sent
     /// only on a link of [`PREPARED_CHECKOUT_PROTOCOL`] or later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkout: Option<PreparedCheckout>,
+    pub checkout: Option<Box<PreparedCheckout>>,
 }
 
 /// The checkout a nodeProtocol 10 launch prepares. The body is closed.

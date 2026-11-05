@@ -629,9 +629,11 @@ impl RemoteLaunchPort for RemoteLaunch {
                             return Err(error);
                         }
                     }
-                    (protocol >= PREPARED_CHECKOUT_PROTOCOL).then(|| PreparedCheckout {
-                        submodules: view.pins().to_vec(),
-                        setup: None,
+                    (protocol >= PREPARED_CHECKOUT_PROTOCOL).then(|| {
+                        Box::new(PreparedCheckout {
+                            submodules: view.pins().to_vec(),
+                            setup: None,
+                        })
                     })
                 } else {
                     None

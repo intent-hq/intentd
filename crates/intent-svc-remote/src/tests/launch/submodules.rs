@@ -385,7 +385,10 @@ async fn a_module_session_advertises_only_the_agents_refs() {
         )),
         "{advertised}"
     );
-    assert!(!advertised.contains("refs/heads/"), "{advertised}");
+    // Every advertised ref is the agent's; `symref=HEAD:…` in the
+    // capabilities names no ref.
+    assert!(!advertised.contains(" refs/heads/"), "{advertised}");
+    assert!(!advertised.contains(" HEAD"), "{advertised}");
     f.node.shutdown();
 }
 
@@ -490,10 +493,7 @@ async fn only_prepared_agents_get_a_checkout() {
     let (f, mut link, _machine) = prepared_fixture().await;
     let (prepared, _) = f.placed().await;
     let launch = f.launch_frame(&mut link, &prepared).await;
-    assert_eq!(
-        launch.checkout,
-        Some(intent_core::node_link::PreparedCheckout::default())
-    );
+    assert_eq!(launch.checkout, Some(Box::default()));
 
     let (legacy, mut view) = f.placed().await;
     view.submodules = None;
