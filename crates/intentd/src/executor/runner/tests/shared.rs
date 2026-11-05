@@ -130,7 +130,10 @@ async fn the_sweep_keeps_a_checkout_its_sharers_use() {
         .await
         .is_empty());
     assert!(h.storage.existing_agent_dir(&owner).is_some());
-    assert_eq!(h.runner.sweep(&[]).await, vec![owner.clone()]);
+    assert_eq!(
+        h.runner.sweep(&[]).await,
+        vec![child.clone(), owner.clone()]
+    );
     assert!(h.storage.existing_agent_dir(&owner).is_none());
 }
 
@@ -213,4 +216,38 @@ async fn a_push_request_during_the_owners_final_stop_is_skipped() {
     );
     assert_eq!(request.await.unwrap(), (FinalPush::Skipped, None));
     assert_eq!(h.checkouts.pushes.lock().unwrap().as_slice(), [owner]);
+}
+
+/// A sharing agent's provider gets its own private temp folder, in its
+/// own agent directory, never the owner's; its final stop removes that
+/// folder and leaves the owner's checkout.
+#[tokio::test]
+async fn a_sharing_agent_gets_its_own_temp_folder() {
+    let Some(h) = harness(2, &["--dump-env"]) else {
+        return;
+    };
+    h.runner.launch(launch("o1")).await;
+    let owner_env = agent_env(&h.storage, "o1").await;
+    let checkout = h.storage.agent_dir(&AgentId::from("o1")).unwrap();
+    std::fs::remove_file(checkout.join("agent.env.json")).unwrap();
+    h.runner.launch(sharing("c1", "o1")).await;
+    // The child's provider runs in the owner's checkout, so its dump lands there.
+    let child_env = agent_env(&h.storage, "o1").await;
+    let child_tmp = checkout
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("c1")
+        .join("tmp");
+    assert_eq!(
+        child_env.get("TMPDIR").and_then(Value::as_str),
+        Some(child_tmp.to_string_lossy().as_ref())
+    );
+    assert_ne!(child_env.get("TMPDIR"), owner_env.get("TMPDIR"));
+    assert!(child_tmp.is_dir());
+
+    h.runner.final_stop(&AgentId::from("c1")).await.unwrap();
+    assert!(!child_tmp.exists(), "removed with the sharing agent");
+    assert!(checkout.is_dir(), "the owner's checkout stays");
 }

@@ -1202,7 +1202,7 @@ impl Runner {
             }
         };
         let prepared = if let Some(owner) = &agent.checkout_of {
-            Some(self.shared_checkout(owner))
+            Some(self.shared_checkout(&agent.id, owner))
         } else {
             tokio::select! {
                 prepared = self.inner.checkouts.prepare(
@@ -1914,7 +1914,7 @@ impl Runner {
 
     /// The checkout of `owner` a launch with `checkoutOf` works in
     /// (nodeProtocol 13); nothing is fetched or set up.
-    fn shared_checkout(&self, owner: &AgentId) -> anyhow::Result<Prepared> {
+    fn shared_checkout(&self, agent_id: &AgentId, owner: &AgentId) -> anyhow::Result<Prepared> {
         let removing = {
             let state = lock(&self.inner.state);
             state.sweeping.contains(owner) || state.finalizing.contains_key(owner)
@@ -1922,6 +1922,7 @@ impl Runner {
         match self.inner.checkouts.existing(owner) {
             Some(worktree) if !removing => Ok(Prepared {
                 worktree,
+                tmp: self.inner.checkouts.agent_tmp(agent_id)?,
                 notice: None,
                 fresh: false,
             }),
