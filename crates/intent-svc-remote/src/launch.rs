@@ -183,7 +183,7 @@ async fn record_refused_start(
     {
         Ok(true) => {
             svc.publish_agent_placement_changed(workspace_id, agent_id)
-                .await
+                .await;
         }
         Ok(false) => {}
         Err(error) => {

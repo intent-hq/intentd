@@ -159,8 +159,8 @@ fn update_required(result: intent_core::Result<impl std::fmt::Debug>) -> String 
     }
 }
 
-fn is_denied<T: std::fmt::Debug>(result: intent_core::Result<T>) -> bool {
-    matches!(result, Err(Error::Forbidden(ref m)) if m == "node-git-denied")
+fn is_denied<T: std::fmt::Debug>(result: &intent_core::Result<T>) -> bool {
+    matches!(result, Err(Error::Forbidden(m)) if m == "node-git-denied")
 }
 
 fn is_unavailable<T: std::fmt::Debug>(result: &intent_core::Result<T>) -> bool {
@@ -277,7 +277,7 @@ async fn module_git_sessions_are_confined_to_the_agents_pins() {
         );
     }
     assert!(is_denied(
-        open(
+        &open(
             &agent,
             "repo-0123456789abcdef0123456789abcdef",
             GitService::UploadPack
@@ -285,7 +285,7 @@ async fn module_git_sessions_are_confined_to_the_agents_pins() {
         .await
     ));
     assert!(is_denied(
-        open(&agent, &key(&repo), GitService::UploadPack).await
+        &open(&agent, &key(&repo), GitService::UploadPack).await
     ));
 
     // Another agent's pins do not admit this one.
@@ -293,7 +293,7 @@ async fn module_git_sessions_are_confined_to_the_agents_pins() {
     unpinned.submodules = Some(Vec::new());
     f.set_view(&other, &unpinned).await;
     assert!(is_denied(
-        open(&other, &key(&repo.join("a")), GitService::UploadPack).await
+        &open(&other, &key(&repo.join("a")), GitService::UploadPack).await
     ));
 
     // A recorded pin is checked against the checkout: a nested repository
@@ -319,13 +319,13 @@ async fn module_git_sessions_are_confined_to_the_agents_pins() {
     ]);
     f.set_view(&agent, &view).await;
     assert!(is_denied(
-        open(&agent, &key(&repo.join("nested")), GitService::UploadPack).await
+        &open(&agent, &key(&repo.join("nested")), GitService::UploadPack).await
     ));
     assert!(is_denied(
-        open(&agent, &key(outside.path()), GitService::UploadPack).await
+        &open(&agent, &key(outside.path()), GitService::UploadPack).await
     ));
     assert!(is_denied(
-        open(&agent, &key(&repo.join("a/b")), GitService::UploadPack).await
+        &open(&agent, &key(&repo.join("a/b")), GitService::UploadPack).await
     ));
     assert!(is_unavailable(
         &open(
@@ -336,7 +336,7 @@ async fn module_git_sessions_are_confined_to_the_agents_pins() {
         .await
     ));
     assert!(is_denied(
-        open(
+        &open(
             &agent,
             "repo-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             GitService::UploadPack
@@ -427,13 +427,13 @@ async fn a_final_stop_admits_the_module_pushes() {
             .unwrap()
     );
     assert!(is_denied(
-        access
+        &access
             .repository(&binding, &a, GitService::UploadPack)
             .await
     ));
     let unknown = module_remote(&agent, &key(&repo.join("nested")));
     assert!(is_denied(
-        access
+        &access
             .repository(&binding, &unknown, GitService::ReceivePack)
             .await
     ));
