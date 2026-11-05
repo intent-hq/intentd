@@ -157,7 +157,7 @@ pub mod events {
 pub mod file_ops {
     pub use crate::file_ops::{
         delete, list, mkdir, read, rename, resolve_attachment_source, workspace_root, write,
-        write_attachment_copy,
+        check_attachment_dest, write_attachment_copy,
     };
 }
 

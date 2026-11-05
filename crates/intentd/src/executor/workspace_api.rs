@@ -526,6 +526,7 @@ impl WorkspaceApi for NodeApi {
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             self.check(&workspace_id)?;
+            file_ops::check_attachment_dest(&self.root(), dest_dir.as_deref())?;
             let data = self.head.attachment_data(&attachment_id).await?;
             self.blocking(&workspace_id, move |root| {
                 file_ops::write_attachment_copy(

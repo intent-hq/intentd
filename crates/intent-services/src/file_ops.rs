@@ -615,6 +615,16 @@ fn attachment_destination(
     Ok((rel, dest))
 }
 
+/// Refuse a `ws.file.getAttachment` `dest_dir` outside `dest_root` before
+/// anything is fetched; [`write_attachment_copy`] checks again.
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn check_attachment_dest(dest_root: &str, dest_dir: Option<&str>) -> Result<()> {
+    resolve_within(dest_root, dest_dir.unwrap_or(ATTACHMENTS_DIR)).map(drop)
+}
+
 /// `{ path, fileName, mimeType?, size, uploadedAt }`, the
 /// `ws.file.getAttachment` result.
 fn attachment_copy_result(

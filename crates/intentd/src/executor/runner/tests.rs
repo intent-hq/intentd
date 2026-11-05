@@ -1694,9 +1694,6 @@ fn the_redactor_masks_a_secret_placed_in_an_enum_position() {
     assert_eq!(config["update"]["configOptions"][0]["type"], "[redacted]");
 }
 
-/// A final stop (nodeProtocol 9) stops the agent, makes its exit push the
-/// final one (bounded by the final-push timeout) and only then removes its
-/// checkout; its acknowledgement reports the push.
 /// Remote parity S6: each remote agent gets a private, owner-only temp
 /// folder beside its checkout as `TMPDIR` / `TMP` / `TEMP`, over the inherited
 /// value, and the folder is removed with the checkout.
@@ -1738,6 +1735,9 @@ async fn node_runner_gives_each_agent_a_private_tmpdir_removed_with_its_checkout
     wait_for(&h.runner, "exit", exited("a2")).await;
 }
 
+/// A final stop (nodeProtocol 9) stops the agent, makes its exit push the
+/// final one (bounded by the final-push timeout) and only then removes its
+/// checkout; its acknowledgement reports the push.
 #[tokio::test]
 async fn node_runner_final_stop_pushes_within_its_bound_then_removes_the_checkout() {
     use crate::executor::checkout::FINAL_PUSH_TIMEOUT;

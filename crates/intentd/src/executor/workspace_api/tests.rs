@@ -301,7 +301,6 @@ async fn a_forwarded_call_without_a_link_fails_clearly() {
     assert!(text.contains("node-link-unavailable"), "{text}");
 }
 
-/// A bound link: the machine's end and the backend's (the test's) end.
 /// Remote parity S6: `ws.file.getAttachment` runs on the machine. The bytes
 /// come from head with the internal `file.attachmentData` frame, and the copy
 /// lands in the agent's checkout, git-ignored, with the local result shape.
@@ -389,6 +388,7 @@ async fn file_get_attachment_copies_heads_bytes_into_the_checkout() {
         unknown.0 && unknown.1.contains("unknown attachment id"),
         "{unknown:?}"
     );
+    while asked.try_recv().is_ok() {}
     let escape = call(
         &server,
         r#"return await ws.file.getAttachment("att-1", "../outside");"#,
@@ -396,9 +396,14 @@ async fn file_get_attachment_copies_heads_bytes_into_the_checkout() {
     .await;
     assert!(escape.0, "{escape:?}");
     assert!(!dir.path().parent().unwrap().join("outside").exists());
+    assert!(
+        asked.try_recv().is_err(),
+        "a destDir outside the checkout is refused before head is asked"
+    );
     answering.abort();
 }
 
+/// A bound link: the machine's end and the backend's (the test's) end.
 async fn bound_link(dir: &Path) -> (NodeLink, DialedLink, crate::executor::test_link::Served) {
     crate::executor::test_link::bound_link(dir).await
 }
