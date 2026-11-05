@@ -739,8 +739,7 @@ async fn remote_workspace_setters_and_proposal(
     })
     .await
     .expect("the remote proposal is pending on head");
-    let proposal_id = pending[0]["proposalId"].as_str().unwrap_or_default();
-    assert!(proposal_id.starts_with("workspace-create-"), "{pending}");
+    assert_eq!(pending[0]["proposalId"], returned["id"], "{pending}");
     assert!(pending[0]["messageId"].is_string(), "{pending}");
 }
 

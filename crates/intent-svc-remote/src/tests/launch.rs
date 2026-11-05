@@ -994,6 +994,7 @@ async fn a_lease_agent_renames_itself_and_no_other_agent() {
 /// propose, as locally.
 #[tokio::test]
 async fn a_lease_agent_proposes_a_sibling_workspace() {
+    use intent_core::remote_launch::workspace_api::ATTACHMENTS_METHOD;
     let (f, link, _machine) = fixture().await;
     let (agent, _) = f.placed().await;
     let params = json!({ "title": "Follow-up", "initialPrompt": "Do the follow-up." });
@@ -1033,7 +1034,6 @@ async fn a_lease_agent_proposes_a_sibling_workspace() {
 
     // The machine publishes the call's cards as one batch: a nonce in the
     // tool output claims them all, for this agent only.
-    use intent_core::remote_launch::workspace_api::ATTACHMENTS_METHOD;
     let first = intent_core::new_attachment_id();
     let second = intent_core::new_attachment_id();
     let attachment = |id: &str| json!({ "id": id, "mimeType": "application/vnd.intent.proposal+json", "uri": "intent-proposal://x", "name": "Card", "text": "{}" });
