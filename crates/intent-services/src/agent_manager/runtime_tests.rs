@@ -843,3 +843,29 @@ async fn a_remote_agents_prompt_matches_what_its_machine_serves() {
     );
     assert!(!full.contains("<available_skills>"), "{full}");
 }
+
+/// The remote prompt swaps out the bundled private-`$TMPDIR` sentence by
+/// exact text, so every bundled doctrine that mentions `$TMPDIR` must carry
+/// it verbatim: a rewording would otherwise leave the promise in place
+/// without any test failing.
+#[test]
+fn every_bundled_tmpdir_promise_is_the_one_remote_prompts_replace() {
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/agent-instructions");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&root).unwrap() {
+        let common = entry.unwrap().path().join("common.md");
+        let Ok(text) = std::fs::read_to_string(&common) else {
+            continue;
+        };
+        if text.contains("$TMPDIR") {
+            assert!(
+                text.contains(super::super::LOCAL_TMPDIR_PROMISE),
+                "{} words the $TMPDIR promise differently; update LOCAL_TMPDIR_PROMISE",
+                common.display()
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no bundled doctrine mentions $TMPDIR");
+}
