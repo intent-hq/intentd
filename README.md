@@ -456,6 +456,27 @@ Paths are resolved via the `directories` crate and can be overridden with the
 `INTENTD_DATA_DIR` and `INTENTD_CONFIG` environment variables. The data dir holds the SQLite
 database (`intentd.db`) and the socket (`intentd.sock`).
 
+### Repairing a damaged search index
+
+Notes and chat messages are indexed for search by FTS5 tables (`note_fts`,
+`agent_message_fts`) that triggers update on every write. If one is damaged, writes that
+touch it fail with `database disk image is malformed` (code 267) although the notes and
+messages themselves are intact. `intentd doctor` attributes each `integrity_check` problem
+and names a damaged index; it exits non-zero while any integrity problem remains. To
+rebuild the index:
+
+```bash
+intentd stop             # quit the Intent app too; the repair needs exclusive ownership
+intentd repair-indexes   # add --all to rebuild every index even when none is damaged
+```
+
+The command refuses while a daemon holds the data dir or database lock, and refuses a
+database whose schema version differs from the binary. It first copies `intentd.db` and its
+WAL to `<data dir>/backups/intentd.db-<UTC timestamp>/`, then rebuilds only the damaged
+indexes from the canonical tables and runs the integrity check again (exit 0 when clean).
+Damage outside the search indexes is reported but not repaired: copy the whole data
+folder before attempting recovery.
+
 ### Installed Codex and Claude CLIs
 
 Install and authenticate the canonical `codex` or `claude` executable on the

@@ -5450,6 +5450,41 @@ const MESSAGE_FTS_TEXT_SQL: &str = "CASE \
           WHERE json_type(m.content, je.fullkey || '.text') = 'text'), '') \
     ELSE json(m.content) END";
 
+/// Rebuild `agent_message_fts` (0074) and `agent_message_search_ctx` (0112)
+/// from `agent_message` on `conn`, which must already be inside a write
+/// transaction: delete-all, then re-insert every user/assistant row keyed by
+/// its current rowid. Shared by [`Store::rebuild_agent_message_fts`] and the
+/// offline derived-index repair (`crate::derived_index`).
+pub(crate) async fn rebuild_agent_message_search(conn: &mut sqlx::SqliteConnection) -> Result<()> {
+    sqlx::query("INSERT INTO agent_message_fts(agent_message_fts) VALUES('delete-all')")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("fts rebuild delete-all failed: {e}")))?;
+    let backfill = format!(
+        "INSERT INTO agent_message_fts(rowid, text) \
+         SELECT m.rowid, {MESSAGE_FTS_TEXT_SQL} FROM agent_message m \
+         WHERE m.role IN ('user', 'assistant')"
+    );
+    sqlx::query(&backfill)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("fts rebuild backfill failed: {e}")))?;
+    sqlx::query("DELETE FROM agent_message_search_ctx")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("search ctx rebuild clear failed: {e}")))?;
+    sqlx::query(
+        "INSERT INTO agent_message_search_ctx(message_rowid, agent_id, workspace_id, role) \
+         SELECT m.rowid, m.agent_id, s.workspace_id, m.role \
+         FROM agent_message m JOIN agent_session s ON s.id = m.agent_id \
+         WHERE m.role IN ('user', 'assistant')",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| Error::Internal(format!("search ctx rebuild backfill failed: {e}")))?;
+    Ok(())
+}
+
 /// `search.messages` `preferWorkspaceId` ranking boost, in bm25 units,
 /// subtracted from the bm25 rank (lower = better) of matches owned by the
 /// preferred workspace. Large enough to lift a preferred-workspace match above
@@ -5501,32 +5536,7 @@ impl Store {
                 .begin()
                 .await
                 .map_err(|e| Error::Internal(format!("fts rebuild begin failed: {e}")))?;
-            sqlx::query("INSERT INTO agent_message_fts(agent_message_fts) VALUES('delete-all')")
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("fts rebuild delete-all failed: {e}")))?;
-            let backfill = format!(
-                "INSERT INTO agent_message_fts(rowid, text) \
-                 SELECT m.rowid, {MESSAGE_FTS_TEXT_SQL} FROM agent_message m \
-                 WHERE m.role IN ('user', 'assistant')"
-            );
-            sqlx::query(&backfill)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("fts rebuild backfill failed: {e}")))?;
-            sqlx::query("DELETE FROM agent_message_search_ctx")
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("search ctx rebuild clear failed: {e}")))?;
-            sqlx::query(
-                "INSERT INTO agent_message_search_ctx(message_rowid, agent_id, workspace_id, role) \
-                 SELECT m.rowid, m.agent_id, s.workspace_id, m.role \
-                 FROM agent_message m JOIN agent_session s ON s.id = m.agent_id \
-                 WHERE m.role IN ('user', 'assistant')",
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Error::Internal(format!("search ctx rebuild backfill failed: {e}")))?;
+            rebuild_agent_message_search(&mut tx).await?;
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("fts rebuild commit failed: {e}")))?;

@@ -160,9 +160,11 @@ impl CallLedger {
         if corrupted {
             out.push_str(
                 "\n\nThe daemon's database reported corruption, so writes may not have been \
-                 saved. Stop writing and tell the user: they should back up the Intent data \
-                 folder and run `intentd doctor`, which checks database integrity, before any \
-                 repair.",
+                 saved. Stop writing and tell the user: they should run `intentd doctor`, which \
+                 checks database integrity. If it reports only a damaged search index, quitting \
+                 Intent, running `intentd stop` and then `intentd repair-indexes` backs up the \
+                 database and rebuilds the index without changing notes; for any other damage, \
+                 back up the Intent data folder before any repair.",
             );
         }
         out
