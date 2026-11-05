@@ -225,9 +225,7 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
         HeadLink::default(),
     )
     .unwrap();
-    for code in [
-        "return await ws.mcp.listServers();",
-    ] {
+    for code in ["return await ws.mcp.listServers();"] {
         let (failed, text) = call(&server, code).await;
         assert!(failed, "{code}: {text}");
         assert!(
