@@ -38,6 +38,10 @@ const URL_PREFIX: &str = "intent://ws/";
 
 const UNAPPLIED: &str = "unapplied/";
 
+/// Suffix of the directory beside a repository's cache that holds its
+/// submodules' caches: `<repoKey>.modules/<moduleKey>.git`.
+const MODULE_CACHES: &str = ".modules";
+
 /// Head's `update` hook for node pushes. Inside the agent's prefix (the
 /// only refs a session can reach) it allows exactly `head`, `wip` and
 /// `unapplied/<full lowercase hex sha>`. An `unapplied/` ref is create-only
@@ -633,6 +637,121 @@ pub fn module_repository(
     })
 }
 
+fn invalid_pin(path: &str, why: &str) -> Error {
+    Error::InvalidParams(format!("submodule {path:?}: {why}"))
+}
+
+/// Node side: check that `pins` is a launch's valid submodule set: safe,
+/// unique relative paths, each listed after the pin it is nested in, with
+/// a safe module key, a name and a full commit id.
+///
+/// # Errors
+///
+/// `InvalidParams` naming the first offending pin.
+pub fn validate_pins(pins: &[SubmodulePin]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for (index, pin) in pins.iter().enumerate() {
+        let path = pin.path.as_str();
+        if module_components(path).is_none() {
+            return Err(invalid_pin(path, "not a safe relative path"));
+        }
+        if !seen.insert(path) {
+            return Err(invalid_pin(path, "repeats another pin's path"));
+        }
+        if hub::component(&pin.module_key).is_err() {
+            return Err(invalid_pin(path, "not a safe module key"));
+        }
+        if pin.name.is_empty() || pin.name.contains(['\n', '\0']) {
+            return Err(invalid_pin(path, "not a submodule name"));
+        }
+        let hex = pin.commit.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !hex || !matches!(pin.commit.len(), 40 | 64) {
+            return Err(invalid_pin(path, "not a full commit id"));
+        }
+        if pins[index + 1..]
+            .iter()
+            .any(|later| is_nested_in(path, &later.path))
+        {
+            return Err(invalid_pin(path, "listed before its parent"));
+        }
+    }
+    Ok(())
+}
+
+fn is_nested_in(path: &str, parent: &str) -> bool {
+    path.strip_prefix(parent)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The pin `pins[index]` is nested in, if any: the deepest one before it
+/// whose path contains it.
+fn parent_of(pins: &[SubmodulePin], index: usize) -> Option<usize> {
+    (0..index)
+        .rev()
+        .find(|&parent| is_nested_in(&pins[index].path, &pins[parent].path))
+}
+
+/// The `(path relative to the parent, wip)` gitlinks of the pushed pins
+/// directly inside `parent` (`None`: the superproject).
+fn child_links(
+    pins: &[SubmodulePin],
+    wips: &[Option<String>],
+    parent: Option<usize>,
+) -> Vec<(String, String)> {
+    pins.iter()
+        .enumerate()
+        .filter(|&(index, _)| parent_of(pins, index) == parent)
+        .filter_map(|(index, pin)| {
+            let wip = wips[index].clone()?;
+            let rel = match parent {
+                Some(parent) => pin.path[pins[parent].path.len() + 1..].to_owned(),
+                None => pin.path.clone(),
+            };
+            Some((rel, wip))
+        })
+        .collect()
+}
+
+/// Whether a submodule is checked out at `dir`: it has its own `.git`
+/// and `dir` is not a symlink.
+fn populated_here(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir())
+        && std::fs::symlink_metadata(dir.join(".git")).is_ok()
+}
+
+/// Refuse a submodule path inside `worktree` with a symlinked step, so a
+/// checkout never writes outside it.
+fn ensure_no_symlink(worktree: &Path, path: &str) -> Result<()> {
+    let mut dir = worktree.to_path_buf();
+    for part in path.split('/') {
+        dir.push(part);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(Error::Internal(format!(
+                    "submodule {path}: {} is a symlink",
+                    dir.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
+/// A pinned submodule [`CheckoutCache::checkout_modules`] added.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleCheckout {
+    pub path: String,
+    /// The module's `base` ref: the pin.
+    pub base: String,
+    /// The commit it is at: the module's saved `head`, else `base`.
+    pub at: String,
+    /// Its `wip` commit when it did not apply on top of `at`; pinned on
+    /// head under [`AgentRemote::unapplied_ref`] in the module's repository.
+    pub unrestored_wip: Option<String>,
+}
+
 /// Node side: how the node's git commands reach head.
 #[derive(Clone, Debug)]
 pub struct NodeGit {
@@ -728,6 +847,53 @@ impl NodeGit {
     ///
     /// When a git step fails or head rejects the push.
     pub async fn push_wip(&self, worktree: &Path, remote: &AgentRemote) -> Result<WipRefs> {
+        self.push_repository(worktree, remote, &[]).await
+    }
+
+    /// [`Self::push_wip`] for a checkout with pinned submodules
+    /// (nodeProtocol 10): each populated pin first, deepest first, to its
+    /// module remote, then the superproject. Each repository's `wip` tree
+    /// names its pinned children's `wip` commits. A failed module push ends
+    /// the run before its parents; the next push sends it again.
+    ///
+    /// # Errors
+    ///
+    /// When the pins are not a valid set, a git step fails, or head rejects
+    /// a push.
+    pub async fn push_work(
+        &self,
+        worktree: &Path,
+        remote: &AgentRemote,
+        pins: &[SubmodulePin],
+    ) -> Result<WipRefs> {
+        validate_pins(pins)?;
+        let mut wips: Vec<Option<String>> = vec![None; pins.len()];
+        for (index, pin) in pins.iter().enumerate().rev() {
+            let dir = worktree.join(&pin.path);
+            if !populated_here(&dir) {
+                continue;
+            }
+            let children = child_links(pins, &wips, Some(index));
+            let module = remote.with_module(&pin.module_key)?;
+            let pushed = self
+                .push_repository(&dir, &module, &children)
+                .await
+                .map_err(|error| Error::Internal(format!("submodule {}: {error}", pin.path)))?;
+            wips[index] = Some(pushed.wip);
+        }
+        let children = child_links(pins, &wips, None);
+        self.push_repository(worktree, remote, &children).await
+    }
+
+    /// Push one repository's `head` and `wip`; `links` are the
+    /// `(path, commit)` gitlinks its `wip` tree records instead of what
+    /// its children have checked out.
+    async fn push_repository(
+        &self,
+        worktree: &Path,
+        remote: &AgentRemote,
+        links: &[(String, String)],
+    ) -> Result<WipRefs> {
         let head = self
             .git(worktree, &["rev-parse", "--verify", "HEAD^{commit}"])
             .await?;
@@ -743,6 +909,10 @@ impl NodeGit {
         };
         run(with_index(&["read-tree", "HEAD"])).await?;
         run(with_index(&["add", "--all"])).await?;
+        for (path, commit) in links {
+            let entry = format!("160000,{commit},{path}");
+            run(with_index(&["update-index", "--add", "--cacheinfo", &entry])).await?;
+        }
         let tree = run(with_index(&["write-tree"])).await?;
         let wip = if tree == head_tree {
             head.clone()
@@ -840,9 +1010,133 @@ impl CheckoutCache {
     ) -> Result<Checkout> {
         let cache = self.cache(repo_key)?;
         let _serial = self.lock.lock().await;
+        self.checkout_repository(&cache, remote, worktree, None)
+            .await
+    }
+
+    /// Node side, after [`Self::checkout`] (nodeProtocol 10): check out each
+    /// of `pins` not yet populated in `worktree`, parents first, from its
+    /// module cache (created on first use) at the module's saved `head`,
+    /// else its `base`, which must be the pinned commit. A module `wip` is
+    /// restored on top, or pinned under `unapplied/` in the module's
+    /// repository on head, as [`Self::checkout`] does. Each module is
+    /// activated in its parent's own worktree config; no URL is set.
+    /// Returns the modules it added.
+    ///
+    /// # Errors
+    ///
+    /// When the pins are not a valid set, a path has a symlinked step, head
+    /// refuses a fetch, a base is not its pin, or a git step fails; the
+    /// error names the submodule.
+    pub async fn checkout_modules(
+        &self,
+        repo_key: &str,
+        remote: &AgentRemote,
+        worktree: &Path,
+        pins: &[SubmodulePin],
+    ) -> Result<Vec<ModuleCheckout>> {
+        validate_pins(pins)?;
+        hub::component(repo_key)?;
+        let _serial = self.lock.lock().await;
+        let mut added = Vec::new();
+        for (index, pin) in pins.iter().enumerate() {
+            let context = |error: Error| Error::Internal(format!("submodule {}: {error}", pin.path));
+            ensure_no_symlink(worktree, &pin.path)?;
+            let dir = worktree.join(&pin.path);
+            if populated_here(&dir) {
+                continue;
+            }
+            let cache = self.module_cache(repo_key, &pin.module_key)?;
+            let module = remote.with_module(&pin.module_key)?;
+            let checkout = self
+                .checkout_repository(&cache, &module, &dir, Some(&pin.commit))
+                .await
+                .map_err(context)?;
+            let parent = match parent_of(pins, index) {
+                Some(parent) => worktree.join(&pins[parent].path),
+                None => worktree.to_path_buf(),
+            };
+            self.activate(&parent, &pin.name).await.map_err(context)?;
+            added.push(ModuleCheckout {
+                path: pin.path.clone(),
+                base: checkout.base,
+                at: checkout.at,
+                unrestored_wip: checkout.unrestored_wip,
+            });
+        }
+        Ok(added)
+    }
+
+    fn module_cache(&self, repo_key: &str, module_key: &str) -> Result<PathBuf> {
+        hub::component(repo_key)?;
+        hub::component(module_key)?;
+        Ok(self
+            .root
+            .join(format!("{repo_key}{MODULE_CACHES}"))
+            .join(format!("{module_key}.git")))
+    }
+
+    /// Set `submodule.<name>.active` in `parent`'s own worktree config. The
+    /// first time, turn on per-worktree config in `parent`'s shared cache,
+    /// moving its `core.bare` to the cache's own worktree config first, so
+    /// no other worktree of it ever reads itself as bare.
+    async fn activate(&self, parent: &Path, name: &str) -> Result<()> {
+        let common = PathBuf::from(
+            self.git
+                .git(
+                    parent,
+                    &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                )
+                .await?,
+        );
+        let config = common.join("config");
+        let config_arg = config.to_string_lossy().into_owned();
+        let get = |key: &'static str| {
+            let mut command = self.git.command(parent);
+            command.args(["config", "--file", &config_arg, "--get", key]);
+            async move { run(command).await.ok() }
+        };
+        if get("extensions.worktreeConfig").await.as_deref() != Some("true") {
+            if get("core.bare").await.as_deref() == Some("true") {
+                let own = common.join("config.worktree");
+                let own = own.to_string_lossy().into_owned();
+                self.git
+                    .git(parent, &["config", "--file", &own, "core.bare", "true"])
+                    .await?;
+                self.git
+                    .git(parent, &["config", "--file", &config_arg, "--unset", "core.bare"])
+                    .await?;
+            }
+            self.git
+                .git(
+                    parent,
+                    &["config", "--file", &config_arg, "extensions.worktreeConfig", "true"],
+                )
+                .await?;
+        }
+        let key = format!("submodule.{name}.active");
+        self.git
+            .git(parent, &["config", "--worktree", &key, "true"])
+            .await?;
+        Ok(())
+    }
+
+    /// Fetch `remote`'s refs into the bare `cache` (created on first use)
+    /// and add a detached worktree at `worktree`; see [`Self::checkout`].
+    /// With `expect_base`, a `base` ref at another commit fails before the
+    /// worktree is added.
+    async fn checkout_repository(
+        &self,
+        cache: &Path,
+        remote: &AgentRemote,
+        worktree: &Path,
+        expect_base: Option<&str>,
+    ) -> Result<Checkout> {
+        let cache = cache.to_path_buf();
         if !cache.join("HEAD").is_file() {
-            std::fs::create_dir_all(&self.root).map_err(io)?;
-            let mut init = self.git.command(&self.root);
+            let parent = cache.parent().unwrap_or(&self.root).to_path_buf();
+            std::fs::create_dir_all(&parent).map_err(io)?;
+            let mut init = self.git.command(&parent);
             init.args(["init", "--quiet", "--bare"]).arg(&cache);
             run(init).await?;
         }
@@ -874,6 +1168,13 @@ impl CheckoutCache {
         let base = resolve(AgentRef::Base).await.ok_or_else(|| {
             Error::Internal("node-git-failed: head has no base ref for the agent".into())
         })?;
+        if let Some(expected) = expect_base {
+            if base != expected {
+                return Err(Error::Internal(format!(
+                    "node-git-failed: head's base ref is at {base}, not the pinned commit {expected}"
+                )));
+            }
+        }
         let saved_head = resolve(AgentRef::Head).await;
         let wip = resolve(AgentRef::Wip).await;
         let at = saved_head.unwrap_or_else(|| base.clone());
@@ -943,7 +1244,14 @@ impl CheckoutCache {
         let scratch = tempfile::tempdir().map_err(io)?;
         let patch = scratch.path().join("wip.patch");
         let mut diff = self.git.command(worktree);
-        diff.args(["diff", "--binary", "--full-index", "--no-color"])
+        // Gitlinks are the submodules' business: each restores its own.
+        diff.args([
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-color",
+            "--ignore-submodules=all",
+        ])
             .arg(format!("--output={}", patch.display()))
             .arg(format!("{wip}^"))
             .arg(wip);
@@ -970,28 +1278,59 @@ impl CheckoutCache {
             Err(e) => return Err(io(e)),
         };
         for entry in entries {
-            let cache = entry.map_err(io)?.path();
-            if cache.extension().is_some_and(|ext| ext == "git") && cache.join("HEAD").is_file() {
-                let mut prune = self.git.command(&cache);
-                prune.args(["worktree", "prune"]);
-                run(prune).await?;
+            let path = entry.map_err(io)?.path();
+            if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(MODULE_CACHES))
+            {
+                self.prune_dir(&path).await?;
+            } else {
+                self.prune_cache(&path).await?;
             }
         }
         Ok(())
     }
 
-    /// Remove an agent's worktree from the `repo_key` cache.
+    /// `git worktree prune` in every bare cache directly in `dir`.
+    async fn prune_dir(&self, dir: &Path) -> Result<()> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io(e)),
+        };
+        for entry in entries {
+            self.prune_cache(&entry.map_err(io)?.path()).await?;
+        }
+        Ok(())
+    }
+
+    async fn prune_cache(&self, cache: &Path) -> Result<()> {
+        if cache.extension().is_some_and(|ext| ext == "git") && cache.join("HEAD").is_file() {
+            let mut prune = self.git.command(cache);
+            prune.args(["worktree", "prune"]);
+            run(prune).await?;
+        }
+        Ok(())
+    }
+
+    /// Remove an agent's worktree, with its submodules' worktrees, from the
+    /// `repo_key` cache and its module caches.
     ///
     /// # Errors
     ///
-    /// When `repo_key` is not a safe name or git can't remove the worktree.
+    /// When `repo_key` is not a safe name, the directory can't be removed or
+    /// git can't prune the caches.
     pub async fn remove(&self, repo_key: &str, worktree: &Path) -> Result<()> {
         let cache = self.cache(repo_key)?;
         let _serial = self.lock.lock().await;
-        let mut remove = self.git.command(&cache);
-        remove.args(["worktree", "remove", "--force"]).arg(worktree);
-        run(remove).await?;
-        Ok(())
+        match std::fs::remove_dir_all(worktree) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io(e)),
+        }
+        self.prune_cache(&cache).await?;
+        self.prune_dir(&self.root.join(format!("{repo_key}{MODULE_CACHES}")))
+            .await
     }
 }
 

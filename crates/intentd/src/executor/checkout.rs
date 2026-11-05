@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{ensure, Context as _};
+use anyhow::Context as _;
 
+use intent_core::node_link::SubmodulePin;
 use intent_core::{AgentId, BoxFuture, WorkspaceId};
-use intent_git::node_git::{AgentRemote, CheckoutCache};
+use intent_git::node_git::{self, AgentRemote, CheckoutCache, ModuleCheckout};
 
 use super::storage::Storage;
 
@@ -27,20 +28,23 @@ pub(super) struct Prepared {
     /// Prepended to the agent's first turn: its saved `wip` work could not
     /// be restored on top of its saved head.
     pub(super) notice: Option<String>,
+    /// This launch created the checkout (it did not keep one).
+    pub(super) fresh: bool,
 }
 
 /// How the runner gets an agent's working directory and sends its work back.
 pub(super) trait Checkouts: Send + Sync {
-    /// The agent's working directory at `base_commit`. A relaunched agent
+    /// The agent's working directory at `base_commit`, with `submodules`
+    /// (nodeProtocol 10) checked out at their pins. A relaunched agent
     /// (same id) keeps the checkout it already has, with its work; one whose
     /// checkout was removed starts from its saved `head` ref with its saved
-    /// `wip` changes restored on top.
+    /// `wip` changes restored on top, in every repository.
     fn prepare<'a>(
         &'a self,
         agent_id: &'a AgentId,
         workspace_id: &'a WorkspaceId,
-        base_commit: &'a str,
-        repo_key: &'a str,
+        base: (&'a str, &'a str),
+        submodules: &'a [SubmodulePin],
     ) -> BoxFuture<'a, anyhow::Result<Prepared>>;
 
     /// The agent's existing checkout on this machine, if it has one (it
@@ -48,7 +52,8 @@ pub(super) trait Checkouts: Send + Sync {
     fn existing(&self, agent_id: &AgentId) -> Option<PathBuf>;
 
     /// Push the agent's committed `HEAD` to its `head` ref and a commit of
-    /// its dirty tree to its `wip` ref, within `timeout`.
+    /// its dirty tree to its `wip` ref, within `timeout`; its pinned
+    /// submodules first, deepest first.
     fn push_wip<'a>(
         &'a self,
         agent_id: &'a AgentId,
@@ -94,32 +99,68 @@ impl Checkouts for GitCheckouts {
         &'a self,
         agent_id: &'a AgentId,
         workspace_id: &'a WorkspaceId,
-        base_commit: &'a str,
-        repo_key: &'a str,
+        (base_commit, repo_key): (&'a str, &'a str),
+        submodules: &'a [SubmodulePin],
     ) -> BoxFuture<'a, anyhow::Result<Prepared>> {
         Box::pin(async move {
+            node_git::validate_pins(submodules).context("the launch's submodule pins")?;
             let worktree = self.storage.agent_worktree(agent_id)?;
-            if worktree.join(".git").exists() {
-                return Ok(Prepared {
-                    worktree,
-                    notice: None,
-                });
-            }
             let remote = AgentRemote::new(&workspace_id.0, &agent_id.0)?;
-            let checkout = self
+            let fresh = !worktree.join(".git").exists();
+            let mut notices = Vec::new();
+            if fresh {
+                let checkout = self
+                    .cache
+                    .checkout(repo_key, &remote, &worktree)
+                    .await
+                    .context("fetch the agent's refs from head")?;
+                if checkout.base != base_commit {
+                    self.discard(&worktree).await;
+                    anyhow::bail!(
+                        "head's base ref is at {}, not the launched commit {base_commit}",
+                        checkout.base
+                    );
+                }
+                notices.extend(
+                    checkout
+                        .unrestored_wip
+                        .map(|wip| unrestored_wip_notice(&remote, &checkout.at, &wip)),
+                );
+            }
+            // Recorded before the modules, so a push or removal of a
+            // partly prepared checkout knows them.
+            write_pins(&pins_file(&worktree), submodules)?;
+            // A kept checkout gets the pins it lacks (one prepared before
+            // the machine knew them); its present modules are left alone.
+            let modules = match self
                 .cache
-                .checkout(repo_key, &remote, &worktree)
+                .checkout_modules(repo_key, &remote, &worktree, submodules)
                 .await
-                .context("fetch the agent's refs from head")?;
-            ensure!(
-                checkout.base == base_commit,
-                "head's base ref is at {}, not the launched commit {base_commit}",
-                checkout.base
-            );
-            let notice = checkout
-                .unrestored_wip
-                .map(|wip| unrestored_wip_notice(&remote, &checkout.at, &wip));
-            Ok(Prepared { worktree, notice })
+            {
+                Ok(modules) => modules,
+                Err(error) => {
+                    if fresh {
+                        self.discard(&worktree).await;
+                    }
+                    return Err(anyhow::anyhow!("{error}").context("check out the submodules"));
+                }
+            };
+            notices.extend(modules.iter().filter_map(|module| {
+                let ModuleCheckout {
+                    path,
+                    at,
+                    unrestored_wip,
+                    ..
+                } = module;
+                let wip = unrestored_wip.as_ref()?;
+                Some(unrestored_module_notice(&remote, path, at, wip))
+            }));
+            let notice = (!notices.is_empty()).then(|| notices.join("\n\n"));
+            Ok(Prepared {
+                worktree,
+                notice,
+                fresh,
+            })
         })
     }
 
@@ -132,9 +173,13 @@ impl Checkouts for GitCheckouts {
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let remote = AgentRemote::new(&workspace_id.0, &agent_id.0)?;
-            tokio::time::timeout(timeout, self.cache.git().push_wip(worktree, &remote))
-                .await
-                .context("WIP push timed out")??;
+            let pins = read_pins(&pins_file(worktree));
+            tokio::time::timeout(
+                timeout,
+                self.cache.git().push_work(worktree, &remote, &pins),
+            )
+            .await
+            .context("WIP push timed out")??;
             Ok(())
         })
     }
@@ -153,6 +198,56 @@ impl Checkouts for GitCheckouts {
                 .map_err(|e| anyhow::anyhow!("prune the checkout caches: {e}"))
         })
     }
+}
+
+impl GitCheckouts {
+    /// Remove a checkout this launch created and could not finish, so the
+    /// next launch starts fresh.
+    async fn discard(&self, worktree: &Path) {
+        if let Err(error) = std::fs::remove_dir_all(worktree) {
+            tracing::warn!(%error, "node: could not remove a partial checkout");
+        }
+        let _ = std::fs::remove_file(pins_file(worktree));
+        if let Err(error) = self.cache.prune().await {
+            tracing::warn!(%error, "node: could not prune the checkout caches");
+        }
+    }
+}
+
+/// Where an agent's submodule pins are kept: beside its worktree, in its
+/// own storage directory, so neither a push nor the agent sees them.
+fn pins_file(worktree: &Path) -> PathBuf {
+    worktree.with_file_name("submodules.json")
+}
+
+fn write_pins(file: &Path, pins: &[SubmodulePin]) -> anyhow::Result<()> {
+    let body = serde_json::to_vec(pins).context("encode the submodule pins")?;
+    let scratch = file.with_extension("json.tmp");
+    std::fs::write(&scratch, body).context("write the submodule pins")?;
+    std::fs::rename(&scratch, file).context("write the submodule pins")
+}
+
+/// The agent's recorded pins; none for a checkout prepared without them.
+fn read_pins(file: &Path) -> Vec<SubmodulePin> {
+    match std::fs::read(file) {
+        Ok(body) => serde_json::from_slice(&body).unwrap_or_else(|error| {
+            tracing::warn!(%error, "node: unreadable submodule pins; pushing the superproject only");
+            Vec::new()
+        }),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// [`unrestored_wip_notice`] for the submodule at `path`, whose wip is
+/// pinned in that submodule's repository.
+fn unrestored_module_notice(remote: &AgentRemote, path: &str, at: &str, wip: &str) -> String {
+    let pinned = remote.unapplied_ref(wip);
+    format!(
+        "Note from Intent: the submodule {path} of this agent's checkout was recreated at its \
+         saved head commit {at}. Its uncommitted work (commit {wip}) could not be applied on top \
+         of it and is kept in {pinned} in that submodule's repository. Inspect it with \
+         `git -C {path} diff {wip}^ {wip}` and reapply what you need."
+    )
 }
 
 /// What the agent's first turn is told when its saved `wip` work could not
@@ -195,6 +290,8 @@ pub(super) struct PlainCheckouts {
     pub(super) fail_pin: std::sync::atomic::AtomicBool,
     /// The notice the next checkout reports.
     pub(super) notice: std::sync::Mutex<Option<String>>,
+    /// The submodule pins of each checkout prepared, in order.
+    pub(super) prepared_pins: std::sync::Mutex<Vec<Vec<SubmodulePin>>>,
     /// Every push waits here first, so a test can hold pushes until a
     /// number of them are under way together.
     pub(super) push_gate: Option<Arc<tokio::sync::Barrier>>,
@@ -222,6 +319,7 @@ impl PlainCheckouts {
             hold_push: std::sync::Mutex::default(),
             panic_push: std::sync::atomic::AtomicBool::new(false),
             notice: std::sync::Mutex::default(),
+            prepared_pins: std::sync::Mutex::default(),
             push_gate: None,
             hold_sweep: std::sync::Mutex::default(),
         })
@@ -248,21 +346,27 @@ impl Checkouts for PlainCheckouts {
         &'a self,
         agent_id: &'a AgentId,
         _workspace_id: &'a WorkspaceId,
-        _base_commit: &'a str,
-        _repo_key: &'a str,
+        _base: (&'a str, &'a str),
+        submodules: &'a [SubmodulePin],
     ) -> BoxFuture<'a, anyhow::Result<Prepared>> {
         Box::pin(async move {
-            ensure!(
+            anyhow::ensure!(
                 !self.fail.load(std::sync::atomic::Ordering::SeqCst),
                 "head refused the fetch"
             );
+            self.prepared_pins
+                .lock()
+                .unwrap()
+                .push(submodules.to_vec());
             if self.fail_pin.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(anyhow::anyhow!("pin the unapplied wip on head: refused")
                     .context("fetch the agent's refs from head"));
             }
+            let fresh = self.storage.existing_agent_dir(agent_id).is_none();
             Ok(Prepared {
                 worktree: self.storage.agent_dir(agent_id)?,
                 notice: self.notice.lock().unwrap().take(),
+                fresh,
             })
         })
     }
@@ -291,7 +395,7 @@ impl Checkouts for PlainCheckouts {
             if let Some(gate) = &self.push_gate {
                 gate.wait().await;
             }
-            ensure!(
+            anyhow::ensure!(
                 !self.fail_pushes.load(std::sync::atomic::Ordering::SeqCst),
                 "head refused the push"
             );
@@ -305,7 +409,7 @@ impl Checkouts for PlainCheckouts {
 
     fn remove<'a>(&'a self, agent_id: &'a AgentId) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
-            ensure!(
+            anyhow::ensure!(
                 !self.fail_removals.load(std::sync::atomic::Ordering::SeqCst),
                 "the checkout could not be removed"
             );

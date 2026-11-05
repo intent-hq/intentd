@@ -288,6 +288,42 @@ impl StopWait {
     }
 }
 
+/// The first turn's notice when the launch carried a setup script this
+/// machine cannot run yet.
+const SETUP_UNSUPPORTED_NOTICE: &str = "[System: workspace setup failed — the workspace has a \
+     setup script, but this machine's Intent cannot run setup scripts yet, so it did not run. \
+     The checkout may be missing tooling the script installs: tell the user to update Intent \
+     on this machine.]";
+
+/// The `setupFinished` record of a fresh prepared checkout: `skipped`
+/// without a setup script; `failed` with one, which this machine does not
+/// run.
+fn setup_finished(agent: &Agent, has_setup: bool) -> JournalEntry {
+    use intent_core::node_link::{SetupState, SETUP_FAILED_CODE};
+    let (state, error) = if has_setup {
+        (
+            SetupState::Failed,
+            Some(format!(
+                "{SETUP_FAILED_CODE}: this machine's Intent cannot run setup scripts; update it"
+            )),
+        )
+    } else {
+        (SetupState::Skipped, None)
+    };
+    JournalEntry {
+        agent_id: agent.id.clone(),
+        workspace_id: agent.workspace_id.clone(),
+        turn_id: None,
+        recorded_at: intent_core::now_iso(),
+        body: JournalBody::SetupFinished {
+            state,
+            exit_code: None,
+            error,
+            finished_at: intent_core::now_iso(),
+        },
+    }
+}
+
 struct Agent {
     id: AgentId,
     workspace_id: WorkspaceId,
@@ -299,6 +335,11 @@ struct Agent {
     /// The commit head launched the agent at, and the checkout cache key.
     base_commit: String,
     repo_key: String,
+    /// The submodules its checkout has at their pins (nodeProtocol 10).
+    submodules: Vec<intent_core::node_link::SubmodulePin>,
+    /// Whether the launch carried a setup script, when it carried a
+    /// prepared checkout (nodeProtocol 10).
+    setup: Option<bool>,
     /// The session's `agentFeatures` snapshot and sub-agent flag, which gate
     /// its workspace API.
     gates: workspace_api::Gates,
@@ -836,8 +877,10 @@ impl Runner {
             profile_env,
             agent_features,
             is_sub_agent,
-            checkout: _,
+            checkout,
         } = command;
+        let setup = checkout.as_ref().map(|checkout| checkout.setup.is_some());
+        let submodules = checkout.map(|checkout| checkout.submodules).unwrap_or_default();
         let refused = |error: String, failure: Option<ExitFailure>| JournalEntry {
             agent_id: agent_id.clone(),
             workspace_id: workspace_id.clone(),
@@ -908,6 +951,8 @@ impl Runner {
             root_pid: Mutex::new(None),
             base_commit,
             repo_key,
+            submodules,
+            setup,
             gates: workspace_api::Gates {
                 agent_features,
                 is_sub_agent,
@@ -1078,8 +1123,8 @@ impl Runner {
             prepared = self.inner.checkouts.prepare(
                 &agent.id,
                 &agent.workspace_id,
-                &agent.base_commit,
-                &agent.repo_key,
+                (&agent.base_commit, &agent.repo_key),
+                &agent.submodules,
             ) => Some(prepared),
             _ = &mut stop => None,
         };
@@ -1089,8 +1134,20 @@ impl Runner {
             Some(Ok(Prepared {
                 worktree: cwd,
                 notice,
+                fresh,
             })) => {
                 *lock(&agent.worktree) = Some(cwd.clone());
+                let notice = match agent.setup {
+                    Some(has_setup) if fresh => {
+                        self.append(setup_finished(&agent, has_setup)).await;
+                        let unsupported = has_setup.then(|| SETUP_UNSUPPORTED_NOTICE.to_owned());
+                        match (notice, unsupported) {
+                            (Some(notice), Some(setup)) => Some(format!("{setup}\n\n{notice}")),
+                            (notice, setup) => notice.or(setup),
+                        }
+                    }
+                    _ => notice,
+                };
                 *lock(&agent.notice) = notice;
                 match workspace_api::serve(
                     &agent.id,

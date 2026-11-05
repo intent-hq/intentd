@@ -102,7 +102,7 @@ fn add_submodules(repo: &Path) -> Modules {
 }
 
 /// The fixture on a protocol 10 link of a backend that offers the prepared
-/// checkout (this build does not yet; see [`dormant`]).
+/// checkout.
 async fn prepared_fixture() -> (Fixture, NodeEnd, Machine) {
     let (f, link, machine) = fixture().await;
     f.node
@@ -440,10 +440,11 @@ async fn a_final_stop_admits_the_module_pushes() {
     f.node.shutdown();
 }
 
-/// A machine below nodeProtocol 10 cannot prepare submodules or run the
-/// setup script, so a workspace that needs either is refused with
-/// machine-update-required; one that needs neither launches as before,
-/// without a `checkout`.
+/// A machine below nodeProtocol 10 cannot prepare submodules, so a
+/// workspace with populated submodules is refused with
+/// machine-update-required; one without launches as before, without a
+/// `checkout`. A setup script alone is not refused yet: no machine runs
+/// one.
 #[tokio::test]
 async fn an_older_machine_is_refused_only_when_the_checkout_needs_preparing() {
     let (f, mut link, _machine) = prepared_fixture().await;
@@ -461,13 +462,13 @@ async fn an_older_machine_is_refused_only_when_the_checkout_needs_preparing() {
         r#"{"setupScript":"echo ready"}"#,
     )
     .unwrap();
-    let message = update_required(f.admit(r#"{"target":"remote"}"#).await);
-    assert!(message.contains("Test machine"), "{message}");
-    assert!(message.contains("setup script"), "{message}");
-    std::fs::remove_file(config.join("config.json")).unwrap();
+    let (setup_only, _) = f.placed().await;
+    let launch = f.launch_frame(&mut link, &setup_only).await;
+    assert_eq!(launch.checkout, None);
 
     let _modules = add_submodules(f.repo.path());
-    update_required(f.admit(r#"{"target":"remote"}"#).await);
+    let message = update_required(f.admit(r#"{"target":"remote"}"#).await);
+    assert!(message.contains("Test machine"), "{message}");
 
     // An agent pinned on a protocol-10 link that later reconnects below
     // 10 is refused at its start rather than launched without them.
@@ -503,17 +504,19 @@ async fn only_prepared_agents_get_a_checkout() {
     f.node.shutdown();
 }
 
-/// While this build does not offer nodeProtocol 10 nothing a user sees
-/// changes: a workspace with submodules and a setup script still places and
-/// launches on the negotiated link without `checkout`, module sessions are
-/// invalid, the projection and the create notice are as before. The pins
-/// are still captured and their `base` refs written, ready for when it is
-/// offered.
+/// This build offers nodeProtocol 10 by default, but no setup yet: an
+/// agent of a workspace with submodules and a setup script gets `checkout`
+/// with its pins and no `setup`, module sessions are served, the projection
+/// shows the pins and the create notice names them.
 #[tokio::test]
-async fn dormant() {
+async fn the_prepared_checkout_is_offered_without_setup() {
     let (f, mut link, _machine) = fixture().await;
-    assert!(!intent_core::node_link::offers_prepared_checkout());
-    let modules = add_submodules(f.repo.path());
+    assert!(intent_core::node_link::offers_prepared_checkout());
+    assert!(f.node.shared_ref().offers_prepared_checkout());
+    f.node
+        .shared_ref()
+        .set_protocol_for_test(PREPARED_CHECKOUT_PROTOCOL);
+    let _modules = add_submodules(f.repo.path());
     let config = f.repo.path().join(".intent");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(
@@ -524,24 +527,22 @@ async fn dormant() {
 
     let (agent, view) = f.placed().await;
     assert_eq!(view.pins().len(), 3);
-    let base_ref = AgentRemote::new(workspace().as_str(), agent.as_str())
-        .unwrap()
-        .ref_name(intent_git::hub::AgentRef::Base);
-    assert_eq!(
-        git(&f.repo.path().join("a"), &["rev-parse", &base_ref]),
-        modules.a
-    );
-
     let launch = f.launch_frame(&mut link, &agent).await;
-    assert_eq!(launch.checkout, None);
+    let checkout = launch.checkout.expect("a prepared checkout");
+    assert_eq!(checkout.submodules, view.pins());
+    assert_eq!(checkout.setup, None);
     assert_eq!(f.view(&agent).await.placement_error, None);
 
     let access = crate::git::HeadGitAccess::new(f.node.shared());
     let module = module_remote(&agent, &key(&f.repo.path().join("a")));
-    assert!(matches!(
-        access.repository(&link.hello.binding, &module, GitService::UploadPack).await,
-        Err(Error::InvalidParams(ref m)) if m == "node-git-invalid"
-    ));
+    let served = access
+        .repository(&link.hello.binding, &module, GitService::UploadPack)
+        .await
+        .unwrap();
+    assert_eq!(
+        served.canonicalize().unwrap(),
+        f.repo.path().join("a").canonicalize().unwrap()
+    );
 
     let session = f
         .services
@@ -554,8 +555,8 @@ async fn dormant() {
     assert!(serde_json::to_value(&lite)
         .unwrap()
         .get("submodules")
-        .is_none());
-    assert_eq!(
+        .is_some());
+    assert_ne!(
         intent_core::remote_launch::launch_notice("m", &f.base, true),
         intent_core::remote_launch::launch_notice("m", &f.base, false)
     );

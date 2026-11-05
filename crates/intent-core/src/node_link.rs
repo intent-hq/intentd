@@ -68,24 +68,23 @@ fn is_false(value: &bool) -> bool {
 /// acknowledgement (`stopId` on [`LinkFrame::Stop`], [`LinkFrame::StopAck`]);
 /// 8 adds the saved-script frames ([`SCRIPT_PROTOCOL`]); 9 adds final
 /// stops and the bind-time checkout sweep ([`FINAL_STOP_PROTOCOL`]); 10 adds
-/// the prepared checkout ([`PREPARED_CHECKOUT_PROTOCOL`]), which this build
-/// does not offer yet; each keeps everything the one before has. Neither 6
-/// nor the single-node 5 ever shipped, and a protocol-6 peer cannot confirm a
-/// stop, so this build speaks 7 to 9: a
-/// backend never takes a stop as confirmed by a machine that cannot
-/// acknowledge it. The
+/// the prepared checkout ([`PREPARED_CHECKOUT_PROTOCOL`]); each keeps
+/// everything the one before has. Neither 6 nor the single-node 5 ever
+/// shipped, and a protocol-6 peer cannot confirm a stop, so this build
+/// speaks 7 to 10: a backend never takes a stop as confirmed by a machine
+/// that cannot acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 9 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 10 };
 
 /// The first protocol with the prepared checkout: [`LaunchCommand::checkout`]
 /// and module git remotes (`intent://ws/<ws>/agents/<agent>/modules/<key>`).
 /// Head sends neither on a link that negotiated less, and refuses a module
-/// session there. Until [`NODE_LINK_PROTOCOLS`] reaches it (the machine's
-/// recursive checkout), head captures pins but nothing else changes: see
-/// [`offers_prepared_checkout`].
+/// session there. This build prepares submodules but runs no setup script
+/// yet: head never sends [`PreparedCheckout::setup`], and a machine given
+/// one records it `failed` without running it.
 pub const PREPARED_CHECKOUT_PROTOCOL: u32 = 10;
 
 /// Whether this build offers the prepared checkout: only then does a
@@ -695,7 +694,34 @@ pub enum LinkFrame {
     ScriptStarted(ScriptStarted),
     ScriptOutput(ScriptOutput),
     ScriptExited(ScriptExited),
+    /// Machine to backend (nodeProtocol 10): the prepared checkout's
+    /// progress and setup script output.
+    SetupOutput(SetupOutput),
 }
+
+/// A chunk of an agent's checkout progress and setup output, `seq`
+/// counting from 0 per fresh checkout. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetupOutput {
+    pub agent_id: AgentId,
+    pub seq: u64,
+    pub data: String,
+}
+
+/// How an agent's setup ended, in [`JournalBody::SetupFinished`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SetupState {
+    Completed,
+    Failed,
+    /// The launch carried no setup script.
+    Skipped,
+}
+
+/// `setupFinished.error` when a launch carries a setup script this machine
+/// cannot run yet.
+pub const SETUP_FAILED_CODE: &str = "node-setup-failed";
 
 impl LinkFrame {
     /// The lane this frame travels on.
@@ -723,17 +749,27 @@ impl LinkFrame {
             | Self::ScriptStop(_)
             | Self::ScriptStarted(_)
             | Self::ScriptOutput(_)
-            | Self::ScriptExited(_) => LinkChannel::Script,
+            | Self::ScriptExited(_)
+            | Self::SetupOutput(_) => LinkChannel::Script,
         }
     }
 
     /// The lowest negotiated protocol this frame may travel on.
     #[must_use]
     pub fn min_protocol(&self) -> u32 {
-        if self.channel() == LinkChannel::Script {
-            SCRIPT_PROTOCOL
-        } else {
-            NODE_LINK_PROTOCOLS.min
+        match self {
+            Self::Launch(command) if command.checkout.is_some() => PREPARED_CHECKOUT_PROTOCOL,
+            Self::SetupOutput(_) => PREPARED_CHECKOUT_PROTOCOL,
+            Self::Journal(record)
+                if matches!(
+                    record.body,
+                    JournalBody::SetupStarted { .. } | JournalBody::SetupFinished { .. }
+                ) =>
+            {
+                PREPARED_CHECKOUT_PROTOCOL
+            }
+            _ if self.channel() == LinkChannel::Script => SCRIPT_PROTOCOL,
+            _ => NODE_LINK_PROTOCOLS.min,
         }
     }
 
@@ -763,7 +799,8 @@ impl LinkFrame {
             | Self::StopAck { .. }
             | Self::ScriptStarted(_)
             | Self::ScriptOutput(_)
-            | Self::ScriptExited(_) => false,
+            | Self::ScriptExited(_)
+            | Self::SetupOutput(_) => false,
         }
     }
 
@@ -843,6 +880,21 @@ pub enum JournalBody {
         error: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         failure: Option<ExitFailure>,
+    },
+    /// nodeProtocol 10: the setup script started in a fresh checkout.
+    #[serde(rename_all = "camelCase")]
+    SetupStarted { started_at: String },
+    /// nodeProtocol 10: how setup ended, before `started`. `exit_code`
+    /// when the script exited; `error` (`"<code>: <detail>"`) when it
+    /// failed without one.
+    #[serde(rename_all = "camelCase")]
+    SetupFinished {
+        state: SetupState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        finished_at: String,
     },
 }
 
