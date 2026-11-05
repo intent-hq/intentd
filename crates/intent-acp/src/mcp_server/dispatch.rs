@@ -897,7 +897,8 @@ fn make_workspace_host_with_pending(
             state.next_seq += 1;
             seq
         });
-        // Recorded synchronously, like `seq`, so the ledger keeps call order.
+        // Recorded when the frame first runs, like `seq`; a frame never run
+        // before the script ends never ran its call either.
         let slot = ledger.as_ref().map(|ledger| {
             let method = arg.get("method").and_then(Value::as_str).unwrap_or("?");
             (ledger.clone(), ledger.start(method))
