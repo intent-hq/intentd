@@ -49,12 +49,13 @@ async fn script_frames_travel_both_ways_on_a_protocol_8_link() {
 /// Two current builds negotiate their highest protocol, which keeps
 /// protocol 8's script frames.
 #[tokio::test]
-async fn script_frames_travel_both_ways_on_a_negotiated_protocol_10_link() {
+async fn script_frames_travel_both_ways_on_the_current_protocol_link() {
     let mut node = Node::start(token("t")).await;
     let head = dial(&node, 1).await;
     let (machine, machine_events, _) = node.accept_link().await;
-    assert_eq!(head.link.protocol(), NODE_LINK_PROTOCOLS.max);
-    assert_eq!(machine.protocol(), NODE_LINK_PROTOCOLS.max);
+    let current = intent_core::node_link::NODE_LINK_PROTOCOLS.max;
+    assert_eq!(head.link.protocol(), current);
+    assert_eq!(machine.protocol(), current);
     script_frames_travel_both_ways(head, machine, machine_events).await;
 }
 

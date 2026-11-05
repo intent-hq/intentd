@@ -260,6 +260,37 @@ pub async fn serve_workspace_mcp_tcp(
     serve_mcp_tcp_with_timeout(server, dispatch_timeout).await
 }
 
+/// One MCP request or notification in, its response (none for a
+/// notification) out: a plain MCP server for [`serve_mcp_handler_tcp`].
+pub type McpHandler =
+    Arc<dyn Fn(Value) -> Pin<Box<dyn Future<Output = Option<Value>> + Send>> + Send + Sync>;
+
+struct HandlerDispatch(McpHandler);
+
+impl BridgeDispatch for HandlerDispatch {
+    fn dispatch(
+        self: Arc<Self>,
+        message: Value,
+    ) -> Pin<Box<dyn Future<Output = Option<Value>> + Send>> {
+        (self.0)(message)
+    }
+}
+
+/// Serve `handler` on its own authenticated loopback listener, as
+/// [`serve_workspace_mcp_tcp`] serves the workspace server, so a provider
+/// reaches it through `intentd mcp-bridge` the same way. A request still
+/// running after `dispatch_timeout` is answered with the watchdog error.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if binding the loopback listener fails.
+pub async fn serve_mcp_handler_tcp(
+    handler: McpHandler,
+    dispatch_timeout: Duration,
+) -> std::io::Result<McpBridge> {
+    serve_mcp_tcp_with_timeout(Arc::new(HandlerDispatch(handler)), dispatch_timeout).await
+}
+
 /// Generic body of [`serve_workspace_mcp_tcp`], parameterized over the dispatch
 /// seam so tests can serve a mock handler over a real loopback socket.
 #[cfg(test)]

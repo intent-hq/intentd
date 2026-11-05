@@ -12497,6 +12497,16 @@ impl AgentManager {
         else {
             return Ok(());
         };
+        let mut prompt = prompt;
+        if let Some(notice) = self
+            .services
+            .feature_remote_launch_port()
+            .mcp_servers_notice(&self.services, agent_id)
+            .await
+        {
+            prompt.push_str("\n\n");
+            prompt.push_str(&notice);
+        }
         self.services
             .store
             .set_agent_session_system_prompt(workspace_id, agent_id, &prompt)

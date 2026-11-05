@@ -68,8 +68,9 @@ fn is_false(value: &bool) -> bool {
 /// acknowledgement (`stopId` on [`LinkFrame::Stop`], [`LinkFrame::StopAck`]);
 /// 8 adds the saved-script frames ([`SCRIPT_PROTOCOL`]); 9 adds final
 /// stops and the bind-time checkout sweep ([`FINAL_STOP_PROTOCOL`]); 10 adds
-/// the prepared checkout ([`PREPARED_CHECKOUT_PROTOCOL`]); 12 adds the
-/// machine's skills ([`SKILLS_PROTOCOL`]); each keeps
+/// the prepared checkout ([`PREPARED_CHECKOUT_PROTOCOL`]); 11 adds the
+/// user MCP server proxies ([`MCP_PROXY_PROTOCOL`]); 12 adds the machine's
+/// skills ([`SKILLS_PROTOCOL`]); each keeps
 /// everything the one before has. Neither 6 nor the single-node 5 ever
 /// shipped, and a protocol-6 peer cannot confirm a stop, so this build
 /// speaks 7 to 12: a backend never takes a stop as confirmed by a machine
@@ -79,6 +80,12 @@ fn is_false(value: &bool) -> bool {
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
 pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 12 };
+
+/// The first protocol with the user MCP server proxies:
+/// [`LaunchCommand::mcp_proxies`] and the internal `mcp.proxy.*` frames.
+/// Head sends neither on a link that negotiated less (an older machine
+/// would ignore the proxies and start the agent without them).
+pub const MCP_PROXY_PROTOCOL: u32 = 11;
 
 /// The first protocol with the machine's skills: the [`JournalBody::Skills`]
 /// record and the [`LinkFrame::Skills`] / [`LinkFrame::SkillsReply`] query.
@@ -413,6 +420,25 @@ pub struct LaunchCommand {
     /// only on a link of [`PREPARED_CHECKOUT_PROTOCOL`] or later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout: Option<Box<PreparedCheckout>>,
+    /// The user MCP servers the provider sees, each proxied to head's MCP
+    /// hub; sent only on a link of [`MCP_PROXY_PROTOCOL`] or later.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_proxies: Vec<McpProxy>,
+    /// Head put the condensed `workspace_api` reference in the agent's
+    /// instructions, so the node serves the compact description that points
+    /// at it. Absent (an older head): the full description.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub compact_tool_descriptions: bool,
+}
+
+/// One user MCP server a remote agent's provider sees: only its name and
+/// head's server id, never its command, environment, URL or headers. The
+/// body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpProxy {
+    pub name: String,
+    pub server_id: String,
 }
 
 /// The checkout a nodeProtocol 10 launch prepares. The body is closed.
@@ -808,6 +834,7 @@ impl LinkFrame {
     #[must_use]
     pub fn min_protocol(&self) -> u32 {
         match self {
+            Self::Launch(command) if !command.mcp_proxies.is_empty() => MCP_PROXY_PROTOCOL,
             Self::Launch(command) if command.checkout.is_some() => PREPARED_CHECKOUT_PROTOCOL,
             Self::SetupOutput(_) => PREPARED_CHECKOUT_PROTOCOL,
             Self::Skills(_) | Self::SkillsReply(_) => SKILLS_PROTOCOL,

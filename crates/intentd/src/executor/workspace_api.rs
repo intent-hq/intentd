@@ -22,10 +22,12 @@ use serde_json::{json, Value};
 
 use intent_acp::session::McpServer;
 use intent_acp::{HostFrameRouter, McpBridge, NormalizedMcpServer, WorkspaceMcpServer};
-use intent_core::node_link::{LinkOutcome, PREPARED_CHECKOUT_PROTOCOL};
+use intent_core::node_link::{
+    LinkOutcome, McpProxy, MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL, SCRIPT_PROTOCOL,
+};
 use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
-    PLACEMENT_HELP_METHOD,
+    MCP_PROXY_LINK_TIMEOUT, PLACEMENT_HELP_METHOD,
 };
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
@@ -64,7 +66,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// What gates an agent's workspace API, as head sent it in the launch.
+/// What gates an agent's workspace API and which user MCP servers its
+/// provider sees, as head sent them in the launch.
 pub(super) struct Gates {
     /// The session's `agentFeatures` snapshot (`AgentFeaturesSettings`).
     pub agent_features: Value,
@@ -74,11 +77,18 @@ pub(super) struct Gates {
     /// machine's provider entry decides). Head then carries the condensed
     /// reference in the agent's instructions.
     pub compact_tool_descriptions: bool,
+    /// The user MCP servers head proxies to its hub (nodeProtocol 11).
+    pub mcp_proxies: Vec<McpProxy>,
 }
 
-/// Start `agent_id`'s workspace MCP server and return it with the
-/// `session/new` server entry that points the provider at it. The server
-/// stops when the returned bridge is dropped.
+/// The agent's MCP listeners: its workspace server's and one per proxied
+/// user server. They stop when this is dropped.
+pub(super) struct Bridges(#[expect(dead_code, reason = "held for its drop")] Vec<McpBridge>);
+
+/// Start `agent_id`'s workspace MCP server and one listener per proxied
+/// user MCP server, and return them with the `session/new` server entries
+/// that point the provider at them, `workspace-mcp` first. The servers stop
+/// when the returned bridges are dropped.
 pub(super) async fn serve(
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
@@ -86,18 +96,57 @@ pub(super) async fn serve(
     (gates, setup_status): (&Gates, Option<Value>),
     head: HeadLink,
     bridge_exe: &Path,
-) -> std::io::Result<(McpBridge, McpServer)> {
+) -> std::io::Result<(Bridges, Vec<McpServer>)> {
     let server = Arc::new(
         described_server(
             agent_id,
             workspace_id,
             worktree,
             (gates, setup_status),
-            head,
+            head.clone(),
         )
         .await?,
     );
-    let bridge = intent_acp::serve_workspace_mcp_tcp(server).await?;
+    let workspace = intent_acp::serve_workspace_mcp_tcp(server).await?;
+    let mut entries = vec![bridge_entry(WORKSPACE_SERVER, &workspace, bridge_exe)?];
+    let mut bridges = vec![workspace];
+    let mut names = vec![WORKSPACE_SERVER];
+    let proxy_router = Router {
+        agent_id: agent_id.clone(),
+        head,
+        timeout: MCP_PROXY_LINK_TIMEOUT,
+        setup_status: None,
+    };
+    for proxy in &gates.mcp_proxies {
+        // Head never names the reserved server; a proxy must not shadow it.
+        if names.contains(&proxy.name.as_str()) {
+            continue;
+        }
+        names.push(&proxy.name);
+        let router = proxy_router.clone();
+        let forward: crate::executor::mcp_proxy::Forward =
+            Arc::new(move |method, args| Box::pin(router.forward(method, &args)));
+        let bridge = intent_acp::serve_mcp_handler_tcp(
+            crate::executor::mcp_proxy::handler(proxy.clone(), forward),
+            MCP_PROXY_LINK_TIMEOUT + PROXY_WATCHDOG_MARGIN,
+        )
+        .await?;
+        entries.push(bridge_entry(&proxy.name, &bridge, bridge_exe)?);
+        bridges.push(bridge);
+    }
+    Ok((Bridges(bridges), entries))
+}
+
+/// The reserved name of the agent's own workspace server.
+const WORKSPACE_SERVER: &str = "workspace-mcp";
+
+/// How much longer than a proxied frame's link budget its listener lets a
+/// request run before answering with the watchdog error.
+const PROXY_WATCHDOG_MARGIN: Duration = Duration::from_secs(30);
+
+/// The `session/new` entry named `name` that runs `intentd mcp-bridge`
+/// against `bridge`, with the listener's secret in its environment.
+fn bridge_entry(name: &str, bridge: &McpBridge, bridge_exe: &Path) -> std::io::Result<McpServer> {
     let (command, path) = intent_acp::normalize_spaced_bridge_command(
         bridge_exe,
         std::env::var_os("PATH").as_deref(),
@@ -111,7 +160,7 @@ pub(super) async fn serve(
         )))
         .collect();
     let servers = std::collections::BTreeMap::from([(
-        "workspace-mcp".to_owned(),
+        name.to_owned(),
         NormalizedMcpServer::Stdio {
             command,
             args: vec![
@@ -122,10 +171,9 @@ pub(super) async fn serve(
             env,
         },
     )]);
-    let entry = intent_acp::to_acp_session_mcp_servers(&servers)
+    intent_acp::to_acp_session_mcp_servers(&servers)
         .pop()
-        .ok_or_else(|| std::io::Error::other("no workspace MCP server entry"))?;
-    Ok((bridge, entry))
+        .ok_or_else(|| std::io::Error::other(format!("no MCP server entry for {name}")))
 }
 
 /// `agent_id`'s workspace MCP server over its worktree and the head link,
@@ -281,8 +329,13 @@ impl Router {
         let link = self.head.get();
         let agent_id = self.agent_id.clone();
         let min_protocol = workspace_api::forward_min_protocol(method);
+        let what = match min_protocol {
+            SCRIPT_PROTOCOL => "saved-script support",
+            MCP_PROXY_PROTOCOL => "MCP server proxies",
+            _ => "a newer node link",
+        };
         let refused = format!(
-            "{}: `{method}` needs saved-script support on both this machine and the backend (node-link protocol {min_protocol}); update Intent on both",
+            "{}: `{method}` needs {what} on both this machine and the backend (node-link protocol {min_protocol}); update Intent on both",
             workspace_api::UNSUPPORTED_CODE
         );
         let params = json!({ "method": method, "args": args });

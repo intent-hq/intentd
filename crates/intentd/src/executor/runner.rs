@@ -881,6 +881,8 @@ impl Runner {
             agent_features,
             is_sub_agent,
             checkout,
+            mcp_proxies,
+            compact_tool_descriptions,
         } = command;
         let prepared = checkout.is_some();
         let setup = checkout
@@ -966,7 +968,10 @@ impl Runner {
             gates: workspace_api::Gates {
                 agent_features,
                 is_sub_agent,
-                compact_tool_descriptions: launch.config.truncates_tool_descriptions,
+                // Head's call, as it decides whether the instructions carry
+                // the condensed reference the compact description points at.
+                compact_tool_descriptions,
+                mcp_proxies,
             },
             worktree: Mutex::new(None),
             notice: Mutex::new(None),
@@ -1511,14 +1516,14 @@ impl Runner {
         child: &mut Child,
         stop: &mut oneshot::Receiver<()>,
         ready: &watch::Sender<Option<Arc<Ready>>>,
-        (cwd, mcp): (&std::path::Path, intent_acp::session::McpServer),
+        (cwd, mcp): (&std::path::Path, Vec<intent_acp::session::McpServer>),
         (pid, descendants): (Option<u32>, &Descendants),
     ) -> Outcome {
-        // The agent's workspace MCP server rides `session/new`, which every
-        // ACP agent accepts stdio servers on.
+        // The agent's workspace MCP server and its proxied user servers ride
+        // `session/new`, which every ACP agent accepts stdio servers on.
         let setup = async {
             intent_acp::handshake(connection, &launch.config).await?;
-            intent_acp::session::new_session(connection, cwd, vec![mcp], None).await
+            intent_acp::session::new_session(connection, cwd, mcp, None).await
         };
         let session = tokio::select! {
             result = setup => match result {
