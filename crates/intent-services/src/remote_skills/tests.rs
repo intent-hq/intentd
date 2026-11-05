@@ -374,7 +374,7 @@ async fn no_notice_before_the_machine_reported_or_for_a_local_agent() {
     }
 }
 
-fn row(role: &str, text: &str, metadata: Option<Value>) -> intent_core::AgentMessage {
+fn row(role: &str, text: &str, metadata: Option<&Value>) -> intent_core::AgentMessage {
     serde_json::from_value(serde_json::json!({
         "id": "m1",
         "agentId": "remote",
@@ -397,8 +397,14 @@ fn only_a_persons_slash_message_is_checked() {
     assert_eq!(person_skill_text(&row("user", "deploy now", None)), None);
     assert_eq!(person_skill_text(&row("assistant", "/deploy", None)), None);
     assert_eq!(person_skill_text(&row("system", "/deploy", None)), None);
-    let from_agent = Some(serde_json::json!({ "fromAgentId": "agent-2" }));
-    assert_eq!(person_skill_text(&row("user", "/deploy", from_agent)), None);
-    let system = Some(serde_json::json!({ "source": "system" }));
-    assert_eq!(person_skill_text(&row("user", "/deploy", system)), None);
+    let from_agent = serde_json::json!({ "fromAgentId": "agent-2" });
+    assert_eq!(
+        person_skill_text(&row("user", "/deploy", Some(&from_agent))),
+        None
+    );
+    let system = serde_json::json!({ "source": "system" });
+    assert_eq!(
+        person_skill_text(&row("user", "/deploy", Some(&system))),
+        None
+    );
 }
