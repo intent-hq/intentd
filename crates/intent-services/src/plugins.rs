@@ -695,7 +695,7 @@ impl PluginPaths {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InstalledPlugin {
     Loaded {
-        plugin: LoadedPlugin,
+        plugin: Box<LoadedPlugin>,
         entry: RegistryEntry,
     },
     Rejected {
@@ -708,7 +708,7 @@ pub(crate) enum InstalledPlugin {
 impl InstalledPlugin {
     pub(crate) fn enabled_plugin(&self) -> Option<&LoadedPlugin> {
         match self {
-            Self::Loaded { plugin, entry } if entry.enabled => Some(plugin),
+            Self::Loaded { plugin, entry } if entry.enabled => Some(plugin.as_ref()),
             _ => None,
         }
     }
@@ -737,9 +737,10 @@ pub(crate) fn list_installed(paths: &PluginPaths) -> Vec<InstalledPlugin> {
                 .cloned()
                 .unwrap_or_default();
             match load_plugin(&path, &paths.data_dir(&directory)) {
-                Ok(plugin) if plugin.manifest.name == directory => {
-                    InstalledPlugin::Loaded { plugin, entry }
-                }
+                Ok(plugin) if plugin.manifest.name == directory => InstalledPlugin::Loaded {
+                    plugin: Box::new(plugin),
+                    entry,
+                },
                 Ok(plugin) => InstalledPlugin::Rejected {
                     rejection: PluginRejection {
                         root: path,

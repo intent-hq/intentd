@@ -413,8 +413,7 @@ fn insert_source(obj: &mut serde_json::Map<String, Value>, entry: &RegistryEntry
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn io_error(action: &'static str) -> impl Fn(std::io::Error) -> Error {

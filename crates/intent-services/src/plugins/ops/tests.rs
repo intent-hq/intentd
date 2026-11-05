@@ -61,7 +61,11 @@ async fn invalid_sources_leave_nothing_behind() {
         assert!(matches!(err, Error::InvalidParams(_)), "{source}: {err:?}");
     }
     let leftovers: Vec<_> = std::fs::read_dir(paths.plugins_dir())
-        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+        .map(|d| {
+            d.filter_map(std::result::Result::ok)
+                .map(|e| e.file_name())
+                .collect()
+        })
         .unwrap_or_default();
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }

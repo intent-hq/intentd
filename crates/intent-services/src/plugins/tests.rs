@@ -10,7 +10,7 @@ fn manifest(name: &str) -> String {
     json!({ "$schema": PLUGIN_SCHEMA, "name": name }).to_string()
 }
 
-fn mcp(servers: Value) -> String {
+fn mcp(servers: &Value) -> String {
     json!({ "$schema": MCP_SCHEMA, "mcpServers": servers }).to_string()
 }
 
@@ -19,7 +19,7 @@ fn skill(name: &str) -> String {
 }
 
 struct Fixture {
-    _tmp: tempfile::TempDir,
+    tmp: tempfile::TempDir,
     root: PathBuf,
     data: PathBuf,
 }
@@ -30,11 +30,7 @@ fn fixture(name: &str) -> Fixture {
     write(&root.join(MANIFEST_FILE), &manifest(name));
     let root = root.canonicalize().unwrap();
     let data = tmp.path().join("plugin-data").join(name);
-    Fixture {
-        _tmp: tmp,
-        root,
-        data,
-    }
+    Fixture { tmp, root, data }
 }
 
 fn load(f: &Fixture) -> LoadedPlugin {
@@ -127,7 +123,7 @@ fn skills_are_one_level_deep_and_bad_entries_are_skipped() {
 #[test]
 fn symlink_escapes_are_isolated_to_their_component() {
     let f = fixture("p");
-    let outside = f._tmp.path().join("outside");
+    let outside = f.tmp.path().join("outside");
     write(&outside.join("SKILL.md"), &skill("evil"));
     write(&f.root.join("skills/good/SKILL.md"), &skill("good"));
     std::os::unix::fs::symlink(&outside, f.root.join("skills/evil")).unwrap();
@@ -135,7 +131,7 @@ fn symlink_escapes_are_isolated_to_their_component() {
     std::os::unix::fs::symlink(outside.join("server"), f.root.join("server")).unwrap();
     write(
         &f.root.join(MCP_FILE),
-        &mcp(json!({
+        &mcp(&json!({
             "escape": { "type": "stdio", "command": "./server" },
             "ok": { "type": "stdio", "command": "node" },
         })),
@@ -177,7 +173,7 @@ fn stdio_servers_expand_variables_once_in_permitted_fields() {
     std::fs::create_dir_all(f.root.join("work")).unwrap();
     write(
         &f.root.join(MCP_FILE),
-        &mcp(json!({
+        &mcp(&json!({
             "local": {
                 "type": "stdio",
                 "command": "./bin/server",
@@ -225,7 +221,7 @@ fn invalid_server_entries_are_skipped_individually() {
     let f = fixture("p");
     write(
         &f.root.join(MCP_FILE),
-        &mcp(json!({
+        &mcp(&json!({
             "shell": { "type": "stdio", "command": "node server.js" },
             "absolute": { "type": "stdio", "command": "/usr/bin/node" },
             "parent": { "type": "stdio", "command": "../node" },
@@ -340,7 +336,7 @@ fn session_servers_launch_through_plugin_exec_without_bridge_secrets() {
     let f = fixture("acme");
     write(
         &f.root.join(MCP_FILE),
-        &mcp(json!({
+        &mcp(&json!({
             "search": { "type": "stdio", "command": "node", "args": ["s.js"], "env": { "MODE": "x" } },
             "docs": { "type": "streamable-http", "url": "https://docs.example/mcp" },
             "taken": { "type": "streamable-http", "url": "https://other.example/mcp" },
