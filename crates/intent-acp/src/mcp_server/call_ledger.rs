@@ -1,0 +1,203 @@
+//! Per-invocation record of the `ws.*` calls a `workspace_api` script made,
+//! rendered only when the script fails (intent-hq/intent#8592).
+//!
+//! A rejection the script does not catch replaces the whole tool result, so
+//! the results of calls that already finished are lost. When one of those
+//! calls had an external side effect — a `ws.host.exec` that sent a review `POST` —
+//! the agent saw only the later error (a note write failing on a corrupted
+//! store) and could not tell the POST had landed; a blind retry would repeat
+//! it. The ledger lists every call in call order with its outcome, keeps a
+//! bounded head of each `host.exec`'s output, and names calls that never
+//! answered, so the agent can reconcile before retrying anything.
+
+use std::fmt::Write as _;
+use std::sync::{Arc, Mutex};
+
+use serde_json::Value;
+
+/// Most entries rendered; earlier ones are summarized by count.
+const MAX_ENTRIES: usize = 20;
+/// Characters kept from each `host.exec` stdout/stderr and from each error.
+const MAX_TEXT: usize = 500;
+
+/// `SQLite`'s text for the `SQLITE_CORRUPT` family (codes 11, 267, 523, 779)
+/// and for `SQLITE_NOTADB` (26).
+const CORRUPTION_MARKERS: &[&str] = &["database disk image is malformed", "file is not a database"];
+
+enum Outcome {
+    Pending,
+    Succeeded(Value),
+    Failed(String),
+}
+
+struct Entry {
+    method: String,
+    outcome: Outcome,
+}
+
+/// Shared between the host closure (records frames) and the dispatch
+/// (renders on failure).
+#[derive(Clone, Default)]
+pub(super) struct CallLedger(Arc<Mutex<Vec<Entry>>>);
+
+impl CallLedger {
+    /// Record a call synchronously when JS invokes `host()`, so entries keep
+    /// call order under `Promise.all`. Returns the slot for [`Self::finish`].
+    pub(super) fn start(&self, method: &str) -> usize {
+        let mut entries = self.0.lock().unwrap();
+        entries.push(Entry {
+            method: method.to_string(),
+            outcome: Outcome::Pending,
+        });
+        entries.len() - 1
+    }
+
+    /// Record a call's reply. A frame dropped before replying stays pending.
+    /// Only `host.exec` keeps its value; other successes need no detail.
+    pub(super) fn finish(&self, slot: usize, result: &Result<Value, String>) {
+        let mut entries = self.0.lock().unwrap();
+        let Some(entry) = entries.get_mut(slot) else {
+            return;
+        };
+        entry.outcome = match result {
+            Ok(value) if entry.method == "host.exec" => Outcome::Succeeded(value.clone()),
+            Ok(_) => Outcome::Succeeded(Value::Null),
+            Err(error) => Outcome::Failed(error.clone()),
+        };
+    }
+
+    /// Append the ledger to a failed script's error text. `include_output`
+    /// is false when a private-result policy governs this invocation: command
+    /// output must not bypass its admission boundary, so only exit codes show.
+    pub(super) fn annotate(&self, error: &str, include_output: bool) -> String {
+        let entries = self.0.lock().unwrap();
+        let corrupted = std::iter::once(error)
+            .chain(entries.iter().filter_map(|e| match &e.outcome {
+                Outcome::Failed(message) => Some(message.as_str()),
+                _ => None,
+            }))
+            .any(is_corruption);
+        let mut out = error.to_string();
+        if !entries.is_empty() {
+            out.push_str(
+                "\n\nws.* calls this script made before it failed (their results were not returned):",
+            );
+            let skipped = entries.len().saturating_sub(MAX_ENTRIES);
+            if skipped > 0 {
+                let _ = write!(out, "\n({skipped} earlier calls omitted)");
+            }
+            for (index, entry) in entries.iter().enumerate().skip(skipped) {
+                let _ = write!(out, "\n{}. ws.{} — ", index + 1, entry.method);
+                render_outcome(&mut out, &entry.outcome, include_output);
+            }
+            out.push_str(
+                "\nCalls that succeeded already took effect, and calls with no reply may have \
+                 too: check their outcome before retrying so side effects are not repeated. \
+                 Wrap each call in try/catch to keep its result when a later call fails.",
+            );
+        }
+        if corrupted {
+            out.push_str(
+                "\n\nThe daemon's database reported corruption, so writes may not have been \
+                 saved. Stop writing and tell the user: they should back up the Intent data \
+                 folder and run `intentd doctor`, which checks database integrity, before any \
+                 repair.",
+            );
+        }
+        out
+    }
+}
+
+fn render_outcome(out: &mut String, outcome: &Outcome, include_output: bool) {
+    match outcome {
+        Outcome::Pending => out.push_str("no reply before the script ended; outcome unknown"),
+        Outcome::Failed(message) => {
+            out.push_str("failed: ");
+            out.push_str(&bounded(message));
+        }
+        Outcome::Succeeded(Value::Null) => out.push_str("succeeded"),
+        Outcome::Succeeded(value) => {
+            let exit = value
+                .get("exitCode")
+                .map_or_else(|| "?".to_string(), Value::to_string);
+            let _ = write!(out, "succeeded (exitCode {exit}");
+            if value.get("timedOut").and_then(Value::as_bool) == Some(true) {
+                out.push_str(", timed out");
+            }
+            out.push(')');
+            if include_output {
+                for stream in ["stdout", "stderr"] {
+                    if let Some(text) = value.get(stream).and_then(Value::as_str) {
+                        if !text.trim().is_empty() {
+                            let _ = write!(out, "\n   {stream}: {}", bounded(text.trim_end()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn bounded(text: &str) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(MAX_TEXT).collect();
+    if chars.next().is_some() {
+        format!("{head}… (truncated)")
+    } else {
+        head
+    }
+}
+
+fn is_corruption(message: &str) -> bool {
+    CORRUPTION_MARKERS.iter().any(|m| message.contains(m))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn empty_ledger_leaves_plain_errors_alone() {
+        assert_eq!(
+            CallLedger::default().annotate("Error: boom", true),
+            "Error: boom"
+        );
+    }
+
+    #[test]
+    fn omits_command_output_under_a_private_policy() {
+        let ledger = CallLedger::default();
+        let slot = ledger.start("host.exec");
+        ledger.finish(slot, &Ok(json!({ "exitCode": 0, "stdout": "secret-ish" })));
+        let text = ledger.annotate("Error: later", false);
+        assert!(
+            text.contains("1. ws.host.exec — succeeded (exitCode 0)"),
+            "{text}"
+        );
+        assert!(!text.contains("secret-ish"), "{text}");
+    }
+
+    #[test]
+    fn caps_entries_and_truncates_long_text() {
+        let ledger = CallLedger::default();
+        for _ in 0..25 {
+            let slot = ledger.start("note.read");
+            ledger.finish(slot, &Ok(json!({})));
+        }
+        let slot = ledger.start("note.add");
+        ledger.finish(slot, &Err("x".repeat(600)));
+        let text = ledger.annotate("Error: x", true);
+        assert!(text.contains("(6 earlier calls omitted)"), "{text}");
+        assert!(!text.contains("\n6. ws."), "{text}");
+        assert!(text.contains("\n26. ws.note.add — failed: "), "{text}");
+        assert!(text.contains("… (truncated)"), "{text}");
+    }
+
+    #[test]
+    fn recognizes_every_corruption_rendering() {
+        assert!(is_corruption("(code: 11) database disk image is malformed"));
+        assert!(is_corruption("(code: 26) file is not a database"));
+        assert!(!is_corruption("(code: 5) database is locked"));
+    }
+}
