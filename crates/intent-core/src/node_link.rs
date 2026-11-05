@@ -256,6 +256,12 @@ pub struct MachineCapabilities {
     pub intentd_version: String,
     pub capacity: MachineCapacity,
     pub providers: Vec<ProviderCapability>,
+    /// The providers left out of `providers` because the machine's own
+    /// `providers.enabled` switches them off, so a backend can tell one
+    /// switched off there from one not installed. An id is never in both
+    /// lists. Optional: an older machine omits it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_providers: Vec<String>,
     pub observed_at: String,
 }
 
@@ -296,6 +302,7 @@ impl MachineCapabilities {
                 memory_budget_bytes: None,
             },
             providers: Vec::new(),
+            disabled_providers: Vec::new(),
             observed_at: observed_at.into(),
         }
     }
@@ -319,7 +326,9 @@ pub struct ProviderCapability {
 /// `auth-failed` from a launch without a profile that failed to
 /// authenticate, `cli-missing` / `prerequisite-missing` from the machine's
 /// model listing. `unknown` when the provider has no probe or it failed,
-/// and for any status this build does not know.
+/// and for any status this build does not know. `disabled` is never in a
+/// report's `providers`: the backend derives it, in `model-unavailable`, for
+/// a provider the report names in `disabledProviders`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderStatus {
@@ -328,6 +337,7 @@ pub enum ProviderStatus {
     AuthFailed,
     CliMissing,
     PrerequisiteMissing,
+    Disabled,
     #[serde(other)]
     Unknown,
 }

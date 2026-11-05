@@ -30,7 +30,8 @@ pub struct MachineModels {
     pub node_id: String,
     pub name: String,
     pub platform: AgentPlatform,
-    /// The provider's status there (`cli-missing` when it isn't installed).
+    /// The provider's status there (`cli-missing` when it isn't installed,
+    /// `disabled` when it is switched off in the machine's own settings).
     pub status: ProviderStatus,
     /// The provider's models there, at most
     /// [`MODEL_UNAVAILABLE_MAX_MODELS`].
@@ -118,6 +119,13 @@ impl ModelUnavailable {
         self.machines
             .iter()
             .map(|machine| {
+                if machine.status == ProviderStatus::Disabled {
+                    return format!(
+                        "Provider \"{}\" can't start: it is {}.",
+                        self.provider,
+                        disabled_on(machine)
+                    );
+                }
                 format!(
                     "Provider \"{}\" can't start on {} ({}, status: {}).",
                     self.provider,
@@ -131,6 +139,14 @@ impl ModelUnavailable {
     }
 
     fn sentence(&self, machine: &MachineModels) -> String {
+        if machine.status == ProviderStatus::Disabled {
+            return format!(
+                "Model \"{}\" isn't available: {} is {}.",
+                self.model,
+                self.provider,
+                disabled_on(machine)
+            );
+        }
         let shown = machine.models.len().min(MESSAGE_MAX_MODELS);
         let mut has = if shown == 0 {
             "no models listed".to_string()
@@ -163,6 +179,16 @@ impl ModelUnavailable {
     }
 }
 
+/// "disabled on <machine> (<platform>); …": the provider is switched off
+/// in that machine's own settings, so it is switched on there, not
+/// installed.
+fn disabled_on(machine: &MachineModels) -> String {
+    format!(
+        "disabled on {} ({}); switch it on in that machine's Settings > Providers",
+        machine.name, machine.platform
+    )
+}
+
 /// The wire name of a provider status.
 pub(crate) fn status_name(status: ProviderStatus) -> &'static str {
     match status {
@@ -171,6 +197,7 @@ pub(crate) fn status_name(status: ProviderStatus) -> &'static str {
         ProviderStatus::AuthFailed => "auth-failed",
         ProviderStatus::CliMissing => "cli-missing",
         ProviderStatus::PrerequisiteMissing => "prerequisite-missing",
+        ProviderStatus::Disabled => "disabled",
         ProviderStatus::Unknown => "unknown",
     }
 }

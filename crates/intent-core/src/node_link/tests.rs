@@ -153,6 +153,7 @@ fn capabilities() -> MachineCapabilities {
                 models_stale: true,
             },
         ],
+        disabled_providers: vec![],
         observed_at: "2026-10-30T00:00:00Z".into(),
     }
 }
@@ -196,6 +197,29 @@ fn the_capabilities_report_matches_the_documented_shape() {
     );
 }
 
+/// `disabledProviders` names the providers switched off in the machine's
+/// own settings; it is optional, so a report from an older machine (without
+/// it) still decodes, with none disabled, and an empty list is omitted.
+#[test]
+fn disabled_providers_are_optional_and_omitted_when_empty() {
+    let mut value = serde_json::to_value(capabilities()).unwrap();
+    assert!(
+        value.get("disabledProviders").is_none(),
+        "omitted when empty"
+    );
+    assert_eq!(
+        serde_json::from_value::<MachineCapabilities>(value.clone())
+            .unwrap()
+            .disabled_providers,
+        Vec::<String>::new(),
+        "an older machine's report"
+    );
+    value["disabledProviders"] = json!(["droid"]);
+    let decoded = serde_json::from_value::<MachineCapabilities>(value.clone()).unwrap();
+    assert_eq!(decoded.disabled_providers, ["droid"]);
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), value);
+}
+
 #[test]
 fn every_provider_status_has_its_kebab_case_name() {
     for (status, name) in [
@@ -205,6 +229,7 @@ fn every_provider_status_has_its_kebab_case_name() {
         (ProviderStatus::CliMissing, "cli-missing"),
         (ProviderStatus::PrerequisiteMissing, "prerequisite-missing"),
         (ProviderStatus::Unknown, "unknown"),
+        (ProviderStatus::Disabled, "disabled"),
     ] {
         assert_eq!(serde_json::to_value(status).unwrap(), json!(name));
         assert_eq!(
