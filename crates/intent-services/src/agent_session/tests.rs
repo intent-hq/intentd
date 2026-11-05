@@ -11598,7 +11598,15 @@ fn map_acp_session_error_maps_auth_and_demotes_verdict() {
 #[test]
 fn prompt_auth_required_turn_error_matches_mapped_shape() {
     use intent_core::Error;
-    for id in ["auggie", "claude-code", "codex", "opencode", "droid", "pi"] {
+    for id in [
+        "auggie",
+        "claude-code",
+        "codex",
+        "opencode",
+        "droid",
+        "pi",
+        "cursor",
+    ] {
         let msg = format!(
             "session/prompt: {}",
             crate::provider_auth::not_authenticated_message(id)
@@ -11659,7 +11667,15 @@ fn prompt_auth_required_turn_error_matches_mapped_shape() {
 #[test]
 fn load_auth_required_error_matches_mapped_shape() {
     use intent_core::Error;
-    for id in ["auggie", "claude-code", "codex", "opencode", "droid", "pi"] {
+    for id in [
+        "auggie",
+        "claude-code",
+        "codex",
+        "opencode",
+        "droid",
+        "pi",
+        "cursor",
+    ] {
         let msg = format!(
             "session/load: {}",
             crate::provider_auth::not_authenticated_message(id)

@@ -108,7 +108,7 @@ pub(crate) fn check_pi_cli_for_spawn(status: &PiCliStatus) -> crate::Result<()> 
 /// Run `<path> --version` with a 3s budget and return the trimmed first
 /// stdout line, or `None` on spawn failure, nonzero exit, timeout, or empty
 /// output (the same shape as the npx version probe in `lib.rs`).
-fn run_version_probe(path: &std::path::Path) -> Option<String> {
+pub(crate) fn run_version_probe(path: &std::path::Path) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::Duration;

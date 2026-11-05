@@ -72,6 +72,9 @@ const CREDENTIAL_ENV_EXACT: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "XAI_API_KEY",
+    // Cursor CLI API key. Exact name only: `CURSOR_CONFIG_DIR` /
+    // `CURSOR_DATA_DIR` select config and state folders, not credentials.
+    "CURSOR_API_KEY",
     "AWS_PROFILE",
     "AWS_REGION",
     "AWS_ACCESS_KEY_ID",
@@ -1262,6 +1265,9 @@ mod tests {
         assert!(!is_credential_env_allow_listed("AUGGIE"));
         assert!(!is_credential_env_allow_listed("PIN"));
         assert!(!is_credential_env_allow_listed("HOME"));
+        assert!(is_credential_env_allow_listed("CURSOR_API_KEY"));
+        assert!(!is_credential_env_allow_listed("CURSOR_CONFIG_DIR"));
+        assert!(!is_credential_env_allow_listed("CURSOR_DATA_DIR"));
         assert!(!is_credential_env_allow_listed("PATH"));
     }
 

@@ -184,6 +184,42 @@ fn antigravity_version_key() -> String {
     AntigravityModelSource::resolve(None).version_key
 }
 
+/// The `cursor-agent` binary a Cursor catalog probe runs, resolved once so
+/// the cache key and the probe agree (`providers.paths.cursor` honored).
+/// The key changes with the executable, so switching installs or overrides
+/// never serves the previous binary's rows as fresh.
+pub(crate) struct CursorModelSource {
+    pub binary: Option<PathBuf>,
+    pub version_key: String,
+}
+
+impl CursorModelSource {
+    pub(crate) fn resolve(explicit_path: Option<&str>) -> Self {
+        use sha2::{Digest, Sha256};
+        let binary = crate::provider_models::cursor_binary(explicit_path);
+        let version_key = binary.as_ref().map_or_else(
+            || "cursor-executable-v1:missing".to_string(),
+            |path| {
+                use std::fmt::Write;
+                Sha256::digest(path.as_os_str().as_encoded_bytes())
+                    .iter()
+                    .fold("cursor-executable-v1:".to_string(), |mut key, byte| {
+                        let _ = write!(key, "{byte:02x}");
+                        key
+                    })
+            },
+        );
+        Self {
+            binary,
+            version_key,
+        }
+    }
+}
+
+fn cursor_version_key() -> String {
+    CursorModelSource::resolve(None).version_key
+}
+
 /// Auggie catalog wire-shape version. Bump when daemon-side filtering or
 /// metadata projection changes so persisted rows from the old shape cannot be
 /// served indefinitely by the last-good cache.
@@ -379,6 +415,11 @@ static SOURCES: &[ModelSource] = &[
         provider_id: "grok",
         version_key: no_version,
         fetch: grok_fetch,
+    },
+    ModelSource {
+        provider_id: "cursor",
+        version_key: cursor_version_key,
+        fetch: || provider_models_fetch("cursor"),
     },
     ModelSource {
         provider_id: "unsloth",

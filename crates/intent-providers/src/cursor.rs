@@ -15,6 +15,11 @@
 //!   `<cursor config dir>/grok-switch.json` (`state: "pending" | "active"`),
 //!   and leaves the versioned Cursor install untouched. The Grok host's
 //!   `--version` prints `grok <x.y.z> (…)`, not a Cursor date-hash version.
+//! - `cursor/list_available_models` (ACP extension, no session needed) lists
+//!   the base models (`value`, e.g. `grok-4.7`; `default` = Auto). A session's
+//!   `model` option values are variants of those bases
+//!   (`grok-4.7[context=256k,…]`), applied with `session/set_config_option`.
+//!   Applying a model also saves it as the user's Cursor CLI default.
 //! - `cursor-agent models` signed in exits 0 and prints `id - Name` rows
 //!   after an `Available models` header, then a `Tip:` footer. Signed out it
 //!   exits 1 with `Error: Authentication required. …`.
@@ -99,7 +104,9 @@ pub fn grok_switch_active(cursor_config_dir: Option<&Path>) -> bool {
 /// lexicographic sort is newest-first by date.
 #[must_use]
 pub fn versioned_install_candidates(home: &Path) -> Vec<PathBuf> {
-    let root = VERSIONS_DIR.iter().fold(home.to_path_buf(), |p, c| p.join(c));
+    let root = VERSIONS_DIR
+        .iter()
+        .fold(home.to_path_buf(), |p, c| p.join(c));
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
     };
@@ -209,7 +216,8 @@ pub struct CursorModelsOutput {
 /// Whether CLI output carries Cursor's auth-required error.
 #[must_use]
 pub fn is_cursor_auth_required(text: &str) -> bool {
-    text.to_ascii_lowercase().contains("authentication required")
+    text.to_ascii_lowercase()
+        .contains("authentication required")
 }
 
 /// Parse one `cursor-agent models` run. The signed-out error may arrive on
@@ -239,9 +247,19 @@ pub fn parse_cursor_models_command_output(
 
 /// Drop zero-width and BOM characters and collapse whitespace runs (the CLI
 /// pads some names with U+200B and double spaces).
+#[must_use]
+pub fn clean_display_text(text: &str) -> String {
+    clean(text)
+}
+
 fn clean(text: &str) -> String {
     text.chars()
-        .filter(|c| !matches!(c, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'))
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
+            )
+        })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -255,9 +273,9 @@ fn parse_model_row(line: &str) -> Option<CursorModel> {
     let (id, name) = line.split_once(" - ")?;
     let id = id.trim();
     if id.is_empty()
-        || !id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'[' | b']' | b'=' | b','))
+        || !id.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'[' | b']' | b'=' | b',')
+        })
     {
         return None;
     }
@@ -279,6 +297,89 @@ fn parse_model_row(line: &str) -> Option<CursorModel> {
         name,
         is_default,
     })
+}
+
+/// The id Cursor's `model` option uses for its Auto router.
+pub const CURSOR_AUTO_MODEL: &str = "default";
+
+/// The session `model` option value for a catalog base id: the exact value,
+/// else the first variant of that base (`<base>[…]`). `options` is the
+/// session's `configOptions` array (from `session/new` / `session/load`).
+#[must_use]
+pub fn cursor_session_model_value(options: &serde_json::Value, base: &str) -> Option<String> {
+    let values: Vec<&str> = options
+        .as_array()?
+        .iter()
+        .find(|o| o.get("id").and_then(serde_json::Value::as_str) == Some("model"))?
+        .get("options")?
+        .as_array()?
+        .iter()
+        .filter_map(|o| o.get("value").and_then(serde_json::Value::as_str))
+        .collect();
+    let prefix = format!("{base}[");
+    values
+        .iter()
+        .find(|v| **v == base)
+        .or_else(|| values.iter().find(|v| v.starts_with(&prefix)))
+        .map(|v| (*v).to_string())
+}
+
+#[cfg(test)]
+mod session_model_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Option values from a captured cursor-agent 2026.11.05-86047df
+    /// `session/new` (stored login).
+    fn options() -> serde_json::Value {
+        json!([
+            {"id":"mode","type":"select","currentValue":"agent","options":[{"value":"agent","name":"Agent"}]},
+            {"id":"model","type":"select","currentValue":"default[]","options":[
+                {"value":"default[]","name":"Auto"},
+                {"value":"grok-4.7[context=256k,reasoning_effort=high,fast=true]","name":"grok-4.7"},
+                {"value":"grok-4.6[effort=high,fast=true]","name":"grok-4.6"},
+                {"value":"claude-sonnet-4-5[thinking=true,context=200k]","name":"claude-sonnet-4-5"},
+                {"value":"claude-sonnet-4[thinking=false,context=200k]","name":"claude-sonnet-4"},
+                {"value":"gpt-5.2-codex[reasoning=high,fast=false]","name":"gpt-5.2-codex"},
+                {"value":"gpt-5.2[reasoning=medium,fast=false]","name":"gpt-5.2"}
+            ]}
+        ])
+    }
+
+    #[test]
+    fn base_ids_resolve_to_the_session_variant() {
+        let o = options();
+        assert_eq!(
+            cursor_session_model_value(&o, CURSOR_AUTO_MODEL).as_deref(),
+            Some("default[]")
+        );
+        assert_eq!(
+            cursor_session_model_value(&o, "grok-4.7").as_deref(),
+            Some("grok-4.7[context=256k,reasoning_effort=high,fast=true]")
+        );
+        // `claude-sonnet-4` must not pick `claude-sonnet-4-5[…]`.
+        assert_eq!(
+            cursor_session_model_value(&o, "claude-sonnet-4").as_deref(),
+            Some("claude-sonnet-4[thinking=false,context=200k]")
+        );
+        // An exact variant id passes through.
+        assert_eq!(
+            cursor_session_model_value(&o, "grok-4.6[effort=high,fast=true]").as_deref(),
+            Some("grok-4.6[effort=high,fast=true]")
+        );
+        // Near-collisions: a longer id listed first never wins the prefix match.
+        assert_eq!(
+            cursor_session_model_value(&o, "gpt-5.2").as_deref(),
+            Some("gpt-5.2[reasoning=medium,fast=false]")
+        );
+        assert_eq!(
+            cursor_session_model_value(&o, "gpt-5.2-codex").as_deref(),
+            Some("gpt-5.2-codex[reasoning=high,fast=false]")
+        );
+        assert_eq!(cursor_session_model_value(&o, "gpt-5"), None);
+        assert_eq!(cursor_session_model_value(&o, "gpt-9"), None);
+        assert_eq!(cursor_session_model_value(&json!([]), "grok-4.7"), None);
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -348,8 +449,14 @@ mod tests {
         let link = home.path().join(".local/bin").join(CURSOR_COMMAND);
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
         symlink(&host_link, &link).unwrap();
-        assert!(is_grok_agent_host_path(&link, dirs(home.path()).grok_home.as_deref()));
-        assert_eq!(find_cursor_auto(&dirs(home.path()), || Some(link)), Some(cursor));
+        assert!(is_grok_agent_host_path(
+            &link,
+            dirs(home.path()).grok_home.as_deref()
+        ));
+        assert_eq!(
+            find_cursor_auto(&dirs(home.path()), || Some(link)),
+            Some(cursor)
+        );
     }
 
     #[test]
@@ -358,7 +465,10 @@ mod tests {
         let host = dir.path().join("agent-host-0.3.1");
         executable(&host, "#!/bin/sh\n");
         assert!(is_grok_agent_host_path(&host, None));
-        assert!(!is_grok_agent_host_path(&dir.path().join("cursor-agent"), None));
+        assert!(!is_grok_agent_host_path(
+            &dir.path().join("cursor-agent"),
+            None
+        ));
     }
 
     #[test]
@@ -369,16 +479,25 @@ mod tests {
         executable(&other, "#!/bin/sh\n");
         std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
         let switch = home.path().join(".cursor/grok-switch.json");
-        std::fs::write(&switch, r#"{"schema":1,"provider":"cursor-cli","state":"pending"}"#)
-            .unwrap();
+        std::fs::write(
+            &switch,
+            r#"{"schema":1,"provider":"cursor-cli","state":"pending"}"#,
+        )
+        .unwrap();
         assert!(!grok_switch_active(Some(&home.path().join(".cursor"))));
         assert_eq!(
             find_cursor_auto(&dirs(home.path()), || Some(other.clone())),
             Some(other.clone())
         );
-        std::fs::write(&switch, r#"{"schema":1,"provider":"cursor-cli","state":"active"}"#)
-            .unwrap();
-        assert_eq!(find_cursor_auto(&dirs(home.path()), || Some(other)), Some(cursor));
+        std::fs::write(
+            &switch,
+            r#"{"schema":1,"provider":"cursor-cli","state":"active"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_cursor_auto(&dirs(home.path()), || Some(other)),
+            Some(cursor)
+        );
     }
 
     #[test]

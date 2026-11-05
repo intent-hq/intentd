@@ -319,7 +319,17 @@ pub struct ProviderConfig {
     /// configuration (Cursor persists it to `~/.cursor/cli-config.json`'s
     /// allowlist): the daemon must never change user settings.
     pub auto_allow_once: bool,
+    /// Provider-specific section appended to the assembled system prompt
+    /// (prompt-only policy for a provider with no tool-level knob). Cursor:
+    /// its native `Task` subagent tool stays callable without the
+    /// `subagents` client capability and `cursor-agent acp` has no
+    /// disable-tool flag.
+    pub system_prompt_note: Option<&'static str>,
 }
+
+/// Cursor's prompt-only native-subagent restriction
+/// ([`ProviderConfig::system_prompt_note`]).
+pub const CURSOR_SUBAGENT_PROMPT_NOTE: &str = "## Subagents\n\nDo not use Cursor's native Task (subagent) tool. To hand work to another agent, use Intent's delegation through the workspace tools (`ws.agent.create` or `ws.agent.delegate`), so the work stays visible in Intent.";
 
 impl ProviderConfig {
     /// ACP session selector supported by the pinned adapter. This is a
@@ -381,6 +391,7 @@ impl ProviderConfig {
             kills_child_on_interrupt: false,
             supports_test_prompt: true,
             auto_allow_once: false,
+            system_prompt_note: None,
         }
     }
 
@@ -707,17 +718,19 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // advertised in `mcpCapabilities`).
         supports_session_mcp_servers: true,
         // The `session/new` result advertises the model as a
-        // `configOptions[id="model"]` select. Without the
-        // `parameterizedModelPicker` client capability (never advertised)
-        // its values are the plain variant ids `cursor-agent models` lists.
+        // `configOptions[id="model"]` select of variants (`<base>[…]`; no
+        // `parameterizedModelPicker` capability is advertised). The catalog
+        // lists base ids from `cursor/list_available_models`; the daemon maps
+        // the pick onto the session's variant (`apply_cursor_session_model`).
+        // Cursor saves the applied model as the user's CLI default.
         supports_config_option_model: true,
         // Never send ACP `authenticate`: a stored login already marks the
         // agent authenticated at startup, and `cursor_login` on a signed-out
         // host starts a browser login flow from a headless daemon.
         supports_authenticate: false,
-        // Signed in: `cursor-agent models` exits 0 with `id - Name` rows.
-        // Signed out: exit 1, "Authentication required. Run 'agent login'…".
-        // Parsed by `models::parse_cursor_models_command_output`; works for
+        // Auth probe. Signed in: `cursor-agent models` exits 0 with
+        // `id - Name` rows; signed out: exit 1, "Authentication required…".
+        // Parsed by `cursor::parse_cursor_models_command_output`; works for
         // both a stored login and `CURSOR_API_KEY`, and starts no chat.
         auth_check_args: Some(&["models"]),
         // `session/new` signed out: -32000 "Authentication required".
@@ -731,8 +744,10 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // `~/.cursor/cli-config.json` allowlist.
         auto_allow_once: true,
         // No spawn-time tool stripping: `cursor-agent acp` has no
-        // disable-tool flag. Native subagents stay off because initialize
-        // never advertises `clientCapabilities.subagents`.
+        // disable-tool flag, and the native `Task` tool stays callable even
+        // though initialize never advertises `clientCapabilities.subagents`.
+        // The restriction is prompt-only (user decision 2026-11-05).
+        system_prompt_note: Some(CURSOR_SUBAGENT_PROMPT_NOTE),
         ..ProviderConfig::empty("cursor", "Cursor", "cursor-agent")
     },
     ProviderConfig {

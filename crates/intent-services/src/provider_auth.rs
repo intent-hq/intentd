@@ -29,6 +29,12 @@
 //! - **grok** — `grok models` parsed via
 //!   [`intent_providers::parse_grok_models_command_output`] (the exit code is
 //!   never trusted).
+//! - **cursor** — `cursor-agent models` parsed via
+//!   [`intent_providers::cursor::parse_cursor_models_command_output`]: model
+//!   rows ⇒ `true`, the explicit "Authentication required" error ⇒ `false`,
+//!   else unknown. Covers a stored login and `CURSOR_API_KEY` alike (the
+//!   stored login wins when both exist) and, unlike an ACP probe, starts no
+//!   chat in the user's Cursor history.
 //! - **pi** — ACP probe via the pinned pi-acp npx adapter, gated on the `pi`
 //!   CLI being installed: non-empty model list ⇒ `true`; an empty list or an
 //!   auth-required error ⇒ `false`; else unknown.
@@ -68,6 +74,7 @@ pub(crate) const AUTH_PROBE_PROVIDERS: &[&str] = &[
     "grok",
     "pi",
     "antigravity",
+    "cursor",
 ];
 
 /// Timeout for one CLI auth probe (`auth status` / `login status` /
@@ -288,6 +295,24 @@ async fn check_provider_auth_cli_with(
                 Err(_) => CliAuthProbe::TimedOut,
             }
         }
+        "cursor" => {
+            let mut cmd = probe_command(program);
+            cmd.args(auth_check_args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            match tokio::time::timeout(CLI_AUTH_TIMEOUT, cmd.output()).await {
+                Ok(Ok(output)) if could_not_run(output.status) => CliAuthProbe::Failed,
+                Ok(Ok(output)) => cursor_probe_outcome(
+                    &String::from_utf8_lossy(&output.stdout),
+                    &String::from_utf8_lossy(&output.stderr),
+                    output.status.success(),
+                ),
+                Ok(Err(_)) => CliAuthProbe::Failed,
+                Err(_) => CliAuthProbe::TimedOut,
+            }
+        }
         "opencode" => {
             let mut cmd = probe_command(program);
             cmd.args(auth_check_args)
@@ -499,6 +524,19 @@ fn grok_probe_outcome(
     }
 }
 
+/// Map one `cursor-agent models` run to a probe outcome. Never log the
+/// output: it lists the account's models.
+fn cursor_probe_outcome(stdout: &str, stderr: &str, exit_success: bool) -> CliAuthProbe {
+    let parsed =
+        intent_providers::cursor::parse_cursor_models_command_output(stdout, stderr, exit_success);
+    match parsed.authenticated {
+        Some(true) => CliAuthProbe::Authenticated,
+        Some(false) => CliAuthProbe::NotAuthenticated,
+        None if exit_success => CliAuthProbe::StatusUnknown,
+        None => CliAuthProbe::Failed,
+    }
+}
+
 /// Timeout for the opencode readiness probe (`opencode models` can be slower
 /// than a simple auth-file read; parity with the FE's 10s budget).
 const OPENCODE_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -554,7 +592,7 @@ async fn probe_provider(
         .as_ref()
         .map_or(program, |c| c.runtime.path().as_os_str().to_owned());
     match provider_id {
-        "auggie" | "codex" | "opencode" | "grok" => {
+        "auggie" | "codex" | "opencode" | "grok" | "cursor" => {
             let args = intent_providers::find_provider(provider_id)
                 .and_then(|cfg| cfg.auth_check_args)
                 .unwrap_or_default();
@@ -691,6 +729,7 @@ fn resolve_probe_binary(
         "grok" => "grok",
         "pi" => "pi",
         "antigravity" => "antigravity-acp",
+        "cursor" => intent_providers::cursor::CURSOR_COMMAND,
         _ => return None,
     };
     let override_applies =
@@ -895,17 +934,26 @@ pub(crate) fn not_authenticated_message(provider_id: &str) -> String {
     let display = intent_providers::provider_config(provider_id).display_name;
     let login_cmd =
         intent_providers::login_command(intent_providers::base_provider_id(provider_id));
-    let caveat = if intent_providers::base_provider_id(provider_id) == "claude-code" {
-        " Note: signing into the Claude desktop app does not carry over to the CLI — run \
-         \"claude\" in a terminal, then \"/login\"."
-    } else {
-        ""
+    let caveat = match intent_providers::base_provider_id(provider_id) {
+        "claude-code" => {
+            " Note: signing into the Claude desktop app does not carry over to the CLI — run \
+             \"claude\" in a terminal, then \"/login\"."
+        }
+        "cursor" => CURSOR_CREDENTIALS_NOTE,
+        _ => "",
     };
     format!(
         "provider \"{provider_id}\" ({display}) is not authenticated — run \
          \"{login_cmd}\" in a terminal, then retry.{caveat}"
     )
 }
+
+/// How Cursor picks credentials, appended to its not-authenticated message:
+/// `cursor-agent` also accepts `CURSOR_API_KEY`, but a stored login wins
+/// over the key when both exist.
+pub(crate) const CURSOR_CREDENTIALS_NOTE: &str =
+    " Cursor also accepts a CURSOR_API_KEY in the daemon's environment; when both exist, \
+     the stored \"cursor-agent login\" wins over the key.";
 
 /// Demote one provider's cached auth verdict to a hard `false` after the
 /// runtime observed an authoritative auth-required error from its adapter
@@ -1269,6 +1317,78 @@ mod tests {
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
             let probe =
                 check_provider_auth_cli("auggie", stub.as_os_str(), &["token", "print"]).await;
+            assert_eq!(probe, expected, "stub {name}");
+        }
+    }
+
+    /// `cursor-agent models` decides Cursor auth from its output: model rows
+    /// (stored login, or `CURSOR_API_KEY` alone) ⇒ authenticated; the
+    /// explicit "Authentication required" error ⇒ not authenticated; a run
+    /// that listed nothing is unknown, a crash is a failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_probe_parses_models_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("cursor-models");
+        let args = intent_providers::find_provider("cursor")
+            .unwrap()
+            .auth_check_args
+            .unwrap();
+        assert_eq!(args, &["models"]);
+        let signed_in = "printf 'Available models\\n\\nauto - Auto (current, default)\\ngpt-5.2 - GPT-5.2\\n'; exit 0";
+        let signed_out = "echo \"Error: Authentication required. Run 'agent login', pass --api-key/--auth-token, or set CURSOR_API_KEY/CURSOR_AUTH_TOKEN.\" >&2; exit 1";
+        let key_only =
+            format!("if [ -n \"$CURSOR_API_KEY\" ]; then {signed_in}; else {signed_out}; fi");
+        for (name, body, captured, expected) in [
+            (
+                "signed-in",
+                signed_in.to_string(),
+                None,
+                CliAuthProbe::Authenticated,
+            ),
+            (
+                "signed-out",
+                signed_out.to_string(),
+                None,
+                CliAuthProbe::NotAuthenticated,
+            ),
+            (
+                "empty",
+                "printf 'Available models\\n'; exit 0".into(),
+                None,
+                CliAuthProbe::StatusUnknown,
+            ),
+            (
+                "crash",
+                "echo boom >&2; exit 3".into(),
+                None,
+                CliAuthProbe::Failed,
+            ),
+            (
+                "key-only-without-key",
+                key_only.clone(),
+                None,
+                CliAuthProbe::NotAuthenticated,
+            ),
+            (
+                "key-only-with-key",
+                key_only,
+                Some("crsr-test-key"),
+                CliAuthProbe::Authenticated,
+            ),
+        ] {
+            let stub = dir.path().join(name);
+            std::fs::write(&stub, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if std::env::var_os("CURSOR_API_KEY").is_some() && captured.is_none() {
+                continue;
+            }
+            let captured: std::collections::BTreeMap<String, String> = captured
+                .map(|key| [("CURSOR_API_KEY".to_string(), key.to_string())].into())
+                .unwrap_or_default();
+            let probe =
+                check_provider_auth_cli_with("cursor", stub.as_os_str(), args, None, &captured)
+                    .await;
             assert_eq!(probe, expected, "stub {name}");
         }
     }
@@ -1928,7 +2048,7 @@ while IFS= read -r unexpected; do exit 95; done
     #[test]
     fn valid_override_resolves_install_gate() {
         let dir = unique_temp_dir("valid-override");
-        for provider in ["droid", "antigravity"] {
+        for provider in ["droid", "antigravity", "cursor"] {
             let bin = dir.path().join(provider);
             make_executable(&bin);
             let resolved = resolve_probe_binary(provider, Some(bin.to_str().unwrap()));
@@ -2237,6 +2357,12 @@ while IFS= read -r unexpected; do exit 95; done
             "{droid}"
         );
         assert!(!droid.contains("desktop app"), "{droid}");
+        assert!(!droid.contains("CURSOR_API_KEY"), "{droid}");
+
+        let cursor = not_authenticated_message("cursor");
+        assert!(cursor.contains("\"cursor-agent login\""), "{cursor}");
+        assert!(cursor.contains("CURSOR_API_KEY"), "{cursor}");
+        assert!(cursor.contains("stored"), "{cursor}");
     }
 
     // -----------------------------------------------------------------------

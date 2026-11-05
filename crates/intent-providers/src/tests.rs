@@ -353,7 +353,14 @@ fn cortex_and_droid_gate_on_enable_env_vars() {
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn session_mcp_servers_partition() {
-    let opted_in = ["claude-code", "codex", "droid", "grok", "antigravity", "cursor"];
+    let opted_in = [
+        "claude-code",
+        "codex",
+        "droid",
+        "grok",
+        "antigravity",
+        "cursor",
+    ];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -1884,6 +1891,25 @@ fn cursor_registry_entry() {
 #[test]
 fn auto_allow_once_partition() {
     for id in all_provider_ids() {
-        assert_eq!(find_provider(id).unwrap().auto_allow_once, id == "cursor", "{id}");
+        assert_eq!(
+            find_provider(id).unwrap().auto_allow_once,
+            id == "cursor",
+            "{id}"
+        );
     }
+}
+
+/// Only Cursor carries a prompt-only provider note (its native-subagent
+/// restriction).
+#[test]
+fn system_prompt_note_partition() {
+    for id in all_provider_ids() {
+        let note = find_provider(id).unwrap().system_prompt_note;
+        assert_eq!(note.is_some(), id == "cursor", "{id}");
+    }
+    let note = find_provider("cursor").unwrap().system_prompt_note.unwrap();
+    assert!(
+        note.contains("Task") && note.contains("ws.agent.delegate"),
+        "{note}"
+    );
 }

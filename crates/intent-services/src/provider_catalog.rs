@@ -126,6 +126,28 @@ mod tests {
         );
     }
 
+    /// The FE Labs gate (cloudlands-fe feat/cursor-provider) keys off this
+    /// row: id `cursor`, display name `Cursor`, test prompt supported, and
+    /// visible without any env var or feature code.
+    #[test]
+    fn cursor_row_matches_the_frontend_contract() {
+        let v = catalog(&|_| false);
+        let cursor = row(&v, "cursor");
+        assert_eq!(cursor["displayName"], "Cursor");
+        assert_eq!(cursor["shortName"], "Cursor");
+        assert_eq!(cursor["command"], "cursor-agent");
+        assert_eq!(cursor["canBeDisabled"], true);
+        assert_eq!(cursor["supportsTestPrompt"], true);
+        assert_eq!(cursor["supportsProfiles"], false);
+        assert_eq!(cursor["visible"], true);
+        assert_eq!(cursor["loginCommandHint"], "cursor-agent login");
+        assert_eq!(
+            cursor["loginDocsUrl"],
+            "https://cursor.com/docs/cli/reference/authentication"
+        );
+        assert!(cursor.get("requiresEnvVar").is_none());
+    }
+
     #[test]
     fn row_shape_matches_registry_entry() {
         let v = catalog(&|_| false);

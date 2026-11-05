@@ -1600,14 +1600,26 @@ mod find_provider_binary_tests {
         make_executable(&bin.path().join("agent"));
         let dirs = [bin.path().to_path_buf()];
         assert_eq!(
-            find_provider_binary_with_home_and_dirs("cursor", "cursor-agent", None, Some(home.path()), &dirs),
+            find_provider_binary_with_home_and_dirs(
+                "cursor",
+                "cursor-agent",
+                None,
+                Some(home.path()),
+                &dirs
+            ),
             None,
             "a bare `agent` must never stand in for cursor-agent"
         );
         let cursor = bin.path().join("cursor-agent");
         make_executable(&cursor);
         assert_eq!(
-            find_provider_binary_with_home_and_dirs("cursor", "cursor-agent", None, Some(home.path()), &dirs),
+            find_provider_binary_with_home_and_dirs(
+                "cursor",
+                "cursor-agent",
+                None,
+                Some(home.path()),
+                &dirs
+            ),
             Some(cursor),
         );
     }

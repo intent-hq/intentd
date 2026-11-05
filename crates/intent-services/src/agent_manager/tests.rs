@@ -28200,7 +28200,7 @@ mod session_model_tests {
         let provider = intent_providers::find_provider("codex").unwrap();
         let (conn, server, request) = track_config_reply(&mgr, &id, reply);
         let err = mgr
-            .maybe_apply_session_model(&conn, &id, provider, "session", Some("gpt-5.5"))
+            .maybe_apply_session_model(&conn, &id, provider, "session", Some("gpt-5.5"), None)
             .await
             .expect_err("configuration must fail");
         let sent = request.await.unwrap();
@@ -28237,7 +28237,7 @@ mod session_model_tests {
         server.abort();
 
         let (conn, server, request) = track_config_reply(&mgr, &id, ConfigReply::Accept);
-        mgr.maybe_apply_session_model(&conn, &id, provider, "recovered", Some("gpt-5.5"))
+        mgr.maybe_apply_session_model(&conn, &id, provider, "recovered", Some("gpt-5.5"), None)
             .await
             .expect("fresh connection recovers");
         assert_eq!(

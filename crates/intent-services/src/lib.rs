@@ -211,6 +211,7 @@ mod repository_read_source;
 mod agent_list_cache;
 mod automatic_pr_refresh;
 pub mod checkpoint;
+pub mod cursor_cli;
 mod direct_secret_ops;
 mod fast_mode;
 mod harness;
@@ -39574,6 +39575,16 @@ pub fn discover_providers_with_npx_overrides<S: std::hash::BuildHasher>(
         .any(|p| p.id == "pi" && p.gated_off.is_none())
         .then(crate::pi_cli::probe_pi_cli);
 
+    // Cursor: report the CLI version and refuse the Grok agent host channel,
+    // probed on the binary a launch would exec (`providers.paths.cursor`
+    // honored). Skipped when the row is gated off or nothing resolved.
+    let cursor_cli_status = providers
+        .iter()
+        .any(|p| p.id == "cursor" && p.gated_off.is_none() && p.installed)
+        .then(|| {
+            crate::cursor_cli::probe_cursor_cli(provider_paths.get("cursor").map(String::as_str))
+        });
+
     let provider_array: Vec<serde_json::Value> = providers
         .iter()
         .map(|p| {
@@ -39590,6 +39601,11 @@ pub fn discover_providers_with_npx_overrides<S: std::hash::BuildHasher>(
             if p.id == "pi" {
                 if let Some(status) = &pi_cli_status {
                     apply_pi_cli_fields(&mut obj, &mut installed, status);
+                }
+            }
+            if p.id == "cursor" {
+                if let Some(status) = &cursor_cli_status {
+                    crate::cursor_cli::apply_cursor_cli_fields(&mut obj, &mut installed, status);
                 }
             }
             obj.insert("installed".to_string(), serde_json::json!(installed));
