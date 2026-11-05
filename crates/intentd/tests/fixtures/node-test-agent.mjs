@@ -127,6 +127,11 @@ function mcpCall(name, tool, args) {
         const reply = JSON.parse(buffered.slice(0, newline));
         buffered = buffered.slice(newline + 1);
         replies[reply.id] = reply;
+        // List, then call, as a provider does: the bridge answers requests
+        // concurrently, so a call sent with the list can finish first.
+        if (reply.id === 2) {
+          frame({ id: 3, method: 'tools/call', params: { name: tool, arguments: args } });
+        }
         if (reply.id === 3) {
           child.kill();
           resolve({ init: replies[1], tools: replies[2], call: replies[3] });
@@ -137,7 +142,6 @@ function mcpCall(name, tool, args) {
     frame({ id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'node-test-agent', version: '0' } } });
     frame({ method: 'notifications/initialized' });
     frame({ id: 2, method: 'tools/list', params: {} });
-    frame({ id: 3, method: 'tools/call', params: { name: tool, arguments: args } });
   });
 }
 
