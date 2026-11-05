@@ -1313,7 +1313,10 @@ impl Runner {
             },
             (true, None) => SetupStatus::skipped(),
             (true, Some(command)) => {
-                match self.run_setup(agent, (cwd, tmp), command, output, stop).await {
+                match self
+                    .run_setup(agent, (cwd, tmp), command, output, stop)
+                    .await
+                {
                     setup::Ran::Finished(status) => status,
                     setup::Ran::Stopped => {
                         return Settled {

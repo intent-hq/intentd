@@ -2454,7 +2454,11 @@ async fn node_runner_runs_setup_before_the_agent_starts() {
     assert_eq!(fields[3..7], ["feat/x", "main", "1", "none"], "{env}");
     let agent_dir = worktree.parent().unwrap();
     // The script gets the agent's private temp folder (remote parity S6).
-    assert_eq!(std::path::Path::new(fields[7]), agent_dir.join("tmp"), "{env}");
+    assert_eq!(
+        std::path::Path::new(fields[7]),
+        agent_dir.join("tmp"),
+        "{env}"
+    );
     assert!(
         !std::fs::read_dir(agent_dir)
             .unwrap()
