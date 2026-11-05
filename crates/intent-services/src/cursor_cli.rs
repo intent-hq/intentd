@@ -128,12 +128,9 @@ pub(crate) async fn run_cursor_cli(
     let stderr = read(child.stderr.take().map(|p| Box::new(p) as _));
     let status = tokio::time::timeout(timeout, child.wait()).await;
     kill_cursor_group(pgid);
-    let status = match status {
-        Ok(Ok(status)) => status,
-        _ => {
-            let _ = child.kill().await;
-            return None;
-        }
+    let Ok(Ok(status)) = status else {
+        let _ = child.kill().await;
+        return None;
     };
     let collect = |task: tokio::task::JoinHandle<Vec<u8>>| async move {
         tokio::time::timeout(std::time::Duration::from_secs(2), task)
