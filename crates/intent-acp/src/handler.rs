@@ -74,7 +74,33 @@ pub struct ClientRequestHandler {
     /// commands the daemon runs for the agent see the same `TMPDIR` as the
     /// agent process.
     terminal_env_defaults: Vec<(String, String)>,
+    /// Auto-approved prompts select the `allow_once` option (see
+    /// [`intent_providers::ProviderConfig::auto_allow_once`]).
+    auto_allow_once: bool,
 }
+
+/// Cursor's agent→client question request. Answered "skipped" so the agent
+/// proceeds on its own judgement: a headless agent has no one to ask, and a
+/// `method not found` reply makes Cursor re-ask each question as a
+/// permission prompt whose auto-approval would silently pick an answer.
+pub const CURSOR_ASK_QUESTION_METHOD: &str = "cursor/ask_question";
+
+/// The `cursor/ask_question` result: `{ outcome: { outcome: "skipped" } }`
+/// (shape read from cursor-agent 2026.11.05-86047df's ask-question handler).
+#[must_use]
+pub fn cursor_ask_question_skipped() -> Value {
+    json!({
+        "outcome": {
+            "outcome": "skipped",
+            "reason": "No one can answer questions in this session; continue with your best judgement and state any assumptions."
+        }
+    })
+}
+
+/// Cursor's report of a finished native `Task` subagent run (sent as a
+/// request after the tool call, with no permission prompt). Acknowledged
+/// with an empty result; `method not found` changes nothing on Cursor's side.
+pub const CURSOR_TASK_METHOD: &str = "cursor/task";
 
 impl ClientRequestHandler {
     /// Wire a handler for one agent session.
@@ -97,7 +123,17 @@ impl ClientRequestHandler {
             sink,
             terminal_host: None,
             terminal_env_defaults: Vec::new(),
+            auto_allow_once: false,
         }
+    }
+
+    /// Answer auto-approved permission prompts with the `allow_once` option
+    /// instead of the first non-destructive one (Cursor: its
+    /// `allow-always` writes into the user's Cursor configuration).
+    #[must_use]
+    pub fn with_auto_allow_once(mut self, enabled: bool) -> Self {
+        self.auto_allow_once = enabled;
+        self
     }
 
     /// Attach the client-served terminal host so `terminal/*` requests run on
@@ -148,6 +184,10 @@ impl ClientRequestHandler {
             "fs/read_text_file" => self.handle_read(conn, id, params).await,
             "fs/write_text_file" => self.handle_write(conn, id, params).await,
             "session/request_permission" => self.handle_permission(conn, id, params).await,
+            CURSOR_ASK_QUESTION_METHOD => {
+                conn.respond_result(id, cursor_ask_question_skipped()).await
+            }
+            CURSOR_TASK_METHOD => conn.respond_result(id, json!({})).await,
             m if terminal::is_terminal_method(m) => match self.terminal_host.clone() {
                 Some(host) => self.handle_terminal(conn, id, m, params, host).await,
                 None => conn.respond_error(id, terminal::unsupported_error(m)).await,
@@ -241,7 +281,13 @@ impl ClientRequestHandler {
             // Headless: emit the prompt for observability, then resolve it now.
             self.emit(AGENT_PERMISSION_REQUEST, request_value(&data))
                 .await;
-            match permission::select_option(&data.options, allow) {
+            let selected = if allow && self.auto_allow_once {
+                permission::allow_once_option(&parsed.options)
+                    .or_else(|| permission::select_option(&data.options, allow))
+            } else {
+                permission::select_option(&data.options, allow)
+            };
+            match selected {
                 Some(option_id) => PermissionOutcome::Selected { option_id },
                 None => PermissionOutcome::Cancelled,
             }

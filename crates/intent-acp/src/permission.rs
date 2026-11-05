@@ -358,6 +358,14 @@ pub(crate) fn select_option(options: &[PermissionOptionView], allow: bool) -> Op
         .map(|o| o.id.clone())
 }
 
+/// The first `allow_once` option's id, if the provider offered one.
+pub(crate) fn allow_once_option(options: &[PermissionOption]) -> Option<String> {
+    options
+        .iter()
+        .find(|o| o.kind == PermissionOptionKind::AllowOnce)
+        .map(|o| o.option_id.0.to_string())
+}
+
 /// Epoch milliseconds (timestamp on [`PermissionRequestData`]).
 fn now_millis() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};

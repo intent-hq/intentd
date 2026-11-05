@@ -666,6 +666,105 @@ fn unwrap_codex_mcp_input(raw_input: Option<&Value>) -> Option<(Value, String)> 
     Some((Value::Object(unwrapped), format!("{server}_{tool}")))
 }
 
+/// Cursor delivers MCP tool calls as
+/// `{ "providerIdentifier": "<server>", "toolName": "<tool>", "args": {…} }`
+/// (captured from cursor-agent 2026.11.05-86047df; the tool-call title is
+/// `"<server>: <tool>"`, which the `<name>: …` split would mis-read as the
+/// server name). Hoist `args` and name the call `{server}_{tool}`, like
+/// [`unwrap_codex_mcp_input`]. Requires exactly these keys (`args` optional).
+fn unwrap_cursor_mcp_input(raw_input: Option<&Value>) -> Option<(Value, String)> {
+    let obj = raw_input?.as_object()?;
+    if obj
+        .keys()
+        .any(|k| !matches!(k.as_str(), "providerIdentifier" | "toolName" | "args"))
+    {
+        return None;
+    }
+    let server = obj.get("providerIdentifier")?.as_str()?;
+    let tool = obj.get("toolName")?.as_str()?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    let args = match obj.get("args") {
+        None | Some(Value::Null) => Value::Object(serde_json::Map::new()),
+        Some(Value::Object(args)) => Value::Object(args.clone()),
+        Some(_) => return None,
+    };
+    Some((args, format!("{server}_{tool}")))
+}
+
+/// Cursor's native tool shapes (cursor-agent 2026.11.05-86047df,
+/// `tool-call-presentation.ts` `summarizeToolCall` / `extractToolCallInput`;
+/// shell and task frames also captured live). Each rule requires the exact
+/// `raw_input` key set Cursor emits plus its title form, so other
+/// providers' shapes never match.
+fn derive_cursor_tool_name(title: &str, obj: &serde_json::Map<String, Value>) -> Option<String> {
+    let keys = |expected: &[&str]| {
+        obj.len() == expected.len() && expected.iter().all(|k| obj.contains_key(*k))
+    };
+    // `_toolName`-tagged tools (`task`, `updateTodos`, `askQuestion`,
+    // `createPlan`, `generateImage`, `generateVideo`).
+    if let Some(name) = obj.get("_toolName").and_then(Value::as_str) {
+        // The native subagent tool renders as "Subagent" in the timeline.
+        if name == "task" {
+            return Some("Subagent".to_string());
+        }
+        if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Some(name.to_string());
+        }
+    }
+    if keys(&["command"]) {
+        let command = obj.get("command")?.as_str()?;
+        let quoted = format!("`{}`", command.replace('`', "\\`"));
+        return (title == quoted || title == "Terminal").then(|| "bash".to_string());
+    }
+    if keys(&["path"]) {
+        let path = obj.get("path")?.as_str()?;
+        // Cursor backticks the path in edit/delete/list titles; a read title
+        // shows the (cwd-relative) path plus an optional line range.
+        let shown_path = |shown: &str| {
+            !shown.is_empty() && (path == shown || path.ends_with(&format!("/{shown}")))
+        };
+        let backticked = |verb: &str| {
+            title
+                .strip_prefix(verb)
+                .and_then(|rest| rest.strip_prefix('`'))
+                .and_then(|rest| rest.split_once('`'))
+                .is_some_and(|(shown, _)| shown_path(shown))
+        };
+        let name = if title == "Edit File" || backticked("Edit ") {
+            "edit"
+        } else if title == "Delete File" || backticked("Delete ") {
+            "delete"
+        } else if backticked("List the ") {
+            "ls"
+        } else if title.strip_prefix("Read ").is_some_and(|rest| {
+            rest.ends_with(')') && shown_path(rest.split(" (").next().unwrap_or(rest))
+        }) {
+            "read"
+        } else {
+            return None;
+        };
+        return Some(name.to_string());
+    }
+    if keys(&["pattern", "path"]) && title.starts_with("grep") {
+        return Some("grep".to_string());
+    }
+    if keys(&["pattern"]) && title.starts_with("Find") {
+        return Some("glob".to_string());
+    }
+    if keys(&["query"]) && (title.starts_with("Search: ") || title == "Codebase Search") {
+        return Some("codebase-search".to_string());
+    }
+    if keys(&["searchTerm"]) && title.starts_with("Web Search") {
+        return Some("web-search".to_string());
+    }
+    if keys(&["paths"]) && title.starts_with("Read Lints") {
+        return Some("read-lints".to_string());
+    }
+    None
+}
+
 /// Resolve the mapped `input` and tool name for a tool call. When the codex
 /// nested-MCP shape is detected ([`unwrap_codex_mcp_input`]) the arguments
 /// are hoisted to the top level and the rewritten `{server}_{tool}` name is
@@ -703,6 +802,10 @@ fn resolve_input_and_name(
                 return (Value::Object(input), strip_workspace_mcp_affix(title), true);
             }
         }
+    }
+    if let Some((input, rewritten)) = unwrap_cursor_mcp_input(raw_input) {
+        let (name, _) = derive_tool_name_inner(&rewritten, Some(&input), false);
+        return (input, name, true);
     }
     if let Some((input, rewritten)) = unwrap_codex_mcp_input(raw_input) {
         // `server`/`tool` are authoritative: a foreign tool whose arguments
@@ -797,7 +900,10 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///     the call with the tool name resolve to `workspace_api` through rules
 ///     1–2 and 4–5 anyway. Skipped on the [`unwrap_codex_mcp_input`] path,
 ///     where `server`/`tool` are authoritative.
-///  4. A title of the form `<name>: <description>` (`<name>` a bare identifier
+///  4. Cursor's native tool shapes ([`derive_cursor_tool_name`]: exact
+///     `raw_input` key sets plus title forms, e.g. a backticked command with
+///     `{ command }` → `bash`, `_toolName: "task"` → `Subagent`).
+///  4b. A title of the form `<name>: <description>` (`<name>` a bare identifier
 ///     of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
 ///     becomes the name.
 ///  5. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
@@ -859,6 +965,12 @@ fn derive_tool_name_inner(
     }
     if infer_workspace_api && raw_input.is_some_and(intent_core::is_workspace_api_input) {
         return ("workspace_api".to_string(), false);
+    }
+    if let Some(name) = raw_input
+        .and_then(Value::as_object)
+        .and_then(|obj| derive_cursor_tool_name(title, obj))
+    {
+        return (name, false);
     }
     if let Some(name) = split_name_prefix(title) {
         return (strip_workspace_mcp_affix(name), false);
