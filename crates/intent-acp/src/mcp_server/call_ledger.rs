@@ -20,9 +20,12 @@ use serde_json::Value;
 const MAX_PLAIN: usize = 20;
 /// Characters kept from each `host.exec` stdout/stderr and from each error.
 const MAX_TEXT: usize = 500;
-/// Characters of listed entries before the rest are only counted, so a
-/// script that ran hundreds of commands cannot return an unbounded error.
+/// Characters of fully listed entries; past it only failed, unanswered and
+/// `host.exec` calls get a one-line entry and the rest are counted.
 const MAX_LISTED_CHARS: usize = 8_000;
+/// One-line entries allowed past [`MAX_LISTED_CHARS`], so a script that ran
+/// hundreds of commands cannot return an unbounded error.
+const MAX_COMPACT: usize = 50;
 
 /// `SQLite`'s text for the `SQLITE_CORRUPT` family (codes 11, 267, 523, 779)
 /// and for `SQLITE_NOTADB` (26).
@@ -113,15 +116,22 @@ impl CallLedger {
             let collapse = entries.len() > MAX_PLAIN;
             let listed_from = out.len();
             let mut collapsed: Vec<(&str, usize)> = Vec::new();
+            let mut unlisted = 0usize;
+            let mut compact = 0usize;
             for (index, entry) in entries.iter().enumerate() {
                 if out.len() - listed_from > MAX_LISTED_CHARS {
+                    // Past the text budget a failed, unanswered or `host.exec`
+                    // call still gets a one-line entry (no output text), so a
+                    // late side effect is never dropped silently.
                     flush_collapsed(&mut out, &mut collapsed);
-                    let _ = write!(
-                        out,
-                        "\n   ({} later calls not listed; check their effects before retrying)",
-                        entries.len() - index
-                    );
-                    break;
+                    if entry.outcome.is_notable() && compact < MAX_COMPACT {
+                        compact += 1;
+                        let _ = write!(out, "\n{}. ws.{} — ", index + 1, entry.method);
+                        render_outcome(&mut out, &entry.outcome, false);
+                    } else {
+                        unlisted += 1;
+                    }
+                    continue;
                 }
                 if collapse && !entry.outcome.is_notable() {
                     match collapsed.iter_mut().find(|(m, _)| *m == entry.method) {
@@ -135,6 +145,12 @@ impl CallLedger {
                 render_outcome(&mut out, &entry.outcome, include_output);
             }
             flush_collapsed(&mut out, &mut collapsed);
+            if unlisted > 0 {
+                let _ = write!(
+                    out,
+                    "\n   ({unlisted} other calls not listed; check their effects before retrying)"
+                );
+            }
             out.push_str(
                 "\nCalls that succeeded already took effect, and calls with no reply may have \
                  too: check their outcome before retrying so side effects are not repeated. \
@@ -197,9 +213,9 @@ fn render_outcome(out: &mut String, outcome: &Outcome, include_output: bool) {
         Outcome::Executed(exec) => {
             match exec.exit_code {
                 Some(code) => {
-                    let _ = write!(out, "succeeded (exitCode {code}");
+                    let _ = write!(out, "ran (exitCode {code}");
                 }
-                None => out.push_str("succeeded (no exit code: killed by a signal"),
+                None => out.push_str("ran (no exit code: killed by a signal"),
             }
             if exec.timed_out {
                 out.push_str(", timed out");
@@ -216,14 +232,18 @@ fn render_outcome(out: &mut String, outcome: &Outcome, include_output: bool) {
     }
 }
 
+/// Keep the head and the tail of long text: a command prints its receipt or
+/// id last, and that is what proves a side effect landed.
 fn bounded(text: &str) -> String {
-    let mut chars = text.chars();
-    let head: String = chars.by_ref().take(MAX_TEXT).collect();
-    if chars.next().is_some() {
-        format!("{head}… (truncated)")
-    } else {
-        head
+    if text.chars().count() <= MAX_TEXT {
+        return text.to_string();
     }
+    let half = MAX_TEXT / 2;
+    let head: String = text.chars().take(half).collect();
+    let mut tail: Vec<char> = text.chars().rev().take(half).collect();
+    tail.reverse();
+    let tail: String = tail.into_iter().collect();
+    format!("{head}… (truncated) …{tail}")
 }
 
 fn is_corruption(message: &str) -> bool {
@@ -250,7 +270,7 @@ mod tests {
         ledger.finish(slot, &Ok(json!({ "exitCode": 0, "stdout": "secret-ish" })));
         let text = ledger.annotate("Error: later", false);
         assert!(
-            text.contains("1. ws.host.exec — succeeded (exitCode 0)"),
+            text.contains("1. ws.host.exec — ran (exitCode 0)"),
             "{text}"
         );
         assert!(!text.contains("secret-ish"), "{text}");
@@ -277,7 +297,7 @@ mod tests {
         ledger.finish(slot, &Err("boom".to_string()));
         let text = ledger.annotate("Error: boom", true);
         assert!(
-            text.contains("\n1. ws.host.exec — succeeded (exitCode 0)"),
+            text.contains("\n1. ws.host.exec — ran (exitCode 0)"),
             "{text}"
         );
         assert!(text.contains("… (truncated)"), "{text}");
@@ -300,8 +320,44 @@ mod tests {
             );
         }
         let text = ledger.annotate("Error: x", true);
-        assert!(text.len() < MAX_LISTED_CHARS + 2_000, "{}", text.len());
-        assert!(text.contains("later calls not listed"), "{text}");
+        assert!(text.len() < MAX_LISTED_CHARS + 6_000, "{}", text.len());
+        assert!(text.contains("other calls not listed"), "{text}");
+    }
+
+    #[test]
+    fn late_failure_past_the_cap_is_still_listed() {
+        let ledger = CallLedger::default();
+        for _ in 0..30 {
+            let slot = ledger.start("host.exec");
+            ledger.finish(
+                slot,
+                &Ok(json!({ "exitCode": 0, "stdout": "z".repeat(600) })),
+            );
+        }
+        let slot = ledger.start("note.read");
+        ledger.finish(slot, &Ok(json!({})));
+        let slot = ledger.start("note.add");
+        ledger.finish(slot, &Err("late boom".to_string()));
+        let _pending = ledger.start("agent.send");
+        let text = ledger.annotate("Error: late boom", true);
+        assert!(text.contains("\n32. ws.note.add — failed"), "{text}");
+        assert!(
+            text.contains("\n33. ws.agent.send — no reply before the script ended"),
+            "{text}"
+        );
+        assert!(!text.contains("31. ws.note.read"), "{text}");
+        assert!(text.contains("1 other calls not listed"), "{text}");
+    }
+
+    #[test]
+    fn long_output_keeps_its_tail() {
+        let ledger = CallLedger::default();
+        let stdout = format!("{}RECEIPT-42", "a".repeat(2_000));
+        let slot = ledger.start("host.exec");
+        ledger.finish(slot, &Ok(json!({ "exitCode": 0, "stdout": stdout })));
+        let text = ledger.annotate("Error: later", true);
+        assert!(text.contains("… (truncated) …"), "{text}");
+        assert!(text.contains("RECEIPT-42"), "{text}");
     }
 
     #[test]
@@ -331,7 +387,7 @@ mod tests {
         ledger.finish(slot, &Ok(json!({ "exitCode": null, "stdout": "" })));
         let text = ledger.annotate("Error: later", true);
         assert!(
-            text.contains("succeeded (no exit code: killed by a signal)"),
+            text.contains("ran (no exit code: killed by a signal)"),
             "{text}"
         );
     }

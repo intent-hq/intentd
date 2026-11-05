@@ -115,7 +115,7 @@ async fn failed_note_write_still_reports_the_completed_host_command() {
     assert!(is_error, "{text}");
     assert!(text.contains(CORRUPT), "the original error stays: {text}");
     assert!(
-        text.contains("1. ws.host.exec — succeeded (exitCode 0)"),
+        text.contains("1. ws.host.exec — ran (exitCode 0)"),
         "the command's outcome is reported: {text}"
     );
     assert!(
@@ -155,7 +155,7 @@ async fn call_cut_off_by_the_script_timeout_is_reported_as_unknown() {
         "{text}"
     );
     assert!(
-        text.contains("1. ws.host.exec — succeeded (exitCode 0)"),
+        text.contains("1. ws.host.exec — ran (exitCode 0)"),
         "{text}"
     );
     assert!(
@@ -189,7 +189,7 @@ async fn rethrown_command_text_gets_no_database_hint() {
     )
     .await;
     assert!(is_error, "{text}");
-    assert!(text.contains("1. ws.host.exec — succeeded"), "{text}");
+    assert!(text.contains("1. ws.host.exec — ran"), "{text}");
     assert!(!text.contains("intentd doctor"), "{text}");
 }
 
