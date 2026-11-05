@@ -1078,10 +1078,7 @@ fn script_frames_need_protocol_8_skills_frames_12_and_push_frames_13() {
                     ..
                 })
         );
-        let push = matches!(
-            frame,
-            LinkFrame::PushWip(_) | LinkFrame::PushWipReply(_)
-        );
+        let push = matches!(frame, LinkFrame::PushWip(_) | LinkFrame::PushWipReply(_));
         let expected = if push {
             SHARED_CHECKOUT_PROTOCOL
         } else if skills {
@@ -1268,7 +1265,14 @@ fn push_wip_frames_have_closed_bodies() {
     )
     .unwrap();
     assert!(
-        matches!(&reply, LinkFrame::PushWipReply(PushWipResult { outcome: FinalPush::Pushed, error: None, .. })),
+        matches!(
+            &reply,
+            LinkFrame::PushWipReply(PushWipResult {
+                outcome: FinalPush::Pushed,
+                error: None,
+                ..
+            })
+        ),
         "{reply:?}"
     );
     for raw in [
