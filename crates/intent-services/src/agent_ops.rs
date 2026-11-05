@@ -9869,7 +9869,13 @@ impl Services {
                 .get_attachment(id)
                 .await
                 .map_err(|e| invalid(format!("cannot load attachment record: {e}")))?;
-            let root = crate::file_ops::resolve_root(&self.store, &record.workspace_id, None).await;
+            let root = crate::file_ops::resolve_root(
+                &self.store,
+                &record.workspace_id,
+                None,
+                self.chief_cwd_root.as_deref(),
+            )
+            .await;
             if root.is_empty() || !std::path::Path::new(&root).is_absolute() {
                 return Err(invalid(
                     "attachment workspace has no safe resolved root".into(),

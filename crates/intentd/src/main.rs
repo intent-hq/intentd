@@ -2196,9 +2196,13 @@ async fn cmd_serve_owned(
             )))
         });
 
+    // One chief-cwd dir (`<data_dir>/chief-cwd`) is both the Assistant
+    // workspace's `file.*` root and its provider children's spawn cwd.
+    let chief_cwd_root = intent_core::chief_cwd_root(&config.data_dir);
     // Composition root: register the feature crates on the core services.
     let services = intent_app::compose(Services::new(store))
         .with_assets_root(assets_root)
+        .with_chief_cwd_root(chief_cwd_root.clone())
         // Persist the per-provider models.list cache in the data dir (§5.30).
         .with_models_cache_dir(&config.data_dir.clone())
         // Named provider profile metadata lives next to config.toml (§5.54).
@@ -2323,7 +2327,7 @@ async fn cmd_serve_owned(
         // scribbled into its cwd don't accumulate across daemon runs and
         // get re-indexed.
         .with_chief_cwd_root({
-            let root = intent_core::chief_cwd_root(&config.data_dir);
+            let root = chief_cwd_root;
             if let Err(e) = intent_core::sweep_chief_cwd(&root) {
                 tracing::warn!(error = %e, path = %root.display(), "chief-cwd sweep failed");
             }

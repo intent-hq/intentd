@@ -388,7 +388,13 @@ impl Services {
         idempotency: Option<(&str, Option<&str>, &str)>,
     ) -> Result<serde_json::Value> {
         let store = &self.store;
-        let root = crate::file_ops::resolve_root(store, &workspace_id, None).await;
+        let root = crate::file_ops::resolve_root(
+            store,
+            &workspace_id,
+            None,
+            self.chief_cwd_root.as_deref(),
+        )
+        .await;
         if root.is_empty() {
             return Err(Error::Internal(
                 "workspace has no resolved filesystem root".to_string(),
