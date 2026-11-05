@@ -48,6 +48,26 @@ pub const ATTACHMENT_DATA_METHOD: &str = "file.attachmentData";
 /// fit one response frame ([`crate::node_link::MAX_FRAME_BYTES`]).
 pub const MAX_LINK_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
 
+/// The frame method the node forwards (never from agent code: the table
+/// refuses it there) for a provider's `tools/list` on one of the user MCP
+/// servers proxied to head (nodeProtocol 11). Args `{ "serverId" }`; head
+/// answers the server's raw MCP result.
+pub const MCP_PROXY_LIST_TOOLS_METHOD: &str = "mcp.proxy.listTools";
+
+/// The frame method the node forwards (never from agent code) for a
+/// provider's `tools/call` on a proxied user MCP server (nodeProtocol 11).
+/// Args `{ "serverId", "name", "arguments" }`; head answers the server's raw
+/// MCP result.
+pub const MCP_PROXY_CALL_TOOL_METHOD: &str = "mcp.proxy.callTool";
+
+/// How long a proxied `tools/call` may run on head's hub; `ws.mcp` keeps
+/// the hub's own shorter cap.
+pub const MCP_PROXY_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The link budget of one proxied frame: the call's own bound plus room
+/// for the gates and the reply.
+pub const MCP_PROXY_LINK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(630);
+
 /// The node's own frames to head. They ride [`CALL_METHOD`] but agent code
 /// cannot send them, even when their namespace is forwarded.
 pub const INTERNAL_METHODS: &[&str] = &[
@@ -55,6 +75,8 @@ pub const INTERNAL_METHODS: &[&str] = &[
     ATTACHMENTS_METHOD,
     PLACEMENT_HELP_METHOD,
     ATTACHMENT_DATA_METHOD,
+    MCP_PROXY_LIST_TOOLS_METHOD,
+    MCP_PROXY_CALL_TOOL_METHOD,
 ];
 
 /// Most cards one [`ATTACHMENTS_METHOD`] frame carries.
@@ -64,6 +86,7 @@ pub const MAX_FORWARDED_ATTACHMENTS: usize = 32;
 /// run on head: their code and its `ws.host.exec` see head's worktree, and
 /// their wakes reach the agent as agent messages. `browser` and `desktop`
 /// act on the user's client connected to head, with a local agent's consent.
+/// `mcp` lists and calls head's MCP servers, with a local agent's gates.
 pub const FORWARDED_NAMESPACES: &[&str] = &[
     "note",
     "task",
@@ -79,6 +102,7 @@ pub const FORWARDED_NAMESPACES: &[&str] = &[
     "hook",
     "browser",
     "desktop",
+    "mcp",
 ];
 
 /// Methods that run on the node, against the agent's checkout.
@@ -175,6 +199,8 @@ pub fn route(method: &str) -> Route {
 pub fn forward_min_protocol(method: &str) -> u32 {
     if method.starts_with("script.") {
         crate::node_link::SCRIPT_PROTOCOL
+    } else if method == MCP_PROXY_LIST_TOOLS_METHOD || method == MCP_PROXY_CALL_TOOL_METHOD {
+        crate::node_link::MCP_PROXY_PROTOCOL
     } else {
         crate::node_link::NODE_LINK_PROTOCOLS.min
     }
@@ -314,6 +340,9 @@ mod tests {
             "desktop.listDisplay",
             "desktop.screenshot",
             "desktop.click",
+            "mcp.listServers",
+            "mcp.listTools",
+            "mcp.callTool",
         ] {
             assert_eq!(route(method), Route::Forward, "{method}");
             assert_eq!(
@@ -335,11 +364,25 @@ mod tests {
             COMMIT_POLICY_METHOD,
             ATTACHMENTS_METHOD,
             PLACEMENT_HELP_METHOD,
+            MCP_PROXY_LIST_TOOLS_METHOD,
+            MCP_PROXY_CALL_TOOL_METHOD,
         ] {
             assert!(INTERNAL_METHODS.contains(&method), "{method}");
             assert_eq!(route(method), Route::Unsupported, "{method}");
         }
         assert_eq!(PLACEMENT_HELP_METHOD, "agent.placementHelp");
+        // The provider's proxied MCP servers ride `mcp.proxy.*`, inside the
+        // forwarded `mcp` namespace, and only on nodeProtocol 11.
+        assert_eq!(MCP_PROXY_LIST_TOOLS_METHOD, "mcp.proxy.listTools");
+        assert_eq!(MCP_PROXY_CALL_TOOL_METHOD, "mcp.proxy.callTool");
+        for method in [MCP_PROXY_LIST_TOOLS_METHOD, MCP_PROXY_CALL_TOOL_METHOD] {
+            assert_eq!(
+                forward_min_protocol(method),
+                crate::node_link::MCP_PROXY_PROTOCOL,
+                "{method}"
+            );
+        }
+        assert!(MCP_PROXY_LINK_TIMEOUT > MCP_PROXY_CALL_TIMEOUT);
     }
 
     /// `app.*` and secondary git roots say why they are refused.
@@ -383,7 +426,6 @@ mod tests {
     #[test]
     fn everything_else_is_refused_by_name() {
         for method in [
-            "mcp.listTools",
             "secret.request",
             "search.query",
             COMMIT_POLICY_METHOD,
@@ -395,14 +437,14 @@ mod tests {
         ] {
             assert_eq!(route(method), Route::Unsupported, "{method:?}");
         }
-        let message = unsupported_message("mcp.listTools");
+        let message = unsupported_message("secret.request");
         assert!(
             message.starts_with(
-                "remote-agent-unsupported: `mcp.listTools` is not supported on remote agents yet"
+                "remote-agent-unsupported: `secret.request` is not supported on remote agents yet"
             ),
             "{message}"
         );
-        assert!(message.contains("ws.mcp.* is"), "{message}");
+        assert!(message.contains("ws.secret.* is"), "{message}");
         for forwarded in [
             "ws.script",
             "ws.primitive",
@@ -411,6 +453,7 @@ mod tests {
             "ws.hook",
             "ws.browser",
             "ws.desktop",
+            "ws.mcp",
             "ws.app.question.ask",
             "ws.git.listRoots",
             "ws.terminal.list",

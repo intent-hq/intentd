@@ -17,10 +17,14 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use intent_core::node_link::{LeaseBinding, LinkOutcome, LinkRequest, LinkRpcError};
+use intent_core::node_link::{
+    LeaseBinding, LinkOutcome, LinkRequest, LinkRpcError, MAX_FRAME_BYTES,
+};
 use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
-    INTERNAL_METHODS, MAX_FORWARDED_ATTACHMENTS, MAX_LINK_ATTACHMENT_BYTES, PLACEMENT_HELP_METHOD,
+    INTERNAL_METHODS, MAX_FORWARDED_ATTACHMENTS, MAX_LINK_ATTACHMENT_BYTES,
+    MCP_PROXY_CALL_TOOL_METHOD, MCP_PROXY_LINK_TIMEOUT, MCP_PROXY_LIST_TOOLS_METHOD,
+    PLACEMENT_HELP_METHOD,
 };
 use intent_core::remote_launch::RemoteAgentRecord;
 use intent_core::{with_caller, AgentSession, Caller, Error, WorkspaceApi};
@@ -39,6 +43,8 @@ const FORBIDDEN: i32 = -32003;
 const CALL_FAILED: i32 = -32000;
 /// Longest budget a forwarded frame gets, whatever the node asks for.
 const MAX_BUDGET: Duration = Duration::from_secs(300);
+/// Room the response frame needs beyond its result.
+const RESPONSE_OVERHEAD: usize = 4 * 1024;
 
 fn refusal(code: i32, message: impl Into<String>) -> LinkOutcome {
     LinkOutcome::Err(LinkRpcError {
@@ -188,6 +194,9 @@ impl HeadCalls {
                 Err(error) => refusal(CALL_FAILED, error.to_string()),
             };
         }
+        if method == MCP_PROXY_LIST_TOOLS_METHOD || method == MCP_PROXY_CALL_TOOL_METHOD {
+            return self.mcp_proxy(record, method, request).await;
+        }
         let features = self.services.session_agent_features(session);
         let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
         let budget = Duration::from_millis(u64::from(request.timeout_ms)).min(MAX_BUDGET);
@@ -234,6 +243,64 @@ impl HeadCalls {
     }
 }
 
+impl HeadCalls {
+    /// One of the provider's proxied user MCP requests (nodeProtocol 11),
+    /// run in head's hub as the bound agent, within the proxy's budget.
+    async fn mcp_proxy(
+        &self,
+        record: &RemoteAgentRecord,
+        method: &str,
+        request: &LinkRequest,
+    ) -> LinkOutcome {
+        let args = request.params.get("args").cloned().unwrap_or(Value::Null);
+        let Some(server_id) = args.get("serverId").and_then(Value::as_str) else {
+            return refusal(INVALID_PARAMS, format!("{method} needs a string `serverId`"));
+        };
+        let budget =
+            Duration::from_millis(u64::from(request.timeout_ms)).min(MCP_PROXY_LINK_TIMEOUT);
+        let call = async {
+            if method == MCP_PROXY_LIST_TOOLS_METHOD {
+                return self
+                    .services
+                    .remote_mcp_proxy_list_tools(&record.workspace_id, server_id)
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| fits_one_frame(result, server_id, "tools/list"));
+            }
+            let Some(name) = args.get("name").and_then(Value::as_str) else {
+                return Err(format!("{method} needs a string `name`"));
+            };
+            let arguments = args.get("arguments").cloned().unwrap_or(Value::Null);
+            let (result, server) = self
+                .services
+                .remote_mcp_proxy_call_tool(&record.workspace_id, server_id, name, arguments)
+                .await
+                .map_err(|error| error.to_string())?;
+            fits_one_frame(result, &server, name)
+        };
+        match tokio::time::timeout(budget, call).await {
+            Ok(Ok(result)) => LinkOutcome::Ok(result),
+            Ok(Err(message)) => refusal(CALL_FAILED, message),
+            Err(_) => refusal(
+                CALL_FAILED,
+                format!("mcp-proxy-timeout: {method} did not finish within {}s", budget.as_secs()),
+            ),
+        }
+    }
+}
+
+/// `result` when its response frame fits the link; otherwise the
+/// documented `mcp-proxy-result-too-large` error naming `server.tool`.
+fn fits_one_frame(result: Value, server: &str, tool: &str) -> std::result::Result<Value, String> {
+    let len = serde_json::to_vec(&result).map_or(usize::MAX, |bytes| bytes.len());
+    if len.saturating_add(RESPONSE_OVERHEAD) > MAX_FRAME_BYTES {
+        return Err(format!(
+            "mcp-proxy-result-too-large: {server}.{tool} returned more than 8 MiB; the backend could not send it to this machine."
+        ));
+    }
+    Ok(result)
+}
+
 /// The cards of one [`ATTACHMENTS_METHOD`] frame, for the tool result they
 /// came from: claimed together by nonce or by the `workspace_api` fallback.
 fn forwarded_attachments(
@@ -275,4 +342,24 @@ fn forwarded_attachments(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod mcp_proxy_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// A result too large for one link frame fails with the documented
+    /// message instead of a response the link would drop.
+    #[test]
+    fn a_result_past_the_frame_limit_is_refused_by_name() {
+        let small = json!({ "content": [{ "type": "text", "text": "ok" }] });
+        assert_eq!(fits_one_frame(small.clone(), "Linear", "search"), Ok(small));
+        let large = json!({ "content": [{ "type": "text", "text": "x".repeat(MAX_FRAME_BYTES) }] });
+        assert_eq!(
+            fits_one_frame(large, "Linear", "search").unwrap_err(),
+            "mcp-proxy-result-too-large: Linear.search returned more than 8 MiB; the backend could not send it to this machine."
+        );
+    }
 }

@@ -1355,6 +1355,8 @@ mod stop_acks {
             agent_features: serde_json::json!({}),
             is_sub_agent: false,
             checkout: None,
+            mcp_proxies: Vec::new(),
+            compact_tool_descriptions: false,
             profile_env: None,
         }
     }

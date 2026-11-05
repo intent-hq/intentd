@@ -5396,6 +5396,66 @@ impl Services {
         self.mcp_servers_service().start_enabled().await;
     }
 
+    /// The user MCP servers a remote agent of `workspace_id` gets proxied to
+    /// this daemon's hub (nodeProtocol 11), as names and ids only. A store
+    /// failure yields none: the agent starts without them.
+    pub async fn remote_mcp_proxies(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Vec<intent_core::node_link::McpProxy> {
+        match self
+            .mcp_servers_service()
+            .remote_proxies(workspace_id.as_str())
+            .await
+        {
+            Ok(proxies) => proxies,
+            Err(error) => {
+                tracing::warn!(workspace = %workspace_id, %error, "remote agent: could not list the user MCP servers to proxy");
+                Vec::new()
+            }
+        }
+    }
+
+    /// A remote agent's proxied `tools/list` on `server_id`, run in this
+    /// daemon's hub as the bound agent caller: host membership, workspace
+    /// membership and the server gates (not `agentFeatures.mcpTools`).
+    ///
+    /// # Errors
+    ///
+    /// The refused gate, or the hub's error.
+    pub async fn remote_mcp_proxy_list_tools(
+        &self,
+        workspace_id: &WorkspaceId,
+        server_id: &str,
+    ) -> Result<serde_json::Value> {
+        self.require_host_execution("mcp.proxy.listTools").await?;
+        self.require_member(workspace_id).await?;
+        self.mcp_servers_service()
+            .proxy_list_tools(workspace_id.as_str(), server_id)
+            .await
+    }
+
+    /// A remote agent's proxied `tools/call`, with the gates of
+    /// [`Self::remote_mcp_proxy_list_tools`] and the proxy's longer bound.
+    /// Returns the raw MCP result and the server's display name.
+    ///
+    /// # Errors
+    ///
+    /// The refused gate, or the hub's error.
+    pub async fn remote_mcp_proxy_call_tool(
+        &self,
+        workspace_id: &WorkspaceId,
+        server_id: &str,
+        tool_name: &str,
+        args: serde_json::Value,
+    ) -> Result<(serde_json::Value, String)> {
+        self.require_host_execution("mcp.proxy.callTool").await?;
+        self.require_member(workspace_id).await?;
+        self.mcp_servers_service()
+            .proxy_call_tool(workspace_id.as_str(), server_id, tool_name, args)
+            .await
+    }
+
     /// Build an [`McpServersService`](mcp_servers::McpServersService) view over the
     /// settings registry, secret store, and hub for one `mcp.servers.*` call.
     fn mcp_servers_service(&self) -> mcp_servers::McpServersService<'_> {

@@ -48,6 +48,8 @@ fn launch_frame() -> LinkFrame {
         agent_features: json!({ "apiToken": "tok-secret", "inputTokens": 12 }),
         is_sub_agent: false,
         checkout: None,
+        mcp_proxies: Vec::new(),
+        compact_tool_descriptions: false,
         profile_env: Some(LaunchProfileEnv(json!({
             "providerRef": "claude-code@work",
             "fingerprint": "fp-1",

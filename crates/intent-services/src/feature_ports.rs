@@ -1330,6 +1330,17 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
     /// `None` when no node is configured.
     fn placement_help<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Option<String>>;
 
+    /// The line a remote agent's instructions carry when its machine's link
+    /// is older than nodeProtocol 11 and the agent would have had user MCP
+    /// servers: they are not proxied there. `None` otherwise.
+    fn mcp_servers_notice<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async { None })
+    }
+
     /// Check that an agent with `placement` and `needs` (its provider,
     /// model and whether a profile is sent) can start in `workspace_id`
     /// now, before anything is created, and resolve where it would run.

@@ -148,6 +148,8 @@ fn launch(id: &str) -> LaunchCommand {
         profile_env: None,
         is_sub_agent: false,
         checkout: None,
+        mcp_proxies: Vec::new(),
+        compact_tool_descriptions: false,
     }
 }
 

@@ -29,6 +29,7 @@ fn gates() -> Gates {
         agent_features: serde_json::to_value(AgentFeaturesSettings::default()).unwrap(),
         is_sub_agent: false,
         compact_tool_descriptions: false,
+        mcp_proxies: Vec::new(),
     }
 }
 
@@ -933,4 +934,126 @@ async fn a_truncating_provider_gets_the_compact_tool_description() {
     );
     assert!(!compact.contains("ws.note.read("), "{compact}");
     assert!(compact.len() < full.len());
+}
+
+/// nodeProtocol 11: each user MCP server head names becomes one more
+/// `session/new` entry after `workspace-mcp` (a reserved or repeated name is
+/// skipped), running `intentd mcp-bridge` against its own authenticated
+/// listener; a provider's `tools/call` there reaches head as the agent's
+/// `mcp.proxy.callTool` frame with the proxy's longer link budget.
+#[tokio::test]
+async fn proxied_user_mcp_servers_ride_session_new_and_call_head() {
+    use intent_acp::session::McpServer;
+    use intent_core::remote_launch::workspace_api::MCP_PROXY_CALL_TOOL_METHOD;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
+    let head = HeadLink::default();
+    head.set(node_end);
+    let proxy = |name: &str, id: &str| McpProxy {
+        name: name.into(),
+        server_id: id.into(),
+    };
+    let gates = Gates {
+        mcp_proxies: vec![
+            proxy("Linear", "srv-1"),
+            proxy("workspace-mcp", "srv-2"),
+            proxy("Linear", "srv-3"),
+        ],
+        ..gates()
+    };
+    let answering = tokio::spawn(async move {
+        while let Some(event) = head_end.events.recv().await {
+            let LinkEvent::Request(request) = event else {
+                continue;
+            };
+            let frame = request.request().clone();
+            if frame.params["method"] != MCP_PROXY_CALL_TOOL_METHOD {
+                request
+                    .respond(LinkOutcome::Err(LinkRpcError {
+                        code: -32601,
+                        message: "not here".into(),
+                        data: None,
+                    }))
+                    .await
+                    .unwrap();
+                continue;
+            }
+            request
+                .respond(LinkOutcome::Ok(json!({
+                    "content": [{ "type": "text", "text": "from head" }],
+                })))
+                .await
+                .unwrap();
+            return frame;
+        }
+        panic!("the link closed");
+    });
+    let (_bridges, entries) = serve(
+        &agent(),
+        &workspace(),
+        dir.path(),
+        (&gates, None),
+        head,
+        Path::new("/opt/intent/intentd"),
+    )
+    .await
+    .unwrap();
+    let stdio: Vec<_> = entries
+        .iter()
+        .map(|entry| match entry {
+            McpServer::Stdio(stdio) => stdio.clone(),
+            other => panic!("not stdio: {other:?}"),
+        })
+        .collect();
+    let names: Vec<&str> = stdio.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["workspace-mcp", "Linear"]);
+    let linear = &stdio[1];
+    assert_eq!(linear.args[0], "mcp-bridge");
+    assert_ne!(linear.args[2], stdio[0].args[2], "its own listener");
+    let token = linear
+        .env
+        .iter()
+        .find(|var| var.name == intent_acp::BRIDGE_TOKEN_ENV)
+        .map(|var| var.value.clone())
+        .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(&linear.args[2]).await.unwrap();
+    stream
+        .write_all(intent_acp::bridge_auth_line(&token).as_bytes())
+        .await
+        .unwrap();
+    let request = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                          "params": { "name": "echo", "arguments": { "input": "x" } } });
+    stream
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut lines = BufReader::new(stream).lines();
+    let reply: Value = serde_json::from_str(
+        &tokio::time::timeout(wait(), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reply["id"], 7, "{reply}");
+    assert_eq!(reply["result"]["content"][0]["text"], "from head", "{reply}");
+
+    let frame = tokio::time::timeout(wait(), answering)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame.agent_id, agent());
+    assert_eq!(frame.method, CALL_METHOD);
+    assert_eq!(
+        frame.params["args"],
+        json!({ "serverId": "srv-1", "name": "echo", "arguments": { "input": "x" } })
+    );
+    assert_eq!(
+        u128::from(frame.timeout_ms),
+        MCP_PROXY_LINK_TIMEOUT.as_millis()
+    );
 }
