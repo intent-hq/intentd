@@ -461,6 +461,7 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
         desktop_writes: crate::desktop_repo::DesktopWrites::default(),
         desktop_delete_barrier: std::sync::Arc::default(),
+        transcript_delete_test_pause: std::sync::Arc::default(),
         export_author_barrier: std::sync::Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
     };

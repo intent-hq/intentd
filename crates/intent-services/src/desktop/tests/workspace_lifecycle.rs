@@ -179,6 +179,9 @@ async fn watchdog_ends_control_once_the_workspace_is_archived_or_retired() {
         let h = Harness::new().await;
         let mut events = session_events(&h);
         let session_id = activate(&h).await;
+        h.executor
+            .hold_end
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let now = intent_core::now_iso();
         sqlx::query("UPDATE workspace SET archived=1, archived_at=? WHERE id=?")
             .bind(&now)
@@ -194,34 +197,15 @@ async fn watchdog_ends_control_once_the_workspace_is_archived_or_retired() {
                 .await
                 .unwrap());
         }
-        // One 5s watchdog tick, scaled for loaded hosts. Control reads Inactive
-        // as soon as the watchdog drops it, before the terminal record and the
-        // native end call land, so wait for both (in any order) rather than
-        // the state; `assert_ended` then checks settled teardown. The ended
-        // event is awaited there.
-        let deadline = tokio::time::Instant::now()
-            + intentd_test_support::test_timeout(Duration::from_secs(7));
-        loop {
-            let calls = end_calls(&h, &session_id);
-            let reason = h
-                .services
-                .store
-                .desktop_terminal(&session_id)
-                .await
-                .unwrap()
-                .map(|record| record["reason"].clone());
-            if calls > 0 && reason.as_ref().is_some_and(|r| !r.is_null()) {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "watchdog teardown incomplete (retired={retired}): \
-                 endControl calls={calls}, terminal reason={reason:?}, \
-                 state={:?}",
-                h.services.desktop.state(&h.agent)
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        // Live state becomes Inactive before durable/event work and native dispatch.
+        // Wait for that dispatch, using the same scaled watchdog-tick budget.
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(7)),
+            h.executor.end_seen.notified(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watchdog did not dispatch native end (retired={retired})"));
+        h.executor.release_end.notify_one();
         assert_ended(&h, &session_id, &mut events).await;
     }
 }

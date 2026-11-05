@@ -255,6 +255,20 @@ impl SecretVault {
             .is_some_and(|entry| !entry.pending.is_empty())
     }
 
+    /// Whether this agent has a persisted request card still awaiting a
+    /// response. One keyed lookup and the bounded per-agent pending list;
+    /// callers with session summaries do not scan every agent's vault entry.
+    pub(crate) fn has_surfaced_pending(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) -> bool {
+        self.lock()
+            .agents
+            .get(&(workspace_id.clone(), agent_id.clone()))
+            .is_some_and(|entry| entry.pending.iter().any(|request| request.surfaced))
+    }
+
     /// Mark the agent's pending requests named in `request_ids` as surfaced
     /// (their card was persisted). Returns whether anything changed.
     pub(crate) fn mark_surfaced(
@@ -285,6 +299,7 @@ impl SecretVault {
 
     /// The agents in `workspace_id` with at least one surfaced pending
     /// request — one lock for a whole workspace's attention derivation.
+    #[cfg(test)]
     pub(crate) fn agents_awaiting_user(
         &self,
         workspace_id: &WorkspaceId,

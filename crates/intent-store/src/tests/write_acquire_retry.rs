@@ -51,6 +51,7 @@ async fn short_acquire_store(tmp: &TempDb) -> Store {
         export_author_barrier: Arc::default(),
         desktop_writes: crate::desktop_repo::DesktopWrites::default(),
         desktop_delete_barrier: Arc::default(),
+        transcript_delete_test_pause: Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
     }
 }

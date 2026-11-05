@@ -1416,6 +1416,8 @@ async fn serve_survives_closed_stderr_pipe_during_skill_scan() {
     let mut cmd = common::hermetic_serve_command(&data_dir);
     cmd.env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        // The warning is an asserted milestone, independent of caller logging filters.
+        .env("RUST_LOG", "info")
         .env("HOME", &home)
         .env_remove("USERPROFILE")
         .env_remove("CLAUDE_CONFIG_DIR")

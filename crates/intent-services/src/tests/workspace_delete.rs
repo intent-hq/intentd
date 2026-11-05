@@ -1066,6 +1066,10 @@ async fn transcript_mutation_cannot_refill_completed_sweep(mutation: TranscriptM
     let (ws, agents) = h.workspace("transcript-delete", 1).await;
     let agent = &agents[0];
     let (keeper, _) = h.workspace("transcript-keeper", 0).await;
+    let (after_sweep, resume_delete) = h
+        .store
+        .pause_workspace_transcript_delete_for_test(ws.clone())
+        .unwrap();
     sqlx::query("INSERT INTO agent_queue(id,agent_id,position,payload,created_at) VALUES('gate',?,0,'{}','t0')")
         .bind(&agent.0).execute(h.store.write_pool()).await.unwrap();
     sqlx::query("CREATE TABLE cascade_audit(messages INTEGER, payloads INTEGER); CREATE TRIGGER before_session_delete BEFORE DELETE ON agent_session BEGIN INSERT INTO cascade_audit SELECT (SELECT COUNT(*) FROM agent_message WHERE agent_id=OLD.id), (SELECT COUNT(*) FROM agent_message_payload WHERE agent_id=OLD.id); END")
@@ -1144,11 +1148,22 @@ async fn transcript_mutation_cannot_refill_completed_sweep(mutation: TranscriptM
             None => writing.await,
         }
     };
-    // Both futures must progress after releasing the SQLite worker. Awaiting
+    // A pending poll does not order the note's SQLite work before root removal.
+    // Keep teardown paused after the worker releases its connection until the
+    // unrelated public write actually finishes. Cancellation releases the pause.
+    let finish_unrelated = async {
+        after_sweep
+            .await
+            .expect("post-sweep deletion pause reached");
+        let result = unrelated.await;
+        let _ = resume_delete.send(());
+        result
+    };
+    // All three futures must progress after releasing the SQLite worker. Awaiting
     // the writer alone can deadlock behind a connection still owned by delete.
     let (deleted, result, unrelated) = tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(30)),
-        async { tokio::join!(deleting, finish_write, unrelated) },
+        async { tokio::join!(deleting, finish_write, finish_unrelated) },
     )
     .await
     .unwrap();

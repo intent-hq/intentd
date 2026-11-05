@@ -197,6 +197,7 @@ pub use model::{
     AGENT_QUEUE_PAGE_BUDGET_BYTES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
+pub use model::{AttentionReminderReason, WorkspaceAttentionReminder};
 pub use model::{
     BrowserTab, BrowserTabInput, BrowserTabSize, BrowserTabSyncResult, BrowserTabUpsertOutcome,
     BrowserTabVisibility,
