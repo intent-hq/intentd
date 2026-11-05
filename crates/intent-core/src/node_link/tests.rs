@@ -340,6 +340,7 @@ fn executor_link_requests_golden() {
             "hello",
             "launch",
             "prompt",
+            "pushWip",
             "response",
             "scriptStart",
             "scriptStop",
@@ -384,6 +385,7 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
             "cancelRequest",
             "capabilitiesReply",
             "journal",
+            "pushWipReply",
             "replayComplete",
             "request",
             "scriptExited",
@@ -561,6 +563,16 @@ fn every_frame() -> Vec<LinkFrame> {
                 skills: vec![machine_skill("deploy", "project")],
             },
         )),
+        LinkFrame::PushWip(PushWipRequest {
+            request_id,
+            agent_id: AgentId::from("a1"),
+        }),
+        LinkFrame::PushWipReply(PushWipResult {
+            request_id,
+            agent_id: AgentId::from("a1"),
+            outcome: FinalPush::Failed,
+            error: Some("head refused the push".into()),
+        }),
     ]
 }
 
@@ -596,7 +608,8 @@ fn frames_are_routed_to_their_lane() {
         [
             Control, Control, Control, Control, Control, Control, Control, Control, Control,
             Control, Journal, Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control,
-            Control, Script, Script, Script, Script, Script, Control, Control, Journal
+            Control, Script, Script, Script, Script, Script, Control, Control, Journal, Control,
+            Control
         ]
     );
 }
@@ -1049,7 +1062,7 @@ fn script_env_never_debug_renders_its_values() {
 }
 
 #[test]
-fn script_frames_need_protocol_8_and_skills_frames_12() {
+fn script_frames_need_protocol_8_skills_frames_12_and_push_frames_13() {
     for frame in every_frame() {
         let script = matches!(frame.channel(), LinkChannel::Script);
         let skills = matches!(
@@ -1061,7 +1074,13 @@ fn script_frames_need_protocol_8_and_skills_frames_12() {
                     ..
                 })
         );
-        let expected = if skills {
+        let push = matches!(
+            frame,
+            LinkFrame::PushWip(_) | LinkFrame::PushWipReply(_)
+        );
+        let expected = if push {
+            SHARED_CHECKOUT_PROTOCOL
+        } else if skills {
             12
         } else if script {
             8
@@ -1200,4 +1219,60 @@ fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
     let decoded: LaunchCommand = serde_json::from_value(bare).unwrap();
     assert!(decoded.mcp_proxies.is_empty());
     assert!(!decoded.compact_tool_descriptions);
+}
+
+/// A machine below nodeProtocol 13 rejects a launch into another agent's
+/// checkout: it would ignore `checkoutOf` and make a checkout of its own.
+#[test]
+fn a_launch_into_another_agents_checkout_needs_protocol_13() {
+    let mut command = LaunchCommand {
+        agent_id: AgentId::from("child"),
+        workspace_id: WorkspaceId::from("ws-1"),
+        provider: "codex".into(),
+        model: None,
+        base_commit: "base".into(),
+        repo_key: "repo".into(),
+        agent_features: json!({}),
+        is_sub_agent: true,
+        profile_env: None,
+        checkout: None,
+        checkout_of: Some(AgentId::from("parent")),
+        mcp_proxies: Vec::new(),
+        compact_tool_descriptions: false,
+    };
+    let wire = serde_json::to_value(LinkFrame::Launch(command.clone())).unwrap();
+    assert_eq!(wire["checkoutOf"], "parent", "{wire}");
+    assert_eq!(
+        LinkFrame::Launch(command.clone()).min_protocol(),
+        SHARED_CHECKOUT_PROTOCOL
+    );
+    command.checkout_of = None;
+    let wire = serde_json::to_value(LinkFrame::Launch(command)).unwrap();
+    assert!(wire.get("checkoutOf").is_none(), "{wire}");
+    assert!(NODE_LINK_PROTOCOLS.contains(SHARED_CHECKOUT_PROTOCOL));
+}
+
+/// `pushWip` and its reply are closed bodies with the documented wire names.
+#[test]
+fn push_wip_frames_have_closed_bodies() {
+    let reply = LinkFrame::decode(
+        json!({ "type": "pushWipReply", "requestId": "6f9619ff-8b86-d011-b42d-00c04fc964ff", "agentId": "a1", "outcome": "pushed" })
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    assert!(
+        matches!(&reply, LinkFrame::PushWipReply(PushWipResult { outcome: FinalPush::Pushed, error: None, .. })),
+        "{reply:?}"
+    );
+    for raw in [
+        json!({ "type": "pushWip", "requestId": "6f9619ff-8b86-d011-b42d-00c04fc964ff", "agentId": "a1", "extra": 1 }),
+        json!({ "type": "pushWip", "agentId": "a1" }),
+        json!({ "type": "pushWipReply", "requestId": "6f9619ff-8b86-d011-b42d-00c04fc964ff", "agentId": "a1", "outcome": "maybe" }),
+    ] {
+        assert!(
+            LinkFrame::decode(raw.to_string().as_bytes()).is_err(),
+            "{raw}"
+        );
+    }
 }
