@@ -1223,7 +1223,10 @@ async fn machine_runs(
     let reply = wsapi_turn(rpc_ws, events, (ws_id, agent_id), &wsapi, "turn-264", 264).await;
     assert!(reply.starts_with("wsapi: "), "{reply}");
     let copied = wsapi_value(&reply);
-    assert_eq!(copied["a"]["path"], ".intent/attachments/notes.txt", "{copied}");
+    assert_eq!(
+        copied["a"]["path"], ".intent/attachments/notes.txt",
+        "{copied}"
+    );
     assert_eq!(copied["t"], "hello", "{copied}");
 
     // A service started by the agent, stopped from the app.
