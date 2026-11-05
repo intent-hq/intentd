@@ -791,7 +791,7 @@ async fn forwarded_calls_are_confined_to_the_leases_agents_and_the_allowlist() {
         "script.list",
         "script.start",
         "file.read",
-        "hook.list",
+        "mcp.listServers",
         "workspace.info",
     ] {
         let error = refused(forward(&link, &agent, method, json!({})).await);
@@ -1253,6 +1253,81 @@ async fn a_lease_agents_backend_data_calls_run_on_head() {
             "{method}: {denied:?}"
         );
     }
+    f.node.shutdown();
+}
+
+/// Remote parity S3: hooks, structured questions, the browser and the
+/// desktop run on head as the lease agent. A question is registered for the
+/// agent's turn on head, so it drains onto that turn's message there.
+#[tokio::test]
+async fn a_lease_agents_hooks_questions_and_client_calls_run_on_head() {
+    let (f, link, _machine) = fixture().await;
+    let (agent, _) = f.placed().await;
+    let asked = answered(
+        forward(
+            &link,
+            &agent,
+            "app.question.ask",
+            json!({ "question": {
+                "header": "Pick",
+                "question": "Which one?",
+                "options": [{ "label": "Left" }, { "label": "Right" }],
+            } }),
+        )
+        .await,
+    );
+    assert_eq!(asked["ok"], json!(true), "{asked}");
+    let drained = f.services.turn_attachments().finish_turn(&agent);
+    assert_eq!(drained.len(), 1, "{drained:?}");
+    assert_eq!(drained[0].id, asked["attachmentId"].as_str().unwrap());
+    assert_eq!(drained[0].mime_type, "application/vnd.intent.question+json");
+    let docs = answered(
+        forward(
+            &link,
+            &agent,
+            "browser.docs",
+            json!({ "topic": "overview" }),
+        )
+        .await,
+    );
+    assert!(docs.as_str().is_some_and(|text| !text.is_empty()), "{docs}");
+
+    // These reach head's own bindings: whatever they answer is a local
+    // agent's answer, never the routing table's refusal.
+    for (method, args) in [
+        ("hook.list", json!({})),
+        ("hook.cancel", json!({ "hookId": "h-none" })),
+        ("browser.listTabs", json!({})),
+        ("desktop.listDisplay", json!({})),
+    ] {
+        if let LinkOutcome::Err(error) = forward(&link, &agent, method, args).await {
+            assert!(
+                !error.message.starts_with("remote-agent-unsupported")
+                    && !error.message.starts_with("node-agent-denied"),
+                "{method}: {error:?}"
+            );
+        }
+    }
+
+    let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+    let unplaced = f.agent(&view).await;
+    for method in [
+        "hook.list",
+        "app.question.ask",
+        "browser.docs",
+        "desktop.listDisplay",
+    ] {
+        let denied = refused(forward(&link, &unplaced, method, json!({})).await);
+        assert!(
+            denied.message.starts_with("node-agent-denied"),
+            "{method}: {denied:?}"
+        );
+    }
+    let other_app = refused(forward(&link, &agent, "app.agents.list", json!({})).await);
+    assert!(
+        other_app.message.starts_with("remote-agent-unsupported"),
+        "{other_app:?}"
+    );
     f.node.shutdown();
 }
 

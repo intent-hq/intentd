@@ -226,9 +226,7 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
     )
     .unwrap();
     for code in [
-        "return await ws.hook.list();",
-        "return await ws.desktop.listDisplay();",
-        "return await ws.browser.listTabs();",
+        "return await ws.mcp.listServers();",
         r#"return await ws.file.getAttachment("att-1");"#,
     ] {
         let (failed, text) = call(&server, code).await;
@@ -237,6 +235,18 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
             text.contains("is not supported on remote agents yet"),
             "{code}: {text}"
         );
+    }
+    // Hooks, questions, the browser and the desktop go to head, so with no
+    // link they fail for the link, not by name.
+    for code in [
+        "return await ws.hook.list();",
+        "return await ws.desktop.listDisplay();",
+        "return await ws.browser.listTabs();",
+        r#"return await ws.app.question.ask({ header: "h", question: "q", options: [{ label: "a" }, { label: "b" }] });"#,
+    ] {
+        let (failed, text) = call(&server, code).await;
+        assert!(failed, "{code}: {text}");
+        assert!(text.contains("node-link-unavailable"), "{code}: {text}");
     }
     for code in [
         r#"return await ws.git.registerRoot("sub");"#,

@@ -2,8 +2,9 @@
 //!
 //! A remote agent evaluates its `workspace_api` code on its node and
 //! forwards the control-plane frames (notes, tasks, agents, PRs, comments,
-//! events, primitives, discussions, sibling workspaces and the backend's
-//! workspace data) to head as [`CALL_METHOD`] link requests. Head serves one only on
+//! events, primitives, discussions, sibling workspaces, the backend's
+//! workspace data, hooks, structured questions, the browser and the
+//! desktop) to head as [`CALL_METHOD`] link requests. Head serves one only on
 //! the node's current binding, only for an agent recorded on that binding's
 //! lease, and only for a frame its own routing table forwards (the node is
 //! not trusted to route). The frame then runs through the same host
