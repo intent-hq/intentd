@@ -192,6 +192,29 @@ pub fn grok_agent_host_reason(version_line: &str) -> String {
     )
 }
 
+/// The unavailable reason for a `providers.paths.cursor` override that
+/// resolves to the Grok agent host, or `None` for any other override
+/// (blank, invalid, or a real Cursor CLI). Such an override is refused on
+/// every surface (discovery, auth, models, spawn) rather than silently
+/// replaced by auto-discovery.
+#[must_use]
+pub fn grok_host_override_reason(override_path: &str, dirs: &CursorHostDirs) -> Option<String> {
+    let trimmed = override_path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = Path::new(trimmed);
+    (path.is_absolute()
+        && is_executable_file(path)
+        && is_grok_agent_host_path(path, dirs.grok_home.as_deref()))
+    .then(|| {
+        format!(
+            "providers.paths.cursor ({trimmed}) points at the Grok agent host, not the Cursor CLI. \
+             Point it at the Cursor install under ~/.local/share/cursor-agent/versions/, or clear it."
+        )
+    })
+}
+
 /// One model row from `cursor-agent models`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorModel {

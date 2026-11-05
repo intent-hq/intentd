@@ -420,6 +420,20 @@ async fn build_rtk_instruction(
     Some(rtk_instruction_line(harness, &status.subcommands))
 }
 
+/// Append the provider's prompt-only note
+/// ([`intent_providers::ProviderConfig::system_prompt_note`]; Cursor's
+/// native-subagent restriction) to an assembled prompt. Other providers'
+/// prompts are returned unchanged.
+pub(crate) fn with_provider_prompt_note(
+    prompt: String,
+    provider: &intent_providers::ProviderConfig,
+) -> String {
+    match provider.system_prompt_note {
+        Some(note) => format!("{}\n\n{note}", prompt.trim_end()),
+        None => prompt,
+    }
+}
+
 /// Assemble the effective system prompt (the **internal** injection pipeline,
 /// §18.1) in documented precedence: base-system-prompt override →
 /// specialization rules (the 3-tier resolver: agent-type override → workspace
@@ -459,20 +473,6 @@ async fn build_rtk_instruction(
 /// the prompt under [`intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING`] (the
 /// section the compact header points at). `None` — every non-flagged
 /// provider — leaves the prompt byte-identical to before.
-/// Append the provider's prompt-only note
-/// ([`intent_providers::ProviderConfig::system_prompt_note`]; Cursor's
-/// native-subagent restriction) to an assembled prompt. Other providers'
-/// prompts are returned unchanged.
-pub(crate) fn with_provider_prompt_note(
-    prompt: String,
-    provider: &intent_providers::ProviderConfig,
-) -> String {
-    match provider.system_prompt_note {
-        Some(note) => format!("{}\n\n{note}", prompt.trim_end()),
-        None => prompt,
-    }
-}
-
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn assemble_system_prompt(
     store: &Store,

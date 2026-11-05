@@ -306,7 +306,15 @@ fn availability_for_with_npx(
         None
     } else {
         let key = provider.primary_binary_provider_id();
-        override_path(key).and_then(|p| resolve_explicit_path(key, &p))
+        override_path(key).and_then(|p| {
+            if provider.id == "cursor" {
+                let dirs = crate::cursor::CursorHostDirs::from_env(home_dir().as_deref());
+                if crate::cursor::grok_host_override_reason(&p, &dirs).is_some() {
+                    return None;
+                }
+            }
+            resolve_explicit_path(key, &p)
+        })
     };
     // The secondary binary (unsloth: the `unsloth` CLI itself) is resolved
     // with the same provider_id/command pair the daemon's managed-server
@@ -643,10 +651,14 @@ fn find_provider_binary_with_source_and_dirs(
                 if !crate::cursor::is_grok_agent_host_path(&pb, dirs.grok_home.as_deref()) {
                     return Some(explicit(pb));
                 }
+                // An explicit Grok agent host is refused, never silently
+                // swapped for an auto-discovered Cursor: discovery reports
+                // the row unavailable with the reason.
                 tracing::warn!(
                     configured_path = path.trim(),
-                    "providers.paths[\"cursor\"] points at the Grok agent host, not the Cursor CLI; ignoring the override"
+                    "providers.paths[\"cursor\"] points at the Grok agent host, not the Cursor CLI; refusing it"
                 );
+                return None;
             }
         }
         return crate::cursor::find_cursor_auto(&dirs, || find_in_dirs(enhanced_dirs, command))
@@ -1625,7 +1637,7 @@ mod find_provider_binary_tests {
     }
 
     /// `providers.paths.cursor` wins, except when it points at the Grok agent
-    /// host: that override is ignored and auto-discovery takes over.
+    /// host: that override is refused (no silent auto-discovery fallback).
     #[cfg(unix)]
     #[test]
     fn cursor_override_wins_unless_it_is_the_grok_agent_host() {
@@ -1650,6 +1662,8 @@ mod find_provider_binary_tests {
         );
         let host = custom.path().join("agent-host-0.3.1-linux-x64");
         make_executable(&host);
+        // Refused, not replaced by the auto-discovered install.
+        assert!(versioned.exists());
         assert_eq!(
             find_provider_binary_with_home_and_dirs(
                 "cursor",
@@ -1658,7 +1672,7 @@ mod find_provider_binary_tests {
                 Some(home.path()),
                 &[],
             ),
-            Some(versioned),
+            None,
         );
     }
 

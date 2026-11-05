@@ -173,6 +173,37 @@ mod tests {
         }
     }
 
+    /// A `providers.paths.cursor` override that resolves to the Grok agent
+    /// host makes the discovery row unavailable with an actionable reason,
+    /// whatever auto-discovery finds on this host, and the spawn/auth
+    /// resolver refuses it instead of falling back.
+    #[cfg(unix)]
+    #[test]
+    fn grok_host_override_is_unavailable_in_discovery() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("agent-host-0.3.1-linux-x64");
+        std::fs::write(&host, "#!/bin/sh\necho 'grok 0.3.1'\n").unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let paths =
+            std::collections::HashMap::from([("cursor".to_string(), host.display().to_string())]);
+        let discovery = crate::discover_providers_with_npx_overrides(&paths);
+        let row = discovery["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "cursor")
+            .unwrap();
+        assert_eq!(row["installed"], false, "{row}");
+        let reason = row["unavailableReason"].as_str().unwrap();
+        assert!(reason.contains("Grok agent host"), "{reason}");
+        assert!(reason.contains("providers.paths.cursor"), "{reason}");
+        assert_eq!(
+            intent_providers::find_provider_binary("cursor", "cursor-agent", host.to_str()),
+            None
+        );
+    }
+
     /// End to end over a fake `cursor-agent` on an explicit override path:
     /// resolve → `--version` → classify, without touching PATH or HOME.
     #[cfg(unix)]

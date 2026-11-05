@@ -5580,8 +5580,8 @@ impl AgentManager {
 
     /// Cursor: map the stored base model (`cursor/list_available_models`
     /// ids; `default` = Auto) onto this session's own `model` option variant
-    /// and apply it with `session/set_config_option`. No stored model leaves
-    /// Cursor on the user's CLI default. A model the session does not offer,
+    /// and apply it with `session/set_config_option`. No stored model applies
+    /// Auto (skipped only when the session offers no Auto option). A model the session does not offer,
     /// or one Cursor rejects, fails setup with an actionable error before
     /// any prompt is sent. Cursor also saves the applied model as the
     /// user's CLI default (accepted product behavior).
@@ -5593,15 +5593,19 @@ impl AgentManager {
         stored_model: Option<&str>,
         advertised_options: Option<&Value>,
     ) -> Result<Option<Value>> {
-        let Some(pick) = stored_model
+        let explicit = stored_model
             .map(|m| m.strip_prefix("cursor:").unwrap_or(m).trim())
-            .filter(|m| !m.is_empty())
-        else {
-            return Ok(None);
-        };
+            .filter(|m| !m.is_empty());
+        // No stored model means Auto, not whatever the user's Cursor CLI
+        // default became after an earlier pick (every applied pick is saved
+        // as that default), so API and delegated agents never inherit it.
+        let pick = explicit.unwrap_or(intent_providers::cursor::CURSOR_AUTO_MODEL);
         let Some(value) = advertised_options.and_then(|options| {
             intent_providers::cursor::cursor_session_model_value(options, pick)
         }) else {
+            if explicit.is_none() {
+                return Ok(None);
+            }
             self.kill_child_only(agent_id).await;
             return Err(Error::InvalidInput(format!(
                 "Cursor does not offer model '{pick}' for this account. Refresh the Cursor model list and pick an available model; no prompt was sent."

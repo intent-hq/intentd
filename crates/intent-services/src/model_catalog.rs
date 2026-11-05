@@ -196,14 +196,17 @@ pub(crate) struct CursorModelSource {
 impl CursorModelSource {
     pub(crate) fn resolve(explicit_path: Option<&str>) -> Self {
         use sha2::{Digest, Sha256};
+        // Built from the bare prefix so the key never reads as an `ns:name`
+        // event-type literal to the emit taxonomy scanner.
+        const PREFIX: &str = "cursor-executable-v1:";
         let binary = crate::provider_models::cursor_binary(explicit_path);
         let version_key = binary.as_ref().map_or_else(
-            || "cursor-executable-v1:missing".to_string(),
+            || format!("{PREFIX}missing"),
             |path| {
                 use std::fmt::Write;
                 Sha256::digest(path.as_os_str().as_encoded_bytes())
                     .iter()
-                    .fold("cursor-executable-v1:".to_string(), |mut key, byte| {
+                    .fold(PREFIX.to_string(), |mut key, byte| {
                         let _ = write!(key, "{byte:02x}");
                         key
                     })

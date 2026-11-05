@@ -39578,9 +39578,27 @@ pub fn discover_providers_with_npx_overrides<S: std::hash::BuildHasher>(
     // Cursor: report the CLI version and refuse the Grok agent host channel,
     // probed on the binary a launch would exec (`providers.paths.cursor`
     // honored). Skipped when the row is gated off or nothing resolved.
+    // An override pointing at the Grok agent host is refused everywhere, so
+    // the row is unavailable with that reason even when an auto-discovered
+    // Cursor exists.
+    let cursor_override_reason = provider_paths.get("cursor").and_then(|path| {
+        intent_providers::cursor::grok_host_override_reason(
+            path,
+            &intent_providers::cursor::CursorHostDirs::from_env(
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .as_deref(),
+            ),
+        )
+    });
     let cursor_cli_status = providers
         .iter()
-        .any(|p| p.id == "cursor" && p.gated_off.is_none() && p.installed)
+        .any(|p| {
+            p.id == "cursor"
+                && p.gated_off.is_none()
+                && p.installed
+                && cursor_override_reason.is_none()
+        })
         .then(|| {
             crate::cursor_cli::probe_cursor_cli(provider_paths.get("cursor").map(String::as_str))
         });
@@ -39603,8 +39621,11 @@ pub fn discover_providers_with_npx_overrides<S: std::hash::BuildHasher>(
                     apply_pi_cli_fields(&mut obj, &mut installed, status);
                 }
             }
-            if p.id == "cursor" {
-                if let Some(status) = &cursor_cli_status {
+            if p.id == "cursor" && p.gated_off.is_none() {
+                if let Some(reason) = &cursor_override_reason {
+                    installed = false;
+                    obj.insert("unavailableReason".to_string(), serde_json::json!(reason));
+                } else if let Some(status) = &cursor_cli_status {
                     crate::cursor_cli::apply_cursor_cli_fields(&mut obj, &mut installed, status);
                 }
             }

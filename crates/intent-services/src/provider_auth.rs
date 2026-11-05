@@ -165,6 +165,10 @@ impl AuthIdentity {
 struct AuthVerdict {
     authenticated: Option<bool>,
     identity: Option<AuthIdentity>,
+    /// Optional human-readable status text for the wire entry
+    /// (`statusNote`). Cursor only: says the stored login is in use when
+    /// `CURSOR_API_KEY` is also set.
+    status_note: Option<String>,
 }
 
 impl AuthVerdict {
@@ -174,6 +178,7 @@ impl AuthVerdict {
         Self {
             authenticated,
             identity: None,
+            status_note: None,
         }
     }
 }
@@ -537,6 +542,48 @@ fn cursor_probe_outcome(stdout: &str, stderr: &str, exit_success: bool) -> CliAu
     }
 }
 
+/// Signed-in Cursor status text when both credentials exist.
+pub(crate) const CURSOR_STORED_LOGIN_IN_USE_NOTE: &str =
+    "Using the stored Cursor login. CURSOR_API_KEY is also set; Cursor uses the stored login while it exists.";
+
+/// The Cursor `statusNote` for a signed-in account: when `CURSOR_API_KEY`
+/// reaches the CLI (daemon env or captured login-shell env) and `cursor-agent
+/// status --format json` reports a stored access token, say the stored login
+/// is in use. Any probe failure omits the note.
+async fn cursor_stored_login_note(program: &OsStr) -> Option<String> {
+    let captured = captured_credential_env().await;
+    let key_present = std::env::var_os("CURSOR_API_KEY").is_some_and(|v| !v.is_empty())
+        || captured
+            .get("CURSOR_API_KEY")
+            .is_some_and(|v| !v.is_empty());
+    if !key_present {
+        return None;
+    }
+    let mut cmd = probe_command(program);
+    gap_fill_credentials(&mut cmd, captured);
+    cmd.args(["status", "--format", "json"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(CLI_AUTH_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    cursor_status_note(true, &String::from_utf8_lossy(&output.stdout))
+}
+
+/// Pure seam for [`cursor_stored_login_note`]: a note only when the key is
+/// present and the status JSON reports a stored access token. Never log the
+/// payload (it carries the account email).
+fn cursor_status_note(key_present: bool, status_json: &str) -> Option<String> {
+    let stored = serde_json::from_str::<Value>(status_json)
+        .ok()?
+        .get("hasAccessToken")
+        .and_then(Value::as_bool)?;
+    (key_present && stored).then(|| CURSOR_STORED_LOGIN_IN_USE_NOTE.to_string())
+}
+
 /// Timeout for the opencode readiness probe (`opencode models` can be slower
 /// than a simple auth-file read; parity with the FE's 10s budget).
 const OPENCODE_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -592,7 +639,25 @@ async fn probe_provider(
         .as_ref()
         .map_or(program, |c| c.runtime.path().as_os_str().to_owned());
     match provider_id {
-        "auggie" | "codex" | "opencode" | "grok" | "cursor" => {
+        "cursor" => {
+            let args = intent_providers::find_provider(provider_id)
+                .and_then(|cfg| cfg.auth_check_args)
+                .unwrap_or_default();
+            let authenticated = check_provider_auth_cli_in(provider_id, &program, args, None)
+                .await
+                .auth_status();
+            let status_note = if authenticated == Some(true) {
+                cursor_stored_login_note(&program).await
+            } else {
+                None
+            };
+            AuthVerdict {
+                authenticated,
+                identity: None,
+                status_note,
+            }
+        }
+        "auggie" | "codex" | "opencode" | "grok" => {
             let args = intent_providers::find_provider(provider_id)
                 .and_then(|cfg| cfg.auth_check_args)
                 .unwrap_or_default();
@@ -624,6 +689,7 @@ async fn probe_provider(
             AuthVerdict {
                 authenticated,
                 identity: status.identity,
+                status_note: None,
             }
         }
         "droid" => {
@@ -844,12 +910,13 @@ impl AuthStatusCache {
     fn promote(&self, provider_id: &str) {
         let mut demotions = self.demotions.lock().expect("auth demotions poisoned");
         *demotions.entry(provider_id.to_owned()).or_insert(0) += 1;
-        let identity = self.fresh(provider_id).and_then(|verdict| verdict.identity);
+        let prior = self.fresh(provider_id);
         self.store(
             provider_id,
             AuthVerdict {
                 authenticated: Some(true),
-                identity,
+                identity: prior.as_ref().and_then(|verdict| verdict.identity.clone()),
+                status_note: prior.and_then(|verdict| verdict.status_note),
             },
         );
     }
@@ -1242,6 +1309,9 @@ fn auth_status_entry(id: &str, verdict: &AuthVerdict) -> Value {
     let mut entry = json!({ "id": id, "authenticated": verdict.authenticated });
     if let Some(identity) = &verdict.identity {
         entry["identity"] = identity.to_json();
+    }
+    if let Some(note) = &verdict.status_note {
+        entry["statusNote"] = json!(note);
     }
     entry
 }
@@ -2255,6 +2325,7 @@ while IFS= read -r unexpected; do exit 95; done
                         org_name: Some("Old Org".into()),
                         subscription_type: Some("max".into()),
                     }),
+                    status_note: None,
                 },
             ),
         );
@@ -2283,6 +2354,7 @@ while IFS= read -r unexpected; do exit 95; done
             AuthVerdict {
                 authenticated: Some(true),
                 identity: Some(identity.clone()),
+                status_note: None,
             },
         );
         cache().demote("test-identity-demote");
@@ -2296,6 +2368,7 @@ while IFS= read -r unexpected; do exit 95; done
             AuthVerdict {
                 authenticated: Some(false),
                 identity: Some(identity.clone()),
+                status_note: None,
             },
         );
         cache().promote("test-identity-promote");
@@ -2304,8 +2377,42 @@ while IFS= read -r unexpected; do exit 95; done
             Some(AuthVerdict {
                 authenticated: Some(true),
                 identity: Some(identity),
+                status_note: None,
             })
         );
+    }
+
+    /// Mixed Cursor credentials: with `CURSOR_API_KEY` set and a stored
+    /// login (`status --format json` → `hasAccessToken: true`), the signed-in
+    /// entry says the stored login is in use; otherwise no note.
+    #[test]
+    fn cursor_status_note_names_the_stored_login_only_in_the_mixed_case() {
+        let stored = r#"{"status":"authenticated","isAuthenticated":true,"hasAccessToken":true,"hasRefreshToken":true}"#;
+        let key_only =
+            r#"{"status":"authenticated","isAuthenticated":true,"hasAccessToken":false}"#;
+        assert_eq!(
+            cursor_status_note(true, stored).as_deref(),
+            Some(CURSOR_STORED_LOGIN_IN_USE_NOTE)
+        );
+        assert_eq!(cursor_status_note(false, stored), None);
+        assert_eq!(cursor_status_note(true, key_only), None);
+        assert_eq!(cursor_status_note(true, "not json"), None);
+        let entry = auth_status_entry(
+            "cursor",
+            &AuthVerdict {
+                authenticated: Some(true),
+                identity: None,
+                status_note: cursor_status_note(true, stored),
+            },
+        );
+        assert_eq!(
+            entry,
+            json!({ "id": "cursor", "authenticated": true, "statusNote": CURSOR_STORED_LOGIN_IN_USE_NOTE })
+        );
+        assert!(entry["statusNote"]
+            .as_str()
+            .unwrap()
+            .contains("stored Cursor login"));
     }
 
     /// The wire entry carries the additive `identity` object only when the
@@ -2325,6 +2432,7 @@ while IFS= read -r unexpected; do exit 95; done
                 org_name: None,
                 subscription_type: None,
             }),
+            status_note: None,
         };
         assert_eq!(
             auth_status_entry("claude-code", &partial),
