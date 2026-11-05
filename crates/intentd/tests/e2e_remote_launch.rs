@@ -2631,3 +2631,207 @@ fn entry_is_script(work: &Path) -> bool {
         name.starts_with("setup-") && Path::new(&name).extension().is_some_and(|ext| ext == "sh")
     })
 }
+
+/// The `name` file the fixture provider wrote in `agent_id`'s worktree under
+/// the machine's data dir `root`.
+fn find_agent_file(root: &Path, agent_id: &str, name: &str) -> Option<std::path::PathBuf> {
+    find_agent_pid_file(root, agent_id)
+        .map(|pid| pid.with_file_name(name))
+        .filter(|path| path.exists())
+}
+
+/// Poll `mcp.servers.getStatus` until `server_id` runs in head's hub, and
+/// return its status.
+async fn running_mcp_server(rpc_ws: &mut common::TlsWs, server_id: &str, id: i64) -> Value {
+    let mut next = id;
+    let found = timeout(wait(), async {
+        loop {
+            next += 1;
+            let status = ok(
+                rpc_ws,
+                next,
+                "mcp.servers.getStatus",
+                json!({ "serverId": server_id }),
+            )
+            .await;
+            if status["status"]["state"] == "running" {
+                return status["status"].clone();
+            }
+            // timing-guard: poll interval while head's hub starts the stdio server (no event in this harness's subscription)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    found.unwrap_or_else(|_| panic!("mcp server {server_id} never ran on head"))
+}
+
+/// Remote parity S4 (nodeProtocol 11): a remote agent's provider sees the
+/// user's MCP servers as servers in its own session, and their tool calls
+/// run in head's MCP hub, as the agent (head runs with the bound-caller
+/// assertion armed). The machine gets names and ids only: no command,
+/// environment or secret. A server a local agent would not get (disabled)
+/// is not offered. `ws.mcp.*` is forwarded to head too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remote_agents_provider_calls_user_mcp_tools_in_heads_hub() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping remote S4 e2e: node or git not on PATH");
+        return;
+    }
+    const SECRET: &str = "s4-mcp-secret-5d1e";
+    let mcp_script = format!(
+        "{}/tests/fixtures/mock-mcp-server.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let scratch = common::test_tempdir_in("/tmp", "itd-s4-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let (_head, port, cfg, ws_id) = start_backend(&scratch.path().join("head"), &repo).await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let created = ok(
+        &mut rpc_ws,
+        1,
+        "mcp.servers.create",
+        json!({ "config": {
+            "name": "Echo",
+            "transport": "stdio",
+            "command": "node",
+            "args": [mcp_script],
+            "env": { "MOCK_MCP_SECRET": SECRET },
+            "enabled": true,
+        } }),
+    )
+    .await;
+    let server_id = created["server"]["id"].as_str().unwrap().to_owned();
+    ok(
+        &mut rpc_ws,
+        2,
+        "mcp.servers.create",
+        json!({ "config": {
+            "name": "Off",
+            "transport": "stdio",
+            "command": "node",
+            "args": [mcp_script],
+            "enabled": false,
+        } }),
+    )
+    .await;
+    let hub = running_mcp_server(&mut rpc_ws, &server_id, 3).await;
+    let hub_pid = hub["pid"].as_u64().expect("stdio pid");
+    let backend = ok(&mut rpc_ws, 100, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let machine = start_machine(&node_dir, &backend_id).await;
+    ok(
+        &mut rpc_ws,
+        101,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        102,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let create = json!({
+        "workspaceId": ws_id, "name": "Remote", "model": "default", "provider": "mock",
+        "placement": { "target": "remote" },
+    });
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 110;
+    let created = loop {
+        id += 1;
+        let response = rpc(&mut rpc_ws, id, "agent.create", create.clone()).await;
+        if response.get("error").is_none() {
+            break response["result"].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the placement: {response}"
+        );
+        // timing-guard: poll interval while the machine daemon binds to head (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+
+    // The provider starts the server named in its session and calls an
+    // (unlisted) tool: it answers from head's hub process, with the secret
+    // only head's config holds.
+    let reply = turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        r#"mcp Echo whoami {"input":"from-provider"}"#,
+        200,
+    )
+    .await;
+    let body: Value = serde_json::from_str(
+        reply
+            .strip_prefix("mcp: ")
+            .unwrap_or_else(|| panic!("{reply}")),
+    )
+    .unwrap();
+    assert!(body["capabilities"]["tools"].is_object(), "{body}");
+    assert_eq!(body["tools"], json!(["echo", "reverse"]), "{body}");
+    assert!(body["error"].is_null(), "{body}");
+    let who: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(who["pid"].as_u64(), Some(hub_pid), "ran in head's hub: {who}");
+    assert_eq!(who["secret"], SECRET, "{who}");
+    assert_eq!(who["input"], "from-provider", "{who}");
+
+    // The provider's session names the servers, nothing about them.
+    let session = std::fs::read_to_string(
+        find_agent_file(&node_dir, &agent_id, "session-mcp.json")
+            .expect("the provider recorded its session servers"),
+    )
+    .unwrap();
+    let servers: Value = serde_json::from_str(&session).unwrap();
+    let names: Vec<&str> = servers
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|server| server["name"].as_str())
+        .collect();
+    assert_eq!(names, ["workspace-mcp", "Echo"], "{session}");
+    assert!(!session.contains(SECRET), "{session}");
+    assert!(!session.contains("mock-mcp-server.mjs"), "{session}");
+
+    // ws.mcp.* is forwarded and runs on head's hub as the agent.
+    let wsapi = format!(
+        r#"wsapi const s = await ws.mcp.listServers(); const c = await ws.mcp.callTool({server_id:?}, "whoami", {{ input: "from-wsapi" }}); return JSON.stringify({{ marker: "turn-300", s, c }});"#
+    );
+    let reply = wsapi_turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        &wsapi,
+        "turn-300",
+        300,
+    )
+    .await;
+    assert!(reply.starts_with("wsapi: "), "{reply}");
+    let answer = wsapi_value(&reply);
+    let ids: Vec<&str> = answer["s"]["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|server| server["id"].as_str())
+        .collect();
+    assert!(ids.contains(&server_id.as_str()), "{answer}");
+    let who: Value =
+        serde_json::from_str(answer["c"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(who["pid"].as_u64(), Some(hub_pid), "{who}");
+    assert_eq!(who["input"], "from-wsapi", "{who}");
+    drop(machine);
+}
