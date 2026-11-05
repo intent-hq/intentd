@@ -1914,7 +1914,8 @@ impl<'a> McpServersService<'a> {
     /// this hub (nodeProtocol 11): the servers a local agent's spawn merges
     /// (`mcp.enableUserServers` on, `enabled`, not in `mcp.disabledServers`,
     /// a usable `command` or `url`, not the reserved `workspace-mcp`), less
-    /// those disabled for the workspace, sorted by name; on a repeated name
+    /// those disabled for the workspace and `sse` ones (the hub calls no
+    /// tools over `sse`), sorted by name; on a repeated name
     /// the last config wins, as at a local spawn. Names and ids only.
     pub(crate) async fn remote_proxies(
         &self,
@@ -1936,8 +1937,10 @@ impl<'a> McpServersService<'a> {
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
             };
+            // The hub calls no tools over `sse`, so it is not offered.
             let usable = match text("transport").unwrap_or("stdio") {
-                "http" | "sse" => text("url").is_some(),
+                "http" => text("url").is_some(),
+                "sse" => false,
                 _ => text("command").is_some(),
             };
             if !usable
@@ -3624,6 +3627,7 @@ for line in sys.stdin:
             json!({ "id": "w", "name": "Here", "transport": "stdio", "command": "x", "enabled": true }),
             json!({ "id": "r", "name": "workspace-mcp", "transport": "stdio", "command": "x", "enabled": true }),
             json!({ "id": "h", "name": "Alpha", "transport": "http", "url": "http://127.0.0.1:9/mcp", "enabled": true }),
+            json!({ "id": "s", "name": "Streamed", "transport": "sse", "url": "http://127.0.0.1:9/sse", "enabled": true }),
         ] {
             s.create(config).await.unwrap();
         }

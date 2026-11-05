@@ -27,8 +27,7 @@ use intent_core::node_link::{
 };
 use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
-    MCP_PROXY_LINK_TIMEOUT,
-    PLACEMENT_HELP_METHOD,
+    MCP_PROXY_LINK_TIMEOUT, PLACEMENT_HELP_METHOD,
 };
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
