@@ -49,7 +49,8 @@ pub use fs::FileService;
 pub use handler::{ClientRequestHandler, EventSink, SinkEvent};
 pub use handshake::handshake;
 pub use mcp_bridge::{
-    bridge_auth_line, run_stdio_bridge, serve_workspace_mcp_tcp, McpBridge, BRIDGE_TOKEN_ENV,
+    bridge_auth_line, run_stdio_bridge, serve_mcp_handler_tcp, serve_workspace_mcp_tcp, McpBridge,
+    McpHandler, BRIDGE_TOKEN_ENV,
 };
 pub use mcp_config::{
     apply_baseline_env_to_stdio_servers, normalize_mcp_servers, normalize_spaced_bridge_command,

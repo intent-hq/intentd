@@ -85,16 +85,17 @@ fn the_binding_wire_shape_uses_decimal_string_generations() {
 }
 
 #[test]
-fn the_daemon_to_daemon_link_speaks_protocols_7_to_10() {
+fn the_daemon_to_daemon_link_speaks_protocols_7_to_11() {
     // 7 adds the correlated stop acknowledgement. A protocol-6 peer cannot
     // send `stopAck`, so it never links: a backend must not take a stop as
     // confirmed by a machine that cannot confirm it. 8 adds the script
-    // frames, 9 final stops, 10 the prepared checkout; a protocol-7 peer
-    // still binds and runs agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 10 });
+    // frames, 9 final stops, 10 the prepared checkout, 11 the user MCP
+    // server proxies; a protocol-7 peer still binds and runs agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 11 });
     assert_eq!(SCRIPT_PROTOCOL, 8);
     assert_eq!(FINAL_STOP_PROTOCOL, 9);
-    assert_eq!(PREPARED_CHECKOUT_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    assert_eq!(PREPARED_CHECKOUT_PROTOCOL, 10);
+    assert_eq!(MCP_PROXY_PROTOCOL, NODE_LINK_PROTOCOLS.max);
     assert!(offers_prepared_checkout());
     for version in 7..=10 {
         ensure_protocol(version).unwrap();
@@ -438,6 +439,8 @@ fn every_frame() -> Vec<LinkFrame> {
             agent_features: serde_json::json!({}),
             is_sub_agent: false,
             checkout: None,
+            mcp_proxies: Vec::new(),
+            compact_tool_descriptions: false,
         }),
         LinkFrame::Prompt {
             agent_id: agent_id.clone(),
@@ -780,6 +783,8 @@ fn launch_profile_env_never_debug_renders_its_values() {
             "env": [{ "key": "CODEX_ACCESS_TOKEN", "value": "canary-secret-7f3a" }],
         }))),
         checkout: None,
+        mcp_proxies: Vec::new(),
+        compact_tool_descriptions: false,
     };
     let rendered = format!("{command:?} {:?}", LinkFrame::Launch(command.clone()));
     assert!(!rendered.contains("canary-secret-7f3a"), "{rendered}");
@@ -804,6 +809,8 @@ fn launch_without_a_profile_omits_profile_env() {
         is_sub_agent: false,
         profile_env: None,
         checkout: None,
+        mcp_proxies: Vec::new(),
+        compact_tool_descriptions: false,
     };
     let wire = serde_json::to_value(&command).unwrap();
     assert!(wire.get("profileEnv").is_none(), "{wire}");
@@ -1054,6 +1061,8 @@ fn a_launch_with_a_checkout_needs_protocol_10() {
             is_sub_agent: false,
             profile_env: None,
             checkout,
+            mcp_proxies: Vec::new(),
+            compact_tool_descriptions: false,
         })
     };
     assert_eq!(launch(None).min_protocol(), NODE_LINK_PROTOCOLS.min);
@@ -1061,4 +1070,54 @@ fn a_launch_with_a_checkout_needs_protocol_10() {
         launch(Some(Box::default())).min_protocol(),
         PREPARED_CHECKOUT_PROTOCOL
     );
+}
+
+/// nodeProtocol 11's `mcpProxies`: names and ids only, closed entries; a
+/// launch that carries any needs protocol 11 (an older machine would start
+/// the agent without them), and one without them travels as before.
+#[test]
+fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
+    let launch =
+        |mcp_proxies: Vec<McpProxy>, checkout: Option<Box<PreparedCheckout>>| LaunchCommand {
+            agent_id: AgentId::from("a1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            provider: "codex".into(),
+            model: None,
+            base_commit: "base".into(),
+            repo_key: "repo".into(),
+            agent_features: json!({}),
+            is_sub_agent: false,
+            profile_env: None,
+            checkout,
+            mcp_proxies,
+            compact_tool_descriptions: false,
+        };
+    let proxy = McpProxy {
+        name: "Linear".into(),
+        server_id: "srv-1".into(),
+    };
+    let with = launch(vec![proxy.clone()], Some(Box::default()));
+    assert_eq!(
+        LinkFrame::Launch(with.clone()).min_protocol(),
+        MCP_PROXY_PROTOCOL
+    );
+    assert_eq!(
+        LinkFrame::Launch(launch(Vec::new(), None)).min_protocol(),
+        NODE_LINK_PROTOCOLS.min
+    );
+    let wire = serde_json::to_value(&with).unwrap();
+    assert_eq!(
+        wire["mcpProxies"],
+        json!([{ "name": "Linear", "serverId": "srv-1" }])
+    );
+    let bare = serde_json::to_value(launch(Vec::new(), None)).unwrap();
+    assert!(bare.get("mcpProxies").is_none(), "{bare}");
+    assert!(bare.get("compactToolDescriptions").is_none(), "{bare}");
+    assert!(serde_json::from_value::<McpProxy>(
+        json!({ "name": "x", "serverId": "y", "command": "leak" })
+    )
+    .is_err());
+    let decoded: LaunchCommand = serde_json::from_value(bare).unwrap();
+    assert!(decoded.mcp_proxies.is_empty());
+    assert!(!decoded.compact_tool_descriptions);
 }

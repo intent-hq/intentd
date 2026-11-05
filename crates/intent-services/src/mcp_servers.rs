@@ -48,6 +48,12 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard cap on a caller-supplied tool-call timeout, kept below the 60s hook
 /// budget so a forwarded call always resolves within one hook run.
 const TOOL_TIMEOUT_CAP: Duration = Duration::from_secs(55);
+/// The built-in workspace server's name, never given to a user server.
+const RESERVED_SERVER_NAME: &str = "workspace-mcp";
+/// Bound on a remote agent's proxied `tools/call` (nodeProtocol 11), longer
+/// than [`TOOL_TIMEOUT_CAP`]: it is the provider's own call, not a hook run.
+const PROXY_TOOL_TIMEOUT: Duration =
+    intent_core::remote_launch::workspace_api::MCP_PROXY_CALL_TIMEOUT;
 /// `Accept` header required by MCP streamable HTTP (the server may answer a
 /// POST with either a plain JSON body or an SSE stream).
 const HTTP_ACCEPT: &str = "application/json, text/event-stream";
@@ -768,6 +774,25 @@ impl McpHub {
         let timeout = timeout.unwrap_or(TOOL_TIMEOUT).min(TOOL_TIMEOUT_CAP);
         let params = json!({ "name": tool_name, "arguments": args });
         self.forward(server_id, "tools/call", params, timeout).await
+    }
+
+    /// Forward `tools/call` for a remote agent's provider, bounded by
+    /// [`PROXY_TOOL_TIMEOUT`] instead of the `ws.mcp` cap.
+    pub(crate) async fn proxy_call_tool(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+        args: Value,
+    ) -> Result<Value> {
+        let params = json!({ "name": tool_name, "arguments": args });
+        self.forward(server_id, "tools/call", params, PROXY_TOOL_TIMEOUT)
+            .await
+    }
+
+    /// Whether the hub can take a tool request for `server_id` now; `false`
+    /// when it is not running (another refusal, such as `sse`, passes).
+    fn is_running(&self, server_id: &str) -> bool {
+        !matches!(self.tool_target(server_id), Err(Error::NotFound(_)))
     }
 
     /// Forward one tool request to the server's transport. stdio reuses the
@@ -1827,6 +1852,13 @@ impl<'a> McpServersService<'a> {
                 "mcp: disabled in settings (agentFeatures.mcpTools = false)".to_string(),
             ));
         }
+        Self::require_user_servers(settings)
+    }
+
+    /// The `mcp.enableUserServers` master switch alone: the gate on the
+    /// servers a provider gets, which `agentFeatures.mcpTools` (the
+    /// `ws.mcp` toggle) does not gate.
+    fn require_user_servers(settings: SettingsFile) -> Result<SettingsFile> {
         if !enable_user_servers(&settings) {
             return Err(Error::InvalidParams(
                 "mcp: user servers disabled in settings (mcp.enableUserServers = false)"
@@ -1847,6 +1879,19 @@ impl<'a> McpServersService<'a> {
         server_id: &str,
     ) -> Result<()> {
         let settings = self.require_agent_mcp()?;
+        self.require_enabled_server(settings, workspace_id, server_id)
+            .await
+            .map(|_| ())
+    }
+
+    /// The per-server half of [`Self::require_agent_server`]; the server's
+    /// config when it passes.
+    async fn require_enabled_server(
+        &self,
+        settings: SettingsFile,
+        workspace_id: Option<&str>,
+        server_id: &str,
+    ) -> Result<Value> {
         let config = self.require_config(server_id).await?;
         let enabled = config
             .get("enabled")
@@ -1862,7 +1907,105 @@ impl<'a> McpServersService<'a> {
                 "mcp server {server_id} is disabled for this workspace"
             )));
         }
-        Ok(())
+        Ok(config)
+    }
+
+    /// The user MCP servers a remote agent of `workspace_id` gets proxied to
+    /// this hub (nodeProtocol 11): the servers a local agent's spawn merges
+    /// (`mcp.enableUserServers` on, `enabled`, not in `mcp.disabledServers`,
+    /// a usable `command` or `url`, not the reserved `workspace-mcp`), less
+    /// those disabled for the workspace and `sse` ones (the hub calls no
+    /// tools over `sse`), sorted by name; on a repeated name
+    /// the last config wins, as at a local spawn. Names and ids only.
+    pub(crate) async fn remote_proxies(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<intent_core::node_link::McpProxy>> {
+        let settings = self.effective();
+        if !enable_user_servers(&settings) {
+            return Ok(Vec::new());
+        }
+        let disabled = disabled_servers(&settings);
+        let ws_disabled = self.workspace_disabled_ids(Some(workspace_id)).await?;
+        let mut named = std::collections::BTreeMap::new();
+        for (id, config) in &read_configs(self.secrets).await {
+            let Some(obj) = config.as_object() else {
+                continue;
+            };
+            let text = |key: &str| {
+                obj.get(key)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+            };
+            // The hub calls no tools over `sse`, so it is not offered.
+            let usable = match text("transport").unwrap_or("stdio") {
+                "http" => text("url").is_some(),
+                "sse" => false,
+                _ => text("command").is_some(),
+            };
+            if !usable
+                || !obj.get("enabled").and_then(Value::as_bool).unwrap_or(false)
+                || disabled.contains(id)
+                || ws_disabled.contains(id)
+            {
+                continue;
+            }
+            let name = text("name").unwrap_or(id.as_str());
+            if name == RESERVED_SERVER_NAME {
+                continue;
+            }
+            named.insert(name.to_owned(), id.clone());
+        }
+        Ok(named
+            .into_iter()
+            .map(|(name, server_id)| intent_core::node_link::McpProxy { name, server_id })
+            .collect())
+    }
+
+    /// The gates on a remote agent's proxied request to `server_id`: the
+    /// launch's server gates read again (not `agentFeatures.mcpTools`), then
+    /// the hub must be running it. The server's display name when it passes.
+    async fn require_proxy_server(&self, workspace_id: &str, server_id: &str) -> Result<String> {
+        let settings = Self::require_user_servers(self.effective())?;
+        let config = self
+            .require_enabled_server(settings, Some(workspace_id), server_id)
+            .await?;
+        let name = config
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(server_id)
+            .to_owned();
+        if !self.hub.is_running(server_id) {
+            return Err(Error::InvalidParams(format!(
+                "mcp-proxy-unavailable: MCP server {name} is not running on the backend. Start it in Settings → MCP servers."
+            )));
+        }
+        Ok(name)
+    }
+
+    /// A remote agent's proxied `tools/list`: the raw MCP result.
+    pub(crate) async fn proxy_list_tools(
+        &self,
+        workspace_id: &str,
+        server_id: &str,
+    ) -> Result<Value> {
+        self.require_proxy_server(workspace_id, server_id).await?;
+        self.hub.list_tools(server_id).await
+    }
+
+    /// A remote agent's proxied `tools/call`, bounded by
+    /// [`PROXY_TOOL_TIMEOUT`]: the raw MCP result and the server's name.
+    pub(crate) async fn proxy_call_tool(
+        &self,
+        workspace_id: &str,
+        server_id: &str,
+        tool_name: &str,
+        args: Value,
+    ) -> Result<(Value, String)> {
+        let name = self.require_proxy_server(workspace_id, server_id).await?;
+        let result = self.hub.proxy_call_tool(server_id, tool_name, args).await?;
+        Ok((result, name))
     }
 
     /// `ws.mcp.listServers`: every configured server projected to a
@@ -3463,6 +3606,100 @@ for line in sys.stdin:
                 );
             }
         }
+    }
+
+    /// Remote parity S4: a remote agent's provider is offered the servers a
+    /// local agent's spawn merges, less those disabled for its workspace;
+    /// names and ids only, sorted by name.
+    #[tokio::test]
+    async fn remote_proxies_are_a_local_agents_servers_less_the_workspace_disabled() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let (_tmp, store, ws_id) = store_with_workspace().await;
+        reg.apply(&[("mcp.disabledServers".to_string(), json!(["g"]))])
+            .unwrap();
+        let s = svc_with_store(Some(&reg), &secrets, &h, &store);
+        for config in [
+            json!({ "id": "a", "name": "Zed", "transport": "stdio", "command": "x", "enabled": true }),
+            json!({ "id": "b", "name": "Off", "transport": "stdio", "command": "x", "enabled": false }),
+            json!({ "id": "g", "name": "Global", "transport": "stdio", "command": "x", "enabled": true }),
+            json!({ "id": "w", "name": "Here", "transport": "stdio", "command": "x", "enabled": true }),
+            json!({ "id": "r", "name": "workspace-mcp", "transport": "stdio", "command": "x", "enabled": true }),
+            json!({ "id": "h", "name": "Alpha", "transport": "http", "url": "http://127.0.0.1:9/mcp", "enabled": true }),
+            json!({ "id": "s", "name": "Streamed", "transport": "sse", "url": "http://127.0.0.1:9/sse", "enabled": true }),
+        ] {
+            s.create(config).await.unwrap();
+        }
+        s.toggle_workspace(&ws_id, "w", false).await.unwrap();
+        let proxies = s.remote_proxies(&ws_id).await.unwrap();
+        let pairs: Vec<(&str, &str)> = proxies
+            .iter()
+            .map(|p| (p.name.as_str(), p.server_id.as_str()))
+            .collect();
+        assert_eq!(pairs, [("Alpha", "h"), ("Zed", "a")]);
+        // Another workspace still gets the workspace-disabled one.
+        let elsewhere = s.remote_proxies("ws-other").await.unwrap();
+        assert!(elsewhere.iter().any(|p| p.server_id == "w"));
+        reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
+            .unwrap();
+        assert!(s.remote_proxies(&ws_id).await.unwrap().is_empty());
+    }
+
+    /// A provider's proxied request is not gated by `agentFeatures.mcpTools`
+    /// (the `ws.mcp` toggle; a local provider gets its servers regardless),
+    /// but keeps every server gate, read per call, and names a server the
+    /// hub is not running.
+    #[tokio::test]
+    async fn proxied_requests_keep_the_server_gates_but_not_the_ws_mcp_toggle() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let (_tmp, store, ws_id) = store_with_workspace().await;
+        reg.apply(&[("agentFeatures.mcpTools".to_string(), json!(false))])
+            .unwrap();
+        let s = svc_with_store(Some(&reg), &secrets, &h, &store);
+        for config in [
+            json!({ "id": "a", "name": "Alpha", "transport": "stdio", "command": "x", "enabled": true }),
+            json!({ "id": "b", "transport": "stdio", "command": "x", "enabled": false }),
+            json!({ "id": "w", "transport": "stdio", "command": "x", "enabled": true }),
+        ] {
+            s.create(config).await.unwrap();
+        }
+        s.toggle_workspace(&ws_id, "w", false).await.unwrap();
+        let error = s
+            .proxy_list_tools(&ws_id, "a")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("mcp-proxy-unavailable: MCP server Alpha is not running on the backend. Start it in Settings → MCP servers."),
+            "{error}"
+        );
+        let error = s
+            .proxy_call_tool(&ws_id, "b", "t", json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mcp server b is disabled"), "{error}");
+        let error = s
+            .proxy_list_tools(&ws_id, "w")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("disabled for this workspace"), "{error}");
+        assert!(matches!(
+            s.proxy_list_tools(&ws_id, "nope").await.unwrap_err(),
+            Error::NotFound(_)
+        ));
+        reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
+            .unwrap();
+        let error = s
+            .proxy_list_tools(&ws_id, "a")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mcp.enableUserServers"), "{error}");
     }
 
     #[tokio::test]

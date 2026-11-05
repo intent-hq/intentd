@@ -27,7 +27,12 @@
 // session/new) and streams "wsapi: <result text>" (or "wsapi-error: ...").
 // "wsapi-tool <code>" does the same and also reports the call as a
 // `workspace_api` tool_call / tool_call_update carrying the MCP content
-// items, as a real provider does. A `<system>` block in the prompt is ignored.
+// items, as a real provider does. "mcp <server> <tool> <json args>" runs the
+// stdio command of the session/new entry named <server> (as a real provider
+// starts a user MCP server), lists its tools and calls <tool>, and streams
+// "mcp: {tools, result}" (or "mcp-error: ..."). session/new writes the
+// servers it got to `session-mcp.json`. A `<system>` block in the prompt is
+// ignored.
 import readline from 'node:readline';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -103,6 +108,43 @@ function workspaceApi(code) {
   });
 }
 
+// initialize, tools/list and tools/call <tool> on the stdio MCP server named
+// `name` in session/new, through its own command and env.
+function mcpCall(name, tool, args) {
+  const server = mcpServers.find((s) => s.name === name);
+  if (!server) return Promise.reject(new Error(`no MCP server ${name}`));
+  return new Promise((resolve, reject) => {
+    const env = { ...process.env };
+    for (const { name: key, value } of server.env ?? []) env[key] = value;
+    const child = spawn(server.command, server.args, { env, stdio: ['pipe', 'pipe', 'ignore'] });
+    child.on('error', reject);
+    const replies = {};
+    let buffered = '';
+    child.stdout.on('data', (data) => {
+      buffered += data;
+      let newline;
+      while ((newline = buffered.indexOf('\n')) >= 0) {
+        const reply = JSON.parse(buffered.slice(0, newline));
+        buffered = buffered.slice(newline + 1);
+        replies[reply.id] = reply;
+        // List, then call, as a provider does: the bridge answers requests
+        // concurrently, so a call sent with the list can finish first.
+        if (reply.id === 2) {
+          frame({ id: 3, method: 'tools/call', params: { name: tool, arguments: args } });
+        }
+        if (reply.id === 3) {
+          child.kill();
+          resolve({ init: replies[1], tools: replies[2], call: replies[3] });
+        }
+      }
+    });
+    const frame = (message) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
+    frame({ id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'node-test-agent', version: '0' } } });
+    frame({ method: 'notifications/initialized' });
+    frame({ id: 2, method: 'tools/list', params: {} });
+  });
+}
+
 function send(message) {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
 }
@@ -138,6 +180,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
     case 'session/new':
       if (hangSetup) return;
       mcpServers = msg.params?.mcpServers ?? [];
+      fs.writeFileSync('session-mcp.json', JSON.stringify(mcpServers));
       if (authRequiredSetup) return send({ id: msg.id, error: AUTH_REQUIRED });
       if (failSetupVar) {
         const value = process.env[failSetupVar];
@@ -149,6 +192,24 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       return send({ id: msg.id, result: { sessionId: SESSION } });
     case 'session/prompt': {
       const text = promptText(msg.params);
+      const mcp = text.match(/^mcp (\S+) (\S+) (.*)$/);
+      if (mcp) {
+        let line;
+        try {
+          const { init, tools, call } = await mcpCall(mcp[1], mcp[2], JSON.parse(mcp[3]));
+          line = `mcp: ${JSON.stringify({ capabilities: init?.result?.capabilities, tools: (tools?.result?.tools ?? []).map((t) => t.name), result: call.result, error: call.error })}`;
+        } catch (error) {
+          line = `mcp-error: ${error}`;
+        }
+        send({
+          method: 'session/update',
+          params: {
+            sessionId: SESSION,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: line } },
+          },
+        });
+        return send({ id: msg.id, result: { stopReason: 'end_turn' } });
+      }
       const asTool = text.startsWith('wsapi-tool ');
       if (asTool || text.startsWith('wsapi ')) {
         const code = text.slice(asTool ? 'wsapi-tool '.length : 'wsapi '.length);

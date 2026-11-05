@@ -21,7 +21,7 @@ use intent_core::machines::ExposedMachine;
 use intent_core::node_link::MachineCapabilities;
 use intent_core::node_link::{
     LaunchCommand, LaunchProfileEnv, PreparedCheckout, SetupCommand, SubmodulePin,
-    PREPARED_CHECKOUT_PROTOCOL,
+    MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL,
 };
 use intent_core::placement::{
     AgentPlacement, MachineRef, PlacementCheckout, PlacementTarget, PlacementUnavailable,
@@ -107,6 +107,12 @@ async fn link_protocol(node: &RemoteNode) -> Result<u32> {
         node.connect().await?;
     }
     Ok(node.shared_ref().protocol())
+}
+
+/// What a remote agent's instructions say when its machine's link is older
+/// than [`MCP_PROXY_PROTOCOL`] and it would have had user MCP servers.
+pub(crate) fn mcp_servers_notice(machine: &str) -> String {
+    format!("Your MCP servers are not available on {machine} until Intent there is updated.")
 }
 
 /// Refuse a checkout that needs preparing on a machine whose link is older
@@ -363,6 +369,31 @@ impl RemoteLaunchPort for RemoteLaunch {
 
     fn placement_help<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Option<String>> {
         Box::pin(help_text(svc))
+    }
+
+    fn mcp_servers_notice<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let record = svc.store().get_remote_agent(agent_id).await.ok()??;
+            let node = svc
+                .remote_feature()?
+                .node(svc, &record.node_id)
+                .await
+                .ok()?;
+            let protocol = link_protocol(&node).await.ok()?;
+            if protocol >= MCP_PROXY_PROTOCOL
+                || svc
+                    .remote_mcp_proxies(&record.workspace_id)
+                    .await
+                    .is_empty()
+            {
+                return None;
+            }
+            Some(mcp_servers_notice(&node.status().node_name))
+        })
     }
 
     fn admit<'a>(
@@ -663,6 +694,20 @@ impl RemoteLaunchPort for RemoteLaunch {
             if checkout.is_some() && view.setup.is_none() {
                 record_setup_pending(svc, &record.workspace_id, agent_id).await;
             }
+            // The user's MCP servers, proxied to this daemon's hub, only on a
+            // link that has them; an older machine would start without them
+            // anyway (its instructions say so).
+            let mcp_proxies = if link_protocol(&node).await? >= MCP_PROXY_PROTOCOL {
+                svc.remote_mcp_proxies(&record.workspace_id).await
+            } else {
+                Vec::new()
+            };
+            // The same call that puts the condensed reference in the
+            // instructions, so the compact description never points at a
+            // missing section.
+            let compact_tool_descriptions =
+                intent_providers::find_provider(intent_providers::base_provider_id(&provider))
+                    .is_some_and(|entry| entry.truncates_tool_descriptions);
             let checkout_dir = workspace_checkout(svc, &record.workspace_id).await?;
             let repo_key = blocking(move || node_git::repo_key(&checkout_dir)).await?;
             let runtime = node
@@ -677,6 +722,8 @@ impl RemoteLaunchPort for RemoteLaunch {
                     agent_features,
                     is_sub_agent,
                     checkout,
+                    mcp_proxies,
+                    compact_tool_descriptions,
                 })
                 .await?;
             Ok(runtime as Arc<RemoteRuntime>)
