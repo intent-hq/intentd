@@ -1280,11 +1280,16 @@ async fn a_lease_agents_hooks_questions_and_client_calls_run_on_head() {
     let drained = f.services.turn_attachments().finish_turn(&agent);
     assert_eq!(drained.len(), 1, "{drained:?}");
     assert_eq!(drained[0].id, asked["attachmentId"].as_str().unwrap());
-    assert_eq!(
-        drained[0].mime_type,
-        "application/vnd.intent.question+json"
+    assert_eq!(drained[0].mime_type, "application/vnd.intent.question+json");
+    let docs = answered(
+        forward(
+            &link,
+            &agent,
+            "browser.docs",
+            json!({ "topic": "overview" }),
+        )
+        .await,
     );
-    let docs = answered(forward(&link, &agent, "browser.docs", json!({ "topic": "overview" })).await);
     assert!(docs.as_str().is_some_and(|text| !text.is_empty()), "{docs}");
 
     // These reach head's own bindings: whatever they answer is a local
@@ -1306,7 +1311,12 @@ async fn a_lease_agents_hooks_questions_and_client_calls_run_on_head() {
 
     let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
     let unplaced = f.agent(&view).await;
-    for method in ["hook.list", "app.question.ask", "browser.docs", "desktop.listDisplay"] {
+    for method in [
+        "hook.list",
+        "app.question.ask",
+        "browser.docs",
+        "desktop.listDisplay",
+    ] {
         let denied = refused(forward(&link, &unplaced, method, json!({})).await);
         assert!(
             denied.message.starts_with("node-agent-denied"),

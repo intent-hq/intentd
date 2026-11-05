@@ -4,8 +4,10 @@
 //! Each `host({ method, args })` frame is routed by its method: calls on the
 //! agent's own checkout and host run on the node, a fixed set of control-plane
 //! namespaces (saved scripts included: head keeps them and runs them on the
-//! agent's machine), plus single methods such as `workspace.details`,
-//! `git.listRoots` and the terminal reads ([`FORWARDED_METHODS`]), is
+//! agent's machine; hooks run on head; the browser and the desktop act on the
+//! user's client connected to head), plus single methods such as
+//! `workspace.details`, `git.listRoots`, the terminal reads and
+//! `app.question.ask` ([`FORWARDED_METHODS`]), is
 //! forwarded to head over the node link (head checks the agent is on the
 //! link's lease and routes the frame again, never trusting the node), and
 //! everything else is refused with an explicit error instead of running on
@@ -45,7 +47,10 @@ pub const INTERNAL_METHODS: &[&str] = &[
 /// Most cards one [`ATTACHMENTS_METHOD`] frame carries.
 pub const MAX_FORWARDED_ATTACHMENTS: usize = 32;
 
-/// Namespaces forwarded to head.
+/// Namespaces forwarded to head. A remote agent's hooks belong to it but
+/// run on head: their code and its `ws.host.exec` see head's worktree, and
+/// their wakes reach the agent as agent messages. `browser` and `desktop`
+/// act on the user's client connected to head, with a local agent's consent.
 pub const FORWARDED_NAMESPACES: &[&str] = &[
     "note",
     "task",
@@ -58,6 +63,9 @@ pub const FORWARDED_NAMESPACES: &[&str] = &[
     "primitive",
     "discussion",
     "crossWorkspace",
+    "hook",
+    "browser",
+    "desktop",
 ];
 
 /// Methods that run on the node, against the agent's checkout.
@@ -74,8 +82,9 @@ pub const LOCAL_METHODS: &[&str] = &[
 ];
 
 /// Single methods forwarded to head outside [`FORWARDED_NAMESPACES`]: the
-/// `workspace.*` calls other than `info`, the secondary-root list and the
-/// read-only terminal calls. Head runs them as the agent with a local
+/// `workspace.*` calls other than `info`, the secondary-root list, the
+/// read-only terminal calls and structured questions (registered for the
+/// agent's turn on head, so they drain onto its message there). Head runs them as the agent with a local
 /// agent's checks, so `setAgentName` renames only the caller, a sub-agent
 /// cannot propose, and `archive` / `unarchive` act on the workspace on head
 /// (not the agent's checkout); the node publishes a proposal's card with
@@ -99,6 +108,7 @@ pub const FORWARDED_METHODS: &[&str] = &[
     "git.listRoots",
     "terminal.list",
     "terminal.readOutput",
+    "app.question.ask",
 ];
 
 /// Why secondary git roots (`git.registerRoot`, `git.unregisterRoot`, a
@@ -174,7 +184,7 @@ pub fn unsupported_message(method: &str) -> String {
         format!("ws.{namespace}.* is")
     };
     format!(
-        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.git.listRoots, ws.terminal.list and readOutput, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
+        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.app.question.ask, ws.git.listRoots, ws.terminal.list and readOutput, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
         FORWARDED_NAMESPACES
             .iter()
             .filter(|namespace| **namespace != "mr")

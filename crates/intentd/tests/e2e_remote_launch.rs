@@ -914,7 +914,10 @@ async fn remote_hooks_questions_and_client_calls(
     );
     let request = timeout(wait(), seen.recv()).await.unwrap().unwrap();
     assert_eq!(request["method"], "browser.exec", "{request}");
-    assert_eq!(request["params"]["actions"][0]["action"], "getUrl", "{request}");
+    assert_eq!(
+        request["params"]["actions"][0]["action"], "getUrl",
+        "{request}"
+    );
 
     let controlled = wsapi_turn(
         rpc_ws,
