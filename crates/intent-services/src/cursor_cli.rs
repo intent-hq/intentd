@@ -389,7 +389,8 @@ mod tests {
     /// Wait (bounded) until none of `pids` runs.
     #[cfg(unix)]
     fn assert_all_gone(pids: &[i32], what: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
         while pids.iter().any(|p| alive(*p)) {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -421,7 +422,8 @@ mod tests {
 
     #[cfg(unix)]
     fn recorded_pid(pid_file: &std::path::Path) -> i32 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
         loop {
             if let Some(pid) = std::fs::read_to_string(pid_file)
                 .ok()
