@@ -255,11 +255,14 @@ async fn before_its_first_start_the_machine_user_skills_merge_with_project_skill
 }
 
 #[tokio::test]
-async fn an_older_machine_gets_project_skills_and_machine_update_required() {
+async fn an_older_machine_offers_no_skills_and_machine_update_required() {
     let (_tmp, svc, ws, id, _port, _root) =
         fixture(Some(view(None)), MachineSkills::UpdateRequired).await;
     let listed = list(&svc, &ws, &id).await;
-    assert_eq!(rows(&listed).len(), 2);
+    assert!(
+        rows(&listed).is_empty(),
+        "an older machine gives its agent no catalog: {listed}"
+    );
     assert_eq!(listed["unavailable"], "machine-update-required");
 }
 

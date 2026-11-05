@@ -72,8 +72,9 @@ impl Services {
                 }
                 json!({ "skills": by_name.into_values().collect::<Vec<_>>() })
             }
+            // An older machine gives its agent no catalog: offer nothing.
             MachineSkills::UpdateRequired => {
-                json!({ "skills": sorted(project), "unavailable": MACHINE_UPDATE_REQUIRED })
+                json!({ "skills": [], "unavailable": MACHINE_UPDATE_REQUIRED })
             }
             MachineSkills::Offline | MachineSkills::Reachable => {
                 json!({ "skills": sorted(project), "unavailable": MACHINE_OFFLINE })
