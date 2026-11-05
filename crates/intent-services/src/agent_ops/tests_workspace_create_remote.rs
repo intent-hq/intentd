@@ -77,6 +77,7 @@ impl RemoteLaunchPort for FakeRemote {
                 submodules: None,
                 setup: None,
                 setup_script: None,
+                skills: None,
             })
         })
     }

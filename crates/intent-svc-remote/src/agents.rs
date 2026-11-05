@@ -124,7 +124,8 @@ impl AgentSink {
             // The connector records these on the agent's placement.
             JournalBody::Started { .. }
             | JournalBody::SetupStarted { .. }
-            | JournalBody::SetupFinished { .. } => {}
+            | JournalBody::SetupFinished { .. }
+            | JournalBody::Skills { .. } => {}
             JournalBody::Notification { notification } => {
                 self.requests.fetch_add(1, Ordering::SeqCst);
                 // The manager may have dropped the stream; nothing to do then.

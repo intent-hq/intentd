@@ -190,6 +190,63 @@ pub(crate) fn invalidate_skills_cache(workspace_path: &Path) {
     }
 }
 
+/// Discovery on a remote agent's machine (node-link.md § Skills on the
+/// machine): user roots under `home` (the daemon's own `CLAUDE_CONFIG_DIR`
+/// as for local agents), then project roots in `checkout`. Name-sorted.
+/// Fresh and blocking, like [`discover_skills_sync`].
+#[must_use]
+pub fn discover_on_machine(
+    checkout: Option<&Path>,
+    home: Option<PathBuf>,
+) -> Vec<intent_core::node_link::MachineSkill> {
+    let checkout = checkout.and_then(|path| path.canonicalize().ok());
+    let checkout = checkout.as_ref().map(|path| path.to_string_lossy());
+    let mut skills = scan_skills_sync(checkout.as_deref(), home).skills;
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+        .into_iter()
+        .map(SkillMetadata::into_machine)
+        .collect()
+}
+
+/// The `<available_skills>` prompt catalog of a machine's skills; empty
+/// when there are none.
+#[must_use]
+pub fn machine_catalog(skills: &[intent_core::node_link::MachineSkill]) -> String {
+    let skills: Vec<_> = skills
+        .iter()
+        .cloned()
+        .map(SkillMetadata::from_machine)
+        .collect();
+    build_skills_catalog(&skills)
+}
+
+impl SkillMetadata {
+    pub(crate) fn into_machine(self) -> intent_core::node_link::MachineSkill {
+        intent_core::node_link::MachineSkill {
+            name: self.name,
+            description: self.description,
+            location: self.location,
+            resource_directory: self.resource_directory,
+            scope: self.scope,
+            allowed_tools: self.allowed_tools,
+            compatibility: self.compatibility,
+        }
+    }
+
+    pub(crate) fn from_machine(skill: intent_core::node_link::MachineSkill) -> Self {
+        Self {
+            name: skill.name,
+            description: skill.description,
+            location: skill.location,
+            resource_directory: skill.resource_directory,
+            scope: skill.scope,
+            allowed_tools: skill.allowed_tools,
+            compatibility: skill.compatibility,
+        }
+    }
+}
+
 /// Empty `CLAUDE_CONFIG_DIR` has the same meaning as an unset variable.
 pub(crate) fn claude_config_dir(home: &Path) -> PathBuf {
     std::env::var_os("CLAUDE_CONFIG_DIR")
@@ -1535,5 +1592,59 @@ mod tests {
         let skills2 = discover_skills_test(&workspace_path.to_string_lossy(), home_dir).await;
         assert_eq!(skills2.len(), 1);
         assert_eq!(skills2[0].description, "Updated description");
+    }
+
+    /// A remote agent's machine scans its own home and the agent's
+    /// checkout; a project skill wins a name collision, and without a
+    /// checkout only user skills are found (node-link.md § Skills on the
+    /// machine).
+    #[tokio::test]
+    async fn machine_discovery_scans_its_home_and_the_checkout() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home = temp_dir.path().join("home");
+        let checkout = temp_dir.path().join("checkout");
+        tokio::fs::create_dir_all(&checkout).await.unwrap();
+        let skill = |name: &str, from: &str| {
+            build_skill_content(&format!("name: {name}\ndescription: from {from}"), "Body.")
+        };
+        write_skill(&home.join(".claude/skills"), "mine", &skill("mine", "home")).await;
+        write_skill(
+            &home.join(".agents/skills"),
+            "shared",
+            &skill("shared", "user"),
+        )
+        .await;
+        write_skill(
+            &checkout.join(".claude/skills"),
+            "shared",
+            &skill("shared", "checkout"),
+        )
+        .await;
+
+        let found = discover_on_machine(Some(&checkout), Some(home.clone()));
+        let names: Vec<_> = found
+            .iter()
+            .map(|s| (s.name.as_str(), s.description.as_str(), s.scope.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("mine", "from home", "user"),
+                ("shared", "from checkout", "project")
+            ],
+            "sorted by name; project wins"
+        );
+
+        let user_only = discover_on_machine(None, Some(home.clone()));
+        let names: Vec<_> = user_only
+            .iter()
+            .map(|s| (s.name.as_str(), s.scope.as_str()))
+            .collect();
+        assert_eq!(names, [("mine", "user"), ("shared", "user")]);
+
+        let catalog = machine_catalog(&found);
+        assert!(catalog.contains("<available_skills>"), "{catalog}");
+        assert!(catalog.contains("<name>mine</name>"), "{catalog}");
+        assert!(machine_catalog(&[]).is_empty());
     }
 }

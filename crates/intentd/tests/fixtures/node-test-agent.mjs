@@ -32,7 +32,8 @@
 // starts a user MCP server), lists its tools and calls <tool>, and streams
 // "mcp: {tools, result}" (or "mcp-error: ..."). session/new writes the
 // servers it got to `session-mcp.json`. A `<system>` block in the prompt is
-// ignored.
+// ignored. "echo-skills" streams "skills: <names>" from every `<name>` of an
+// `<available_skills>` catalog anywhere in the raw prompt (or "skills: none").
 import readline from 'node:readline';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -192,6 +193,22 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       return send({ id: msg.id, result: { sessionId: SESSION } });
     case 'session/prompt': {
       const text = promptText(msg.params);
+      if (text === 'echo-skills') {
+        const raw = (msg.params?.prompt ?? []).map((block) => block?.text ?? '').join('\n');
+        const catalog = raw.match(/<available_skills>([\s\S]*?)<\/available_skills>/);
+        const names = catalog ? [...catalog[1].matchAll(/<name>([^<]*)<\/name>/g)].map((m) => m[1]) : [];
+        send({
+          method: 'session/update',
+          params: {
+            sessionId: SESSION,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `skills: ${names.length ? names.join(',') : 'none'}` },
+            },
+          },
+        });
+        return send({ id: msg.id, result: { stopReason: 'end_turn' } });
+      }
       const mcp = text.match(/^mcp (\S+) (\S+) (.*)$/);
       if (mcp) {
         let line;

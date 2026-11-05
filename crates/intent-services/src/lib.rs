@@ -68,6 +68,7 @@ mod executor_ops;
 mod link_traffic_ops;
 mod plain_folder;
 mod remote_machine_ops;
+mod remote_skills;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;
@@ -19839,6 +19840,7 @@ impl WorkspaceApi for Services {
             caps.insert("workspaceLabels".into(), serde_json::json!(1));
             caps.insert("workspaceAutoArchiveOptOut".into(), serde_json::json!(1));
             caps.insert("messageBlockPages".into(), serde_json::json!(1));
+            caps.insert("remoteAgentSkills".into(), serde_json::json!(1));
             // Reads answer bounded pages by default (default page sizes,
             // maximums and byte budgets), so a new app pages them.
             caps.insert("boundedReads".into(), serde_json::json!(1));
@@ -20394,6 +20396,14 @@ impl WorkspaceApi for Services {
 
             Ok(serde_json::to_value(&sorted_skills).unwrap_or(serde_json::Value::Array(vec![])))
         })
+    }
+
+    fn skill_list_for_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.agent_skill_list(workspace_id, agent_id))
     }
 
     fn specialist_create(

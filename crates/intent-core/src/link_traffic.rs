@@ -682,6 +682,12 @@ fn light_frame(frame: &LinkFrame) -> Value {
         }
         LinkFrame::Capabilities => json!({ "type": "capabilities" }),
         LinkFrame::CapabilitiesReply { .. } => json!({ "type": "capabilitiesReply" }),
+        LinkFrame::Skills(query) => json!({ "type": "skills", "queryId": query.query_id }),
+        LinkFrame::SkillsReply(reply) => json!({
+            "type": "skillsReply",
+            "queryId": reply.query_id,
+            "skills": reply.skills.len(),
+        }),
         LinkFrame::ScriptStart(start) => json!({
             "type": "scriptStart",
             "agentId": agent(&start.agent_id),
@@ -746,6 +752,7 @@ fn journal_kind(body: &JournalBody) -> &'static str {
         JournalBody::Exited { .. } => "exited",
         JournalBody::SetupStarted { .. } => "setupStarted",
         JournalBody::SetupFinished { .. } => "setupFinished",
+        JournalBody::Skills { .. } => "skills",
     }
 }
 

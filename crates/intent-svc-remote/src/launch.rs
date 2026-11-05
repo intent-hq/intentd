@@ -473,6 +473,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                 submodules: None,
                 setup: None,
                 setup_script: None,
+                skills: None,
             })
         })
     }
@@ -619,6 +620,27 @@ impl RemoteLaunchPort for RemoteLaunch {
                     }),
                 },
             )
+        })
+    }
+
+    fn machine_skills<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        query: bool,
+    ) -> BoxFuture<'a, intent_services::feature_api::feature_ports::MachineSkills> {
+        use intent_services::feature_api::feature_ports::MachineSkills;
+        Box::pin(async move {
+            let Ok(Some(record)) = svc.store().get_remote_agent(agent_id).await else {
+                return MachineSkills::Offline;
+            };
+            let Some(feature) = svc.remote_feature() else {
+                return MachineSkills::Offline;
+            };
+            match feature.node(svc, &record.node_id).await {
+                Ok(node) => node.machine_skills(query).await,
+                Err(_) => MachineSkills::Offline,
+            }
         })
     }
 

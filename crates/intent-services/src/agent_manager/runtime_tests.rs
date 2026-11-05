@@ -435,6 +435,7 @@ async fn remote_manager(
         submodules: None,
         setup: None,
         setup_script: None,
+        skills: None,
     };
     mgr.services
         .store
@@ -463,6 +464,7 @@ fn remote_view() -> intent_core::remote_launch::RemotePlacementView {
         submodules: None,
         setup: None,
         setup_script: None,
+        skills: None,
     }
 }
 

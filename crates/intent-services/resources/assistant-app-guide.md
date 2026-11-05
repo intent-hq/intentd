@@ -436,6 +436,10 @@ icons. **Add machine** opens the connection form; a remote machine's actions inc
 actions can also include **Let <backend> run agents here**, which asks to confirm with
 **Allow**, and **Stop letting <backend> run agents here**; machines allowed this way are
 listed under **Machines <backend> can run agents on**.
+An agent running on one of those machines uses that machine's skills (its
+`~/.agents/skills` and `~/.claude/skills`, plus the project's), and its **/** menu lists
+them; to give it a skill, add the skill there. A **/name** it lacks still sends, with a
+notice in the chat.
 Workspaces and agents belong to a host, so identify the intended device before
 explaining missing work or changing host settings. **Mobile** follows the active
 connection and its permissions; do not describe a remote connection's QR as belonging

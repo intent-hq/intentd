@@ -85,19 +85,21 @@ fn the_binding_wire_shape_uses_decimal_string_generations() {
 }
 
 #[test]
-fn the_daemon_to_daemon_link_speaks_protocols_7_to_11() {
+fn the_daemon_to_daemon_link_speaks_protocols_7_to_12() {
     // 7 adds the correlated stop acknowledgement. A protocol-6 peer cannot
     // send `stopAck`, so it never links: a backend must not take a stop as
     // confirmed by a machine that cannot confirm it. 8 adds the script
     // frames, 9 final stops, 10 the prepared checkout, 11 the user MCP
-    // server proxies; a protocol-7 peer still binds and runs agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 11 });
+    // server proxies, 12 the machine's skills; a protocol-7 peer still binds
+    // and runs agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 12 });
     assert_eq!(SCRIPT_PROTOCOL, 8);
     assert_eq!(FINAL_STOP_PROTOCOL, 9);
     assert_eq!(PREPARED_CHECKOUT_PROTOCOL, 10);
-    assert_eq!(MCP_PROXY_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    assert_eq!(MCP_PROXY_PROTOCOL, 11);
+    assert_eq!(SKILLS_PROTOCOL, NODE_LINK_PROTOCOLS.max);
     assert!(offers_prepared_checkout());
-    for version in 7..=10 {
+    for version in 7..=12 {
         ensure_protocol(version).unwrap();
     }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
@@ -341,6 +343,7 @@ fn executor_link_requests_golden() {
             "response",
             "scriptStart",
             "scriptStop",
+            "skills",
             "stop",
         ]
     );
@@ -386,6 +389,7 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
             "scriptExited",
             "scriptOutput",
             "scriptStarted",
+            "skillsReply",
             "stopAck",
             "welcome"
         ]
@@ -544,6 +548,19 @@ fn every_frame() -> Vec<LinkFrame> {
             exit_code: Some(0),
             error: None,
         }),
+        LinkFrame::Skills(SkillsQuery {
+            query_id: request_id,
+        }),
+        LinkFrame::SkillsReply(SkillsReply {
+            query_id: request_id,
+            skills: vec![machine_skill("review", "user")],
+        }),
+        LinkFrame::Journal(record(
+            14,
+            JournalBody::Skills {
+                skills: vec![machine_skill("deploy", "project")],
+            },
+        )),
     ]
 }
 
@@ -579,7 +596,7 @@ fn frames_are_routed_to_their_lane() {
         [
             Control, Control, Control, Control, Control, Control, Control, Control, Control,
             Control, Journal, Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control,
-            Control, Script, Script, Script, Script, Script
+            Control, Script, Script, Script, Script, Script, Control, Control, Journal
         ]
     );
 }
@@ -1032,16 +1049,79 @@ fn script_env_never_debug_renders_its_values() {
 }
 
 #[test]
-fn script_frames_need_protocol_8() {
+fn script_frames_need_protocol_8_and_skills_frames_12() {
     for frame in every_frame() {
         let script = matches!(frame.channel(), LinkChannel::Script);
-        assert_eq!(
-            frame.min_protocol(),
-            if script { 8 } else { 7 },
-            "{}",
-            frame_tag(&frame)
+        let skills = matches!(
+            &frame,
+            LinkFrame::Skills(_)
+                | LinkFrame::SkillsReply(_)
+                | LinkFrame::Journal(JournalRecord {
+                    body: JournalBody::Skills { .. },
+                    ..
+                })
         );
+        let expected = if skills {
+            12
+        } else if script {
+            8
+        } else {
+            7
+        };
+        assert_eq!(frame.min_protocol(), expected, "{}", frame_tag(&frame));
     }
+}
+
+fn machine_skill(name: &str, scope: &str) -> MachineSkill {
+    MachineSkill {
+        name: name.into(),
+        description: format!("{name} things"),
+        location: format!("/Users/me/.claude/skills/{name}/SKILL.md"),
+        resource_directory: None,
+        scope: scope.into(),
+        allowed_tools: None,
+        compatibility: None,
+    }
+}
+
+/// The wire shapes of the skills frames and journal body (`node-link.md`
+/// § Skills on the machine).
+#[test]
+fn skills_frames_and_journal_body_have_the_documented_shape() {
+    let id = LinkId::new_v4();
+    let query = LinkFrame::Skills(SkillsQuery { query_id: id });
+    assert_eq!(
+        serde_json::to_value(&query).unwrap(),
+        json!({ "type": "skills", "queryId": id })
+    );
+    let reply = LinkFrame::SkillsReply(SkillsReply {
+        query_id: id,
+        skills: vec![machine_skill("review", "user")],
+    });
+    assert_eq!(
+        serde_json::to_value(&reply).unwrap(),
+        json!({
+            "type": "skillsReply",
+            "queryId": id,
+            "skills": [{
+                "name": "review",
+                "description": "review things",
+                "location": "/Users/me/.claude/skills/review/SKILL.md",
+                "scope": "user",
+            }],
+        })
+    );
+    let body = JournalBody::Skills {
+        skills: vec![machine_skill("deploy", "project")],
+    };
+    let wire = serde_json::to_value(&body).unwrap();
+    assert_eq!(wire["kind"], "skills");
+    assert_eq!(wire["skills"][0]["scope"], "project");
+    for frame in [query, reply] {
+        let bytes = frame.encode().unwrap();
+        assert_eq!(LinkFrame::decode(&bytes).unwrap(), frame);
+    }
+    assert_eq!(serde_json::from_value::<JournalBody>(wire).unwrap(), body);
 }
 
 /// A machine below nodeProtocol 10 rejects a launch that carries `checkout`

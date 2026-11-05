@@ -7013,6 +7013,7 @@ mod _dead_workspace_metadata_tool_tests {
                 scope: None,
                 skip_worktree: false,
                 setup_script: None,
+                skills: None,
                 is_remote: false,
                 default_model: None,
                 pr_number: None,
