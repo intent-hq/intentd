@@ -247,6 +247,8 @@ async fn cursor_provider_discovery_auth_models_and_turn_over_wss() {
             &[
                 ("MOCK_CURSOR_RPC_LOG", log.to_str().unwrap()),
                 ("MOCK_CURSOR_PID_FILE", pid_file.to_str().unwrap()),
+                // Mixed credentials: a stored login and an API key.
+                ("CURSOR_API_KEY", "crsr-e2e-placeholder"),
             ],
         ),
     };
@@ -284,9 +286,13 @@ async fn cursor_provider_discovery_auth_models_and_turn_over_wss() {
         json!({ "providerId": "cursor", "force": true }),
     )
     .await;
-    assert_eq!(
-        auth["providers"],
-        json!([{ "id": "cursor", "authenticated": true }])
+    assert_eq!(auth["providers"][0]["id"], "cursor", "{auth}");
+    assert_eq!(auth["providers"][0]["authenticated"], true, "{auth}");
+    assert!(
+        auth["providers"][0]["statusNote"]
+            .as_str()
+            .is_some_and(|n| n.contains("Using the stored Cursor login")),
+        "mixed credentials name the stored login: {auth}"
     );
 
     let models = wss_rpc(
@@ -706,4 +712,262 @@ async fn cursor_unknown_or_rejected_model_fails_with_an_actionable_error() {
             .all(|f| f["msg"]["method"] != "session/prompt"),
         "a failed model setup never reaches session/prompt"
     );
+}
+
+/// Read agent events until `agent:stream:end` for `agent_id`, returning them.
+async fn turn_events(events: &mut Ws, agent_id: &str) -> Vec<Value> {
+    let mut seen = Vec::new();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(60)),
+        async {
+            loop {
+                let Some(Ok(Message::Text(text))) = events.next().await else {
+                    continue;
+                };
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                let event = frame["params"]["event"].clone();
+                if event["data"]["agentId"] != agent_id {
+                    continue;
+                }
+                let kind = event["type"].as_str().unwrap_or_default().to_string();
+                assert_ne!(kind, "agent:failed", "turn failed: {event}");
+                seen.push(event);
+                if kind == "agent:stream:end" {
+                    return;
+                }
+            }
+        },
+    )
+    .await
+    .expect("the turn must end");
+    seen
+}
+
+fn method_frames<'a>(frames: &'a [Value], method: &str) -> Vec<&'a Value> {
+    frames
+        .iter()
+        .filter(|f| f["dir"] == "in" && f["msg"]["method"] == method)
+        .map(|f| &f["msg"])
+        .collect()
+}
+
+/// Stop sends `session/cancel` as a notification and the same process
+/// takes the next turn; after a daemon restart the session resumes through
+/// `session/load`, Auto is re-applied, and the replayed history is not
+/// duplicated in the conversation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cursor_stop_then_resume_over_wss() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(node) = intent_providers::resolve_on_path("node") else {
+        eprintln!("skipping Cursor WSS E2E: node not on PATH");
+        return;
+    };
+    let fixture = format!(
+        "{}/tests/fixtures/mock-cursor-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itd-wss-cursor-resume-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let wrapper = data_dir.join("cursor-agent");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec '{}' '{}' \"$@\"\n",
+            node.display(),
+            fixture
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        data_dir.join("config.toml"),
+        format!("[providers.paths]\ncursor = \"{}\"\n", wrapper.display()),
+    )
+    .unwrap();
+    let log = data_dir.join("cursor-rpc.jsonl");
+    let pid_file = data_dir.join("cursor-acp.pid");
+    let env = [
+        ("MOCK_CURSOR_RPC_LOG", log.to_str().unwrap()),
+        ("MOCK_CURSOR_PID_FILE", pid_file.to_str().unwrap()),
+    ];
+    let socket = data_dir.join("intentd.sock");
+    let read_pid = || -> i32 {
+        std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+
+    let mut daemon = Daemon {
+        child: spawn_serve(&data_dir, &env),
+    };
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let workspace = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({ "title": "Cursor stop and resume", "noPrompt": true }),
+    )
+    .await;
+    let workspace_id = workspace["workspace"]["id"].as_str().unwrap().to_string();
+    let mut events = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({ "workspaceId": workspace_id, "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    // No model stored: Auto must still be applied explicitly.
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "agent.create",
+        json!({ "workspaceId": workspace_id, "name": "Cursor resume", "provider": "cursor" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+
+    // Turn 1 blocks until Stop.
+    wss_rpc(
+        &mut rpc,
+        3,
+        "agent.sendMessage",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id, "content": "WAIT_FOR_CANCEL please" }),
+    )
+    .await;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while method_frames(&rpc_log(&log), "session/prompt").is_empty() {
+                // timing-guard: poll interval until the mock logs the prompt (bounded by the timeout).
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        },
+    )
+    .await
+    .expect("the first prompt reaches Cursor");
+    let pid = read_pid();
+    wss_rpc(
+        &mut rpc,
+        4,
+        "agent.stop",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id }),
+    )
+    .await;
+    turn_events(&mut events, &agent_id).await;
+    let frames = rpc_log(&log);
+    let cancels = method_frames(&frames, "session/cancel");
+    assert!(!cancels.is_empty(), "Stop must send session/cancel");
+    assert!(
+        cancels.iter().all(|m| m.get("id").is_none()),
+        "session/cancel is a notification: {cancels:?}"
+    );
+    assert!(pid_alive(pid), "Stop keeps the Cursor process alive");
+
+    // Turn 2 continues on the same process and session.
+    wss_rpc(
+        &mut rpc,
+        5,
+        "agent.sendMessage",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id, "content": "check git status" }),
+    )
+    .await;
+    turn_events(&mut events, &agent_id).await;
+    assert_eq!(read_pid(), pid, "the next turn reuses the process");
+    let frames = rpc_log(&log);
+    assert_eq!(method_frames(&frames, "session/new").len(), 1);
+    assert_eq!(method_frames(&frames, "session/prompt").len(), 2);
+    let auto_applied = |frames: &[Value]| {
+        method_frames(frames, "session/set_config_option")
+            .iter()
+            .filter(|m| m["params"]["configId"] == "model" && m["params"]["value"] == "default[]")
+            .count()
+    };
+    assert_eq!(auto_applied(&frames), 1, "no stored model applies Auto");
+    let before = wss_rpc(
+        &mut rpc,
+        6,
+        "agent.getConversation",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id }),
+    )
+    .await;
+    let before = common::conversation_fingerprint(&before);
+
+    // Restart the daemon: the next message resumes via session/load.
+    drop(rpc);
+    drop(events);
+    daemon.child.kill_tree().unwrap();
+    daemon.child = spawn_serve(&data_dir, &env);
+    assert!(await_uds(&socket).await, "daemon did not restart");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+    let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let mut events = connect_ws(port, cfg).await;
+    wss_rpc(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({ "workspaceId": workspace_id, "eventTypes": ["agent:*"] }),
+    )
+    .await;
+    let after_restart = wss_rpc(
+        &mut rpc,
+        7,
+        "agent.getConversation",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(
+        common::conversation_fingerprint(&after_restart),
+        before,
+        "a restart alone changes no history"
+    );
+    wss_rpc(
+        &mut rpc,
+        8,
+        "agent.sendMessage",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id, "content": "and again" }),
+    )
+    .await;
+    turn_events(&mut events, &agent_id).await;
+    let frames = rpc_log(&log);
+    let loads = method_frames(&frames, "session/load");
+    assert_eq!(loads.len(), 1, "the restart resumes through session/load");
+    let session_id = method_frames(&frames, "session/prompt")[0]["params"]["sessionId"].clone();
+    assert_eq!(loads[0]["params"]["sessionId"], session_id);
+    assert_eq!(
+        auto_applied(&frames),
+        2,
+        "Auto is re-applied after session/load"
+    );
+    let after = wss_rpc(
+        &mut rpc,
+        9,
+        "agent.getConversation",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id }),
+    )
+    .await;
+    let after = common::conversation_fingerprint(&after);
+    assert!(
+        after.starts_with(&before),
+        "the resumed conversation keeps the earlier history as-is:\n{}",
+        common::fingerprint_diff(&before, &after)
+    );
+    let new_rows = &after[before.len()..];
+    let new_text = serde_json::to_string(new_rows).unwrap();
+    assert_eq!(
+        new_text.matches("check git status").count(),
+        0,
+        "replayed history must not be appended again: {new_text}"
+    );
+    assert!(new_text.contains("and again"), "{new_text}");
 }

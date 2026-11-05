@@ -36,6 +36,14 @@ if (args[0] === '--version' || args[0] === '-v') {
   process.exit(0);
 }
 
+if (args[0] === 'status') {
+  log('cli', { args });
+  process.stdout.write(JSON.stringify(signedOut
+    ? { status: 'unauthenticated', isAuthenticated: false, hasAccessToken: false, hasRefreshToken: false, message: 'Not logged in' }
+    : { status: 'authenticated', isAuthenticated: true, hasAccessToken: true, hasRefreshToken: true }) + '\n');
+  process.exit(0);
+}
+
 if (args[0] === 'models') {
   log('cli', { args });
   if (signedOut) {
@@ -197,6 +205,14 @@ async function handle(msg) {
       return fail(-32602, 'mock: authenticate must never be called (it would open a browser login)');
     case 'session/new':
     case 'session/load': {
+      if (msg.method === 'session/load') {
+        // Like the real CLI: replay the stored history before answering.
+        const sid = msg.params.sessionId;
+        update(sid, { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'check git status' } });
+        update(sid, { sessionUpdate: 'tool_call', toolCallId: 'replay-0-4', title: 'workspace-mcp: workspace_api', kind: 'other', status: 'pending', rawInput: { providerIdentifier: 'workspace-mcp', toolName: 'workspace_api', args: {} } });
+        update(sid, { sessionUpdate: 'tool_call_update', toolCallId: 'replay-0-4', status: 'completed', rawOutput: { success: true } });
+        update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'cursor mock done (ask=skipped)' } });
+      }
       if (signedOut) {
         return fail(-32000, 'Authentication required', { message: "Authentication required. Please run 'agent login' first, then call authenticate() with methodId 'cursor_login'." });
       }
@@ -226,7 +242,11 @@ async function handle(msg) {
       return reply({});
     case 'session/prompt': {
       const cancelled = new Promise((resolve) => { cancelCurrent = () => resolve({ stopReason: 'cancelled' }); });
-      const result = await Promise.race([runTurn(msg.params.sessionId), cancelled]);
+      const waitForCancel = JSON.stringify(msg.params.prompt).includes('WAIT_FOR_CANCEL');
+      if (waitForCancel) {
+        update(msg.params.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'working until stopped' } });
+      }
+      const result = await Promise.race([waitForCancel ? new Promise(() => {}) : runTurn(msg.params.sessionId), cancelled]);
       cancelCurrent = null;
       return reply(result);
     }
