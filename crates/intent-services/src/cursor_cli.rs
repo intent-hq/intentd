@@ -116,6 +116,7 @@ pub(crate) async fn run_cursor_cli(
     // Read the pipes concurrently and wait for the CLI itself, not for pipe
     // EOF: a child the CLI leaves behind would keep the pipes open.
     let read = |pipe: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>>| {
+        // caller-binding: allow — only drains a child pipe into a buffer; never reaches a capability gate
         tokio::spawn(async move {
             let mut buf = Vec::new();
             if let Some(mut pipe) = pipe {
