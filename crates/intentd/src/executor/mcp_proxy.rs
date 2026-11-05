@@ -111,10 +111,11 @@ mod tests {
         }
     }
 
+    /// The frames a recording forward sent.
+    type Sent = Arc<Mutex<Vec<(&'static str, Value)>>>;
+
     /// A forward that records its frames and answers with `answer`.
-    fn recording(
-        answer: Result<Value, String>,
-    ) -> (Forward, Arc<Mutex<Vec<(&'static str, Value)>>>) {
+    fn recording(answer: Result<Value, String>) -> (Forward, Sent) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let log = sent.clone();
         let forward: Forward = Arc::new(move |method, args| {

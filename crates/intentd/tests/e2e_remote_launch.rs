@@ -2673,13 +2673,13 @@ async fn running_mcp_server(rpc_ws: &mut common::TlsWs, server_id: &str, id: i64
 /// is not offered. `ws.mcp.*` is forwarded to head too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_remote_agents_provider_calls_user_mcp_tools_in_heads_hub() {
+    const SECRET: &str = "s4-mcp-secret-5d1e";
     if intent_providers::resolve_on_path("node").is_none()
         || intent_providers::resolve_on_path("git").is_none()
     {
         eprintln!("skipping remote S4 e2e: node or git not on PATH");
         return;
     }
-    const SECRET: &str = "s4-mcp-secret-5d1e";
     let mcp_script = format!(
         "{}/tests/fixtures/mock-mcp-server.mjs",
         env!("CARGO_MANIFEST_DIR")
