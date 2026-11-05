@@ -1918,6 +1918,15 @@ async fn host_provider_discovery_over_wss() {
         "{pi}"
     );
     for p in providers.iter().filter(|p| p["id"] != "pi") {
+        // Cursor reports its CLI identity (cliCommand/cliVersion) without a
+        // version requirement.
+        if p["id"] == "cursor" {
+            assert!(p.get("cliRequirement").is_none(), "{p}");
+            if p.get("cliCommand").is_some() {
+                assert_eq!(p["cliCommand"], "cursor-agent", "{p}");
+            }
+            continue;
+        }
         if let Some(requirement) =
             intent_providers::adapter_cli::requirement(p["id"].as_str().unwrap())
         {
