@@ -529,14 +529,6 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
         "the forwarded note is on head: {notes}"
     );
     remote_workspace_setters_and_proposal(&mut rpc_ws, &mut events, (&ws_id, &agent_id)).await;
-    remote_hooks_questions_and_client_calls(
-        (port, cfg.clone()),
-        &mut rpc_ws,
-        &mut events,
-        (&ws_id, &agent_id),
-        (&repo, &node_dir),
-    )
-    .await;
     // Saved scripts (`remoteScripts: 1`): the agent's runs are machine runs.
     let service_id = machine_runs(
         &mut rpc_ws,
@@ -775,31 +767,8 @@ async fn remote_hooks_questions_and_client_calls(
     assert!(scheduled.starts_with("wsapi: "), "{scheduled}");
     // The wake is the agent's next turn on the machine; the provider echoes it.
     event(events, "agent:stream:end").await;
-    let woke = timeout(wait(), async {
-        let mut id = 710;
-        loop {
-            let got = ok(
-                rpc_ws,
-                id,
-                "agent.get",
-                json!({ "workspaceId": ws_id, "agentId": agent_id }),
-            )
-            .await;
-            id += 1;
-            let reply = got["agent"]["lastAgentResponse"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned();
-            if reply.contains("hook-woke-remote") {
-                return reply;
-            }
-            // timing-guard: poll interval for the wake turn's reply to be recorded
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("the hook's wake reaches the remote agent");
-    assert!(woke.starts_with("echo: "), "{woke}");
+    let woke = reply_containing(rpc_ws, (ws_id, agent_id), "hook-woke-remote", 710).await;
+    assert!(woke.contains("echo: [Background hook"), "{woke}");
     let repo = std::fs::canonicalize(repo).unwrap();
     assert!(
         woke.contains(repo.to_str().unwrap()),
@@ -829,15 +798,23 @@ async fn remote_hooks_questions_and_client_calls(
         marked["agent"]["metadata"]["pendingQuestionsMessageId"].is_string(),
         "the question is pending on the agent's message on head: {marked}"
     );
-    let answered = wsapi_turn(
+    // The app sends the answers as a user message tagged with the
+    // questions' message.
+    let marked_id = marked["agent"]["metadata"]["pendingQuestionsMessageId"].clone();
+    ok(
         rpc_ws,
-        events,
-        (ws_id, agent_id),
-        "Q: Which one?\nA: Left",
-        "A: Left",
         820,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": agent_id,
+            "content": "Q: Which one?\nA: Left",
+            "messageMetadata": { "type": "question_answers", "answeredQuestionsMessageId": marked_id },
+        }),
     )
     .await;
+    event(events, "agent:stream:end").await;
+    let answered = reply_containing(rpc_ws, (ws_id, agent_id), "A: Left", 821).await;
     assert!(answered.contains("A: Left"), "{answered}");
     let cleared = ok(
         rpc_ws,
@@ -847,7 +824,10 @@ async fn remote_hooks_questions_and_client_calls(
     )
     .await;
     assert!(
-        cleared["agent"]["metadata"]["pendingQuestionsMessageId"].is_null(),
+        cleared["agent"]["metadata"]["pendingQuestionsMessageId"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
         "{cleared}"
     );
 
@@ -876,11 +856,11 @@ async fn remote_hooks_questions_and_client_calls(
                 _ => continue,
             };
             let result = match request["method"].as_str() {
-                Some("browser.exec") => json!({
+                Some("browser.exec") => json!({ "results": [{
                     "action": "getUrl",
                     "success": true,
                     "result": "http://daemon.localhost:4173/",
-                }),
+                }] }),
                 Some("desktop.control") if request["params"]["operation"] == "prepare" => json!({
                     "computerId": "remote-e2e-desktop",
                     "computerName": "E2E desktop",
@@ -941,32 +921,48 @@ async fn remote_hooks_questions_and_client_calls(
     // The withdrawn request wakes the agent once, as it would a local agent;
     // take that turn here so later steps see only their own turns.
     event(events, "agent:stream:end").await;
-    let woke = timeout(wait(), async {
-        let mut id = 960;
+    let woke = reply_containing(rpc_ws, (ws_id, agent_id), "Desktop permission", 960).await;
+    assert!(woke.contains("echo: "), "{woke}");
+    served.abort();
+}
+
+/// The agent's latest assistant message containing `needle`, as JSON text,
+/// polled from its conversation: a wake turn has no reply of its own to
+/// wait on, and `lastAgentResponse` is only the reply's last line.
+async fn reply_containing(
+    rpc_ws: &mut common::TlsWs,
+    (ws_id, agent_id): (&str, &str),
+    needle: &str,
+    id: i64,
+) -> String {
+    timeout(wait(), async {
+        let mut id = id;
         loop {
-            let got = ok(
+            let convo = ok(
                 rpc_ws,
                 id,
-                "agent.get",
+                "agent.getConversation",
                 json!({ "workspaceId": ws_id, "agentId": agent_id }),
             )
             .await;
             id += 1;
-            let reply = got["agent"]["lastAgentResponse"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned();
-            if reply.contains("Desktop permission") {
-                return reply;
+            let found = convo["messages"].as_array().and_then(|messages| {
+                messages
+                    .iter()
+                    .rev()
+                    .filter(|m| m["role"] == "assistant")
+                    .map(Value::to_string)
+                    .find(|text| text.contains(needle))
+            });
+            if let Some(text) = found {
+                return text;
             }
-            // timing-guard: poll interval for the desktop wake turn's reply to be recorded
+            // timing-guard: poll interval for the wake turn's reply to be recorded
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("the desktop outcome wakes the remote agent");
-    assert!(woke.starts_with("echo: "), "{woke}");
-    served.abort();
+    .unwrap_or_else(|_| panic!("no assistant reply containing {needle:?}"))
 }
 
 /// [`turn`] for a `wsapi` prompt whose reply carries `marker`. Monitor
@@ -1720,6 +1716,75 @@ async fn deleting_a_running_local_agent_stops_its_provider() {
     })
     .await
     .expect("agent.delete stops the local agent's provider process tree");
+}
+
+/// Remote parity S3 over two real daemons: see
+/// [`remote_hooks_questions_and_client_calls`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_agent_hooks_questions_browser_and_desktop() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping remote S3 e2e: node or git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-s3-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let (_head, port, cfg, ws_id) = start_backend(&scratch.path().join("head"), &repo).await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let machine = start_machine(&node_dir, &backend_id).await;
+    ok(
+        &mut rpc_ws,
+        2,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let create = json!({
+        "workspaceId": ws_id, "name": "Remote", "model": "default", "provider": "mock",
+        "placement": { "target": "remote" },
+    });
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 10;
+    let created = loop {
+        id += 1;
+        let response = rpc(&mut rpc_ws, id, "agent.create", create.clone()).await;
+        if response.get("error").is_none() {
+            break response["result"].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the placement: {response}"
+        );
+        // timing-guard: poll interval while the machine daemon binds to head (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    remote_hooks_questions_and_client_calls(
+        (port, cfg),
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        (&repo, &node_dir),
+    )
+    .await;
 }
 
 /// Deleting a remote agent ends it for good: without a prior stop, its
