@@ -2786,7 +2786,11 @@ async fn a_remote_agents_provider_calls_user_mcp_tools_in_heads_hub() {
     assert!(body["error"].is_null(), "{body}");
     let who: Value =
         serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(who["pid"].as_u64(), Some(hub_pid), "ran in head's hub: {who}");
+    assert_eq!(
+        who["pid"].as_u64(),
+        Some(hub_pid),
+        "ran in head's hub: {who}"
+    );
     assert_eq!(who["secret"], SECRET, "{who}");
     assert_eq!(who["input"], "from-provider", "{who}");
 

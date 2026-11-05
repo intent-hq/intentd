@@ -254,7 +254,10 @@ impl HeadCalls {
     ) -> LinkOutcome {
         let args = request.params.get("args").cloned().unwrap_or(Value::Null);
         let Some(server_id) = args.get("serverId").and_then(Value::as_str) else {
-            return refusal(INVALID_PARAMS, format!("{method} needs a string `serverId`"));
+            return refusal(
+                INVALID_PARAMS,
+                format!("{method} needs a string `serverId`"),
+            );
         };
         let budget =
             Duration::from_millis(u64::from(request.timeout_ms)).min(MCP_PROXY_LINK_TIMEOUT);
@@ -283,7 +286,10 @@ impl HeadCalls {
             Ok(Err(message)) => refusal(CALL_FAILED, message),
             Err(_) => refusal(
                 CALL_FAILED,
-                format!("mcp-proxy-timeout: {method} did not finish within {}s", budget.as_secs()),
+                format!(
+                    "mcp-proxy-timeout: {method} did not finish within {}s",
+                    budget.as_secs()
+                ),
             ),
         }
     }

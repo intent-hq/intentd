@@ -385,7 +385,10 @@ impl RemoteLaunchPort for RemoteLaunch {
                 .ok()?;
             let protocol = link_protocol(&node).await.ok()?;
             if protocol >= MCP_PROXY_PROTOCOL
-                || svc.remote_mcp_proxies(&record.workspace_id).await.is_empty()
+                || svc
+                    .remote_mcp_proxies(&record.workspace_id)
+                    .await
+                    .is_empty()
             {
                 return None;
             }

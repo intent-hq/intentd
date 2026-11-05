@@ -1019,7 +1019,9 @@ async fn proxied_user_mcp_servers_ride_session_new_and_call_head() {
         .map(|var| var.value.clone())
         .unwrap();
 
-    let mut stream = tokio::net::TcpStream::connect(&linear.args[2]).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(&linear.args[2])
+        .await
+        .unwrap();
     stream
         .write_all(intent_acp::bridge_auth_line(&token).as_bytes())
         .await
@@ -1040,7 +1042,10 @@ async fn proxied_user_mcp_servers_ride_session_new_and_call_head() {
     )
     .unwrap();
     assert_eq!(reply["id"], 7, "{reply}");
-    assert_eq!(reply["result"]["content"][0]["text"], "from head", "{reply}");
+    assert_eq!(
+        reply["result"]["content"][0]["text"], "from head",
+        "{reply}"
+    );
 
     let frame = tokio::time::timeout(wait(), answering)
         .await

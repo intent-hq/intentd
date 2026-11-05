@@ -3663,7 +3663,11 @@ for line in sys.stdin:
             s.create(config).await.unwrap();
         }
         s.toggle_workspace(&ws_id, "w", false).await.unwrap();
-        let error = s.proxy_list_tools(&ws_id, "a").await.unwrap_err().to_string();
+        let error = s
+            .proxy_list_tools(&ws_id, "a")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             error.contains("mcp-proxy-unavailable: MCP server Alpha is not running on the backend. Start it in Settings → MCP servers."),
             "{error}"
@@ -3674,7 +3678,11 @@ for line in sys.stdin:
             .unwrap_err()
             .to_string();
         assert!(error.contains("mcp server b is disabled"), "{error}");
-        let error = s.proxy_list_tools(&ws_id, "w").await.unwrap_err().to_string();
+        let error = s
+            .proxy_list_tools(&ws_id, "w")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("disabled for this workspace"), "{error}");
         assert!(matches!(
             s.proxy_list_tools(&ws_id, "nope").await.unwrap_err(),
@@ -3682,7 +3690,11 @@ for line in sys.stdin:
         ));
         reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
             .unwrap();
-        let error = s.proxy_list_tools(&ws_id, "a").await.unwrap_err().to_string();
+        let error = s
+            .proxy_list_tools(&ws_id, "a")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("mcp.enableUserServers"), "{error}");
     }
 

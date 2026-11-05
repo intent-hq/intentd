@@ -52,7 +52,10 @@ pub(super) async fn handle(proxy: &McpProxy, forward: &Forward, message: Value) 
         .await
         .map_err(|message| (INTERNAL_ERROR, message)),
         "tools/call" => match params.get("name").and_then(Value::as_str) {
-            None => Err((INVALID_PARAMS, "tools/call needs a string `name`".to_owned())),
+            None => Err((
+                INVALID_PARAMS,
+                "tools/call needs a string `name`".to_owned(),
+            )),
             Some(name) => {
                 let arguments = match params.get("arguments") {
                     None | Some(Value::Null) => json!({}),
@@ -207,9 +210,13 @@ mod tests {
         .unwrap();
         assert_eq!(called["result"]["isError"], true);
         assert_eq!(called["result"]["content"][0]["text"], message);
-        let listed = handle(&proxy(), &forward, json!({ "id": 2, "method": "tools/list" }))
-            .await
-            .unwrap();
+        let listed = handle(
+            &proxy(),
+            &forward,
+            json!({ "id": 2, "method": "tools/list" }),
+        )
+        .await
+        .unwrap();
         assert_eq!(listed["error"]["code"], INTERNAL_ERROR);
         assert_eq!(listed["error"]["message"], message);
         let nameless = handle(

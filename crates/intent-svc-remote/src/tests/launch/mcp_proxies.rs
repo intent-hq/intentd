@@ -33,7 +33,9 @@ async fn a_protocol_11_launch_names_the_user_mcp_servers_and_an_older_link_says_
     .await
     .unwrap();
 
-    f.node.shared_ref().set_protocol_for_test(MCP_PROXY_PROTOCOL);
+    f.node
+        .shared_ref()
+        .set_protocol_for_test(MCP_PROXY_PROTOCOL);
     let (agent, _view) = f.placed().await;
     let launch = f.mcp_launch(&mut link, &agent).await;
     assert_eq!(
@@ -59,7 +61,10 @@ async fn a_protocol_11_launch_names_the_user_mcp_servers_and_an_older_link_says_
     let launch = f.mcp_launch(&mut link, &older).await;
     assert!(launch.mcp_proxies.is_empty());
     assert_eq!(
-        f.port().mcp_servers_notice(&f.services, &older).await.as_deref(),
+        f.port()
+            .mcp_servers_notice(&f.services, &older)
+            .await
+            .as_deref(),
         Some("Your MCP servers are not available on Test machine until Intent there is updated.")
     );
 }

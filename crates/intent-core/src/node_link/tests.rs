@@ -1077,8 +1077,8 @@ fn a_launch_with_a_checkout_needs_protocol_10() {
 /// the agent without them), and one without them travels as before.
 #[test]
 fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
-    let launch = |mcp_proxies: Vec<McpProxy>, checkout: Option<Box<PreparedCheckout>>| {
-        LaunchCommand {
+    let launch =
+        |mcp_proxies: Vec<McpProxy>, checkout: Option<Box<PreparedCheckout>>| LaunchCommand {
             agent_id: AgentId::from("a1"),
             workspace_id: WorkspaceId::from("ws-1"),
             provider: "codex".into(),
@@ -1091,14 +1091,16 @@ fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
             checkout,
             mcp_proxies,
             compact_tool_descriptions: false,
-        }
-    };
+        };
     let proxy = McpProxy {
         name: "Linear".into(),
         server_id: "srv-1".into(),
     };
     let with = launch(vec![proxy.clone()], Some(Box::default()));
-    assert_eq!(LinkFrame::Launch(with.clone()).min_protocol(), MCP_PROXY_PROTOCOL);
+    assert_eq!(
+        LinkFrame::Launch(with.clone()).min_protocol(),
+        MCP_PROXY_PROTOCOL
+    );
     assert_eq!(
         LinkFrame::Launch(launch(Vec::new(), None)).min_protocol(),
         NODE_LINK_PROTOCOLS.min
