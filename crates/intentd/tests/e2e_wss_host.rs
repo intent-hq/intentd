@@ -608,6 +608,7 @@ async fn host_provider_auth_status_over_wss() {
         "grok",
         "pi",
         "antigravity",
+        "cursor",
     ];
     assert_eq!(
         providers.len(),
