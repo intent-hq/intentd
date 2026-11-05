@@ -576,23 +576,32 @@ watches, its last update on GitHub as of the watch's latest check). Home's short
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector,SetupScriptPicker,SetupScriptEditor}.svelte; packages/cloudlands-fe/src/lib/components/modals/SetupScriptModal.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/messages/en.json. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector,SetupScriptPicker,SetupScriptEditor,StartOnPicker}.svelte; packages/cloudlands-fe/src/lib/components/modals/SetupScriptModal.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/messages/en.json. -->
+
+<!-- The searchable Machines picker for initial-agent placement is Labs-only;
+do not list it among the normal workspace settings below. -->
 
 Open **New workspace** (`/workspace/new`), describe the work in the prompt, and
 choose **Create workspace**. The settings beside the prompt (below it on narrow
 windows) are **Codebase**, **Branch**, **Setup script**, **Initial agent**, and **Model**.
-Use **+** below the prompt to add context, or the microphone on the right to dictate.
+Use **+** below the prompt to add context, the paperclip to attach files, or the
+microphone to dictate. These controls are grouped on the left.
 These controls open a picker or editor and preserve your prompt draft. **Codebase** lists
 your repositories once each, most recently used first, with search at the top;
 the selected codebase is included even if it has not reached your history yet.
+Codebase icons use owner avatars where available, or folder icons for local paths.
+The selected codebase field shows the same icon as its dropdown row.
 Use the external-link action beside a codebase to open it in your browser.
 **Add codebase** opens the **Clone**, **Existing folder**, and **New** tabs.
 **Clone** is hidden only once Intent has confirmed no forge account is connected;
 to clone, use the connect link or **Settings → Connections**. Onboarding uses
 the same tab names. Open the agent picker to choose who starts the workspace.
 **Create new or manage specialists** closes the workspace form and opens specialist settings.
-In **Setup script**, search the list and select the repository's config, last-used
-commands, or a template to apply it. **Edit commands** opens the selected script;
+In **Setup script**, search the list and select the repository's config, a previously
+used script, or a template to apply it. Previously used scripts appear first, most
+recent first, each under its own name. The selected script is highlighted in the list.
+The script and agent lists scroll down to the divider above their fixed actions.
+**Edit commands** opens the selected script;
 **Create Script** starts a blank draft. Both open a separate **Setup Script** modal:
 **Done** or **Save & Done** keeps your edits; **Cancel** discards them and returns
 to the workspace form.
