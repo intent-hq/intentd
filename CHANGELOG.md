@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.135] - 2026-11-05
+
+### 🚀 Features
+
+- Proxy a remote agent's user MCP servers to head's hub (nodeProtocol 11) ([#3075](https://github.com/intent-hq/intentd/pull/3075))
+
+
 ## [0.11.134] - 2026-11-05
 
 ### 🐛 Bug Fixes
