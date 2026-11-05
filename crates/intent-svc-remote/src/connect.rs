@@ -79,7 +79,7 @@ impl ConnectFailure {
             Self::Revoked(attempts) => Error::remote_machine(
                 true,
                 format!(
-                    "{name} no longer accepts this backend's credential; make it available again."
+                    "{name} no longer accepts this backend's credential; let this backend run agents on it again."
                 ),
                 json!({ "code": MACHINE_REVOKED, "attempts": attempts_json(&attempts) }),
             ),

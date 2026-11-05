@@ -428,11 +428,14 @@ finding the QR control.
 
 **Settings → Machines** lists **<name> (local)** first, then the backend this window
 is connected to as **<name> (connected backend)**, then saved remote connections. Each
-row shows a macOS, Windows or Linux icon and, after the version (or the **Available to
-<backend>** badge), icons for the AI providers available there; hover an icon for its
+row shows a macOS, Windows or Linux icon and, after the version (or the **Runs agents
+for <backend>** badge), icons for the AI providers available there; hover an icon for its
 name. Switched-off providers are hidden, and offline or unknown machines show no
 icons. **Add machine** opens the connection form; a remote machine's actions include
-**Edit** and **Connect**, with **Test connection** inside its editing panel.
+**Edit** and **Connect**, with **Test connection** inside its editing panel. A machine's
+actions can also include **Let <backend> run agents here**, which asks to confirm with
+**Allow**, and **Stop letting <backend> run agents here**; machines allowed this way are
+listed under **Machines <backend> can run agents on**.
 Workspaces and agents belong to a host, so identify the intended device before
 explaining missing work or changing host settings. **Mobile** follows the active
 connection and its permissions; do not describe a remote connection's QR as belonging
