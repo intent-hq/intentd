@@ -126,7 +126,7 @@ mod tests {
         );
     }
 
-    /// The FE Labs gate (cloudlands-fe feat/cursor-provider) keys off this
+    /// The FE (cloudlands-fe feat/cursor-provider) keys off this
     /// row: id `cursor`, display name `Cursor`, test prompt supported, and
     /// visible without any env var or feature code.
     #[test]

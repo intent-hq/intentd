@@ -495,23 +495,20 @@ that phase. **Startup status unavailable. Reconnecting securely…** means curre
 status is unavailable. For **Startup Failed**, use **Retry Connection** after
 checking the desktop daemon. **Back to Home** keeps saved credentials.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/{command-palette-labs.ts,command-palette-commands.ts,settings/ProviderSelector.svelte}; packages/intentd/crates/intent-providers/src/{config.rs,cursor.rs}; packages/intentd/crates/intent-services/src/{cursor_cli.rs,provider_auth.rs}. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/settings/ProviderSelector.svelte; packages/intentd/crates/intent-providers/src/{config.rs,cursor.rs}; packages/intentd/crates/intent-services/src/{cursor_cli.rs,provider_auth.rs}. -->
 
-## Cursor as an agent provider (experimental, Labs)
+## Use Cursor as an agent provider
 
-The Cursor provider is experimental and hidden until the user runs **Enable experimental
-Cursor provider** from Cmd+K (Labs). Do not offer it as a normal option; describe it only
-when the user asks about it, and say it is experimental. **Disable experimental Cursor
-provider** hides it again but does not switch off a Cursor provider already enabled in
-**Settings → Providers**.
-
+Cursor is an opt-in provider: it stays off until the user enables it in
+**Settings → Providers** (`/settings?tab=providers#providers`), like other providers.
 It needs the Cursor CLI (`cursor-agent`) on the daemon host, signed in with
 `cursor-agent login`. Intent also accepts `CURSOR_API_KEY` in the daemon's environment;
 when both exist, the stored login wins. If `cursor-agent` runs the Grok agent host
 instead of Cursor, **Providers** shows it as unavailable: run
 `cursor-agent update --channel cursor`, or set a custom path to the Cursor install.
-Labs limitations: choosing a model for a Cursor agent also changes the user's default
-model for the Cursor CLI. Cursor's own subagent tool still works; Intent only instructs
+
+Limitations: choosing a model for a Cursor agent also changes the user's default model
+for the Cursor CLI. Cursor's own subagent tool still works; Intent only instructs
 Cursor agents to delegate through Intent instead, and such runs show as **Subagent**
 in the timeline. Cursor also loads your own `~/.cursor/mcp.json` and the project's
 `.cursor/mcp.json` servers.

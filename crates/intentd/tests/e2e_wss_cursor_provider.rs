@@ -283,7 +283,7 @@ async fn cursor_provider_discovery_auth_models_and_turn_over_wss() {
     let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
     let mut rpc = connect_ws(port, cfg.clone()).await;
 
-    // Catalog row: the FE contract for the Labs-gated Cursor entry.
+    // Catalog row: the FE contract for the Cursor entry.
     let catalog = wss_rpc(&mut rpc, 1, "providers.catalog", json!({})).await;
     let cursor = row(&catalog["providers"], "cursor");
     assert_eq!(cursor["displayName"], "Cursor");
