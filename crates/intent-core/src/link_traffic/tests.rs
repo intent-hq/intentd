@@ -47,6 +47,7 @@ fn launch_frame() -> LinkFrame {
         repo_key: "repo".into(),
         agent_features: json!({ "apiToken": "tok-secret", "inputTokens": 12 }),
         is_sub_agent: false,
+        checkout: None,
         profile_env: Some(LaunchProfileEnv(json!({
             "providerRef": "claude-code@work",
             "fingerprint": "fp-1",

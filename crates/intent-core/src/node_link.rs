@@ -67,9 +67,11 @@ fn is_false(value: &bool) -> bool {
 /// daemon-to-daemon executor link started at 6; 7 adds the correlated stop
 /// acknowledgement (`stopId` on [`LinkFrame::Stop`], [`LinkFrame::StopAck`]);
 /// 8 adds the saved-script frames ([`SCRIPT_PROTOCOL`]); 9 adds final
-/// stops and the bind-time checkout sweep ([`FINAL_STOP_PROTOCOL`]), and
-/// keeps everything 8 has. Neither 6 nor the single-node 5 ever shipped, and
-/// a protocol-6 peer cannot confirm a stop, so this build speaks 7 to 9: a
+/// stops and the bind-time checkout sweep ([`FINAL_STOP_PROTOCOL`]); 10 adds
+/// the prepared checkout ([`PREPARED_CHECKOUT_PROTOCOL`]), which this build
+/// does not offer yet; each keeps everything the one before has. Neither 6
+/// nor the single-node 5 ever shipped, and a protocol-6 peer cannot confirm a
+/// stop, so this build speaks 7 to 9: a
 /// backend never takes a stop as confirmed by a machine that cannot
 /// acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
@@ -77,6 +79,22 @@ fn is_false(value: &bool) -> bool {
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
 pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 9 };
+
+/// The first protocol with the prepared checkout: [`LaunchCommand::checkout`]
+/// and module git remotes (`intent://ws/<ws>/agents/<agent>/modules/<key>`).
+/// Head sends neither on a link that negotiated less, and refuses a module
+/// session there. Until [`NODE_LINK_PROTOCOLS`] reaches it (the machine's
+/// recursive checkout), head captures pins but nothing else changes: see
+/// [`offers_prepared_checkout`].
+pub const PREPARED_CHECKOUT_PROTOCOL: u32 = 10;
+
+/// Whether this build offers the prepared checkout: only then does a
+/// workspace that needs one refuse older machines, and do placed agents
+/// show their submodule pins.
+#[must_use]
+pub const fn offers_prepared_checkout() -> bool {
+    NODE_LINK_PROTOCOLS.max >= PREPARED_CHECKOUT_PROTOCOL
+}
 
 /// The first protocol with the saved-script frames (`scriptStart`,
 /// `scriptStop`, `scriptStarted`, `scriptOutput`, `scriptExited`). Neither
@@ -384,6 +402,49 @@ pub struct LaunchCommand {
     /// no profile is selected and the node uses its own provider login.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_env: Option<LaunchProfileEnv>,
+    /// What the node prepares in the checkout before the agent starts; sent
+    /// only on a link of [`PREPARED_CHECKOUT_PROTOCOL`] or later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<PreparedCheckout>,
+}
+
+/// The checkout a nodeProtocol 10 launch prepares. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreparedCheckout {
+    /// The submodules populated in head's checkout, parents before children.
+    pub submodules: Vec<SubmodulePin>,
+    /// The workspace's setup script; absent when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupCommand>,
+}
+
+/// A submodule populated in head's checkout, at the commit its `HEAD` has
+/// checked out (its module `base` ref). The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubmodulePin {
+    /// From the superproject root, `/`-separated, without `.` or `..`.
+    pub path: String,
+    /// Its `.gitmodules` name.
+    pub name: String,
+    pub commit: String,
+    /// Names the module's git remote and the node's module cache; opaque
+    /// to the node (the same recipe as [`LaunchCommand::repo_key`]).
+    pub module_key: String,
+}
+
+/// The setup script the node runs in a fresh checkout before the agent
+/// starts. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetupCommand {
+    pub script: String,
+    pub branch_name: String,
+    pub source_branch: String,
+    /// The node's default when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 /// The environment overlay of the provider profile a launch runs with:

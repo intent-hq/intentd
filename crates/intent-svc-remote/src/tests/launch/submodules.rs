@@ -38,7 +38,15 @@ fn add_submodules(repo: &Path) -> Modules {
     repo_with_commit(&src("a"), "a.txt");
     git(
         &src("a"),
-        &["-c", FILE, "submodule", "add", "--quiet", src("b").to_str().unwrap(), "b"],
+        &[
+            "-c",
+            FILE,
+            "submodule",
+            "add",
+            "--quiet",
+            src("b").to_str().unwrap(),
+            "b",
+        ],
     );
     git(&src("a"), &["commit", "--quiet", "-m", "add b"]);
     repo_with_commit(&src("c"), "c.txt");
@@ -46,17 +54,43 @@ fn add_submodules(repo: &Path) -> Modules {
     for name in ["a", "c", "d"] {
         git(
             repo,
-            &["-c", FILE, "submodule", "add", "--quiet", src(name).to_str().unwrap(), name],
+            &[
+                "-c",
+                FILE,
+                "submodule",
+                "add",
+                "--quiet",
+                src(name).to_str().unwrap(),
+                name,
+            ],
         );
     }
-    git(repo, &["config", "-f", ".gitmodules", "submodule.c.update", "none"]);
+    git(
+        repo,
+        &["config", "-f", ".gitmodules", "submodule.c.update", "none"],
+    );
     git(repo, &["add", ".gitmodules"]);
     git(repo, &["commit", "--quiet", "-m", "submodules"]);
-    git(repo, &["-c", FILE, "submodule", "update", "--quiet", "--init", "--recursive", "a"]);
+    git(
+        repo,
+        &[
+            "-c",
+            FILE,
+            "submodule",
+            "update",
+            "--quiet",
+            "--init",
+            "--recursive",
+            "a",
+        ],
+    );
     git(repo, &["submodule", "deinit", "--quiet", "-f", "d"]);
     std::fs::write(repo.join("a/ahead.txt"), "backend only\n").unwrap();
     git(&repo.join("a"), &["add", "ahead.txt"]);
-    git(&repo.join("a"), &["commit", "--quiet", "-m", "backend only"]);
+    git(
+        &repo.join("a"),
+        &["commit", "--quiet", "-m", "backend only"],
+    );
     std::fs::write(repo.join("c/dirty.txt"), "uncommitted\n").unwrap();
     repo_with_commit(&repo.join("nested"), "nested.txt");
     Modules {
@@ -65,6 +99,17 @@ fn add_submodules(repo: &Path) -> Modules {
         c: git(&repo.join("c"), &["rev-parse", "HEAD"]),
         _sources: sources,
     }
+}
+
+/// The fixture on a protocol 10 link of a backend that offers the prepared
+/// checkout (this build does not yet; see [`dormant`]).
+async fn prepared_fixture() -> (Fixture, NodeEnd, Machine) {
+    let (f, link, machine) = fixture().await;
+    f.node
+        .shared_ref()
+        .set_protocol_for_test(PREPARED_CHECKOUT_PROTOCOL);
+    f.node.shared_ref().offer_prepared_checkout_for_test();
+    (f, link, machine)
 }
 
 fn key(dir: &Path) -> String {
@@ -107,6 +152,7 @@ fn update_required(result: intent_core::Result<impl std::fmt::Debug>) -> String 
     match result {
         Err(Error::MachineUpdateRequired(update)) => {
             assert_eq!(update.update, intent_core::machines::UpdateSide::Machine);
+            assert_eq!(update.data()["reason"], "prepared-checkout");
             update.message()
         }
         other => panic!("expected machine-update-required, got {other:?}"),
@@ -128,7 +174,7 @@ fn is_unavailable<T: std::fmt::Debug>(result: &intent_core::Result<T>) -> bool {
 /// carries the pins.
 #[tokio::test]
 async fn populated_submodules_are_pinned_at_their_backend_heads() {
-    let (f, mut link, _machine) = fixture().await;
+    let (f, mut link, _machine) = prepared_fixture().await;
     let modules = add_submodules(f.repo.path());
     let repo = f.repo.path();
     let (agent, view) = f.placed().await;
@@ -153,17 +199,51 @@ async fn populated_submodules_are_pinned_at_their_backend_heads() {
             module_key: key(&repo.join("c")),
         },
     ];
-    assert_eq!(view.submodules, expected);
-    assert_eq!(f.view(&agent).await.submodules, expected);
+    assert_eq!(view.pins(), expected);
+    assert_eq!(f.view(&agent).await.pins(), expected);
+    let session = f
+        .services
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .unwrap();
+    let mut lite =
+        intent_core::model::AgentLite::from_session(session, 0, None, None, None, None, None);
+    // Detail reads carry the pins once this build offers the prepared
+    // checkout; until then nothing new is projected.
+    let shown = intent_core::node_link::offers_prepared_checkout().then(|| {
+        json!([
+            { "path": "a", "commit": modules.a },
+            { "path": "a/b", "commit": modules.b },
+            { "path": "c", "commit": modules.c },
+        ])
+    });
+    assert_eq!(
+        serde_json::to_value(&lite)
+            .unwrap()
+            .get("submodules")
+            .cloned(),
+        shown
+    );
+    lite.strip_detail_only_fields();
+    assert!(serde_json::to_value(&lite)
+        .unwrap()
+        .get("submodules")
+        .is_none());
     let base_ref = AgentRemote::new(workspace().as_str(), agent.as_str())
         .unwrap()
         .ref_name(intent_git::hub::AgentRef::Base);
     for pin in &expected {
-        assert_eq!(git(&repo.join(&pin.path), &["rev-parse", &base_ref]), pin.commit);
+        assert_eq!(
+            git(&repo.join(&pin.path), &["rev-parse", &base_ref]),
+            pin.commit
+        );
     }
 
     let launch = f.launch_frame(&mut link, &agent).await;
-    let checkout = launch.checkout.expect("a protocol-10 launch prepares the checkout");
+    let checkout = launch
+        .checkout
+        .expect("a protocol-10 launch prepares the checkout");
     assert_eq!(checkout.submodules, expected);
     assert_eq!(checkout.setup, None);
     f.node.shutdown();
@@ -173,7 +253,7 @@ async fn populated_submodules_are_pinned_at_their_backend_heads() {
 /// pins, at a real gitlink inside the checkout, and only on nodeProtocol 10.
 #[tokio::test]
 async fn module_git_sessions_are_confined_to_the_agents_pins() {
-    let (f, link, _machine) = fixture().await;
+    let (f, link, _machine) = prepared_fixture().await;
     let _modules = add_submodules(f.repo.path());
     let repo = f.repo.path().to_path_buf();
     let (agent, mut view) = f.placed().await;
@@ -191,16 +271,30 @@ async fn module_git_sessions_are_confined_to_the_agents_pins() {
         let opened = open(&agent, &key(&repo.join(path)), GitService::UploadPack)
             .await
             .unwrap();
-        assert_eq!(opened.canonicalize().unwrap(), repo.join(path).canonicalize().unwrap());
+        assert_eq!(
+            opened.canonicalize().unwrap(),
+            repo.join(path).canonicalize().unwrap()
+        );
     }
-    assert!(is_denied(open(&agent, "repo-0123456789abcdef0123456789abcdef", GitService::UploadPack).await));
-    assert!(is_denied(open(&agent, &key(&repo), GitService::UploadPack).await));
+    assert!(is_denied(
+        open(
+            &agent,
+            "repo-0123456789abcdef0123456789abcdef",
+            GitService::UploadPack
+        )
+        .await
+    ));
+    assert!(is_denied(
+        open(&agent, &key(&repo), GitService::UploadPack).await
+    ));
 
     // Another agent's pins do not admit this one.
     let mut unpinned = f.view(&other).await;
-    unpinned.submodules.clear();
+    unpinned.submodules = Some(Vec::new());
     f.set_view(&other, &unpinned).await;
-    assert!(is_denied(open(&other, &key(&repo.join("a")), GitService::UploadPack).await));
+    assert!(is_denied(
+        open(&other, &key(&repo.join("a")), GitService::UploadPack).await
+    ));
 
     // A recorded pin is checked against the checkout: a nested repository
     // that is not a gitlink, a gitlink replaced by a symlink to another
@@ -216,24 +310,44 @@ async fn module_git_sessions_are_confined_to_the_agents_pins() {
         commit: "0".repeat(40),
         module_key,
     };
-    view.submodules = vec![
+    view.submodules = Some(vec![
         pin("nested", key(&repo.join("nested"))),
         pin("c", key(outside.path())),
         pin("a", key(&repo.join("a/b"))),
         pin("d", "repo-dddddddddddddddddddddddddddddddd".into()),
         pin("../escape", "repo-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into()),
-    ];
+    ]);
     f.set_view(&agent, &view).await;
-    assert!(is_denied(open(&agent, &key(&repo.join("nested")), GitService::UploadPack).await));
-    assert!(is_denied(open(&agent, &key(outside.path()), GitService::UploadPack).await));
-    assert!(is_denied(open(&agent, &key(&repo.join("a/b")), GitService::UploadPack).await));
-    assert!(is_unavailable(
-        &open(&agent, "repo-dddddddddddddddddddddddddddddddd", GitService::UploadPack).await
+    assert!(is_denied(
+        open(&agent, &key(&repo.join("nested")), GitService::UploadPack).await
     ));
-    assert!(is_denied(open(&agent, "repo-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", GitService::UploadPack).await));
+    assert!(is_denied(
+        open(&agent, &key(outside.path()), GitService::UploadPack).await
+    ));
+    assert!(is_denied(
+        open(&agent, &key(&repo.join("a/b")), GitService::UploadPack).await
+    ));
+    assert!(is_unavailable(
+        &open(
+            &agent,
+            "repo-dddddddddddddddddddddddddddddddd",
+            GitService::UploadPack
+        )
+        .await
+    ));
+    assert!(is_denied(
+        open(
+            &agent,
+            "repo-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            GitService::UploadPack
+        )
+        .await
+    ));
 
     // A module session on a link below nodeProtocol 10 is invalid.
-    f.node.shared_ref().set_protocol_for_test(PREPARED_CHECKOUT_PROTOCOL - 1);
+    f.node
+        .shared_ref()
+        .set_protocol_for_test(PREPARED_CHECKOUT_PROTOCOL - 1);
     let old = open(&agent, &key(&repo.join("nested")), GitService::UploadPack).await;
     assert!(
         matches!(old, Err(Error::InvalidParams(ref m)) if m == "node-git-invalid"),
@@ -246,7 +360,7 @@ async fn module_git_sessions_are_confined_to_the_agents_pins() {
 /// own branches stay hidden.
 #[tokio::test]
 async fn a_module_session_advertises_only_the_agents_refs() {
-    let (f, link, _machine) = fixture().await;
+    let (f, link, _machine) = prepared_fixture().await;
     let modules = add_submodules(f.repo.path());
     let (agent, _) = f.placed().await;
     let module_key = key(&f.repo.path().join("a"));
@@ -264,7 +378,11 @@ async fn a_module_session_advertises_only_the_agents_refs() {
         .await
         .unwrap();
     assert!(
-        advertised.contains(&format!("{} {}", modules.a, remote.ref_name(intent_git::hub::AgentRef::Base))),
+        advertised.contains(&format!(
+            "{} {}",
+            modules.a,
+            remote.ref_name(intent_git::hub::AgentRef::Base)
+        )),
         "{advertised}"
     );
     assert!(!advertised.contains("refs/heads/"), "{advertised}");
@@ -275,7 +393,7 @@ async fn a_module_session_advertises_only_the_agents_refs() {
 /// pushes are admitted (receive-pack only) after the placement is gone.
 #[tokio::test]
 async fn a_final_stop_admits_the_module_pushes() {
-    let (f, mut link, _machine) = fixture().await;
+    let (f, mut link, _machine) = prepared_fixture().await;
     let _modules = add_submodules(f.repo.path());
     let repo: PathBuf = f.repo.path().to_path_buf();
     let (agent, _) = f.placed().await;
@@ -283,7 +401,10 @@ async fn a_final_stop_admits_the_module_pushes() {
     let binding = link.hello.binding.clone();
     let stop_id = f
         .node
-        .final_stop(&agent, intent_core::remote_launch::FinalStopReason::AgentDeleted)
+        .final_stop(
+            &agent,
+            intent_core::remote_launch::FinalStopReason::AgentDeleted,
+        )
         .await;
     assert_eq!(link.stop_for(&agent).await, stop_id);
     sqlx::query("DELETE FROM agent_session WHERE id = ?")
@@ -302,9 +423,17 @@ async fn a_final_stop_admits_the_module_pushes() {
             .canonicalize()
             .unwrap()
     );
-    assert!(is_denied(access.repository(&binding, &a, GitService::UploadPack).await));
+    assert!(is_denied(
+        access
+            .repository(&binding, &a, GitService::UploadPack)
+            .await
+    ));
     let unknown = module_remote(&agent, &key(&repo.join("nested")));
-    assert!(is_denied(access.repository(&binding, &unknown, GitService::ReceivePack).await));
+    assert!(is_denied(
+        access
+            .repository(&binding, &unknown, GitService::ReceivePack)
+            .await
+    ));
     f.node.shutdown();
 }
 
@@ -314,15 +443,21 @@ async fn a_final_stop_admits_the_module_pushes() {
 /// without a `checkout`.
 #[tokio::test]
 async fn an_older_machine_is_refused_only_when_the_checkout_needs_preparing() {
-    let (f, mut link, _machine) = fixture().await;
-    f.node.shared_ref().set_protocol_for_test(PREPARED_CHECKOUT_PROTOCOL - 1);
+    let (f, mut link, _machine) = prepared_fixture().await;
+    f.node
+        .shared_ref()
+        .set_protocol_for_test(PREPARED_CHECKOUT_PROTOCOL - 1);
     let (plain, _) = f.placed().await;
     let launch = f.launch_frame(&mut link, &plain).await;
     assert_eq!(launch.checkout, None);
 
     let config = f.repo.path().join(".intent");
     std::fs::create_dir_all(&config).unwrap();
-    std::fs::write(config.join("config.json"), r#"{"setupScript":"echo ready"}"#).unwrap();
+    std::fs::write(
+        config.join("config.json"),
+        r#"{"setupScript":"echo ready"}"#,
+    )
+    .unwrap();
     let message = update_required(f.admit(r#"{"target":"remote"}"#).await);
     assert!(message.contains("Test machine"), "{message}");
     assert!(message.contains("setup script"), "{message}");
@@ -333,9 +468,96 @@ async fn an_older_machine_is_refused_only_when_the_checkout_needs_preparing() {
 
     // An agent pinned on a protocol-10 link that later reconnects below
     // 10 is refused at its start rather than launched without them.
-    f.node.shared_ref().set_protocol_for_test(PREPARED_CHECKOUT_PROTOCOL);
+    f.node
+        .shared_ref()
+        .set_protocol_for_test(PREPARED_CHECKOUT_PROTOCOL);
     let (pinned, _) = f.placed().await;
-    f.node.shared_ref().set_protocol_for_test(PREPARED_CHECKOUT_PROTOCOL - 1);
+    f.node
+        .shared_ref()
+        .set_protocol_for_test(PREPARED_CHECKOUT_PROTOCOL - 1);
     update_required(f.port().runtime(&f.services, &pinned).await.map(|_| ()));
+    assert_eq!(
+        f.view(&pinned).await.placement_error.map(|e| e.code),
+        Some("machine-update-required".to_owned())
+    );
+    f.node.shutdown();
+}
+
+/// A prepared agent gets `checkout` on a protocol 10 launch even with no
+/// submodule; an agent placed before pins were captured never does.
+#[tokio::test]
+async fn only_prepared_agents_get_a_checkout() {
+    let (f, mut link, _machine) = prepared_fixture().await;
+    let (prepared, _) = f.placed().await;
+    let launch = f.launch_frame(&mut link, &prepared).await;
+    assert_eq!(
+        launch.checkout,
+        Some(intent_core::node_link::PreparedCheckout::default())
+    );
+
+    let (legacy, mut view) = f.placed().await;
+    view.submodules = None;
+    f.set_view(&legacy, &view).await;
+    let launch = f.launch_frame(&mut link, &legacy).await;
+    assert_eq!(launch.checkout, None);
+    f.node.shutdown();
+}
+
+/// While this build does not offer nodeProtocol 10 nothing a user sees
+/// changes: a workspace with submodules and a setup script still places and
+/// launches on the negotiated link without `checkout`, module sessions are
+/// invalid, the projection and the create notice are as before. The pins
+/// are still captured and their `base` refs written, ready for when it is
+/// offered.
+#[tokio::test]
+async fn dormant() {
+    let (f, mut link, _machine) = fixture().await;
+    assert!(!intent_core::node_link::offers_prepared_checkout());
+    let modules = add_submodules(f.repo.path());
+    let config = f.repo.path().join(".intent");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config.json"),
+        r#"{"setupScript":"echo ready"}"#,
+    )
+    .unwrap();
+
+    let (agent, view) = f.placed().await;
+    assert_eq!(view.pins().len(), 3);
+    let base_ref = AgentRemote::new(workspace().as_str(), agent.as_str())
+        .unwrap()
+        .ref_name(intent_git::hub::AgentRef::Base);
+    assert_eq!(
+        git(&f.repo.path().join("a"), &["rev-parse", &base_ref]),
+        modules.a
+    );
+
+    let launch = f.launch_frame(&mut link, &agent).await;
+    assert_eq!(launch.checkout, None);
+    assert_eq!(f.view(&agent).await.placement_error, None);
+
+    let access = crate::git::HeadGitAccess::new(f.node.shared());
+    let module = module_remote(&agent, &key(&f.repo.path().join("a")));
+    assert!(matches!(
+        access.repository(&link.hello.binding, &module, GitService::UploadPack).await,
+        Err(Error::InvalidParams(ref m)) if m == "node-git-invalid"
+    ));
+
+    let session = f
+        .services
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .unwrap();
+    let lite =
+        intent_core::model::AgentLite::from_session(session, 0, None, None, None, None, None);
+    assert!(serde_json::to_value(&lite)
+        .unwrap()
+        .get("submodules")
+        .is_none());
+    assert_eq!(
+        intent_core::remote_launch::launch_notice("m", &f.base, true),
+        intent_core::remote_launch::launch_notice("m", &f.base, false)
+    );
     f.node.shutdown();
 }

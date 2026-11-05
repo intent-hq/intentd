@@ -85,17 +85,19 @@ fn the_binding_wire_shape_uses_decimal_string_generations() {
 }
 
 #[test]
-fn the_daemon_to_daemon_link_speaks_protocols_7_to_10() {
+fn the_daemon_to_daemon_link_speaks_protocols_7_to_9() {
     // 7 adds the correlated stop acknowledgement. A protocol-6 peer cannot
     // send `stopAck`, so it never links: a backend must not take a stop as
     // confirmed by a machine that cannot confirm it. 8 adds the script
-    // frames, 9 final stops, 10 the prepared checkout; a protocol-7 peer
-    // still binds and runs agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 10 });
+    // frames, 9 final stops; a protocol-7 peer still binds and runs agents.
+    // 10 (the prepared checkout) is defined but not offered until the
+    // machine prepares submodules.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 9 });
     assert_eq!(SCRIPT_PROTOCOL, 8);
-    assert_eq!(FINAL_STOP_PROTOCOL, 9);
-    assert_eq!(PREPARED_CHECKOUT_PROTOCOL, NODE_LINK_PROTOCOLS.max);
-    for version in 7..=10 {
+    assert_eq!(FINAL_STOP_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    assert_eq!(PREPARED_CHECKOUT_PROTOCOL, NODE_LINK_PROTOCOLS.max + 1);
+    assert!(!offers_prepared_checkout());
+    for version in 7..=9 {
         ensure_protocol(version).unwrap();
     }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
@@ -436,6 +438,7 @@ fn every_frame() -> Vec<LinkFrame> {
             }))),
             agent_features: serde_json::json!({}),
             is_sub_agent: false,
+            checkout: None,
         }),
         LinkFrame::Prompt {
             agent_id: agent_id.clone(),
@@ -836,13 +839,21 @@ fn a_prepared_checkout_matches_the_documented_wire_shape() {
         json!({ "submodules": [{ "path": "a", "name": "a", "commit": "c", "moduleKey": "k", "url": "x" }] }),
         json!({ "submodules": [], "setup": { "script": "s", "branchName": "b", "sourceBranch": "m", "env": {} } }),
     ] {
-        assert!(serde_json::from_value::<PreparedCheckout>(open.clone()).is_err(), "{open}");
+        assert!(
+            serde_json::from_value::<PreparedCheckout>(open.clone()).is_err(),
+            "{open}"
+        );
     }
     let old = json!({
         "agentId": "a1", "workspaceId": "ws-1", "provider": "codex", "baseCommit": "base",
         "repoKey": "repo", "agentFeatures": {}, "isSubAgent": false,
     });
-    assert_eq!(serde_json::from_value::<LaunchCommand>(old).unwrap().checkout, None);
+    assert_eq!(
+        serde_json::from_value::<LaunchCommand>(old)
+            .unwrap()
+            .checkout,
+        None
+    );
 }
 
 /// The executor frames of `docs/protocol/node-link.md`: an empty

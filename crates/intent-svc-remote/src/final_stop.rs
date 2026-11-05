@@ -6,7 +6,8 @@
 //! down, so a backend restart before the machine acknowledges it still
 //! resends it at the next bind. While the record exists the machine's final
 //! push is accepted into the workspace's repository, even once the session
-//! (and its placement record) or the worktree is gone. The record is dropped
+//! (and its placement record) or the worktree is gone, and likewise into
+//! the repositories of the submodules it was pinned with. The record is dropped
 //! on the acknowledgement or after [`FINAL_STOP_BOUND`].
 //!
 //! [`FINAL_STOP_BOUND`]: intent_core::remote_launch::FINAL_STOP_BOUND
@@ -14,8 +15,12 @@
 use std::time::Duration;
 
 use intent_core::node_link::StopId;
-use intent_core::remote_launch::{FinalStopReason, RemoteAgentRecord, RemoteFinalStopRecord};
+use intent_core::remote_launch::{
+    FinalStopReason, FinalStopSubmodule, RemoteAgentRecord, RemoteFinalStopRecord,
+    RemotePlacementView,
+};
 use intent_core::{AgentSession, AgentStatus, Result, Workspace};
+use intent_git::node_git;
 use intent_store::Store;
 
 /// Whether `session` has ended for good or for now (deleted, completed or
@@ -68,7 +73,7 @@ pub(crate) fn expired(
 /// Where a final push for `workspace`'s agents lands: the workspace's
 /// repository, whose refs its worktrees share, so the push still lands once
 /// the worktree is removed. Empty when the workspace has neither.
-pub(crate) fn repo_path(workspace: &Workspace) -> String {
+fn repo_path(workspace: &Workspace) -> String {
     workspace
         .repository_path
         .as_ref()
@@ -78,8 +83,55 @@ pub(crate) fn repo_path(workspace: &Workspace) -> String {
         .unwrap_or_default()
 }
 
+/// The submodule repositories `placed`'s last module pushes land in: its
+/// recorded pins with their common git directories in `workspace`'s
+/// checkout (empty for a pin that no longer resolves).
+async fn module_repos(
+    store: &Store,
+    placed: &RemoteAgentRecord,
+    workspace: &Workspace,
+) -> Vec<FinalStopSubmodule> {
+    let pins = match store.get_agent_session_summary(&placed.agent_id).await {
+        Ok(session) => RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .and_then(|view| view.submodules)
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let Some(checkout) = crate::launch::checkout_path(workspace) else {
+        return Vec::new();
+    };
+    if pins.is_empty() {
+        return Vec::new();
+    }
+    let agent = placed.agent_id.clone();
+    tokio::task::spawn_blocking(move || {
+        pins.into_iter()
+            .map(|pin| {
+                // A pin that no longer resolves is kept without a git dir,
+                // so its final push is unavailable rather than denied.
+                let git_dir =
+                    match node_git::module_repository(&checkout, &pin.path, &pin.module_key) {
+                        Ok(module) => module.git_dir.to_string_lossy().into_owned(),
+                        Err(refusal) => {
+                            tracing::warn!(agent = %agent, path = %pin.path, ?refusal, "remote agent: a pinned submodule no longer resolves; its final push cannot land");
+                            String::new()
+                        }
+                    };
+                FinalStopSubmodule {
+                    path: pin.path,
+                    module_key: pin.module_key,
+                    git_dir,
+                }
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
 /// Record a final stop for `placed` with `reason` (keeping one already
-/// recorded) and return its stop id.
+/// recorded) and return its stop id. Its pushes land in the workspace's
+/// repository and its pinned submodules' repositories.
 ///
 /// # Errors
 ///
@@ -88,8 +140,13 @@ pub(crate) async fn record(
     store: &Store,
     placed: &RemoteAgentRecord,
     reason: FinalStopReason,
-    repo_path: String,
 ) -> Result<StopId> {
+    let workspace = store.get_workspace(&placed.workspace_id).await.ok();
+    let repo_path = workspace.as_ref().map(repo_path).unwrap_or_default();
+    let submodules = match &workspace {
+        Some(workspace) => module_repos(store, placed, workspace).await,
+        None => Vec::new(),
+    };
     let recorded = store
         .record_final_stop(&RemoteFinalStopRecord {
             agent_id: placed.agent_id.clone(),
@@ -100,6 +157,7 @@ pub(crate) async fn record(
             reason,
             repo_path,
             requested_at: intent_core::now_iso(),
+            submodules,
         })
         .await?;
     recorded.stop_id.parse().map_err(|_| {
@@ -124,6 +182,7 @@ mod tests {
             reason: FinalStopReason::AgentDeleted,
             repo_path: "/repo".into(),
             requested_at: requested_at.into(),
+            submodules: Vec::new(),
         }
     }
 

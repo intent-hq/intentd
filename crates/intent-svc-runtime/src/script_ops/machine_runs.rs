@@ -225,6 +225,7 @@ impl MachineRuns {
                         "Remote agents' saved scripts need the machine on a newer Intent."
                             .to_owned(),
                     ),
+                    reason: None,
                 },
             )));
         }

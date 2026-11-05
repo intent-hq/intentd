@@ -6164,11 +6164,12 @@ impl Services {
         match self
             .ports
             .remote_launch()
-            .base_commit(self, workspace_id)
+            .checkout_base(self, workspace_id)
             .await
         {
-            Ok(commit) => {
-                view.base_commit = commit;
+            Ok(base) => {
+                view.base_commit = base.commit;
+                view.submodules = Some(base.submodules);
                 None
             }
             Err(error) => {
@@ -6274,7 +6275,8 @@ impl Services {
                 "notice".into(),
                 json!(intent_core::remote_launch::launch_notice(
                     &view.node_name,
-                    &view.base_commit
+                    &view.base_commit,
+                    !view.pins().is_empty(),
                 )),
             );
         }

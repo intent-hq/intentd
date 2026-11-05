@@ -836,6 +836,7 @@ impl Runner {
             profile_env,
             agent_features,
             is_sub_agent,
+            checkout: _,
         } = command;
         let refused = |error: String, failure: Option<ExitFailure>| JournalEntry {
             agent_id: agent_id.clone(),

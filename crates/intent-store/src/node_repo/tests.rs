@@ -821,6 +821,11 @@ async fn final_stops_outlive_the_session_and_drop_the_placement_unless_it_can_co
         reason,
         repo_path: "/repo".into(),
         requested_at: "2026-01-01T00:00:00Z".into(),
+        submodules: vec![intent_core::remote_launch::FinalStopSubmodule {
+            path: "a".into(),
+            module_key: "repo-1".into(),
+            git_dir: "/repo/.git/modules/a".into(),
+        }],
     };
     for agent in ["agent-deleted", "agent-retired"] {
         seed_agent(&store, agent, "workspace").await;
@@ -835,6 +840,11 @@ async fn final_stops_outlive_the_session_and_drop_the_placement_unless_it_can_co
         .await
         .unwrap();
     assert_eq!(deleted.stop_id, "stop-1");
+    assert_eq!(
+        deleted.submodules,
+        stop("agent-deleted", "stop-1", FinalStopReason::AgentDeleted).submodules,
+        "the module repositories round-trip"
+    );
     let again = store
         .record_final_stop(&stop(
             "agent-deleted",

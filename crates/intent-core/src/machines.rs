@@ -245,9 +245,30 @@ pub struct MachineUpdateRequired {
     pub update: UpdateSide,
     /// A sentence appended to the message (never to the data).
     pub hint: Option<String>,
+    /// Why placement needs the update, when the versions do overlap:
+    /// [`PREPARED_CHECKOUT_REASON`].
+    pub reason: Option<String>,
 }
 
+/// `machine-update-required`'s `reason` when the machine links below
+/// nodeProtocol 10 and the workspace needs a prepared checkout.
+pub const PREPARED_CHECKOUT_REASON: &str = "prepared-checkout";
+
 impl MachineUpdateRequired {
+    /// Placement's refusal of a machine that cannot prepare the workspace's
+    /// checkout (submodules or a setup script).
+    #[must_use]
+    pub fn prepared_checkout(machine_name: String, machine_version: String) -> Self {
+        Self {
+            machine_name,
+            machine_version,
+            backend_version: env!("CARGO_PKG_VERSION").to_owned(),
+            update: UpdateSide::Machine,
+            hint: None,
+            reason: Some(PREPARED_CHECKOUT_REASON.to_owned()),
+        }
+    }
+
     /// The message, for example `Update Intent on mac-mini (it runs 0.11.0;
     /// this backend needs 0.12.0 or newer).`
     #[must_use]
@@ -260,6 +281,12 @@ impl MachineUpdateRequired {
     }
 
     fn bare_message(&self) -> String {
+        if self.reason.as_deref() == Some(PREPARED_CHECKOUT_REASON) {
+            return format!(
+                "Update Intent on {} to run agents for this workspace: it has submodules or a setup script.",
+                self.machine_name
+            );
+        }
         match self.update {
             UpdateSide::Machine => format!(
                 "Update Intent on {} (it runs {}; this backend needs {} or newer).",
@@ -275,12 +302,16 @@ impl MachineUpdateRequired {
     /// The `error.data` object.
     #[must_use]
     pub fn data(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut data = serde_json::json!({
             "code": MACHINE_UPDATE_REQUIRED_CODE,
             "machineVersion": self.machine_version,
             "backendVersion": self.backend_version,
             "update": self.update,
-        })
+        });
+        if let Some(reason) = &self.reason {
+            data["reason"] = serde_json::json!(reason);
+        }
+        data
     }
 }
 

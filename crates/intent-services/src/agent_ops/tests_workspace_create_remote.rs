@@ -74,17 +74,23 @@ impl RemoteLaunchPort for FakeRemote {
                 effective_isolation: EffectiveIsolation::Pending,
                 placement_error: None,
                 base_commit: String::new(),
+                submodules: None,
             })
         })
     }
 
-    fn base_commit<'a>(
+    fn checkout_base<'a>(
         &'a self,
         _svc: &'a Services,
         workspace_id: &'a WorkspaceId,
-    ) -> BoxFuture<'a, intent_core::Result<String>> {
+    ) -> BoxFuture<'a, intent_core::Result<intent_core::remote_launch::RemoteCheckoutBase>> {
         self.base_commits.lock().unwrap().push(workspace_id.clone());
-        Box::pin(async { Ok(BASE.to_owned()) })
+        Box::pin(async {
+            Ok(intent_core::remote_launch::RemoteCheckoutBase {
+                commit: BASE.to_owned(),
+                submodules: Vec::new(),
+            })
+        })
     }
 
     fn launch<'a>(

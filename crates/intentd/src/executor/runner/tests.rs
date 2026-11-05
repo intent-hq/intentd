@@ -147,6 +147,7 @@ fn launch(id: &str) -> LaunchCommand {
         agent_features: serde_json::json!({}),
         profile_env: None,
         is_sub_agent: false,
+        checkout: None,
     }
 }
 

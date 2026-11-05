@@ -960,8 +960,8 @@ impl Store {
     ) -> Result<RemoteFinalStopRecord> {
         let mut tx = self.write_pool().begin().await.map_err(db)?;
         sqlx::query(
-            "INSERT INTO remote_final_stop (agent_id, workspace_id, machine_id, lease_id, stop_id, reason, repo_path, requested_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(agent_id) DO NOTHING",
+            "INSERT INTO remote_final_stop (agent_id, workspace_id, machine_id, lease_id, stop_id, reason, repo_path, requested_at, submodules) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(agent_id) DO NOTHING",
         )
         .bind(stop.agent_id.as_str())
         .bind(stop.workspace_id.as_str())
@@ -971,6 +971,7 @@ impl Store {
         .bind(stop.reason.as_str())
         .bind(&stop.repo_path)
         .bind(&stop.requested_at)
+        .bind(serde_json::to_string(&stop.submodules).map_err(db)?)
         .execute(&mut *tx)
         .await
         .map_err(db)?;
@@ -1046,7 +1047,7 @@ impl Store {
     }
 }
 
-const FINAL_STOP_SELECT: &str = "SELECT agent_id, workspace_id, machine_id, lease_id, stop_id, reason, repo_path, requested_at FROM remote_final_stop";
+const FINAL_STOP_SELECT: &str = "SELECT agent_id, workspace_id, machine_id, lease_id, stop_id, reason, repo_path, requested_at, submodules FROM remote_final_stop";
 
 fn final_stop_row(row: &sqlx::sqlite::SqliteRow) -> Result<RemoteFinalStopRecord> {
     let reason: String = row.get("reason");
@@ -1060,6 +1061,8 @@ fn final_stop_row(row: &sqlx::sqlite::SqliteRow) -> Result<RemoteFinalStopRecord
             .ok_or_else(|| db(format!("unknown final stop reason {reason}")))?,
         repo_path: row.get("repo_path"),
         requested_at: row.get("requested_at"),
+        submodules: serde_json::from_str(&row.get::<String, _>("submodules"))
+            .map_err(|e| db(format!("final stop submodules: {e}")))?,
     })
 }
 

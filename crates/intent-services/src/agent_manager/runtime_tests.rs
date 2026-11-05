@@ -432,6 +432,7 @@ async fn remote_manager(
         effective_isolation: intent_core::remote_launch::EffectiveIsolation::Pending,
         placement_error: None,
         base_commit: "base".into(),
+        submodules: None,
     };
     mgr.services
         .store
@@ -457,6 +458,7 @@ fn remote_view() -> intent_core::remote_launch::RemotePlacementView {
         effective_isolation: intent_core::remote_launch::EffectiveIsolation::Pending,
         placement_error: None,
         base_commit: "base".into(),
+        submodules: None,
     }
 }
 
