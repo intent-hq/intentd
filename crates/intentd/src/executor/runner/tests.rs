@@ -2277,79 +2277,297 @@ fn setup_finished(id: &str) -> impl Fn(&JournalRecord) -> bool + '_ {
     move |r| r.agent_id.0 == id && matches!(r.body, JournalBody::SetupFinished { .. })
 }
 
-/// A fresh prepared checkout journals one `setupFinished` before `started`:
-/// `skipped` without a setup script. This machine does not run setup
-/// scripts yet: a launch that carries one records `failed` with
-/// `node-setup-failed`, never runs it, and still starts the agent with the
-/// failure notice on its first turn. A launch without `checkout` journals
-/// neither, nor does one that keeps its checkout.
+/// Wait until `id` has journaled `count` exits.
+async fn wait_exits(runner: &Runner, id: &str, count: usize) {
+    let deadline = tokio::time::Instant::now() + wait();
+    while records(runner)
+        .await
+        .iter()
+        .filter(|r| exited(id)(r))
+        .count()
+        < count
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{id} never exited {count} times"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn setup_started(id: &str) -> impl Fn(&JournalRecord) -> bool + '_ {
+    move |r| r.agent_id.0 == id && matches!(r.body, JournalBody::SetupStarted { .. })
+}
+
+/// A launch of `id` with a prepared checkout and `script` as its setup.
+fn launch_with_setup(id: &str, script: Option<&str>, timeout_secs: Option<u64>) -> LaunchCommand {
+    use intent_core::node_link::{PreparedCheckout, SetupCommand};
+    let mut command = launch(id);
+    command.checkout = Some(Box::new(PreparedCheckout {
+        submodules: Vec::new(),
+        setup: script.map(|script| SetupCommand {
+            script: script.into(),
+            branch_name: "feat/x".into(),
+            source_branch: "main".into(),
+            timeout_secs,
+        }),
+    }));
+    command
+}
+
+/// `id`'s `setupFinished` state, exit code and error.
+fn finished(
+    all: &[JournalRecord],
+    id: &str,
+) -> (
+    intent_core::node_link::SetupState,
+    Option<i32>,
+    Option<String>,
+) {
+    match &find(all, setup_finished(id)).body {
+        JournalBody::SetupFinished {
+            state,
+            exit_code,
+            error,
+            ..
+        } => (*state, *exit_code, error.clone()),
+        _ => unreachable!(),
+    }
+}
+
+/// Whether `id`'s turn `turn` was told setup failed (the fixture echoes its
+/// prompt).
+fn told_setup_failed(all: &[JournalRecord], id: &str, turn: &str, needle: &str) -> bool {
+    all.iter().any(|r| {
+        r.agent_id.0 == id
+            && r.turn_id.as_deref() == Some(turn)
+            && matches!(&r.body, JournalBody::Notification { notification }
+                if notification.to_string().contains("workspace setup failed")
+                    && notification.to_string().contains(needle))
+    })
+}
+
+/// Test 8 (intent-hq/intent#8594): a fresh prepared checkout runs its
+/// setup script before the agent starts, journaling `setupStarted` and
+/// `setupFinished` before `started`, with the documented environment and
+/// never the profile's values or the agent's git wiring; without a script
+/// it records `skipped`. A failing or timed-out script still starts the
+/// agent, whose first turn (only) carries the failure notice. A launch
+/// without `checkout` records nothing, a relaunch that keeps the checkout
+/// does not run setup again, and one without a checkout does.
 #[tokio::test]
-async fn node_runner_records_setup_it_cannot_run_and_starts_the_agent() {
-    use intent_core::node_link::{PreparedCheckout, SetupCommand, SetupState};
-    let Some(h) = harness(3, &[]) else { return };
-    let with = |id: &str, setup: Option<SetupCommand>| {
-        let mut command = launch(id);
-        command.checkout = Some(Box::new(PreparedCheckout {
-            submodules: Vec::new(),
-            setup,
-        }));
-        command
-    };
-    let script = SetupCommand {
-        script: "touch ran-setup".into(),
-        branch_name: "main".into(),
-        source_branch: "main".into(),
-        timeout_secs: None,
-    };
-    h.runner.launch(with("a1", Some(script))).await;
-    h.runner.launch(with("a2", None)).await;
-    h.runner.launch(launch("a3")).await;
-    for id in ["a1", "a2", "a3"] {
+async fn node_runner_runs_setup_before_the_agent_starts() {
+    use intent_core::node_link::SetupState;
+    let Some(h) = harness(5, &[]) else { return };
+    let env_script =
+        "printf '%s|%s|%s|%s|%s|%s|%s\\n' \"$(pwd -P)\" \"$WORKTREE_PATH\" \"$MAIN_CHECKOUT\" \
+         \"$BRANCH_NAME\" \"$SOURCE_BRANCH\" \"$INTENT_REMOTE_MACHINE\" \
+         \"${CODEX_ACCESS_TOKEN-none}${INTENT_NODE_GIT_SOCKET-}\" > setup-env.txt\n\
+         echo ran >> setup-runs.txt\n";
+    let mut with_profile = launch_with_setup("a1", Some(env_script), None);
+    with_profile.profile_env = launch_with_profile(
+        "a1",
+        &json!([{ "key": "CODEX_ACCESS_TOKEN", "value": CANARY }]),
+    )
+    .profile_env;
+    h.runner.launch(with_profile).await;
+    h.runner
+        .launch(launch_with_setup(
+            "a2",
+            Some("echo boom-from-setup\nexit 3\n"),
+            None,
+        ))
+        .await;
+    h.runner
+        .launch(launch_with_setup("a3", Some("sleep 30\n"), Some(1)))
+        .await;
+    h.runner.launch(launch_with_setup("a4", None, None)).await;
+    h.runner.launch(launch("a5")).await;
+    for id in ["a1", "a2", "a3", "a4", "a5"] {
         wait_for(&h.runner, "started", started(id)).await;
     }
     let all = records(&h.runner).await;
-    let state = |id: &str| match &find(&all, setup_finished(id)).body {
-        JournalBody::SetupFinished { state, error, .. } => (*state, error.clone()),
-        _ => unreachable!(),
-    };
-    let (failed, error) = state("a1");
-    assert_eq!(failed, SetupState::Failed);
-    assert!(
-        error.as_deref().unwrap().starts_with("node-setup-failed: "),
-        "{error:?}"
-    );
-    assert_eq!(state("a2"), (SetupState::Skipped, None));
-    assert!(!all.iter().any(setup_finished("a3")), "{all:#?}");
-    for id in ["a1", "a2"] {
-        let finished = all.iter().position(setup_finished(id)).unwrap();
+    for id in ["a1", "a2", "a3"] {
+        let begun = all.iter().position(setup_started(id)).unwrap();
+        let ended = all.iter().position(setup_finished(id)).unwrap();
         let start = all.iter().position(started(id)).unwrap();
-        assert!(finished < start, "{all:#?}");
+        assert!(begun < ended && ended < start, "{all:#?}");
     }
-    let worktree = h.storage.existing_agent_dir(&AgentId::from("a1")).unwrap();
-    assert!(!worktree.join("ran-setup").exists());
+    assert_eq!(finished(&all, "a1"), (SetupState::Completed, Some(0), None));
+    assert_eq!(finished(&all, "a2"), (SetupState::Failed, Some(3), None));
+    let (state, code, error) = finished(&all, "a3");
+    assert_eq!((state, code), (SetupState::Failed, None));
+    assert!(error.unwrap().starts_with("node-setup-timeout: "));
+    assert_eq!(finished(&all, "a4"), (SetupState::Skipped, None, None));
+    assert!(!all.iter().any(setup_started("a4")), "{all:#?}");
+    assert!(!all.iter().any(setup_finished("a5")), "{all:#?}");
 
+    let worktree = h.storage.existing_agent_dir(&AgentId::from("a1")).unwrap();
+    let env = std::fs::read_to_string(worktree.join("setup-env.txt")).unwrap();
+    let fields: Vec<&str> = env.trim_end().split('|').collect();
+    let here = worktree.canonicalize().unwrap();
+    assert_eq!(std::path::Path::new(fields[0]), here, "{env}");
+    assert_eq!(std::path::Path::new(fields[1]), worktree, "{env}");
+    assert!(fields[2].ends_with("/repos/repo/main"), "{env}");
+    assert!(std::path::Path::new(fields[2]).is_dir(), "{env}");
+    assert_eq!(fields[3..], ["feat/x", "main", "1", "none"], "{env}");
+    let agent_dir = worktree.parent().unwrap();
+    assert!(
+        !std::fs::read_dir(agent_dir)
+            .unwrap()
+            .chain(std::fs::read_dir(&worktree).unwrap())
+            .any(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "sh")),
+        "the script file is written outside the checkout and removed"
+    );
+
+    for id in ["a1", "a2", "a3"] {
+        h.runner
+            .prompt(&AgentId::from(id), "t1".into(), text("hello"))
+            .await;
+        wait_for(&h.runner, "turn end", turn_ended(id, "t1")).await;
+        h.runner
+            .prompt(&AgentId::from(id), "t2".into(), text("again"))
+            .await;
+    }
+    for id in ["a1", "a2", "a3"] {
+        wait_for(&h.runner, "second turn end", turn_ended(id, "t2")).await;
+    }
+    let all = records(&h.runner).await;
+    assert!(!told_setup_failed(&all, "a1", "t1", ""), "{all:#?}");
+    assert!(told_setup_failed(&all, "a2", "t1", "exited with code 3"));
+    assert!(told_setup_failed(&all, "a2", "t1", "boom-from-setup"));
+    assert!(told_setup_failed(&all, "a3", "t1", "timed out"));
+    for id in ["a2", "a3"] {
+        assert!(!told_setup_failed(&all, id, "t2", ""), "the notice is once");
+    }
+
+    // A relaunch that keeps the checkout does not run setup again.
+    h.runner.stop(&AgentId::from("a1"));
+    wait_for(&h.runner, "exit", exited("a1")).await;
+    h.runner
+        .launch(launch_with_setup("a1", Some(env_script), None))
+        .await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t3".into(), text("kept"))
+        .await;
+    let all = wait_for(&h.runner, "kept turn end", turn_ended("a1", "t3")).await;
+    assert_eq!(all.iter().filter(|r| setup_started("a1")(r)).count(), 1);
+    assert_eq!(all.iter().filter(|r| setup_finished("a1")(r)).count(), 1);
+    // A relaunch without its checkout runs it again.
+    h.runner.stop(&AgentId::from("a1"));
+    wait_exits(&h.runner, "a1", 2).await;
+    h.storage.remove_agent(&AgentId::from("a1")).unwrap();
+    h.runner
+        .launch(launch_with_setup("a1", Some(env_script), None))
+        .await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t4".into(), text("fresh"))
+        .await;
+    let all = wait_for(&h.runner, "fresh turn end", turn_ended("a1", "t4")).await;
+    assert_eq!(all.iter().filter(|r| setup_started("a1")(r)).count(), 2);
+    for id in ["a1", "a2", "a3", "a4", "a5"] {
+        h.runner.stop(&AgentId::from(id));
+    }
+}
+
+/// A stop during setup kills the script's process group and journals the
+/// exit with neither `setupFinished` nor `started`; the next launch keeps
+/// that checkout, records `failed` with `node-setup-interrupted` without
+/// running the script again, and tells the agent.
+#[tokio::test]
+async fn node_runner_stop_during_setup_kills_it_and_records_it_interrupted() {
+    use intent_core::node_link::SetupState;
+    let Some(h) = harness(1, &[]) else { return };
+    let script = "echo ran >> setup-runs.txt\nsleep 60 &\necho $! > child.pid\nwait\n";
+    h.runner
+        .launch(launch_with_setup("a1", Some(script), None))
+        .await;
+    wait_for(&h.runner, "setup started", setup_started("a1")).await;
+    let worktree = h.storage.existing_agent_dir(&AgentId::from("a1")).unwrap();
+    let pid_file = worktree.join("child.pid");
+    let deadline = tokio::time::Instant::now() + wait();
+    let child: i32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|pid| pid.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "setup never ran");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    h.runner.stop(&AgentId::from("a1"));
+    let all = wait_for(&h.runner, "exit", exited("a1")).await;
+    assert!(!all.iter().any(setup_finished("a1")), "{all:#?}");
+    assert!(!all.iter().any(started("a1")), "{all:#?}");
+    let deadline = tokio::time::Instant::now() + wait();
+    while nix::sys::signal::kill(nix::unistd::Pid::from_raw(child), None).is_ok() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the script's child outlived the stop"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    h.runner
+        .launch(launch_with_setup("a1", Some(script), None))
+        .await;
     h.runner
         .prompt(&AgentId::from("a1"), "t1".into(), text("hello"))
         .await;
     let all = wait_for(&h.runner, "turn end", turn_ended("a1", "t1")).await;
-    assert!(
-        all.iter().any(|r| r.turn_id.as_deref() == Some("t1")
-            && matches!(&r.body, JournalBody::Notification { notification }
-                if notification.to_string().contains("workspace setup failed"))),
-        "{all:#?}"
+    let (state, code, error) = finished(&all, "a1");
+    assert_eq!((state, code), (SetupState::Failed, None));
+    assert!(error.unwrap().starts_with("node-setup-interrupted: "));
+    assert_eq!(all.iter().filter(|r| setup_started("a1")(r)).count(), 1);
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("setup-runs.txt")).unwrap(),
+        "ran\n",
+        "no re-run"
     );
+    assert!(told_setup_failed(
+        &all,
+        "a1",
+        "t1",
+        "stopped before it finished"
+    ));
+    h.runner.stop(&AgentId::from("a1"));
+}
 
-    // A relaunch that keeps the checkout records no setup again.
-    h.runner.stop(&AgentId::from("a2"));
-    wait_for(&h.runner, "exit", exited("a2")).await;
-    h.runner.launch(with("a2", None)).await;
+/// A kept checkout with no recorded setup (its first launch was stopped
+/// before setup, or ran on a machine without it) records one result, so
+/// the backend never waits on a setup that will not come: `failed` without
+/// running a script it carries, `skipped` without one.
+#[tokio::test]
+async fn node_runner_records_setup_for_a_kept_checkout_without_one() {
+    use intent_core::node_link::SetupState;
+    let Some(h) = harness(2, &[]) else { return };
+    for id in ["a1", "a2"] {
+        h.storage.agent_dir(&AgentId::from(id)).unwrap();
+    }
     h.runner
-        .prompt(&AgentId::from("a2"), "t2".into(), text("again"))
+        .launch(launch_with_setup("a1", Some("echo ran > ran.txt\n"), None))
         .await;
-    let all = wait_for(&h.runner, "relaunched turn end", turn_ended("a2", "t2")).await;
-    assert_eq!(all.iter().filter(|r| started("a2")(r)).count(), 2);
-    assert_eq!(all.iter().filter(|r| setup_finished("a2")(r)).count(), 1);
-    for id in ["a1", "a2", "a3"] {
+    h.runner.launch(launch_with_setup("a2", None, None)).await;
+    for id in ["a1", "a2"] {
+        wait_for(&h.runner, "started", started(id)).await;
+    }
+    let all = records(&h.runner).await;
+    let (state, code, error) = finished(&all, "a1");
+    assert_eq!((state, code), (SetupState::Failed, None));
+    assert!(error.unwrap().starts_with("node-setup-interrupted: "));
+    assert!(!all.iter().any(setup_started("a1")), "{all:#?}");
+    let worktree = h.storage.existing_agent_dir(&AgentId::from("a1")).unwrap();
+    assert!(
+        !worktree.join("ran.txt").exists(),
+        "no run on a kept checkout"
+    );
+    assert_eq!(finished(&all, "a2"), (SetupState::Skipped, None, None));
+    for id in ["a1", "a2"] {
         h.runner.stop(&AgentId::from(id));
     }
 }

@@ -94,6 +94,54 @@ impl Services {
         crate::publish_event(self.event_bus.as_ref(), event).await;
     }
 
+    /// The setup script a remote agent of `workspace_id` placed with `view`
+    /// runs on its machine, resolved at every launch with the local
+    /// `workspace.create` rule: the explicit create parameter kept with the
+    /// initial agent's placement, else `setupScript` in the workspace
+    /// worktree's `.intent/config.json`, else the workspace's stored script.
+    /// A workspace without a worktree (`skipWorktree`, a plain folder) has
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// When the workspace cannot be read.
+    pub async fn remote_setup_command(
+        &self,
+        workspace_id: &WorkspaceId,
+        view: &intent_core::remote_launch::RemotePlacementView,
+    ) -> Result<Option<intent_core::node_link::SetupCommand>> {
+        let ws = self.store.get_workspace(workspace_id).await?;
+        if ws.skip_worktree || ws.plain_folder {
+            return Ok(None);
+        }
+        let Some(worktree) = crate::git_ops::worktree_path(&ws) else {
+            return Ok(None);
+        };
+        let nonblank = |script: &str| {
+            let script = script.trim();
+            (!script.is_empty()).then(|| script.to_owned())
+        };
+        let script = match view.setup_script.as_deref().and_then(nonblank) {
+            Some(explicit) => Some(explicit),
+            None => crate::repo_config::read_repo_config(&worktree)
+                .await
+                .setup_script
+                .as_deref()
+                .and_then(nonblank)
+                .or_else(|| {
+                    ws.setup_script
+                        .as_ref()
+                        .and_then(|stored| nonblank(&stored.script))
+                }),
+        };
+        Ok(script.map(|script| intent_core::node_link::SetupCommand {
+            script,
+            branch_name: ws.branch.clone(),
+            source_branch: ws.base_ref.clone().unwrap_or_default(),
+            timeout_secs: None,
+        }))
+    }
+
     /// Publish `agent:updated` for a remote agent whose projected placement
     /// changed on its node (checkout isolated, or a start error), so the
     /// `agent` channel pushes its list row with the new `effectiveIsolation`

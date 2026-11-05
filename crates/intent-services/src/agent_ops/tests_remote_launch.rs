@@ -42,6 +42,8 @@ fn view(placement: &AgentPlacement) -> RemotePlacementView {
         placement_error: None,
         base_commit: BASE.into(),
         submodules: None,
+        setup: None,
+        setup_script: None,
     }
 }
 

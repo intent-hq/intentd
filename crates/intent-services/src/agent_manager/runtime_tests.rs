@@ -433,6 +433,8 @@ async fn remote_manager(
         placement_error: None,
         base_commit: "base".into(),
         submodules: None,
+        setup: None,
+        setup_script: None,
     };
     mgr.services
         .store
@@ -459,6 +461,8 @@ fn remote_view() -> intent_core::remote_launch::RemotePlacementView {
         placement_error: None,
         base_commit: "base".into(),
         submodules: None,
+        setup: None,
+        setup_script: None,
     }
 }
 

@@ -24201,6 +24201,7 @@ impl WorkspaceApi for Services {
                     // transiently `pending` — by the time its first turn starts,
                     // so that turn carries no in-progress notice. The explicit
                     // param is execute-only, never persisted (§5.1).
+                    let explicit_remote_setup_script = explicit_setup_script.clone();
                     let effective_setup_script = match &setup_worktree {
                         Some(worktree) => {
                             boxed_await(test_hold_setup_resolution).await;
@@ -24261,8 +24262,14 @@ impl WorkspaceApi for Services {
                         // repository path).
                         let snapshot_wp = crate::git_ops::worktree_path(&ws);
                         let base_error =
-                            boxed_await(|| services.pin_remote_base_commit(&ws.id, &mut plan))
-                                .await;
+                            boxed_await(|| {
+                                services.pin_remote_base_commit(
+                                    &ws.id,
+                                    &mut plan,
+                                    explicit_remote_setup_script.clone(),
+                                )
+                            })
+                            .await;
                         let remote_view = plan.remote.clone();
                         // On that infrastructure failure the create returns
                         // before the setup task below is scheduled, so the

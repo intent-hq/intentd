@@ -440,11 +440,10 @@ async fn a_final_stop_admits_the_module_pushes() {
     f.node.shutdown();
 }
 
-/// A machine below nodeProtocol 10 cannot prepare submodules, so a
-/// workspace with populated submodules is refused with
-/// machine-update-required; one without launches as before, without a
-/// `checkout`. A setup script alone is not refused yet: no machine runs
-/// one.
+/// A machine below nodeProtocol 10 can neither prepare submodules nor run
+/// the setup script, so a workspace with populated submodules or a setup
+/// script is refused with machine-update-required; one with neither
+/// launches as before, without a `checkout`.
 #[tokio::test]
 async fn an_older_machine_is_refused_only_when_the_checkout_needs_preparing() {
     let (f, mut link, _machine) = prepared_fixture().await;
@@ -462,9 +461,9 @@ async fn an_older_machine_is_refused_only_when_the_checkout_needs_preparing() {
         r#"{"setupScript":"echo ready"}"#,
     )
     .unwrap();
-    let (setup_only, _) = f.placed().await;
-    let launch = f.launch_frame(&mut link, &setup_only).await;
-    assert_eq!(launch.checkout, None);
+    let message = update_required(f.admit(r#"{"target":"remote"}"#).await);
+    assert!(message.contains("setup script"), "{message}");
+    std::fs::remove_file(config.join("config.json")).unwrap();
 
     let _modules = add_submodules(f.repo.path());
     let message = update_required(f.admit(r#"{"target":"remote"}"#).await);
@@ -504,12 +503,13 @@ async fn only_prepared_agents_get_a_checkout() {
     f.node.shutdown();
 }
 
-/// This build offers nodeProtocol 10 by default, but no setup yet: an
-/// agent of a workspace with submodules and a setup script gets `checkout`
-/// with its pins and no `setup`, module sessions are served, the projection
-/// shows the pins and the create notice names them.
+/// This build offers nodeProtocol 10 by default: an agent of a workspace
+/// with submodules and a setup script gets `checkout` with its pins and the
+/// script (resolved from the worktree's `.intent/config.json`), module
+/// sessions are served, the projection shows the pins and the create notice
+/// names the submodules and the setup.
 #[tokio::test]
-async fn the_prepared_checkout_is_offered_without_setup() {
+async fn the_prepared_checkout_carries_the_pins_and_the_setup_script() {
     let (f, mut link, _machine) = fixture().await;
     assert!(intent_core::node_link::offers_prepared_checkout());
     assert!(f.node.shared_ref().offers_prepared_checkout());
@@ -530,8 +530,22 @@ async fn the_prepared_checkout_is_offered_without_setup() {
     let launch = f.launch_frame(&mut link, &agent).await;
     let checkout = launch.checkout.expect("a prepared checkout");
     assert_eq!(checkout.submodules, view.pins());
-    assert_eq!(checkout.setup, None);
-    assert_eq!(f.view(&agent).await.placement_error, None);
+    assert_eq!(
+        checkout.setup,
+        Some(intent_core::node_link::SetupCommand {
+            script: "echo ready".into(),
+            branch_name: "main".into(),
+            source_branch: String::new(),
+            timeout_secs: None,
+        })
+    );
+    let placed = f.view(&agent).await;
+    assert_eq!(placed.placement_error, None);
+    assert_eq!(
+        placed.setup.map(|setup| setup.state),
+        Some(intent_core::remote_launch::RemoteSetupState::Pending),
+        "the first prepared launch shows the checkout being prepared"
+    );
 
     let access = crate::git::HeadGitAccess::new(f.node.shared());
     let module = module_remote(&agent, &key(&f.repo.path().join("a")));
@@ -560,5 +574,97 @@ async fn the_prepared_checkout_is_offered_without_setup() {
         intent_core::remote_launch::launch_notice("m", &f.base, true),
         intent_core::remote_launch::launch_notice("m", &f.base, false)
     );
+    assert!(
+        intent_core::remote_launch::launch_notice_with_setup("m", &f.base, false, true)
+            .contains("setup script runs on that machine")
+    );
+    f.node.shutdown();
+}
+
+/// The machine's setup records and output reach the agent's placement:
+/// `setupStarted` makes it `running`, `setupFinished` records the result
+/// with its start time, each announced as `agent:updated`; `setupOutput`
+/// is kept (seq 0 starts it over) and shown on detail reads only. Output
+/// for an agent not attached here is dropped.
+#[tokio::test]
+async fn setup_records_and_output_reach_the_agents_placement() {
+    use intent_core::node_link::{JournalBody, JournalRecord, SetupOutput, SetupState};
+    use intent_core::nodes::NodeCounter;
+    use intent_core::remote_launch::RemoteSetupState;
+    use intent_core::WorkspaceApi as _;
+    let (f, mut link, _machine) = prepared_fixture().await;
+    let (agent, _) = f.placed().await;
+    let _runtime = f.port().runtime(&f.services, &agent).await.unwrap();
+    link.expect(|frame| match frame {
+        LinkFrame::Launch(command) => Some(command),
+        _ => None,
+    })
+    .await;
+    let record = |seq: u64, body: JournalBody| JournalRecord {
+        seq: NodeCounter(seq),
+        agent_id: agent.clone(),
+        workspace_id: workspace(),
+        turn_id: None,
+        recorded_at: intent_core::now_iso(),
+        body,
+    };
+    let output = |agent: &AgentId, seq: u64, data: &str| {
+        assert!(link
+            .link
+            .try_send_setup_output(SetupOutput {
+                agent_id: agent.clone(),
+                seq,
+                data: data.into(),
+            })
+            .unwrap());
+    };
+    output(&agent, 0, "stale\n");
+    output(&agent, 0, "Fetching a…\n");
+    output(&agent, 1, "ready\n");
+    output(&AgentId::new(), 0, "someone else\n");
+    link.journal(record(
+        1,
+        JournalBody::SetupStarted {
+            started_at: "2026-11-05T10:00:00Z".into(),
+        },
+    ))
+    .await;
+    link.acked(1).await;
+    let running = f.view(&agent).await.setup.unwrap();
+    assert_eq!(running.state, RemoteSetupState::Running);
+    assert_eq!(running.started_at.as_deref(), Some("2026-11-05T10:00:00Z"));
+    link.journal(record(
+        2,
+        JournalBody::SetupFinished {
+            state: SetupState::Failed,
+            exit_code: Some(3),
+            error: None,
+            finished_at: "2026-11-05T10:00:05Z".into(),
+        },
+    ))
+    .await;
+    link.acked(2).await;
+    let done = f.view(&agent).await.setup.unwrap();
+    assert_eq!(done.state, RemoteSetupState::Failed);
+    assert_eq!(done.exit_code, Some(3));
+    assert_eq!(done.started_at.as_deref(), Some("2026-11-05T10:00:00Z"));
+    assert_eq!(done.finished_at.as_deref(), Some("2026-11-05T10:00:05Z"));
+    assert_eq!(done.output, None, "the placement stores no output");
+
+    let detail = intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        f.services.agent_get(agent.clone(), Some(workspace())),
+    )
+    .await
+    .unwrap();
+    let setup = serde_json::to_value(&detail).unwrap()["setup"].clone();
+    assert_eq!(setup["state"], "failed", "{setup}");
+    assert_eq!(setup["output"], "Fetching a…\nready\n", "{setup}");
+    assert_eq!(setup["outputTruncated"], false, "{setup}");
+    let mut row = detail;
+    row.strip_detail_only_fields();
+    let row = serde_json::to_value(&row).unwrap();
+    assert_eq!(row["setup"]["state"], "failed", "{row}");
+    assert!(row["setup"].get("output").is_none(), "{row}");
     f.node.shutdown();
 }

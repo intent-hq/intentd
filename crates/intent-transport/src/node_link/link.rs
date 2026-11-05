@@ -19,7 +19,7 @@ use tokio_tungstenite::WebSocketStream;
 use intent_core::link_traffic::{LinkTap, TrafficDirection};
 use intent_core::node_link::{
     FinalPush, LeaseBinding, LinkChannel, LinkFrame, LinkId, LinkOutcome, LinkRequest,
-    LinkRpcError, ScriptOutput, StopId, StopOutcome, SCRIPT_OUTPUT_QUEUE_BYTES,
+    LinkRpcError, ScriptOutput, SetupOutput, StopId, StopOutcome, SCRIPT_OUTPUT_QUEUE_BYTES,
 };
 use intent_core::{AgentId, Error, Result};
 
@@ -465,15 +465,27 @@ impl NodeLink {
     /// `node-link-protocol` on a link below protocol 8; `node-link-closed`
     /// when the link is gone.
     pub fn try_send_script_output(&self, output: ScriptOutput) -> Result<bool> {
-        let frame = LinkFrame::ScriptOutput(output);
-        self.check_protocol(&frame)?;
+        let len = output.data.len();
+        self.try_send_output(&LinkFrame::ScriptOutput(output), len)
+    }
+
+    /// [`Self::try_send_script_output`] for a `setupOutput`, under the same
+    /// bound.
+    ///
+    /// # Errors
+    ///
+    /// `node-link-protocol` on a link below protocol 10; `node-link-closed`
+    /// when the link is gone.
+    pub fn try_send_setup_output(&self, output: SetupOutput) -> Result<bool> {
+        let len = output.data.len();
+        self.try_send_output(&LinkFrame::SetupOutput(output), len)
+    }
+
+    fn try_send_output(&self, frame: &LinkFrame, len: usize) -> Result<bool> {
+        self.check_protocol(frame)?;
         if self.is_closed() {
             return Err(closed_error());
         }
-        let len = match &frame {
-            LinkFrame::ScriptOutput(output) => output.data.len(),
-            _ => 0,
-        };
         let queued = &self.inner.script_output_bytes;
         let mut current = queued.load(Ordering::Acquire);
         loop {
@@ -490,7 +502,7 @@ impl NodeLink {
                 Err(now) => current = now,
             }
         }
-        self.queue_script(&frame, len)?;
+        self.queue_script(frame, len)?;
         Ok(true)
     }
 
@@ -574,6 +586,7 @@ impl NodeLink {
                 | LinkFrame::Response { .. }
                 | LinkFrame::CancelRequest { .. }
                 | LinkFrame::ScriptOutput(_)
+                | LinkFrame::SetupOutput(_)
         ) {
             return Err(super::protocol("frame is not sent directly"));
         }

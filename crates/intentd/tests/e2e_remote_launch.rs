@@ -284,6 +284,12 @@ async fn turn(
 }
 
 async fn seed_workspace(data_dir: &Path, repo: &Path) -> String {
+    seed_workspace_on(data_dir, repo, false).await
+}
+
+/// [`seed_workspace`]; with `worktree`, `repo` is the workspace's own
+/// worktree (so its setup script applies) instead of a shared checkout.
+async fn seed_workspace_on(data_dir: &Path, repo: &Path, worktree: bool) -> String {
     use intent_core::{now_iso, Workspace, WorkspaceId};
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
@@ -296,7 +302,9 @@ async fn seed_workspace(data_dir: &Path, repo: &Path) -> String {
             title: "Remote E2E".to_string(),
             branch: "main".to_string(),
             repository_path: Some(repo.to_string_lossy().into_owned()),
-            skip_worktree: true,
+            worktree_path: worktree.then(|| repo.to_string_lossy().into_owned()),
+            base_ref: worktree.then(|| "main".to_owned()),
+            skip_worktree: !worktree,
             created_at: ts.clone(),
             updated_at: ts,
             ..Default::default()
@@ -1220,8 +1228,18 @@ async fn start_backend_with(
     repo: &Path,
     env: &[(&str, &str)],
 ) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String) {
+    start_backend_on(data_dir, repo, env, false).await
+}
+
+/// [`start_backend_with`]; see [`seed_workspace_on`] for `worktree`.
+async fn start_backend_on(
+    data_dir: &Path,
+    repo: &Path,
+    env: &[(&str, &str)],
+    worktree: bool,
+) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String) {
     std::fs::create_dir_all(data_dir.join("workspaces")).unwrap();
-    let ws_id = seed_workspace(data_dir, repo).await;
+    let ws_id = seed_workspace_on(data_dir, repo, worktree).await;
     common::enable_ws_api(data_dir);
     let mut serve = common::hermetic_serve_command(data_dir);
     serve
@@ -2242,4 +2260,337 @@ async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
     // The backend's own checkouts are untouched.
     assert_eq!(heads(&repo), backend_heads);
     assert!(!repo.join("c/edit.txt").exists());
+}
+
+/// Create a remote agent named `name` on the exposed machine, retrying
+/// while the backend's first connect to it is still in flight.
+async fn create_remote(rpc_ws: &mut common::TlsWs, ws_id: &str, name: &str, id: i64) -> Value {
+    let create = json!({
+        "workspaceId": ws_id, "name": name, "model": "default", "provider": "mock",
+        "placement": { "target": "remote" },
+    });
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = id;
+    loop {
+        id += 1;
+        let response = rpc(rpc_ws, id, "agent.create", create.clone()).await;
+        if response.get("error").is_none() {
+            return response["result"].clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the machine never took the placement: {response}"
+        );
+        // timing-guard: poll interval while the machine daemon binds to head (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll `agent.get` until the agent's `setup` satisfies `done`; returns it.
+async fn setup_until(
+    rpc_ws: &mut common::TlsWs,
+    (ws_id, agent_id): (&str, &str),
+    id: i64,
+    done: impl Fn(&Value) -> bool,
+) -> Value {
+    let mut id = id;
+    let mut last = Value::Null;
+    let found = timeout(wait(), async {
+        loop {
+            id += 1;
+            let got = ok(
+                rpc_ws,
+                id,
+                "agent.get",
+                json!({ "workspaceId": ws_id, "agentId": agent_id }),
+            )
+            .await;
+            last = got["agent"]["setup"].clone();
+            if done(&last) {
+                return last.clone();
+            }
+            // timing-guard: poll interval for the machine's setup records and output to reach head
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    found.unwrap_or_else(|_| panic!("setup never reached the expected state: {last}"))
+}
+
+/// The workspace setup script on the machine (nodeProtocol 10,
+/// intent-hq/intent#8594): it runs in the remote agent's fresh checkout
+/// after the submodules are populated and before the agent starts, with the
+/// documented environment; its status and output reach the backend
+/// (`agent.get`, list rows without output, the agent's own
+/// `workspace.details`); the files it creates stay out of the agent's
+/// `wip`. A failing script still starts the agent, whose first turn carries
+/// the failure notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remote_agents_setup_script_runs_on_the_machine_after_its_submodules() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping remote setup e2e: node or git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-setup-");
+    let module = scratch.path().join("upstream").join("a");
+    std::fs::create_dir_all(&module).unwrap();
+    git(&module, &["init", "--quiet"]);
+    std::fs::write(module.join("README.md"), "a\n").unwrap();
+    git(&module, &["add", "README.md"]);
+    git(&module, &["commit", "--quiet", "-m", "a"]);
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet", "--initial-branch", "main"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--quiet",
+            module.to_str().unwrap(),
+            "a",
+        ],
+    );
+    git(&repo, &["commit", "--quiet", "-m", "submodule"]);
+    // Read from the backend worktree at each launch, uncommitted.
+    let set_script = |script: &str| {
+        std::fs::create_dir_all(repo.join(".intent")).unwrap();
+        std::fs::write(
+            repo.join(".intent/config.json"),
+            json!({ "setupScript": script }).to_string(),
+        )
+        .unwrap();
+    };
+    set_script(
+        "test -e a/.git || { echo submodules-missing; exit 9; }\n\
+         echo submodules-ready\n\
+         printf '%s|%s|%s|%s|%s\\n' \"$BRANCH_NAME\" \"$SOURCE_BRANCH\" \"$INTENT_REMOTE_MACHINE\" \"$MAIN_CHECKOUT\" \"${INTENT_NODE_GIT_SOCKET-unset}\" > setup-env.txt\n\
+         mkdir -p generated a/built && echo out > generated/out.txt && echo out > a/built/out.txt\n",
+    );
+
+    let (_head, port, cfg, ws_id) =
+        start_backend_on(&scratch.path().join("head"), &repo, &[], true).await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let machine = start_machine(&node_dir, &backend_id).await;
+    ok(
+        &mut rpc_ws,
+        2,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+
+    let created = create_remote(&mut rpc_ws, &ws_id, "Remote", 10).await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    assert!(
+        created["notice"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("setup script runs on that machine"),
+        "{created}"
+    );
+    let reply = turn(&mut rpc_ws, &mut events, (&ws_id, &agent_id), "hello", 50).await;
+    assert!(reply.contains("echo:"), "{reply}");
+    assert!(!reply.contains("workspace setup failed"), "{reply}");
+
+    let setup = setup_until(&mut rpc_ws, (&ws_id, &agent_id), 100, |setup| {
+        setup["output"]
+            .as_str()
+            .is_some_and(|out| out.contains("Setup script completed in"))
+    })
+    .await;
+    assert_eq!(setup["state"], "completed", "{setup}");
+    assert_eq!(setup["exitCode"], 0, "{setup}");
+    assert!(setup["startedAt"].is_string() && setup["finishedAt"].is_string());
+    let output = setup["output"].as_str().unwrap();
+    let fetched = output.find("Fetching a…").expect(output);
+    let ready = output.find("submodules-ready").expect(output);
+    assert!(fetched < ready, "the checkout comes before setup: {output}");
+    assert_eq!(setup["outputTruncated"], false);
+
+    let listed = ok(
+        &mut rpc_ws,
+        200,
+        "agent.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let row = listed["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == agent_id.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(row["setup"]["state"], "completed", "{row}");
+    assert!(row["setup"].get("output").is_none(), "{row}");
+
+    let details = wsapi_turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        r#"wsapi const d = await ws.workspace.details(); return JSON.stringify({ marker: "turn-details", setup: d.setupStatus });"#,
+        "turn-details",
+        300,
+    )
+    .await;
+    let value = wsapi_value(&details);
+    assert_eq!(value["setup"]["state"], "completed", "{value}");
+    assert_eq!(value["setup"]["exitCode"], 0, "{value}");
+
+    let work = node_dir
+        .join("executor")
+        .join(&machine.credential_id)
+        .join("agents")
+        .join(&agent_id)
+        .join("work");
+    let env = std::fs::read_to_string(work.join("setup-env.txt")).unwrap();
+    let fields: Vec<&str> = env.trim_end().split('|').collect();
+    assert_eq!(fields[..3], ["main", "main", "1"], "{env}");
+    let main_checkout = Path::new(fields[3]);
+    assert!(main_checkout.is_dir(), "{env}");
+    assert!(
+        main_checkout.starts_with(
+            node_dir
+                .join("executor")
+                .join(&machine.credential_id)
+                .join("repos")
+        ),
+        "{env}"
+    );
+    assert_eq!(fields[4], "unset", "no agent launch wiring: {env}");
+    assert!(
+        !entry_is_script(&work) && !entry_is_script(work.parent().unwrap()),
+        "the script file is removed and never in the checkout"
+    );
+
+    // A failing script: the second agent still starts, told on its first
+    // turn.
+    set_script("echo boom-from-setup\nexit 3\n");
+    let failing = create_remote(&mut rpc_ws, &ws_id, "Failing", 400).await;
+    let failing_id = failing["agent"]["id"].as_str().unwrap().to_owned();
+    turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &failing_id),
+        "hello",
+        450,
+    )
+    .await;
+    let setup = setup_until(&mut rpc_ws, (&ws_id, &failing_id), 500, |setup| {
+        setup["state"] == "failed"
+    })
+    .await;
+    assert_eq!(setup["exitCode"], 3, "{setup}");
+    turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &failing_id),
+        "again",
+        600,
+    )
+    .await;
+    // The fixture echoes each prompt; the notice rides the first one only.
+    let replies = timeout(wait(), async {
+        let mut id = 650;
+        loop {
+            id += 1;
+            let session = ok(
+                &mut rpc_ws,
+                id,
+                "agent.getSession",
+                json!({ "workspaceId": ws_id, "agentId": failing_id }),
+            )
+            .await;
+            let replies: Vec<String> = session["session"]["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|message| message["role"] == "assistant")
+                .map(Value::to_string)
+                .collect();
+            if replies.len() >= 2 {
+                return replies;
+            }
+            // timing-guard: poll interval for both replies to be recorded
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("both turns are recorded");
+    assert!(replies[0].contains("workspace setup failed"), "{replies:?}");
+    assert!(replies[0].contains("exited with code 3"), "{replies:?}");
+    assert!(replies[0].contains("boom-from-setup"), "{replies:?}");
+    assert!(
+        !replies[1].contains("workspace setup failed"),
+        "notice once: {replies:?}"
+    );
+
+    // The first agent's work comes back without the setup's files.
+    std::fs::write(work.join("agent.txt"), "agent edit\n").unwrap();
+    std::fs::write(work.join("a/agent.txt"), "module edit\n").unwrap();
+    ok(
+        &mut rpc_ws,
+        700,
+        "agent.delete",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let refs = format!("refs/intent/ws/{ws_id}/agents/{agent_id}");
+    let wip = timeout(wait(), async {
+        loop {
+            if let Some(wip) = try_rev(&repo, &format!("{refs}/wip")) {
+                let files = git(&repo, &["ls-tree", "-r", "--name-only", &wip]);
+                if files.lines().any(|f| f == "agent.txt") {
+                    return wip;
+                }
+            }
+            // timing-guard: poll interval for the machine's final push to land the refs (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the final push lands the agent's edit");
+    let files = git(&repo, &["ls-tree", "-r", "--name-only", &wip]);
+    assert!(files.lines().any(|f| f == "agent.txt"), "{files}");
+    for setup_file in ["setup-env.txt", "generated/out.txt"] {
+        assert!(!files.lines().any(|f| f == setup_file), "{files}");
+    }
+    let module_wip = git(&repo, &["rev-parse", &format!("{wip}:a")]);
+    let module_files = git(
+        &repo.join("a"),
+        &["ls-tree", "-r", "--name-only", &module_wip],
+    );
+    assert!(
+        module_files.lines().any(|f| f == "agent.txt"),
+        "{module_files}"
+    );
+    assert!(
+        !module_files.lines().any(|f| f == "built/out.txt"),
+        "{module_files}"
+    );
+}
+
+/// Whether `work` holds a setup script file (`setup-<uuid>.sh`).
+fn entry_is_script(work: &Path) -> bool {
+    std::fs::read_dir(work).unwrap().any(|entry| {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        name.starts_with("setup-") && Path::new(&name).extension().is_some_and(|ext| ext == "sh")
+    })
 }

@@ -37,6 +37,7 @@ use intent_providers::ProviderConfig;
 
 use super::checkout::{Checkouts, Prepared, FINAL_PUSH_TIMEOUT, WIP_PUSH_TIMEOUT};
 use super::scripts::ScriptProcesses;
+use super::setup::{self, SetupOutput, SetupStatus};
 use super::workspace_api::{self, HeadLink};
 
 /// Error codes at the start of a journaled launch or turn error.
@@ -174,6 +175,8 @@ struct Inner {
     link_gate: tokio::sync::Mutex<Option<LeaseBinding>>,
     /// Machine runs of the agents' saved scripts (nodeProtocol 8).
     scripts: ScriptProcesses,
+    /// Runs the agents' setup scripts (nodeProtocol 10).
+    pty: Arc<intent_pty::PtyHost>,
     /// Notified each time the bind sweep finishes removing one checkout.
     swept: tokio::sync::Notify,
     /// Set when shutdown begins: an ordinary push still under way is
@@ -288,40 +291,26 @@ impl StopWait {
     }
 }
 
-/// The first turn's notice when the launch carried a setup script this
-/// machine cannot run yet.
-const SETUP_UNSUPPORTED_NOTICE: &str = "[System: workspace setup failed — the workspace has a \
-     setup script, but this machine's Intent cannot run setup scripts yet, so it did not run. \
-     The checkout may be missing tooling the script installs: tell the user to update Intent \
-     on this machine.]";
-
-/// The `setupFinished` record of a fresh prepared checkout: `skipped`
-/// without a setup script; `failed` with one, which this machine does not
-/// run.
-fn setup_finished(agent: &Agent, has_setup: bool) -> JournalEntry {
-    use intent_core::node_link::{SetupState, SETUP_FAILED_CODE};
-    let (state, error) = if has_setup {
-        (
-            SetupState::Failed,
-            Some(format!(
-                "{SETUP_FAILED_CODE}: this machine's Intent cannot run setup scripts; update it"
-            )),
-        )
-    } else {
-        (SetupState::Skipped, None)
-    };
+/// A journal entry of `agent` with `body`, outside any turn.
+fn agent_entry(agent: &Agent, body: JournalBody) -> JournalEntry {
     JournalEntry {
         agent_id: agent.id.clone(),
         workspace_id: agent.workspace_id.clone(),
         turn_id: None,
         recorded_at: intent_core::now_iso(),
-        body: JournalBody::SetupFinished {
-            state,
-            exit_code: None,
-            error,
-            finished_at: intent_core::now_iso(),
-        },
+        body,
     }
+}
+
+/// What the checkout's setup left for the agent's start.
+#[derive(Default)]
+struct Settled {
+    /// Prepended to the first turn: setup did not complete.
+    notice: Option<String>,
+    /// The `setupStatus` its `workspace.details` shows.
+    overlay: Option<Value>,
+    /// The agent was stopped during setup: it does not start.
+    stopped: bool,
 }
 
 struct Agent {
@@ -337,9 +326,13 @@ struct Agent {
     repo_key: String,
     /// The submodules its checkout has at their pins (nodeProtocol 10).
     submodules: Vec<intent_core::node_link::SubmodulePin>,
-    /// Whether the launch carried a setup script, when it carried a
-    /// prepared checkout (nodeProtocol 10).
-    setup: Option<bool>,
+    /// Whether the launch carried a prepared checkout (nodeProtocol 10).
+    prepared: bool,
+    /// Its setup script, if any.
+    setup: Option<intent_core::node_link::SetupCommand>,
+    /// The checkout's progress and setup output while they run, resent
+    /// after a reconnect.
+    setup_output: Mutex<Option<Arc<SetupOutput>>>,
     /// The session's `agentFeatures` snapshot and sub-agent flag, which gate
     /// its workspace API.
     gates: workspace_api::Gates,
@@ -707,6 +700,7 @@ impl EventSink for NodeSink {
 impl Runner {
     pub(super) fn new(config: RunnerConfig) -> Self {
         let last = config.journal.last_seq();
+        let pty = Arc::new(intent_pty::PtyHost::new());
         Self {
             inner: Arc::new(Inner {
                 admission: config.admission,
@@ -721,7 +715,8 @@ impl Runner {
                 state: Mutex::new(State::default()),
                 pumps: Mutex::new(Vec::new()),
                 link_gate: tokio::sync::Mutex::new(None),
-                scripts: ScriptProcesses::new(Arc::new(intent_pty::PtyHost::new())),
+                scripts: ScriptProcesses::new(pty.clone()),
+                pty,
                 swept: tokio::sync::Notify::new(),
                 closing_signal: watch::channel(false).0,
             }),
@@ -879,7 +874,10 @@ impl Runner {
             is_sub_agent,
             checkout,
         } = command;
-        let setup = checkout.as_ref().map(|checkout| checkout.setup.is_some());
+        let prepared = checkout.is_some();
+        let setup = checkout
+            .as_ref()
+            .and_then(|checkout| checkout.setup.clone());
         let submodules = checkout
             .map(|checkout| checkout.submodules)
             .unwrap_or_default();
@@ -954,7 +952,9 @@ impl Runner {
             base_commit,
             repo_key,
             submodules,
+            prepared,
             setup,
+            setup_output: Mutex::new(None),
             gates: workspace_api::Gates {
                 agent_features,
                 is_sub_agent,
@@ -1122,12 +1122,23 @@ impl Runner {
         ready: watch::Sender<Option<Arc<Ready>>>,
         mut stop: oneshot::Receiver<()>,
     ) {
+        let output = agent.prepared.then(|| {
+            let output = SetupOutput::new(agent.id.clone(), self.inner.head.clone());
+            *lock(&agent.setup_output) = Some(output.clone());
+            output
+        });
+        let progress = |line: &str| {
+            if let Some(output) = &output {
+                output.line(line);
+            }
+        };
         let prepared = tokio::select! {
             prepared = self.inner.checkouts.prepare(
                 &agent.id,
                 &agent.workspace_id,
                 (&agent.base_commit, &agent.repo_key),
                 &agent.submodules,
+                &progress,
             ) => Some(prepared),
             _ = &mut stop => None,
         };
@@ -1140,42 +1151,53 @@ impl Runner {
                 fresh,
             })) => {
                 *lock(&agent.worktree) = Some(cwd.clone());
-                let notice = match agent.setup {
-                    Some(has_setup) if fresh => {
-                        self.append(setup_finished(&agent, has_setup)).await;
-                        let unsupported = has_setup.then(|| SETUP_UNSUPPORTED_NOTICE.to_owned());
-                        match (notice, unsupported) {
-                            (Some(notice), Some(setup)) => Some(format!("{setup}\n\n{notice}")),
-                            (notice, setup) => notice.or(setup),
-                        }
-                    }
-                    _ => notice,
-                };
-                *lock(&agent.notice) = notice;
-                match workspace_api::serve(
-                    &agent.id,
-                    &agent.workspace_id,
-                    &cwd,
-                    &agent.gates,
-                    self.inner.head.clone(),
-                    &self.inner.mcp_bridge_exe,
-                )
-                .await
-                {
-                    Err(error) => Err(Some(format!(
-                        "{}: the workspace API server did not start: {error}",
-                        codes::START
-                    ))),
-                    Ok((bridge, mcp)) => self
-                        .start(
+                let settled = match &output {
+                    Some(output) => {
+                        self.settle_setup(
                             &agent,
-                            (&launch, profile.as_ref()),
-                            model.as_deref(),
-                            notes,
-                            cwd,
+                            &cwd,
+                            fresh,
+                            agent.setup.as_ref(),
+                            output,
+                            &mut stop,
                         )
-                        .map(|started| (started, bridge, mcp))
-                        .map_err(|error| Some(format!("{}: {error}", codes::START))),
+                        .await
+                    }
+                    None => Settled::default(),
+                };
+                *lock(&agent.setup_output) = None;
+                if settled.stopped {
+                    Err(None)
+                } else {
+                    *lock(&agent.notice) = match (settled.notice, notice) {
+                        (Some(setup), Some(notice)) => Some(format!("{setup}\n\n{notice}")),
+                        (setup, notice) => setup.or(notice),
+                    };
+                    match workspace_api::serve(
+                        &agent.id,
+                        &agent.workspace_id,
+                        &cwd,
+                        (&agent.gates, settled.overlay),
+                        self.inner.head.clone(),
+                        &self.inner.mcp_bridge_exe,
+                    )
+                    .await
+                    {
+                        Err(error) => Err(Some(format!(
+                            "{}: the workspace API server did not start: {error}",
+                            codes::START
+                        ))),
+                        Ok((bridge, mcp)) => self
+                            .start(
+                                &agent,
+                                (&launch, profile.as_ref()),
+                                model.as_deref(),
+                                notes,
+                                cwd,
+                            )
+                            .map(|started| (started, bridge, mcp))
+                            .map_err(|error| Some(format!("{}: {error}", codes::START))),
+                    }
                 }
             }
         };
@@ -1255,6 +1277,146 @@ impl Runner {
             }
         }
         let _ = agent.marks.send(Mark::Exited { exit_code, error });
+    }
+
+    /// Run or account for the setup of a prepared checkout: a fresh one
+    /// runs `command` (or records `skipped` without one) and journals
+    /// `setupFinished`; a kept one journals only a setup a stop or restart
+    /// interrupted (`failed`, no re-run).
+    async fn settle_setup(
+        &self,
+        agent: &Agent,
+        cwd: &std::path::Path,
+        fresh: bool,
+        command: Option<&intent_core::node_link::SetupCommand>,
+        output: &Arc<SetupOutput>,
+        stop: &mut oneshot::Receiver<()>,
+    ) -> Settled {
+        let status = match (fresh, command) {
+            (false, _) => match setup::read_status(cwd) {
+                Some(status) if status.state == setup::Recorded::Running => {
+                    setup::exclude_interrupted(cwd, &agent.submodules).await;
+                    status.interrupted()
+                }
+                Some(kept) => {
+                    return Settled {
+                        overlay: Some(kept.overlay()),
+                        ..Settled::default()
+                    }
+                }
+                // Kept from a launch that never got as far as setup (or
+                // from a machine without it): record a result once, so the
+                // backend does not wait for one.
+                None if command.is_some() => SetupStatus::never_ran(),
+                None => SetupStatus::skipped(),
+            },
+            (true, None) => SetupStatus::skipped(),
+            (true, Some(command)) => {
+                match self.run_setup(agent, cwd, command, output, stop).await {
+                    setup::Ran::Finished(status) => status,
+                    setup::Ran::Stopped => {
+                        return Settled {
+                            stopped: true,
+                            ..Settled::default()
+                        }
+                    }
+                }
+            }
+        };
+        setup::write_status(cwd, &status);
+        if let Some(state) = status.finished_state() {
+            self.append(agent_entry(
+                agent,
+                JournalBody::SetupFinished {
+                    state,
+                    exit_code: status.exit_code,
+                    error: status.error.clone(),
+                    finished_at: status
+                        .finished_at
+                        .clone()
+                        .unwrap_or_else(intent_core::now_iso),
+                },
+            ))
+            .await;
+        }
+        let (tail, _) = output.tail();
+        Settled {
+            notice: setup::failed_notice(&status, cwd, &tail),
+            overlay: Some(status.overlay()),
+            stopped: false,
+        }
+    }
+
+    /// Journal `setupStarted`, then run the script. Until it finishes the
+    /// checkout records it running, so a stop or restart reads as
+    /// interrupted at the next launch.
+    async fn run_setup(
+        &self,
+        agent: &Agent,
+        cwd: &std::path::Path,
+        command: &intent_core::node_link::SetupCommand,
+        output: &Arc<SetupOutput>,
+        stop: &mut oneshot::Receiver<()>,
+    ) -> setup::Ran {
+        let main_checkout = match self.inner.checkouts.main_checkout(&agent.repo_key) {
+            Ok(dir) => dir,
+            Err(error) => {
+                return setup::Ran::Finished(SetupStatus {
+                    state: setup::Recorded::Failed,
+                    exit_code: None,
+                    error: Some(format!(
+                        "{}: could not create MAIN_CHECKOUT: {error:#}",
+                        setup::codes::FAILED
+                    )),
+                    started_at: None,
+                    finished_at: Some(intent_core::now_iso()),
+                });
+            }
+        };
+        let started_at = intent_core::now_iso();
+        setup::write_status(
+            cwd,
+            &SetupStatus {
+                state: setup::Recorded::Running,
+                exit_code: None,
+                error: None,
+                started_at: Some(started_at.clone()),
+                finished_at: None,
+            },
+        );
+        self.append(agent_entry(
+            agent,
+            JournalBody::SetupStarted {
+                started_at: started_at.clone(),
+            },
+        ))
+        .await;
+        setup::run(
+            &self.inner.pty,
+            setup::SetupRun {
+                command,
+                worktree: cwd,
+                main_checkout: &main_checkout,
+                pins: &agent.submodules,
+            },
+            output,
+            started_at,
+            stop,
+        )
+        .await
+    }
+
+    /// A new link to head is up: resend the kept output of every setup
+    /// still under way, from `seq` 0.
+    pub(super) fn resend_setup_output(&self, link: &intent_transport::node_link::NodeLink) {
+        let outputs: Vec<Arc<SetupOutput>> = lock(&self.inner.state)
+            .agents
+            .values()
+            .filter_map(|agent| lock(&agent.setup_output).clone())
+            .collect();
+        for output in outputs {
+            output.resend(link);
+        }
     }
 
     fn start(
