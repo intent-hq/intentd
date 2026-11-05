@@ -50,9 +50,17 @@ impl WorkspaceApi for FakeApi {
         Box::pin(async move { Ok(ws) })
     }
 
+    /// `instant` and `hang` are fakes that answer at once / never, so the
+    /// timeout test does not depend on real process timing.
     fn host_exec(&self, workspace_id: WorkspaceId, params: Value) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
-            intent_services::host_exec::run_for_workspace(self, workspace_id, params).await
+            match params["command"].as_str() {
+                Some("instant") => Ok(json!({ "exitCode": 0, "stdout": "", "stderr": "" })),
+                Some("hang") => std::future::pending().await,
+                _ => {
+                    intent_services::host_exec::run_for_workspace(self, workspace_id, params).await
+                }
+            }
         })
     }
 
@@ -130,18 +138,22 @@ async fn failed_note_write_still_reports_the_completed_host_command() {
 
 /// The engine waits for in-flight calls before a rejection ends the script,
 /// so a call is only left without a reply when the eval budget runs out.
-#[cfg(unix)]
 #[tokio::test]
 async fn call_cut_off_by_the_script_timeout_is_reported_as_unknown() {
-    let srv = server().with_workspace_api_timeout(std::time::Duration::from_secs(10));
+    let srv = server().with_workspace_api_timeout(intentd_test_support::test_timeout(
+        std::time::Duration::from_millis(500),
+    ));
     let (is_error, text) = call(
         &srv,
-        r#"await ws.host.exec({ command: "echo", args: ["first"] });
-           await ws.host.exec({ command: "sleep", args: ["30"] });"#,
+        r#"await ws.host.exec({ command: "instant" });
+           await ws.host.exec({ command: "hang" });"#,
     )
     .await;
     assert!(is_error, "{text}");
-    assert!(text.contains("timed out"), "{text}");
+    assert!(
+        text.contains("javascript execution timed out after"),
+        "{text}"
+    );
     assert!(
         text.contains("1. ws.host.exec — succeeded (exitCode 0)"),
         "{text}"
@@ -165,6 +177,20 @@ async fn successful_or_caught_scripts_carry_no_ledger() {
     .await;
     assert!(!is_error, "{text}");
     assert!(!text.contains("ws.host.exec"), "{text}");
+}
+
+#[tokio::test]
+async fn rethrown_command_text_gets_no_database_hint() {
+    let srv = server();
+    let (is_error, text) = call(
+        &srv,
+        r#"await ws.host.exec({ command: "instant" });
+           throw new Error("sqlite3: file is not a database");"#,
+    )
+    .await;
+    assert!(is_error, "{text}");
+    assert!(text.contains("1. ws.host.exec — succeeded"), "{text}");
+    assert!(!text.contains("intentd doctor"), "{text}");
 }
 
 #[tokio::test]

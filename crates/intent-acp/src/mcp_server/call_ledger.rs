@@ -20,6 +20,9 @@ use serde_json::Value;
 const MAX_PLAIN: usize = 20;
 /// Characters kept from each `host.exec` stdout/stderr and from each error.
 const MAX_TEXT: usize = 500;
+/// Characters of listed entries before the rest are only counted, so a
+/// script that ran hundreds of commands cannot return an unbounded error.
+const MAX_LISTED_CHARS: usize = 8_000;
 
 /// `SQLite`'s text for the `SQLITE_CORRUPT` family (codes 11, 267, 523, 779)
 /// and for `SQLITE_NOTADB` (26).
@@ -89,16 +92,16 @@ impl CallLedger {
 
     /// Append the ledger to a failed script's error text. `include_output`
     /// is false when a private-result policy governs this invocation, so only
-    /// exit codes show. The list renders only when some call succeeded or got
-    /// no reply: a lone failed call is already the error itself.
+    /// exit codes and bare outcomes show. The list renders only when some call
+    /// succeeded or got no reply: a lone failed call is already the error
+    /// itself. The corruption hint keys on `ws.*` failures only, never on
+    /// text the script threw itself (say, a rethrown `sqlite3` stderr).
     pub(super) fn annotate(&self, error: &str, include_output: bool) -> String {
         let entries = self.entries();
-        let corrupted = std::iter::once(error)
-            .chain(entries.iter().filter_map(|e| match &e.outcome {
-                Outcome::Failed(message) => Some(message.as_str()),
-                _ => None,
-            }))
-            .any(is_corruption);
+        let corrupted = entries.iter().any(|e| match &e.outcome {
+            Outcome::Failed(message) => is_corruption(message),
+            _ => false,
+        });
         let mut out = error.to_string();
         if entries
             .iter()
@@ -108,10 +111,23 @@ impl CallLedger {
                 "\n\nws.* calls this script made before it failed (their results were not returned):",
             );
             let collapse = entries.len() > MAX_PLAIN;
-            let mut collapsed = 0usize;
+            let listed_from = out.len();
+            let mut collapsed: Vec<(&str, usize)> = Vec::new();
             for (index, entry) in entries.iter().enumerate() {
+                if out.len() - listed_from > MAX_LISTED_CHARS {
+                    flush_collapsed(&mut out, &mut collapsed);
+                    let _ = write!(
+                        out,
+                        "\n   ({} later calls not listed; check their effects before retrying)",
+                        entries.len() - index
+                    );
+                    break;
+                }
                 if collapse && !entry.outcome.is_notable() {
-                    collapsed += 1;
+                    match collapsed.iter_mut().find(|(m, _)| *m == entry.method) {
+                        Some((_, count)) => *count += 1,
+                        None => collapsed.push((&entry.method, 1)),
+                    }
                     continue;
                 }
                 flush_collapsed(&mut out, &mut collapsed);
@@ -137,11 +153,20 @@ impl CallLedger {
     }
 }
 
-fn flush_collapsed(out: &mut String, collapsed: &mut usize) {
-    if *collapsed > 0 {
-        let _ = write!(out, "\n   ({collapsed} other calls succeeded)");
-        *collapsed = 0;
+/// Summarize a run of collapsed successes by method, so a successful
+/// `agent.send` or `note.create` stays visible even when not listed.
+fn flush_collapsed(out: &mut String, collapsed: &mut Vec<(&str, usize)>) {
+    if collapsed.is_empty() {
+        return;
     }
+    let total: usize = collapsed.iter().map(|(_, n)| n).sum();
+    let _ = write!(out, "\n   ({total} other calls succeeded:");
+    for (i, (method, count)) in collapsed.iter().enumerate() {
+        let sep = if i == 0 { " " } else { ", " };
+        let _ = write!(out, "{sep}ws.{method} ×{count}");
+    }
+    out.push(')');
+    collapsed.clear();
 }
 
 fn summarize_exec(value: &Value) -> ExecSummary {
@@ -163,10 +188,11 @@ fn summarize_exec(value: &Value) -> ExecSummary {
 fn render_outcome(out: &mut String, outcome: &Outcome, include_output: bool) {
     match outcome {
         Outcome::Pending => out.push_str("no reply before the script ended; outcome unknown"),
-        Outcome::Failed(message) => {
+        Outcome::Failed(message) if include_output => {
             out.push_str("failed: ");
             out.push_str(message);
         }
+        Outcome::Failed(_) => out.push_str("failed"),
         Outcome::Succeeded => out.push_str("succeeded"),
         Outcome::Executed(exec) => {
             match exec.exit_code {
@@ -228,6 +254,11 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("secret-ish"), "{text}");
+        let slot = ledger.start("note.read");
+        ledger.finish(slot, &Err("private failure detail".to_string()));
+        let text = ledger.annotate("Error: later", false);
+        assert!(text.contains("2. ws.note.read — failed\n"), "{text}");
+        assert!(!text.contains("private failure detail"), "{text}");
     }
 
     #[test]
@@ -250,9 +281,39 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("… (truncated)"), "{text}");
-        assert!(text.contains("(25 other calls succeeded)"), "{text}");
-        assert!(!text.contains("ws.note.read"), "{text}");
+        assert!(
+            text.contains("(25 other calls succeeded: ws.note.read ×25)"),
+            "{text}"
+        );
+        assert!(!text.contains(". ws.note.read"), "{text}");
         assert!(text.contains("\n27. ws.note.add — failed: boom"), "{text}");
+    }
+
+    #[test]
+    fn caps_the_listed_text() {
+        let ledger = CallLedger::default();
+        for _ in 0..100 {
+            let slot = ledger.start("host.exec");
+            ledger.finish(
+                slot,
+                &Ok(json!({ "exitCode": 0, "stdout": "z".repeat(600) })),
+            );
+        }
+        let text = ledger.annotate("Error: x", true);
+        assert!(text.len() < MAX_LISTED_CHARS + 2_000, "{}", text.len());
+        assert!(text.contains("later calls not listed"), "{text}");
+    }
+
+    #[test]
+    fn corruption_hint_ignores_text_the_script_threw() {
+        let ledger = CallLedger::default();
+        let slot = ledger.start("host.exec");
+        ledger.finish(
+            slot,
+            &Ok(json!({ "exitCode": 1, "stderr": "file is not a database" })),
+        );
+        let text = ledger.annotate("Error: file is not a database", true);
+        assert!(!text.contains("intentd doctor"), "{text}");
     }
 
     #[test]
