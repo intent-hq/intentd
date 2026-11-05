@@ -617,23 +617,25 @@ impl RemoteLaunchPort for RemoteLaunch {
             // A prepared agent (its pins captured, possibly none) gets
             // `checkout` on every protocol 10 launch, and never starts below
             // 10 when its workspace needs a prepared checkout. An agent
-            // placed before pins were captured starts as before.
-            let checkout = if view.submodules.is_some() {
-                let protocol = link_protocol(&node).await?;
-                let workspace = svc.store().get_workspace(&record.workspace_id).await?;
-                if needs_prepared_checkout(&workspace, view.pins()).await {
-                    if let Err(error) = require_prepared_checkout(&node, protocol) {
-                        record_refused_start(svc, &record.workspace_id, agent_id, &error).await;
-                        return Err(error);
+            // placed before pins were captured, or any agent while this
+            // build does not offer the prepared checkout, starts as before.
+            let checkout =
+                if view.submodules.is_some() && node.shared_ref().offers_prepared_checkout() {
+                    let protocol = link_protocol(&node).await?;
+                    let workspace = svc.store().get_workspace(&record.workspace_id).await?;
+                    if needs_prepared_checkout(&workspace, view.pins()).await {
+                        if let Err(error) = require_prepared_checkout(&node, protocol) {
+                            record_refused_start(svc, &record.workspace_id, agent_id, &error).await;
+                            return Err(error);
+                        }
                     }
-                }
-                (protocol >= PREPARED_CHECKOUT_PROTOCOL).then(|| PreparedCheckout {
-                    submodules: view.pins().to_vec(),
-                    setup: None,
-                })
-            } else {
-                None
-            };
+                    (protocol >= PREPARED_CHECKOUT_PROTOCOL).then(|| PreparedCheckout {
+                        submodules: view.pins().to_vec(),
+                        setup: None,
+                    })
+                } else {
+                    None
+                };
             let checkout_dir = workspace_checkout(svc, &record.workspace_id).await?;
             let repo_key = blocking(move || node_git::repo_key(&checkout_dir)).await?;
             let runtime = node
