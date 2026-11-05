@@ -482,3 +482,69 @@ async fn pins_that_are_not_a_safe_ordered_set_are_refused() {
     assert!(error.contains("symlink"), "{error}");
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
 }
+
+/// A kept checkout whose submodule the agent removed by hand gets it back
+/// at the next launch, though the module cache still registers the old
+/// worktree; a submodule the agent removed in a commit is not brought back
+/// by a relaunch, nor pushed again as a gitlink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removed_submodules_are_re_added_by_hand_and_stay_removed_by_commit() {
+    let mut fixture = Fixture::start().await;
+    let layout = layout(&mut fixture);
+    let worktree = fixture.worktree("a");
+    checkout(&fixture, &worktree, &layout.pins).await;
+
+    std::fs::remove_dir_all(worktree.join("c")).unwrap();
+    std::fs::create_dir(worktree.join("c")).unwrap();
+    let readded = tokio::time::timeout(
+        wait(),
+        fixture
+            .cache
+            .checkout_modules(REPO, &remote(AGENT), &worktree, &layout.pins),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        readded.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(),
+        ["c"]
+    );
+    assert_eq!(
+        git(&worktree.join("c"), &["rev-parse", "HEAD"]),
+        layout.pins[2].commit
+    );
+
+    git(&worktree, &["rm", "--quiet", "-r", "--force", "c"]);
+    commit(&worktree, "drop c");
+    let pushed = push(&fixture, &worktree, &layout.pins).await.unwrap();
+    tokio::time::timeout(wait(), fixture.cache.remove(REPO, &worktree))
+        .await
+        .unwrap()
+        .unwrap();
+    let restored = fixture.worktree("a-restored");
+    tokio::time::timeout(
+        wait(),
+        fixture.cache.checkout(REPO, &remote(AGENT), &restored),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let modules = tokio::time::timeout(
+        wait(),
+        fixture
+            .cache
+            .checkout_modules(REPO, &remote(AGENT), &restored, &layout.pins),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        modules.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(),
+        ["a", "a/b"]
+    );
+    assert!(!restored.join("c").exists());
+    let again = push(&fixture, &restored, &layout.pins).await.unwrap();
+    assert_eq!(again.head, pushed.head);
+    let files = git(fixture.head.path(), &["ls-tree", "--name-only", &again.wip]);
+    assert!(files.lines().all(|file| file != "c"), "{files}");
+}

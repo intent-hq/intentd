@@ -1029,8 +1029,9 @@ impl CheckoutCache {
     /// else its `base`, which must be the pinned commit. A module `wip` is
     /// restored on top, or pinned under `unapplied/` in the module's
     /// repository on head, as [`Self::checkout`] does. Each module is
-    /// activated in its parent's own worktree config; no URL is set.
-    /// Returns the modules it added.
+    /// activated in its parent's own worktree config; no URL is set. A pin
+    /// that is no longer a gitlink of its parent's index (the agent removed
+    /// it in a commit) is skipped. Returns the modules it added.
     ///
     /// # Errors
     ///
@@ -1056,16 +1057,31 @@ impl CheckoutCache {
             if populated_here(&dir) {
                 continue;
             }
+            let (parent, rel) = match parent_of(pins, index) {
+                Some(parent) => (
+                    worktree.join(&pins[parent].path),
+                    &pin.path[pins[parent].path.len() + 1..],
+                ),
+                None => (worktree.to_path_buf(), pin.path.as_str()),
+            };
+            // A submodule the agent removed in a commit stays removed.
+            let pathspec = format!(":(literal){rel}");
+            let staged = self
+                .git
+                .git(&parent, &["ls-files", "--stage", "--", &pathspec])
+                .await
+                .map_err(context)?;
+            if !staged.starts_with("160000 ") {
+                continue;
+            }
             let cache = self.module_cache(repo_key, &pin.module_key)?;
+            // A worktree the agent deleted by hand is still registered.
+            self.prune_cache(&cache).await.map_err(context)?;
             let module = remote.with_module(&pin.module_key)?;
             let checkout = self
                 .checkout_repository(&cache, &module, &dir, Some(&pin.commit))
                 .await
                 .map_err(context)?;
-            let parent = match parent_of(pins, index) {
-                Some(parent) => worktree.join(&pins[parent].path),
-                None => worktree.to_path_buf(),
-            };
             self.activate(&parent, &pin.name).await.map_err(context)?;
             added.push(ModuleCheckout {
                 path: pin.path.clone(),
