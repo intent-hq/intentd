@@ -518,19 +518,6 @@ fn every_frame() -> Vec<LinkFrame> {
         LinkFrame::CapabilitiesReply {
             capabilities: capabilities(),
         },
-        LinkFrame::Skills(SkillsQuery {
-            query_id: request_id,
-        }),
-        LinkFrame::SkillsReply(SkillsReply {
-            query_id: request_id,
-            skills: vec![machine_skill("review", "user")],
-        }),
-        LinkFrame::Journal(record(
-            14,
-            JournalBody::Skills {
-                skills: vec![machine_skill("deploy", "project")],
-            },
-        )),
         LinkFrame::ScriptStart(script_start()),
         LinkFrame::ScriptStop(ScriptProcessRef {
             agent_id: AgentId::from("a1"),
@@ -557,6 +544,19 @@ fn every_frame() -> Vec<LinkFrame> {
             exit_code: Some(0),
             error: None,
         }),
+        LinkFrame::Skills(SkillsQuery {
+            query_id: request_id,
+        }),
+        LinkFrame::SkillsReply(SkillsReply {
+            query_id: request_id,
+            skills: vec![machine_skill("review", "user")],
+        }),
+        LinkFrame::Journal(record(
+            14,
+            JournalBody::Skills {
+                skills: vec![machine_skill("deploy", "project")],
+            },
+        )),
     ]
 }
 
@@ -592,7 +592,7 @@ fn frames_are_routed_to_their_lane() {
         [
             Control, Control, Control, Control, Control, Control, Control, Control, Control,
             Control, Journal, Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control,
-            Control, Script, Script, Script, Script, Script
+            Control, Script, Script, Script, Script, Script, Control, Control, Journal
         ]
     );
 }
