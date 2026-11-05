@@ -490,6 +490,10 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
     let mut scan_state = ScanState::default();
     let mut project_watch_directories = HashSet::new();
 
+    let plugin_paths = home_override
+        .as_ref()
+        .map(|home| crate::plugins::PluginPaths::new(home.join(".intent")))
+        .or_else(crate::plugins::PluginPaths::user);
     // Visit the winning tier first so canonical deduplication cannot erase it.
     for target in get_scan_targets(workspace_path, home_override)
         .into_iter()
@@ -554,6 +558,15 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
                 }
             }
         }
+    }
+
+    if let Some(paths) = plugin_paths {
+        add_plugin_skills(
+            &paths,
+            &mut discovered_by_name,
+            &mut observed_paths,
+            &mut scan_state,
+        );
     }
 
     let mut skills: Vec<SkillMetadata> = discovered_by_name
@@ -777,6 +790,44 @@ fn walk_directory(
                     return;
                 }
             }
+        }
+    }
+}
+
+/// Enabled user plugins contribute `<plugin>:<skill>` entries. They rank below
+/// every directory tier, so a loose skill with the same name still wins.
+fn add_plugin_skills(
+    paths: &crate::plugins::PluginPaths,
+    discovered_by_name: &mut BTreeMap<String, DiscoveredSkill>,
+    observed_paths: &mut HashSet<PathBuf>,
+    scan_state: &mut ScanState,
+) {
+    observed_paths.insert(paths.plugins_dir());
+    observed_paths.insert(paths.registry_file());
+    for installed in crate::plugins::list_installed(paths) {
+        let crate::plugins::InstalledPlugin::Loaded { plugin, entry } = installed else {
+            continue;
+        };
+        observed_paths.insert(plugin.root.join(crate::plugins::MANIFEST_FILE));
+        observed_paths.insert(plugin.root.join("skills"));
+        if !entry.enabled {
+            continue;
+        }
+        for skill in &plugin.skills {
+            observed_paths.insert(skill.file.clone());
+            let Some(parsed) = parse_skill_file(&skill.file, scan_state) else {
+                continue;
+            };
+            let name = crate::plugins::skill_name(&plugin.manifest.name, &parsed.metadata.name);
+            discovered_by_name
+                .entry(name.clone())
+                .or_insert(DiscoveredSkill {
+                    metadata: SkillMetadata {
+                        name,
+                        ..parsed.metadata
+                    },
+                    precedence: 0,
+                });
         }
     }
 }

@@ -44,6 +44,7 @@ mod executor;
 mod git_credential;
 #[cfg(unix)]
 mod git_remote_intent;
+mod plugin_exec;
 mod provider;
 mod rpc_profile;
 mod shutdown;
@@ -214,6 +215,17 @@ enum Command {
         #[arg(long)]
         stdin: bool,
     },
+    /// Start an Agent Plugins stdio MCP server in its working directory. Session
+    /// MCP configs carry no cwd, so plugin servers launch through this.
+    #[command(hide = true)]
+    PluginExec {
+        /// Working directory for the server.
+        #[arg(long)]
+        cwd: std::path::PathBuf,
+        /// Server executable and its arguments, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<std::ffi::OsString>,
+    },
     /// stdio↔TCP MCP proxy referenced from a generated `--mcp-config`; forwards a
     /// spawned provider's MCP frames to the daemon's in-process server (§6.8).
     McpBridge {
@@ -333,6 +345,9 @@ fn main() -> ExitCode {
     // value). The env var is the single seam `apply_startup_pins` and the
     // specialists service read.
     let cli = Cli::parse();
+    if let Command::PluginExec { cwd, command } = &cli.command {
+        return plugin_exec::run(cwd, command);
+    }
     #[cfg(unix)]
     let cli = match cli.command {
         Command::EvidenceRun(args) => return command_evidence::run(args),
@@ -449,6 +464,7 @@ async fn async_main(cli: Cli) -> ExitCode {
             Command::Settings { name, value, stdin } => {
                 to_exit(cmd_settings(name.as_deref(), value.as_deref(), stdin).await)
             }
+            Command::PluginExec { cwd, command } => plugin_exec::run(&cwd, &command),
             Command::McpBridge { connect } => {
                 // The bridge reads stdin via `tokio::io::stdin()`, whose pending
                 // blocking-pool read outlives `run_stdio_bridge`; returning

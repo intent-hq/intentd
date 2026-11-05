@@ -39467,6 +39467,7 @@ pub mod event {}
 mod instructions;
 mod mcp_oauth;
 mod mcp_servers;
+mod plugins;
 mod rules;
 pub mod skills;
 mod specialists;
