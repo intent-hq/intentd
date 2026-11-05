@@ -625,6 +625,9 @@ mod tests_settings_default_effort;
 mod tests_catalog_default_model;
 
 #[cfg(test)]
+mod tests_blank_model;
+
+#[cfg(test)]
 mod tests_unknown_model;
 
 #[cfg(test)]
