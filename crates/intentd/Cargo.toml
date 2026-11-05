@@ -16,6 +16,8 @@ description = "Intent backend daemon — local-first JSON-RPC daemon for the Int
 autotests = false
 
 [dependencies]
+# The machine decodes the attachment bytes head sends (`file.attachmentData`).
+base64 = { workspace = true }
 # Keep this requirement major-only ("0", not "0.1.N"). release-plz 0.3.162
 # bumps a dependent package's patch version, outside its version_group,
 # whenever a dependency release rewrites the requirement: an exact pin made
@@ -181,9 +183,6 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
-# `e2e_wss_agent_lifecycle.rs::terminal_create_env_over_wss` decodes base64
-# `terminal:data` chunks to prove the env overlay reached the child (§5.13).
-base64 = { workspace = true }
 # `e2e_wss_last_activity.rs` parses RFC3339 timestamps with chrono to compare instants
 # (lexicographic comparison can be wrong with differing fractional-second precision).
 chrono = "0.4"

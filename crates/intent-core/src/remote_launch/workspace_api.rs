@@ -2,7 +2,7 @@
 //!
 //! A remote agent evaluates its `workspace_api` code on its execution node.
 //! Each `host({ method, args })` frame is routed by its method: calls on the
-//! agent's own checkout and host run on the node, a fixed set of control-plane
+//! agent's own checkout and host (attachment copies included) run on the node, a fixed set of control-plane
 //! namespaces (saved scripts included: head keeps them and runs them on the
 //! agent's machine; hooks run on head; the browser and the desktop act on the
 //! user's client connected to head), plus single methods such as
@@ -36,12 +36,25 @@ pub const ATTACHMENTS_METHOD: &str = "turn.attachments";
 /// head answers `{ "help": string | null }`.
 pub const PLACEMENT_HELP_METHOD: &str = "agent.placementHelp";
 
+/// The frame method the node forwards (never from agent code: the table
+/// refuses it there) for the bytes of an attachment the agent copies with
+/// `ws.file.getAttachment`, which runs on the node. Args `{ attachmentId }`;
+/// head answers `{ fileName, mimeType?, size, uploadedAt, data }` (`data` is
+/// base64) for an attachment of the agent's workspace of at most
+/// [`MAX_LINK_ATTACHMENT_BYTES`].
+pub const ATTACHMENT_DATA_METHOD: &str = "file.attachmentData";
+
+/// Largest attachment [`ATTACHMENT_DATA_METHOD`] carries: its base64 must
+/// fit one response frame ([`crate::node_link::MAX_FRAME_BYTES`]).
+pub const MAX_LINK_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+
 /// The node's own frames to head. They ride [`CALL_METHOD`] but agent code
 /// cannot send them, even when their namespace is forwarded.
 pub const INTERNAL_METHODS: &[&str] = &[
     COMMIT_POLICY_METHOD,
     ATTACHMENTS_METHOD,
     PLACEMENT_HELP_METHOD,
+    ATTACHMENT_DATA_METHOD,
 ];
 
 /// Most cards one [`ATTACHMENTS_METHOD`] frame carries.
@@ -76,6 +89,7 @@ pub const LOCAL_METHODS: &[&str] = &[
     "file.delete",
     "file.mkdir",
     "file.rename",
+    "file.getAttachment",
     "git.commit",
     "host.exec",
     "workspace.info",
@@ -178,13 +192,8 @@ pub fn unsupported_message(method: &str) -> String {
     if matches!(method, "git.registerRoot" | "git.unregisterRoot") {
         return GIT_ROOTS_MESSAGE.to_owned();
     }
-    let what = if method == "file.getAttachment" {
-        "attachments are".to_owned()
-    } else {
-        format!("ws.{namespace}.* is")
-    };
     format!(
-        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.app.question.ask, ws.git.listRoots, ws.terminal.list and readOutput, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
+        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet (ws.{namespace}.* is not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.app.question.ask, ws.git.listRoots, ws.terminal.list and readOutput, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
         FORWARDED_NAMESPACES
             .iter()
             .filter(|namespace| **namespace != "mr")
@@ -207,6 +216,7 @@ mod tests {
             "file.delete",
             "file.mkdir",
             "file.rename",
+            "file.getAttachment",
             "git.commit",
             "host.exec",
             "help.index",
@@ -376,9 +386,9 @@ mod tests {
             "mcp.listTools",
             "secret.request",
             "search.query",
-            "file.getAttachment",
             COMMIT_POLICY_METHOD,
             ATTACHMENTS_METHOD,
+            ATTACHMENT_DATA_METHOD,
             "note",
             "note.",
             "",
@@ -409,6 +419,5 @@ mod tests {
         ] {
             assert!(message.contains(forwarded), "{forwarded}: {message}");
         }
-        assert!(unsupported_message("file.getAttachment").contains("attachments are"));
     }
 }

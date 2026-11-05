@@ -10,7 +10,7 @@
 //! journaled in order by a single per-agent pump.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1147,6 +1147,7 @@ impl Runner {
             Some(Err(error)) => Err(Some(format!("{}: {error:#}", codes::CHECKOUT))),
             Some(Ok(Prepared {
                 worktree: cwd,
+                tmp,
                 notice,
                 fresh,
             })) => {
@@ -1155,7 +1156,7 @@ impl Runner {
                     Some(output) => {
                         self.settle_setup(
                             &agent,
-                            &cwd,
+                            (&cwd, &tmp),
                             fresh,
                             agent.setup.as_ref(),
                             output,
@@ -1193,7 +1194,7 @@ impl Runner {
                                 (&launch, profile.as_ref()),
                                 model.as_deref(),
                                 notes,
-                                cwd,
+                                (cwd, &tmp),
                             )
                             .map(|started| (started, bridge, mcp))
                             .map_err(|error| Some(format!("{}: {error}", codes::START))),
@@ -1286,7 +1287,7 @@ impl Runner {
     async fn settle_setup(
         &self,
         agent: &Agent,
-        cwd: &std::path::Path,
+        (cwd, tmp): (&Path, &Path),
         fresh: bool,
         command: Option<&intent_core::node_link::SetupCommand>,
         output: &Arc<SetupOutput>,
@@ -1312,7 +1313,10 @@ impl Runner {
             },
             (true, None) => SetupStatus::skipped(),
             (true, Some(command)) => {
-                match self.run_setup(agent, cwd, command, output, stop).await {
+                match self
+                    .run_setup(agent, (cwd, tmp), command, output, stop)
+                    .await
+                {
                     setup::Ran::Finished(status) => status,
                     setup::Ran::Stopped => {
                         return Settled {
@@ -1353,7 +1357,7 @@ impl Runner {
     async fn run_setup(
         &self,
         agent: &Agent,
-        cwd: &std::path::Path,
+        (cwd, tmp): (&Path, &Path),
         command: &intent_core::node_link::SetupCommand,
         output: &Arc<SetupOutput>,
         stop: &mut oneshot::Receiver<()>,
@@ -1396,6 +1400,7 @@ impl Runner {
             setup::SetupRun {
                 command,
                 worktree: cwd,
+                tmp,
                 main_checkout: &main_checkout,
                 pins: &agent.submodules,
             },
@@ -1425,7 +1430,7 @@ impl Runner {
         (launch, profile): (&ProviderLaunch, Option<&ProfileEnv>),
         model: Option<&str>,
         notes: mpsc::UnboundedSender<IncomingNotification>,
-        cwd: PathBuf,
+        (cwd, tmp): (PathBuf, &Path),
     ) -> anyhow::Result<(Child, Arc<Connection>, tokio::task::JoinHandle<()>, PathBuf)> {
         let (requests_tx, mut requests) = mpsc::unbounded_channel::<IncomingRequest>();
         let hooks = ConnectionHooks {
@@ -1445,13 +1450,21 @@ impl Runner {
         options
             .extra_env
             .insert(RUN_MARKER_ENV.to_owned(), agent.run_marker.clone());
+        // The agent's private temp folder lives with its checkout (a launch
+        // folder from `agent_tmp_root` would end with each process), and
+        // beats inherited and profile values like a local launch's.
+        for key in intent_core::AGENT_TMP_ENV_KEYS {
+            options
+                .extra_env
+                .insert(key.to_owned(), tmp.to_string_lossy().into_owned());
+        }
         let spawned = intent_acp::spawn_provider(&options, hooks)?;
         let (child, connection, npx_launch_dir, agent_tmp_dir) = spawned.into_parts();
         // An npx launch runs from its launch directory; keep it until the
         // agent is gone.
         *lock(&agent.npx_launch_dir) = npx_launch_dir;
-        // Remote agents set no `agent_tmp_root`, so no private temp folder
-        // was created for this launch.
+        // Remote agents set no `agent_tmp_root`: their folder is the
+        // checkout's, so no launch folder was created.
         debug_assert!(agent_tmp_dir.is_none());
         drop(agent_tmp_dir);
         let connection = Arc::new(connection);

@@ -1358,6 +1358,123 @@ async fn head_answers_placement_help_for_lease_agents() {
     f.node.shutdown();
 }
 
+/// Remote parity S6: the machine fetches an attachment's bytes for
+/// `ws.file.getAttachment` with the internal `file.attachmentData` frame.
+/// Head answers only for a lease agent, only for an attachment of that
+/// agent's workspace, and only when the bytes fit the link.
+#[tokio::test]
+async fn head_serves_attachment_bytes_to_lease_agents_of_the_workspace() {
+    use base64::Engine as _;
+    use intent_core::remote_launch::workspace_api::{
+        ATTACHMENT_DATA_METHOD, MAX_LINK_ATTACHMENT_BYTES,
+    };
+    let (f, link, _machine) = fixture().await;
+    let (agent, _) = f.placed().await;
+    let store = f.services.store();
+    let root = std::path::PathBuf::from(intent_services::feature_api::file_ops::workspace_root(
+        &store.get_workspace(&workspace()).await.unwrap(),
+    ));
+    std::fs::create_dir_all(root.join(".intent/attachments")).unwrap();
+    let record = |id: &str, workspace_id: WorkspaceId, name: &str, size: usize| {
+        std::fs::write(
+            root.join(".intent/attachments").join(name),
+            vec![b'x'; size],
+        )
+        .unwrap();
+        intent_store::AttachmentRecord {
+            id: id.into(),
+            workspace_id,
+            file_name: name.into(),
+            mime_type: Some("text/plain".into()),
+            size: i64::try_from(size).unwrap(),
+            uploaded_at: "2026-11-05T00:00:00Z".into(),
+            stored_path: format!(".intent/attachments/{name}"),
+        }
+    };
+    let now = intent_core::now_iso();
+    store
+        .insert_workspace(&Workspace {
+            id: WorkspaceId::from("ws-other"),
+            title: "Other".into(),
+            branch: "main".into(),
+            created_at: now.clone(),
+            updated_at: now,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for record in [
+        record("att-1", workspace(), "notes.txt", 5),
+        record("att-other", WorkspaceId::from("ws-other"), "other.txt", 1),
+        record(
+            "att-big",
+            workspace(),
+            "big.bin",
+            usize::try_from(MAX_LINK_ATTACHMENT_BYTES).unwrap() + 1,
+        ),
+        record("att-gone", workspace(), "gone.txt", 1),
+    ] {
+        store.insert_attachment(&record).await.unwrap();
+    }
+    std::fs::remove_file(root.join(".intent/attachments/gone.txt")).unwrap();
+
+    let answer = answered(
+        forward(
+            &link,
+            &agent,
+            ATTACHMENT_DATA_METHOD,
+            json!({ "attachmentId": "att-1" }),
+        )
+        .await,
+    );
+    assert_eq!(
+        answer,
+        json!({
+            "fileName": "notes.txt",
+            "mimeType": "text/plain",
+            "size": 5,
+            "uploadedAt": "2026-11-05T00:00:00Z",
+            "data": base64::engine::general_purpose::STANDARD.encode(b"xxxxx"),
+        })
+    );
+    for (id, expected) in [
+        ("att-other", "unknown attachment id: att-other"),
+        ("att-missing", "unknown attachment id: att-missing"),
+        ("att-big", "attachment-too-large-for-link"),
+        ("att-gone", "Continue without this file"),
+    ] {
+        let error = refused(
+            forward(
+                &link,
+                &agent,
+                ATTACHMENT_DATA_METHOD,
+                json!({ "attachmentId": id }),
+            )
+            .await,
+        );
+        assert!(error.message.contains(expected), "{id}: {error:?}");
+    }
+    let malformed = refused(forward(&link, &agent, ATTACHMENT_DATA_METHOD, json!({})).await);
+    assert_eq!(malformed.code, -32602, "{malformed:?}");
+
+    let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+    let unplaced = f.agent(&view).await;
+    let denied = refused(
+        forward(
+            &link,
+            &unplaced,
+            ATTACHMENT_DATA_METHOD,
+            json!({ "attachmentId": "att-1" }),
+        )
+        .await,
+    );
+    assert!(
+        denied.message.starts_with("node-agent-denied"),
+        "{denied:?}"
+    );
+    f.node.shutdown();
+}
+
 /// A TCP proxy on `ip`:`port` to 127.0.0.1:`port` that reports each
 /// accepted connection and holds it until `release` fires.
 #[cfg(target_os = "linux")]
