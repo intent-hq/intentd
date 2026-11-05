@@ -316,7 +316,7 @@ impl Shared {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn offer_prepared_checkout_for_test(&self) {
         self.prepared_checkout
             .store(true, std::sync::atomic::Ordering::SeqCst);
