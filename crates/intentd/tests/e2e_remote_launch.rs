@@ -1107,6 +1107,21 @@ async fn machine_runs(
         .to_owned();
     assert!(woken.contains("exited with code 0"), "{woken}");
 
+    // Definition reads run on head as the agent (intent#8630): head runs
+    // with the bound-caller assertion armed, so an unbound gate aborts it.
+    let wsapi = format!(
+        r#"wsapi const l = await ws.script.list(); const p = await ws.script.listPage(); const g = await ws.script.get({script_id:?}); return JSON.stringify({{ marker: "turn-220", l, p, g }});"#
+    );
+    let reply = wsapi_turn(rpc_ws, events, (ws_id, agent_id), &wsapi, "turn-220", 220).await;
+    assert!(reply.starts_with("wsapi: "), "{reply}");
+    let reads = wsapi_value(&reply);
+    for key in ["l", "p", "g"] {
+        assert!(
+            reads[key].to_string().contains(&script_id),
+            "script.{key}: {reads}"
+        );
+    }
+
     let row = script_row(rpc_ws, (ws_id, &script_id), 203).await;
     assert_eq!(row["remoteAuthor"]["agentId"], agent_id, "{row}");
     assert_eq!(row["remoteAuthor"]["nodeId"], node_id, "{row}");
