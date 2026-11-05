@@ -8681,11 +8681,6 @@ impl AgentManager {
         // a truncated/mistyped id must not claim the slot or queue a phantom
         // message that never drains (the sender then waits forever).
         let session = self.services.require_agent_session(&agent_id).await?;
-        crate::agent_ops::reject_remote_attachments(
-            &session,
-            options.image_blocks.as_ref(),
-            options.file_blocks.as_ref(),
-        )?;
         // Bind the delivery to the target's OWN session workspace
         // (intent-hq/intent#5017): a cross-workspace `ws.agent.send` arrives
         // with the SENDER's bridge workspace, and every scope-sensitive step
@@ -12452,9 +12447,8 @@ impl AgentManager {
     /// It matches what the agent's machine serves: a provider that truncates
     /// tool descriptions gets the condensed `workspace_api` reference (the
     /// machine serves the compact description that points at it); the
-    /// skills catalog is left out (its paths are on this host); and the
-    /// private `$TMPDIR` promise is replaced, as the machine does not make
-    /// one.
+    /// skills catalog is left out (its paths are on this host). The private
+    /// `$TMPDIR` promise stays: the machine gives each agent its own.
     ///
     /// # Errors
     ///
@@ -12501,7 +12495,6 @@ impl AgentManager {
         else {
             return Ok(());
         };
-        let prompt = prompt.replace(LOCAL_TMPDIR_PROMISE, REMOTE_TMPDIR_NOTE);
         self.services
             .store
             .set_agent_session_system_prompt(workspace_id, agent_id, &prompt)
@@ -14771,13 +14764,6 @@ pub struct ProviderLaunchSpec {
     pub npx_fallback_package: Option<&'static str>,
     pub extra_env: BTreeMap<String, String>,
 }
-
-/// The bundled instructions' promise of a per-agent temp folder, which a
-/// remote agent's machine does not create yet.
-const LOCAL_TMPDIR_PROMISE: &str = "Your shell's `$TMPDIR` is a private temp folder for this agent: put scratch files (drafts, patches, logs) there or use `mktemp`, never a fixed `/tmp/<name>` path that other agents share.";
-
-/// What a remote agent is told instead of [`LOCAL_TMPDIR_PROMISE`].
-const REMOTE_TMPDIR_NOTE: &str = "Your shell's `$TMPDIR` on this machine is shared with other agents: create scratch files (drafts, patches, logs) with `mktemp` or `mktemp -d`, never at a fixed path.";
 
 /// The condensed `workspace_api` reference for a remote agent whose
 /// provider truncates tool descriptions, assembled as its machine's

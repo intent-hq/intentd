@@ -2390,8 +2390,8 @@ fn told_setup_failed(all: &[JournalRecord], id: &str, turn: &str, needle: &str) 
 
 /// Test 8 (intent-hq/intent#8594): a fresh prepared checkout runs its
 /// setup script before the agent starts, journaling `setupStarted` and
-/// `setupFinished` before `started`, with the documented environment and
-/// never the profile's values or the agent's git wiring; without a script
+/// `setupFinished` before `started`, with the documented environment (and
+/// the agent's private `TMPDIR`) and never the profile's values or the agent's git wiring; without a script
 /// it records `skipped`. A failing or timed-out script still starts the
 /// agent, whose first turn (only) carries the failure notice. A launch
 /// without `checkout` records nothing, a relaunch that keeps the checkout
@@ -2401,9 +2401,9 @@ async fn node_runner_runs_setup_before_the_agent_starts() {
     use intent_core::node_link::SetupState;
     let Some(h) = harness(5, &[]) else { return };
     let env_script =
-        "printf '%s|%s|%s|%s|%s|%s|%s\\n' \"$(pwd -P)\" \"$WORKTREE_PATH\" \"$MAIN_CHECKOUT\" \
+        "printf '%s|%s|%s|%s|%s|%s|%s|%s\\n' \"$(pwd -P)\" \"$WORKTREE_PATH\" \"$MAIN_CHECKOUT\" \
          \"$BRANCH_NAME\" \"$SOURCE_BRANCH\" \"$INTENT_REMOTE_MACHINE\" \
-         \"${CODEX_ACCESS_TOKEN-none}${INTENT_NODE_GIT_SOCKET-}\" > setup-env.txt\n\
+         \"${CODEX_ACCESS_TOKEN-none}${INTENT_NODE_GIT_SOCKET-}\" \"$TMPDIR\" > setup-env.txt\n\
          echo ran >> setup-runs.txt\n";
     let mut with_profile = launch_with_setup("a1", Some(env_script), None);
     with_profile.profile_env = launch_with_profile(
@@ -2451,8 +2451,10 @@ async fn node_runner_runs_setup_before_the_agent_starts() {
     assert_eq!(std::path::Path::new(fields[1]), worktree, "{env}");
     assert!(fields[2].ends_with("/repos/repo/main"), "{env}");
     assert!(std::path::Path::new(fields[2]).is_dir(), "{env}");
-    assert_eq!(fields[3..], ["feat/x", "main", "1", "none"], "{env}");
+    assert_eq!(fields[3..7], ["feat/x", "main", "1", "none"], "{env}");
     let agent_dir = worktree.parent().unwrap();
+    // The script gets the agent's private temp folder (remote parity S6).
+    assert_eq!(std::path::Path::new(fields[7]), agent_dir.join("tmp"), "{env}");
     assert!(
         !std::fs::read_dir(agent_dir)
             .unwrap()

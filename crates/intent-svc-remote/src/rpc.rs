@@ -9,6 +9,8 @@
 //! lease, and only for a frame its own routing table forwards (the node is
 //! not trusted to route). The frame then runs through the same host
 //! dispatch a local agent's bridge uses, as that agent, in its workspace.
+//! The node's internal frames (its commit-policy read, a call's cards, the
+//! placement text and an attachment's bytes) are answered here directly.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,8 +19,8 @@ use serde_json::Value;
 
 use intent_core::node_link::{LeaseBinding, LinkOutcome, LinkRequest, LinkRpcError};
 use intent_core::remote_launch::workspace_api::{
-    self, Route, ATTACHMENTS_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD, INTERNAL_METHODS,
-    MAX_FORWARDED_ATTACHMENTS, PLACEMENT_HELP_METHOD,
+    self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
+    INTERNAL_METHODS, MAX_FORWARDED_ATTACHMENTS, MAX_LINK_ATTACHMENT_BYTES, PLACEMENT_HELP_METHOD,
 };
 use intent_core::remote_launch::RemoteAgentRecord;
 use intent_core::{with_caller, AgentSession, Caller, Error, WorkspaceApi};
@@ -161,6 +163,29 @@ impl HeadCalls {
                     LinkOutcome::Ok(serde_json::json!({}))
                 }
                 Err(message) => refusal(INVALID_PARAMS, message),
+            };
+        }
+        if method == ATTACHMENT_DATA_METHOD {
+            let Some(id) = request
+                .params
+                .get("args")
+                .and_then(|args| args.get("attachmentId"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+            else {
+                return refusal(
+                    INVALID_PARAMS,
+                    format!("{ATTACHMENT_DATA_METHOD} needs a string `attachmentId`"),
+                );
+            };
+            return match self
+                .services
+                .remote_attachment_data(&record.workspace_id, id, MAX_LINK_ATTACHMENT_BYTES)
+                .await
+            {
+                Ok(value) => LinkOutcome::Ok(value),
+                Err(Error::InvalidParams(message)) => refusal(INVALID_PARAMS, message),
+                Err(error) => refusal(CALL_FAILED, error.to_string()),
             };
         }
         let features = self.services.session_agent_features(session);

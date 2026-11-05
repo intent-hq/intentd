@@ -2489,6 +2489,7 @@ dependencies = [
 name = "intent-svc-remote"
 version = "0.11.133"
 dependencies = [
+ "base64 0.23.1",
  "git2",
  "intent-acp",
  "intent-core",

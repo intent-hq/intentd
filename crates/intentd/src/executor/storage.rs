@@ -185,6 +185,23 @@ impl Storage {
         Ok(parent.join("work"))
     }
 
+    /// `agent_id`'s private temp folder, created owner-only on demand
+    /// beside its worktree, so [`Self::remove_agent`] removes it with the
+    /// checkout.
+    pub(super) fn agent_tmp(&self, agent_id: &AgentId) -> anyhow::Result<PathBuf> {
+        ensure!(
+            valid_id(&agent_id.0),
+            "agent id is not a safe path component"
+        );
+        let dir = self.root.join(AGENTS).join(&agent_id.0).join("tmp");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .context("create the agent's temp folder")?;
+        Ok(dir)
+    }
+
     /// The agents with a directory under `agents/`; names that are not safe
     /// ids are left alone.
     pub(super) fn agent_ids(&self) -> Vec<AgentId> {

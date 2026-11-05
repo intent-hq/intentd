@@ -1371,14 +1371,13 @@ async fn head_serves_attachment_bytes_to_lease_agents_of_the_workspace() {
     let (f, link, _machine) = fixture().await;
     let (agent, _) = f.placed().await;
     let store = f.services.store();
-    let root = tempfile::tempdir().unwrap();
-    let mut ws = store.get_workspace(&workspace()).await.unwrap();
-    ws.worktree_path = Some(root.path().to_string_lossy().into_owned());
-    store.update_workspace(&ws).await.unwrap();
-    std::fs::create_dir_all(root.path().join(".intent/attachments")).unwrap();
+    let root = std::path::PathBuf::from(intent_services::feature_api::file_ops::workspace_root(
+        &store.get_workspace(&workspace()).await.unwrap(),
+    ));
+    std::fs::create_dir_all(root.join(".intent/attachments")).unwrap();
     let record = |id: &str, workspace_id: WorkspaceId, name: &str, size: usize| {
         std::fs::write(
-            root.path().join(".intent/attachments").join(name),
+            root.join(".intent/attachments").join(name),
             vec![b'x'; size],
         )
         .unwrap();
@@ -1417,7 +1416,7 @@ async fn head_serves_attachment_bytes_to_lease_agents_of_the_workspace() {
     ] {
         store.insert_attachment(&record).await.unwrap();
     }
-    std::fs::remove_file(root.path().join(".intent/attachments/gone.txt")).unwrap();
+    std::fs::remove_file(root.join(".intent/attachments/gone.txt")).unwrap();
 
     let answer = answered(
         forward(

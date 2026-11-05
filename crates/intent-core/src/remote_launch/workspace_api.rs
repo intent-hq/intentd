@@ -2,7 +2,7 @@
 //!
 //! A remote agent evaluates its `workspace_api` code on its execution node.
 //! Each `host({ method, args })` frame is routed by its method: calls on the
-//! agent's own checkout and host run on the node, a fixed set of control-plane
+//! agent's own checkout and host (attachment copies included) run on the node, a fixed set of control-plane
 //! namespaces (saved scripts included: head keeps them and runs them on the
 //! agent's machine; hooks run on head; the browser and the desktop act on the
 //! user's client connected to head), plus single methods such as
@@ -89,6 +89,7 @@ pub const LOCAL_METHODS: &[&str] = &[
     "file.delete",
     "file.mkdir",
     "file.rename",
+    "file.getAttachment",
     "git.commit",
     "host.exec",
     "workspace.info",
@@ -191,13 +192,8 @@ pub fn unsupported_message(method: &str) -> String {
     if matches!(method, "git.registerRoot" | "git.unregisterRoot") {
         return GIT_ROOTS_MESSAGE.to_owned();
     }
-    let what = if method == "file.getAttachment" {
-        "attachments are".to_owned()
-    } else {
-        format!("ws.{namespace}.* is")
-    };
     format!(
-        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet ({what} not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.app.question.ask, ws.git.listRoots, ws.terminal.list and readOutput, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
+        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet (ws.{namespace}.* is not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.app.question.ask, ws.git.listRoots, ws.terminal.list and readOutput, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
         FORWARDED_NAMESPACES
             .iter()
             .filter(|namespace| **namespace != "mr")

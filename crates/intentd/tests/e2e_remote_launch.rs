@@ -1207,6 +1207,25 @@ async fn machine_runs(
         );
     }
 
+    // Remote parity S6: the agent copies a chat attachment into its machine
+    // checkout; head serves the bytes as the bound agent (intent#8630).
+    let placed = ok(
+        rpc_ws,
+        263,
+        "file.placeAttachment",
+        json!({ "workspaceId": ws_id, "fileName": "notes.txt", "data": "aGVsbG8=", "mimeType": "text/plain" }),
+    )
+    .await;
+    let attachment_id = placed["attachmentId"].as_str().unwrap().to_owned();
+    let wsapi = format!(
+        r#"wsapi const a = await ws.file.getAttachment({attachment_id:?}); const t = await ws.file.read(a.path); return JSON.stringify({{ marker: "turn-264", a, t }});"#
+    );
+    let reply = wsapi_turn(rpc_ws, events, (ws_id, agent_id), &wsapi, "turn-264", 264).await;
+    assert!(reply.starts_with("wsapi: "), "{reply}");
+    let copied = wsapi_value(&reply);
+    assert_eq!(copied["a"]["path"], ".intent/attachments/notes.txt", "{copied}");
+    assert_eq!(copied["t"], "hello", "{copied}");
+
     // A service started by the agent, stopped from the app.
     // timing-guard: the saved script's own runtime on the machine, not a wait in the test
     let wsapi = r#"wsapi const c = await ws.script.create("msrv", "echo up; sleep 300", "service"); const id = c.id ?? c.script.id; await ws.script.start(id); return JSON.stringify({ marker: "turn-206", id });"#;

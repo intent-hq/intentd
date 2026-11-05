@@ -4,7 +4,8 @@
 //! through `intentd mcp-bridge` like a local agent's. The agent's code is
 //! evaluated here, and each `ws.*` frame is routed by the shared table in
 //! `intent_core::remote_launch::workspace_api`: file, `git.commit` and
-//! `host.exec` calls run against the agent's own worktree on this node, the
+//! `host.exec` calls run against the agent's own worktree on this node
+//! (`file.getAttachment` with the bytes from head), the
 //! control-plane and backend-data calls are forwarded to head over the
 //! current link (head checks the agent is on the link's lease), and every
 //! other namespace fails with an explicit `remote-agent-unsupported:` error.
@@ -23,7 +24,8 @@ use intent_acp::session::McpServer;
 use intent_acp::{HostFrameRouter, McpBridge, NormalizedMcpServer, WorkspaceMcpServer};
 use intent_core::node_link::{LinkOutcome, PREPARED_CHECKOUT_PROTOCOL};
 use intent_core::remote_launch::workspace_api::{
-    self, Route, ATTACHMENTS_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD, PLACEMENT_HELP_METHOD,
+    self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
+    PLACEMENT_HELP_METHOD,
 };
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
@@ -326,6 +328,40 @@ impl Router {
         }
     }
 
+    /// Attachment `attachment_id`'s bytes and metadata from head, for
+    /// `ws.file.getAttachment` on this node. An older backend refuses the
+    /// frame; the agent is told what to update.
+    async fn attachment_data(&self, attachment_id: &str) -> Result<AttachmentData> {
+        use base64::Engine as _;
+        let answer = self
+            .forward(
+                ATTACHMENT_DATA_METHOD,
+                &json!({ "attachmentId": attachment_id }),
+            )
+            .await
+            .map_err(|error| {
+                if error.starts_with(workspace_api::UNSUPPORTED_CODE) {
+                    Error::InvalidParams(format!(
+                        "{}: ws.file.getAttachment on a remote agent needs a newer Intent on the backend; update it, or continue without this file",
+                        workspace_api::UNSUPPORTED_CODE
+                    ))
+                } else {
+                    Error::InvalidParams(error)
+                }
+            })?;
+        let text = |key: &str| answer.get(key).and_then(Value::as_str).map(str::to_owned);
+        let malformed = || Error::Internal("head sent a malformed attachment".to_owned());
+        let bytes = text("data")
+            .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
+            .ok_or_else(malformed)?;
+        Ok(AttachmentData {
+            file_name: text("fileName").ok_or_else(malformed)?,
+            mime_type: text("mimeType"),
+            uploaded_at: text("uploadedAt").unwrap_or_default(),
+            bytes,
+        })
+    }
+
     /// Whether the workspace lets agents commit on their own, as head
     /// resolves it. Fails closed: no answer is no.
     async fn auto_commit(&self) -> Result<bool> {
@@ -339,6 +375,14 @@ impl Router {
             })?;
         Ok(answer.get("autoCommit").and_then(Value::as_bool) == Some(true))
     }
+}
+
+/// An attachment head sent for `ws.file.getAttachment`.
+struct AttachmentData {
+    file_name: String,
+    mime_type: Option<String>,
+    uploaded_at: String,
+    bytes: Vec<u8>,
 }
 
 /// The node-local half of the API: the agent's worktree is its workspace
@@ -468,6 +512,32 @@ impl WorkspaceApi for NodeApi {
     ) -> BoxFuture<'_, Result<Value>> {
         self.blocking(&workspace_id, move |root| {
             file_ops::rename(root, &old_path, &new_path)
+        })
+    }
+
+    /// The bytes come from head; the copy lands in the agent's checkout,
+    /// as a local agent's lands in its worktree.
+    fn file_get_attachment(
+        &self,
+        workspace_id: WorkspaceId,
+        attachment_id: String,
+        _caller_agent_id: Option<AgentId>,
+        dest_dir: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            self.check(&workspace_id)?;
+            let data = self.head.attachment_data(&attachment_id).await?;
+            self.blocking(&workspace_id, move |root| {
+                file_ops::write_attachment_copy(
+                    root,
+                    dest_dir.as_deref(),
+                    &data.file_name,
+                    data.mime_type.as_deref(),
+                    &data.uploaded_at,
+                    &data.bytes,
+                )
+            })
+            .await
         })
     }
 

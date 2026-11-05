@@ -25,6 +25,8 @@ pub(super) const FINAL_PUSH_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 pub(super) struct Prepared {
     pub(super) worktree: PathBuf,
+    /// The agent's private temp folder beside the worktree, removed with it.
+    pub(super) tmp: PathBuf,
     /// Prepended to the agent's first turn: its saved `wip` work could not
     /// be restored on top of its saved head.
     pub(super) notice: Option<String>,
@@ -174,6 +176,7 @@ impl Checkouts for GitCheckouts {
             }));
             let notice = (!notices.is_empty()).then(|| notices.join("\n\n"));
             Ok(Prepared {
+                tmp: self.storage.agent_tmp(agent_id)?,
                 worktree,
                 notice,
                 fresh,
@@ -392,6 +395,7 @@ impl Checkouts for PlainCheckouts {
             let fresh = self.storage.existing_agent_dir(agent_id).is_none();
             Ok(Prepared {
                 worktree: self.storage.agent_dir(agent_id)?,
+                tmp: self.storage.agent_tmp(agent_id)?,
                 notice: self.notice.lock().unwrap().take(),
                 fresh,
             })

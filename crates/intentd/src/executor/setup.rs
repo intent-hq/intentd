@@ -362,6 +362,8 @@ impl SetupOutput {
 pub(super) struct SetupRun<'a> {
     pub command: &'a SetupCommand,
     pub worktree: &'a Path,
+    /// The agent's private temp folder, the script's `TMPDIR` as the agent's.
+    pub tmp: &'a Path,
     /// The machine-local stand-in for head's main checkout.
     pub main_checkout: &'a Path,
     pub pins: &'a [SubmodulePin],
@@ -442,13 +444,16 @@ async fn spawn_and_wait(
     }
     let worktree = run.worktree.to_string_lossy().into_owned();
     let main = run.main_checkout.to_string_lossy().into_owned();
+    let tmp = run.tmp.to_string_lossy().into_owned();
     let vars = [
         ("WORKTREE_PATH", worktree.as_str()),
         ("MAIN_CHECKOUT", main.as_str()),
         ("BRANCH_NAME", run.command.branch_name.as_str()),
         ("SOURCE_BRANCH", run.command.source_branch.as_str()),
         ("INTENT_REMOTE_MACHINE", "1"),
-    ];
+    ]
+    .into_iter()
+    .chain(intent_core::AGENT_TMP_ENV_KEYS.map(|key| (key, tmp.as_str())));
     let mut spec = SpawnSpec::new("remote-setup".to_owned(), "/bin/sh".to_owned());
     spec.args = vec![
         "-c".to_owned(),
