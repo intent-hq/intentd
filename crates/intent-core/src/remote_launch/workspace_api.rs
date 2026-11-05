@@ -129,16 +129,28 @@ mod tests {
         }
     }
 
-    /// Remote agents read their workspace's details through head; the
-    /// workspace setters stay refused (route is per method, not namespace).
+    /// Remote agents read their workspace's details and set its title,
+    /// status and their own name through head (intent-hq/intent#8593); the
+    /// other workspace calls stay refused (route is per method, not
+    /// namespace). They ride `workspace.call` with no protocol gate: an
+    /// older machine refuses them itself, an older backend refuses them.
     #[test]
-    fn workspace_details_are_forwarded_and_the_setters_refused() {
+    fn workspace_details_and_setters_are_forwarded_and_the_rest_refused() {
         assert_eq!(route("workspace.details"), Route::Forward);
         for method in [
             "workspace.setTitle",
             "workspace.setStatusMessage",
             "workspace.setStatusImage",
             "workspace.setAgentName",
+        ] {
+            assert_eq!(route(method), Route::Forward, "{method}");
+            assert_eq!(
+                forward_min_protocol(method),
+                crate::node_link::NODE_LINK_PROTOCOLS.min,
+                "{method}"
+            );
+        }
+        for method in [
             "workspace.archive",
             "workspace.unarchive",
             "workspace.proposeSibling",
@@ -147,10 +159,10 @@ mod tests {
         ] {
             assert_eq!(route(method), Route::Unsupported, "{method}");
         }
-        let message = unsupported_message("workspace.setTitle");
+        let message = unsupported_message("workspace.archive");
         assert!(
             message.contains("ws.workspace.info on their own checkout")
-                && message.contains("ws.workspace.details through head"),
+                && message.contains("ws.workspace.details, setTitle, setStatusMessage, setStatusImage and setAgentName through head"),
             "{message}"
         );
     }

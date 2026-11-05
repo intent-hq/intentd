@@ -883,6 +883,165 @@ async fn the_commit_policy_is_the_workspaces_and_only_for_lease_agents() {
     f.node.shutdown();
 }
 
+/// intent-hq/intent#8593: a lease agent sets its workspace's title and
+/// status message on head, as itself.
+#[tokio::test]
+async fn a_lease_agent_sets_the_workspace_title_and_status() {
+    let (f, link, _machine) = fixture().await;
+    let (agent, _) = f.placed().await;
+    let store = f.services.store();
+    sqlx::query("UPDATE workspace SET title = '' WHERE id = ?")
+        .bind(workspace().as_str())
+        .execute(f.backend.store().write_pool())
+        .await
+        .unwrap();
+
+    let set = answered(
+        forward(
+            &link,
+            &agent,
+            "workspace.setTitle",
+            json!({ "title": "Remote naming" }),
+        )
+        .await,
+    );
+    assert_eq!(set["title"], json!("Remote naming"), "{set}");
+    let status = answered(
+        forward(
+            &link,
+            &agent,
+            "workspace.setStatusMessage",
+            json!({ "statusMessage": "Working remotely." }),
+        )
+        .await,
+    );
+    assert_eq!(status["statusMessage"], json!("Working remotely."), "{status}");
+    let row = store.get_workspace(&workspace()).await.unwrap();
+    assert_eq!(row.title, "Remote naming");
+    assert_eq!(row.status_message.as_deref(), Some("Working remotely."));
+
+    const PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let image = answered(
+        forward(
+            &link,
+            &agent,
+            "workspace.setStatusImage",
+            json!({ "image": { "data": PIXEL_PNG, "mimeType": "image/png" } }),
+        )
+        .await,
+    );
+    let asset = image["statusImageAssetId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an asset id: {image}"))
+        .to_owned();
+    let row = store.get_workspace(&workspace()).await.unwrap();
+    assert_eq!(row.status_image_asset_id.as_deref(), Some(asset.as_str()));
+    let cleared = answered(
+        forward(&link, &agent, "workspace.setStatusImage", json!({ "image": null })).await,
+    );
+    assert_eq!(cleared["statusImageAssetId"], Value::Null, "{cleared}");
+
+    let skipped = answered(
+        forward(
+            &link,
+            &agent,
+            "workspace.setTitle",
+            json!({ "title": "Second title" }),
+        )
+        .await,
+    );
+    assert_eq!(skipped["skipped"], json!(true), "{skipped}");
+    let details = answered(forward(&link, &agent, "workspace.details", json!({})).await);
+    assert_eq!(details["title"], json!("Remote naming"), "{details}");
+    f.node.shutdown();
+}
+
+/// intent-hq/intent#8593: `setAgentName` renames the calling agent only;
+/// an `agentId` in its args names nobody else.
+#[tokio::test]
+async fn a_lease_agent_renames_itself_and_no_other_agent() {
+    let (f, link, _machine) = fixture().await;
+    let (agent, view) = f.placed().await;
+    let other = f.agent(&view).await;
+    let store = f.services.store();
+
+    answered(
+        forward(
+            &link,
+            &agent,
+            "workspace.setAgentName",
+            json!({ "name": "Remote namer", "agentId": other.as_str() }),
+        )
+        .await,
+    );
+    let renamed = store
+        .get_agent_session_without_messages(&agent)
+        .await
+        .unwrap();
+    assert_eq!(renamed.name, "Remote namer");
+    let untouched = store
+        .get_agent_session_without_messages(&other)
+        .await
+        .unwrap();
+    assert_eq!(untouched.name, "remote");
+    f.node.shutdown();
+}
+
+/// intent-hq/intent#8593: the setters stay confined to the lease's agents
+/// and to the four setters; a refused one changes nothing.
+#[tokio::test]
+async fn workspace_setters_are_refused_off_the_lease() {
+    let (f, link, _machine) = fixture().await;
+    let (agent, _) = f.placed().await;
+    let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+    let unplaced = f.agent(&view).await;
+    let title = |title: &str| json!({ "title": title });
+
+    let denied = refused(forward(&link, &unplaced, "workspace.setTitle", title("Nope")).await);
+    assert!(
+        denied.message.starts_with("node-agent-denied"),
+        "{denied:?}"
+    );
+    let renamed = refused(
+        forward(
+            &link,
+            &unplaced,
+            "workspace.setAgentName",
+            json!({ "name": "Nope" }),
+        )
+        .await,
+    );
+    assert!(
+        renamed.message.starts_with("node-agent-denied"),
+        "{renamed:?}"
+    );
+    for method in [
+        "workspace.archive",
+        "workspace.unarchive",
+        "workspace.proposeSibling",
+        "workspace.applyProposal",
+    ] {
+        let error = refused(forward(&link, &agent, method, json!({})).await);
+        assert!(
+            error.message.starts_with("remote-agent-unsupported"),
+            "{method}: {error:?}"
+        );
+    }
+
+    let row = f.services.store().get_workspace(&workspace()).await.unwrap();
+    assert_eq!(row.title, "Remote");
+    assert_eq!(row.status_message, None);
+    let name = f
+        .services
+        .store()
+        .get_agent_session_without_messages(&agent)
+        .await
+        .unwrap()
+        .name;
+    assert_eq!(name, "remote");
+    f.node.shutdown();
+}
+
 /// A TCP proxy on `ip`:`port` to 127.0.0.1:`port` that reports each
 /// accepted connection and holds it until `release` fires.
 #[cfg(target_os = "linux")]

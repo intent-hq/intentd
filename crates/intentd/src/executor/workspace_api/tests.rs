@@ -389,6 +389,60 @@ async fn script_calls_reach_head_only_on_a_protocol_8_link() {
     }
 }
 
+/// intent-hq/intent#8593: the machine forwards the workspace setters to
+/// head for the agent; the other workspace calls it still refuses itself.
+#[tokio::test]
+async fn workspace_setters_are_forwarded_to_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
+    let head = HeadLink::default();
+    head.set(node_end);
+    let server = server(&agent(), &workspace(), dir.path(), &gates(), head).unwrap();
+    let answering = tokio::spawn(async move {
+        while let Some(event) = head_end.events.recv().await {
+            if let LinkEvent::Request(request) = event {
+                let frame = request.request().clone();
+                assert_eq!(frame.agent_id, agent());
+                request
+                    .respond(LinkOutcome::Ok(json!({
+                        "answered": frame.params["method"],
+                        "args": frame.params["args"],
+                    })))
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    for (code, method, args) in [
+        (
+            r#"ws.workspace.setTitle("Remote")"#,
+            "workspace.setTitle",
+            json!({ "title": "Remote" }),
+        ),
+        (
+            r#"ws.workspace.setAgentName("Namer")"#,
+            "workspace.setAgentName",
+            json!({ "name": "Namer" }),
+        ),
+        (
+            r#"ws.workspace.setStatusMessage("Busy")"#,
+            "workspace.setStatusMessage",
+            json!({ "statusMessage": "Busy" }),
+        ),
+        (
+            "ws.workspace.setStatusImage(null)",
+            "workspace.setStatusImage",
+            json!({ "image": null }),
+        ),
+    ] {
+        let answer = ok_json(call(&server, &format!("return JSON.stringify(await {code});")).await);
+        assert_eq!(answer, json!({ "answered": method, "args": args }), "{method}");
+    }
+    let (failed, text) = call(&server, "return await ws.workspace.archive();").await;
+    assert!(failed && text.contains("remote-agent-unsupported"), "{text}");
+    answering.abort();
+}
+
 /// Review of intentd#2786: an agent-initiated commit passes the same
 /// auto-commit gate a local one does, with the policy read from head; with
 /// no answer from head it is refused, and `userRequested` bypasses the gate.
