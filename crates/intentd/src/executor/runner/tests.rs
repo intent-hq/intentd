@@ -2277,6 +2277,15 @@ fn setup_finished(id: &str) -> impl Fn(&JournalRecord) -> bool + '_ {
     move |r| r.agent_id.0 == id && matches!(r.body, JournalBody::SetupFinished { .. })
 }
 
+/// Wait until `id` has journaled `count` exits.
+async fn wait_exits(runner: &Runner, id: &str, count: usize) {
+    let deadline = tokio::time::Instant::now() + wait();
+    while records(runner).await.iter().filter(|r| exited(id)(r)).count() < count {
+        assert!(tokio::time::Instant::now() < deadline, "{id} never exited {count} times");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn setup_started(id: &str) -> impl Fn(&JournalRecord) -> bool + '_ {
     move |r| r.agent_id.0 == id && matches!(r.body, JournalBody::SetupStarted { .. })
 }
@@ -2436,7 +2445,7 @@ async fn node_runner_runs_setup_before_the_agent_starts() {
     assert_eq!(all.iter().filter(|r| setup_finished("a1")(r)).count(), 1);
     // A relaunch without its checkout runs it again.
     h.runner.stop(&AgentId::from("a1"));
-    wait_for(&h.runner, "exit", exited("a1")).await;
+    wait_exits(&h.runner, "a1", 2).await;
     h.storage.remove_agent(&AgentId::from("a1")).unwrap();
     h.runner
         .launch(launch_with_setup("a1", Some(env_script), None))

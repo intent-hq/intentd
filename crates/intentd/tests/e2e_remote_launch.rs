@@ -2474,17 +2474,45 @@ async fn a_remote_agents_setup_script_runs_on_the_machine_after_its_submodules()
     set_script("echo boom-from-setup\nexit 3\n");
     let failing = create_remote(&mut rpc_ws, &ws_id, "Failing", 400).await;
     let failing_id = failing["agent"]["id"].as_str().unwrap().to_owned();
-    let reply = turn(&mut rpc_ws, &mut events, (&ws_id, &failing_id), "hello", 450).await;
-    assert!(reply.contains("workspace setup failed"), "{reply}");
-    assert!(reply.contains("exited with code 3"), "{reply}");
-    assert!(reply.contains("boom-from-setup"), "{reply}");
+    turn(&mut rpc_ws, &mut events, (&ws_id, &failing_id), "hello", 450).await;
     let setup = setup_until(&mut rpc_ws, (&ws_id, &failing_id), 500, |setup| {
         setup["state"] == "failed"
     })
     .await;
     assert_eq!(setup["exitCode"], 3, "{setup}");
-    let again = turn(&mut rpc_ws, &mut events, (&ws_id, &failing_id), "again", 600).await;
-    assert!(!again.contains("workspace setup failed"), "notice once: {again}");
+    turn(&mut rpc_ws, &mut events, (&ws_id, &failing_id), "again", 600).await;
+    // The fixture echoes each prompt; the notice rides the first one only.
+    let replies = timeout(wait(), async {
+        let mut id = 650;
+        loop {
+            id += 1;
+            let session = ok(
+                &mut rpc_ws,
+                id,
+                "agent.getSession",
+                json!({ "workspaceId": ws_id, "agentId": failing_id }),
+            )
+            .await;
+            let replies: Vec<String> = session["session"]["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|message| message["role"] == "assistant")
+                .map(Value::to_string)
+                .collect();
+            if replies.len() >= 2 {
+                return replies;
+            }
+            // timing-guard: poll interval for both replies to be recorded
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("both turns are recorded");
+    assert!(replies[0].contains("workspace setup failed"), "{replies:?}");
+    assert!(replies[0].contains("exited with code 3"), "{replies:?}");
+    assert!(replies[0].contains("boom-from-setup"), "{replies:?}");
+    assert!(!replies[1].contains("workspace setup failed"), "notice once: {replies:?}");
 
     // The first agent's work comes back without the setup's files.
     std::fs::write(work.join("agent.txt"), "agent edit\n").unwrap();
@@ -2500,14 +2528,17 @@ async fn a_remote_agents_setup_script_runs_on_the_machine_after_its_submodules()
     let wip = timeout(wait(), async {
         loop {
             if let Some(wip) = try_rev(&repo, &format!("{refs}/wip")) {
-                return wip;
+                let files = git(&repo, &["ls-tree", "-r", "--name-only", &wip]);
+                if files.lines().any(|f| f == "agent.txt") {
+                    return wip;
+                }
             }
             // timing-guard: poll interval for the machine's final push to land the refs (no event exposes it)
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("the final push lands");
+    .expect("the final push lands the agent's edit");
     let files = git(&repo, &["ls-tree", "-r", "--name-only", &wip]);
     assert!(files.lines().any(|f| f == "agent.txt"), "{files}");
     for setup_file in ["setup-env.txt", "generated/out.txt"] {

@@ -651,11 +651,12 @@ async fn setup_records_and_output_reach_the_agents_placement() {
     assert_eq!(done.finished_at.as_deref(), Some("2026-11-05T10:00:05Z"));
     assert_eq!(done.output, None, "the placement stores no output");
 
-    let detail = f
-        .services
-        .agent_get(agent.clone(), Some(workspace()))
-        .await
-        .unwrap();
+    let detail = intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        f.services.agent_get(agent.clone(), Some(workspace())),
+    )
+    .await
+    .unwrap();
     let setup = serde_json::to_value(&detail).unwrap()["setup"].clone();
     assert_eq!(setup["state"], "failed", "{setup}");
     assert_eq!(setup["output"], "Fetching a…\nready\n", "{setup}");

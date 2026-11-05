@@ -286,7 +286,20 @@ pub struct RemoteSetupStatus {
     pub output_truncated: Option<bool>,
 }
 
+/// The longest `setup.error` a placement keeps, in bytes.
+pub const SETUP_ERROR_CAP_BYTES: usize = 512;
+
 impl RemoteSetupStatus {
+    /// `error` cut to [`SETUP_ERROR_CAP_BYTES`] on a character boundary.
+    #[must_use]
+    pub fn capped_error(error: &str) -> String {
+        let mut end = error.len().min(SETUP_ERROR_CAP_BYTES);
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        error[..end].to_owned()
+    }
+
     #[must_use]
     pub fn pending() -> Self {
         Self {

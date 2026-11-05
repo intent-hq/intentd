@@ -340,7 +340,7 @@ pub(super) async fn run(
 ) -> Ran {
     let dir = agent_dir(run.worktree);
     let before = untracked(run.worktree, run.pins).await;
-    let script = dir.join(format!("setup-{}.sh", uuid::Uuid::new_v4()));
+    let script = dir.join(format!("setup-{}.sh", intent_core::node_link::LinkId::new_v4()));
     let ran = spawn_and_wait(pty, &run, &script, output, started_at, stop).await;
     let _ = std::fs::remove_file(&script);
     output.finish();

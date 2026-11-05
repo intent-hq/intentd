@@ -2081,7 +2081,7 @@ async fn record_placement(shared: &Shared, record: &intent_core::node_link::Jour
                         SetupState::Skipped => RemoteSetupState::Skipped,
                     },
                     exit_code: *exit_code,
-                    error: error.clone(),
+                    error: error.as_deref().map(RemoteSetupStatus::capped_error),
                     finished_at: Some(finished_at.clone()),
                     ..RemoteSetupStatus::pending()
                 };
