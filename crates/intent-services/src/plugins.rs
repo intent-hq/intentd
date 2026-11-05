@@ -788,25 +788,25 @@ pub(crate) fn mcp_server_name(plugin: &str, server: &str) -> String {
         .collect()
 }
 
-/// Session MCP entries for `plugins`. Neither the ACP stdio shape nor the
-/// provider config files carry a working directory, so stdio servers start
+/// `mcp.servers` id prefix for servers that come from a plugin.
+pub(crate) const MCP_ID_PREFIX: &str = "plugin:";
+
+/// `mcp.servers` configs for the plugins' servers, keyed by
+/// `plugin:<plugin>/<server>`. They join the user's configs in the MCP hub, so
+/// they get live status, sign-in, `ws.mcp.*` and the per-workspace switch.
+/// Session MCP configs carry no working directory, so stdio servers start
 /// through `<launcher> plugin-exec --cwd <dir> -- <command> <args…>`.
-/// Existing names in `out` win; a clash is logged and the plugin entry dropped.
-pub(crate) fn merge_session_servers(
+pub(crate) fn mcp_configs(
     plugins: &[LoadedPlugin],
     launcher: &str,
     launcher_env: &BTreeMap<String, String>,
-    out: &mut intent_acp::NormalizedMcpServers,
-) {
+) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
     for plugin in plugins {
+        let plugin_name = &plugin.manifest.name;
         for (server, config) in &plugin.mcp_servers {
-            let name = mcp_server_name(&plugin.manifest.name, server);
-            if out.contains_key(&name) {
-                tracing::warn!(plugin = %plugin.manifest.name, server = %server, name = %name,
-                    "plugin MCP server name is taken; skipping");
-                continue;
-            }
-            let normalized = match config {
+            let id = format!("{MCP_ID_PREFIX}{plugin_name}/{server}");
+            let mut value = match config {
                 PluginMcpServer::Stdio {
                     command,
                     args,
@@ -828,24 +828,39 @@ pub(crate) fn merge_session_servers(
                         command.clone(),
                     ];
                     launch.extend(args.iter().cloned());
-                    intent_acp::NormalizedMcpServer::Stdio {
-                        command: launcher.to_string(),
-                        args: launch,
-                        env: full_env,
-                    }
+                    serde_json::json!({
+                        "transport": "stdio",
+                        "command": launcher,
+                        "args": launch,
+                        "env": full_env,
+                    })
                 }
-                PluginMcpServer::Http { url, headers } => intent_acp::NormalizedMcpServer::Http {
-                    url: url.clone(),
-                    headers: (!headers.is_empty()).then(|| headers.clone()),
-                },
-                PluginMcpServer::Sse { url, headers } => intent_acp::NormalizedMcpServer::Sse {
-                    url: url.clone(),
-                    headers: (!headers.is_empty()).then(|| headers.clone()),
-                },
+                PluginMcpServer::Http { url, headers } | PluginMcpServer::Sse { url, headers } => {
+                    let mut remote = serde_json::json!({
+                        "transport": if matches!(config, PluginMcpServer::Sse { .. }) { "sse" } else { "http" },
+                        "url": url,
+                    });
+                    if !headers.is_empty() {
+                        remote["headers"] = serde_json::json!(headers);
+                    }
+                    remote
+                }
             };
-            out.insert(name, normalized);
+            value["id"] = Value::String(id.clone());
+            value["name"] = Value::String(mcp_server_name(plugin_name, server));
+            value["enabled"] = Value::Bool(true);
+            value["plugin"] = Value::String(plugin_name.clone());
+            out.push((id, value));
         }
     }
+    out
+}
+
+/// The plugin that owns an `mcp.servers` id, if any.
+pub(crate) fn mcp_id_plugin(id: &str) -> Option<&str> {
+    id.strip_prefix(MCP_ID_PREFIX)?
+        .split_once('/')
+        .map(|(plugin, _)| plugin)
 }
 
 /// Create each plugin's `PLUGIN_DATA` directory before its servers start.

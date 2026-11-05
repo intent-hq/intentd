@@ -4316,7 +4316,6 @@ impl AgentManager {
         if let Some(path) = path_override {
             env.insert("PATH".to_string(), path);
         }
-        let launcher = (command.clone(), env.clone());
         // The listener refuses any connection that does not present this
         // per-agent secret; it rides in the child env, never argv.
         env.insert(intent_acp::BRIDGE_TOKEN_ENV.to_string(), token.to_string());
@@ -4333,16 +4332,6 @@ impl AgentManager {
             },
         );
         self.merge_user_mcp_servers(&mut servers).await?;
-        if crate::mcp_servers::enable_user_servers(&self.services.effective_settings()) {
-            let plugins = tokio::task::spawn_blocking(|| {
-                let plugins = crate::plugins::enabled_user_plugins();
-                crate::plugins::ensure_data_dirs(&plugins);
-                plugins
-            })
-            .await
-            .unwrap_or_default();
-            crate::plugins::merge_session_servers(&plugins, &launcher.0, &launcher.1, &mut servers);
-        }
         let baseline = build_baseline_mcp_env_from_process();
         Ok(apply_baseline_env_to_stdio_servers(&servers, &baseline))
     }
@@ -4358,7 +4347,11 @@ impl AgentManager {
         if !crate::mcp_servers::enable_user_servers(&settings) {
             return Ok(());
         }
-        let configs = crate::mcp_servers::read_configs(&self.services.secrets).await;
+        let configs = crate::mcp_servers::read_all_configs(
+            &self.services.secrets,
+            &crate::mcp_servers::disabled_servers(&settings),
+        )
+        .await;
         if configs.is_empty() {
             return Ok(());
         }

@@ -20585,14 +20585,20 @@ impl WorkspaceApi for Services {
     fn plugin_install(&self, source: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("plugin.install")?;
-            plugins::ops::install(source).await
+            let out = plugins::ops::install(source).await?;
+            self.mcp_servers_service().sync_plugin_servers(None).await;
+            Ok(out)
         })
     }
 
     fn plugin_update(&self, name: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("plugin.update")?;
-            plugins::ops::update(name).await
+            let out = plugins::ops::update(name.clone()).await?;
+            self.mcp_servers_service()
+                .sync_plugin_servers(Some(&name))
+                .await;
+            Ok(out)
         })
     }
 
@@ -20603,7 +20609,9 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("plugin.uninstall")?;
-            plugins::ops::uninstall(name, keep_data).await
+            let out = plugins::ops::uninstall(name, keep_data).await?;
+            self.mcp_servers_service().sync_plugin_servers(None).await;
+            Ok(out)
         })
     }
 
@@ -20614,7 +20622,9 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("plugin.toggle")?;
-            plugins::ops::toggle(name, enabled).await
+            let out = plugins::ops::toggle(name, enabled).await?;
+            self.mcp_servers_service().sync_plugin_servers(None).await;
+            Ok(out)
         })
     }
 

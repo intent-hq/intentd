@@ -332,50 +332,44 @@ fn enabled_plugin_skills_join_the_catalog_namespaced() {
 }
 
 #[test]
-fn session_servers_launch_through_plugin_exec_without_bridge_secrets() {
+fn mcp_configs_launch_through_plugin_exec_with_plugin_ids() {
     let f = fixture("acme");
     write(
         &f.root.join(MCP_FILE),
         &mcp(&json!({
             "search": { "type": "stdio", "command": "node", "args": ["s.js"], "env": { "MODE": "x" } },
-            "docs": { "type": "streamable-http", "url": "https://docs.example/mcp" },
-            "taken": { "type": "streamable-http", "url": "https://other.example/mcp" },
+            "docs": { "type": "streamable-http", "url": "https://docs.example/mcp", "headers": { "X-Team": "t" } },
+            "events": { "type": "sse", "url": "https://docs.example/sse" },
         })),
     );
     let plugin = load(&f);
-    let mut out = intent_acp::NormalizedMcpServers::new();
-    out.insert(
-        "acme-taken".into(),
-        intent_acp::NormalizedMcpServer::Http {
-            url: "https://user.example".into(),
-            headers: None,
-        },
-    );
     let launcher_env = BTreeMap::from([("PATH".to_string(), "/opt/intent:/usr/bin".to_string())]);
-    merge_session_servers(&[plugin], "intentd", &launcher_env, &mut out);
-
-    let intent_acp::NormalizedMcpServer::Stdio { command, args, env } = &out["acme-search"] else {
-        panic!("stdio expected");
-    };
-    assert_eq!(command, "intentd");
+    let configs: BTreeMap<String, Value> = mcp_configs(&[plugin], "intentd", &launcher_env)
+        .into_iter()
+        .collect();
     let root = f.root.to_string_lossy().into_owned();
+    let data = f.data.to_string_lossy().into_owned();
     assert_eq!(
-        args,
-        &["plugin-exec", "--cwd", root.as_str(), "--", "node", "s.js"]
+        configs["plugin:acme/search"],
+        json!({
+            "id": "plugin:acme/search",
+            "name": "acme-search",
+            "plugin": "acme",
+            "enabled": true,
+            "transport": "stdio",
+            "command": "intentd",
+            "args": ["plugin-exec", "--cwd", root, "--", "node", "s.js"],
+            "env": { "MODE": "x", "PATH": "/opt/intent:/usr/bin", "PLUGIN_DATA": data, "PLUGIN_ROOT": root },
+        })
     );
+    assert_eq!(configs["plugin:acme/docs"]["transport"], "http");
     assert_eq!(
-        env,
-        &BTreeMap::from([
-            ("MODE".to_string(), "x".to_string()),
-            ("PATH".to_string(), "/opt/intent:/usr/bin".to_string()),
-            (DATA_VAR.to_string(), f.data.to_string_lossy().into_owned()),
-            (ROOT_VAR.to_string(), root.clone()),
-        ])
+        configs["plugin:acme/docs"]["headers"],
+        json!({ "X-Team": "t" })
     );
-    assert!(
-        matches!(&out["acme-docs"], intent_acp::NormalizedMcpServer::Http { url, .. } if url == "https://docs.example/mcp")
-    );
-    assert!(
-        matches!(&out["acme-taken"], intent_acp::NormalizedMcpServer::Http { url, .. } if url == "https://user.example")
-    );
+    assert_eq!(configs["plugin:acme/events"]["transport"], "sse");
+    assert!(configs["plugin:acme/events"].get("headers").is_none());
+    assert_eq!(mcp_id_plugin("plugin:acme/docs"), Some("acme"));
+    assert_eq!(mcp_id_plugin("plugin:broken"), None);
+    assert_eq!(mcp_id_plugin("srv-1"), None);
 }

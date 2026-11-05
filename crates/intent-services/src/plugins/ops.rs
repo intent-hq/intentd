@@ -370,6 +370,7 @@ fn info(p: &InstalledPlugin) -> Value {
                     .iter()
                     .map(|(server, config)| {
                         json!({
+                            "id": format!("{}{}/{server}", super::MCP_ID_PREFIX, plugin.manifest.name),
                             "name": server,
                             "sessionName": mcp_server_name(&plugin.manifest.name, server),
                             "transport": config.transport(),
