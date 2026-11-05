@@ -302,25 +302,15 @@ async fn check_provider_auth_cli_with(
         }
         "cursor" => {
             let mut cmd = probe_command(program);
-            cmd.envs(
-                intent_providers::cursor::CURSOR_PLAIN_OUTPUT_ENV
-                    .iter()
-                    .copied(),
-            );
-            cmd.args(auth_check_args)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true);
-            match tokio::time::timeout(CLI_AUTH_TIMEOUT, cmd.output()).await {
-                Ok(Ok(output)) if could_not_run(output.status) => CliAuthProbe::Failed,
-                Ok(Ok(output)) => cursor_probe_outcome(
+            cmd.args(auth_check_args);
+            match crate::cursor_cli::run_cursor_cli(cmd, CLI_AUTH_TIMEOUT).await {
+                Some(output) if could_not_run(output.status) => CliAuthProbe::Failed,
+                Some(output) => cursor_probe_outcome(
                     &String::from_utf8_lossy(&output.stdout),
                     &String::from_utf8_lossy(&output.stderr),
                     output.status.success(),
                 ),
-                Ok(Err(_)) => CliAuthProbe::Failed,
-                Err(_) => CliAuthProbe::TimedOut,
+                None => CliAuthProbe::TimedOut,
             }
         }
         "opencode" => {
@@ -566,20 +556,8 @@ async fn cursor_stored_login_note(program: &OsStr) -> Option<String> {
     }
     let mut cmd = probe_command(program);
     gap_fill_credentials(&mut cmd, captured);
-    cmd.envs(
-        intent_providers::cursor::CURSOR_PLAIN_OUTPUT_ENV
-            .iter()
-            .copied(),
-    );
-    cmd.args(["status", "--format", "json"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(CLI_AUTH_TIMEOUT, cmd.output())
-        .await
-        .ok()?
-        .ok()?;
+    cmd.args(["status", "--format", "json"]);
+    let output = crate::cursor_cli::run_cursor_cli(cmd, CLI_AUTH_TIMEOUT).await?;
     cursor_status_note(true, &String::from_utf8_lossy(&output.stdout))
 }
 

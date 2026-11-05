@@ -40,6 +40,26 @@ impl Drop for Daemon {
     }
 }
 
+/// Kills every mock `cursor-agent acp` process group (and its worker) the
+/// test's daemons started. Declared before the daemon so it drops after it:
+/// a SIGKILLed test daemon cannot reap agents spawned in their own process
+/// groups, and the mock (like the real CLI) ignores stdin EOF.
+struct MockCleanup(std::path::PathBuf);
+
+impl Drop for MockCleanup {
+    fn drop(&mut self) {
+        use nix::sys::signal::{kill, killpg, Signal};
+        use nix::unistd::Pid;
+        let Ok(log) = std::fs::read_to_string(&self.0) else {
+            return;
+        };
+        for pid in log.split_whitespace().filter_map(|p| p.parse::<i32>().ok()) {
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+    }
+}
+
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
@@ -50,6 +70,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
+        .env("MOCK_CURSOR_PIDS_LOG", data_dir.join("mock-pids.log"))
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     for (k, v) in env {
@@ -223,6 +244,7 @@ async fn cursor_provider_discovery_auth_models_and_turn_over_wss() {
     );
     let data_dir_guard = common::test_tempdir_in("/tmp", "itd-wss-cursor-");
     let data_dir = data_dir_guard.path().to_path_buf();
+    let _mock_cleanup = MockCleanup(data_dir.join("mock-pids.log"));
     let wrapper = data_dir.join("cursor-agent");
     std::fs::write(
         &wrapper,
@@ -538,6 +560,7 @@ async fn cursor_signed_out_reports_unauthenticated_over_wss() {
     );
     let data_dir_guard = common::test_tempdir_in("/tmp", "itd-wss-cursor-out-");
     let data_dir = data_dir_guard.path().to_path_buf();
+    let _mock_cleanup = MockCleanup(data_dir.join("mock-pids.log"));
     let wrapper = data_dir.join("cursor-agent");
     std::fs::write(
         &wrapper,
@@ -607,6 +630,7 @@ async fn cursor_unknown_or_rejected_model_fails_with_an_actionable_error() {
     );
     let data_dir_guard = common::test_tempdir_in("/tmp", "itd-wss-cursor-model-");
     let data_dir = data_dir_guard.path().to_path_buf();
+    let _mock_cleanup = MockCleanup(data_dir.join("mock-pids.log"));
     let wrapper = data_dir.join("cursor-agent");
     std::fs::write(
         &wrapper,
@@ -783,6 +807,7 @@ async fn cursor_stop_then_resume_over_wss() {
     );
     let data_dir_guard = common::test_tempdir_in("/tmp", "itd-wss-cursor-resume-");
     let data_dir = data_dir_guard.path().to_path_buf();
+    let _mock_cleanup = MockCleanup(data_dir.join("mock-pids.log"));
     let wrapper = data_dir.join("cursor-agent");
     std::fs::write(
         &wrapper,

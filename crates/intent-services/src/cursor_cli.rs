@@ -62,7 +62,7 @@ pub fn probe_cursor_cli(override_path: Option<&str>) -> CursorCliStatus {
 pub fn probe_cursor_cli_at(resolved_path: Option<PathBuf>) -> CursorCliStatus {
     let identity = resolved_path
         .as_deref()
-        .and_then(crate::pi_cli::run_version_probe)
+        .and_then(run_cursor_version_probe)
         .map(|line| classify_cursor_version(&line));
     if let Some(CursorCliIdentity::Unrecognized(line)) = &identity {
         tracing::warn!(
@@ -74,6 +74,98 @@ pub fn probe_cursor_cli_at(resolved_path: Option<PathBuf>) -> CursorCliStatus {
         resolved_path,
         identity,
     }
+}
+
+/// Kill every process left in a Cursor CLI's process group (the child was
+/// spawned with `process_group(0)`, so its pid is the group id). The CLI's
+/// own children may outlive it and `cursor-agent` ignores stdin EOF, so
+/// every run ends with this, on success, error and timeout alike.
+fn kill_cursor_group(pgid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pgid) = pgid.and_then(|p| i32::try_from(p).ok()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pgid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
+}
+
+/// Run one short Cursor CLI command (`models`, `status --format json`) in
+/// its own process group with plain-output env, bounded by `timeout`; the
+/// whole group is killed afterwards on every outcome. `None` on spawn
+/// failure or timeout.
+pub(crate) async fn run_cursor_cli(
+    mut cmd: tokio::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    cmd.envs(
+        intent_providers::cursor::CURSOR_PLAIN_OUTPUT_ENV
+            .iter()
+            .copied(),
+    )
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd.spawn().ok()?;
+    let pgid = child.id();
+    let output = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    kill_cursor_group(pgid);
+    output.ok()?.ok()
+}
+
+/// `cursor-agent --version` with a 3s budget, in its own process group that
+/// is killed afterwards (the shared pi probe kills only the leader).
+fn run_cursor_version_probe(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut cmd = Command::new(path);
+    cmd.arg("--version")
+        .envs(
+            intent_providers::cursor::CURSOR_PLAIN_OUTPUT_ENV
+                .iter()
+                .copied(),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().ok()?;
+    let pgid = Some(child.id());
+    let start = Instant::now();
+    let line = loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let mut out = Vec::new();
+                child.stdout.take()?.read_to_end(&mut out).ok()?;
+                break String::from_utf8_lossy(&out)
+                    .lines()
+                    .next()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_owned);
+            }
+            Ok(Some(_)) | Err(_) => break None,
+            Ok(None) if start.elapsed() >= Duration::from_secs(3) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    kill_cursor_group(pgid);
+    line
 }
 
 /// The refusal reason when `providers.paths.cursor` points at the Grok
@@ -251,6 +343,145 @@ mod tests {
         std::fs::write(&cursor, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&cursor, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(check_cursor_override_for_spawn(cursor.to_str()).is_ok());
+    }
+
+    /// Whether `pid` still runs (a zombie counts as gone).
+    #[cfg(unix)]
+    fn alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+            && std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+                stat.rsplit_once(") ")
+                    .is_none_or(|(_, rest)| !rest.starts_with('Z'))
+            })
+    }
+
+    /// Wait (bounded) until none of `pids` runs.
+    #[cfg(unix)]
+    fn assert_all_gone(pids: &[i32], what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pids.iter().any(|p| alive(*p)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: a Cursor child survived: {pids:?}"
+            );
+            // timing-guard: poll interval for killed processes to disappear (bounded above).
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// A fake `cursor-agent` that leaves a SIGTERM-ignoring child behind
+    /// (like the real CLI's workers), records its pid, then runs `tail`.
+    #[cfg(unix)]
+    fn fake_cli(dir: &std::path::Path, name: &str, tail: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let pid_file = dir.join(format!("{name}.pid"));
+        let script = dir.join(name);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsh -c 'trap \"\" TERM; sleep 300' &\necho $! > '{}'\n{tail}\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, pid_file)
+    }
+
+    #[cfg(unix)]
+    fn recorded_pid(pid_file: &std::path::Path) -> i32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "no pid recorded");
+            // timing-guard: poll interval until the fake CLI records its child (bounded above).
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// `models` / `status` runs leave no process behind on success, error
+    /// or timeout, even when the CLI's own child ignores SIGTERM.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn short_cli_runs_kill_the_whole_group_on_every_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, tail, timeout_ms, expect_output) in [
+            ("ok", "echo 'auto - Auto'; exit 0", 5_000, true),
+            (
+                "err",
+                "echo 'Error: Authentication required.' >&2; exit 1",
+                5_000,
+                true,
+            ),
+            ("hang", "sleep 300", 300, false),
+        ] {
+            let (script, pid_file) = fake_cli(dir.path(), name, tail);
+            let out = run_cursor_cli(
+                tokio::process::Command::new(&script),
+                std::time::Duration::from_millis(timeout_ms),
+            )
+            .await;
+            assert_eq!(out.is_some(), expect_output, "{name}");
+            assert_all_gone(&[recorded_pid(&pid_file)], name);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_kills_the_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, tail) in [("v-ok", "echo 2026.11.05-86047df"), ("v-hang", "sleep 300")] {
+            let (script, pid_file) = fake_cli(dir.path(), name, tail);
+            let line = run_cursor_version_probe(&script);
+            assert_eq!(line.is_some(), name == "v-ok", "{name}");
+            assert_all_gone(&[recorded_pid(&pid_file)], name);
+        }
+    }
+
+    /// The session-free model probe (`cursor-agent acp` + list models) kills
+    /// the mock CLI and its SIGTERM-ignoring worker on success and on the
+    /// signed-out error, although the CLI ignores stdin EOF.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_probe_leaves_no_cursor_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(node) = intent_providers::resolve_on_path("node") else {
+            eprintln!("skipping: node not on PATH");
+            return;
+        };
+        let mock = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../intentd/tests/fixtures/mock-cursor-agent.mjs");
+        let dir = tempfile::tempdir().unwrap();
+        for signed_out in [false, true] {
+            let pid_file = dir.path().join(format!("acp-{signed_out}.pid"));
+            let wrapper = dir.path().join(format!("cursor-agent-{signed_out}"));
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nexport MOCK_CURSOR_PID_FILE='{}'\nexport MOCK_CURSOR_SIGNED_OUT='{}'\nexec '{}' '{}' \"$@\"\n",
+                    pid_file.display(),
+                    if signed_out { "1" } else { "0" },
+                    node.display(),
+                    mock.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let fetch = crate::provider_models::fetch_cursor_models_at(Some(wrapper)).await;
+            assert_eq!(fetch.models.is_some(), !signed_out, "{fetch:?}");
+            let pids: Vec<i32> = std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .split_whitespace()
+                .map(|p| p.parse().unwrap())
+                .collect();
+            assert_eq!(pids.len(), 2, "main and worker pids");
+            assert_all_gone(&pids, if signed_out { "signed out" } else { "success" });
+        }
     }
 
     /// End to end over a fake `cursor-agent` on an explicit override path:

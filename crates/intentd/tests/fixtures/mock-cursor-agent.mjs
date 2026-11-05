@@ -13,6 +13,7 @@
 // Env:
 //   MOCK_CURSOR_RPC_LOG     JSONL log of every frame in either direction
 //   MOCK_CURSOR_PID_FILE    the `acp` process writes "<pid> <worker pid>" here
+//   MOCK_CURSOR_PIDS_LOG    every `acp` process appends "<pid> <worker pid>" (test cleanup)
 //   MOCK_CURSOR_VERSION     `--version` output (default 2026.11.05-86047df)
 //   MOCK_CURSOR_SIGNED_OUT  "1": `models`, the model list and `session/new` fail with auth errors
 //   MOCK_CURSOR_REJECT_MODELS  '|'-separated model option values (variant ids contain commas) set_config_option rejects
@@ -87,6 +88,10 @@ if (args[0] !== 'acp') {
 const worker = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1e9)"], { stdio: 'ignore' });
 if (process.env.MOCK_CURSOR_PID_FILE) {
   writeFileSync(process.env.MOCK_CURSOR_PID_FILE, `${process.pid} ${worker.pid}`);
+}
+// Every acp process the suite ever starts, for end-of-test cleanup.
+if (process.env.MOCK_CURSOR_PIDS_LOG) {
+  appendFileSync(process.env.MOCK_CURSOR_PIDS_LOG, `${process.pid} ${worker.pid}\n`);
 }
 // The real `cursor-agent acp` keeps running after stdin EOF.
 setInterval(() => {}, 60_000);
