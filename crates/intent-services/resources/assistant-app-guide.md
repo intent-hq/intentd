@@ -634,9 +634,10 @@ a message says it no longer exists.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
-Use **Next Workspace Tab** (default **Ctrl+Tab**) or **Previous Workspace Tab**
-(default **Ctrl+Shift+Tab**) to cycle through open workspace tabs in displayed
-order. From **Home**, next opens the first workspace tab and previous opens the
+Use **Next Workspace Tab** (defaults **Ctrl+Tab** and **Cmd+Shift+]**) or
+**Previous Workspace Tab** (defaults **Ctrl+Shift+Tab** and **Cmd+Shift+[**; use
+**Ctrl+Shift+]** / **Ctrl+Shift+[** on Windows/Linux) to cycle through open
+workspace tabs in displayed order. From **Home**, next opens the first workspace tab and previous opens the
 last, regardless of which workspace was selected before Home. With no open
 workspace tabs, these shortcuts do nothing. Customize them in **Settings → Input
 and shortcuts → Keyboard shortcuts**.
