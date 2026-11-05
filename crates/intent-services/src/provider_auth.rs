@@ -1958,7 +1958,7 @@ while IFS= read -r unexpected; do exit 95; done
     /// A provider without a sign-in probe is unknown and never cached.
     #[tokio::test]
     async fn default_sign_in_without_a_probe_is_unknown() {
-        for id in ["mock", "cursor", "not-a-provider"] {
+        for id in ["mock", "unsloth", "not-a-provider"] {
             assert_eq!(
                 default_sign_in(id, None).await,
                 DefaultSignIn::default(),
