@@ -97,6 +97,9 @@ mod tests_large_note;
 #[cfg(test)]
 mod tests_hook_get;
 
+#[cfg(test)]
+mod tests_call_ledger;
+
 /// Test-only process-global env setup. Runs before `main()` — and therefore
 /// before any test threads exist, making `set_var` race-free. Node children
 /// spawned by lib tests (e.g. MCP fixture servers) inherit this and skip

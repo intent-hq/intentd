@@ -16,6 +16,8 @@ use intent_core::{
 use intent_js::{eval as js_eval, eval_guarded, BoxFuture, EvalOptions, HostFn, JsError};
 use serde_json::{json, Value};
 
+use super::call_ledger::CallLedger;
+
 /// Per-invocation collector of turn attachments stamped at binding call time
 /// (monorepo#2637): every `host({...})` frame whose result carries
 /// `__mcpContentItems` contributes its resource items here, so registration
@@ -171,6 +173,7 @@ impl WorkspaceMcpServer {
         let pending: Option<PendingAttachments> = self
             .publishes_attachments()
             .then(|| Arc::new(Mutex::new(PendingAttachmentState::default())));
+        let ledger = CallLedger::default();
         let host = make_workspace_host_with_pending(
             self.api.clone(),
             self.workspace_id.clone(),
@@ -181,6 +184,7 @@ impl WorkspaceMcpServer {
             self.workspace_api_timeout,
             pending.clone(),
             self.frame_router.clone(),
+            Some(ledger.clone()),
         );
         // Wrap user code so the engine sees a small `{__k, __v}` envelope,
         // preserving the `undefined` vs `null` distinction that
@@ -363,7 +367,9 @@ impl WorkspaceMcpServer {
                 {
                     return refusal_tool_result();
                 }
-                workspace_api_error(&format_js_error(&e))
+                // intent-hq/intent#8592: the rejection discards every
+                // earlier call's result, so report what those calls did.
+                workspace_api_error(&ledger.annotate(&format_js_error(&e), output.is_none()))
             }
         };
         let total = started.elapsed();
@@ -868,6 +874,7 @@ pub fn make_workspace_host_for_bridge(
         eval_budget,
         None,
         None,
+        None,
     )
 }
 
@@ -892,6 +899,7 @@ fn make_workspace_host_with_pending(
     eval_budget: Duration,
     pending: Option<PendingAttachments>,
     router: Option<Arc<dyn super::HostFrameRouter>>,
+    ledger: Option<CallLedger>,
 ) -> HostFn {
     let features = Arc::new(agent_features);
     let eval_budget = super::bindings::EvalBudget::starting_now(eval_budget);
@@ -916,6 +924,12 @@ fn make_workspace_host_with_pending(
             state.next_seq += 1;
             seq
         });
+        // Recorded when the frame first runs, like `seq`; a frame never run
+        // before the script ends never ran its call either.
+        let slot = ledger.as_ref().map(|ledger| {
+            let method = arg.get("method").and_then(Value::as_str).unwrap_or("?");
+            (ledger.clone(), ledger.start(method))
+        });
         let frame = async move {
             let claimed = router.as_ref().and_then(|router| {
                 let method = arg.get("method").and_then(Value::as_str)?;
@@ -938,6 +952,9 @@ fn make_workspace_host_with_pending(
                     .await
                 }
             };
+            if let Some((ledger, slot)) = &slot {
+                ledger.finish(*slot, &result);
+            }
             match (result, &pending, seq) {
                 (Ok(mut value), Some(pending), Some(seq)) => {
                     collect_binding_attachments(&mut value, pending, seq);
