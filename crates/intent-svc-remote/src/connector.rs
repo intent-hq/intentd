@@ -245,6 +245,11 @@ pub(crate) struct Shared {
     self_ref: Mutex<std::sync::Weak<Shared>>,
     /// The protocol the current (or last) link negotiated.
     protocol: std::sync::atomic::AtomicU32,
+    /// Whether placement refuses this machine below nodeProtocol 10 for a
+    /// workspace that needs a prepared checkout: this build's
+    /// [`offers_prepared_checkout`](intent_core::node_link::offers_prepared_checkout),
+    /// which tests turn on.
+    prepared_checkout: std::sync::atomic::AtomicBool,
     /// Bumped whenever a stop leaves the queue (acknowledged, or dropped on
     /// revocation).
     stops_changed: watch::Sender<u64>,
@@ -297,6 +302,24 @@ impl Shared {
     #[cfg(test)]
     pub(crate) fn tuning_ref(&self) -> &Tuning {
         &self.tuning
+    }
+
+    /// The protocol the current (or last) link negotiated; 0 before the
+    /// first bind.
+    pub(crate) fn protocol(&self) -> u32 {
+        self.protocol.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// See the `prepared_checkout` field.
+    pub(crate) fn offers_prepared_checkout(&self) -> bool {
+        self.prepared_checkout
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn offer_prepared_checkout_for_test(&self) {
+        self.prepared_checkout
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -466,21 +489,13 @@ impl Shared {
             }
         };
         let recorded = match placed {
-            Some(placed) => {
-                let repo_path = self
-                    .store
-                    .get_workspace(&placed.workspace_id)
-                    .await
-                    .map(|workspace| crate::final_stop::repo_path(&workspace))
-                    .unwrap_or_default();
-                match crate::final_stop::record(&self.store, &placed, reason, repo_path).await {
-                    Ok(stop_id) => Some(stop_id),
-                    Err(error) => {
-                        tracing::warn!(agent = %agent_id, %error, "remote machine: could not record a final stop; stopping it from memory");
-                        None
-                    }
+            Some(placed) => match crate::final_stop::record(&self.store, &placed, reason).await {
+                Ok(stop_id) => Some(stop_id),
+                Err(error) => {
+                    tracing::warn!(agent = %agent_id, %error, "remote machine: could not record a final stop; stopping it from memory");
+                    None
                 }
-            }
+            },
             None => None,
         };
         self.agents.close(agent_id);
@@ -1100,6 +1115,9 @@ impl RemoteNode {
             in_grace: Mutex::new(std::collections::HashSet::new()),
             self_ref: Mutex::new(std::sync::Weak::new()),
             protocol: std::sync::atomic::AtomicU32::new(0),
+            prepared_checkout: std::sync::atomic::AtomicBool::new(
+                intent_core::node_link::offers_prepared_checkout(),
+            ),
             stops_changed: watch::channel(0).0,
             resending: Mutex::new(HashMap::new()),
             stop_exits: Mutex::new(HashMap::new()),
@@ -1878,13 +1896,7 @@ async fn claim(shared: &Arc<Shared>, running_agents: &[AgentId]) -> bool {
         };
         if let Some(reason) = ended_reason(shared, record).await {
             tracing::info!(agent = %agent_id, reason = reason.as_str(), "remote node: stopping an agent whose session has ended");
-            let repo_path = shared
-                .store
-                .get_workspace(&record.workspace_id)
-                .await
-                .map(|workspace| crate::final_stop::repo_path(&workspace))
-                .unwrap_or_default();
-            match crate::final_stop::record(&shared.store, record, reason, repo_path).await {
+            match crate::final_stop::record(&shared.store, record, reason).await {
                 Ok(stop_id) => shared.queue_final_stop(agent_id, stop_id, true),
                 Err(error) => {
                     tracing::warn!(agent = %agent_id, %error, "remote node: could not record a final stop; stopping it from memory");

@@ -111,9 +111,28 @@ fn remote_url_round_trips_and_rejects_other_spellings() {
         "intent://hub/ws-1/agents/agent-1",
         "intent://user@ws/ws-1/agents/agent-1",
         "ext::sh -c id",
+        "intent://ws/ws-1/agents/agent-1/modules/",
+        "intent://ws/ws-1/agents/agent-1/modules/a/b",
+        "intent://ws/ws-1/agents/agent-1/modules/../repo-1",
+        "intent://ws/ws-1/agents/agent-1/modules/.repo",
+        "intent://ws/ws-1/agents/agent-1/module/repo-1",
+        "intent://ws/ws-1/agents/modules/repo-1",
     ] {
         assert!(AgentRemote::parse(url).is_err(), "{url}");
     }
+    let module = remote.with_module("repo-1").unwrap();
+    assert_eq!(
+        module.url(),
+        "intent://ws/ws-1/agents/agent-1/modules/repo-1"
+    );
+    assert_eq!(AgentRemote::parse(&module.url()).unwrap(), module);
+    assert_eq!(module.module_key(), Some("repo-1"));
+    assert_eq!(remote.module_key(), None);
+    assert_eq!(
+        module.ref_name(AgentRef::Base),
+        remote.ref_name(AgentRef::Base)
+    );
+    assert!(remote.with_module("a/b").is_err());
     assert!(GitService::parse("git-upload-archive").is_err());
 }
 

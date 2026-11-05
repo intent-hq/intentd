@@ -137,8 +137,9 @@ fn close_message(session: u32, error: Option<&'static str>) -> Vec<u8> {
 pub trait NodeGitAccess: Send + Sync {
     /// The repository holding `remote`'s refs for `service`, only if
     /// `binding` is the node's current binding and `remote`'s agent runs on
-    /// its lease. An error carrying [`codes::UNAVAILABLE`] closes the session
-    /// with that code; any other refuses it ([`codes::DENIED`]).
+    /// its lease. An error carrying [`codes::UNAVAILABLE`] or [`codes::INVALID`]
+    /// closes the session with that code; any other refuses it
+    /// ([`codes::DENIED`]).
     fn repository<'a>(
         &'a self,
         binding: &'a LeaseBinding,
@@ -234,13 +235,14 @@ async fn head_session(
     id
 }
 
-/// The session code for an access refusal: [`codes::UNAVAILABLE`] when the
-/// error says so, [`codes::DENIED`] otherwise.
+/// The session code for an access refusal: [`codes::UNAVAILABLE`] or
+/// [`codes::INVALID`] when the error says so, [`codes::DENIED`] otherwise.
 fn access_code(error: &intent_core::Error) -> &'static str {
     match error {
         intent_core::Error::Internal(message) if message.starts_with(codes::UNAVAILABLE) => {
             codes::UNAVAILABLE
         }
+        intent_core::Error::InvalidParams(message) if message == codes::INVALID => codes::INVALID,
         _ => codes::DENIED,
     }
 }

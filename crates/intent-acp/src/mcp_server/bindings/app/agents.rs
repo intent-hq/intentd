@@ -804,6 +804,7 @@ mod tests {
             placement: None,
             effective_isolation: None,
             placement_error: None,
+            submodules: None,
             id: AgentId::from_string(id),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,

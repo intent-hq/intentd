@@ -913,6 +913,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         placement: None,
         effective_isolation: None,
         placement_error: None,
+        submodules: None,
         id: AgentId::from_string(id),
         workspace_id: WorkspaceId::from_string("ws-1"),
         parent_agent_id: None,

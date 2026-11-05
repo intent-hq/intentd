@@ -91,6 +91,7 @@ fn launch(id: &str) -> LinkFrame {
         profile_env: None,
         agent_features: serde_json::json!({}),
         is_sub_agent: false,
+        checkout: None,
     })
 }
 

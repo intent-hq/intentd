@@ -1353,7 +1353,7 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
     /// [`Self::admit`] for an agent whose workspace does not exist yet
     /// (`workspace.create`'s initial agent): the same checks and machine
     /// choice, before anything is created, with an empty `base_commit` that
-    /// [`Self::base_commit`] fills once the workspace commits. Refuses as a
+    /// [`Self::checkout_base`] fills once the workspace commits. Refuses as a
     /// daemon without machines by default.
     ///
     /// # Errors
@@ -1373,18 +1373,18 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         })
     }
 
-    /// The commit a remote agent of `workspace_id` starts from: its
-    /// checkout's `HEAD`.
+    /// What a remote agent of `workspace_id` starts from: its checkout's
+    /// `HEAD` and the commits of its populated submodules.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidParams`] for a workspace without a git repository;
     /// [`Error::Unsupported`] by default.
-    fn base_commit<'a>(
+    fn checkout_base<'a>(
         &'a self,
         svc: &'a Services,
         workspace_id: &'a WorkspaceId,
-    ) -> BoxFuture<'a, Result<String>> {
+    ) -> BoxFuture<'a, Result<intent_core::remote_launch::RemoteCheckoutBase>> {
         let _ = (svc, workspace_id);
         Box::pin(async { Err(no_execution_node()) })
     }

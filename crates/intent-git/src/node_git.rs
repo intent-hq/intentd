@@ -18,6 +18,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use intent_core::node_link::SubmodulePin;
 use intent_core::{Error, Result};
 use tokio::process::Command;
 
@@ -83,12 +84,16 @@ static HOOKS_DIR: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(No
 const WIP_NAME: &str = "Intent";
 const WIP_EMAIL: &str = "noreply@intent.invalid";
 
-/// One agent's refs as a git remote.
+/// One agent's refs as a git remote: in the workspace's repository, or
+/// with a module key in one of its submodules' repositories.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentRemote {
     workspace_id: String,
     agent_id: String,
+    module_key: Option<String>,
 }
+
+const MODULES: &str = "/modules/";
 
 fn invalid_remote() -> Error {
     Error::InvalidParams("node-git-invalid-remote".into())
@@ -105,10 +110,26 @@ impl AgentRemote {
         Ok(Self {
             workspace_id: workspace_id.into(),
             agent_id: agent_id.into(),
+            module_key: None,
         })
     }
 
-    /// Parse the canonical `intent://ws/<wsId>/agents/<agentId>` URL.
+    /// The same agent's remote in the submodule repository `module_key`
+    /// names.
+    ///
+    /// # Errors
+    ///
+    /// `node-git-invalid-remote` when the key is not a safe ref component.
+    pub fn with_module(&self, module_key: &str) -> Result<Self> {
+        hub::component(module_key).map_err(|_| invalid_remote())?;
+        Ok(Self {
+            module_key: Some(module_key.into()),
+            ..self.clone()
+        })
+    }
+
+    /// Parse the canonical `intent://ws/<wsId>/agents/<agentId>` URL, or
+    /// `…/modules/<moduleKey>` for a submodule.
     ///
     /// # Errors
     ///
@@ -116,7 +137,10 @@ impl AgentRemote {
     pub fn parse(url: &str) -> Result<Self> {
         let rest = url.strip_prefix(URL_PREFIX).ok_or_else(invalid_remote)?;
         let (workspace, agent) = rest.split_once("/agents/").ok_or_else(invalid_remote)?;
-        let remote = Self::new(workspace, agent)?;
+        let remote = match agent.split_once(MODULES) {
+            Some((agent, module_key)) => Self::new(workspace, agent)?.with_module(module_key)?,
+            None => Self::new(workspace, agent)?,
+        };
         if remote.url() != url {
             return Err(invalid_remote());
         }
@@ -125,7 +149,18 @@ impl AgentRemote {
 
     #[must_use]
     pub fn url(&self) -> String {
-        format!("{URL_PREFIX}{}/agents/{}", self.workspace_id, self.agent_id)
+        let url = format!("{URL_PREFIX}{}/agents/{}", self.workspace_id, self.agent_id);
+        match &self.module_key {
+            Some(key) => format!("{url}{MODULES}{key}"),
+            None => url,
+        }
+    }
+
+    /// The submodule repository this remote names; `None` for the
+    /// workspace's own.
+    #[must_use]
+    pub fn module_key(&self) -> Option<&str> {
+        self.module_key.as_deref()
     }
 
     #[must_use]
@@ -400,9 +435,13 @@ pub fn head_commit(repository: &Path) -> Result<String> {
 ///
 /// When the repository can't be opened.
 pub fn repo_key(repository: &Path) -> Result<String> {
+    let repo = git2::Repository::open(repository).map_err(crate::map_git_err)?;
+    key_of(&repo)
+}
+
+fn key_of(repo: &git2::Repository) -> Result<String> {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
-    let repo = git2::Repository::open(repository).map_err(crate::map_git_err)?;
     let common = repo
         .commondir()
         .canonicalize()
@@ -431,6 +470,167 @@ pub fn write_base_ref(repository: &Path, remote: &AgentRemote, commit: git2::Oid
     )
     .map_err(crate::map_git_err)?;
     Ok(())
+}
+
+const GITLINK_MODE: u32 = 0o160_000;
+
+/// The `/`-separated components of a submodule path relative to its
+/// superproject, or `None` when it is empty, absolute, or has `.`, `..` or
+/// empty components.
+fn module_components(path: &str) -> Option<Vec<&str>> {
+    let parts: Vec<&str> = path.split('/').collect();
+    let valid = parts
+        .iter()
+        .all(|part| !part.is_empty() && *part != "." && *part != ".." && !part.contains('\\'));
+    valid.then_some(parts)
+}
+
+/// Whether `rel` is a gitlink in `repo`'s index or `HEAD` tree.
+fn is_gitlink(repo: &git2::Repository, rel: &str) -> bool {
+    let path = Path::new(rel);
+    let in_index = repo
+        .index()
+        .ok()
+        .and_then(|index| index.get_path(path, 0))
+        .is_some_and(|entry| entry.mode == GITLINK_MODE);
+    in_index
+        || repo
+            .head()
+            .and_then(|head| head.peel_to_tree())
+            .and_then(|tree| tree.get_path(path))
+            .is_ok_and(|entry| u32::try_from(entry.filemode()).ok() == Some(GITLINK_MODE))
+}
+
+/// The populated submodule repository checked out at `dir`: one with its
+/// own `.git` there, whose work tree is `dir` itself.
+fn open_populated(dir: &Path) -> Option<git2::Repository> {
+    std::fs::symlink_metadata(dir.join(".git")).ok()?;
+    let repo = git2::Repository::open(dir).ok()?;
+    let workdir = repo.workdir()?.canonicalize().ok()?;
+    (workdir == dir.canonicalize().ok()?).then_some(repo)
+}
+
+/// Head side, when an agent is placed: every submodule populated in
+/// `checkout` (it has its own `.git` and a commit checked out), recursively,
+/// parents before children, at the commit its `HEAD` has checked out.
+/// Unpopulated submodules are skipped, whatever `.gitmodules` says.
+///
+/// # Errors
+///
+/// When the checkout can't be opened.
+pub fn submodule_pins(checkout: &Path) -> Result<Vec<SubmodulePin>> {
+    let repo = git2::Repository::open(checkout).map_err(crate::map_git_err)?;
+    let mut pins = Vec::new();
+    collect_pins(&repo, "", &mut pins)?;
+    let mut keys = std::collections::HashSet::new();
+    pins.retain(|pin| keys.insert(pin.module_key.clone()));
+    Ok(pins)
+}
+
+fn collect_pins(repo: &git2::Repository, prefix: &str, pins: &mut Vec<SubmodulePin>) -> Result<()> {
+    let Some(workdir) = repo.workdir() else {
+        return Ok(());
+    };
+    // An unreadable `.gitmodules` carries nothing rather than blocking
+    // every remote agent of the workspace.
+    let Ok(mut submodules) = repo.submodules() else {
+        return Ok(());
+    };
+    submodules.sort_by(|a, b| a.path().cmp(b.path()));
+    for submodule in submodules {
+        let Some(rel) = submodule.path().to_str() else {
+            continue;
+        };
+        let path = format!("{prefix}{rel}");
+        if module_components(&path).is_none() || !is_gitlink(repo, rel) {
+            continue;
+        }
+        let dir = workdir.join(rel);
+        if std::fs::symlink_metadata(&dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            continue;
+        }
+        let Some(module) = open_populated(&dir) else {
+            continue;
+        };
+        let Ok(commit) = module.head().and_then(|head| head.peel_to_commit()) else {
+            continue;
+        };
+        pins.push(SubmodulePin {
+            path: path.clone(),
+            name: submodule.name().unwrap_or(rel).to_owned(),
+            commit: commit.id().to_string(),
+            module_key: key_of(&module)?,
+        });
+        collect_pins(&module, &format!("{path}/"), pins)?;
+    }
+    Ok(())
+}
+
+/// Why head will not serve a submodule repository for a module session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleRefusal {
+    /// The path is not a submodule of the checkout (no gitlink, a symlink,
+    /// outside it), or its repository is not the pinned one.
+    Denied,
+    /// The submodule is not populated in the checkout any more.
+    Unavailable(String),
+}
+
+/// A submodule repository head serves a module session from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleRepository {
+    /// The submodule's work tree in the checkout.
+    pub worktree: PathBuf,
+    /// Its repository's common git directory, which holds its refs.
+    pub git_dir: PathBuf,
+}
+
+/// Head side: the populated submodule at `path` of `checkout`, only when
+/// every step of `path` is a gitlink of its parent repository, no step is a
+/// symlink, and its repository's key is `module_key`.
+///
+/// # Errors
+///
+/// [`ModuleRefusal::Denied`] or [`ModuleRefusal::Unavailable`].
+pub fn module_repository(
+    checkout: &Path,
+    path: &str,
+    module_key: &str,
+) -> std::result::Result<ModuleRepository, ModuleRefusal> {
+    let parts = module_components(path).ok_or(ModuleRefusal::Denied)?;
+    let unavailable = |what: &str| ModuleRefusal::Unavailable(format!("{path}: {what}"));
+    let root = checkout
+        .canonicalize()
+        .map_err(|_| unavailable("the checkout is gone"))?;
+    let mut repo = git2::Repository::open(&root).map_err(|_| unavailable("no repository"))?;
+    let mut dir = root.clone();
+    let mut start = 0;
+    while start < parts.len() {
+        let end = (start + 1..=parts.len())
+            .find(|&end| is_gitlink(&repo, &parts[start..end].join("/")))
+            .ok_or(ModuleRefusal::Denied)?;
+        for part in &parts[start..end] {
+            dir.push(part);
+            match std::fs::symlink_metadata(&dir) {
+                Ok(meta) if meta.file_type().is_symlink() => return Err(ModuleRefusal::Denied),
+                Ok(meta) if meta.is_dir() => {}
+                _ => return Err(unavailable("not populated")),
+            }
+        }
+        repo = open_populated(&dir).ok_or_else(|| unavailable("not populated"))?;
+        start = end;
+    }
+    if key_of(&repo).ok().as_deref() != Some(module_key) {
+        return Err(ModuleRefusal::Denied);
+    }
+    let git_dir = repo
+        .commondir()
+        .canonicalize()
+        .map_err(|_| unavailable("its repository is gone"))?;
+    Ok(ModuleRepository {
+        worktree: dir,
+        git_dir,
+    })
 }
 
 /// Node side: how the node's git commands reach head.

@@ -457,6 +457,7 @@ fn launch_of(id: &str, provider: &str) -> LinkFrame {
         profile_env: None,
         agent_features: serde_json::json!({}),
         is_sub_agent: false,
+        checkout: None,
     })
 }
 
@@ -750,6 +751,7 @@ async fn executor_shutdown_settles_launches_arriving_on_a_live_link() {
             profile_env: None,
             agent_features: serde_json::json!({}),
             is_sub_agent: false,
+            checkout: None,
         })
     };
     dialed.link.send(&launch("a0".into())).await.unwrap();

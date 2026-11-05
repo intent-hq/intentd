@@ -96,6 +96,19 @@ pub struct RemoteFinalStopRecord {
     /// the push lands even after the worktree is removed.
     pub repo_path: String,
     pub requested_at: String,
+    /// The agent's submodule pins with their repositories, so its last
+    /// module pushes land too.
+    pub submodules: Vec<FinalStopSubmodule>,
+}
+
+/// A pinned submodule repository a final push may land in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalStopSubmodule {
+    pub path: String,
+    pub module_key: String,
+    /// The submodule repository's git dir when the record was written.
+    pub git_dir: String,
 }
 
 /// How long head keeps an unacknowledged final stop before it drops the
@@ -222,9 +235,21 @@ pub struct RemotePlacementView {
     pub placement_error: Option<PlacementError>,
     /// The commit the agent starts from (its `base` ref).
     pub base_commit: String,
+    /// The submodules populated in the workspace's checkout when the agent
+    /// was placed, each with its module `base` ref. They name the only
+    /// submodule repositories its machine may reach. `None` for an agent
+    /// placed before pins were captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submodules: Option<Vec<crate::node_link::SubmodulePin>>,
 }
 
 impl RemotePlacementView {
+    /// The agent's submodule pins; empty when it has none.
+    #[must_use]
+    pub fn pins(&self) -> &[crate::node_link::SubmodulePin] {
+        self.submodules.as_deref().unwrap_or_default()
+    }
+
     /// Read the view from a session's `metadata`, if it carries one.
     #[must_use]
     pub fn from_metadata(metadata: Option<&serde_json::Value>) -> Option<Self> {
@@ -233,14 +258,38 @@ impl RemotePlacementView {
     }
 }
 
+/// A placed agent's submodule pin as the agent projection shows it
+/// (detail reads only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSubmodulePin {
+    /// From the superproject root.
+    pub path: String,
+    pub commit: String,
+}
+
+/// What a remote agent starts from, captured together when it is placed:
+/// the checkout's `HEAD` commit and its populated submodules' commits.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteCheckoutBase {
+    pub commit: String,
+    pub submodules: Vec<crate::node_link::SubmodulePin>,
+}
+
 /// The message a remote launch reports to its caller: what the agent starts
-/// from. Uncommitted changes in the workspace stay on head.
+/// from. Uncommitted changes in the workspace (and, with `submodules`,
+/// in its submodules) stay on head.
 #[must_use]
-pub fn launch_notice(node_name: &str, base_commit: &str) -> String {
+pub fn launch_notice(node_name: &str, base_commit: &str, submodules: bool) -> String {
     let short = base_commit.get(..12).unwrap_or(base_commit);
-    format!(
+    let notice = format!(
         "The agent runs on execution node \"{node_name}\" and starts from commit {short} (the workspace's last commit). Uncommitted changes in the workspace are not carried to the remote agent; commit them first if it needs them."
-    )
+    );
+    if submodules && crate::node_link::offers_prepared_checkout() {
+        format!("{notice} Its submodules start from the commits checked out in the workspace; uncommitted changes inside them are not carried either.")
+    } else {
+        notice
+    }
 }
 
 #[cfg(test)]

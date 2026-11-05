@@ -41,6 +41,7 @@ fn view(placement: &AgentPlacement) -> RemotePlacementView {
         effective_isolation: EffectiveIsolation::Pending,
         placement_error: None,
         base_commit: BASE.into(),
+        submodules: None,
     }
 }
 

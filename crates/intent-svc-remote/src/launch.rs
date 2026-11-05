@@ -11,7 +11,7 @@
 //! another account. Only environment values are sent: login files stay on
 //! the node.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use intent_core::machine_selection::{
@@ -19,22 +19,25 @@ use intent_core::machine_selection::{
 };
 use intent_core::machines::ExposedMachine;
 use intent_core::node_link::MachineCapabilities;
-use intent_core::node_link::{LaunchCommand, LaunchProfileEnv};
+use intent_core::node_link::{
+    LaunchCommand, LaunchProfileEnv, PreparedCheckout, SubmodulePin, PREPARED_CHECKOUT_PROTOCOL,
+};
 use intent_core::placement::{
     AgentPlacement, MachineRef, PlacementCheckout, PlacementTarget, PlacementUnavailable,
     PlacementUnavailableReason, PlatformAvailability,
 };
 use intent_core::remote_launch::{
-    EffectiveIsolation, RemoteAgentRecord, RemoteLaunchNeeds, RemoteLaunchRequest,
-    RemotePlacementView,
+    EffectiveIsolation, RemoteAgentRecord, RemoteCheckoutBase, RemoteLaunchNeeds,
+    RemoteLaunchRequest, RemotePlacementView,
 };
 use intent_core::{AgentId, BoxFuture, Error, Result, Workspace, WorkspaceId};
 use intent_git::node_git::{self, AgentRemote};
 use intent_services::feature_api::feature_ports::{RemoteLaunchPort, RemoteRuntime};
 use intent_services::feature_api::Services;
 
-use intent_core::machines::RemoteMachineState;
+use intent_core::machines::{MachineUpdateRequired, RemoteMachineState};
 
+use crate::connector::RemoteNode;
 use crate::RemoteServicesExt as _;
 
 /// The remote-launch port of the feature. With no exposed machine it
@@ -51,6 +54,25 @@ pub(crate) fn checkout_path(workspace: &Workspace) -> Option<PathBuf> {
         .or(workspace.repository_path.as_ref())
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
+}
+
+/// Point the agent's `base` ref in submodule `pin`'s repository at its
+/// pinned commit, after checking it is still that submodule of `checkout`.
+fn write_module_base_ref(checkout: &Path, remote: &AgentRemote, pin: &SubmodulePin) -> Result<()> {
+    let module =
+        node_git::module_repository(checkout, &pin.path, &pin.module_key).map_err(|refusal| {
+            Error::Internal(format!(
+                "remote launch: submodule {} is not the pinned repository: {refusal:?}",
+                pin.path
+            ))
+        })?;
+    let commit = git2::Oid::from_str(&pin.commit).map_err(|_| {
+        Error::Internal(format!(
+            "remote launch: invalid commit for submodule {}",
+            pin.path
+        ))
+    })?;
+    node_git::write_base_ref(&module.worktree, remote, commit)
 }
 
 fn unavailable(placement: &AgentPlacement, availability: PlatformAvailability) -> Error {
@@ -70,6 +92,104 @@ async fn workspace_checkout(svc: &Services, workspace_id: &WorkspaceId) -> Resul
             "remote agents need a workspace with a git repository to start from".into(),
         )
     })
+}
+
+/// Whether `workspace`'s agents start from a checkout a machine must
+/// prepare: populated submodules, or a setup script (resolved as a local
+/// create resolves it, without the create's execute-only parameter).
+async fn needs_prepared_checkout(workspace: &Workspace, submodules: &[SubmodulePin]) -> bool {
+    if !submodules.is_empty() {
+        return true;
+    }
+    if workspace.skip_worktree || workspace.plain_folder {
+        return false;
+    }
+    let Some(checkout) = checkout_path(workspace) else {
+        return false;
+    };
+    let config = intent_services::feature_api::repo_config::read_repo_config(&checkout).await;
+    config.setup_script.is_some_and(|script| !script.is_empty())
+        || workspace
+            .setup_script
+            .as_ref()
+            .is_some_and(|setup| !setup.script.is_empty())
+}
+
+/// The protocol of `node`'s link, connecting first when none is up.
+async fn link_protocol(node: &RemoteNode) -> Result<u32> {
+    if node.shared_ref().current_link().is_none() {
+        node.connect().await?;
+    }
+    Ok(node.shared_ref().protocol())
+}
+
+/// Refuse a checkout that needs preparing on a machine whose link is older
+/// than [`PREPARED_CHECKOUT_PROTOCOL`]: it would start the agent with empty
+/// submodules and without the setup script.
+/// Nothing is refused while this build does not offer the prepared checkout.
+fn require_prepared_checkout(node: &RemoteNode, protocol: u32) -> Result<()> {
+    if protocol >= PREPARED_CHECKOUT_PROTOCOL || !node.shared_ref().offers_prepared_checkout() {
+        return Ok(());
+    }
+    let status = node.status();
+    Err(Error::MachineUpdateRequired(Box::new(
+        MachineUpdateRequired::prepared_checkout(
+            status.node_name,
+            status
+                .intentd_version
+                .unwrap_or_else(|| "an older version".into()),
+        ),
+    )))
+}
+
+/// [`require_prepared_checkout`] for an agent of `workspace_id` placed with
+/// `view`, when its checkout needs preparing.
+async fn check_machine_prepares(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    view: &RemotePlacementView,
+) -> Result<()> {
+    let feature = svc.remote_feature().ok_or_else(no_node)?;
+    let node = feature.node(svc, &view.node_id).await?;
+    if !node.shared_ref().offers_prepared_checkout() {
+        return Ok(());
+    }
+    let workspace = svc.store().get_workspace(workspace_id).await?;
+    if !needs_prepared_checkout(&workspace, view.pins()).await {
+        return Ok(());
+    }
+    require_prepared_checkout(&node, link_protocol(&node).await?)
+}
+
+/// Record a start refused for `error` as the agent's `placementError`.
+async fn record_refused_start(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+    error: &Error,
+) {
+    let detail = match error {
+        Error::MachineUpdateRequired(update) => update.message(),
+        other => other.to_string(),
+    };
+    let placement_error = intent_core::remote_launch::PlacementError::new(
+        intent_core::machines::MACHINE_UPDATE_REQUIRED_CODE,
+        &detail,
+    );
+    match crate::view::update(svc.store(), workspace_id, agent_id, |view| {
+        view.placement_error = Some(placement_error);
+    })
+    .await
+    {
+        Ok(true) => {
+            svc.publish_agent_placement_changed(workspace_id, agent_id)
+                .await;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(agent = %agent_id, %error, "remote launch: could not record the refused start");
+        }
+    }
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
@@ -248,7 +368,10 @@ impl RemoteLaunchPort for RemoteLaunch {
     ) -> BoxFuture<'a, Result<RemotePlacementView>> {
         Box::pin(async move {
             let mut view = self.admit_new_workspace(svc, placement, needs).await?;
-            view.base_commit = self.base_commit(svc, workspace_id).await?;
+            let base = self.checkout_base(svc, workspace_id).await?;
+            view.base_commit = base.commit;
+            view.submodules = Some(base.submodules);
+            check_machine_prepares(svc, workspace_id, &view).await?;
             Ok(view)
         })
     }
@@ -310,18 +433,25 @@ impl RemoteLaunchPort for RemoteLaunch {
                 effective_isolation: EffectiveIsolation::Pending,
                 placement_error: None,
                 base_commit: String::new(),
+                submodules: None,
             })
         })
     }
 
-    fn base_commit<'a>(
+    fn checkout_base<'a>(
         &'a self,
         svc: &'a Services,
         workspace_id: &'a WorkspaceId,
-    ) -> BoxFuture<'a, Result<String>> {
+    ) -> BoxFuture<'a, Result<RemoteCheckoutBase>> {
         Box::pin(async move {
             let checkout = workspace_checkout(svc, workspace_id).await?;
-            blocking(move || node_git::head_commit(&checkout)).await
+            blocking(move || {
+                Ok(RemoteCheckoutBase {
+                    commit: node_git::head_commit(&checkout)?,
+                    submodules: node_git::submodule_pins(&checkout)?,
+                })
+            })
+            .await
         })
     }
 
@@ -340,11 +470,20 @@ impl RemoteLaunchPort for RemoteLaunch {
                 agent_id,
                 view,
             } = request;
+            check_machine_prepares(svc, &workspace_id, &view).await?;
             let checkout = workspace_checkout(svc, &workspace_id).await?;
             let remote = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
             let commit = git2::Oid::from_str(&view.base_commit)
                 .map_err(|_| Error::Internal("remote launch: invalid base commit".into()))?;
-            blocking(move || node_git::write_base_ref(&checkout, &remote, commit)).await?;
+            let submodules = view.pins().to_vec();
+            blocking(move || {
+                node_git::write_base_ref(&checkout, &remote, commit)?;
+                for pin in &submodules {
+                    write_module_base_ref(&checkout, &remote, pin)?;
+                }
+                Ok(())
+            })
+            .await?;
             svc.store()
                 .record_remote_agent(&RemoteAgentRecord {
                     agent_id,
@@ -475,8 +614,32 @@ impl RemoteLaunchPort for RemoteLaunch {
             let agent_features = serde_json::to_value(svc.session_agent_features(&session))
                 .map_err(|e| Error::Internal(format!("encode the agent's features: {e}")))?;
             let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
-            let checkout = workspace_checkout(svc, &record.workspace_id).await?;
-            let repo_key = blocking(move || node_git::repo_key(&checkout)).await?;
+            // A prepared agent (its pins captured, possibly none) gets
+            // `checkout` on every protocol 10 launch, and never starts below
+            // 10 when its workspace needs a prepared checkout. An agent
+            // placed before pins were captured, or any agent while this
+            // build does not offer the prepared checkout, starts as before.
+            let checkout =
+                if view.submodules.is_some() && node.shared_ref().offers_prepared_checkout() {
+                    let protocol = link_protocol(&node).await?;
+                    let workspace = svc.store().get_workspace(&record.workspace_id).await?;
+                    if needs_prepared_checkout(&workspace, view.pins()).await {
+                        if let Err(error) = require_prepared_checkout(&node, protocol) {
+                            record_refused_start(svc, &record.workspace_id, agent_id, &error).await;
+                            return Err(error);
+                        }
+                    }
+                    (protocol >= PREPARED_CHECKOUT_PROTOCOL).then(|| {
+                        Box::new(PreparedCheckout {
+                            submodules: view.pins().to_vec(),
+                            setup: None,
+                        })
+                    })
+                } else {
+                    None
+                };
+            let checkout_dir = workspace_checkout(svc, &record.workspace_id).await?;
+            let repo_key = blocking(move || node_git::repo_key(&checkout_dir)).await?;
             let runtime = node
                 .launch(LaunchCommand {
                     agent_id: agent_id.clone(),
@@ -488,6 +651,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     profile_env,
                     agent_features,
                     is_sub_agent,
+                    checkout,
                 })
                 .await?;
             Ok(runtime as Arc<RemoteRuntime>)

@@ -318,5 +318,6 @@ fn update_required(
         backend_version: env!("CARGO_PKG_VERSION").to_owned(),
         update,
         hint: None,
+        reason: None,
     }
 }

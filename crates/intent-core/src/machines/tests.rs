@@ -121,6 +121,7 @@ fn machine_update_required_tells_which_side_to_update() {
         backend_version: "0.12.0".into(),
         update: UpdateSide::Machine,
         hint: None,
+        reason: None,
     };
     assert_eq!(
         machine.message(),
@@ -141,6 +142,7 @@ fn machine_update_required_tells_which_side_to_update() {
         backend_version: "0.12.0".into(),
         update: UpdateSide::Backend,
         hint: None,
+        reason: None,
     };
     assert_eq!(
         backend.message(),
@@ -161,6 +163,7 @@ fn both_errors_are_invalid_params_with_typed_text_for_mcp() {
         backend_version: "2".into(),
         update: UpdateSide::Machine,
         hint: None,
+        reason: None,
     }));
     assert_eq!(update.code(), -32602);
     let text = update.to_string();
@@ -227,6 +230,7 @@ fn a_hint_extends_admission_messages_only() {
         backend_version: "2".into(),
         update: UpdateSide::Machine,
         hint: None,
+        reason: None,
     };
     let (message, data) = (update.message(), update.data());
     let Error::MachineUpdateRequired(hinted) =
@@ -248,4 +252,15 @@ fn a_hint_extends_admission_messages_only() {
     assert!(matches!(&invalid, Error::InvalidParams(m) if *m == format!("bad {hint}")));
     let internal = Error::Internal("boom".into()).with_hint(hint);
     assert!(matches!(&internal, Error::Internal(m) if m == "boom"));
+}
+
+#[test]
+fn a_prepared_checkout_refusal_names_the_reason() {
+    let update = MachineUpdateRequired::prepared_checkout("mac-mini".into(), "0.11.0".into());
+    assert_eq!(
+        update.message(),
+        "Update Intent on mac-mini to run agents for this workspace: it has submodules or a setup script."
+    );
+    assert_eq!(update.data()["reason"], "prepared-checkout");
+    assert_eq!(update.data()["update"], "machine");
 }

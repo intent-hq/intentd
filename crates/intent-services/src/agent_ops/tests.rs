@@ -10589,6 +10589,7 @@ async fn worst_case_agent_list_row(
             &format!("node-checkout-failed: {}", "e".repeat(4096)),
         )),
         base_commit: "0".repeat(40),
+        submodules: None,
     };
     svc.store()
         .set_agent_session_metadata_key_json(

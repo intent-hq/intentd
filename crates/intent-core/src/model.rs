@@ -5235,6 +5235,10 @@ pub struct AgentLite {
     /// Why the remote agent could not start on its node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_error: Option<crate::remote_launch::PlacementError>,
+    /// The submodule pins a remote agent was placed with, parents first.
+    /// Detail-only; omitted for local agents and agents placed before pins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submodules: Option<Vec<crate::remote_launch::RemoteSubmodulePin>>,
     pub metadata: AgentMetadata,
 }
 
@@ -5353,6 +5357,19 @@ impl AgentLite {
             node_name: remote.as_ref().map(|r| r.node_name.clone()),
             placement: remote.as_ref().map(|r| r.placement.clone()),
             effective_isolation: remote.as_ref().map(|r| r.effective_isolation),
+            submodules: remote
+                .as_ref()
+                .filter(|_| crate::node_link::offers_prepared_checkout())
+                .and_then(|r| {
+                    r.submodules.as_ref().map(|pins| {
+                        pins.iter()
+                            .map(|pin| crate::remote_launch::RemoteSubmodulePin {
+                                path: pin.path.clone(),
+                                commit: pin.commit.clone(),
+                            })
+                            .collect()
+                    })
+                }),
             placement_error: remote.and_then(|r| r.placement_error),
             metadata,
         }
@@ -5380,6 +5397,7 @@ impl AgentLite {
     pub fn strip_detail_only_fields(&mut self) {
         self.harness_features = None;
         self.lease_id = None;
+        self.submodules = None;
         self.effort_levels = None;
         self.context_references = None;
         self.file_blocks = None;
