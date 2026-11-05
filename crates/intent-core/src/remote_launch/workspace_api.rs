@@ -272,6 +272,41 @@ mod tests {
         }
     }
 
+    /// S3 of the remote-agent parity design: hooks, structured questions,
+    /// the browser and the desktop run on head as the agent (hooks on head's
+    /// runtime, the browser and desktop on the user's client), with no
+    /// protocol gate. The rest of `ws.app.*` stays refused.
+    #[test]
+    fn hooks_questions_browser_and_desktop_are_forwarded_to_head() {
+        for method in [
+            "hook.schedule",
+            "hook.list",
+            "hook.get",
+            "hook.cancel",
+            "hook.runNow",
+            "app.question.ask",
+            "browser.exec",
+            "browser.listTabs",
+            "browser.clients",
+            "browser.docs",
+            "desktop.startControl",
+            "desktop.endControl",
+            "desktop.listDisplay",
+            "desktop.screenshot",
+            "desktop.click",
+        ] {
+            assert_eq!(route(method), Route::Forward, "{method}");
+            assert_eq!(
+                forward_min_protocol(method),
+                crate::node_link::NODE_LINK_PROTOCOLS.min,
+                "{method}"
+            );
+        }
+        for method in ["app.question.list", "app.question", "app.agents.list"] {
+            assert_eq!(route(method), Route::Unsupported, "{method}");
+        }
+    }
+
     /// The machine's internal frames ride `workspace.call` but agent code
     /// cannot send them, even when their namespace is forwarded.
     #[test]
@@ -290,7 +325,7 @@ mod tests {
     /// `app.*` and secondary git roots say why they are refused.
     #[test]
     fn app_and_git_root_refusals_explain_why() {
-        for method in ["app.agents.list", "app.question.ask"] {
+        for method in ["app.agents.list", "app.workspaces.list"] {
             assert_eq!(route(method), Route::Unsupported, "{method}");
             assert_eq!(
                 unsupported_message(method),
@@ -328,10 +363,8 @@ mod tests {
     #[test]
     fn everything_else_is_refused_by_name() {
         for method in [
-            "browser.exec",
-            "hook.schedule",
-            "desktop.screenshot",
             "mcp.listTools",
+            "secret.request",
             "search.query",
             "file.getAttachment",
             COMMIT_POLICY_METHOD,
@@ -342,19 +375,23 @@ mod tests {
         ] {
             assert_eq!(route(method), Route::Unsupported, "{method:?}");
         }
-        let message = unsupported_message("hook.list");
+        let message = unsupported_message("mcp.listTools");
         assert!(
             message.starts_with(
-                "remote-agent-unsupported: `hook.list` is not supported on remote agents yet"
+                "remote-agent-unsupported: `mcp.listTools` is not supported on remote agents yet"
             ),
             "{message}"
         );
-        assert!(message.contains("ws.hook.* is"), "{message}");
+        assert!(message.contains("ws.mcp.* is"), "{message}");
         for forwarded in [
             "ws.script",
             "ws.primitive",
             "ws.discussion",
             "ws.crossWorkspace",
+            "ws.hook",
+            "ws.browser",
+            "ws.desktop",
+            "ws.app.question.ask",
             "ws.git.listRoots",
             "ws.terminal.list",
             "ws.workspace calls (details",

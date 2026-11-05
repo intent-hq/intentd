@@ -976,7 +976,7 @@ async fn node_runner_gives_each_agent_its_workspace_api_on_the_node() {
     );
 
     h.runner
-        .prompt(&id, "t2".into(), text("wsapi return await ws.hook.list();"))
+        .prompt(&id, "t2".into(), text("wsapi return await ws.mcp.listServers();"))
         .await;
     let all = wait_for(&h.runner, "second turn end", turn_ended("w1", "t2")).await;
     let line = wsapi_line(&all, "t2");
