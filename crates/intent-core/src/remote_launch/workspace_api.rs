@@ -36,12 +36,25 @@ pub const ATTACHMENTS_METHOD: &str = "turn.attachments";
 /// head answers `{ "help": string | null }`.
 pub const PLACEMENT_HELP_METHOD: &str = "agent.placementHelp";
 
+/// The frame method the node forwards (never from agent code: the table
+/// refuses it there) for the bytes of an attachment the agent copies with
+/// `ws.file.getAttachment`, which runs on the node. Args `{ attachmentId }`;
+/// head answers `{ fileName, mimeType?, size, uploadedAt, data }` (`data` is
+/// base64) for an attachment of the agent's workspace of at most
+/// [`MAX_LINK_ATTACHMENT_BYTES`].
+pub const ATTACHMENT_DATA_METHOD: &str = "file.attachmentData";
+
+/// Largest attachment [`ATTACHMENT_DATA_METHOD`] carries: its base64 must
+/// fit one response frame ([`crate::node_link::MAX_FRAME_BYTES`]).
+pub const MAX_LINK_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+
 /// The node's own frames to head. They ride [`CALL_METHOD`] but agent code
 /// cannot send them, even when their namespace is forwarded.
 pub const INTERNAL_METHODS: &[&str] = &[
     COMMIT_POLICY_METHOD,
     ATTACHMENTS_METHOD,
     PLACEMENT_HELP_METHOD,
+    ATTACHMENT_DATA_METHOD,
 ];
 
 /// Most cards one [`ATTACHMENTS_METHOD`] frame carries.
@@ -207,6 +220,7 @@ mod tests {
             "file.delete",
             "file.mkdir",
             "file.rename",
+            "file.getAttachment",
             "git.commit",
             "host.exec",
             "help.index",
@@ -376,9 +390,9 @@ mod tests {
             "mcp.listTools",
             "secret.request",
             "search.query",
-            "file.getAttachment",
             COMMIT_POLICY_METHOD,
             ATTACHMENTS_METHOD,
+            ATTACHMENT_DATA_METHOD,
             "note",
             "note.",
             "",
@@ -409,6 +423,5 @@ mod tests {
         ] {
             assert!(message.contains(forwarded), "{forwarded}: {message}");
         }
-        assert!(unsupported_message("file.getAttachment").contains("attachments are"));
     }
 }

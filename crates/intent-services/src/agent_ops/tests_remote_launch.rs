@@ -836,11 +836,11 @@ async fn a_remote_agent_on_a_removed_machine_cannot_switch() {
     assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
 }
 
-/// Attachments live on head and a remote agent's provider runs on its node,
-/// so a message carrying any is refused before it is stored or queued; the
-/// same message without attachments is accepted.
+/// Remote parity S6: a message with image or file attachments to a remote
+/// agent is accepted and stored like a local agent's (images ride the
+/// prompt, files are fetched by `ws.file.getAttachment` on the machine).
 #[tokio::test]
-async fn a_message_with_attachments_to_a_remote_agent_is_refused() {
+async fn a_message_with_attachments_to_a_remote_agent_is_accepted() {
     let (_t, svc, ws) = setup().await;
     let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
     let created = create(
@@ -858,21 +858,11 @@ async fn a_message_with_attachments_to_a_remote_agent_is_refused() {
     let images = json!([{ "data": "aGVsbG8=", "mimeType": "image/png" }]);
     let files = json!([{ "attachmentId": "att-1", "fileName": "notes.txt" }]);
     for (images, files) in [(Some(images.clone()), None), (None, Some(files.clone()))] {
-        let result = svc
-            .agent_send_message_op(id.clone(), "look".into(), None, images, files, None)
-            .await;
-        assert!(
-            matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("remote-agent-unsupported: attachments")),
-            "{result:?}"
-        );
+        svc.agent_send_message_op(id.clone(), "look".into(), None, images, files, None)
+            .await
+            .unwrap();
     }
-    assert_eq!(
-        svc.store.get_agent_messages(&id, None).await.unwrap().len(),
-        before
-    );
-    svc.agent_send_message_op(id.clone(), "look".into(), None, Some(json!([])), None, None)
-        .await
-        .unwrap();
+    assert!(svc.store.get_agent_messages(&id, None).await.unwrap().len() > before);
 }
 
 /// The `"default"` model sentinel asks the machines for no particular

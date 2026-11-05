@@ -1697,6 +1697,47 @@ fn the_redactor_masks_a_secret_placed_in_an_enum_position() {
 /// A final stop (nodeProtocol 9) stops the agent, makes its exit push the
 /// final one (bounded by the final-push timeout) and only then removes its
 /// checkout; its acknowledgement reports the push.
+/// Remote parity S6: each remote agent gets a private, owner-only temp
+/// folder beside its checkout as `TMPDIR` / `TMP` / `TEMP`, over the inherited
+/// value, and the folder is removed with the checkout.
+#[tokio::test]
+async fn node_runner_gives_each_agent_a_private_tmpdir_removed_with_its_checkout() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(h) = harness(2, &["--dump-env"]) else {
+        return;
+    };
+    h.runner.launch(launch("a1")).await;
+    h.runner.launch(launch("a2")).await;
+    let mut tmps = Vec::new();
+    for id in ["a1", "a2"] {
+        let env = agent_env(&h.storage, id).await;
+        let checkout = h.storage.agent_dir(&AgentId::from(id)).unwrap();
+        let expected = checkout.parent().unwrap().join("tmp");
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            assert_eq!(
+                env.get(key).and_then(Value::as_str),
+                Some(expected.to_string_lossy().as_ref()),
+                "{id} {key}"
+            );
+        }
+        let mode = std::fs::metadata(&expected).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{id}: {mode:o}");
+        tmps.push(expected);
+    }
+    assert_ne!(tmps[0], tmps[1]);
+    std::fs::write(tmps[0].join("scratch.txt"), "x").unwrap();
+
+    let id = AgentId::from("a1");
+    wait_for(&h.runner, "started", started("a1")).await;
+    tokio::time::timeout(wait(), h.runner.final_stop(&id))
+        .await
+        .unwrap();
+    assert!(!tmps[0].exists(), "the temp folder goes with the checkout");
+    assert!(tmps[1].is_dir(), "another agent's folder stays");
+    h.runner.stop(&AgentId::from("a2"));
+    wait_for(&h.runner, "exit", exited("a2")).await;
+}
+
 #[tokio::test]
 async fn node_runner_final_stop_pushes_within_its_bound_then_removes_the_checkout() {
     use crate::executor::checkout::FINAL_PUSH_TIMEOUT;
