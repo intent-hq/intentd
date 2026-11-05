@@ -22,13 +22,17 @@ impl Fixture {
 #[tokio::test]
 async fn a_protocol_11_launch_names_the_user_mcp_servers_and_an_older_link_says_why() {
     let (f, mut link, _machine) = fixture().await;
-    WorkspaceApi::mcp_servers_create(
-        &f.services,
-        json!({
-            "id": "srv-1", "name": "Echo", "transport": "stdio",
-            "command": "intent-test-missing-mcp-server", "env": { "TOKEN": "s4-secret" },
-            "enabled": true,
-        }),
+    // The daemon's own configuration write, as the frontend's admin call is.
+    intent_core::with_caller(
+        intent_core::Caller::Daemon,
+        WorkspaceApi::mcp_servers_create(
+            &f.services,
+            json!({
+                "id": "srv-1", "name": "Echo", "transport": "stdio",
+                "command": "intent-test-missing-mcp-server", "env": { "TOKEN": "s4-secret" },
+                "enabled": true,
+            }),
+        ),
     )
     .await
     .unwrap();
