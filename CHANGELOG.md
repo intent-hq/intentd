@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.136] - 2026-11-05
+
+### 🚀 Features
+
+- *(remote)* Discover a remote agent's skills on its machine ([#3072](https://github.com/intent-hq/intentd/pull/3072))
+
+### 🐛 Bug Fixes
+
+- Resolve Assistant workspace file root to chief cwd ([#3077](https://github.com/intent-hq/intentd/pull/3077))
+- *(remote)* Sub-agents share the parent's checkout on its machine and copy its work elsewhere (nodeProtocol 13) ([#3071](https://github.com/intent-hq/intentd/pull/3071))
+
+
 ## [0.11.135] - 2026-11-05
 
 ### 🚀 Features
