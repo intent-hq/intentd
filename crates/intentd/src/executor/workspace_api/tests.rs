@@ -28,6 +28,7 @@ fn gates() -> Gates {
     Gates {
         agent_features: serde_json::to_value(AgentFeaturesSettings::default()).unwrap(),
         is_sub_agent: false,
+        compact_tool_descriptions: false,
     }
 }
 
@@ -620,6 +621,7 @@ async fn the_sessions_feature_snapshot_gates_local_calls() {
     let gated = Gates {
         agent_features: serde_json::to_value(features).unwrap(),
         is_sub_agent: true,
+        ..gates()
     };
     let server = server(
         &agent(),
@@ -647,11 +649,52 @@ async fn the_sessions_feature_snapshot_gates_local_calls() {
 
     let unreadable = Gates {
         agent_features: json!({ "noSuchFeature": true }),
-        is_sub_agent: false,
+        ..gates()
     };
     assert!(server_fails(dir.path(), &unreadable));
 }
 
 fn server_fails(dir: &Path, gates: &Gates) -> bool {
     server(&agent(), &workspace(), dir, gates, HeadLink::default()).is_err()
+}
+
+/// A provider that truncates long tool descriptions gets the compact
+/// `workspace_api` description on the machine, as a local bridge serves
+/// it: an index pointing at the reference head puts in the instructions.
+#[tokio::test]
+async fn a_truncating_provider_gets_the_compact_tool_description() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut described = Vec::new();
+    for compact in [false, true] {
+        let gates = Gates {
+            compact_tool_descriptions: compact,
+            ..gates()
+        };
+        let server = server(
+            &agent(),
+            &workspace(),
+            dir.path(),
+            &gates,
+            HeadLink::default(),
+        )
+        .unwrap();
+        let listed = server
+            .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .await
+            .unwrap();
+        described.push(
+            listed["result"]["tools"][0]["description"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let (full, compact) = (&described[0], &described[1]);
+    assert!(full.contains("ws.note.read("), "{full}");
+    assert!(
+        compact.contains("system-prompt \"Workspace API Reference\""),
+        "{compact}"
+    );
+    assert!(!compact.contains("ws.note.read("), "{compact}");
+    assert!(compact.len() < full.len());
 }

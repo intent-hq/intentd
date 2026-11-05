@@ -12446,9 +12446,15 @@ impl AgentManager {
     }
 
     /// Assemble a remote agent's system prompt the way `create_agent` does
-    /// for a local one (no workspace tool reference: remote agents have no
-    /// workspace tools yet), persist it on the session, and arm the
-    /// first-turn prepend that delivers it with the next prompt.
+    /// for a local one, persist it on the session, and arm the first-turn
+    /// prepend that delivers it with the next prompt.
+    ///
+    /// It matches what the agent's machine serves: a provider that truncates
+    /// tool descriptions gets the condensed `workspace_api` reference (the
+    /// machine serves the compact description that points at it); the
+    /// skills catalog is left out (its paths are on this host); and the
+    /// private `$TMPDIR` promise is replaced, as the machine does not make
+    /// one.
     ///
     /// # Errors
     ///
@@ -12471,7 +12477,14 @@ impl AgentManager {
         let settings = self.services.effective_settings();
         let auto_commit_enabled = self.services.effective_auto_commit(workspace_id).await;
         let agent_features = self.services.session_agent_features(session);
-        let Some(prompt) = crate::rules::assemble_system_prompt(
+        let workspace_api_docs = remote_workspace_api_docs(
+            &self.services,
+            workspace_id,
+            session,
+            &agent_features,
+            is_sub_agent,
+        );
+        let Some(prompt) = crate::rules::assemble_remote_system_prompt(
             &self.services.store,
             cwd.as_deref(),
             &agent_type,
@@ -12482,12 +12495,13 @@ impl AgentManager {
             &agent_features,
             workspace.as_ref(),
             Some(session),
-            None,
+            workspace_api_docs.as_deref(),
         )
         .await
         else {
             return Ok(());
         };
+        let prompt = prompt.replace(LOCAL_TMPDIR_PROMISE, REMOTE_TMPDIR_NOTE);
         self.services
             .store
             .set_agent_session_system_prompt(workspace_id, agent_id, &prompt)
@@ -14756,6 +14770,37 @@ pub struct ProviderLaunchSpec {
     pub npx_fallback_binary: Option<PathBuf>,
     pub npx_fallback_package: Option<&'static str>,
     pub extra_env: BTreeMap<String, String>,
+}
+
+/// The bundled instructions' promise of a per-agent temp folder, which a
+/// remote agent's machine does not create yet.
+const LOCAL_TMPDIR_PROMISE: &str = "Your shell's `$TMPDIR` is a private temp folder for this agent: put scratch files (drafts, patches, logs) there or use `mktemp`, never a fixed `/tmp/<name>` path that other agents share.";
+
+/// What a remote agent is told instead of [`LOCAL_TMPDIR_PROMISE`].
+const REMOTE_TMPDIR_NOTE: &str = "Your shell's `$TMPDIR` on this machine is shared with other agents: create scratch files (drafts, patches, logs) with `mktemp` or `mktemp -d`, never at a fixed path.";
+
+/// The condensed `workspace_api` reference for a remote agent whose
+/// provider truncates tool descriptions, assembled as its machine's
+/// workspace server describes the tool (the session's feature gates; no
+/// specialist model options or placement help, which the machine does not
+/// add). `None` for every other provider, which reads the full description.
+fn remote_workspace_api_docs(
+    services: &Services,
+    workspace_id: &WorkspaceId,
+    session: &AgentSession,
+    agent_features: &intent_core::settings_file::AgentFeaturesSettings,
+    is_sub_agent: bool,
+) -> Option<String> {
+    let provider = intent_providers::find_provider(intent_providers::base_provider_id(
+        session.provider.as_deref()?,
+    ))?;
+    provider.truncates_tool_descriptions.then(|| {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
+        WorkspaceMcpServer::new(api, workspace_id.clone())
+            .with_agent_features(agent_features.clone())
+            .with_sub_agent(is_sub_agent)
+            .condensed_workspace_api_description()
+    })
 }
 
 /// Resolve `provider_id` (a base provider or a profile of one) the way a
