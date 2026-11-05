@@ -6001,13 +6001,22 @@ impl Services {
                     &placement,
                 )
                 .await;
-            plan.remote = Some(match (admitted, inherited_from) {
+            let mut view = match (admitted, inherited_from) {
                 (Ok(view), _) => view,
                 (Err(error), Some(node_name)) => {
                     return Err(error.with_hint(&inherited_placement_hint(&node_name)))
                 }
                 (Err(error), None) => return Err(error),
-            });
+            };
+            if let Some((parent, parent_view)) =
+                self.remote_parent(plan.parent_agent_id.as_ref()).await?
+            {
+                self.ports
+                    .remote_launch()
+                    .place_sub_agent(self, (&parent, &parent_view), &mut view)
+                    .await?;
+            }
+            plan.remote = Some(view);
         }
         let remote = plan.remote.clone();
         let mut created = self
@@ -6031,6 +6040,24 @@ impl Services {
         &self,
         parent: Option<&AgentId>,
     ) -> Result<Option<(intent_core::placement::AgentPlacement, String)>> {
+        Ok(self.remote_parent(parent).await?.map(|(_, view)| {
+            (
+                intent_core::placement::AgentPlacement {
+                    target: Some(intent_core::placement::PlacementTarget::Remote),
+                    node_id: Some(view.node_id),
+                    ..Default::default()
+                },
+                view.node_name,
+            )
+        }))
+    }
+
+    /// The parent and its placement, when the caller is that parent and it
+    /// runs on a remote machine; the rules of [`Self::inherited_placement`].
+    async fn remote_parent(
+        &self,
+        parent: Option<&AgentId>,
+    ) -> Result<Option<(AgentId, intent_core::remote_launch::RemotePlacementView)>> {
         let Some(parent) = parent else {
             return Ok(None);
         };
@@ -6045,19 +6072,12 @@ impl Services {
             Err(Error::NotFound(_)) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let Some(view) = intent_core::remote_launch::RemotePlacementView::from_metadata(
-            session.metadata.as_ref(),
-        ) else {
-            return Ok(None);
-        };
-        Ok(Some((
-            intent_core::placement::AgentPlacement {
-                target: Some(intent_core::placement::PlacementTarget::Remote),
-                node_id: Some(view.node_id),
-                ..Default::default()
-            },
-            view.node_name,
-        )))
+        Ok(
+            intent_core::remote_launch::RemotePlacementView::from_metadata(
+                session.metadata.as_ref(),
+            )
+            .map(|view| (parent.clone(), view)),
+        )
     }
 
     /// Admission of a create with a `placement`, before anything is
@@ -6251,6 +6271,20 @@ impl Services {
                 }
             }
             return Err(error);
+        }
+        // The launch may have settled what a sub-agent starts from.
+        if let Ok(session) = self.store.get_agent_session_summary(&agent_id).await {
+            if let Some(stored) = intent_core::remote_launch::RemotePlacementView::from_metadata(
+                session.metadata.as_ref(),
+            ) {
+                view = stored;
+            }
+        }
+        if let Some(notice) = intent_core::remote_launch::sub_agent_notice(&view) {
+            if let Some(obj) = created.as_object_mut() {
+                obj.insert("notice".into(), json!(notice));
+            }
+            return Ok(());
         }
         // The notice is informational: a script that cannot be resolved
         // now is left out of it, the launch already went ahead.
@@ -12904,7 +12938,7 @@ impl Services {
                 .is_some();
         if inherits && input.isolation.is_some() {
             return Err(Error::InvalidParams(
-                "agent.delegate: a remote agent's sub-agents run on its machine in their own checkout, so isolation does not apply; pass placement { target: \"local\" } to use isolation on the backend".to_string(),
+                "agent.delegate: a remote agent's sub-agents run on its machine, so isolation does not apply; pass placement { target: \"local\" } to use isolation on the backend".to_string(),
             ));
         }
         let placed = inherits || (input.placement.is_some() && !on_backend);

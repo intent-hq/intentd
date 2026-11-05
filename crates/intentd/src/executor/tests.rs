@@ -460,6 +460,7 @@ fn launch_of(id: &str, provider: &str) -> LinkFrame {
         checkout: None,
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
+        checkout_of: None,
     })
 }
 
@@ -813,6 +814,7 @@ async fn executor_shutdown_settles_launches_arriving_on_a_live_link() {
             checkout: None,
             mcp_proxies: Vec::new(),
             compact_tool_descriptions: false,
+            checkout_of: None,
         })
     };
     dialed.link.send(&launch("a0".into())).await.unwrap();

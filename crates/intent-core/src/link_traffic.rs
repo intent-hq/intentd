@@ -728,6 +728,18 @@ fn light_frame(frame: &LinkFrame) -> Value {
             "agentId": agent(&output.agent_id),
             "seq": output.seq,
         }),
+        LinkFrame::PushWip(request) => json!({
+            "type": "pushWip",
+            "requestId": request.request_id,
+            "agentId": agent(&request.agent_id),
+        }),
+        LinkFrame::PushWipReply(reply) => json!({
+            "type": "pushWipReply",
+            "requestId": reply.request_id,
+            "agentId": agent(&reply.agent_id),
+            "outcome": reply.outcome,
+            "error": reply.error.as_deref().map(field),
+        }),
     }
 }
 

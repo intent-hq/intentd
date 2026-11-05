@@ -69,6 +69,11 @@ pub(super) trait Checkouts: Send + Sync {
         timeout: Duration,
     ) -> BoxFuture<'a, anyhow::Result<()>>;
 
+    /// The agent's private temp folder, created on demand in its own
+    /// directory: also for an agent that works in another agent's checkout
+    /// (nodeProtocol 13), so two agents never share one.
+    fn agent_tmp(&self, agent_id: &AgentId) -> anyhow::Result<PathBuf>;
+
     /// The agents with a directory here.
     fn agents(&self) -> Vec<AgentId>;
 
@@ -207,6 +212,10 @@ impl Checkouts for GitCheckouts {
             .context("WIP push timed out")??;
             Ok(())
         })
+    }
+
+    fn agent_tmp(&self, agent_id: &AgentId) -> anyhow::Result<PathBuf> {
+        self.storage.agent_tmp(agent_id)
     }
 
     fn agents(&self) -> Vec<AgentId> {
@@ -432,6 +441,10 @@ impl Checkouts for PlainCheckouts {
             );
             Ok(())
         })
+    }
+
+    fn agent_tmp(&self, agent_id: &AgentId) -> anyhow::Result<PathBuf> {
+        self.storage.agent_tmp(agent_id)
     }
 
     fn agents(&self) -> Vec<AgentId> {

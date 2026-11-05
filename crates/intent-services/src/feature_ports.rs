@@ -1419,6 +1419,24 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         false
     }
 
+    /// Decide what a remote parent's admitted sub-agent `child` starts from
+    /// (nodeProtocol 13): on the parent's machine, the checkout `parent`
+    /// works in; on another machine, the parent's work, copied at
+    /// [`Self::launch`]. Nothing by default.
+    ///
+    /// # Errors
+    ///
+    /// When the machine's link cannot be read.
+    fn place_sub_agent<'a>(
+        &'a self,
+        svc: &'a Services,
+        parent: (&'a AgentId, &'a RemotePlacementView),
+        child: &'a mut RemotePlacementView,
+    ) -> BoxFuture<'a, Result<()>> {
+        let _ = (svc, parent, child);
+        Box::pin(async { Ok(()) })
+    }
+
     /// Place the created agent on the node: record it on the lease and
     /// write its `base` ref.
     ///

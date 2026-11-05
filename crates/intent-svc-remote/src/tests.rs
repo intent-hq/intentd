@@ -1357,6 +1357,7 @@ mod stop_acks {
             checkout: None,
             mcp_proxies: Vec::new(),
             compact_tool_descriptions: false,
+            checkout_of: None,
             profile_env: None,
         }
     }

@@ -253,6 +253,37 @@ pub struct RemotePlacementView {
     /// `skill.list` with its `agentId`; never projected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<Vec<crate::node_link::MachineSkill>>,
+    /// The agent whose checkout this sub-agent works in on their machine
+    /// (nodeProtocol 13), sent as `checkoutOf` at every launch; never
+    /// projected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_checkout_of: Option<crate::AgentId>,
+    /// The parent whose work this sub-agent, on another machine than the
+    /// parent's, starts from (nodeProtocol 13); never projected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_work: Option<ParentWork>,
+}
+
+/// Where a remote agent's sub-agent on another machine starts from: the
+/// owner of the parent's checkout, and how its work was copied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParentWork {
+    pub agent_id: crate::AgentId,
+    /// `None` until copied, and when the parent had no saved work: the
+    /// sub-agent then starts from the workspace's last commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied: Option<ParentWorkCopy>,
+}
+
+/// How a sub-agent got its parent's work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ParentWorkCopy {
+    /// The parent's machine pushed it when the sub-agent was created.
+    Pushed,
+    /// The parent's machine could not push now: its last push.
+    LastPush,
 }
 
 /// Where a remote agent's checkout setup is (`methods/nodes.md` §
@@ -390,6 +421,27 @@ pub fn launch_notice_with_setup(
         );
     }
     notice
+}
+
+/// The launch notice of a remote agent's sub-agent that starts from its
+/// parent's work (nodeProtocol 13), or `None` for any other agent.
+#[must_use]
+pub fn sub_agent_notice(view: &RemotePlacementView) -> Option<String> {
+    let node_name = &view.node_name;
+    if view.shared_checkout_of.is_some() {
+        return Some(format!(
+            "The agent runs on execution node \"{node_name}\" in its parent's checkout there: it sees the parent's uncommitted changes as they happen, and its work reaches the backend in the parent's refs."
+        ));
+    }
+    let short = view.base_commit.get(..12).unwrap_or(&view.base_commit);
+    match view.parent_work.as_ref()?.copied? {
+        ParentWorkCopy::Pushed => Some(format!(
+            "The agent runs on execution node \"{node_name}\" and starts from its parent's work: commit {short} with the parent's uncommitted changes, saved when the agent was created. Later work of either agent is not shared."
+        )),
+        ParentWorkCopy::LastPush => Some(format!(
+            "The agent runs on execution node \"{node_name}\" and starts from its parent's last saved work: commit {short} with the uncommitted changes the parent's machine last pushed (it could not push again now). Later work of either agent is not shared."
+        )),
+    }
 }
 
 #[cfg(test)]

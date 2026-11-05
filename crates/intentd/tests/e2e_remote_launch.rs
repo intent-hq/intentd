@@ -33,6 +33,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::common;
 
+mod sub_agents;
+
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 fn wait() -> Duration {

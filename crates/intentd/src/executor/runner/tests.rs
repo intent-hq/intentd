@@ -9,6 +9,8 @@ use serde_json::json;
 use super::*;
 use crate::executor::storage::Storage;
 
+mod shared;
+
 const PROVIDER: &str = "mock";
 
 fn wait() -> Duration {
@@ -150,6 +152,7 @@ fn launch(id: &str) -> LaunchCommand {
         checkout: None,
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
+        checkout_of: None,
     }
 }
 
