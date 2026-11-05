@@ -632,15 +632,18 @@ the top tab strip, and the current workspace stays selected. Once created, the
 card shows **Open workspace**, whoever applied it; if that workspace was deleted,
 a message says it no longer exists.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/lib/utils/shortcut-bindings.ts; src/lib/components/terminal/QuakeTerminalOverlay.svelte; messages/en.json. -->
 
 Use **Next Workspace Tab** (defaults **Ctrl+Tab** and **Cmd+Shift+]**) or
-**Previous Workspace Tab** (defaults **Ctrl+Shift+Tab** and **Cmd+Shift+[**; use
-**Ctrl+Shift+]** / **Ctrl+Shift+[** on Windows/Linux) to cycle through open
-workspace tabs in displayed order. From **Home**, next opens the first workspace tab and previous opens the
-last, regardless of which workspace was selected before Home. With no open
-workspace tabs, these shortcuts do nothing. Customize them in **Settings → Input
-and shortcuts → Keyboard shortcuts**.
+**Previous Workspace Tab** (defaults **Ctrl+Shift+Tab** and **Cmd+Shift+[**) to
+cycle through open workspace tabs in displayed order. On Windows/Linux the
+bracket shortcuts are **Ctrl+Shift+]** / **Ctrl+Shift+[**. There, the code
+editor keeps them for folding while it has focus; **Ctrl+Tab** still works. In
+the terminal drawer with two or more terminals, the bracket shortcuts cycle
+drawer terminals instead. From **Home**, next opens the first workspace tab and
+previous opens the last, regardless of which workspace was selected before
+Home. With no open workspace tabs, these shortcuts do nothing. Customize them in
+**Settings → Input and shortcuts → Keyboard shortcuts**.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/AgentCard.svelte (toggle-pinned menu item); packages/cloudlands-fe/src/lib/components/workspace/{WorkspaceAgentsList.svelte,workspace-agents-list-utils.ts}; packages/intentd/crates/intent-services/src/agent_ops.rs (agent.update pinned). -->
 
