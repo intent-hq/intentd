@@ -65,6 +65,7 @@ async fn await_uds(socket: &Path) -> bool {
             if UnixStream::connect(socket).await.is_ok() {
                 return;
             }
+            // timing-guard: poll interval while the daemon socket comes up (bounded by the timeout).
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
@@ -448,12 +449,12 @@ async fn cursor_provider_discovery_auth_models_and_turn_over_wss() {
         let id = acp
             .iter()
             .find(|f| f["dir"] == "out" && f["msg"]["method"] == method)
-            .map(|f| f["msg"]["id"].clone())
-            .unwrap_or_else(|| panic!("mock never sent {method}"));
+            .unwrap_or_else(|| panic!("mock never sent {method}"))["msg"]["id"]
+            .clone();
         acp.iter()
             .find(|f| f["dir"] == "in" && f["msg"]["id"] == id && f["msg"].get("method").is_none())
-            .map(|f| f["msg"].clone())
-            .unwrap_or_else(|| panic!("no response to {method}"))
+            .unwrap_or_else(|| panic!("no response to {method}"))["msg"]
+            .clone()
     };
     assert_eq!(
         response_to("session/request_permission")["result"]["outcome"],
@@ -493,6 +494,7 @@ async fn cursor_provider_discovery_auth_models_and_turn_over_wss() {
         intentd_test_support::test_timeout(Duration::from_secs(20)),
         async {
             while pids.iter().any(|p| pid_alive(*p)) {
+                // timing-guard: poll interval for the killed processes to disappear (bounded by the timeout).
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         },

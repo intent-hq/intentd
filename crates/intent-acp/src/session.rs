@@ -898,21 +898,21 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///     `<name>: <description>` split below because a prose summary can
 ///     accidentally match it (intent-hq/intent#4491). Providers that title
 ///     the call with the tool name resolve to `workspace_api` through rules
-///     1–2 and 4–5 anyway. Skipped on the [`unwrap_codex_mcp_input`] path,
+///     1–2 and 5–6 anyway. Skipped on the [`unwrap_codex_mcp_input`] path,
 ///     where `server`/`tool` are authoritative.
 ///  4. Cursor's native tool shapes ([`derive_cursor_tool_name`]: exact
 ///     `raw_input` key sets plus title forms, e.g. a backticked command with
 ///     `{ command }` → `bash`, `_toolName: "task"` → `Subagent`).
-///  4b. A title of the form `<name>: <description>` (`<name>` a bare identifier
+///  5. A title of the form `<name>: <description>` (`<name>` a bare identifier
 ///     of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
 ///     becomes the name.
-///  5. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
+///  6. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
 ///     `<tool>_<server>` (trailing `_workspace-mcp` suffix), opencode names it
 ///     `<server>_<tool>` (leading `workspace-mcp_` prefix); stripping either
 ///     (repeatedly) recovers the registry name (§18.4).
-///  6. A bare `webfetch` title (opencode's fetch tool) is normalized to the
+///  7. A bare `webfetch` title (opencode's fetch tool) is normalized to the
 ///     canonical `web-fetch` builtin name.
-///  7. When none of the above yielded an identifier (the title is prose
+///  8. When none of the above yielded an identifier (the title is prose
 ///     like `"Read"` or `"Edit foo.rs"`), inspect `raw_input` for unambiguous
 ///     shapes. Evaluated in the same order as the reference
 ///     (`acp-provider-streaming.ts` ~L1635–1666), first match wins:
@@ -933,7 +933,7 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///       - string `command` + string `cwd` (no `wait`/`max_wait_seconds`,
 ///         which would mean auggie's `launch-process`) → `bash`
 ///       - `url` → `web-fetch`
-///  8. Otherwise the title passes through as-is.
+///  9. Otherwise the title passes through as-is.
 ///
 /// The `conversation`-vs-`codebase` split keys off the passed-in ACP `title`.
 /// The reference keys off its local `toolName` variable, which may have been

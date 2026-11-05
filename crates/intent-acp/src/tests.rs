@@ -15965,7 +15965,7 @@ mod cursor_tool_mapping {
     use agent_client_protocol::schema::v1::SessionNotification;
     use serde_json::{json, Value};
 
-    fn map(update: Value) -> (String, &'static str, Value, String) {
+    fn map(update: &Value) -> (String, &'static str, Value, String) {
         let note: SessionNotification =
             serde_json::from_value(json!({ "sessionId": "s", "update": update })).unwrap();
         let MappedUpdate::ToolCall(tc) = session::map_session_update(&note.update).unwrap() else {
@@ -15978,14 +15978,14 @@ mod cursor_tool_mapping {
     fn mcp_call_unwraps_server_and_tool_and_keeps_newline_ids_opaque() {
         let id = "call-319b6c00-0bab-4561-a905-9e27aefbeb53-1\nfc_56615f74-5643-917a-ac9f-479d2fe25945_0";
         let (name, kind, input, call_id) = map(
-            json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":"intent-workspace: intent_ping","rawInput":{"providerIdentifier":"intent-workspace","toolName":"intent_ping","args":{}}}),
+            &json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":"intent-workspace: intent_ping","rawInput":{"providerIdentifier":"intent-workspace","toolName":"intent_ping","args":{}}}),
         );
         assert_eq!(name, "intent-workspace_intent_ping");
         assert_eq!(kind, "other");
         assert_eq!(input, json!({}));
         assert_eq!(call_id, id);
         let (name, _, input, _) = map(
-            json!({"sessionUpdate":"tool_call","toolCallId":"replay-0-4","title":"workspace-mcp: workspace_api","kind":"other","status":"pending","rawInput":{"providerIdentifier":"workspace-mcp","toolName":"workspace_api","args":{"code":"return 1","summary":"probe"}}}),
+            &json!({"sessionUpdate":"tool_call","toolCallId":"replay-0-4","title":"workspace-mcp: workspace_api","kind":"other","status":"pending","rawInput":{"providerIdentifier":"workspace-mcp","toolName":"workspace_api","args":{"code":"return 1","summary":"probe"}}}),
         );
         assert_eq!(name, "workspace_api");
         assert_eq!(input, json!({"code":"return 1","summary":"probe"}));
@@ -15994,15 +15994,15 @@ mod cursor_tool_mapping {
     #[test]
     fn shell_task_and_native_tools_get_names_and_kinds() {
         let (name, kind, _, _) = map(
-            json!({"sessionUpdate":"tool_call","toolCallId":"call-29f616b7-902c-482c-930d-030b5dc8add1-0\nfc_b4d77170-841c-9ece-ab40-6899e8653b27_0","title":"`sleep 47 && echo finished-sleep`","kind":"execute","status":"pending","rawInput":{"command":"sleep 47 && echo finished-sleep"}}),
+            &json!({"sessionUpdate":"tool_call","toolCallId":"call-29f616b7-902c-482c-930d-030b5dc8add1-0\nfc_b4d77170-841c-9ece-ab40-6899e8653b27_0","title":"`sleep 47 && echo finished-sleep`","kind":"execute","status":"pending","rawInput":{"command":"sleep 47 && echo finished-sleep"}}),
         );
         assert_eq!((name.as_str(), kind), ("bash", "terminal"));
         let (name, kind, _, _) = map(
-            json!({"sessionUpdate":"tool_call","toolCallId":"call-d5f81713-ef9b-4563-81e1-9fccb289dc3b-0\nfc_4488f13b-7cc1-9ba7-9fe8-679b98c595e1_0","title":"`git status --short | head -5; echo \"EXIT:$?\"`","kind":"execute","status":"pending","rawInput":{"command":"git status --short | head -5; echo \"EXIT:$?\""}}),
+            &json!({"sessionUpdate":"tool_call","toolCallId":"call-d5f81713-ef9b-4563-81e1-9fccb289dc3b-0\nfc_4488f13b-7cc1-9ba7-9fe8-679b98c595e1_0","title":"`git status --short | head -5; echo \"EXIT:$?\"`","kind":"execute","status":"pending","rawInput":{"command":"git status --short | head -5; echo \"EXIT:$?\""}}),
         );
         assert_eq!((name.as_str(), kind), ("bash", "terminal"));
         let (name, kind, _, _) = map(
-            json!({"sessionUpdate":"tool_call","toolCallId":"call-27e9fb5d-2f35-4699-83db-5f3c01ce559a-3\nfc_93650954-f819-9d9f-9e36-f87a8cad6bd7_0","title":"Task: Reply with HELLO","kind":"other","status":"pending","rawInput":{"_toolName":"task","prompt":"Your only job is to reply with exactly the word HELLO and nothing else. Do not call any tools. Do not add punctuation or explanation.","description":"Reply with HELLO"}}),
+            &json!({"sessionUpdate":"tool_call","toolCallId":"call-27e9fb5d-2f35-4699-83db-5f3c01ce559a-3\nfc_93650954-f819-9d9f-9e36-f87a8cad6bd7_0","title":"Task: Reply with HELLO","kind":"other","status":"pending","rawInput":{"_toolName":"task","prompt":"Your only job is to reply with exactly the word HELLO and nothing else. Do not call any tools. Do not add punctuation or explanation.","description":"Reply with HELLO"}}),
         );
         assert_eq!((name.as_str(), kind), ("Subagent", "other"));
         for (title, acp_kind, raw, expected_name, expected_kind) in [
@@ -16078,7 +16078,7 @@ mod cursor_tool_mapping {
             ),
         ] {
             let (name, kind, _, _) = map(
-                json!({"sessionUpdate":"tool_call","toolCallId":"t","title":title,"kind":acp_kind,"status":"pending","rawInput":raw}),
+                &json!({"sessionUpdate":"tool_call","toolCallId":"t","title":title,"kind":acp_kind,"status":"pending","rawInput":raw}),
             );
             assert_eq!(
                 (name.as_str(), kind),

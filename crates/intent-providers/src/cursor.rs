@@ -290,7 +290,7 @@ fn parse_model_row(line: &str) -> Option<CursorModel> {
         }
     }
     if name.is_empty() {
-        name = id.to_owned();
+        id.clone_into(&mut name);
     }
     Some(CursorModel {
         id: id.to_owned(),
