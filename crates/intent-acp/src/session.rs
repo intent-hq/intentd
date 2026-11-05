@@ -765,6 +765,43 @@ fn derive_cursor_tool_name(title: &str, obj: &serde_json::Map<String, Value>) ->
     None
 }
 
+/// Cursor-only naming pass, applied by the service layer after the generic
+/// mapping for sessions whose provider is Cursor (the generic rules never
+/// see these shapes, so other providers map exactly as before). Unwraps
+/// Cursor's MCP input (`{ providerIdentifier, toolName, args }`) and names
+/// its native tools ([`derive_cursor_tool_name`]). A name the callback
+/// routes already resolved to `workspace_api` is kept.
+pub fn apply_cursor_tool_names(call: &mut MappedToolCall) {
+    if call.tool_name == "workspace_api" && call.name_authoritative {
+        return;
+    }
+    if let Some((input, rewritten)) = unwrap_cursor_mcp_input(Some(&call.input)) {
+        let (name, _) = derive_tool_name_inner(&rewritten, Some(&input), false);
+        call.input = input;
+        call.tool_kind = refine_tool_kind(call.tool_kind, &name);
+        call.tool_name = name;
+        call.name_authoritative = true;
+        return;
+    }
+    if let Some(name) = call
+        .input
+        .as_object()
+        .and_then(|obj| derive_cursor_tool_name(&call.title, obj))
+    {
+        call.tool_kind = refine_tool_kind(call.tool_kind, &name);
+        call.tool_name = name;
+    }
+}
+
+/// Re-apply [`tool_kind_word`]'s name-based overrides (git / note /
+/// retrieval) after a rename, keeping the ACP-kind-derived word otherwise.
+fn refine_tool_kind(current: &'static str, name: &str) -> &'static str {
+    match tool_kind_word(ToolKind::Other, name) {
+        "other" => current,
+        word => word,
+    }
+}
+
 /// Resolve the mapped `input` and tool name for a tool call. When the codex
 /// nested-MCP shape is detected ([`unwrap_codex_mcp_input`]) the arguments
 /// are hoisted to the top level and the rewritten `{server}_{tool}` name is
@@ -802,10 +839,6 @@ fn resolve_input_and_name(
                 return (Value::Object(input), strip_workspace_mcp_affix(title), true);
             }
         }
-    }
-    if let Some((input, rewritten)) = unwrap_cursor_mcp_input(raw_input) {
-        let (name, _) = derive_tool_name_inner(&rewritten, Some(&input), false);
-        return (input, name, true);
     }
     if let Some((input, rewritten)) = unwrap_codex_mcp_input(raw_input) {
         // `server`/`tool` are authoritative: a foreign tool whose arguments
@@ -898,21 +931,18 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///     `<name>: <description>` split below because a prose summary can
 ///     accidentally match it (intent-hq/intent#4491). Providers that title
 ///     the call with the tool name resolve to `workspace_api` through rules
-///     1–2 and 5–6 anyway. Skipped on the [`unwrap_codex_mcp_input`] path,
+///     1–2 and 4–5 anyway. Skipped on the [`unwrap_codex_mcp_input`] path,
 ///     where `server`/`tool` are authoritative.
-///  4. Cursor's native tool shapes ([`derive_cursor_tool_name`]: exact
-///     `raw_input` key sets plus title forms, e.g. a backticked command with
-///     `{ command }` → `bash`, `_toolName: "task"` → `Subagent`).
-///  5. A title of the form `<name>: <description>` (`<name>` a bare identifier
+///  4. A title of the form `<name>: <description>` (`<name>` a bare identifier
 ///     of `[A-Za-z0-9_-]+`, followed by `": "` or `":\t"`) is split; the prefix
 ///     becomes the name.
-///  6. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
+///  5. `workspace-mcp` server affixes are stripped — auggie names an MCP tool
 ///     `<tool>_<server>` (trailing `_workspace-mcp` suffix), opencode names it
 ///     `<server>_<tool>` (leading `workspace-mcp_` prefix); stripping either
 ///     (repeatedly) recovers the registry name (§18.4).
-///  7. A bare `webfetch` title (opencode's fetch tool) is normalized to the
+///  6. A bare `webfetch` title (opencode's fetch tool) is normalized to the
 ///     canonical `web-fetch` builtin name.
-///  8. When none of the above yielded an identifier (the title is prose
+///  7. When none of the above yielded an identifier (the title is prose
 ///     like `"Read"` or `"Edit foo.rs"`), inspect `raw_input` for unambiguous
 ///     shapes. Evaluated in the same order as the reference
 ///     (`acp-provider-streaming.ts` ~L1635–1666), first match wins:
@@ -933,7 +963,7 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
 ///       - string `command` + string `cwd` (no `wait`/`max_wait_seconds`,
 ///         which would mean auggie's `launch-process`) → `bash`
 ///       - `url` → `web-fetch`
-///  9. Otherwise the title passes through as-is.
+///  8. Otherwise the title passes through as-is.
 ///
 /// The `conversation`-vs-`codebase` split keys off the passed-in ACP `title`.
 /// The reference keys off its local `toolName` variable, which may have been
@@ -965,12 +995,6 @@ fn derive_tool_name_inner(
     }
     if infer_workspace_api && raw_input.is_some_and(intent_core::is_workspace_api_input) {
         return ("workspace_api".to_string(), false);
-    }
-    if let Some(name) = raw_input
-        .and_then(Value::as_object)
-        .and_then(|obj| derive_cursor_tool_name(title, obj))
-    {
-        return (name, false);
     }
     if let Some(name) = split_name_prefix(title) {
         return (strip_workspace_mcp_affix(name), false);

@@ -15968,9 +15968,11 @@ mod cursor_tool_mapping {
     fn map(update: &Value) -> (String, &'static str, Value, String) {
         let note: SessionNotification =
             serde_json::from_value(json!({ "sessionId": "s", "update": update })).unwrap();
-        let MappedUpdate::ToolCall(tc) = session::map_session_update(&note.update).unwrap() else {
+        let MappedUpdate::ToolCall(mut tc) = session::map_session_update(&note.update).unwrap()
+        else {
             panic!("expected a tool call");
         };
+        session::apply_cursor_tool_names(&mut tc);
         (tc.tool_name, tc.tool_kind, tc.input, tc.tool_call_id)
     }
 
@@ -16088,28 +16090,73 @@ mod cursor_tool_mapping {
         }
     }
 
+    /// The Cursor rules are gated to Cursor sessions: the generic mapping
+    /// (every other provider) leaves Cursor-shaped frames exactly as the
+    /// pre-Cursor rules named them.
     #[test]
-    fn cursor_rules_do_not_capture_other_provider_shapes() {
-        // Extra keys (a description, a cwd) or a title that is not the
-        // backticked command fall through to the existing rules.
-        assert_eq!(
-            session::derive_tool_name("`ls`", Some(&json!({"command":"ls","description":"list"}))),
-            "`ls`"
-        );
-        assert_eq!(
-            session::derive_tool_name("ls -la", Some(&json!({"command":"ls"}))),
-            "ls -la"
-        );
-        assert_eq!(
-            session::derive_tool_name("view", Some(&json!({"path":"a.rs"}))),
-            "view"
-        );
-        assert_eq!(
-            session::derive_tool_name(
-                "server: tool",
-                Some(&json!({"providerIdentifier":"s","toolName":"t","args":{},"extra":1}))
+    fn generic_mapping_ignores_cursor_shapes() {
+        let generic = |update: &Value| {
+            let note: SessionNotification =
+                serde_json::from_value(json!({ "sessionId": "s", "update": update })).unwrap();
+            let MappedUpdate::ToolCall(tc) = session::map_session_update(&note.update).unwrap()
+            else {
+                panic!("expected a tool call");
+            };
+            (tc.tool_name, tc.tool_kind)
+        };
+        for (title, kind, raw, expected) in [
+            ("`ls`", "execute", json!({"command":"ls"}), "`ls`"),
+            ("Terminal", "execute", json!({"command":"ls"}), "Terminal"),
+            (
+                "Task: Reply",
+                "other",
+                json!({"_toolName":"task","prompt":"p","description":"Reply"}),
+                "Task",
             ),
-            "server"
+            ("Edit `a.rs`", "edit", json!({"path":"a.rs"}), "Edit `a.rs`"),
+            (
+                "Find `*.rs`",
+                "search",
+                json!({"pattern":"*.rs"}),
+                "Find `*.rs`",
+            ),
+            (
+                "srv: tool",
+                "other",
+                json!({"providerIdentifier":"srv","toolName":"tool","args":{}}),
+                "srv",
+            ),
+        ] {
+            let (name, _) = generic(
+                &json!({"sessionUpdate":"tool_call","toolCallId":"t","title":title,"kind":kind,"status":"pending","rawInput":raw}),
+            );
+            assert_eq!(name, expected, "{title}");
+        }
+    }
+
+    #[test]
+    fn cursor_pass_keeps_unrelated_shapes_and_callback_names() {
+        let mut call = session::MappedToolCall {
+            tool_call_id: "t".into(),
+            tool_name: "workspace_api".into(),
+            name_authoritative: true,
+            title: "srv: workspace_api".into(),
+            tool_kind: "other",
+            input: json!({"code":"1","summary":"s"}),
+            output: None,
+            status: "started",
+            keeps_status: false,
+        };
+        session::apply_cursor_tool_names(&mut call);
+        assert_eq!(call.tool_name, "workspace_api");
+        call.tool_name = "`ls -la`".into();
+        call.name_authoritative = false;
+        call.title = "ls -la".into();
+        call.input = json!({"command":"ls"});
+        session::apply_cursor_tool_names(&mut call);
+        assert_eq!(
+            call.tool_name, "`ls -la`",
+            "title must be the backticked command"
         );
     }
 }

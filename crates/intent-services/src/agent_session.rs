@@ -448,6 +448,9 @@ impl ThoughtLevelOption {
 /// order.
 struct Transcript {
     callback_routes: Arc<CallbackToolRoutes>,
+    /// Apply Cursor's tool-naming pass ([`intent_acp::session::apply_cursor_tool_names`])
+    /// to this turn's tool calls; set only for Cursor sessions.
+    cursor_tool_names: bool,
     /// Assistant `AgentMessage` id minted at turn start (the block-id prefix).
     message_id: String,
     blocks: Vec<Value>,
@@ -524,6 +527,7 @@ impl Transcript {
     fn new(message_id: String) -> Self {
         Self {
             callback_routes: Arc::default(),
+            cursor_tool_names: false,
             message_id,
             blocks: Vec::new(),
             text: String::new(),
@@ -545,6 +549,11 @@ impl Transcript {
 
     fn with_callback_routes(mut self, routes: Arc<CallbackToolRoutes>) -> Self {
         self.callback_routes = routes;
+        self
+    }
+
+    fn with_cursor_tool_names(mut self, enabled: bool) -> Self {
+        self.cursor_tool_names = enabled;
         self
     }
 
@@ -2117,6 +2126,17 @@ impl Services {
     /// `media`): the workspace root (or the agent's sandbox path, `CoW`
     /// containment) plus the assets root, resolved ONCE per turn so the
     /// per-chunk probe does no store reads.
+    /// Whether the agent runs on the Cursor provider (one store read per
+    /// turn); gates Cursor's tool-naming pass.
+    async fn is_cursor_session(&self, agent_id: &AgentId) -> bool {
+        self.store
+            .get_agent_session_without_messages(agent_id)
+            .await
+            .ok()
+            .and_then(|session| session.provider)
+            .is_some_and(|p| intent_providers::base_provider_id(&p) == "cursor")
+    }
+
     async fn image_probe_context(
         &self,
         agent_id: &AgentId,
@@ -3902,7 +3922,8 @@ impl Services {
                     .map(|input| input.connection.callback_tool_routes())
                     .unwrap_or_default(),
             )
-            .with_probe_context(self.image_probe_context(agent_id, workspace_id).await);
+            .with_probe_context(self.image_probe_context(agent_id, workspace_id).await)
+            .with_cursor_tool_names(self.is_cursor_session(agent_id).await);
         // Turn wall-clock start, for the global usage-stats longest-run MAX.
         let turn_started = std::time::Instant::now();
         // Publish the in-flight turn so a `chat.subscribe` arriving mid-turn can
@@ -5587,7 +5608,8 @@ impl Services {
         let message_id = Uuid::now_v7().to_string();
         let mut transcript = Transcript::new(message_id.clone())
             .with_callback_routes(routes)
-            .with_probe_context(self.image_probe_context(agent_id, workspace_id).await);
+            .with_probe_context(self.image_probe_context(agent_id, workspace_id).await)
+            .with_cursor_tool_names(self.is_cursor_session(agent_id).await);
         // Live-turn slot + abort-safe guard, same contract as a prompt turn:
         // a `chat.subscribe` arriving mid-wake reconstructs the partial
         // message, and an abort (preempting prompt / stop) clears the slot.
@@ -6425,11 +6447,16 @@ impl Services {
         workspace_id: &WorkspaceId,
         transcript: &mut Transcript,
     ) -> bool {
-        let Some(mapped) =
+        let Some(mut mapped) =
             session::map_notification_with_callback_routes(note, &transcript.callback_routes)
         else {
             return false;
         };
+        if transcript.cursor_tool_names {
+            if let MappedUpdate::ToolCall(call) = &mut mapped {
+                session::apply_cursor_tool_names(call);
+            }
+        }
         // A timed return home is announced at home's first output, ahead of
         // it, and the output proves the configuration's quota to every
         // conversation (PROTOCOL §5.54 backup failover).
