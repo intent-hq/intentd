@@ -249,6 +249,10 @@ pub struct RemotePlacementView {
     /// agent's later launches; never projected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_script: Option<String>,
+    /// The skills its machine last reported for it (nodeProtocol 12), for
+    /// `skill.list` with its `agentId`; never projected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<crate::node_link::MachineSkill>>,
 }
 
 /// Where a remote agent's checkout setup is (`methods/nodes.md` §

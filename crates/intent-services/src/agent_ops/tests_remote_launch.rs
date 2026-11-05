@@ -44,6 +44,7 @@ fn view(placement: &AgentPlacement) -> RemotePlacementView {
         submodules: None,
         setup: None,
         setup_script: None,
+        skills: None,
     }
 }
 

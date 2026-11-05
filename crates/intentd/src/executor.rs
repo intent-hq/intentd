@@ -37,6 +37,7 @@ mod runner;
 mod scripts;
 mod session;
 mod setup;
+mod skills;
 mod storage;
 #[cfg(test)]
 mod test_link;

@@ -12,7 +12,8 @@
 
 use intent_core::node_link::{
     FinalPush, LeaseBinding, LinkChannel, LinkFrame, LinkHello, LinkOutcome, LinkRpcError,
-    MachineCapabilities, StopId, StopOutcome, FINAL_STOP_PROTOCOL, NODE_LINK_PROTOCOLS,
+    MachineCapabilities, SkillsReply, StopId, StopOutcome, FINAL_STOP_PROTOCOL,
+    NODE_LINK_PROTOCOLS, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::AgentId;
@@ -20,6 +21,7 @@ use intent_core::BoxFuture;
 use intent_transport::node_link::{LinkEvent, LinkEvents, NodeLink};
 
 use super::runner::{Runner, StopWait};
+use super::skills;
 
 /// JSON-RPC "method not found": the node serves no head-to-node requests yet.
 const METHOD_NOT_FOUND: i32 = -32601;
@@ -287,6 +289,22 @@ pub(super) async fn serve_link(
                     let capabilities = report().await;
                     let _ = link
                         .send(&LinkFrame::CapabilitiesReply { capabilities })
+                        .await;
+                });
+            }
+            // Read-only like the capabilities report: the machine's user
+            // skills for a profile, before any checkout exists.
+            LinkEvent::Frame(LinkFrame::Skills(query)) if protocol >= SKILLS_PROTOCOL => {
+                let link = link.clone();
+                let home = runner.home();
+                // caller-binding: allow — answers one skills query on its link
+                tokio::spawn(async move {
+                    let skills = skills::discover(None, home).await;
+                    let _ = link
+                        .send(&LinkFrame::SkillsReply(SkillsReply {
+                            query_id: query.query_id,
+                            skills,
+                        }))
                         .await;
                 });
             }

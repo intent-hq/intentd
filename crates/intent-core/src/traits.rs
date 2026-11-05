@@ -7448,6 +7448,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `skill.list` with `agentId` → `{ skills, stale?, unavailable? }`,
+    /// name-sorted, before paging: a remote agent's machine skills
+    /// (agent-aux.md § Skills of a remote agent), else the workspace's.
+    /// `-32602` when the agent is not in `workspace_id`.
+    fn skill_list_for_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::skill_list_for_agent not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `specialist.edit` → overwrite an existing user/project file; returns
     /// `{ specialist: SpecialistDef }`; missing file → `-32602` (PROTOCOL §5.11).
     fn specialist_edit(

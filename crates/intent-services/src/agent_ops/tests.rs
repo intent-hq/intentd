@@ -10602,6 +10602,7 @@ async fn worst_case_agent_list_row(
             output_truncated: None,
         }),
         setup_script: None,
+        skills: None,
     };
     svc.store()
         .set_agent_session_metadata_key_json(

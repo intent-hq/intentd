@@ -1447,6 +1447,20 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         agent_id: &'a AgentId,
     ) -> BoxFuture<'a, Result<Arc<RemoteRuntime>>>;
 
+    /// What remote agent `agent_id`'s machine says about its skills,
+    /// connecting on demand within a short bound. With `query`, its user
+    /// skills (node-link.md § Skills on the machine); without, only whether
+    /// it is reachable. [`MachineSkills::Offline`] by default.
+    fn machine_skills<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        query: bool,
+    ) -> BoxFuture<'a, MachineSkills> {
+        let _ = (svc, agent_id, query);
+        Box::pin(async { MachineSkills::Offline })
+    }
+
     /// The executor link to `agent_id`'s machine for its machine runs,
     /// connecting on demand.
     ///
@@ -1487,6 +1501,20 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
             )))
         })
     }
+}
+
+/// A machine's answer for [`RemoteLaunchPort::machine_skills`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MachineSkills {
+    /// The user skills it listed.
+    Listed(Vec<intent_core::node_link::MachineSkill>),
+    /// It is reachable (no query was made).
+    Reachable,
+    /// No link came up, or it did not answer in time.
+    Offline,
+    /// Its link speaks a protocol older than
+    /// [`intent_core::node_link::SKILLS_PROTOCOL`].
+    UpdateRequired,
 }
 
 /// A remote agent calling `ws.script.*` through its machine.

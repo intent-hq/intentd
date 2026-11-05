@@ -204,5 +204,35 @@ pub(super) fn page_skill_list(
     })
 }
 
+/// `skill.list` with `agentId`: always the envelope, paged like
+/// [`page_skill_list`], keeping the reply's `stale` / `unavailable`.
+pub(super) fn page_agent_skill_list(
+    listed: Value,
+    params: &Map<String, Value>,
+    workspace_id: &intent_core::WorkspaceId,
+    agent_id: &intent_core::AgentId,
+) -> Result<Value, RpcErr> {
+    let Value::Object(mut listed) = listed else {
+        return Ok(listed);
+    };
+    let rows = match listed.remove("skills") {
+        Some(Value::Array(rows)) => rows,
+        _ => Vec::new(),
+    };
+    let scope = format!("skill.list:{}:{}", workspace_id.as_str(), agent_id.as_str());
+    let envelope = json!({
+        "skills": [],
+        "nextToken": "x".repeat(128 + scope.len()),
+        "stale": true,
+        "unavailable": "machine-update-required",
+    });
+    let page = page_rows(rows, params, &scope, row_budget(&envelope), |row| {
+        omit_body(row, "description");
+    })?;
+    listed.insert("skills".into(), Value::Array(page.rows));
+    listed.insert("nextToken".into(), token_value(page.next_token));
+    Ok(Value::Object(listed))
+}
+
 #[cfg(test)]
 mod tests;

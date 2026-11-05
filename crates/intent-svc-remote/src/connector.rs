@@ -24,8 +24,9 @@ use tokio::time::Instant;
 
 use intent_core::machines::RemoteMachineState;
 use intent_core::node_link::{
-    JournalBody, LaunchCommand, LinkFrame, LinkOutcome, LinkRpcError, LinkWelcome,
-    MachineCapabilities, SetupState, StopId, StopOutcome, FINAL_STOP_PROTOCOL,
+    JournalBody, LaunchCommand, LinkFrame, LinkId, LinkOutcome, LinkRpcError, LinkWelcome,
+    MachineCapabilities, MachineSkill, SetupState, SkillsQuery, StopId, StopOutcome,
+    FINAL_STOP_PROTOCOL, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::{AgentPlatform, PlatformAvailability};
@@ -33,6 +34,7 @@ use intent_core::remote_launch::{
     EffectiveIsolation, PlacementError, RemoteSetupState, RemoteSetupStatus,
 };
 use intent_core::{AgentId, Error, Result, WorkspaceId};
+use intent_services::feature_api::feature_ports::MachineSkills;
 use intent_services::feature_api::Services;
 use intent_store::Store;
 use intent_transport::node_link::{
@@ -284,6 +286,8 @@ pub(crate) struct Shared {
     survivors_unclaimed: std::sync::atomic::AtomicBool,
     /// Waiting for the machine's next capabilities report.
     capability_waiters: Mutex<Vec<oneshot::Sender<MachineCapabilities>>>,
+    /// Waiting for a `skillsReply` (nodeProtocol 12), by query id.
+    skills_waiters: Mutex<HashMap<LinkId, oneshot::Sender<Vec<MachineSkill>>>>,
     ingested: Mutex<NodeCounter>,
     /// Each agent's checkout and setup output tail (nodeProtocol 10).
     setup_outputs: Mutex<HashMap<AgentId, SetupTail>>,
@@ -378,6 +382,7 @@ impl Shared {
             || self.machine_runs_live()
             || !lock(&self.stops).is_empty()
             || !lock(&self.capability_waiters).is_empty()
+            || !lock(&self.skills_waiters).is_empty()
             || (self
                 .survivors_unclaimed
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -1200,6 +1205,7 @@ impl RemoteNode {
             claim_lock: tokio::sync::Mutex::new(()),
             survivors_unclaimed: std::sync::atomic::AtomicBool::new(false),
             capability_waiters: Mutex::new(Vec::new()),
+            skills_waiters: Mutex::new(HashMap::new()),
             ingested: Mutex::new(acked),
             demand,
             shutdown: watch::channel(false).0,
@@ -1318,6 +1324,39 @@ impl RemoteNode {
             self.shared.resend_queued(&link);
         }
         true
+    }
+
+    /// What the machine says about its skills (node-link.md § Skills on the
+    /// machine), connecting on demand: with `query`, its user skills;
+    /// without, only whether it is reachable. Bounded by the capabilities
+    /// timeout.
+    pub async fn machine_skills(&self, query: bool) -> MachineSkills {
+        let bound = self.shared.tuning.capabilities_timeout;
+        if !matches!(
+            tokio::time::timeout(bound, self.connect()).await,
+            Ok(Ok(()))
+        ) {
+            return MachineSkills::Offline;
+        }
+        if self.shared.protocol() < SKILLS_PROTOCOL {
+            return MachineSkills::UpdateRequired;
+        }
+        if !query {
+            return MachineSkills::Reachable;
+        }
+        let query_id = LinkId::new_v4();
+        let (tx, rx) = oneshot::channel();
+        lock(&self.shared.skills_waiters).insert(query_id, tx);
+        let frame = LinkFrame::Skills(SkillsQuery { query_id });
+        let answer = match self.shared.send(&frame).await {
+            Ok(()) => match tokio::time::timeout(bound, rx).await {
+                Ok(Ok(skills)) => MachineSkills::Listed(skills),
+                _ => MachineSkills::Offline,
+            },
+            Err(_) => MachineSkills::Offline,
+        };
+        lock(&self.shared.skills_waiters).remove(&query_id);
+        answer
     }
 
     /// Connect if needed and ask the machine for a fresh capabilities
@@ -1568,6 +1607,7 @@ async fn run(
                 }
                 // Fail the capability requests; they no longer hold a link.
                 lock(&shared.capability_waiters).clear();
+                lock(&shared.skills_waiters).clear();
                 retry = shared.wants_link();
                 if retry {
                     let delay = match failure {
@@ -1623,6 +1663,7 @@ async fn run(
                 let _ = waiter.send(Err(failure.clone()));
             }
             lock(&shared.capability_waiters).clear();
+            lock(&shared.skills_waiters).clear();
             shared.announce().await;
             retry = shared.wants_link();
             if retry {
@@ -1692,6 +1733,7 @@ async fn run(
         });
         shared.disconnected();
         lock(&shared.capability_waiters).clear();
+        lock(&shared.skills_waiters).clear();
         // The machine stops this binding's scripts when its link closes.
         shared
             .machine_runs_lost("remote-script-lost: the machine disconnected")
@@ -1796,6 +1838,11 @@ async fn serve(
                     }
                     LinkEvent::Frame(LinkFrame::SetupOutput(output)) => {
                         shared.setup_output(output).await;
+                    }
+                    LinkEvent::Frame(LinkFrame::SkillsReply(reply)) => {
+                        if let Some(waiter) = lock(&shared.skills_waiters).remove(&reply.query_id) {
+                            let _ = waiter.send(reply.skills);
+                        }
                     }
                     LinkEvent::Frame(frame)
                         if frame.channel() == intent_core::node_link::LinkChannel::Script =>
@@ -2054,6 +2101,10 @@ async fn serve_git(
 /// node reports its checkout and session ready, and the start error of an
 /// agent that never got there.
 async fn record_placement(shared: &Shared, record: &intent_core::node_link::JournalRecord) {
+    if let JournalBody::Skills { skills } = &record.body {
+        record_skills(shared, record, skills.clone()).await;
+        return;
+    }
     let update: Box<dyn FnOnce(&mut intent_core::remote_launch::RemotePlacementView) + Send> =
         match &record.body {
             JournalBody::Started { .. } => Box::new(|view| {
@@ -2131,6 +2182,36 @@ async fn record_placement(shared: &Shared, record: &intent_core::node_link::Jour
         Ok(false) => {}
         Err(error) => {
             tracing::warn!(agent = %record.agent_id, %error, "remote node: could not record the agent's placement state");
+        }
+    }
+}
+
+/// Keep the skills the machine reported for an agent with its placement
+/// (not projected), and announce a change as `skills:changed` with the
+/// agent.
+async fn record_skills(
+    shared: &Shared,
+    record: &intent_core::node_link::JournalRecord,
+    skills: Vec<MachineSkill>,
+) {
+    match crate::view::update(
+        &shared.store,
+        &record.workspace_id,
+        &record.agent_id,
+        move |view| view.skills = Some(skills),
+    )
+    .await
+    {
+        Ok(true) => {
+            if let Some(services) = &shared.services {
+                services
+                    .publish_agent_skills_changed(&record.workspace_id, &record.agent_id)
+                    .await;
+            }
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::warn!(agent = %record.agent_id, %error, "remote node: could not record the agent's skills");
         }
     }
 }

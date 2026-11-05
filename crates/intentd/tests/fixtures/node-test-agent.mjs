@@ -28,6 +28,8 @@
 // "wsapi-tool <code>" does the same and also reports the call as a
 // `workspace_api` tool_call / tool_call_update carrying the MCP content
 // items, as a real provider does. A `<system>` block in the prompt is ignored.
+// "echo-skills" streams "skills: <names>" from every `<name>` of an
+// `<available_skills>` catalog anywhere in the raw prompt (or "skills: none").
 import readline from 'node:readline';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -149,6 +151,22 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       return send({ id: msg.id, result: { sessionId: SESSION } });
     case 'session/prompt': {
       const text = promptText(msg.params);
+      if (text === 'echo-skills') {
+        const raw = (msg.params?.prompt ?? []).map((block) => block?.text ?? '').join('\n');
+        const catalog = raw.match(/<available_skills>([\s\S]*?)<\/available_skills>/);
+        const names = catalog ? [...catalog[1].matchAll(/<name>([^<]*)<\/name>/g)].map((m) => m[1]) : [];
+        send({
+          method: 'session/update',
+          params: {
+            sessionId: SESSION,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `skills: ${names.length ? names.join(',') : 'none'}` },
+            },
+          },
+        });
+        return send({ id: msg.id, result: { stopReason: 'end_turn' } });
+      }
       const asTool = text.startsWith('wsapi-tool ');
       if (asTool || text.startsWith('wsapi ')) {
         const code = text.slice(asTool ? 'wsapi-tool '.length : 'wsapi '.length);

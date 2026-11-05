@@ -68,16 +68,22 @@ fn is_false(value: &bool) -> bool {
 /// acknowledgement (`stopId` on [`LinkFrame::Stop`], [`LinkFrame::StopAck`]);
 /// 8 adds the saved-script frames ([`SCRIPT_PROTOCOL`]); 9 adds final
 /// stops and the bind-time checkout sweep ([`FINAL_STOP_PROTOCOL`]); 10 adds
-/// the prepared checkout ([`PREPARED_CHECKOUT_PROTOCOL`]); each keeps
+/// the prepared checkout ([`PREPARED_CHECKOUT_PROTOCOL`]); 12 adds the
+/// machine's skills ([`SKILLS_PROTOCOL`]); each keeps
 /// everything the one before has. Neither 6 nor the single-node 5 ever
 /// shipped, and a protocol-6 peer cannot confirm a stop, so this build
-/// speaks 7 to 10: a backend never takes a stop as confirmed by a machine
+/// speaks 7 to 12: a backend never takes a stop as confirmed by a machine
 /// that cannot acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 10 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 12 };
+
+/// The first protocol with the machine's skills: the [`JournalBody::Skills`]
+/// record and the [`LinkFrame::Skills`] / [`LinkFrame::SkillsReply`] query.
+/// Neither side sends them on a link that negotiated less.
+pub const SKILLS_PROTOCOL: u32 = 12;
 
 /// The first protocol with the prepared checkout: [`LaunchCommand::checkout`]
 /// and module git remotes (`intent://ws/<ws>/agents/<agent>/modules/<key>`).
@@ -138,10 +144,12 @@ impl std::fmt::Display for ProtocolRange {
 /// to the machine on `/node/link`, by their wire `type` tag: binding,
 /// liveness, agent control, journal acks, the capabilities request,
 /// responses to the machine's forwarded `workspace.call` requests, and
-/// starting and stopping script runs (protocol 8). Nothing else is admitted
+/// starting and stopping script runs (protocol 8), and the skills query
+/// (protocol 12). Nothing else is admitted
 /// from an executor credential; the machine-to-backend frames (`welcome`,
 /// `journal`, `replayComplete`, `request`, `capabilitiesReply`, `stopAck`,
-/// `scriptStarted`, `scriptOutput`, `scriptExited`) and `cancelRequest` are
+/// `scriptStarted`, `scriptOutput`, `scriptExited`, `skillsReply`) and
+/// `cancelRequest` are
 /// refused. Git sessions use the
 /// separate `/node/git` connection, admitted per binding. Sorted;
 /// [`LinkFrame::admitted_from_executor`] is the typed form.
@@ -157,6 +165,7 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "response",
     "scriptStart",
     "scriptStop",
+    "skills",
     "stop",
 ];
 
@@ -565,6 +574,42 @@ pub const MAX_SCRIPT_OUTPUT_BYTES: usize = 64 * 1024;
 /// past it the sender drops output and later reports how much it dropped.
 pub const SCRIPT_OUTPUT_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 
+/// One skill the machine discovered: the `skill.list` row, with paths on
+/// the machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineSkill {
+    pub name: String,
+    pub description: String,
+    pub location: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_directory: Option<String>,
+    /// `"user"` or `"project"`.
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<String>,
+}
+
+/// Backend to machine (protocol 12): list the machine's user skills. No
+/// profile member is sent: a profile that sets an account folder cannot run
+/// on another machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillsQuery {
+    pub query_id: LinkId,
+}
+
+/// Machine to backend (protocol 12): the answer to the [`SkillsQuery`]
+/// `query_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillsReply {
+    pub query_id: LinkId,
+    pub skills: Vec<MachineSkill>,
+}
+
 /// A request over the link: node to head for forwarded workspace API calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -696,6 +741,10 @@ pub enum LinkFrame {
     /// Machine to backend (nodeProtocol 10): the prepared checkout's
     /// progress and setup script output.
     SetupOutput(SetupOutput),
+    /// Backend to machine (nodeProtocol 12): list its user skills.
+    Skills(SkillsQuery),
+    /// Machine to backend (nodeProtocol 12): the skills it found.
+    SkillsReply(SkillsReply),
 }
 
 /// A chunk of an agent's checkout progress and setup output, `seq`
@@ -737,7 +786,9 @@ impl LinkFrame {
             | Self::Stop { .. }
             | Self::StopAck { .. }
             | Self::Capabilities
-            | Self::CapabilitiesReply { .. } => LinkChannel::Control,
+            | Self::CapabilitiesReply { .. }
+            | Self::Skills(_)
+            | Self::SkillsReply(_) => LinkChannel::Control,
             Self::Journal(_) | Self::Ack { .. } | Self::ReplayComplete { .. } => {
                 LinkChannel::Journal
             }
@@ -759,6 +810,10 @@ impl LinkFrame {
         match self {
             Self::Launch(command) if command.checkout.is_some() => PREPARED_CHECKOUT_PROTOCOL,
             Self::SetupOutput(_) => PREPARED_CHECKOUT_PROTOCOL,
+            Self::Skills(_) | Self::SkillsReply(_) => SKILLS_PROTOCOL,
+            Self::Journal(record) if matches!(record.body, JournalBody::Skills { .. }) => {
+                SKILLS_PROTOCOL
+            }
             Self::Journal(record)
                 if matches!(
                     record.body,
@@ -788,7 +843,8 @@ impl LinkFrame {
             | Self::Response { .. }
             | Self::Capabilities
             | Self::ScriptStart(_)
-            | Self::ScriptStop(_) => true,
+            | Self::ScriptStop(_)
+            | Self::Skills(_) => true,
             Self::Welcome(_)
             | Self::Journal(_)
             | Self::ReplayComplete { .. }
@@ -799,7 +855,8 @@ impl LinkFrame {
             | Self::ScriptStarted(_)
             | Self::ScriptOutput(_)
             | Self::ScriptExited(_)
-            | Self::SetupOutput(_) => false,
+            | Self::SetupOutput(_)
+            | Self::SkillsReply(_) => false,
         }
     }
 
@@ -895,6 +952,11 @@ pub enum JournalBody {
         error: Option<String>,
         finished_at: String,
     },
+    /// nodeProtocol 12: the skills the machine found for the agent (its
+    /// user skills for the launch's profile and its checkout's project
+    /// skills), before `started`.
+    #[serde(rename_all = "camelCase")]
+    Skills { skills: Vec<MachineSkill> },
 }
 
 /// `exited.failure`: the structured form of an exit error. `data` is

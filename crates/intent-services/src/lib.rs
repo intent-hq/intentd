@@ -68,6 +68,7 @@ mod executor_ops;
 mod link_traffic_ops;
 mod plain_folder;
 mod remote_machine_ops;
+mod remote_skills;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;
@@ -19749,6 +19750,7 @@ impl WorkspaceApi for Services {
             caps.insert("workspaceLabels".into(), serde_json::json!(1));
             caps.insert("workspaceAutoArchiveOptOut".into(), serde_json::json!(1));
             caps.insert("messageBlockPages".into(), serde_json::json!(1));
+            caps.insert("remoteAgentSkills".into(), serde_json::json!(1));
             // Reads answer bounded pages by default (default page sizes,
             // maximums and byte budgets), so a new app pages them.
             caps.insert("boundedReads".into(), serde_json::json!(1));
@@ -20304,6 +20306,14 @@ impl WorkspaceApi for Services {
 
             Ok(serde_json::to_value(&sorted_skills).unwrap_or(serde_json::Value::Array(vec![])))
         })
+    }
+
+    fn skill_list_for_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.agent_skill_list(workspace_id, agent_id))
     }
 
     fn specialist_create(
@@ -32291,6 +32301,13 @@ impl WorkspaceApi for Services {
             // path and the store-only fallback persist what the model sees.
             // Same gate as the stamp — only a user-origin send is a person
             // speaking; the owner's content stays byte-identical.
+            // A `/name` a remote agent's machine lacks still sends; it gets
+            // a notice once the send is accepted.
+            let asked_skill = origin
+                .is_user()
+                .then(|| crate::remote_skills::leading_skill_name(&content))
+                .flatten()
+                .map(|name| format!("/{name}"));
             if origin.is_user() {
                 self.annotate_collaborator_sender(&workspace_id, &mut content)
                     .await?;
@@ -32312,7 +32329,8 @@ impl WorkspaceApi for Services {
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
             // (the child is never killed) and streams the message immediately.
-            if let Some(manager) = self.agent_manager() {
+            let (notice_workspace, notice_agent) = (workspace_id.clone(), agent_id.clone());
+            let sent = if let Some(manager) = self.agent_manager() {
                 // Construct TurnOptions only when the manager is attached
                 // to avoid cloning large payloads on the fallback path.
                 let options = crate::agent_manager::TurnOptions {
@@ -32355,7 +32373,12 @@ impl WorkspaceApi for Services {
                     message_metadata,
                 )
                 .await
+            };
+            if let (Ok(_), Some(asked)) = (&sent, asked_skill) {
+                self.note_unavailable_skill(&notice_workspace, &notice_agent, &asked)
+                    .await;
             }
+            sent
         }))
     }
 

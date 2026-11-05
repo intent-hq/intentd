@@ -5931,6 +5931,19 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "skill.list" if params.get("agentId").is_some_and(|v| !v.is_null()) => {
+            let ws_id = require_workspace_id(params)?;
+            let agent_id = require_agent_id(params)?;
+            match api
+                .skill_list_for_agent(ws_id.clone(), agent_id.clone())
+                .await
+            {
+                Ok(v) => catalog_lists::page_agent_skill_list(v, params, &ws_id, &agent_id),
+                Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+                Err(Error::NotFound(m)) => Err(not_found(m)),
+                Err(e) => Err(domain_to_rpc(e)),
+            }
+        }
         "skill.list" => {
             let ws_id = require_workspace_id(params)?;
             match api.skill_list(ws_id.clone()).await {

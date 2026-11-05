@@ -27,7 +27,7 @@ use intent_acp::{
 };
 use intent_core::node_link::{
     ExitFailure, FinalPush, JournalBody, JournalRecord, LaunchCommand, LeaseBinding,
-    MachineCapacity, StopOutcome,
+    MachineCapacity, StopOutcome, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::CapacityRefusal;
@@ -38,6 +38,7 @@ use intent_providers::ProviderConfig;
 use super::checkout::{Checkouts, Prepared, FINAL_PUSH_TIMEOUT, WIP_PUSH_TIMEOUT};
 use super::scripts::ScriptProcesses;
 use super::setup::{self, SetupOutput, SetupStatus};
+use super::skills;
 use super::workspace_api::{self, HeadLink};
 
 /// Error codes at the start of a journaled launch or turn error.
@@ -340,6 +341,8 @@ struct Agent {
     worktree: Mutex<Option<PathBuf>>,
     /// Prepended to the agent's first turn (see [`Prepared::notice`]).
     notice: Mutex<Option<String>>,
+    /// The machine's skills catalog block, added to the agent's first turn.
+    skills_catalog: Mutex<Option<String>>,
     /// Serializes the agent's WIP pushes.
     wip: tokio::sync::Mutex<()>,
     /// A final stop ends the agent: its exit push is bounded by
@@ -792,6 +795,11 @@ impl Runner {
 
     /// The link agents forward control-plane calls on; the newest session
     /// sets it when it adopts its lease.
+    /// This machine's home, for skill discovery.
+    pub(super) fn home(&self) -> Option<PathBuf> {
+        self.inner.home.clone()
+    }
+
     pub(super) fn head_link(&self) -> &HeadLink {
         &self.inner.head
     }
@@ -962,6 +970,7 @@ impl Runner {
             },
             worktree: Mutex::new(None),
             notice: Mutex::new(None),
+            skills_catalog: Mutex::new(None),
             wip: tokio::sync::Mutex::new(()),
             final_stop: std::sync::atomic::AtomicBool::new(false),
             final_push: Mutex::new(None),
@@ -1173,6 +1182,7 @@ impl Runner {
                         (Some(setup), Some(notice)) => Some(format!("{setup}\n\n{notice}")),
                         (setup, notice) => setup.or(notice),
                     };
+                    self.find_skills(&agent, &cwd).await;
                     match workspace_api::serve(
                         &agent.id,
                         &agent.workspace_id,
@@ -1611,6 +1621,22 @@ impl Runner {
         None
     }
 
+    /// Discover the agent's skills on this machine for its first prompt and,
+    /// on a protocol 12 link, journal them before it starts.
+    async fn find_skills(&self, agent: &Agent, cwd: &std::path::Path) {
+        let found = skills::discover(Some(cwd.to_path_buf()), self.inner.home.clone()).await;
+        *lock(&agent.skills_catalog) = skills::catalog_block(&found);
+        let reports = self
+            .inner
+            .head
+            .get()
+            .is_some_and(|link| link.protocol() >= SKILLS_PROTOCOL);
+        if reports {
+            self.append(agent_entry(agent, JournalBody::Skills { skills: found }))
+                .await;
+        }
+    }
+
     /// Push the agent's work to head, if its checkout was prepared. Failures
     /// are logged: the next push sends the same refs again.
     async fn push_wip(&self, agent: &Agent, kind: Push) {
@@ -2008,6 +2034,14 @@ async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, 
         return failed(format!("{}: the agent has exited", codes::NOT_RUNNING));
     };
     // Set before the agent is ready, so the first turn takes it.
+    if let Some(catalog) = lock(&agent.skills_catalog).take() {
+        match serde_json::from_value(serde_json::json!({ "type": "text", "text": catalog })) {
+            Ok(block) => blocks.insert(0, block),
+            Err(error) => {
+                tracing::warn!(error = %error, "node: the skills catalog is not a prompt block");
+            }
+        }
+    }
     let notice = lock(&agent.notice).take();
     if let Some(notice) = notice {
         match serde_json::from_value(serde_json::json!({ "type": "text", "text": notice })) {

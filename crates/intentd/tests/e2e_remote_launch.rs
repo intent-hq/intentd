@@ -210,6 +210,11 @@ struct Machine {
 }
 
 async fn start_machine(dir: &Path, backend_id: &str) -> Machine {
+    start_machine_with(dir, backend_id, &[]).await
+}
+
+/// [`start_machine`] with extra environment for the machine process.
+async fn start_machine_with(dir: &Path, backend_id: &str, env: &[(&str, &str)]) -> Machine {
     let fixture = format!(
         "{}/tests/fixtures/node-test-agent.mjs",
         env!("CARGO_MANIFEST_DIR")
@@ -223,6 +228,7 @@ async fn start_machine(dir: &Path, backend_id: &str) -> Machine {
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("MOCK_AGENT_SCRIPT_PATH", &fixture)
+        .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(dir.join("machine.log")).unwrap(),
@@ -2608,4 +2614,223 @@ fn entry_is_script(work: &Path) -> bool {
         let name = entry.unwrap().file_name().to_string_lossy().into_owned();
         name.starts_with("setup-") && Path::new(&name).extension().is_some_and(|ext| ext == "sh")
     })
+}
+
+fn write_skill(root: &Path, name: &str, description: &str) {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\n\nUse it.\n"),
+    )
+    .unwrap();
+}
+
+fn skill_names(listed: &Value) -> Vec<String> {
+    listed["skills"]
+        .as_array()
+        .unwrap_or_else(|| panic!("skill.list with agentId is the envelope: {listed}"))
+        .iter()
+        .map(|skill| skill["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// A remote agent's skills are its machine's (parity S7, node-link.md §
+/// Skills on the machine): before its first start `skill.list` with its
+/// `agentId` merges the machine's user skills with the workspace's project
+/// skills; its first prompt carries the machine's catalog; once the machine
+/// reports it, `skills:changed` names the agent and `skill.list` answers
+/// with machine paths. The backend's own user skills never appear. A
+/// message starting with a skill the machine lacks still runs, with a
+/// `skill_unavailable` notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remote_agents_skills_come_from_its_machine() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping remote skills e2e: node or git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-skills-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    write_skill(
+        &repo.join(".agents/skills"),
+        "proj-skill",
+        "from the project",
+    );
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let head_claude = scratch.path().join("head-claude");
+    write_skill(
+        &head_claude.join("skills"),
+        "backend-only",
+        "on the backend",
+    );
+    let head_claude_env = head_claude.to_string_lossy().into_owned();
+    let (_head, port, cfg, ws_id) = start_backend_with(
+        &scratch.path().join("head"),
+        &repo,
+        &[("CLAUDE_CONFIG_DIR", &head_claude_env)],
+    )
+    .await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let caps = ok(&mut rpc_ws, 1, "system.capabilities", json!({})).await;
+    assert_eq!(caps["remoteAgentSkills"], 1, "{caps}");
+    let backend = ok(&mut rpc_ws, 2, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let node_claude = scratch.path().join("node-claude");
+    write_skill(
+        &node_claude.join("skills"),
+        "machine-skill",
+        "on the machine",
+    );
+    let node_claude_env = node_claude.to_string_lossy().into_owned();
+    let machine = start_machine_with(
+        &node_dir,
+        &backend_id,
+        &[("CLAUDE_CONFIG_DIR", &node_claude_env)],
+    )
+    .await;
+    ok(
+        &mut rpc_ws,
+        3,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        4,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let mut skill_events = connect(port, cfg.clone()).await;
+    ok(
+        &mut skill_events,
+        5,
+        "events.subscribe",
+        json!({ "eventTypes": ["skills:changed"] }),
+    )
+    .await;
+    let created = create_remote(&mut rpc_ws, &ws_id, "Remote", 10).await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+
+    let before = ok(
+        &mut rpc_ws,
+        40,
+        "skill.list",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let names = skill_names(&before);
+    assert!(names.contains(&"machine-skill".to_owned()), "{before}");
+    assert!(names.contains(&"proj-skill".to_owned()), "{before}");
+    assert!(!names.contains(&"backend-only".to_owned()), "{before}");
+    assert!(before.get("unavailable").is_none(), "{before}");
+    let local = ok(
+        &mut rpc_ws,
+        41,
+        "skill.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        local
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "backend-only"),
+        "without agentId the backend's own skills: {local}"
+    );
+
+    let reply = turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        "echo-skills",
+        50,
+    )
+    .await;
+    assert!(reply.contains("machine-skill"), "{reply}");
+    assert!(reply.contains("proj-skill"), "{reply}");
+    assert!(!reply.contains("backend-only"), "{reply}");
+
+    let changed = loop {
+        let changed = event(&mut skill_events, "skills:changed").await;
+        if changed["data"]["agentId"] == agent_id.as_str() {
+            break changed;
+        }
+    };
+    assert_eq!(changed["data"]["workspaceId"], ws_id.as_str(), "{changed}");
+    let after = ok(
+        &mut rpc_ws,
+        60,
+        "skill.list",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let rows = after["skills"].as_array().unwrap();
+    let machine_row = rows
+        .iter()
+        .find(|s| s["name"] == "machine-skill")
+        .unwrap_or_else(|| panic!("{after}"));
+    assert!(
+        machine_row["location"]
+            .as_str()
+            .unwrap()
+            .contains("node-claude"),
+        "{machine_row}"
+    );
+    let project_row = rows.iter().find(|s| s["name"] == "proj-skill").unwrap();
+    assert_eq!(project_row["scope"], "project");
+    assert!(
+        !project_row["location"]
+            .as_str()
+            .unwrap()
+            .starts_with(&*repo.to_string_lossy()),
+        "the project skill is the one in the machine's checkout: {project_row}"
+    );
+    assert!(after.get("stale").is_none(), "{after}");
+
+    turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        "/no-such-skill please",
+        70,
+    )
+    .await;
+    turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        "/machine-skill please",
+        72,
+    )
+    .await;
+    let convo = ok(
+        &mut rpc_ws,
+        80,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let notices: Vec<&Value> = convo["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["metadata"]["type"] == "skill_unavailable")
+        .collect();
+    assert_eq!(notices.len(), 1, "{convo}");
+    assert_eq!(notices[0]["metadata"]["skill"], "no-such-skill");
+    assert_eq!(notices[0]["metadata"]["machine"], "E2E node");
+    let text = notices[0]["content"].to_string();
+    assert!(text.contains("/no-such-skill"), "{text}");
+    assert!(text.contains("E2E node"), "{text}");
 }
