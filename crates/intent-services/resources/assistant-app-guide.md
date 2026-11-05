@@ -1177,6 +1177,13 @@ when Undo cannot preserve the file's contents; the file stays unchanged.
 A missing-file or access error is different: check the path and access rather than
 assuming the file cannot be previewed.
 
+In Assistant chat, a short file link (`intent://local/file/{path}`) opens a file from the
+Assistant's own working folder (`chief-cwd` in the daemon's data folder), not from a
+workspace. Files there are temporary and are cleared when the daemon restarts, and edits
+made to them in the file panel are not saved yet.
+
+<!-- Sources: packages/intentd/crates/intent-core/src/chief_cwd.rs; packages/intentd/crates/intent-services/src/file_ops.rs (resolve_root, chief_root). -->
+
 Assistant chat can show an image from any workspace on the connected computer when its link names that workspace (`intent://local/{workspaceId}/file/{path}`). A workspace agent's chat shows only its own workspace's images; another workspace's image appears as a link or as a placeholder saying it is from another workspace. Open that workspace, or ask the Assistant, to view it.
 
 With a supporting daemon, a tool output too large to load in one read shows its first part in agent chat with **Output truncated — showing <size> of <size>**, or a preview with **Too large to show in full — showing a preview**. An image too large to load keeps its thumbnail with **The full image is too large to show**. Regenerating a message re-sends its original images even when they are too large to show. A single message too large for one page shows its first part, without the parts that did not fit, and a **Show full message** button that loads the rest.
