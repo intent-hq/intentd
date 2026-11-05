@@ -229,7 +229,6 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
         "return await ws.hook.list();",
         "return await ws.desktop.listDisplay();",
         "return await ws.browser.listTabs();",
-        r#"return await ws.workspace.setTitle("Renamed");"#,
         "return await ws.workspace.archive();",
         r#"return await ws.file.getAttachment("att-1");"#,
         r#"return await ws.git.registerRoot("sub");"#,
@@ -453,6 +452,92 @@ async fn workspace_setters_are_forwarded_to_head() {
         failed && text.contains("remote-agent-unsupported"),
         "{text}"
     );
+    answering.abort();
+}
+
+/// intent-hq/intent#8593: a call's cards (two proposals here) go to head as
+/// one stamped batch before the call answers, whether the agent's code
+/// returns the card or discards it, as a local agent's call registers them.
+#[tokio::test]
+async fn a_calls_cards_are_published_to_head_as_one_batch() {
+    use intent_core::remote_launch::workspace_api::ATTACHMENTS_METHOD;
+    let dir = tempfile::tempdir().unwrap();
+    let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
+    let head = HeadLink::default();
+    head.set(node_end);
+    let server = server(&agent(), &workspace(), dir.path(), &gates(), head).unwrap();
+    let (published_tx, mut published) = tokio::sync::mpsc::unbounded_channel();
+    let answering = tokio::spawn(async move {
+        let mut proposals = 0;
+        while let Some(event) = head_end.events.recv().await {
+            let LinkEvent::Request(request) = event else {
+                continue;
+            };
+            let frame = request.request().clone();
+            let outcome = if frame.params["method"] == ATTACHMENTS_METHOD {
+                published_tx.send(frame.params["args"].clone()).unwrap();
+                json!({})
+            } else {
+                proposals += 1;
+                let card = json!({ "kind": "workspace-create", "applyToolCallId": format!("workspace-create-{proposals}") });
+                json!({
+                    "ok": true,
+                    "proposal": card,
+                    "__mcpContentItems": [
+                        { "type": "text", "text": json!({ "ok": true, "proposal": card }).to_string() },
+                        { "type": "resource", "resource": {
+                            "uri": format!("intent-proposal://workspace-create/{proposals}"),
+                            "name": "Create workspace",
+                            "mimeType": "application/vnd.intent.proposal+json",
+                            "text": card.to_string(),
+                        } },
+                    ],
+                })
+            };
+            request.respond(LinkOutcome::Ok(outcome)).await.unwrap();
+        }
+    });
+
+    let returned = call(
+        &server,
+        r#"const a = await ws.workspace.proposeSibling({ title: "A", initialPrompt: "Go" }); await ws.workspace.proposeSibling({ title: "B", initialPrompt: "Go" }); return a;"#,
+    )
+    .await;
+    assert!(!returned.0, "{returned:?}");
+    let batch = published
+        .try_recv()
+        .expect("published before the call answered");
+    let cards = batch["attachments"].as_array().unwrap();
+    assert_eq!(cards.len(), 2, "{batch}");
+    for card in cards {
+        let id = card["id"].as_str().unwrap();
+        assert!(
+            intent_core::turn_attachments::is_attachment_id(id),
+            "{card}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(card["text"].as_str().unwrap()).unwrap()["attachmentId"],
+            id,
+            "{card}"
+        );
+    }
+    assert!(
+        returned.1.contains(cards[0]["id"].as_str().unwrap()),
+        "the output carries the batch's nonce: {}",
+        returned.1
+    );
+    assert!(published.try_recv().is_err(), "one batch per call");
+
+    let discarded = call(
+        &server,
+        r#"await ws.workspace.proposeSibling({ title: "C", initialPrompt: "Go" }); return "done";"#,
+    )
+    .await;
+    assert!(!discarded.0, "{discarded:?}");
+    let batch = published
+        .try_recv()
+        .expect("a discarded card is published too");
+    assert_eq!(batch["attachments"].as_array().unwrap().len(), 1, "{batch}");
     answering.abort();
 }
 

@@ -657,9 +657,9 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
 /// intent-hq/intent#8593: a remote agent sets the workspace status, status
 /// image and title and its own name through head (the explicit name and
 /// the seeded title are kept, as for a local agent), and proposes a
-/// sibling workspace. The
-/// proposal lands on the agent's message in head's history as a pending,
-/// Apply-able card.
+/// sibling workspace. Its code discards the card, so only the batch the
+/// machine publishes to head can put it on the agent's message in head's
+/// history as a pending, Apply-able card.
 async fn remote_workspace_setters_and_proposal(
     rpc_ws: &mut common::TlsWs,
     events: &mut common::TlsWs,
@@ -712,12 +712,12 @@ async fn remote_workspace_setters_and_proposal(
         rpc_ws,
         events,
         (ws_id, agent_id),
-        r#"wsapi-tool return await ws.workspace.proposeSibling({ title: "Remote follow-up", initialPrompt: "Continue the remote work." });"#,
-        "Remote follow-up",
+        r#"wsapi-tool const p = await ws.workspace.proposeSibling({ title: "Remote follow-up", initialPrompt: "Continue the remote work." }); return JSON.stringify({ marker: "turn-proposal", id: p.proposalId });"#,
+        "turn-proposal",
         620,
     )
     .await;
-    assert!(proposed.starts_with("wsapi: "), "{proposed}");
+    let returned = wsapi_value(&proposed);
     let pending = timeout(wait(), async {
         let mut id = 630;
         loop {

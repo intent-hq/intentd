@@ -19,6 +19,17 @@ pub const CALL_METHOD: &str = "workspace.call";
 /// before an agent-initiated `git.commit`. Head answers `{ "autoCommit": bool }`.
 pub const COMMIT_POLICY_METHOD: &str = "git.commitPolicy";
 
+/// The frame method the node forwards (never from agent code: the table
+/// refuses it there) when one of the agent's `workspace_api` calls produced
+/// cards (such as a sibling proposal), before the call answers the provider.
+/// Args `{ "attachments": [{ "id", "mimeType", "uri", "name", "text" }] }`,
+/// at most [`MAX_FORWARDED_ATTACHMENTS`]. Head registers them as one batch
+/// for the agent's turn, as a local agent's call does, and answers `{}`.
+pub const ATTACHMENTS_METHOD: &str = "turn.attachments";
+
+/// Most cards one [`ATTACHMENTS_METHOD`] frame carries.
+pub const MAX_FORWARDED_ATTACHMENTS: usize = 32;
+
 /// Namespaces forwarded to head.
 pub const FORWARDED_NAMESPACES: &[&str] = &[
     "note", "task", "agent", "pr", "mr", "comment", "event", "script",
@@ -41,8 +52,8 @@ pub const LOCAL_METHODS: &[&str] = &[
 /// workspace details, the setters an agent names its workspace and itself
 /// with, and the sibling-workspace proposal. Head runs them as the agent
 /// with a local agent's checks, so `setAgentName` renames only the caller
-/// and a sub-agent cannot propose; head registers a proposal's card for the
-/// agent's message. They ride `workspace.call` on every protocol: an older
+/// and a sub-agent cannot propose; the node publishes a proposal's card
+/// with [`ATTACHMENTS_METHOD`]. They ride `workspace.call` on every protocol: an older
 /// machine refuses them itself, an older backend refuses them by its own
 /// table. The other `workspace.*` stay refused.
 pub const FORWARDED_METHODS: &[&str] = &[
@@ -210,6 +221,7 @@ mod tests {
             "file.getAttachment",
             "git.registerRoot",
             COMMIT_POLICY_METHOD,
+            ATTACHMENTS_METHOD,
             "note",
             "note.",
             "",

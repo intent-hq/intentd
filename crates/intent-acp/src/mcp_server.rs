@@ -59,7 +59,7 @@ pub use bindings::prelude_for_workspace as bindings_prelude_for_workspace;
 /// The `ws.script.<method>` binding dispatch, for the backend's handling of a
 /// remote agent's forwarded script calls.
 pub use bindings::script::dispatch as dispatch_script_method;
-pub use dispatch::{make_workspace_host_for_bridge, register_forwarded_attachments};
+pub use dispatch::make_workspace_host_for_bridge;
 
 /// Protocol version advertised on `initialize` (matches the TS server).
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -151,6 +151,24 @@ pub trait HostFrameRouter: Send + Sync {
         method: &str,
         args: &Value,
     ) -> Option<intent_core::BoxFuture<'static, std::result::Result<Value, String>>>;
+
+    /// Whether [`Self::publish_attachments`] takes the cards a
+    /// `workspace_api` call produced, for a bridge with no turn-attachment
+    /// registry of its own (a remote agent's node, whose transcript is on
+    /// head).
+    fn publishes_attachments(&self) -> bool {
+        false
+    }
+
+    /// Publish one `workspace_api` call's cards as one batch, before the
+    /// call answers the provider. Best effort: the cards are already in the
+    /// tool output.
+    fn publish_attachments(
+        &self,
+        _batch: Vec<intent_core::TurnAttachment>,
+    ) -> intent_core::BoxFuture<'static, ()> {
+        Box::pin(async {})
+    }
 }
 
 impl WorkspaceMcpServer {

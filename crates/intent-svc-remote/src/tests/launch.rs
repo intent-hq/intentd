@@ -989,8 +989,9 @@ async fn a_lease_agent_renames_itself_and_no_other_agent() {
 }
 
 /// intent-hq/intent#8593: a lease agent proposes a sibling workspace on
-/// head; the answer carries the proposal card the agent's transcript
-/// records. A remote sub-agent may not propose, as locally.
+/// head; the answer carries the proposal card, which the machine publishes
+/// back as one batch for the agent's transcript. A remote sub-agent may not
+/// propose, as locally.
 #[tokio::test]
 async fn a_lease_agent_proposes_a_sibling_workspace() {
     let (f, link, _machine) = fixture().await;
@@ -1014,24 +1015,83 @@ async fn a_lease_agent_proposes_a_sibling_workspace() {
                     .flatten()
             })
         })
-        .map(|text| serde_json::from_str::<Value>(text).unwrap())
-        .unwrap_or_else(|| panic!("a proposal resource: {proposed}"));
+        .map_or_else(
+            || panic!("a proposal resource: {proposed}"),
+            |text| serde_json::from_str::<Value>(text).unwrap(),
+        );
     assert_eq!(card["kind"], json!("workspace-create"), "{card}");
-    let nonce = card[intent_core::turn_attachments::ATTACHMENT_ID_KEY]
-        .as_str()
-        .unwrap_or_else(|| panic!("the card is stamped for the transcript: {card}"));
-    assert!(nonce.starts_with("tar-"), "{card}");
-    let registry = f.services.turn_attachments();
-    assert_eq!(
-        registry.pending_count_by_mime(&agent, "application/vnd.intent.proposal+json"),
-        1,
-        "head holds the card for the agent's turn"
+    assert!(
+        card.get(intent_core::turn_attachments::ATTACHMENT_ID_KEY)
+            .is_none(),
+        "the machine stamps and publishes cards, not head: {card}"
     );
-    assert_eq!(card["applyToolCallId"], proposed["proposalId"], "{card}");
     assert_eq!(
         card["payload"]["params"]["title"],
         json!("Follow-up"),
         "{card}"
+    );
+
+    // The machine publishes the call's cards as one batch: a nonce in the
+    // tool output claims them all, for this agent only.
+    use intent_core::remote_launch::workspace_api::ATTACHMENTS_METHOD;
+    let first = intent_core::new_attachment_id();
+    let second = intent_core::new_attachment_id();
+    let attachment = |id: &str| json!({ "id": id, "mimeType": "application/vnd.intent.proposal+json", "uri": "intent-proposal://x", "name": "Card", "text": "{}" });
+    let published = answered(
+        forward(
+            &link,
+            &agent,
+            ATTACHMENTS_METHOD,
+            json!({ "attachments": [attachment(&first), attachment(&second)] }),
+        )
+        .await,
+    );
+    assert_eq!(published, json!({}));
+    let registry = f.services.turn_attachments();
+    let claimed = registry.claim_at_tool_result(
+        &agent,
+        Some(&json!([{ "type": "text", "text": first }])),
+        "workspace_api",
+        None,
+    );
+    let ids: Vec<&str> = claimed.iter().map(|card| card.id.as_str()).collect();
+    assert_eq!(ids, [first.as_str(), second.as_str()]);
+    for (args, wanted) in [
+        (
+            json!({ "attachments": [attachment("")] }),
+            "not an attachment id",
+        ),
+        (
+            json!({ "attachments": [attachment("tar-1")] }),
+            "not an attachment id",
+        ),
+        (
+            json!({ "attachments": vec![attachment(&first); 33] }),
+            "at most 32",
+        ),
+        (json!({}), "needs an `attachments` array"),
+    ] {
+        let error = refused(forward(&link, &agent, ATTACHMENTS_METHOD, args).await);
+        assert!(error.message.contains(wanted), "{error:?}");
+    }
+    let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+    let unplaced = f.agent(&view).await;
+    let denied = refused(
+        forward(
+            &link,
+            &unplaced,
+            ATTACHMENTS_METHOD,
+            json!({ "attachments": [attachment(&first)] }),
+        )
+        .await,
+    );
+    assert!(
+        denied.message.starts_with("node-agent-denied"),
+        "{denied:?}"
+    );
+    assert_eq!(
+        registry.pending_count_by_mime(&unplaced, "application/vnd.intent.proposal+json"),
+        0
     );
 
     sqlx::query("UPDATE agent_session SET parent_agent_id = ? WHERE id = ?")
@@ -1478,21 +1538,16 @@ async fn user_and_local_agent_creates_stay_on_the_backend() {
     f.node.shutdown();
 }
 
-/// A remote agent reads its workspace's details through head; the
-/// setters, and `workspace.info` (answered on the machine), are refused.
+/// A remote agent reads its workspace's details through head;
+/// `archive`, and `workspace.info` (answered on the machine), are refused.
 #[tokio::test]
-async fn a_remote_agent_reads_workspace_details_but_cannot_set_them() {
+async fn a_remote_agent_reads_workspace_details_but_cannot_archive() {
     let (f, link, _machine) = fixture().await;
     let (agent, _) = f.placed().await;
     let details = answered(forward(&link, &agent, "workspace.details", json!({})).await);
     assert_eq!(details["id"], json!(workspace().as_str()), "{details}");
     assert_eq!(details["title"], json!("Remote"), "{details}");
     for (method, args) in [
-        ("workspace.setTitle", json!({ "title": "Renamed" })),
-        (
-            "workspace.setStatusMessage",
-            json!({ "statusMessage": "x" }),
-        ),
         ("workspace.archive", json!({})),
         ("workspace.info", json!({})),
     ] {

@@ -62,9 +62,8 @@ pub use mcp_server::bindings_prelude_for_bridge;
 pub use mcp_server::bindings_prelude_for_workspace;
 pub use mcp_server::dispatch_script_method;
 pub use mcp_server::{
-    make_workspace_host_for_bridge, register_forwarded_attachments, HostFrameRouter,
-    SpecialistModelOption, SpecialistModelOptions, WorkspaceMcpServer, MCP_PROTOCOL_VERSION,
-    WORKSPACE_API_SYSTEM_PROMPT_HEADING,
+    make_workspace_host_for_bridge, HostFrameRouter, SpecialistModelOption, SpecialistModelOptions,
+    WorkspaceMcpServer, MCP_PROTOCOL_VERSION, WORKSPACE_API_SYSTEM_PROMPT_HEADING,
 };
 pub use permission::{
     PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,

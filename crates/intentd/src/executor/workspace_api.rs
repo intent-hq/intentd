@@ -20,11 +20,13 @@ use serde_json::{json, Value};
 use intent_acp::session::McpServer;
 use intent_acp::{HostFrameRouter, McpBridge, NormalizedMcpServer, WorkspaceMcpServer};
 use intent_core::node_link::LinkOutcome;
-use intent_core::remote_launch::workspace_api::{self, Route, CALL_METHOD, COMMIT_POLICY_METHOD};
+use intent_core::remote_launch::workspace_api::{
+    self, Route, ATTACHMENTS_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
+};
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
-    AgentId, BoxFuture, Error, GitAgentCommitResult, NoteId, Result, Workspace, WorkspaceApi,
-    WorkspaceGitRootId, WorkspaceId,
+    AgentId, BoxFuture, Error, GitAgentCommitResult, NoteId, Result, TurnAttachment, Workspace,
+    WorkspaceApi, WorkspaceGitRootId, WorkspaceId,
 };
 use intent_services::feature_api::file_ops;
 use intent_transport::node_link::NodeLink;
@@ -162,6 +164,35 @@ impl HostFrameRouter for Router {
             }
             Route::Forward => Some(Box::pin(self.forward(method, args))),
         }
+    }
+
+    /// The node has no turn-attachment registry (the agent's transcript is
+    /// on head), so a call's cards go to head as one batch.
+    fn publishes_attachments(&self) -> bool {
+        true
+    }
+
+    fn publish_attachments(&self, batch: Vec<TurnAttachment>) -> BoxFuture<'static, ()> {
+        let attachments: Vec<Value> = batch
+            .iter()
+            .map(|card| {
+                json!({
+                    "id": card.id,
+                    "mimeType": card.mime_type,
+                    "uri": card.uri,
+                    "name": card.name,
+                    "text": card.text,
+                })
+            })
+            .collect();
+        let sent = self.forward(ATTACHMENTS_METHOD, &json!({ "attachments": attachments }));
+        Box::pin(async move {
+            // An older backend refuses the frame; the card still reaches the
+            // transcript in the tool output.
+            if let Err(error) = sent.await {
+                tracing::debug!(%error, "head did not take the call's attachments");
+            }
+        })
     }
 }
 
