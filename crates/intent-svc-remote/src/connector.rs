@@ -25,11 +25,13 @@ use tokio::time::Instant;
 use intent_core::machines::RemoteMachineState;
 use intent_core::node_link::{
     JournalBody, LaunchCommand, LinkFrame, LinkOutcome, LinkRpcError, LinkWelcome,
-    MachineCapabilities, StopId, StopOutcome, FINAL_STOP_PROTOCOL,
+    MachineCapabilities, SetupState, StopId, StopOutcome, FINAL_STOP_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::{AgentPlatform, PlatformAvailability};
-use intent_core::remote_launch::{EffectiveIsolation, PlacementError};
+use intent_core::remote_launch::{
+    EffectiveIsolation, PlacementError, RemoteSetupState, RemoteSetupStatus,
+};
 use intent_core::{AgentId, Error, Result, WorkspaceId};
 use intent_services::feature_api::Services;
 use intent_store::Store;
@@ -283,6 +285,8 @@ pub(crate) struct Shared {
     /// Waiting for the machine's next capabilities report.
     capability_waiters: Mutex<Vec<oneshot::Sender<MachineCapabilities>>>,
     ingested: Mutex<NodeCounter>,
+    /// Each agent's checkout and setup output tail (nodeProtocol 10).
+    setup_outputs: Mutex<HashMap<AgentId, SetupTail>>,
     /// Asks the connector for a link: `None` just wakes it.
     demand: mpsc::UnboundedSender<Option<Waiter>>,
     shutdown: watch::Sender<bool>,
@@ -1075,6 +1079,69 @@ impl std::fmt::Debug for RemoteNode {
     }
 }
 
+/// The output a remote agent's setup is kept with (`setupOutput`).
+const SETUP_OUTPUT_TAIL_BYTES: usize = 256 * 1024;
+
+/// While output arrives, `agent:updated` goes out at most this often.
+const SETUP_OUTPUT_PUBLISH_EVERY: Duration = Duration::from_secs(2);
+
+/// One agent's kept setup output.
+#[derive(Default)]
+struct SetupTail {
+    text: String,
+    truncated: bool,
+    published: Option<Instant>,
+}
+
+impl Shared {
+    /// Keep a `setupOutput` of an agent attached here (seq 0 starts the
+    /// output over) and announce it, throttled.
+    async fn setup_output(&self, output: intent_core::node_link::SetupOutput) {
+        let Some(workspace_id) = self.agents.workspace_of(&output.agent_id) else {
+            tracing::debug!(agent = %output.agent_id, "remote machine: setup output for an agent not attached here; dropped");
+            return;
+        };
+        let publish = {
+            let mut tails = lock(&self.setup_outputs);
+            let tail = tails.entry(output.agent_id.clone()).or_default();
+            if output.seq == 0 {
+                tail.text.clear();
+                tail.truncated = false;
+            }
+            tail.text.push_str(&output.data);
+            if tail.text.len() > SETUP_OUTPUT_TAIL_BYTES {
+                let mut cut = tail.text.len() - SETUP_OUTPUT_TAIL_BYTES;
+                while !tail.text.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                tail.text.drain(..cut);
+                tail.truncated = true;
+            }
+            let due = tail
+                .published
+                .is_none_or(|at| at.elapsed() >= SETUP_OUTPUT_PUBLISH_EVERY);
+            if due {
+                tail.published = Some(Instant::now());
+            }
+            due
+        };
+        if publish {
+            if let Some(services) = &self.services {
+                services
+                    .publish_agent_placement_changed(&workspace_id, &output.agent_id)
+                    .await;
+            }
+        }
+    }
+
+    /// `agent_id`'s kept setup output and whether earlier output was cut.
+    pub(crate) fn setup_output_tail(&self, agent_id: &AgentId) -> Option<(String, bool)> {
+        lock(&self.setup_outputs)
+            .get(agent_id)
+            .map(|tail| (tail.text.clone(), tail.truncated))
+    }
+}
+
 impl RemoteNode {
     /// Start the connector to `target` on this backend's live lease there.
     /// Nothing is dialed until a link is wanted. Forwarded `workspace_api`
@@ -1113,6 +1180,7 @@ impl RemoteNode {
             status: Mutex::new(status),
             stops: Mutex::new(BTreeMap::new()),
             in_grace: Mutex::new(std::collections::HashSet::new()),
+            setup_outputs: Mutex::default(),
             self_ref: Mutex::new(std::sync::Weak::new()),
             protocol: std::sync::atomic::AtomicU32::new(0),
             prepared_checkout: std::sync::atomic::AtomicBool::new(
@@ -1724,6 +1792,9 @@ async fn serve(
                             let _ = waiter.send(capabilities.clone());
                         }
                     }
+                    LinkEvent::Frame(LinkFrame::SetupOutput(output)) => {
+                        shared.setup_output(output).await;
+                    }
                     LinkEvent::Frame(frame)
                         if frame.channel() == intent_core::node_link::LinkChannel::Script =>
                     {
@@ -1987,6 +2058,45 @@ async fn record_placement(shared: &Shared, record: &intent_core::node_link::Jour
                 view.effective_isolation = EffectiveIsolation::Isolated;
                 view.placement_error = None;
             }),
+            JournalBody::SetupStarted { started_at } => {
+                let started_at = started_at.clone();
+                Box::new(move |view| {
+                    view.setup = Some(RemoteSetupStatus {
+                        state: RemoteSetupState::Running,
+                        started_at: Some(started_at),
+                        ..RemoteSetupStatus::pending()
+                    });
+                })
+            }
+            JournalBody::SetupFinished {
+                state,
+                exit_code,
+                error,
+                finished_at,
+            } => {
+                let finished = RemoteSetupStatus {
+                    state: match state {
+                        SetupState::Completed => RemoteSetupState::Completed,
+                        SetupState::Failed => RemoteSetupState::Failed,
+                        SetupState::Skipped => RemoteSetupState::Skipped,
+                    },
+                    exit_code: *exit_code,
+                    error: error.clone(),
+                    finished_at: Some(finished_at.clone()),
+                    ..RemoteSetupStatus::pending()
+                };
+                Box::new(move |view| {
+                    let started_at = view
+                        .setup
+                        .as_ref()
+                        .filter(|setup| setup.state == RemoteSetupState::Running)
+                        .and_then(|setup| setup.started_at.clone());
+                    view.setup = Some(RemoteSetupStatus {
+                        started_at,
+                        ..finished
+                    });
+                })
+            }
             JournalBody::Exited {
                 error: Some(error), ..
             } => {

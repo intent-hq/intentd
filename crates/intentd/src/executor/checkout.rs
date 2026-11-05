@@ -45,7 +45,12 @@ pub(super) trait Checkouts: Send + Sync {
         workspace_id: &'a WorkspaceId,
         base: (&'a str, &'a str),
         submodules: &'a [SubmodulePin],
+        progress: &'a (dyn Fn(&str) + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<Prepared>>;
+
+    /// The machine-local directory a setup script gets as `MAIN_CHECKOUT`
+    /// for the repository `repo_key`, created empty.
+    fn main_checkout(&self, repo_key: &str) -> anyhow::Result<PathBuf>;
 
     /// The agent's existing checkout on this machine, if it has one (it
     /// stays after the agent's process stops). Saved scripts run in it.
@@ -90,6 +95,10 @@ impl GitCheckouts {
 }
 
 impl Checkouts for GitCheckouts {
+    fn main_checkout(&self, repo_key: &str) -> anyhow::Result<PathBuf> {
+        self.storage.main_checkout(repo_key)
+    }
+
     fn existing(&self, agent_id: &AgentId) -> Option<PathBuf> {
         let worktree = self.storage.agent_worktree(agent_id).ok()?;
         worktree.join(".git").exists().then_some(worktree)
@@ -101,6 +110,7 @@ impl Checkouts for GitCheckouts {
         workspace_id: &'a WorkspaceId,
         (base_commit, repo_key): (&'a str, &'a str),
         submodules: &'a [SubmodulePin],
+        progress: &'a (dyn Fn(&str) + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<Prepared>> {
         Box::pin(async move {
             node_git::validate_pins(submodules).context("the launch's submodule pins")?;
@@ -109,6 +119,7 @@ impl Checkouts for GitCheckouts {
             let fresh = !worktree.join(".git").exists();
             let mut notices = Vec::new();
             if fresh {
+                progress("Fetching the checkout…");
                 let checkout = self
                     .cache
                     .checkout(repo_key, &remote, &worktree)
@@ -134,7 +145,9 @@ impl Checkouts for GitCheckouts {
             // the machine knew them); its present modules are left alone.
             let modules = match self
                 .cache
-                .checkout_modules(repo_key, &remote, &worktree, submodules)
+                .checkout_modules_reporting(repo_key, &remote, &worktree, submodules, &|path| {
+                    progress(&format!("Fetching {path}…"));
+                })
                 .await
             {
                 Ok(modules) => modules,
@@ -176,7 +189,12 @@ impl Checkouts for GitCheckouts {
             let pins = read_pins(&pins_file(worktree));
             tokio::time::timeout(
                 timeout,
-                self.cache.git().push_work(worktree, &remote, &pins),
+                self.cache.git().push_work_excluding(
+                    worktree,
+                    &remote,
+                    &pins,
+                    Some(&super::setup::excludes_dir(worktree)),
+                ),
             )
             .await
             .context("WIP push timed out")??;
@@ -338,6 +356,10 @@ impl PlainCheckouts {
 
 #[cfg(test)]
 impl Checkouts for PlainCheckouts {
+    fn main_checkout(&self, repo_key: &str) -> anyhow::Result<PathBuf> {
+        self.storage.main_checkout(repo_key)
+    }
+
     fn existing(&self, agent_id: &AgentId) -> Option<PathBuf> {
         self.storage.existing_agent_dir(agent_id)
     }
@@ -348,8 +370,12 @@ impl Checkouts for PlainCheckouts {
         _workspace_id: &'a WorkspaceId,
         _base: (&'a str, &'a str),
         submodules: &'a [SubmodulePin],
+        progress: &'a (dyn Fn(&str) + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<Prepared>> {
         Box::pin(async move {
+            for pin in submodules {
+                progress(&format!("Fetching {}…", pin.path));
+            }
             anyhow::ensure!(
                 !self.fail.load(std::sync::atomic::Ordering::SeqCst),
                 "head refused the fetch"

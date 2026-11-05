@@ -850,7 +850,7 @@ impl NodeGit {
     ///
     /// When a git step fails or head rejects the push.
     pub async fn push_wip(&self, worktree: &Path, remote: &AgentRemote) -> Result<WipRefs> {
-        self.push_repository(worktree, remote, &[]).await
+        self.push_repository(worktree, remote, &[], None).await
     }
 
     /// [`Self::push_wip`] for a checkout with pinned submodules
@@ -869,7 +869,30 @@ impl NodeGit {
         remote: &AgentRemote,
         pins: &[SubmodulePin],
     ) -> Result<WipRefs> {
+        self.push_work_excluding(worktree, remote, pins, None).await
+    }
+
+    /// [`Self::push_work`], leaving out of each repository's `wip` the
+    /// untracked paths its [`exclude_file`] in `excludes` lists (a remote
+    /// agent's setup-created files). The file replaces git's global
+    /// excludes file for the push, so it carries that file's patterns too.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::push_work`].
+    pub async fn push_work_excluding(
+        &self,
+        worktree: &Path,
+        remote: &AgentRemote,
+        pins: &[SubmodulePin],
+        excludes: Option<&Path>,
+    ) -> Result<WipRefs> {
         validate_pins(pins)?;
+        let excluded = |pin: Option<usize>| {
+            excludes
+                .map(|dir| exclude_file(dir, pin))
+                .filter(|file| file.is_file())
+        };
         let mut wips: Vec<Option<String>> = vec![None; pins.len()];
         for (index, pin) in pins.iter().enumerate().rev() {
             let dir = worktree.join(&pin.path);
@@ -879,13 +902,14 @@ impl NodeGit {
             let children = child_links(pins, &wips, Some(index));
             let module = remote.with_module(&pin.module_key)?;
             let pushed = self
-                .push_repository(&dir, &module, &children)
+                .push_repository(&dir, &module, &children, excluded(Some(index)).as_deref())
                 .await
                 .map_err(|error| Error::Internal(format!("submodule {}: {error}", pin.path)))?;
             wips[index] = Some(pushed.wip);
         }
         let children = child_links(pins, &wips, None);
-        self.push_repository(worktree, remote, &children).await
+        self.push_repository(worktree, remote, &children, excluded(None).as_deref())
+            .await
     }
 
     /// Push one repository's `head` and `wip`; `links` are the
@@ -896,6 +920,7 @@ impl NodeGit {
         worktree: &Path,
         remote: &AgentRemote,
         links: &[(String, String)],
+        excludes: Option<&Path>,
     ) -> Result<WipRefs> {
         let head = self
             .git(worktree, &["rev-parse", "--verify", "HEAD^{commit}"])
@@ -911,7 +936,11 @@ impl NodeGit {
             command
         };
         run(with_index(&["read-tree", "HEAD"])).await?;
-        run(with_index(&["add", "--all"])).await?;
+        let excludes_file = excludes.map(|file| format!("core.excludesFile={}", file.display()));
+        match &excludes_file {
+            Some(config) => run(with_index(&["-c", config, "add", "--all"])).await?,
+            None => run(with_index(&["add", "--all"])).await?,
+        };
         for (path, commit) in links {
             let entry = format!("160000,{commit},{path}");
             run(with_index(&[
@@ -951,6 +980,17 @@ impl NodeGit {
         let mut command = self.command(dir);
         command.args(args);
         run(command).await
+    }
+}
+
+/// The excludes file of one repository of a checkout in `dir`: the
+/// superproject's for `None`, else the one of the pin at that index (pins
+/// never change after an agent's creation).
+#[must_use]
+pub fn exclude_file(dir: &Path, pin: Option<usize>) -> PathBuf {
+    match pin {
+        None => dir.join("root"),
+        Some(index) => dir.join(format!("module-{index}")),
     }
 }
 
@@ -1045,6 +1085,24 @@ impl CheckoutCache {
         worktree: &Path,
         pins: &[SubmodulePin],
     ) -> Result<Vec<ModuleCheckout>> {
+        self.checkout_modules_reporting(repo_key, remote, worktree, pins, &|_| {})
+            .await
+    }
+
+    /// [`Self::checkout_modules`], calling `fetching` with each pin's path
+    /// before its module is fetched.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::checkout_modules`].
+    pub async fn checkout_modules_reporting(
+        &self,
+        repo_key: &str,
+        remote: &AgentRemote,
+        worktree: &Path,
+        pins: &[SubmodulePin],
+        fetching: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<Vec<ModuleCheckout>> {
         validate_pins(pins)?;
         hub::component(repo_key)?;
         let _serial = self.lock.lock().await;
@@ -1074,6 +1132,7 @@ impl CheckoutCache {
             if !staged.starts_with("160000 ") {
                 continue;
             }
+            fetching(&pin.path);
             let cache = self.module_cache(repo_key, &pin.module_key)?;
             // A worktree the agent deleted by hand is still registered.
             self.prune_cache(&cache).await.map_err(context)?;

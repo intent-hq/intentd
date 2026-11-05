@@ -240,6 +240,7 @@ pub(super) async fn serve_link(
     match adopt(&runner, &binding, acked, || link.is_closed()).await {
         Adopted::Ready => {
             runner.head_link().set(link.clone());
+            runner.resend_setup_output(&link);
             // The backend listed the agents it still records: the
             // checkouts of any others are orphans.
             // The list is taken now, before any frame of this link (a

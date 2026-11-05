@@ -607,7 +607,7 @@ async fn finish_output(link: &NodeLink, stream: &Mutex<OutputStream>) {
 
 /// Decode the complete UTF-8 prefix of `buf` (invalid bytes replaced),
 /// leaving an incomplete trailing character for the next chunk.
-fn take_utf8(buf: &mut Vec<u8>) -> String {
+pub(super) fn take_utf8(buf: &mut Vec<u8>) -> String {
     let keep = incomplete_tail(buf);
     let rest = buf.split_off(buf.len() - keep);
     let text = String::from_utf8_lossy(buf).into_owned();
@@ -632,7 +632,7 @@ fn incomplete_tail(buf: &[u8]) -> usize {
 }
 
 /// Split `text` into pieces of at most `max` bytes on character boundaries.
-fn split_utf8(text: &str, max: usize) -> Vec<&str> {
+pub(super) fn split_utf8(text: &str, max: usize) -> Vec<&str> {
     let mut pieces = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {

@@ -3992,6 +3992,7 @@ pub const AGENT_LIST_ROW_KEYS: &[&str] = &[
     "placement",
     "effectiveIsolation",
     "placementError",
+    "setup",
     "metadata",
 ];
 
@@ -5239,6 +5240,11 @@ pub struct AgentLite {
     /// Detail-only; omitted for local agents and agents placed before pins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submodules: Option<Vec<crate::remote_launch::RemoteSubmodulePin>>,
+    /// The setup of a remote agent's checkout on its machine; rows omit its
+    /// output. Absent for local agents and before the first nodeProtocol 10
+    /// launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<crate::remote_launch::RemoteSetupStatus>,
     pub metadata: AgentMetadata,
 }
 
@@ -5370,6 +5376,10 @@ impl AgentLite {
                             .collect()
                     })
                 }),
+            setup: remote
+                .as_ref()
+                .filter(|_| crate::node_link::offers_prepared_checkout())
+                .and_then(|r| r.setup.clone()),
             placement_error: remote.and_then(|r| r.placement_error),
             metadata,
         }
@@ -5398,6 +5408,10 @@ impl AgentLite {
         self.harness_features = None;
         self.lease_id = None;
         self.submodules = None;
+        if let Some(setup) = self.setup.as_mut() {
+            setup.output = None;
+            setup.output_truncated = None;
+        }
         self.effort_levels = None;
         self.context_references = None;
         self.file_blocks = None;

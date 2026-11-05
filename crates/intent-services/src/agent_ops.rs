@@ -4467,6 +4467,18 @@ impl Services {
             .runtime()
             .active_script_monitors_for_agent(self, &agent_id)
             .await;
+        // A remote agent's checkout setup output is kept by its machine's
+        // connector, not with the placement.
+        if let (Some(setup), Some(node_id)) = (lite.setup.as_mut(), lite.node_id.as_deref()) {
+            if let Some((output, truncated)) = self
+                .ports
+                .remote_launch()
+                .setup_output(self, node_id, &agent_id)
+            {
+                setup.output = Some(output);
+                setup.output_truncated = Some(truncated);
+            }
+        }
         Ok(lite)
     }
 
@@ -6159,8 +6171,12 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
         plan: &mut AgentCreatePlan,
+        explicit_setup_script: Option<String>,
     ) -> Option<Error> {
         let view = plan.remote.as_mut()?;
+        // The create's explicit script runs for its initial agent only, at
+        // every launch that sets up a fresh checkout.
+        view.setup_script = explicit_setup_script;
         match self
             .ports
             .remote_launch()
@@ -6270,13 +6286,22 @@ impl Services {
             }
             return Err(error);
         }
+        // The notice is informational: a script that cannot be resolved
+        // now is left out of it, the launch already went ahead.
+        let setup = self
+            .remote_setup_command(workspace_id, &view)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
         if let Some(obj) = created.as_object_mut() {
             obj.insert(
                 "notice".into(),
-                json!(intent_core::remote_launch::launch_notice(
+                json!(intent_core::remote_launch::launch_notice_with_setup(
                     &view.node_name,
                     &view.base_commit,
                     !view.pins().is_empty(),
+                    setup,
                 )),
             );
         }

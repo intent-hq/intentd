@@ -1389,6 +1389,18 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         Box::pin(async { Err(no_execution_node()) })
     }
 
+    /// Remote agent `agent_id`'s kept checkout and setup output on machine
+    /// `node_id`, and whether earlier output was cut. `None` by default.
+    fn setup_output(
+        &self,
+        svc: &Services,
+        node_id: &str,
+        agent_id: &AgentId,
+    ) -> Option<(String, bool)> {
+        let _ = (svc, node_id, agent_id);
+        None
+    }
+
     /// Whether this port places agents on exposed machines (the backend
     /// side of `remoteMachines.*`), which the `remoteMachines` capability
     /// requires. `false` by default.

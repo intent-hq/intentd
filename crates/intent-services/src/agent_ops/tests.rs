@@ -10590,6 +10590,8 @@ async fn worst_case_agent_list_row(
         )),
         base_commit: "0".repeat(40),
         submodules: None,
+        setup: None,
+        setup_script: None,
     };
     svc.store()
         .set_agent_session_metadata_key_json(

@@ -241,6 +241,64 @@ pub struct RemotePlacementView {
     /// placed before pins were captured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submodules: Option<Vec<crate::node_link::SubmodulePin>>,
+    /// The setup of the agent's checkout on its machine, from its first
+    /// nodeProtocol 10 launch; stored without output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<RemoteSetupStatus>,
+    /// `workspace.create`'s explicit setup script, kept for its initial
+    /// agent's later launches; never projected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_script: Option<String>,
+}
+
+/// Where a remote agent's checkout setup is (`methods/nodes.md` §
+/// Prepared checkout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteSetupState {
+    /// The machine is preparing the checkout.
+    Pending,
+    /// The setup script runs.
+    Running,
+    Completed,
+    Failed,
+    /// The workspace has no setup script.
+    Skipped,
+}
+
+/// A remote agent's checkout setup on its machine. `output` and
+/// `outputTruncated` are on detail reads only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteSetupStatus {
+    pub state: RemoteSetupState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_truncated: Option<bool>,
+}
+
+impl RemoteSetupStatus {
+    #[must_use]
+    pub fn pending() -> Self {
+        Self {
+            state: RemoteSetupState::Pending,
+            exit_code: None,
+            error: None,
+            started_at: None,
+            finished_at: None,
+            output: None,
+            output_truncated: None,
+        }
+    }
 }
 
 impl RemotePlacementView {
@@ -281,15 +339,32 @@ pub struct RemoteCheckoutBase {
 /// in its submodules) stay on head.
 #[must_use]
 pub fn launch_notice(node_name: &str, base_commit: &str, submodules: bool) -> String {
+    launch_notice_with_setup(node_name, base_commit, submodules, false)
+}
+
+/// [`launch_notice`], saying also that the workspace's setup script runs on
+/// the machine before the agent starts when `setup`.
+#[must_use]
+pub fn launch_notice_with_setup(
+    node_name: &str,
+    base_commit: &str,
+    submodules: bool,
+    setup: bool,
+) -> String {
     let short = base_commit.get(..12).unwrap_or(base_commit);
-    let notice = format!(
+    let mut notice = format!(
         "The agent runs on execution node \"{node_name}\" and starts from commit {short} (the workspace's last commit). Uncommitted changes in the workspace are not carried to the remote agent; commit them first if it needs them."
     );
-    if submodules && crate::node_link::offers_prepared_checkout() {
-        format!("{notice} Its submodules start from the commits checked out in the workspace; uncommitted changes inside them are not carried either.")
-    } else {
-        notice
+    if !crate::node_link::offers_prepared_checkout() {
+        return notice;
     }
+    if submodules {
+        notice.push_str(" Its submodules start from the commits checked out in the workspace; uncommitted changes inside them are not carried either.");
+    }
+    if setup {
+        notice.push_str(" The workspace's setup script runs on that machine before the agent starts.");
+    }
+    notice
 }
 
 #[cfg(test)]
