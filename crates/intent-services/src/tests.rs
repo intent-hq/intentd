@@ -35072,6 +35072,78 @@ mod file_ops_service {
         assert!(matches!(denied, Err(Error::Internal(_))));
     }
 
+    /// The Assistant (`__chief__`) workspace has no worktree, so `file.*`
+    /// resolves its root to the configured chief-cwd dir (created on demand):
+    /// relative paths round-trip, while `..`, outside absolute paths and an
+    /// escaping symlink stay denied (intent-hq/intent#8644). Unconfigured,
+    /// chief still fails closed (intent-hq/intent#3839).
+    #[intent_test_macros::daemon_test]
+    async fn file_methods_resolve_chief_root_to_chief_cwd() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let chief = WorkspaceId::from_string(intent_core::CHIEF_WORKSPACE_ID);
+
+        let data_guard = test_tempdir("intentd-chief-files-");
+        let data_dir = std::fs::canonicalize(data_guard.path()).unwrap();
+        let chief_root = intent_core::chief_cwd_root(&data_dir);
+        assert!(!chief_root.exists(), "created on demand");
+
+        let unconfigured = Services::new_isolated(store.clone());
+        let denied = unconfigured
+            .file_read(chief.clone(), "notes.md".to_string(), None, None)
+            .await;
+        assert!(matches!(denied, Err(Error::Internal(_))), "{denied:?}");
+        assert!(!chief_root.exists(), "unconfigured never creates the dir");
+
+        let svc = Services::new_isolated(store).with_chief_cwd_root(chief_root.clone());
+        let missing = svc
+            .file_exists(chief.clone(), "notes.md".to_string())
+            .await
+            .expect("exists");
+        assert_eq!(missing["exists"], serde_json::json!(false));
+        assert!(chief_root.is_dir(), "first file op creates the chief dir");
+
+        std::fs::write(chief_root.join("notes.md"), "assistant notes").unwrap();
+        let read = svc
+            .file_read(chief.clone(), "notes.md".to_string(), None, None)
+            .await
+            .expect("read");
+        assert_eq!(
+            read,
+            serde_json::Value::String("assistant notes".to_string())
+        );
+
+        svc.file_write(
+            chief.clone(),
+            "sub/x.txt".to_string(),
+            "hi".to_string(),
+            None,
+        )
+        .await
+        .expect("write");
+        assert_eq!(
+            std::fs::read_to_string(chief_root.join("sub/x.txt")).unwrap(),
+            "hi"
+        );
+
+        std::fs::write(data_dir.join("secret.txt"), "outside").unwrap();
+        let outside_abs = data_dir.join("secret.txt").to_string_lossy().into_owned();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(data_dir.join("secret.txt"), chief_root.join("link.txt"))
+            .unwrap();
+        let mut escapes = vec!["../secret.txt".to_string(), outside_abs];
+        if cfg!(unix) {
+            escapes.push("link.txt".to_string());
+        }
+        for path in escapes {
+            let denied = svc.file_read(chief.clone(), path.clone(), None, None).await;
+            assert!(
+                matches!(denied, Err(Error::Internal(_))),
+                "{path}: {denied:?}"
+            );
+        }
+    }
+
     /// `file.placeAttachment` wired through `WorkspaceApi`: a base64 payload
     /// lands in `.intent/attachments/` with a workspace-relative result path,
     /// the `.intent/.gitignore` exclusion is ensured on the way, param

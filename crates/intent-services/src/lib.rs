@@ -557,6 +557,11 @@ pub struct Services {
     /// `None` until configured by the composition root; `note.readAsset` errors
     /// when unset.
     assets_root: Option<PathBuf>,
+    /// The Assistant (`__chief__`) workspace's filesystem root for `file.*`
+    /// (`<data_dir>/chief-cwd`, the same directory chief provider children
+    /// spawn in). `None` until configured by the composition root; the chief
+    /// workspace then has no root and its file ops fail closed.
+    chief_cwd_root: Option<PathBuf>,
     /// Live subscriptions minted by the deprecated `event.subscribe` /
     /// `agent.subscribe` aliases: each entry carries the subscriber, filter,
     /// batch window, and its running bus delivery task (monorepo#937). This
@@ -1741,6 +1746,7 @@ impl Services {
         let services = Self {
             store,
             assets_root: None,
+            chief_cwd_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
             agent_workers: Arc::new(agent_workers::AgentWorkers::default()),
@@ -2413,7 +2419,13 @@ impl Services {
             Ok(_) | Err(Error::NotFound(_)) => return Err(unknown()),
             Err(error) => return Err(error),
         };
-        let root = file_ops::resolve_root(&self.store, workspace_id, None).await;
+        let root = file_ops::resolve_root(
+            &self.store,
+            workspace_id,
+            None,
+            self.chief_cwd_root.as_deref(),
+        )
+        .await;
         tokio::task::spawn_blocking(move || file_ops::attachment_data(&root, &record, max_bytes))
             .await
             .map_err(|e| Error::Internal(format!("attachment read failed: {e}")))?
@@ -3244,7 +3256,13 @@ impl Services {
             let root = self.resolve_git_read_root(&ws, Some(id)).await?;
             Ok(root.unwrap_or_default().to_string_lossy().into_owned())
         } else {
-            Ok(file_ops::resolve_root(&self.store, workspace_id, caller_agent_id).await)
+            Ok(file_ops::resolve_root(
+                &self.store,
+                workspace_id,
+                caller_agent_id,
+                self.chief_cwd_root.as_deref(),
+            )
+            .await)
         }
     }
 
@@ -5100,6 +5118,15 @@ impl Services {
     #[must_use]
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
+        self
+    }
+
+    /// Configure the Assistant (`__chief__`) workspace's file root — the
+    /// composition root passes the same `intent_core::chief_cwd_root(data_dir)`
+    /// it hands the agent manager, so `file.*` and chief spawns share one dir.
+    #[must_use]
+    pub fn with_chief_cwd_root(mut self, root: PathBuf) -> Self {
+        self.chief_cwd_root = Some(root);
         self
     }
 
@@ -12719,8 +12746,9 @@ fn new_uuid() -> String {
 async fn attachment_info_result(
     store: &Store,
     record: &intent_store::AttachmentRecord,
+    chief_cwd_root: Option<&Path>,
 ) -> serde_json::Value {
-    let root = file_ops::resolve_root(store, &record.workspace_id, None).await;
+    let root = file_ops::resolve_root(store, &record.workspace_id, None, chief_cwd_root).await;
     let exists = !root.is_empty()
         && file_ops::resolve_attachment_source(&root, &record.stored_path)
             .is_ok_and(|p| p.is_file());
@@ -21109,8 +21137,13 @@ impl WorkspaceApi for Services {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             self.refuse_if_retired(&workspace_id).await?;
-            let root =
-                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
+            let root = file_ops::resolve_root(
+                &store,
+                &workspace_id,
+                caller_agent_id.as_ref(),
+                self.chief_cwd_root.as_deref(),
+            )
+            .await;
             let result = file_ops::write(&root, &path, &content)?;
             // Attribution (monorepo#939): an agent's workspace-api `file.write`
             // must land on `tracked_changes` just like an ACP
@@ -21135,8 +21168,13 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
-            let root =
-                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
+            let root = file_ops::resolve_root(
+                &store,
+                &workspace_id,
+                caller_agent_id.as_ref(),
+                self.chief_cwd_root.as_deref(),
+            )
+            .await;
             // Containment checks and directory enumeration both touch the
             // filesystem, so keep the complete synchronous operation off the
             // async runtime. RPC dispatch tasks are detached from their client
@@ -21161,8 +21199,13 @@ impl WorkspaceApi for Services {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             self.refuse_if_retired(&workspace_id).await?;
-            let root =
-                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
+            let root = file_ops::resolve_root(
+                &store,
+                &workspace_id,
+                caller_agent_id.as_ref(),
+                self.chief_cwd_root.as_deref(),
+            )
+            .await;
             let result = file_ops::delete(&root, &path)?;
             // Attribution (monorepo#939): agent-context deletes land on
             // `tracked_changes` like the ACP `file:changed` delete action does.
@@ -21184,8 +21227,13 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
             self.refuse_if_retired(&workspace_id).await?;
-            let root =
-                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
+            let root = file_ops::resolve_root(
+                &store,
+                &workspace_id,
+                caller_agent_id.as_ref(),
+                self.chief_cwd_root.as_deref(),
+            )
+            .await;
             file_ops::mkdir(&root, &path)
         })
     }
@@ -21202,8 +21250,13 @@ impl WorkspaceApi for Services {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             self.refuse_if_retired(&workspace_id).await?;
-            let root =
-                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
+            let root = file_ops::resolve_root(
+                &store,
+                &workspace_id,
+                caller_agent_id.as_ref(),
+                self.chief_cwd_root.as_deref(),
+            )
+            .await;
             let result = file_ops::rename(&root, &old_path, &new_path)?;
             // Attribution (monorepo#939): an agent-context file rename records
             // both sides (old path deleted, new path added), matching what the
@@ -21286,7 +21339,9 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
-            let root = file_ops::resolve_root(&store, &workspace_id, None).await;
+            let root =
+                file_ops::resolve_root(&store, &workspace_id, None, self.chief_cwd_root.as_deref())
+                    .await;
             tokio::task::spawn_blocking(move || file_ops::tree(&root, &path))
                 .await
                 .map_err(|e| Error::Internal(format!("file.tree task failed: {e}")))?
@@ -21301,7 +21356,9 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
-            let root = file_ops::resolve_root(&store, &workspace_id, None).await;
+            let root =
+                file_ops::resolve_root(&store, &workspace_id, None, self.chief_cwd_root.as_deref())
+                    .await;
             file_ops::exists(&root, &path)
         })
     }
@@ -21314,7 +21371,9 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
-            let root = file_ops::resolve_root(&store, &workspace_id, None).await;
+            let root =
+                file_ops::resolve_root(&store, &workspace_id, None, self.chief_cwd_root.as_deref())
+                    .await;
             file_ops::stat(&root, &path)
         })
     }
@@ -21501,7 +21560,7 @@ impl WorkspaceApi for Services {
                     }
                     other => other,
                 })?;
-            Ok(attachment_info_result(&store, &record).await)
+            Ok(attachment_info_result(&store, &record, self.chief_cwd_root.as_deref()).await)
         })
     }
 
@@ -21529,7 +21588,7 @@ impl WorkspaceApi for Services {
                     "unknown idempotency key: {key}"
                 )));
             };
-            Ok(attachment_info_result(&store, &record).await)
+            Ok(attachment_info_result(&store, &record, self.chief_cwd_root.as_deref()).await)
         })
     }
 
@@ -21562,7 +21621,9 @@ impl WorkspaceApi for Services {
             // Source side: ALWAYS the canonical workspace root (attachments
             // are placed there by `file.placeAttachment`; a sandbox clone
             // does not carry post-clone attachments).
-            let canonical_root = file_ops::resolve_root(&store, &workspace_id, None).await;
+            let canonical_root =
+                file_ops::resolve_root(&store, &workspace_id, None, self.chief_cwd_root.as_deref())
+                    .await;
             if canonical_root.is_empty() {
                 return Err(Error::Internal(
                     "workspace has no resolved filesystem root".to_string(),
@@ -21572,8 +21633,13 @@ impl WorkspaceApi for Services {
             // clone for CoW-sandboxed agents, else the canonical checkout
             // (same session-derived resolution as other sandbox-aware
             // bindings).
-            let dest_root =
-                file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
+            let dest_root = file_ops::resolve_root(
+                &store,
+                &workspace_id,
+                caller_agent_id.as_ref(),
+                self.chief_cwd_root.as_deref(),
+            )
+            .await;
             file_ops::get_attachment(&canonical_root, &dest_root, &record, dest_dir.as_deref())
         })
     }

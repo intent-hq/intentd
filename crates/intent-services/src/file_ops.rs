@@ -1,7 +1,8 @@
 //! Wire-policy + filesystem glue for the `file.*` methods (PROTOCOL §5.10).
 //!
 //! Ports the TS `buildFileApi` / `LocalFileSystemAdapter` semantics: the
-//! workspace root is `worktreePath || repositoryPath`; an unset/unknown root
+//! workspace root is `worktreePath || repositoryPath` (the Assistant
+//! `__chief__` workspace uses the daemon's chief-cwd dir); an unset/unknown root
 //! (empty string) is rejected rather than falling back to the process CWD, so a
 //! bogus `workspaceId` cannot escape workspace containment
 //! (intent-hq/intent#3839). Every path is
@@ -45,16 +46,35 @@ pub fn workspace_root(ws: &Workspace) -> String {
         .unwrap_or_default()
 }
 
+/// The Assistant (`__chief__`) workspace's file root: the configured
+/// chief-cwd directory, created owner-only (0700) on demand. Chief has no
+/// worktree or repository, so without this its `file.*` calls had no root
+/// (intent-hq/intent#8644). An unconfigured root or a failed create yields
+/// an empty root, which [`is_within`] fails closed — never the process CWD
+/// or the temp dir.
+fn chief_root(chief_cwd_root: Option<&Path>) -> String {
+    let Some(root) = chief_cwd_root else {
+        return String::new();
+    };
+    if let Err(e) = intent_core::create_chief_cwd_dir(root) {
+        tracing::warn!(error = %e, path = %root.display(), "failed to create chief file root");
+        return String::new();
+    }
+    root.to_string_lossy().into_owned()
+}
+
 /// Load the workspace and resolve its filesystem root, preferring the calling
-/// agent's sandbox path when available (`CoW` containment). A missing workspace
-/// (or any load error) yields an empty root; the guard in [`is_within`] then
-/// fails such a request closed rather than resolving it CWD-relative, so a
-/// bogus `workspaceId` cannot escape workspace containment
+/// agent's sandbox path when available (`CoW` containment). The Assistant
+/// (`__chief__`) workspace resolves to `chief_cwd_root` (see [`chief_root`]).
+/// A missing workspace (or any load error) yields an empty root; the guard in
+/// [`is_within`] then fails such a request closed rather than resolving it
+/// CWD-relative, so a bogus `workspaceId` cannot escape workspace containment
 /// (intent-hq/intent#3839).
 pub(crate) async fn resolve_root(
     store: &Store,
     workspace_id: &WorkspaceId,
     caller_agent_id: Option<&intent_core::AgentId>,
+    chief_cwd_root: Option<&Path>,
 ) -> String {
     // CoW containment: prefer the calling agent's sandbox path when present.
     if let Some(agent_id) = caller_agent_id {
@@ -63,6 +83,9 @@ pub(crate) async fn resolve_root(
                 return sandbox_path;
             }
         }
+    }
+    if workspace_id.is_chief() {
+        return chief_root(chief_cwd_root);
     }
     match store.get_workspace(workspace_id).await {
         Ok(ws) => workspace_root(&ws),
@@ -1004,6 +1027,34 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn chief_root_creates_configured_dir_owner_only() {
+        let t = TempRoot::new();
+        let dir = intent_core::chief_cwd_root(&t.path);
+        assert_eq!(chief_root(Some(&dir)), dir.to_string_lossy());
+        assert!(dir.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        // Idempotent on an existing dir.
+        assert_eq!(chief_root(Some(&dir)), dir.to_string_lossy());
+    }
+
+    #[test]
+    fn chief_root_fails_closed_when_unconfigured_or_uncreatable() {
+        assert_eq!(chief_root(None), "");
+        let t = TempRoot::new();
+        let file = t.path.join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        // A path under a regular file cannot be created.
+        assert_eq!(chief_root(Some(&file.join("chief-cwd"))), "");
+        // An empty root is denied, never resolved against the process CWD.
+        assert!(read("", "notes.md").is_err());
     }
 
     #[test]

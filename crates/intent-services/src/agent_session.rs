@@ -2124,7 +2124,13 @@ impl Services {
     ) -> ProbeContext {
         ProbeContext {
             workspace_id: workspace_id.0.clone(),
-            workspace_root: file_ops::resolve_root(&self.store, workspace_id, Some(agent_id)).await,
+            workspace_root: file_ops::resolve_root(
+                &self.store,
+                workspace_id,
+                Some(agent_id),
+                self.chief_cwd_root.as_deref(),
+            )
+            .await,
             assets_root: self.assets_root.clone(),
         }
     }
