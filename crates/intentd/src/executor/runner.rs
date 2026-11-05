@@ -1201,9 +1201,10 @@ impl Runner {
                 output.line(line);
             }
         };
-        let prepared = match &agent.checkout_of {
-            Some(owner) => Some(self.shared_checkout(owner)),
-            None => tokio::select! {
+        let prepared = if let Some(owner) = &agent.checkout_of {
+            Some(self.shared_checkout(owner))
+        } else {
+            tokio::select! {
                 prepared = self.inner.checkouts.prepare(
                     &agent.id,
                     &agent.workspace_id,
@@ -1212,7 +1213,7 @@ impl Runner {
                     &progress,
                 ) => Some(prepared),
                 _ = &mut stop => None,
-            },
+            }
         };
         let started = match prepared {
             None => Err(None),

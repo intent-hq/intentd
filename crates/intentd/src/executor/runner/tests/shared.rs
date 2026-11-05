@@ -89,7 +89,7 @@ async fn final_stops_keep_a_shared_checkout_until_its_owner_ends() {
     );
     assert_eq!(
         h.checkouts.pushes.lock().unwrap().as_slice(),
-        [owner.clone()]
+        std::slice::from_ref(&owner)
     );
     assert!(checkout.is_dir(), "the owner's checkout stays");
 
@@ -124,7 +124,11 @@ async fn the_sweep_keeps_a_checkout_its_sharers_use() {
 
     assert!(h.runner.sweep(&[]).await.is_empty());
     h.runner.stop(&child).wait().await.unwrap();
-    assert!(h.runner.sweep(&[child.clone()]).await.is_empty());
+    assert!(h
+        .runner
+        .sweep(std::slice::from_ref(&child))
+        .await
+        .is_empty());
     assert!(h.storage.existing_agent_dir(&owner).is_some());
     assert_eq!(h.runner.sweep(&[]).await, vec![owner.clone()]);
     assert!(h.storage.existing_agent_dir(&owner).is_none());
