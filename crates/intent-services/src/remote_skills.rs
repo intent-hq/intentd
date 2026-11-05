@@ -39,15 +39,17 @@ pub(crate) fn person_skill_text(message: &intent_core::AgentMessage) -> Option<&
         .and_then(|m| m.get("fromAgentId"))
         .and_then(Value::as_str)
         .is_some_and(|id| !id.is_empty());
-    let by_system = metadata.and_then(|m| m.get("source")).and_then(Value::as_str) == Some("system");
+    let by_system = metadata
+        .and_then(|m| m.get("source"))
+        .and_then(Value::as_str)
+        == Some("system");
     if by_agent || by_system {
         return None;
     }
-    let text = message
-        .content
-        .as_array()?
-        .iter()
-        .find_map(|block| (block.get("type")? == "text").then(|| block.get("text")?.as_str())?)?;
+    let text =
+        message.content.as_array()?.iter().find_map(|block| {
+            (block.get("type")? == "text").then(|| block.get("text")?.as_str())?
+        })?;
     leading_skill_name(text).map(|_| text)
 }
 

@@ -2852,7 +2852,7 @@ async fn a_remote_agents_skills_come_from_its_machine() {
     assert_eq!(notices.len(), 1, "{convo}");
     assert_eq!(notices[0]["metadata"]["skill"], "no-such-skill");
     assert_eq!(notices[0]["metadata"]["machine"], "E2E node");
-    let text = notices[0]["content"].to_string();
+    let text = notices[0]["contentBlocks"].to_string();
     assert!(text.contains("/no-such-skill"), "{text}");
     assert!(text.contains("E2E node"), "{text}");
 }

@@ -390,7 +390,10 @@ fn row(role: &str, text: &str, metadata: Option<Value>) -> intent_core::AgentMes
 #[test]
 fn only_a_persons_slash_message_is_checked() {
     use super::person_skill_text;
-    assert_eq!(person_skill_text(&row("user", "/deploy now", None)), Some("/deploy now"));
+    assert_eq!(
+        person_skill_text(&row("user", "/deploy now", None)),
+        Some("/deploy now")
+    );
     assert_eq!(person_skill_text(&row("user", "deploy now", None)), None);
     assert_eq!(person_skill_text(&row("assistant", "/deploy", None)), None);
     assert_eq!(person_skill_text(&row("system", "/deploy", None)), None);
