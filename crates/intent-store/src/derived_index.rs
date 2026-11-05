@@ -131,8 +131,9 @@ pub async fn check_integrity(pool: &SqlitePool) -> Result<IntegrityReport> {
     if rows.len() == 1 && rows[0] == "ok" {
         return Ok(IntegrityReport::default());
     }
-    let mut problems = Vec::with_capacity(rows.len());
-    for message in rows {
+    let lines = problem_lines(&rows);
+    let mut problems = Vec::with_capacity(lines.len());
+    for message in lines {
         let (table, repairable) = attribute(pool, &message).await;
         problems.push(IntegrityProblem {
             message,
@@ -143,15 +144,29 @@ pub async fn check_integrity(pool: &SqlitePool) -> Result<IntegrityReport> {
     Ok(IntegrityReport { problems })
 }
 
-/// Attribute one integrity row. Lookups that fail leave the row unattributed.
-async fn attribute(pool: &SqlitePool, message: &str) -> (Option<String>, Option<DerivedIndex>) {
+/// One problem per line. `SQLite` joins every B-tree error of a database
+/// into a single row separated by newlines, headed by
+/// `*** in database main ***`; splitting lets each line name its own table.
+pub(crate) fn problem_lines(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .flat_map(|row| row.lines())
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("*** in database"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Attribute one integrity line. Lookups that fail leave it unattributed.
+pub(crate) async fn attribute(
+    pool: &SqlitePool,
+    message: &str,
+) -> (Option<String>, Option<DerivedIndex>) {
     // FTS5 xIntegrity: "malformed inverted index for FTS5 table main.note_fts".
     if let Some(name) = word_after(message, "FTS5 table main.") {
         let index = DerivedIndex::owning(&name);
         return (Some(name), index);
     }
-    // B-tree damage: "Tree 23 page 45 cell 3: ..." (first row may carry a
-    // "*** in database main ***" header line).
+    // B-tree damage: "Tree 23 page 45 cell 3: ...".
     if let Some(root) = word_after(message, "Tree ").and_then(|n| n.parse::<i64>().ok()) {
         let table = sqlx::query_scalar::<_, String>(
             "SELECT tbl_name FROM sqlite_schema WHERE rootpage = ?",
@@ -179,7 +194,7 @@ async fn attribute(pool: &SqlitePool, message: &str) -> (Option<String>, Option<
 }
 
 /// The identifier immediately following `prefix` in `message`.
-fn word_after(message: &str, prefix: &str) -> Option<String> {
+pub(crate) fn word_after(message: &str, prefix: &str) -> Option<String> {
     let start = message.find(prefix)? + prefix.len();
     let word: String = message[start..]
         .chars()
@@ -189,11 +204,27 @@ fn word_after(message: &str, prefix: &str) -> Option<String> {
 }
 
 /// Rebuild `note_fts` from `note` on `conn`, inside a write transaction.
-/// Re-syncs `note_search_ctx` first (adds rows for any note missing one and
-/// refreshes its filter columns), keeping existing `search_id`s stable.
+/// Re-syncs `note_search_ctx` first (drops rows whose note is gone, adds rows
+/// for any note missing one and refreshes its filter columns), keeping
+/// existing `search_id`s stable.
 /// The tag expression mirrors the 0141 triggers; keep them in sync.
 async fn rebuild_note_search(conn: &mut sqlx::SqliteConnection) -> Result<()> {
     let step = |what: &'static str| move |e: sqlx::Error| Error::Internal(format!("{what}: {e}"));
+    // Empty the index first: the orphan sweep below fires the ctx delete
+    // trigger, which must not touch damaged index pages.
+    sqlx::query("INSERT INTO note_fts(note_fts) VALUES('delete-all')")
+        .execute(&mut *conn)
+        .await
+        .map_err(step("note search delete-all failed"))?;
+    // A ctx row whose note is gone (only possible if foreign keys were ever
+    // off) would make a later insert of that note fail its UNIQUE key.
+    sqlx::query(
+        "DELETE FROM note_search_ctx WHERE NOT EXISTS (SELECT 1 FROM note n \
+         WHERE n.id = note_search_ctx.note_id AND n.workspace_id = note_search_ctx.workspace_id)",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(step("note search context orphan sweep failed"))?;
     sqlx::query(
         "INSERT INTO note_search_ctx(note_id, workspace_id, is_archived, updated_at) \
          SELECT n.id, n.workspace_id, n.is_archived, n.updated_at FROM note n \
@@ -213,10 +244,6 @@ async fn rebuild_note_search(conn: &mut sqlx::SqliteConnection) -> Result<()> {
     .execute(&mut *conn)
     .await
     .map_err(step("note search context refresh failed"))?;
-    sqlx::query("INSERT INTO note_fts(note_fts) VALUES('delete-all')")
-        .execute(&mut *conn)
-        .await
-        .map_err(step("note search delete-all failed"))?;
     sqlx::query(
         "INSERT INTO note_fts(rowid, title, content, tags) \
          SELECT c.search_id, n.title, n.content, \
@@ -234,29 +261,47 @@ async fn rebuild_note_search(conn: &mut sqlx::SqliteConnection) -> Result<()> {
 /// What [`repair_derived_indexes`] did.
 #[derive(Debug, Clone)]
 pub struct RepairReport {
-    /// Directory holding the pre-repair copy of the database files.
-    pub backup_dir: PathBuf,
-    /// Integrity before any change.
+    /// Read-only integrity result taken before any copy or change.
     pub before: IntegrityReport,
-    /// Indexes rebuilt, in order.
-    pub rebuilt: Vec<DerivedIndex>,
-    /// Integrity after the rebuild.
-    pub after: IntegrityReport,
+    /// What happened next.
+    pub action: RepairAction,
+}
+
+/// The repair's decision after the read-only check.
+#[derive(Debug, Clone)]
+pub enum RepairAction {
+    /// Nothing needed rebuilding (and no `force`): nothing was copied or changed.
+    NothingToDo,
+    /// Damage outside the rebuildable indexes was found. Nothing was copied
+    /// or changed: rebuilding allocates and frees pages, which could
+    /// overwrite pages of canonical tables that are already damaged.
+    RefusedOtherDamage,
+    /// The listed indexes were rebuilt after a backup.
+    Rebuilt {
+        /// Directory holding the pre-repair copy of the database files.
+        backup_dir: PathBuf,
+        /// Indexes rebuilt, in order.
+        rebuilt: Vec<DerivedIndex>,
+        /// Integrity after the rebuild.
+        after: IntegrityReport,
+    },
 }
 
 /// Offline repair: take exclusive daemon ownership of `db_path` (fails while
-/// intentd runs), copy the database and its WAL into a new timestamped
-/// directory under `backup_root`, then rebuild every derived index that
-/// `PRAGMA integrity_check` reports as damaged (or all of them with `force`)
-/// and check again. Canonical tables are only read. Refuses a database whose
-/// migration ledger does not exactly match this build, so the rebuild SQL
-/// always matches the schema.
+/// intentd runs) and check it read-only. Refuses, changing nothing, when the
+/// migration ledger differs from this build (so the rebuild SQL matches the
+/// schema) or the check finds damage outside the rebuildable indexes. Does
+/// nothing when no index is damaged, unless `force`. Otherwise copies the
+/// database and its WAL into a new timestamped directory under `backup_root`,
+/// rebuilds the damaged indexes (all of them with `force`) from canonical
+/// rows, which are only read, and checks again.
 ///
 /// # Errors
 ///
 /// Returns `Error::Internal` when the database is missing, another process
-/// owns it, the schema version differs from this build, the backup cannot be
-/// written, or a rebuild statement fails (its transaction rolls back).
+/// owns it, the schema version differs from this build, the integrity check
+/// cannot run, the backup cannot be written, or a rebuild statement fails
+/// (its transaction rolls back).
 pub async fn repair_derived_indexes(
     db_path: &Path,
     backup_root: &Path,
@@ -273,18 +318,45 @@ pub async fn repair_derived_indexes(
             "{e}; stop intentd (`intentd stop`) and quit the Intent app before repairing"
         ))
     })?;
-    {
+    let before = {
         let diagnostic = crate::DiagnosticStore::open(&prepared.physical).await?;
-        let status = diagnostic.migration_status().await;
-        diagnostic.close().await;
-        let status = status?;
-        if !status.is_current() {
-            return Err(Error::Internal(format!(
-                "database schema does not match this intentd build (applied {:?}, expected {:?}); \
-                 repair with the intentd version that last ran on this database",
-                status.applied, status.expected
-            )));
+        let checked = async {
+            let status = diagnostic.migration_status().await?;
+            if !status.is_current() {
+                return Err(Error::Internal(format!(
+                    "database schema does not match this intentd build (applied {:?}, \
+                     expected {:?}); repair with the intentd version that last ran on this \
+                     database",
+                    status.applied, status.expected
+                )));
+            }
+            check_integrity(diagnostic.read_pool()).await.map_err(|e| {
+                Error::Internal(format!(
+                    "{e}; nothing was changed. Copy the whole data folder before \
+                     attempting any recovery"
+                ))
+            })
         }
+        .await;
+        diagnostic.close().await;
+        checked?
+    };
+    if before.has_unrepairable() {
+        return Ok(RepairReport {
+            before,
+            action: RepairAction::RefusedOtherDamage,
+        });
+    }
+    let rebuilt: Vec<DerivedIndex> = if force {
+        DerivedIndex::ALL.to_vec()
+    } else {
+        before.damaged_indexes()
+    };
+    if rebuilt.is_empty() {
+        return Ok(RepairReport {
+            before,
+            action: RepairAction::NothingToDo,
+        });
     }
     let backup_dir = backup_database_files(&prepared.physical, backup_root)?;
 
@@ -295,12 +367,6 @@ pub async fn repair_derived_indexes(
     )
     .await?;
     let result = async {
-        let before = check_integrity(&pool).await?;
-        let rebuilt: Vec<DerivedIndex> = if force {
-            DerivedIndex::ALL.to_vec()
-        } else {
-            before.damaged_indexes()
-        };
         for index in &rebuilt {
             let mut tx = pool
                 .begin()
@@ -315,16 +381,23 @@ pub async fn repair_derived_indexes(
         let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .execute(&pool)
             .await;
-        Ok::<_, Error>((before, rebuilt, after))
+        Ok::<_, Error>(after)
     }
     .await;
     pool.close().await;
-    let (before, rebuilt, after) = result?;
+    let after = result.map_err(|e| {
+        Error::Internal(format!(
+            "{e}; the pre-repair copy is in {}",
+            backup_dir.display()
+        ))
+    })?;
     Ok(RepairReport {
-        backup_dir,
         before,
-        rebuilt,
-        after,
+        action: RepairAction::Rebuilt {
+            backup_dir,
+            rebuilt,
+            after,
+        },
     })
 }
 
@@ -366,13 +439,20 @@ fn backup_database_files(db: &Path, backup_root: &Path) -> Result<PathBuf> {
     if wal.exists() {
         sources.push(wal);
     }
-    for source in sources {
-        let file_name = source.file_name().unwrap_or_default();
-        let target = dir.join(file_name);
-        std::fs::copy(&source, &target).map_err(|e| io("copy", &source, e))?;
-        std::fs::File::open(&target)
+    let copied = sources.iter().try_for_each(|source| {
+        let target = dir.join(source.file_name().unwrap_or_default());
+        std::fs::copy(source, &target).map_err(|e| io("copy", source, e))?;
+        // Windows FlushFileBuffers needs a handle with write access.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
             .and_then(|f| f.sync_all())
-            .map_err(|e| io("sync", &target, e))?;
+            .map_err(|e| io("sync", &target, e))
+    });
+    if let Err(e) = copied {
+        // Never leave a partial copy that looks like a usable backup.
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
     }
     #[cfg(unix)]
     std::fs::File::open(&dir)

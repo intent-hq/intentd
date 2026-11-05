@@ -29,7 +29,7 @@ mod delegation_group_repo;
 mod derived_index;
 pub use derived_index::{
     check_integrity, repair_derived_indexes, DerivedIndex, IntegrityProblem, IntegrityReport,
-    RepairReport,
+    RepairAction, RepairReport,
 };
 mod desktop_repo;
 mod diagnostics;
@@ -1098,12 +1098,14 @@ async fn connect_read_owned_timeout(
         opts
     };
     // Enforce the read-only convention (intent-hq/intent#8592): with
-    // `query_only` a stray write on a read connection fails with
-    // SQLITE_READONLY instead of becoming a second concurrent writer beside
-    // the single write connection. SQLite's WAL-reset corruption bug (fixed
-    // in 3.51.3; this build bundles 3.46.0) needs two connections writing or
-    // checkpointing at once. The WAL PRAGMAs that follow are no-ops on an
-    // existing WAL database and still succeed under `query_only`.
+    // `query_only` a read connection cannot write, so a stray write fails
+    // with SQLITE_READONLY instead of becoming a second concurrent writer
+    // beside the single write connection. SQLite's WAL-reset corruption bug
+    // (fixed in 3.51.3; this build bundles 3.46.0) needs two connections
+    // writing or checkpointing at once. This narrows it but does not stop a
+    // read connection from checkpointing (explicitly, or as the last one to
+    // close). The WAL PRAGMAs that follow are no-ops on an existing WAL
+    // database and still succeed under `query_only`.
     let opts = opts.pragma("query_only", "ON");
 
     retain_pool_owner(SqlitePoolOptions::new(), owner.clone())

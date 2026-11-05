@@ -470,12 +470,13 @@ intentd stop             # quit the Intent app too; the repair needs exclusive o
 intentd repair-indexes   # add --all to rebuild every index even when none is damaged
 ```
 
-The command refuses while a daemon holds the data dir or database lock, and refuses a
-database whose schema version differs from the binary. It first copies `intentd.db` and its
-WAL to `<data dir>/backups/intentd.db-<UTC timestamp>/`, then rebuilds only the damaged
-indexes from the canonical tables and runs the integrity check again (exit 0 when clean).
-Damage outside the search indexes is reported but not repaired: copy the whole data
-folder before attempting recovery.
+The command refuses while a daemon holds the data dir or database lock. It checks the
+database read-only first and changes nothing when the schema version differs from the
+binary, when the check finds damage outside the search indexes (rebuilding could then
+overwrite damaged pages of canonical tables; copy the whole data folder before attempting
+recovery), or when no index is damaged. Otherwise it copies `intentd.db` and its WAL to
+`<data dir>/backups/intentd.db-<UTC timestamp>/`, rebuilds the damaged indexes from the
+canonical tables and runs the integrity check again (exit 0 when clean).
 
 ### Installed Codex and Claude CLIs
 

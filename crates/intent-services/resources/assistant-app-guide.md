@@ -1246,4 +1246,4 @@ If note or chat writes fail with "database disk image is malformed" (code 267), 
 without changing them. If doctor reports damage outside the search indexes, stop and
 copy the whole data folder before any recovery.
 
-<!-- Sources: packages/intentd/README.md (Start, status, stop, and restart; Repairing a damaged search index); packages/intentd/crates/intentd-sitter/src/{cli.rs,main.rs,startup.rs,supervisor.rs,paths.rs,readiness.rs}; packages/intentd/crates/intentd/src/{main.rs (Serve, Status, Stop, Doctor, RepairIndexes),db_repair.rs}; packages/intentd/crates/intent-store/src/derived_index.rs. -->
+<!-- Sources: packages/intentd/README.md (Start, status, stop, and restart; Repairing a damaged search index); packages/intentd/crates/intentd-sitter/src/{cli.rs,main.rs,startup.rs,supervisor.rs,paths.rs,readiness.rs}; packages/intentd/crates/intentd/src/main.rs (Serve, Status, Stop, Doctor, RepairIndexes); packages/intentd/crates/intentd/src/db_repair.rs; packages/intentd/crates/intent-store/src/derived_index.rs. -->

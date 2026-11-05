@@ -174,14 +174,17 @@ enum Command {
     /// Offline repair of the derived search indexes (note and chat-message
     /// full-text search) that `intentd doctor` reports as damaged; a damaged
     /// index makes writes fail with "database disk image is malformed"
-    /// (code 267). Requires intentd to be stopped. First copies the database
-    /// and its WAL to a new directory under `<data dir>/backups/`, then
-    /// rebuilds only the damaged indexes from the canonical tables (notes and
-    /// messages are read, never changed) and runs the integrity check again.
-    /// Refuses a database whose schema version differs from this build.
-    /// Exits 0 when the database is healthy afterwards, 1 otherwise.
+    /// (code 267). Requires intentd to be stopped. Checks the database
+    /// read-only first and changes nothing when its schema version differs
+    /// from this build, when the check finds damage outside the search
+    /// indexes, or when no index is damaged. Otherwise copies the database and
+    /// its WAL to a new directory under `<data dir>/backups/`, rebuilds the
+    /// damaged indexes from the canonical tables (notes and messages are read,
+    /// never changed) and checks again. Exits 0 when the database is healthy
+    /// afterwards, 1 otherwise.
     RepairIndexes {
         /// Rebuild every derived index, even when none is reported damaged.
+        /// Still refuses when the check finds damage outside the indexes.
         #[arg(long)]
         all: bool,
     },

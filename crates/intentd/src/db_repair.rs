@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use intent_store::{DerivedIndex, IntegrityReport};
+use intent_store::{DerivedIndex, IntegrityReport, RepairAction};
 
 /// Directory under the data dir that receives pre-repair database copies.
 pub(crate) const BACKUP_DIR: &str = "backups";
@@ -112,28 +112,51 @@ pub(crate) async fn cmd_repair_indexes(all: bool) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-    println!("[ok] backup written: {}", report.backup_dir.display());
-    println!("before repair:");
+    println!("before repair (read-only check):");
     if report.before.is_ok() {
         println!("  [ok] integrity_check: ok");
     } else {
-        print_problems(&report.before, &config.data_dir, Severity::Warn);
+        let severity = match report.action {
+            RepairAction::RefusedOtherDamage => Severity::Fail,
+            _ => Severity::Warn,
+        };
+        print_problems(&report.before, &config.data_dir, severity);
     }
-    if report.rebuilt.is_empty() {
-        println!("[ok] no derived index needed a rebuild (pass --all to rebuild anyway)");
-    } else {
-        println!("[ok] rebuilt: {}", label(&report.rebuilt));
-    }
-    println!("after repair:");
-    if report.after.is_ok() {
-        println!("  [ok] integrity_check: ok");
-        ExitCode::SUCCESS
-    } else {
-        print_problems(&report.after, &config.data_dir, Severity::Fail);
-        println!(
-            "  [FAIL] the database still has problems; the pre-repair copy is in {}",
-            report.backup_dir.display()
-        );
-        ExitCode::FAILURE
+    match report.action {
+        RepairAction::NothingToDo => {
+            println!(
+                "[ok] no derived index needs a rebuild; nothing was copied or changed \
+                 (pass --all to rebuild anyway)"
+            );
+            ExitCode::SUCCESS
+        }
+        RepairAction::RefusedOtherDamage => {
+            println!(
+                "  [FAIL] refusing to repair: rebuilding an index allocates and frees pages, \
+                 which could overwrite damaged pages of the tables above. Nothing was \
+                 copied or changed."
+            );
+            ExitCode::FAILURE
+        }
+        RepairAction::Rebuilt {
+            backup_dir,
+            rebuilt,
+            after,
+        } => {
+            println!("[ok] backup written: {}", backup_dir.display());
+            println!("[ok] rebuilt: {}", label(&rebuilt));
+            println!("after repair:");
+            if after.is_ok() {
+                println!("  [ok] integrity_check: ok");
+                ExitCode::SUCCESS
+            } else {
+                print_problems(&after, &config.data_dir, Severity::Fail);
+                println!(
+                    "  [FAIL] the database still has problems; the pre-repair copy is in {}",
+                    backup_dir.display()
+                );
+                ExitCode::FAILURE
+            }
+        }
     }
 }
