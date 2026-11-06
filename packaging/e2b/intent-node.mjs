@@ -15,8 +15,8 @@ export const ARCHIVE_TARGET = 'x86_64-unknown-linux-musl';
 export const RELEASES_REPO = 'intent-hq/intentd-releases';
 export const INSTALL_DIR = '/opt/intentd';
 // E2B Hobby caps sandboxes at 8 vCPU / 8 GiB; Pro goes higher only after E2B
-// support raises the team's limits. So 8x16 and 16x32 need Pro with raised
-// limits, for the publishing team to build them and for a user to start them.
+// support raises the project's limits. So 8x16 and 16x32 need Pro with raised
+// limits, for the publishing project to build them and for a user to start them.
 // A build E2B refuses over those limits is skipped with a warning (see
 // isResourceLimitRefusal); E2B_TEMPLATE_SIZES narrows what gets built.
 export const SIZES = [
@@ -66,7 +66,7 @@ export function enabledSizes(list) {
   return ids.length ? ids.map(id => parseSize(id).id) : SIZES.map(size => size.id);
 }
 
-// True when E2B refused a build request because the size is over the team's
+// True when E2B refused a build request because the size is over the project's
 // vCPU or memory limits. The SDK reports API errors as "<status>: <message>".
 export function isResourceLimitRefusal(error) {
   const message = String(error?.message ?? '');
@@ -181,7 +181,7 @@ export function redact(text, secret) {
   return secret ? value.split(secret).join('[redacted]') : value;
 }
 
-// Makes the template visible to every E2B team as <team-slug>/<name>.
+// Makes the template visible to every E2B project as <project-slug>/<name>.
 // Returns the names E2B reports for it.
 export async function publishTemplate({ templateId, apiKey, fetch = globalThis.fetch, apiUrl = API_URL }) {
   const response = await fetch(`${apiUrl}/v2/templates/${encodeURIComponent(templateId)}`, {

@@ -4,9 +4,9 @@
 # intent-node-2x4 (2 vCPU / 4 GiB), intent-node-4x8 (4 vCPU / 8 GiB, the
 # default), intent-node-8x16 (8 vCPU / 16 GiB) and intent-node-16x32 (16 vCPU /
 # 32 GiB). E2B Hobby caps sandboxes at 8 vCPU / 8 GiB and Pro goes higher only
-# after E2B support raises the team's limits, so the publishing team (the one
+# after E2B support raises the project's limits, so the publishing project (the one
 # that owns E2B_API_KEY) needs those limits to build 8x16 and 16x32. A build E2B
-# refuses over the team's limits is skipped with a warning, so that size has no
+# refuses over the project's limits is skipped with a warning, so that size has no
 # tag for the version. The E2B_TEMPLATE_SIZES repository variable (for example
 # "2x4,4x8") narrows what is built. The steps live in e2b-template-build.yml.
 #
@@ -19,7 +19,7 @@
 # - On pull requests that touch the template: build a private
 #   intent-node-<size>:pr-<number> from the newest release and smoke-test it.
 #
-# Fail-soft: without the E2B_API_KEY secret (an E2B team API key) every job
+# Fail-soft: without the E2B_API_KEY secret (an API key for Intent's publishing E2B project) every job
 # logs a warning and succeeds. The key is passed only through env and is
 # redacted from script errors.
 name: E2B template

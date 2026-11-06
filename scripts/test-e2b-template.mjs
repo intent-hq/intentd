@@ -60,10 +60,11 @@ describe('sizes', () => {
     assert.deepEqual(enabledSizes(' 2x4, 4x8 '), ['2x4', '4x8']);
     assert.throws(() => enabledSizes('2x4,32x64'), /unknown template size/);
   });
-  it('treats an E2B refusal over team CPU or memory limits as a skip', () => {
+  it('treats an E2B refusal over project CPU or memory limits as a skip', () => {
     for (const message of [
       '400: CPU count exceeds team limits (8)',
       '400: Memory exceeds team limits (8192 MiB)',
+      '400: CPU count exceeds project limits (8)',
       '403: requested vCPU 16 is above the maximum allowed for your team',
       '400: memoryMB must be at most 8192',
     ]) assert.equal(isResourceLimitRefusal(new Error(message)), true, message);

@@ -61,9 +61,9 @@ async function main() {
     });
   } catch (error) {
     if (!isResourceLimitRefusal(error)) throw error;
-    // Fail-soft: the publishing team's E2B limits are below this size, so no
+    // Fail-soft: the publishing E2B project's limits are below this size, so no
     // tag exists for this version and the backend does not offer the size.
-    console.log(`::warning::E2B refused ${name} (${size.cpuCount} vCPU, ${size.memoryMB} MiB) over the team's limits; skipping it. ${redact(error.message, apiKey)}`);
+    console.log(`::warning::E2B refused ${name} (${size.cpuCount} vCPU, ${size.memoryMB} MiB) over the project's limits; skipping it. ${redact(error.message, apiKey)}`);
     output({ skip: 'true', refused: 'true' });
     return;
   }
