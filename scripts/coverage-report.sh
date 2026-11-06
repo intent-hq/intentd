@@ -38,12 +38,15 @@ tooling_error() {
     exit 3
 }
 
+no_profiles="the instrumented test run wrote no .profraw files, so there is no coverage data to merge."
+# A missing directory is left to cargo-llvm-cov, whose "not found *.profraw"
+# error is mapped below; stubbed-cargo policy tests never create it.
 profiles=0
 if [ -d "$profile_dir" ]; then
     profiles=$(find "$profile_dir" -maxdepth 1 -name '*.profraw' -type f | wc -l)
-fi
-if [ "$profiles" -eq 0 ]; then
-    tooling_error "the instrumented test run wrote no .profraw files, so there is no coverage data to merge."
+    if [ "$profiles" -eq 0 ]; then
+        tooling_error "$no_profiles"
+    fi
 fi
 
 stderr_log=$(mktemp)
@@ -53,6 +56,9 @@ status=0
 cat "$stderr_log" >&2
 
 dropped=$(grep -cE '^warning: .*\.profraw: ' "$stderr_log" || true)
+if [ "$status" -ne 0 ] && grep -q 'not found \*\.profraw files' "$stderr_log"; then
+    tooling_error "$no_profiles"
+fi
 if [ "$status" -ne 0 ] && grep -q 'no profile can be merged' "$stderr_log"; then
     tooling_error "none of the $profiles .profraw files could be read (llvm-profdata: no profile can be merged)."
 fi

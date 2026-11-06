@@ -113,8 +113,8 @@ class PolicyTests(unittest.TestCase):
                         if child_exit:
                             self.assertEqual(len(calls), 2, "failed test must prevent reports")
                         else:
-                            self.assertIn(["llvm-cov", "report", "--lcov", "--output-path", "lcov.info"], [call[0] for call in calls])
-                            self.assertEqual(calls[-1][0], ["llvm-cov", "report", "--summary-only", "--fail-under-lines", "40"])
+                            self.assertIn(["llvm-cov", "report", "--failure-mode=all", "--lcov", "--output-path", "lcov.info"], [call[0] for call in calls])
+                            self.assertEqual(calls[-1][0], ["llvm-cov", "report", "--failure-mode=all", "--summary-only", "--fail-under-lines", "40"])
 
 
 if __name__ == "__main__":
