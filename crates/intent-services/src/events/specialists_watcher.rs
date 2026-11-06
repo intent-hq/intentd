@@ -313,19 +313,19 @@ async fn debounce_loop(
             maybe = raw_rx.recv() => match maybe {
                 Some(SpecialistsMsg::Stop) => raw_rx.close(),
                 Some(SpecialistsMsg::Change(workspace_id)) => {
-                    let deadline = tokio::time::Instant::now() + DEBOUNCE;
+                    let now = tokio::time::Instant::now();
                     match workspace_id {
                         // User-tier change: affects all workspaces
                         None => {
-                            user_deadline.get_or_insert(deadline);
+                            user_deadline.get_or_insert(now + DEBOUNCE);
                             for ws_id in workspace_paths.keys() {
-                                pending.entry(ws_id.clone()).or_insert(deadline);
+                                schedule_change(&mut pending, ws_id.clone(), now);
                             }
                         }
                         // Project-tier change: affects specific workspace
                         Some(ws_id) => {
                             if workspace_paths.contains_key(&ws_id) {
-                                pending.entry(ws_id).or_insert(deadline);
+                                schedule_change(&mut pending, ws_id, now);
                             }
                         }
                     }
@@ -423,6 +423,35 @@ async fn refresh_claude_watches(
     linked.sync_project(id.clone(), directories);
 }
 
+/// Record a raw change for `ws_id` seen at `now`. The window opens at the
+/// FIRST change and is not extended by later ones, so a continuous stream of
+/// writes still reloads every `DEBOUNCE` (bounded latency) instead of
+/// starving; a burst longer than one window yields one event per window.
+/// Duplicate flushes are harmless because emission is fingerprint-gated.
+fn schedule_change(
+    pending: &mut HashMap<WorkspaceId, tokio::time::Instant>,
+    ws_id: WorkspaceId,
+    now: tokio::time::Instant,
+) {
+    pending.entry(ws_id).or_insert(now + DEBOUNCE);
+}
+
+/// Remove and return the workspaces whose window has closed at `now`.
+fn take_due(
+    pending: &mut HashMap<WorkspaceId, tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> Vec<WorkspaceId> {
+    let due: Vec<WorkspaceId> = pending
+        .iter()
+        .filter(|(_, &deadline)| deadline <= now)
+        .map(|(ws_id, _)| ws_id.clone())
+        .collect();
+    for ws_id in &due {
+        pending.remove(ws_id);
+    }
+    due
+}
+
 async fn flush_due(
     bus: &EventBus,
     workspace_paths: &HashMap<WorkspaceId, PathBuf>,
@@ -430,15 +459,7 @@ async fn flush_due(
     fingerprints: &mut HashMap<WorkspaceId, u64>,
     pending: &mut HashMap<WorkspaceId, tokio::time::Instant>,
 ) {
-    let now = tokio::time::Instant::now();
-    let due: Vec<WorkspaceId> = pending
-        .iter()
-        .filter(|(_, &deadline)| deadline <= now)
-        .map(|(ws_id, _)| ws_id.clone())
-        .collect();
-
-    for ws_id in due {
-        pending.remove(&ws_id);
+    for ws_id in take_due(pending, tokio::time::Instant::now()) {
         if let Some(path) = workspace_paths.get(&ws_id) {
             emit_specialists_changed(bus, &ws_id, path, user_dir, fingerprints).await;
         }
@@ -721,25 +742,88 @@ mod tests {
         // Let the OS watch establish before mutating (FSEvents/inotify warm-up).
         tokio::time::sleep(Duration::from_millis(250)).await;
 
-        // Rapid burst of specialist file changes within one debounce window.
+        // Rapid burst, written back to back. The window is fixed from the
+        // first change (the schedule tests below pin the coalescing
+        // contract deterministically), so exactly one event is guaranteed
+        // only when the whole burst lands inside one window. A loaded or
+        // stalled runner can stretch these writes past `DEBOUNCE`
+        // (intent-hq/intent#8710); the split is then correct behaviour, so
+        // only a missing event or more events than writes is a failure.
+        let burst_start = Instant::now();
         for i in 0..3 {
             std::fs::write(
                 proj.join(format!("custom{i}.md")),
                 specialist_md(&format!("Custom {i}"), "body"),
             )
             .expect("write specialist");
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let burst = burst_start.elapsed();
 
         let events = drain_specialists_events(&mut sub, Duration::from_secs(2), LIVENESS).await;
-        assert_eq!(
-            events.len(),
-            1,
-            "burst must coalesce to one event, got {events:?}"
-        );
+        if burst < DEBOUNCE {
+            assert_eq!(
+                events.len(),
+                1,
+                "burst of {burst:?} inside one window must coalesce to one event, got {events:?}"
+            );
+        } else {
+            assert!(
+                (1..=3).contains(&events.len()),
+                "burst of {burst:?} straddled the window: expected 1..=3 events, got {events:?}"
+            );
+        }
         assert_eq!(events[0].workspace_id, ws_id);
         assert_eq!(events[0].data["workspaceId"], ws_id.as_str());
         assert_eq!(events[0].actor.actor_type, ActorType::System);
+    }
+
+    /// Replay change arrivals (ms offsets) against the pure flush schedule,
+    /// checking due windows at every millisecond. Returns the offsets at
+    /// which the workspace flushed. No clock, IO or watcher involved, so the
+    /// coalescing contract is pinned deterministically (#8710).
+    fn simulated_flush_offsets(change_offsets_ms: &[u64]) -> Vec<u64> {
+        let ws_id = WorkspaceId::from("ws-schedule");
+        let t0 = tokio::time::Instant::now();
+        let mut pending = HashMap::new();
+        let mut flushes = Vec::new();
+        let horizon = change_offsets_ms.iter().copied().max().unwrap_or_default()
+            + u64::try_from(DEBOUNCE.as_millis()).expect("fits") * 2;
+        for ms in 0..=horizon {
+            let now = t0 + Duration::from_millis(ms);
+            if change_offsets_ms.contains(&ms) {
+                schedule_change(&mut pending, ws_id.clone(), now);
+            }
+            for due in take_due(&mut pending, now) {
+                assert_eq!(due, ws_id);
+                flushes.push(ms);
+            }
+        }
+        flushes
+    }
+
+    /// Changes spread across one window (including one just before it
+    /// closes) coalesce into ONE flush, a full `DEBOUNCE` after the first.
+    #[test]
+    fn burst_within_window_flushes_once() {
+        let window = u64::try_from(DEBOUNCE.as_millis()).expect("fits");
+        assert_eq!(
+            simulated_flush_offsets(&[0, 50, 100, window - 1]),
+            vec![window]
+        );
+    }
+
+    /// The window is fixed from the FIRST change (bounded latency: a steady
+    /// stream of writes cannot postpone the reload forever), so a change that
+    /// lands after the flush opens a new window. A wall-clock burst stretched
+    /// past `DEBOUNCE` on a loaded runner splits exactly this way, which is
+    /// what failed `project_tier_burst_debounces_to_one_event` (#8710).
+    #[test]
+    fn change_after_window_opens_a_new_window() {
+        let window = u64::try_from(DEBOUNCE.as_millis()).expect("fits");
+        assert_eq!(
+            simulated_flush_offsets(&[0, 50, window + 1, window + 100]),
+            vec![window, window * 2 + 1]
+        );
     }
 
     #[tokio::test]
