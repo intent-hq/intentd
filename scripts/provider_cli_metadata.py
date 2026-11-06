@@ -9,11 +9,16 @@ A mapping with `runtimePackage` also snapshots that exact adapter dependency's
 CLI version the adapter's runtime was built against, which the daemon uses as
 the bundled-CLI pin and to derive the installed-CLI minimum.
 """
+import importlib.util
 import json
 from pathlib import Path
 import re
 import urllib.parse
 import urllib.request
+
+_spec = importlib.util.spec_from_file_location("download_retry", Path(__file__).with_name("download_retry.py"))
+download_retry = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(download_retry)
 
 METADATA = "crates/intent-providers/data/adapter-cli-packages.json"
 CONFIG = "crates/intent-providers/src/config.rs"
@@ -75,9 +80,17 @@ def registry_url(name, version):
     return REGISTRY + urllib.parse.quote(name, safe="") + "/" + urllib.parse.quote(version, safe="")
 
 
-def fetch_manifest(name, version):
-    with urllib.request.urlopen(registry_url(name, version), timeout=30) as response:
-        manifest = json.load(response)
+def read_manifest(url):
+    with urllib.request.urlopen(url, timeout=30) as response:
+        return json.load(response)
+
+
+def fetch_manifest(name, version, delays=None, sleep=None):
+    # A transient registry 5xx or reset retries (intent-hq/intent#8613).
+    manifest = download_retry.retrying(lambda: read_manifest(registry_url(name, version)),
+                                       "npm registry manifest " + name + "@" + version,
+                                       delays=download_retry.RETRY_DELAYS if delays is None else delays,
+                                       sleep=sleep)
     if manifest.get("name") != name or manifest.get("version") != version:
         raise ValueError("registry returned a different package than the exact pin")
     return manifest

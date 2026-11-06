@@ -20,6 +20,8 @@ name: Warm release Rust caches
     - '**/*.h'
     - .github/dist-build-setup.yml
     - scripts/setup-sccache.py
+    - scripts/download_retry.py
+    - scripts/install-dist.sh
     - .github/workflows/release-cache.yml
     - .github/workflows/release-sitter.yml
     - scripts/*release*cache*.py
@@ -75,7 +77,7 @@ jobs:
         echo "release_push=${line#fast_path=}" >> "$GITHUB_OUTPUT"
     - name: Install dist
       shell: bash
-      run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh
+      run: curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh
         | sh
     - id: plan
       name: Plan build-only matrix
@@ -143,13 +145,13 @@ jobs:
     - name: Provision Rust toolchain and matrix targets
       shell: bash
       run: "if ! command -v rustup >/dev/null 2>&1; then\n  if [ ! -x \"$HOME/.cargo/bin/rustup\" ]; then\n    curl\
-        \ --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain none -y\n  fi\n  echo\
-        \ \"$HOME/.cargo/bin\" >> \"$GITHUB_PATH\"\n  export PATH=\"$HOME/.cargo/bin:$PATH\"\nfi\nchannel=$(sed\
-        \ -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\\1/p' rust-toolchain.toml | head -n1)\n\
-        rustup toolchain install \"$channel\" --profile minimal --no-self-update\nrustup target add --toolchain\
-        \ \"$channel\" ${{ join(matrix.targets, ' ') }}\n# Pin the rustup proxies to the toolchain provisioned above\
-        \ for all\n# later steps. Without this, the first `cargo` invocation inside\n# `dist build` re-enters rustup's\
-        \ rust-toolchain.toml sync to add the\n# declared rustfmt/clippy components, which on the GitHub-hosted\n\
+        \ --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused -sSf https://sh.rustup.rs | sh -s -- --default-toolchain\
+        \ none -y\n  fi\n  echo \"$HOME/.cargo/bin\" >> \"$GITHUB_PATH\"\n  export PATH=\"$HOME/.cargo/bin:$PATH\"\
+        \nfi\nchannel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\\1/p' rust-toolchain.toml\
+        \ | head -n1)\nrustup toolchain install \"$channel\" --profile minimal --no-self-update\nrustup target add\
+        \ --toolchain \"$channel\" ${{ join(matrix.targets, ' ') }}\n# Pin the rustup proxies to the toolchain provisioned\
+        \ above for all\n# later steps. Without this, the first `cargo` invocation inside\n# `dist build` re-enters\
+        \ rustup's rust-toolchain.toml sync to add the\n# declared rustfmt/clippy components, which on the GitHub-hosted\n\
         # gh-linux-16x images collides with the preinstalled Rust (\"failed to\n# install component: 'rustfmt-preview-...',\
         \ detected conflict:\n# 'bin/cargo-fmt'\"), rolls back, and leaves the shim reporting cargo\n# as missing\
         \ (v0.2.16 Release run 30706345522, aarch64-musl leg).\n# The components aren't needed for release builds.\n\
@@ -218,7 +220,10 @@ jobs:
     - name: Install dist (Unix)
       if: runner.os != 'Windows'
       shell: bash
-      run: ${{ matrix.install_dist.run }}
+      env:
+        INSTALL_DIST_RUN: ${{ matrix.install_dist.run }}
+        INSTALL_DIST_SHELL: ${{ matrix.install_dist.shell }}
+      run: bash scripts/install-dist.sh
     - name: Install dist (Windows)
       if: runner.os == 'Windows'
       shell: pwsh

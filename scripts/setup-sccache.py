@@ -8,19 +8,16 @@ Without the variable or a token (for example fork pull requests) compilation
 is uncached.
 """
 import hashlib
-import http.client
+import importlib.util
 import os
 from pathlib import Path
 import platform
 import shutil
 import socket
-import ssl
 import subprocess
 import sys
 import tarfile
 import tempfile
-import time
-import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -73,12 +70,12 @@ def configuration(env):
     return select(env)[2]
 
 
-# A single GitHub 504 on the release download ejected merge-queue PRs
-# (intent-hq/intent#8613, runs 41999101145 and 41999539245). Retry transient
-# failures only: 5xx responses, connection errors and timeouts. A 4xx (a wrong
-# version or asset name) fails at once. Delays between attempts, in seconds.
-RETRY_DELAYS = (2, 5, 15)
 DOWNLOAD_TIMEOUT = 60
+_spec = importlib.util.spec_from_file_location("download_retry", Path(__file__).with_name("download_retry.py"))
+download_retry = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(download_retry)
+# Bounded retry on transient failures (intent-hq/intent#8613); see download_retry.py.
+RETRY_DELAYS = download_retry.RETRY_DELAYS
 
 
 def fetch(url, dest):
@@ -87,23 +84,9 @@ def fetch(url, dest):
         shutil.copyfileobj(response, output)
 
 
-def transient(error):
-    if isinstance(error, urllib.error.HTTPError):
-        return error.code >= 500
-    return isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException))
-
-
 def download(url, dest, delays=RETRY_DELAYS, sleep=None):
     """fetch() with bounded retries on transient failures; re-raises the last error."""
-    for attempt, delay in enumerate((*delays, None), start=1):
-        try:
-            return fetch(url, dest)
-        except Exception as error:
-            if delay is None or not transient(error):
-                raise
-            print(f"::warning::sccache download attempt {attempt} failed ({error}); "
-                  f"retrying in {delay}s", file=sys.stderr)
-            (sleep or time.sleep)(delay)
+    return download_retry.retrying(lambda: fetch(url, dest), "sccache download", delays=delays, sleep=sleep)
 
 
 def install(directory):
