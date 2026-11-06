@@ -227,19 +227,7 @@ jobs:
     - name: Install dist (Windows)
       if: runner.os == 'Windows'
       shell: pwsh
-      env:
-        INSTALL_DIST_RUN: ${{ matrix.install_dist.run }}
-      run: |
-        for ($attempt = 1; ; $attempt++) {
-          try {
-            Invoke-Expression $env:INSTALL_DIST_RUN
-            break
-          } catch {
-            if ($attempt -ge 4) { throw }
-            Write-Warning "cargo-dist installer attempt $attempt failed ($($_.Exception.Message)); retrying in $(10 * $attempt)s"
-            Start-Sleep -Seconds (10 * $attempt)
-          }
-        }
+      run: ${{ matrix.install_dist.run }}
     - name: Install native build dependencies
       shell: bash
       run: ${{ matrix.packages_install }}

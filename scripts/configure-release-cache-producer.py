@@ -62,21 +62,6 @@ def timed_build(step):
     return step
 
 
-# Native pwsh on Windows (no Git Bash script, so no CRLF checkout risk), with
-# the bounded retry scripts/install-dist.sh gives the Unix legs.
-WINDOWS_INSTALL_DIST = '''for ($attempt = 1; ; $attempt++) {
-  try {
-    Invoke-Expression $env:INSTALL_DIST_RUN
-    break
-  } catch {
-    if ($attempt -ge 4) { throw }
-    Write-Warning "cargo-dist installer attempt $attempt failed ($($_.Exception.Message)); retrying in $(10 * $attempt)s"
-    Start-Sleep -Seconds (10 * $attempt)
-  }
-}
-'''
-
-
 def cache_steps(flavor, target, runner, builds):
     return [
         {'name': 'Configure the self-hosted compiler cache', 'shell': 'bash', 'env': deepcopy(CACHE_ENV), 'run': CACHE_RUN},
@@ -144,9 +129,7 @@ echo "matrix=$(jq -c '.ci.github.artifacts_matrix' cache-plan.json)" >> "$GITHUB
                            'env': {'INSTALL_DIST_RUN': '${{ matrix.install_dist.run }}',
                                    'INSTALL_DIST_SHELL': '${{ matrix.install_dist.shell }}'},
                            'run': 'bash scripts/install-dist.sh'},
-                          {'name': 'Install dist (Windows)', 'if': "runner.os == 'Windows'", 'shell': 'pwsh',
-                           'env': {'INSTALL_DIST_RUN': '${{ matrix.install_dist.run }}'},
-                           'run': WINDOWS_INSTALL_DIST},
+                          {'name': 'Install dist (Windows)', 'if': "runner.os == 'Windows'", 'shell': 'pwsh', 'run': '${{ matrix.install_dist.run }}'},
                           {'name': 'Install native build dependencies', 'shell': 'bash', 'run': '${{ matrix.packages_install }}'},
                           *cache_steps('daemon-dist', "${{ join(matrix.targets, ' ') }}", '${{ matrix.runner }}',
                                        [{'name': 'Build cache inputs', 'shell': 'bash',

@@ -294,6 +294,10 @@ PYTHON_DOWNLOADERS = {
 }
 # The two wget calls inside install.sh's retrying wget_download().
 WGET_HELPER_LINES = ('if wget -qO "$2" "$1" 2>/dev/null; then', 'wget -qO "$2" "$1"')
+# Workflows whose Windows leg runs cargo-dist's planned `irm | iex` installer
+# once: installer.ps1 ends in `exit 1`, so a retry needs each attempt in a
+# child pwsh process; left for a follow-up exercised on a Windows runner.
+KNOWN_SINGLE_SHOT_WINDOWS = ('v-release.yml', 'release-cache.yml')
 # Known single-shot downloads left for a follow-up, with the reason.
 KNOWN_SINGLE_SHOT = {
     # User-facing Windows installer; its retry needs Windows/Pester coverage.
@@ -361,20 +365,14 @@ class RepositoryScan(unittest.TestCase):
         self.assertEqual(offenders, [])
 
     def test_planned_installer_runs_through_the_retry_script(self):
-        for file, text in workflow_runs():
-            self.assertNotIn('${{ matrix.install_dist.run }}', text, f'{file}: use scripts/install-dist.sh')
-
-    def test_windows_installer_step_retries(self):
-        steps = 0
-        for path in ('.github/workflows/v-release.yml', '.github/workflows/release-cache.yml'):
-            for job in yaml.safe_load((ROOT / path).read_text())['jobs'].values():
+        # Windows legs are the known exception (KNOWN_SINGLE_SHOT_WINDOWS).
+        raw = []
+        for path in sorted((ROOT / '.github/workflows').glob('*.yml')):
+            for job in (yaml.safe_load(path.read_text()).get('jobs') or {}).values():
                 for step in job.get('steps', []):
-                    if '${{ matrix.install_dist.run }}' in str(step.get('env', {})) and step.get('shell') == 'pwsh':
-                        steps += 1
-                        self.assertEqual(step.get('if'), "runner.os == 'Windows'", path)
-                        for part in ('$attempt -ge 4', 'Start-Sleep', 'Invoke-Expression $env:INSTALL_DIST_RUN'):
-                            self.assertIn(part, step['run'], path)
-        self.assertEqual(steps, 2)
+                    if '${{ matrix.install_dist.run }}' in str(step.get('run', '')):
+                        raw.append((path.name, step.get('if')))
+        self.assertEqual(sorted(raw), sorted((name, "runner.os == 'Windows'") for name in KNOWN_SINGLE_SHOT_WINDOWS))
 
     def test_workflow_web_requests_retry(self):
         for file, text in workflow_runs():

@@ -311,9 +311,10 @@ jobs:
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-sccache.py
-      # LOCAL CUSTOMIZATION: retry the planned installer command, so one
-      # GitHub 5xx on its download does not fail the leg (intent-hq/intent#8613).
-      # Windows stays on native pwsh with the same bounded loop inline.
+      # LOCAL CUSTOMIZATION: retry the planned installer command on Unix, so
+      # one GitHub 5xx on its download does not fail the leg
+      # (intent-hq/intent#8613). Windows keeps cargo-dist's step unchanged:
+      # its installer.ps1 ends in `exit 1`, so a safe retry needs a child pwsh.
       - name: Install dist (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -321,22 +322,9 @@ jobs:
           INSTALL_DIST_RUN: ${{ matrix.install_dist.run }}
           INSTALL_DIST_SHELL: ${{ matrix.install_dist.shell }}
         run: bash scripts/install-dist.sh
-      - name: Install dist (Windows)
+      - name: Install dist
         if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          INSTALL_DIST_RUN: ${{ matrix.install_dist.run }}
-        run: |
-          for ($attempt = 1; ; $attempt++) {
-            try {
-              Invoke-Expression $env:INSTALL_DIST_RUN
-              break
-            } catch {
-              if ($attempt -ge 4) { throw }
-              Write-Warning "cargo-dist installer attempt $attempt failed ($($_.Exception.Message)); retrying in $(10 * $attempt)s"
-              Start-Sleep -Seconds (10 * $attempt)
-            }
-          }
+        run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@v8
