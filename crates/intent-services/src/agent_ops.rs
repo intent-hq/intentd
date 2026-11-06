@@ -3361,6 +3361,11 @@ pub(crate) fn validate_image_blocks(method: &str, image_blocks: Option<&Value>) 
 /// arm could.
 pub(crate) const IMAGE_REF_MAX_BYTES: u64 = 30 * 1024 * 1024;
 
+/// Room a remote agent's prompt frame keeps beyond a message's own text and
+/// images, for what its turn adds: the agent's instructions on its first
+/// turn, attachment notices and the frame's own fields.
+const REMOTE_PROMPT_HEADROOM_BYTES: usize = 256 * 1024;
+
 /// The non-blank `attachmentId` values of reference-arm image entries
 /// (entries WITHOUT inline `data`) — the same either-or reading as
 /// [`validate_image_blocks`] / [`user_message_blocks`]: inline `data` wins,
@@ -6026,6 +6031,8 @@ impl Services {
                     .await?;
             }
             plan.remote = Some(view);
+            self.ensure_fits_planned_prompt("agent.create", &plan)
+                .await?;
         }
         let remote = plan.remote.clone();
         let mut created = self
@@ -6134,7 +6141,19 @@ impl Services {
                 .admit_new_workspace(self, &placement, &needs)
                 .await?,
         );
-        Ok(())
+        self.ensure_fits_planned_prompt("workspace.create", plan)
+            .await
+    }
+
+    /// [`Self::ensure_fits_remote_prompt`] for a planned agent's first
+    /// message, its initial message and image blocks.
+    async fn ensure_fits_planned_prompt(&self, method: &str, plan: &AgentCreatePlan) -> Result<()> {
+        self.ensure_fits_remote_prompt(
+            method,
+            plan.initial_message.as_deref().unwrap_or_default(),
+            plan.image_blocks.as_ref(),
+        )
+        .await
     }
 
     /// The documented subset only, and a provider selection whose profile
@@ -9249,6 +9268,13 @@ impl Services {
         let _mutation = self.workspace_mutations.enter(&session.workspace_id)?;
         self.validate_image_block_refs("agent.queueMessage", image_blocks.as_ref())
             .await?;
+        self.ensure_fits_session_prompt(
+            "agent.queueMessage",
+            &session,
+            &content,
+            image_blocks.as_ref(),
+        )
+        .await?;
         let (queued, position) = self.enqueue_submission(
             &agent_id,
             message_id,
@@ -9885,6 +9911,81 @@ impl Services {
         Ok(())
     }
 
+    /// Refuse a message for an agent on another machine whose text and
+    /// images, prepared as its turn prepares them, cannot fit one prompt
+    /// frame on the node link: `-32602` `attachments-too-large-for-machine`,
+    /// raised before anything is written or sent. Callers run
+    /// [`Self::validate_image_block_refs`] first. Images that fail
+    /// preparation are left to the turn, which reports them as for a local
+    /// agent.
+    pub(crate) async fn ensure_fits_remote_prompt(
+        &self,
+        method: &str,
+        text: &str,
+        image_blocks: Option<&Value>,
+    ) -> Result<()> {
+        use intent_acp::session::ContentBlock;
+        use intent_core::node_link::MAX_FRAME_BYTES;
+        if image_blocks
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            return Ok(());
+        }
+        let resolved = self.resolve_image_block_refs(image_blocks.cloned()).await?;
+        let mut blocks = vec![json!({ "type": "text", "text": text })];
+        for image in resolved
+            .as_ref()
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let (Some(data), Some(mime)) = (
+                image.get("data").and_then(Value::as_str),
+                image.get("mimeType").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            let mime = crate::provider_images::normalize_image_mime(mime);
+            if crate::provider_images::supports_image_mime(&mime) {
+                blocks.push(json!({ "type": "image", "data": data, "mimeType": mime }));
+            }
+        }
+        let Ok(prompt) = serde_json::from_value::<Vec<ContentBlock>>(Value::Array(blocks)) else {
+            return Ok(());
+        };
+        let Ok(prompt) = crate::provider_images::prepare_prompt_images(prompt).await else {
+            return Ok(());
+        };
+        let size = serde_json::to_vec(&prompt)
+            .map_or(usize::MAX, |bytes| bytes.len())
+            .saturating_add(REMOTE_PROMPT_HEADROOM_BYTES);
+        if size > MAX_FRAME_BYTES {
+            return Err(Error::InvalidParams(format!(
+                "attachments-too-large-for-machine: {method}: this message's text and images come to {size} bytes on the link to the remote machine, over its {MAX_FRAME_BYTES}-byte limit; send fewer or smaller images"
+            )));
+        }
+        Ok(())
+    }
+
+    /// [`Self::ensure_fits_remote_prompt`] for `session`, only when it runs
+    /// on another machine.
+    pub(crate) async fn ensure_fits_session_prompt(
+        &self,
+        method: &str,
+        session: &AgentSession,
+        text: &str,
+        image_blocks: Option<&Value>,
+    ) -> Result<()> {
+        if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_none()
+        {
+            return Ok(());
+        }
+        self.ensure_fits_remote_prompt(method, text, image_blocks)
+            .await
+    }
+
     /// Resolve reference-arm image entries into inline `{ data, mimeType }`
     /// form for prompt assembly (monorepo#3338): the attachment's bytes are
     /// read from the record's own canonical workspace root (with the same
@@ -10034,6 +10135,13 @@ impl Services {
         // (monorepo#3338) — rejected before any state change.
         self.validate_image_block_refs("agent.sendMessage", image_blocks.as_ref())
             .await?;
+        self.ensure_fits_session_prompt(
+            "agent.sendMessage",
+            &session,
+            &content,
+            image_blocks.as_ref(),
+        )
+        .await?;
         // STAB-133: persist FE-supplied attachments alongside the text block so
         // the transcript row carries them (the conversation view renders them).
         let blocks = user_message_blocks(&content, image_blocks.as_ref(), file_blocks.as_ref());
