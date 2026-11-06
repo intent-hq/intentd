@@ -532,7 +532,13 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
         too_large(&response);
     }
     let agents = |list: &Value| list["agents"].as_array().map(Vec::len);
-    let listed = ok(&mut rpc_ws, 1003, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let listed = ok(
+        &mut rpc_ws,
+        1003,
+        "agent.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
     let response = rpc(
         &mut rpc_ws,
         1004,
@@ -546,7 +552,13 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
     )
     .await;
     too_large(&response);
-    let relisted = ok(&mut rpc_ws, 1005, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let relisted = ok(
+        &mut rpc_ws,
+        1005,
+        "agent.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
     assert_eq!(agents(&relisted), agents(&listed), "{relisted}");
     assert!(agents(&listed).is_some(), "{listed}");
     let queue = ok(
