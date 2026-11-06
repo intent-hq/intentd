@@ -436,7 +436,7 @@ async fn file_get_attachment_fetches_a_large_file_in_pieces() {
     head.set(node_end);
     let server = server(&agent(), &workspace(), dir.path(), &gates(), head).unwrap();
     let (asked_tx, mut asked) = tokio::sync::mpsc::unbounded_channel();
-    let served = file.clone();
+    let source = file.clone();
     let answering = tokio::spawn(async move {
         while let Some(event) = head_end.events.recv().await {
             let LinkEvent::Request(request) = event else {
@@ -447,15 +447,15 @@ async fn file_get_attachment_fetches_a_large_file_in_pieces() {
             let id = args["attachmentId"].as_str().unwrap_or_default().to_owned();
             let offset = usize::try_from(args["offset"].as_u64().unwrap()).unwrap();
             let length = usize::try_from(args["length"].as_u64().unwrap()).unwrap();
-            let end = served.len().min(offset + length.min(chunk));
-            let mut data = served[offset..end].to_vec();
+            let end = source.len().min(offset + length.min(chunk));
+            let mut data = source[offset..end].to_vec();
             if id == "att-corrupt" && offset > 0 {
                 data[0] ^= 1;
             }
             let mut answer = json!({
                 "fileName": format!("{id}.bin"),
                 "mimeType": "application/octet-stream",
-                "size": served.len(),
+                "size": source.len(),
                 "uploadedAt": "2026-11-06T00:00:00Z",
                 "offset": offset,
                 "data": base64::engine::general_purpose::STANDARD.encode(&data),
