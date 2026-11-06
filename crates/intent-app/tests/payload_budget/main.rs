@@ -827,6 +827,7 @@ async fn run_sweep(scale: &LargeStateScale, baseline_file: &str) {
     sweep_lane(&mut client, &event_rows, &mut measured, &mut failures).await;
     sweep_rows(&daemon, &table, &mut measured, &mut failures).await;
     let rows_done = started.elapsed();
+    failures.extend(account_directory_problems(&daemon.accounts));
     sweep_goldens(&mut client, CANNOT_EXERCISE, &ctx, &mut failures).await;
     sweep_goldens(
         &mut client,
@@ -901,6 +902,24 @@ async fn run_sweep(scale: &LargeStateScale, baseline_file: &str) {
         failures.len(),
         failures.join("\n  ")
     );
+}
+
+/// The sweep must stay off the network: `host.invite.searchAccounts`
+/// (`default` + `max`) has to have been served by the loopback directory,
+/// and nothing else may have asked it for a path it does not serve.
+fn account_directory_problems(accounts: &proxies::AccountDirectory) -> Vec<String> {
+    let mut problems = Vec::new();
+    if accounts.hits() < 2 {
+        problems.push(format!(
+            "host.invite.searchAccounts: {} of its 2 variants reached the loopback account \
+             directory — the sweep would call the real forge (intent-hq/intent#8703)",
+            accounts.hits()
+        ));
+    }
+    for line in accounts.unexpected() {
+        problems.push(format!("account directory: unexpected request `{line}`"));
+    }
+    problems
 }
 
 /// Per-PR sweep on the `ci` preset.
