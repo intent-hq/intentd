@@ -626,7 +626,7 @@ watches, its last update on GitHub as of the watch's latest check). Home's short
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector,SetupScriptPicker,SetupScriptEditor,StartOnPicker,WorkspaceCreateButton,CreateButtonProgress}.svelte; packages/cloudlands-fe/src/lib/components/modals/SetupScriptModal.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/messages/en.json. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector,BranchSelector,SetupScriptPicker,SetupScriptEditor,StartOnPicker,WorkspaceCreateButton,CreateButtonProgress}.svelte; packages/cloudlands-fe/src/lib/components/modals/SetupScriptModal.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/messages/en.json. -->
 
 <!-- The searchable Machines picker for initial-agent placement is Labs-only;
 do not list it among the normal workspace settings below. -->
@@ -646,6 +646,10 @@ Codebase icons use owner avatars where available, or folder icons for local path
 The selected codebase field shows the same icon as its dropdown row.
 Use the external-link action beside a codebase to open it in your browser.
 **Add codebase** opens the **Clone**, **Existing folder**, and **New** tabs.
+If you paste a GitHub URL in codebase search, **Add codebase** carries it into
+**Clone**; press Enter to select it. Selecting the current codebase again keeps
+your branch selection. If the branch list fails to load, open **Branch** and use
+**Refresh branches**.
 **Clone** is hidden only once Intent has confirmed no forge account is connected;
 to clone, use the connect link or **Settings → Connections**. Onboarding uses
 the same tab names. Open the agent picker to choose who starts the workspace.
