@@ -20,6 +20,13 @@ pub enum CommandEnvironment {
 /// Restore an absent manifest for a reviewed adapter pin during provider setup.
 /// The caller returns within the budget. `keep_alive` stays with the owned job
 /// until its process tree has exited, including after cancellation or timeout.
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::unused_async,
+        reason = "Keep the shared async API on targets without automatic cache repair"
+    )
+)]
 pub async fn repair_npx_cache<T: Send + 'static>(
     command: &Command,
     package: &str,
