@@ -733,14 +733,9 @@ impl AttachmentPieces {
             return Err(Error::Internal(ACCESS_DENIED.to_string()));
         }
         let (rel, dest) = attachment_destination(dest_root, dest_dir, file_name)?;
-        let part = dest.with_file_name(format!(
-            ".{}.{}.part",
-            dest.file_name().map_or_else(
-                || std::borrow::Cow::Borrowed("attachment"),
-                |name| name.to_string_lossy()
-            ),
-            uuid::Uuid::new_v4().simple()
-        ));
+        // Not derived from the name, so a name near the file system's limit
+        // still fits.
+        let part = dest.with_file_name(format!(".{}.part", uuid::Uuid::new_v4().simple()));
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

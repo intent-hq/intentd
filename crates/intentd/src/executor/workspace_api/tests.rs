@@ -507,9 +507,16 @@ async fn file_get_attachment_fetches_a_large_file_in_pieces() {
         r#"return JSON.stringify(await ws.file.getAttachment("att-long"));"#,
     )
     .await;
-    assert!(!long.0, "a name near the file-system limit still copies: {long:?}");
+    assert!(
+        !long.0,
+        "a name near the file-system limit still copies: {long:?}"
+    );
     let long_name = format!("{}.bin", "n".repeat(240));
-    assert!(dir.path().join(".intent/attachments").join(&long_name).is_file());
+    assert!(dir
+        .path()
+        .join(".intent/attachments")
+        .join(&long_name)
+        .is_file());
     std::fs::remove_file(dir.path().join(".intent/attachments").join(&long_name)).unwrap();
     while asked.try_recv().is_ok() {}
 
