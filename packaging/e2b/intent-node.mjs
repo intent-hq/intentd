@@ -14,8 +14,9 @@ export const BASE_IMAGE = 'node:24-bookworm';
 export const ARCHIVE_TARGET = 'x86_64-unknown-linux-musl';
 export const RELEASES_REPO = 'intent-hq/intentd-releases';
 export const INSTALL_DIR = '/opt/intentd';
-// E2B Hobby caps sandboxes at 8 GiB, so 8x16 needs E2B Pro; a Hobby team
-// narrows the list with the E2B_TEMPLATE_SIZES repository variable.
+// E2B Hobby caps sandboxes at 8 GiB, so the publishing team must be on E2B
+// Pro to build 8x16 (and a Hobby user starting it is refused by E2B). The
+// E2B_TEMPLATE_SIZES repository variable narrows what gets published.
 export const SIZES = [
   { id: '2x4', cpuCount: 2, memoryMB: 4096 },
   { id: '4x8', cpuCount: 4, memoryMB: 8192 },

@@ -3,8 +3,10 @@
 # time, so there is one template per size, built in parallel matrix legs:
 # intent-node-2x4 (2 vCPU / 4 GiB), intent-node-4x8 (4 vCPU / 8 GiB, the
 # default) and intent-node-8x16 (8 vCPU / 16 GiB). E2B Hobby caps sandboxes at
-# 8 GiB, so 8x16 needs E2B Pro; a Hobby team sets the E2B_TEMPLATE_SIZES
-# repository variable (for example "2x4,4x8") to skip it.
+# 8 GiB, so the publishing team (the one that owns E2B_API_KEY) must be on E2B
+# Pro to build 8x16. The E2B_TEMPLATE_SIZES repository variable (for example
+# "2x4,4x8") narrows what this repo publishes; a skipped size is then missing
+# for every user. The steps live in e2b-template-build.yml.
 #
 # - After each successful Release run (the alpha publish, including the
 #   intentd-releases mirror the template downloads from): build
@@ -39,94 +41,34 @@ on:
     paths:
       - packaging/e2b/**
       - .github/workflows/e2b-template.yml
+      - .github/workflows/e2b-template-build.yml
 
 permissions:
   contents: read
 
-# One writer for release and manual builds, so `latest` moves in order;
-# `queue: max` keeps every pending release run instead of only the newest.
-concurrency:
-  group: e2b-template-${{ github.event.pull_request.number || 'release' }}
-  cancel-in-progress: false
-  queue: max
-
 jobs:
-  template:
-    # Fork PRs get no secrets; same-repo PRs and release runs do.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-24.04
-    timeout-minutes: 75
-    strategy:
-      fail-fast: false
-      matrix:
-        size: ['2x4', '4x8', '8x16']
-    steps:
-      # The key itself goes only to the build and smoke steps.
-      - name: Check for the E2B_API_KEY secret
-        id: key
-        env:
-          HAS_KEY: ${{ secrets.E2B_API_KEY != '' }}
-        run: |
-          if [ "$HAS_KEY" != true ]; then
-            echo "::warning::E2B_API_KEY secret is not set; skipping the intent-node-${{ matrix.size }} E2B template build"
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          fi
+  # One writer for release and manual builds, so `latest` moves in order;
+  # `queue: max` keeps every pending release run instead of only the newest.
+  release:
+    if: github.event_name != 'pull_request'
+    concurrency:
+      group: e2b-template-release
+      cancel-in-progress: false
+      queue: max
+    uses: ./.github/workflows/e2b-template-build.yml
+    with:
+      version: ${{ inputs.version }}
+      latest: ${{ inputs.latest || false }}
+    secrets:
+      E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
 
-      - uses: actions/checkout@v7
-        if: steps.key.outputs.present == 'true'
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@v7
-        if: steps.key.outputs.present == 'true'
-        with:
-          node-version: '24'
-
-      - name: Install the E2B SDK
-        if: steps.key.outputs.present == 'true'
-        working-directory: packaging/e2b
-        run: npm ci --ignore-scripts --no-fund --no-audit
-
-      - name: Find the newest intentd release
-        id: latest
-        if: steps.key.outputs.present == 'true' && github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # The mirror also carries sitter-v* releases; take the newest daemon tag.
-          tag=$(gh release list --repo intent-hq/intentd-releases --limit 50 --json tagName \
-            --jq '[.[] | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0].tagName')
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      - name: Build the template
-        id: build
-        if: steps.key.outputs.present == 'true'
-        working-directory: packaging/e2b
-        env:
-          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
-          SIZE: ${{ matrix.size }}
-          ENABLED_SIZES: ${{ vars.E2B_TEMPLATE_SIZES }}
-          EVENT_NAME: ${{ github.event_name }}
-          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_LATEST: ${{ inputs.latest }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          LATEST_RELEASE_TAG: ${{ steps.latest.outputs.tag }}
-        run: node build.mjs
-
-      - name: Smoke-test the template
-        if: steps.key.outputs.present == 'true' && steps.build.outputs.skip == 'false'
-        working-directory: packaging/e2b
-        env:
-          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
-          REF: ${{ steps.build.outputs.ref }}
-          SIZE: ${{ matrix.size }}
-          VERSION: ${{ steps.build.outputs.version }}
-          NAMES: ${{ steps.build.outputs.names }}
-        run: |
-          node smoke.mjs "$REF" "$VERSION" "$SIZE"
-          echo "### intent-node-$SIZE template" >> "$GITHUB_STEP_SUMMARY"
-          echo "Built and smoke-tested \`$REF\` (intentd $VERSION); names: \`$NAMES\`." >> "$GITHUB_STEP_SUMMARY"
+  # A new push replaces the PR's pr-<n> tags, so it cancels the older run.
+  # Fork PRs get no secrets; same-repo PRs do.
+  pull-request:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    concurrency:
+      group: e2b-template-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    uses: ./.github/workflows/e2b-template-build.yml
+    secrets:
+      E2B_API_KEY: ${{ secrets.E2B_API_KEY }}

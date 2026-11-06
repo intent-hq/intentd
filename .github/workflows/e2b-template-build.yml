@@ -1,0 +1,100 @@
+# Reusable body of e2b-template.yml: builds and smoke-tests every intent-node
+# size for the caller's event (the github context is the caller's). Split out
+# so release and PR runs can use different concurrency: GitHub rejects
+# `queue: max` together with `cancel-in-progress: true`.
+name: E2B template build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: false
+        type: string
+      latest:
+        required: false
+        type: boolean
+    secrets:
+      E2B_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  template:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        size: ['2x4', '4x8', '8x16']
+    steps:
+      # The key itself goes only to the build and smoke steps.
+      - name: Check for the E2B_API_KEY secret
+        id: key
+        env:
+          HAS_KEY: ${{ secrets.E2B_API_KEY != '' }}
+        run: |
+          if [ "$HAS_KEY" != true ]; then
+            echo "::warning::E2B_API_KEY secret is not set; skipping the intent-node-${{ matrix.size }} E2B template build"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.key.outputs.present == 'true'
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        if: steps.key.outputs.present == 'true'
+        with:
+          node-version: '24'
+
+      - name: Install the E2B SDK
+        if: steps.key.outputs.present == 'true'
+        working-directory: packaging/e2b
+        run: npm ci --ignore-scripts --no-fund --no-audit
+
+      - name: Find the newest intentd release
+        id: latest
+        if: steps.key.outputs.present == 'true' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The mirror also carries sitter-v* releases; take the newest daemon tag.
+          tag=$(gh release list --repo intent-hq/intentd-releases --limit 50 --json tagName \
+            --jq '[.[] | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0].tagName')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build the template
+        id: build
+        if: steps.key.outputs.present == 'true'
+        working-directory: packaging/e2b
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          SIZE: ${{ matrix.size }}
+          ENABLED_SIZES: ${{ vars.E2B_TEMPLATE_SIZES }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_LATEST: ${{ inputs.latest }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          LATEST_RELEASE_TAG: ${{ steps.latest.outputs.tag }}
+        run: node build.mjs
+
+      - name: Smoke-test the template
+        if: steps.key.outputs.present == 'true' && steps.build.outputs.skip == 'false'
+        working-directory: packaging/e2b
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          REF: ${{ steps.build.outputs.ref }}
+          SIZE: ${{ matrix.size }}
+          VERSION: ${{ steps.build.outputs.version }}
+          NAMES: ${{ steps.build.outputs.names }}
+        run: |
+          node smoke.mjs "$REF" "$VERSION" "$SIZE"
+          echo "### intent-node-$SIZE template" >> "$GITHUB_STEP_SUMMARY"
+          echo "Built and smoke-tested \`$REF\` (intentd $VERSION); names: \`$NAMES\`." >> "$GITHUB_STEP_SUMMARY"

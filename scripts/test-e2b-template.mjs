@@ -191,6 +191,8 @@ describe('secrets', () => {
 
 describe('workflow contract', () => {
   const workflow = readFileSync(join(ROOT, '.github/workflows/e2b-template.yml'), 'utf8');
+  const build = readFileSync(join(ROOT, '.github/workflows/e2b-template-build.yml'), 'utf8');
+  const job = name => workflow.split(`\n  ${name}:\n`)[1].split(/\n  [\w-]+:\n/)[0];
   it('runs after the Release workflow and by hand', () => {
     assert.match(workflow, /workflow_run:\n\s+workflows: \[Release\]\n\s+types: \[completed\]/);
     assert.match(workflow, /workflow_dispatch:/);
@@ -198,25 +200,31 @@ describe('workflow contract', () => {
     assert.match(readFileSync(join(ROOT, '.github/workflows/v-release.yml'), 'utf8'), /^name: Release$/m);
   });
   it('is fail-soft without the E2B_API_KEY secret', () => {
-    assert.match(workflow, /HAS_KEY: \$\{\{ secrets\.E2B_API_KEY != '' \}\}/);
-    assert.match(workflow, /::warning::E2B_API_KEY secret is not set/);
+    assert.match(build, /E2B_API_KEY:\n\s+required: false/);
+    assert.match(build, /HAS_KEY: \$\{\{ secrets\.E2B_API_KEY != '' \}\}/);
+    assert.match(build, /::warning::E2B_API_KEY secret is not set/);
   });
   it('gives the key only to the build and smoke steps', () => {
-    assert.equal(workflow.match(/E2B_API_KEY: \$\{\{ secrets\.E2B_API_KEY \}\}/g).length, 2);
-    assert.doesNotMatch(workflow.split('\n    steps:\n')[0], /secrets\.E2B_API_KEY/);
-    assert.match(workflow, /npm ci --ignore-scripts/);
+    assert.equal(build.match(/E2B_API_KEY: \$\{\{ secrets\.E2B_API_KEY \}\}/g).length, 2);
+    assert.doesNotMatch(build.split('\n    steps:\n')[0], /secrets\.E2B_API_KEY \}\}/);
+    assert.match(build, /npm ci --ignore-scripts/);
   });
   it('skips sitter releases when it picks the newest daemon release', () => {
-    assert.match(workflow, /select\(\.tagName \| test\("\^v\[0-9\]\+/);
+    assert.match(build, /select\(\.tagName \| test\("\^v\[0-9\]\+/);
   });
-  it('queues release builds instead of dropping them', () => {
-    assert.match(workflow, /cancel-in-progress: false\n\s+queue: max/);
+  it('queues release builds and cancels superseded PR builds', () => {
+    assert.match(job('release'), /if: github\.event_name != 'pull_request'/);
+    assert.match(job('release'), /cancel-in-progress: false\n\s+queue: max/);
+    assert.match(job('pull-request'), /head\.repo\.full_name == github\.repository/);
+    assert.match(job('pull-request'), /cancel-in-progress: true/);
+    assert.doesNotMatch(job('pull-request'), /queue:/);
+    for (const name of ['release', 'pull-request']) assert.match(job(name), /uses: \.\/\.github\/workflows\/e2b-template-build\.yml/);
   });
   it('builds and smoke-tests every size in parallel legs', () => {
-    assert.match(workflow, /fail-fast: false\n\s+matrix:\n\s+size: \['2x4', '4x8', '8x16'\]/);
-    assert.match(workflow, /SIZE: \$\{\{ matrix\.size \}\}/);
-    assert.match(workflow, /ENABLED_SIZES: \$\{\{ vars\.E2B_TEMPLATE_SIZES \}\}/);
-    assert.match(workflow, /node build\.mjs/);
-    assert.match(workflow, /node smoke\.mjs "\$REF" "\$VERSION" "\$SIZE"/);
+    assert.match(build, /fail-fast: false\n\s+matrix:\n\s+size: \['2x4', '4x8', '8x16'\]/);
+    assert.match(build, /SIZE: \$\{\{ matrix\.size \}\}/);
+    assert.match(build, /ENABLED_SIZES: \$\{\{ vars\.E2B_TEMPLATE_SIZES \}\}/);
+    assert.match(build, /node build\.mjs/);
+    assert.match(build, /node smoke\.mjs "\$REF" "\$VERSION" "\$SIZE"/);
   });
 });
