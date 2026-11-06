@@ -653,10 +653,18 @@ impl Shared {
                     .await;
                 continue;
             };
-            if lock(&self.in_grace).contains(&stop_id) {
+            // Both read in one step under the queue's lock, which a legacy
+            // ack's claim holds while it enters the grace: a stop is never
+            // seen settled but not yet in its grace.
+            let (in_grace, settled) = {
+                let _stops = lock(&self.stops);
+                let in_grace = lock(&self.in_grace).contains(&stop_id);
+                (in_grace, lock(&self.settled_finals).contains(&stop_id))
+            };
+            if in_grace {
                 continue;
             }
-            if lock(&self.settled_finals).contains(&stop_id) {
+            if settled {
                 // Settled already, by an ack whose drop of the record failed
                 // or that this load listed before the drop: drop it now
                 // (again), settling nothing.
@@ -750,12 +758,29 @@ impl Shared {
     /// interleave. With `dequeue` (an expiry) the stop also leaves the
     /// queue in the same step, so an ack still in flight settles nothing;
     /// an ack leaves the queue itself once it is handled. Decided under the
-    /// queue's lock, taken before [`Shared::settled_finals`].
+    /// queue's lock, taken before [`Shared::settled_finals`] and
+    /// [`Shared::in_grace`] (each taken alone under it).
     fn claim_final_settle(&self, agent_id: &AgentId, stop_id: StopId, dequeue: bool) -> bool {
+        self.claim_final_settle_with(agent_id, stop_id, dequeue, false)
+    }
+
+    /// [`Self::claim_final_settle`]; with `grace` (an ack below
+    /// nodeProtocol 9) the stop enters [`Shared::in_grace`] in the same
+    /// step, so no load drops its record during the grace.
+    fn claim_final_settle_with(
+        &self,
+        agent_id: &AgentId,
+        stop_id: StopId,
+        dequeue: bool,
+        grace: bool,
+    ) -> bool {
         let removed = {
             let mut stops = lock(&self.stops);
             if !lock(&self.settled_finals).insert(stop_id) {
                 return false;
+            }
+            if grace {
+                lock(&self.in_grace).insert(stop_id);
             }
             let queued = dequeue
                 && stops
@@ -973,10 +998,9 @@ impl Shared {
         if !sent_final {
             // Acknowledged: not queued again, nor dropped as expired, while
             // its record waits out the grace.
-            if !self.claim_final_settle(agent_id, stop_id, false) {
+            if !self.claim_final_settle_with(agent_id, stop_id, false, true) {
                 return false;
             }
-            lock(&self.in_grace).insert(stop_id);
             let store = self.store.clone();
             let grace = self.tuning.legacy_push_grace;
             let agent_id = agent_id.clone();
