@@ -321,6 +321,7 @@ def workflow_runs():
                 stack.extend(node)
 
 
+RETRY = re.compile(r'--retry[ =][1-9]')
 QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'')
 
 
@@ -334,7 +335,8 @@ def command_lines(text):
 
 def invokes(word, line):
     """True when `word` runs as a command: not a `command -v` probe or a quoted message."""
-    line = QUOTED.sub('""', re.sub(r'command -v \w+', '', line))
+    # Quoted text is a message, unless it holds a command substitution.
+    line = QUOTED.sub(lambda m: m.group() if '$(' in m.group() else '""', re.sub(r'command -v \w+', '', line))
     return re.search(r'(?:^|[\s;|&(`])' + word + r'\s', line) is not None
 
 
@@ -353,7 +355,7 @@ class RepositoryScan(unittest.TestCase):
 
     def test_every_curl_retries(self):
         offenders = [f'{file}: {line}' for file, text in self.shell_sources()
-                     for line in command_lines(text) if invokes('curl', line) and '--retry' not in line]
+                     for line in command_lines(text) if invokes('curl', line) and not RETRY.search(line)]
         self.assertEqual(offenders, [], 'add --retry N --retry-connrefused (and --fail) to these curl calls')
 
     def test_wget_only_in_the_retrying_install_helper(self):
@@ -379,6 +381,15 @@ class RepositoryScan(unittest.TestCase):
         self.assertEqual(sorted(found), sorted(PYTHON_DOWNLOADERS), 'new Python downloader: use download_retry.py')
         for file, marker in PYTHON_DOWNLOADERS.items():
             self.assertIn(marker, found[file], file)
+            # One wrapped fetch per file: a second urlopen would bypass the retry.
+            self.assertEqual(len(re.findall(r'\burlopen\(|\burlretrieve\(', found[file])), 1, file)
+
+    def test_scan_sees_through_messages_but_not_substitutions(self):
+        self.assertFalse(invokes('curl', 'fail "neither curl nor wget is available"'))
+        self.assertFalse(invokes('curl', 'if command -v curl >/dev/null; then'))
+        self.assertTrue(invokes('curl', 'out="$(curl -fsSL https://example.invalid)"'))
+        self.assertIsNone(RETRY.search('curl --retry 0 --retry-connrefused -fsSL x'))
+        self.assertIsNotNone(RETRY.search('curl --retry 5 -fsSL x'))
 
     def test_powershell_scripts(self):
         for file, text in shipped_scripts('.ps1'):
