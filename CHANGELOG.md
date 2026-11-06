@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.138] - 2026-11-06
+
+### 🐛 Bug Fixes
+
+- Persist revoked before ending a machine's agents ([#3028](https://github.com/intent-hq/intentd/pull/3028))
+
+
 ## [0.11.137] - 2026-11-06
 
 ### 🚀 Features
