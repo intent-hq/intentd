@@ -1370,6 +1370,33 @@ async fn machine_runs(
         "{copied}"
     );
     assert_eq!(copied["t"], "hello", "{copied}");
+    // A file larger than one link frame arrives in pieces, intact.
+    let source = common::test_tempdir_in("/tmp", "itd-att-");
+    let large: Vec<u8> = (0u32..20 * 1024 * 1024)
+        .map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[3])
+        .collect();
+    let large_path = source.path().join("large.bin");
+    std::fs::write(&large_path, &large).unwrap();
+    let placed = ok(
+        rpc_ws,
+        265,
+        "file.placeAttachment",
+        json!({ "workspaceId": ws_id, "fileName": "large.bin", "sourcePath": large_path, "mimeType": "application/octet-stream" }),
+    )
+    .await;
+    let attachment_id = placed["attachmentId"].as_str().unwrap().to_owned();
+    let wsapi = format!(
+        r#"wsapi const a = await ws.file.getAttachment({attachment_id:?}); const r = await ws.host.exec({{ command: "sha256sum", args: [a.path] }}); return JSON.stringify({{ marker: "turn-266", a, hash: r.stdout.slice(0, 64) }});"#
+    );
+    let reply = wsapi_turn(rpc_ws, events, (ws_id, agent_id), &wsapi, "turn-266", 266).await;
+    assert!(reply.starts_with("wsapi: "), "{reply}");
+    let copied = wsapi_value(&reply);
+    assert_eq!(copied["a"]["size"], large.len(), "{copied}");
+    assert_eq!(
+        copied["hash"],
+        format!("{:x}", Sha256::digest(&large)),
+        "{copied}"
+    );
 
     // A service started by the agent, stopped from the app.
     // timing-guard: the saved script's own runtime on the machine, not a wait in the test

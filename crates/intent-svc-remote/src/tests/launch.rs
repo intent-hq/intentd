@@ -1367,8 +1367,9 @@ async fn head_answers_placement_help_for_lease_agents() {
 async fn head_serves_attachment_bytes_to_lease_agents_of_the_workspace() {
     use base64::Engine as _;
     use intent_core::remote_launch::workspace_api::{
-        ATTACHMENT_DATA_METHOD, MAX_LINK_ATTACHMENT_BYTES,
+        ATTACHMENT_DATA_METHOD, MAX_LINK_ATTACHMENT_BYTES, MAX_LINK_ATTACHMENT_CHUNK_BYTES,
     };
+    use sha2::Digest as _;
     let (f, link, _machine) = fixture().await;
     let (agent, _) = f.placed().await;
     let store = f.services.store();
@@ -1457,6 +1458,51 @@ async fn head_serves_attachment_bytes_to_lease_agents_of_the_workspace() {
     }
     let malformed = refused(forward(&link, &agent, ATTACHMENT_DATA_METHOD, json!({})).await);
     assert_eq!(malformed.code, -32602, "{malformed:?}");
+
+    // In pieces: a range of a file of any size, the whole file's sha256 on
+    // the first piece, each piece at most one chunk.
+    let big = usize::try_from(MAX_LINK_ATTACHMENT_BYTES).unwrap() + 1;
+    let chunk = usize::try_from(MAX_LINK_ATTACHMENT_CHUNK_BYTES).unwrap();
+    let piece = |offset: usize, length: usize| json!({ "attachmentId": "att-big", "offset": offset, "length": length });
+    let first = answered(forward(&link, &agent, ATTACHMENT_DATA_METHOD, piece(0, chunk)).await);
+    let bytes = |answer: &Value| {
+        base64::engine::general_purpose::STANDARD
+            .decode(answer["data"].as_str().unwrap())
+            .unwrap()
+    };
+    assert_eq!(bytes(&first), vec![b'x'; chunk]);
+    assert_eq!(first["offset"], 0, "{}", first["offset"]);
+    assert_eq!(first["size"], big);
+    assert_eq!(first["fileName"], "big.bin");
+    assert_eq!(
+        first["sha256"],
+        format!("{:x}", sha2::Sha256::digest(vec![b'x'; big])),
+    );
+    let rest = answered(
+        forward(
+            &link,
+            &agent,
+            ATTACHMENT_DATA_METHOD,
+            piece(chunk, 4 * chunk),
+        )
+        .await,
+    );
+    assert_eq!(
+        bytes(&rest),
+        vec![b'x'; big - chunk],
+        "clamped to the file's end"
+    );
+    assert_eq!(rest["offset"], chunk);
+    assert!(rest.get("sha256").is_none(), "{}", rest["size"]);
+    for args in [
+        piece(big + 1, chunk),
+        piece(0, 0),
+        json!({ "attachmentId": "att-big", "offset": "0", "length": chunk }),
+        json!({ "attachmentId": "att-big", "offset": 0 }),
+    ] {
+        let bad = refused(forward(&link, &agent, ATTACHMENT_DATA_METHOD, args.clone()).await);
+        assert_eq!(bad.code, -32602, "{args}: {bad:?}");
+    }
 
     let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
     let unplaced = f.agent(&view).await;
