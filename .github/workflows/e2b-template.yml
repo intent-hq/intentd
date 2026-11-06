@@ -2,11 +2,13 @@
 # the backend starts cloud sandboxes from. E2B fixes vCPU and RAM at build
 # time, so there is one template per size, built in parallel matrix legs:
 # intent-node-2x4 (2 vCPU / 4 GiB), intent-node-4x8 (4 vCPU / 8 GiB, the
-# default) and intent-node-8x16 (8 vCPU / 16 GiB). E2B Hobby caps sandboxes at
-# 8 GiB, so the publishing team (the one that owns E2B_API_KEY) must be on E2B
-# Pro to build 8x16. The E2B_TEMPLATE_SIZES repository variable (for example
-# "2x4,4x8") narrows what this repo publishes; a skipped size is then missing
-# for every user. The steps live in e2b-template-build.yml.
+# default), intent-node-8x16 (8 vCPU / 16 GiB) and intent-node-16x32 (16 vCPU /
+# 32 GiB). E2B Hobby caps sandboxes at 8 vCPU / 8 GiB and Pro goes higher only
+# after E2B support raises the team's limits, so the publishing team (the one
+# that owns E2B_API_KEY) needs those limits to build 8x16 and 16x32. A build E2B
+# refuses over the team's limits is skipped with a warning, so that size has no
+# tag for the version. The E2B_TEMPLATE_SIZES repository variable (for example
+# "2x4,4x8") narrows what is built. The steps live in e2b-template-build.yml.
 #
 # - After each successful Release run (the alpha publish, including the
 #   intentd-releases mirror the template downloads from): build

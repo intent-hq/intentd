@@ -13,6 +13,7 @@ import {
   defineTemplate,
   enabledSizes,
   installIntentdCommand,
+  isResourceLimitRefusal,
   parseSha256,
   parseSize,
   parseVersion,
@@ -41,22 +42,41 @@ function recorder() {
 }
 
 describe('sizes', () => {
-  it('offers 2x4, 4x8 (default) and 8x16, one template each', () => {
+  it('offers 2x4, 4x8 (default), 8x16 and 16x32, one template each', () => {
     assert.deepEqual(SIZES.map(size => [size.id, size.cpuCount, size.memoryMB]), [
-      ['2x4', 2, 4096], ['4x8', 4, 8192], ['8x16', 8, 16384],
+      ['2x4', 2, 4096], ['4x8', 4, 8192], ['8x16', 8, 16384], ['16x32', 16, 32768],
     ]);
     assert.equal(DEFAULT_SIZE, '4x8');
-    assert.deepEqual(SIZES.map(size => templateName(size.id)), ['intent-node-2x4', 'intent-node-4x8', 'intent-node-8x16']);
+    assert.deepEqual(SIZES.map(size => templateName(size.id)),
+      ['intent-node-2x4', 'intent-node-4x8', 'intent-node-8x16', 'intent-node-16x32']);
   });
   it('rejects unknown sizes', () => {
-    assert.equal(parseSize('8x16').memoryMB, 16384);
-    for (const bad of ['', '16x32', '4X8', '4x8;id']) assert.throws(() => parseSize(bad), /unknown template size/, bad);
+    assert.equal(parseSize('16x32').memoryMB, 32768);
+    for (const bad of ['', '32x64', '4X8', '4x8;id']) assert.throws(() => parseSize(bad), /unknown template size/, bad);
   });
   it('builds every size unless E2B_TEMPLATE_SIZES narrows the list', () => {
-    assert.deepEqual(enabledSizes(undefined), ['2x4', '4x8', '8x16']);
-    assert.deepEqual(enabledSizes(''), ['2x4', '4x8', '8x16']);
+    assert.deepEqual(enabledSizes(undefined), ['2x4', '4x8', '8x16', '16x32']);
+    assert.deepEqual(enabledSizes(''), ['2x4', '4x8', '8x16', '16x32']);
     assert.deepEqual(enabledSizes(' 2x4, 4x8 '), ['2x4', '4x8']);
-    assert.throws(() => enabledSizes('2x4,16x32'), /unknown template size/);
+    assert.throws(() => enabledSizes('2x4,32x64'), /unknown template size/);
+  });
+  it('treats an E2B refusal over team CPU or memory limits as a skip', () => {
+    for (const message of [
+      '400: CPU count exceeds team limits (8)',
+      '400: Memory exceeds team limits (8192 MiB)',
+      '403: requested vCPU 16 is above the maximum allowed for your team',
+      '400: memoryMB must be at most 8192',
+    ]) assert.equal(isResourceLimitRefusal(new Error(message)), true, message);
+  });
+  it('fails the build on any other error', () => {
+    for (const message of [
+      'Unauthorized, please check your credentials.',
+      'Rate limit exceeded, please try again later',
+      '500: internal error while allocating memory',
+      '400: invalid template name',
+      'Build failed: npm ERR! JavaScript heap out of memory, CPU limit',
+    ]) assert.equal(isResourceLimitRefusal(new Error(message)), false, message);
+    assert.equal(isResourceLimitRefusal(undefined), false);
   });
 });
 
@@ -221,7 +241,7 @@ describe('workflow contract', () => {
     for (const name of ['release', 'pull-request']) assert.match(job(name), /uses: \.\/\.github\/workflows\/e2b-template-build\.yml/);
   });
   it('builds and smoke-tests every size in parallel legs', () => {
-    assert.match(build, /fail-fast: false\n\s+matrix:\n\s+size: \['2x4', '4x8', '8x16'\]/);
+    assert.match(build, /fail-fast: false\n\s+matrix:\n\s+size: \['2x4', '4x8', '8x16', '16x32'\]/);
     assert.match(build, /SIZE: \$\{\{ matrix\.size \}\}/);
     assert.match(build, /ENABLED_SIZES: \$\{\{ vars\.E2B_TEMPLATE_SIZES \}\}/);
     assert.match(build, /node build\.mjs/);

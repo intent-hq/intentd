@@ -10,6 +10,7 @@ import {
   archiveUrl,
   defineTemplate,
   enabledSizes,
+  isResourceLimitRefusal,
   parseSha256,
   parseSize,
   plan,
@@ -49,13 +50,23 @@ async function main() {
   const sha256 = await fetchSha256(target.version);
   const name = templateName(size.id);
   console.log(`Building ${name} (${size.cpuCount} vCPU, ${size.memoryMB} MiB) for intentd ${target.version} with tags ${target.tags.join(', ')}`);
-  const info = await Template.build(defineTemplate(Template, { version: target.version, sha256 }), name, {
-    cpuCount: size.cpuCount,
-    memoryMB: size.memoryMB,
-    tags: target.tags,
-    apiKey,
-    onBuildLogs: defaultBuildLogger(),
-  });
+  let info;
+  try {
+    info = await Template.build(defineTemplate(Template, { version: target.version, sha256 }), name, {
+      cpuCount: size.cpuCount,
+      memoryMB: size.memoryMB,
+      tags: target.tags,
+      apiKey,
+      onBuildLogs: defaultBuildLogger(),
+    });
+  } catch (error) {
+    if (!isResourceLimitRefusal(error)) throw error;
+    // Fail-soft: the publishing team's E2B limits are below this size, so no
+    // tag exists for this version and the backend does not offer the size.
+    console.log(`::warning::E2B refused ${name} (${size.cpuCount} vCPU, ${size.memoryMB} MiB) over the team's limits; skipping it. ${redact(error.message, apiKey)}`);
+    output({ skip: 'true', refused: 'true' });
+    return;
+  }
   console.log(`Built template ${info.templateId} build ${info.buildId}`);
   const names = target.publish ? await publishTemplate({ templateId: info.templateId, apiKey }) : [info.name];
   output({ skip: 'false', version: target.version, ref: `${name}:${target.tags[0]}`, names: names.join(',') });

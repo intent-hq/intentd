@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        size: ['2x4', '4x8', '8x16']
+        size: ['2x4', '4x8', '8x16', '16x32']
     steps:
       # The key itself goes only to the build and smoke steps.
       - name: Check for the E2B_API_KEY secret

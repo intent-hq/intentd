@@ -14,13 +14,16 @@ export const BASE_IMAGE = 'node:24-bookworm';
 export const ARCHIVE_TARGET = 'x86_64-unknown-linux-musl';
 export const RELEASES_REPO = 'intent-hq/intentd-releases';
 export const INSTALL_DIR = '/opt/intentd';
-// E2B Hobby caps sandboxes at 8 GiB, so the publishing team must be on E2B
-// Pro to build 8x16 (and a Hobby user starting it is refused by E2B). The
-// E2B_TEMPLATE_SIZES repository variable narrows what gets published.
+// E2B Hobby caps sandboxes at 8 vCPU / 8 GiB; Pro goes higher only after E2B
+// support raises the team's limits. So 8x16 and 16x32 need Pro with raised
+// limits, for the publishing team to build them and for a user to start them.
+// A build E2B refuses over those limits is skipped with a warning (see
+// isResourceLimitRefusal); E2B_TEMPLATE_SIZES narrows what gets built.
 export const SIZES = [
   { id: '2x4', cpuCount: 2, memoryMB: 4096 },
   { id: '4x8', cpuCount: 4, memoryMB: 8192 },
   { id: '8x16', cpuCount: 8, memoryMB: 16384 },
+  { id: '16x32', cpuCount: 16, memoryMB: 32768 },
 ];
 export const DEFAULT_SIZE = '4x8';
 export const API_URL = 'https://api.e2b.app';
@@ -61,6 +64,15 @@ export function templateName(sizeId) {
 export function enabledSizes(list) {
   const ids = String(list ?? '').split(',').map(id => id.trim()).filter(Boolean);
   return ids.length ? ids.map(id => parseSize(id).id) : SIZES.map(size => size.id);
+}
+
+// True when E2B refused a build request because the size is over the team's
+// vCPU or memory limits. The SDK reports API errors as "<status>: <message>".
+export function isResourceLimitRefusal(error) {
+  const message = String(error?.message ?? '');
+  return /^(400|403|422): /.test(message)
+    && /\b(v?cpu|memory(mb)?|ram)\b/i.test(message)
+    && /(exceed|limit|maximum|at most|above)/i.test(message);
 }
 
 const VERSION = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$/;
