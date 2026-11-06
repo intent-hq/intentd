@@ -56,6 +56,7 @@ class Network(unittest.TestCase):
         self.env = {**os.environ, 'PATH': f'{self.dir}{os.pathsep}{os.environ["PATH"]}',
                     'STUB_LOG': str(self.log)}
         self.env.pop('CARGO_NET_OFFLINE', None)
+        self.env.pop('RUSTUP_TOOLCHAIN', None)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -175,6 +176,21 @@ class Network(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised:
             fetch_mod.install_toolchain(self.dir, self.env, attempts=2, sleep=self.sleeps.append)
         self.assertIn('toolchain', str(raised.exception.code))
+        self.assertEqual(len(self.calls()), 1, 'no uninstall after the final attempt')
+
+    def test_toolchain_conflict_uninstalls_the_rustup_toolchain_override(self):
+        self.conflict_stubs()
+        self.env['RUSTUP_TOOLCHAIN'] = 'stable'
+        fetch_mod.install_toolchain(self.dir, self.env, sleep=self.sleeps.append)
+        self.assertEqual(self.calls(), [{'rustup': ['toolchain', 'uninstall', 'stable']}])
+
+    def test_toolchain_conflict_without_a_channel_retries_without_a_traceback(self):
+        self.conflict_stubs()
+        (self.dir / 'rust-toolchain.toml').write_text('[toolchain]\n')
+        with self.assertRaises(SystemExit) as raised:
+            fetch_mod.install_toolchain(self.dir, self.env, attempts=2, sleep=self.sleeps.append)
+        self.assertIn('toolchain', str(raised.exception.code))
+        self.assertFalse(self.log.exists(), 'nothing to uninstall')
 
     def test_release_limits_allow_slow_attempts(self):
         self.assertGreater(fetch_mod.RELEASE_ATTEMPT_TIMEOUT, fetch_mod.FETCH_ATTEMPT_TIMEOUT)

@@ -81,19 +81,40 @@ def install_toolchain(root, env, attempts=TOOLCHAIN_ATTEMPTS, sleep=time.sleep):
     uninstalls the channel and the next attempt installs it from scratch.
     """
     for attempt in range(1, attempts + 1):
-        result = subprocess.run(['cargo', '--version'], cwd=root, env=env, stderr=subprocess.PIPE, text=True)
+        result = subprocess.run(['cargo', '--version'], cwd=root, env=env, stderr=subprocess.PIPE,
+                                text=True, errors='replace')
         sys.stderr.write(result.stderr)
         if result.returncode == 0:
             return
+        if attempt == attempts:
+            break
         if 'detected conflict' in result.stderr:
-            toml = (Path(root) / 'rust-toolchain.toml').read_text()
-            channel = re.search(r'^\s*channel\s*=\s*"([^"]+)"', toml, re.M).group(1)
-            print(f'removing the partially installed {channel} toolchain before retrying', flush=True)
-            subprocess.run(['rustup', 'toolchain', 'uninstall', channel], cwd=root, env=env)
-        if attempt < attempts:
-            sleep(5 * 2 ** (attempt - 1))
+            remove_partial_toolchain(root, env)
+        sleep(5 * 2 ** (attempt - 1))
     raise SystemExit(f'FAIL: installing the pinned Rust toolchain (`cargo --version`) failed {attempts} times; '
                      'see the rustup errors above.')
+
+
+def toolchain_channel(root, env):
+    """The toolchain cargo resolves: RUSTUP_TOOLCHAIN, else rust-toolchain.toml's channel."""
+    if env.get('RUSTUP_TOOLCHAIN'):
+        return env['RUSTUP_TOOLCHAIN']
+    try:
+        toml = (Path(root) / 'rust-toolchain.toml').read_text()
+    except OSError:
+        return None
+    match = re.search(r'''^\s*channel\s*=\s*["']([^"']+)["']''', toml, re.M)
+    return match and match.group(1)
+
+
+def remove_partial_toolchain(root, env):
+    channel = toolchain_channel(root, env)
+    if not channel:
+        print('rustup reported a conflict but the toolchain channel is unknown; retrying as is', flush=True)
+        return
+    print(f'removing the partially installed {channel} toolchain before retrying', flush=True)
+    if subprocess.run(['rustup', 'toolchain', 'uninstall', channel], cwd=root, env=env).returncode != 0:
+        print(f'`rustup toolchain uninstall {channel}` failed; retrying anyway', flush=True)
 
 
 def offline_env(env):
