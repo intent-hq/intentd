@@ -27,7 +27,7 @@ class Install(unittest.TestCase):
     def test_corrupt_download_is_not_installed(self):
         def download(url, dest):
             Path(dest).write_bytes(b'corrupt archive')
-        with tempfile.TemporaryDirectory() as temp, patch.object(cache.urllib.request, 'urlretrieve', download):
+        with tempfile.TemporaryDirectory() as temp, patch.object(cache, 'fetch', download):
             with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
                 cache.install(Path(temp))
             self.assertFalse((Path(temp)/'sccache').exists())
@@ -38,7 +38,7 @@ class Install(unittest.TestCase):
             def download(url, dest):
                 self.assertTrue(Path(dest).is_relative_to(directory.parent))
                 Path(dest).write_bytes(b'corrupt archive')
-            with patch.object(cache.urllib.request, 'urlretrieve', download):
+            with patch.object(cache, 'fetch', download):
                 with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
                     cache.install(directory)
 
@@ -57,6 +57,74 @@ class Install(unittest.TestCase):
         for path in (ROOT/'.github').rglob('*.yml'):
             self.assertNotIn('Swatinem/rust-cache', path.read_text(), str(path))
             self.assertNotIn('mozilla-actions/sccache-action', path.read_text(), str(path))
+
+def http_error(code):
+    return cache.urllib.error.HTTPError('https://github.com/x', code, 'error', {}, None)
+
+
+class Download(unittest.TestCase):
+    """Bounded retry around the release download (intent-hq/intent#8613)."""
+
+    def run_download(self, failures, delays=(1, 2, 3)):
+        calls, sleeps = [], []
+        def fetch(url, dest):
+            calls.append(url)
+            if failures:
+                raise failures.pop(0)
+            Path(dest).write_bytes(b'ok')
+        with tempfile.TemporaryDirectory() as temp, patch.object(cache, 'fetch', fetch), \
+                contextlib.redirect_stderr(io.StringIO()):
+            dest = Path(temp) / 'archive'
+            try:
+                cache.download('https://github.com/x', dest, delays=delays, sleep=sleeps.append)
+                return calls, sleeps, dest.read_bytes(), None
+            except Exception as error:
+                return calls, sleeps, None, error
+
+    def test_gateway_timeout_is_retried(self):
+        calls, sleeps, data, error = self.run_download([http_error(504), http_error(502)])
+        self.assertIsNone(error)
+        self.assertEqual((len(calls), sleeps, data), (3, [1, 2], b'ok'))
+
+    def test_network_errors_and_timeouts_are_retried(self):
+        failures = [cache.urllib.error.URLError('reset'), TimeoutError('timed out'), ConnectionResetError(),
+                    cache.http.client.IncompleteRead(b'')]
+        calls, sleeps, data, error = self.run_download(failures, delays=(1, 1, 1, 1))
+        self.assertIsNone(error)
+        self.assertEqual((len(calls), data), (5, b'ok'))
+
+    def test_client_errors_fail_without_retry(self):
+        for code in (403, 404, 429):
+            calls, sleeps, data, error = self.run_download([http_error(code)])
+            self.assertEqual((len(calls), sleeps), (1, []), code)
+            self.assertEqual(error.code, code)
+
+    def test_retries_are_bounded_and_last_error_raised(self):
+        calls, sleeps, data, error = self.run_download([http_error(504)] * 10)
+        self.assertEqual((len(calls), sleeps), (4, [1, 2, 3]))
+        self.assertEqual(error.code, 504)
+
+    def test_non_network_errors_are_not_retried(self):
+        for failure in (ValueError('bad'), PermissionError('read-only volume')):
+            calls, sleeps, data, error = self.run_download([failure])
+            self.assertEqual((len(calls), sleeps), (1, []))
+            self.assertIs(error, failure)
+
+    def test_install_survives_one_gateway_timeout(self):
+        # The defect: install() made a single attempt, so one 504 failed the step.
+        attempts = []
+        def fetch(url, dest):
+            attempts.append(url)
+            if len(attempts) == 1:
+                raise http_error(504)
+            Path(dest).write_bytes(b'corrupt archive')
+        with tempfile.TemporaryDirectory() as temp, patch.object(cache, 'fetch', fetch), \
+                patch.object(cache.time, 'sleep'), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+                cache.install(Path(temp))
+        self.assertEqual(len(attempts), 2)
+        self.assertIn('/mozilla/sccache/releases/download/v', attempts[0])
+
 
 def run_main(env):
     with tempfile.TemporaryDirectory() as temp:
