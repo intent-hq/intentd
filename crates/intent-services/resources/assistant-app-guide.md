@@ -901,10 +901,10 @@ grouping choices keep their behavior.
 
 **Set aside** is available in alpha builds starting with v2.262.0. Use **Set aside**
 on a Home workspace row, card or menu. List view moves it into a collapsed
-**Set aside** section; board view shows it in the
-**Set aside** column on the right, and dragging a card into that column also sets it
-aside. Choose **Bring back** on its row or card, or use the immediate **Undo**
-action. Searching includes set-aside workspaces. With a Home
+**Set aside** section; board view shows it in the **Set aside** column on the right.
+The column stays hidden when empty and appears while dragging a card so you can
+drop it there to set it aside. Choose **Bring back** on its row or card, or use the
+immediate **Undo** action. Searching includes set-aside workspaces. With a Home
 row or card focused, **Cmd/Ctrl+Shift+S** toggles its state; customize the shortcut
 in **Settings → Input**.
 
