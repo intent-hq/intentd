@@ -21,6 +21,8 @@ pub struct Daemon {
     pub state: LargeState,
     pub services: Services,
     pub socket: PathBuf,
+    /// The loopback account directory `host.invite.searchAccounts` reads.
+    pub accounts: crate::proxies::AccountDirectory,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     _sock_dir: tempfile::TempDir,
 }
@@ -45,7 +47,12 @@ pub async fn serve(state: LargeState) -> Daemon {
     // One reverse registry shared by the listener and the services, as the
     // composition root wires it: `client.list` reads its live clients.
     let registry = Arc::new(intent_transport::PrimaryReverseRegistry::new());
+    // Account search talks HTTP straight to the forge's public directory,
+    // not through the `SourceControl` engine: point it at a loopback
+    // fixture so the sweep never depends on api.github.com.
+    let accounts = crate::proxies::AccountDirectory::start().await;
     let services = intent_app::compose(state.services.clone())
+        .with_github_api_base_uri(accounts.base())
         .with_event_bus(bus.clone())
         .with_source_control(Arc::new(crate::proxies::OversizedForge::default()))
         .with_linear_engine(Arc::new(crate::proxies::OversizedLinear))
@@ -86,6 +93,7 @@ pub async fn serve(state: LargeState) -> Daemon {
         state,
         services,
         socket,
+        accounts,
         shutdown: Some(tx),
         _sock_dir: sock_dir,
     }

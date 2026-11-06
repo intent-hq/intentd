@@ -680,3 +680,129 @@ impl intent_core::ContextEngine for OversizedContext {
         })
     }
 }
+
+/// GitHub's maximum username length.
+const GITHUB_LOGIN_MAX: usize = 39;
+/// `host.invite.searchAccounts`' result cap (its `limit` is 1–10).
+const ACCOUNT_SEARCH_MAX: usize = 10;
+
+/// A loopback stand-in for GitHub's public account directory
+/// (`GET /search/users`), wired through `Services::with_github_api_base_uri`
+/// so `host.invite.searchAccounts` never reaches `api.github.com` (a 504
+/// there failed the sweep, intent-hq/intent#8703). Every reply carries the
+/// most accounts the method returns, each with a maximal login and long
+/// name and avatar fields, so the sweep measures the largest page.
+///
+/// The override redirects every GitHub API read that honours
+/// `github_api_base_uri` (invite identity and collaboration verification
+/// too), not only account search. Those paths get a 404 and are reported as
+/// unexpected requests: a row that needs them must teach this directory the
+/// endpoint rather than reach the real GitHub.
+pub struct AccountDirectory {
+    base: String,
+    hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    unexpected: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl AccountDirectory {
+    pub async fn start() -> Self {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind account directory");
+        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let unexpected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let body = account_page().to_string();
+        let task = tokio::spawn({
+            let hits = hits.clone();
+            let unexpected = unexpected.clone();
+            async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let (hits, unexpected, body) = (hits.clone(), unexpected.clone(), body.clone());
+                    tokio::spawn(async move {
+                        let mut head = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => head.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&head);
+                        let line = head.lines().next().unwrap_or_default().to_string();
+                        let (status, body) = if line.starts_with("GET /search/users?") {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            ("200 OK", body)
+                        } else {
+                            unexpected.lock().expect("unexpected log").push(line);
+                            ("404 Not Found", "{}".to_string())
+                        };
+                        let reply = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(reply.as_bytes()).await;
+                    });
+                }
+            }
+        });
+        Self {
+            base,
+            hits,
+            unexpected,
+            task,
+        }
+    }
+
+    /// The API root to hand `with_github_api_base_uri`.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// Searches served so far.
+    pub fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Request lines for any path the directory does not serve.
+    pub fn unexpected(&self) -> Vec<String> {
+        self.unexpected.lock().expect("unexpected log").clone()
+    }
+}
+
+impl Drop for AccountDirectory {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// One `/search/users` page at the method's cap: distinct positive ids,
+/// valid maximal logins, and long display names and avatar URLs.
+fn account_page() -> serde_json::Value {
+    let items: Vec<serde_json::Value> = (1..=ACCOUNT_SEARCH_MAX)
+        .map(|i| {
+            let mut login = format!("member{i}-");
+            while login.len() < GITHUB_LOGIN_MAX {
+                login.push('x');
+            }
+            serde_json::json!({
+                "id": 9_000_000 + i,
+                "login": login,
+                "name": text(i, 255),
+                "avatar_url": format!(
+                    "https://avatars.githubusercontent.com/u/{}?v=4&{}",
+                    9_000_000 + i,
+                    "s".repeat(200)
+                ),
+            })
+        })
+        .collect();
+    serde_json::json!({ "total_count": items.len(), "incomplete_results": false, "items": items })
+}
