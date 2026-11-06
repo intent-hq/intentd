@@ -22,9 +22,7 @@ use serde_json::{json, Value};
 
 use intent_acp::session::McpServer;
 use intent_acp::{HostFrameRouter, McpBridge, NormalizedMcpServer, WorkspaceMcpServer};
-use intent_core::node_link::{
-    LinkOutcome, McpProxy, MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL, SCRIPT_PROTOCOL,
-};
+use intent_core::node_link::{LinkOutcome, McpProxy, PREPARED_CHECKOUT_PROTOCOL, SECRETS_PROTOCOL};
 use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
     MCP_PROXY_LINK_TIMEOUT, PLACEMENT_HELP_METHOD,
@@ -35,15 +33,25 @@ use intent_core::{
     WorkspaceApi, WorkspaceGitRootId, WorkspaceId,
 };
 use intent_services::feature_api::file_ops;
+use intent_services::secret_requests::{exec_with_secrets, remote_unavailable, HeldSecrets};
 use intent_transport::node_link::NodeLink;
 
-/// The link to head the agents' forwarded calls use: the newest bound one.
+/// The link to head the agents' forwarded calls use: the newest bound one,
+/// and the secrets this backend's agents hold on the machine (nodeProtocol
+/// 14).
 #[derive(Clone, Default)]
 pub(super) struct HeadLink {
     current: Arc<Mutex<Option<NodeLink>>>,
+    secrets: Arc<HeldSecrets>,
 }
 
 impl HeadLink {
+    /// The agents' secrets, memory only (node-link.md § Secrets on the
+    /// machine).
+    pub(super) fn secrets(&self) -> &Arc<HeldSecrets> {
+        &self.secrets
+    }
+
     pub(super) fn set(&self, link: NodeLink) {
         *lock(&self.current) = Some(link);
     }
@@ -198,10 +206,16 @@ fn server_with_setup(
     (gates, setup_status): (&Gates, Option<Value>),
     head: HeadLink,
 ) -> std::io::Result<WorkspaceMcpServer> {
-    let features: AgentFeaturesSettings = serde_json::from_value(gates.agent_features.clone())
+    let mut features: AgentFeaturesSettings = serde_json::from_value(gates.agent_features.clone())
         .map_err(|e| {
             std::io::Error::other(format!("the agent's feature settings are invalid: {e}"))
         })?;
+    // Below nodeProtocol 14 neither side can hold a remote agent's secrets:
+    // the agent gets no ws.secret and no secretEnv.
+    if head.last_protocol() < SECRETS_PROTOCOL {
+        features.secret_requests = false;
+    }
+    let secrets = head.secrets().clone();
     let router = Router {
         agent_id: agent_id.clone(),
         head,
@@ -212,6 +226,8 @@ fn server_with_setup(
         workspace_id: workspace_id.clone(),
         worktree: worktree.to_path_buf(),
         head: router.clone(),
+        agent_id: agent_id.clone(),
+        secrets,
     });
     let server = WorkspaceMcpServer::new(api, workspace_id.clone())
         .with_caller_agent_id(Some(agent_id.clone()))
@@ -329,15 +345,7 @@ impl Router {
         let link = self.head.get();
         let agent_id = self.agent_id.clone();
         let min_protocol = workspace_api::forward_min_protocol(method);
-        let what = match min_protocol {
-            SCRIPT_PROTOCOL => "saved-script support",
-            MCP_PROXY_PROTOCOL => "MCP server proxies",
-            _ => "a newer node link",
-        };
-        let refused = format!(
-            "{}: `{method}` needs {what} on both this machine and the backend (node-link protocol {min_protocol}); update Intent on both",
-            workspace_api::UNSUPPORTED_CODE
-        );
+        let refused = workspace_api::forward_refusal(method);
         let params = json!({ "method": method, "args": args });
         let timeout = self.timeout;
         let overlay = self
@@ -453,6 +461,9 @@ struct NodeApi {
     worktree: PathBuf,
     /// Asks head for the workspace's auto-commit policy.
     head: Router,
+    /// The agent this server serves: the only one whose secrets it uses.
+    agent_id: AgentId,
+    secrets: Arc<HeldSecrets>,
 }
 
 impl NodeApi {
@@ -606,6 +617,37 @@ impl WorkspaceApi for NodeApi {
         Box::pin(async move {
             self.check(&workspace_id)?;
             intent_services::host_exec::run_for_workspace(self, workspace_id, params).await
+        })
+    }
+
+    /// `ws.host.exec` with `secretEnv` (nodeProtocol 14): the values come
+    /// only from this agent's secrets held on the machine.
+    fn agent_host_exec(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: Value,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            self.check(&workspace_id)?;
+            let own = agent_id == self.agent_id;
+            let secrets = &self.secrets;
+            exec_with_secrets(
+                self,
+                workspace_id,
+                params,
+                |names| {
+                    if own {
+                        secrets.resolve(&agent_id, names)
+                    } else {
+                        Err(names
+                            .first()
+                            .map_or_else(String::new, |name| (*name).to_owned()))
+                    }
+                },
+                remote_unavailable,
+            )
+            .await
         })
     }
 

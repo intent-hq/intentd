@@ -222,6 +222,25 @@ async fn apply_script(runner: &Runner, binding: &LeaseBinding, link: &NodeLink, 
     }
 }
 
+/// Apply one secret frame (nodeProtocol 14, node-link.md § Secrets on the
+/// machine) for `binding`'s session and build its one `secretReply`. A
+/// replaced session holds, drops and answers nothing.
+async fn apply_secret(
+    runner: &Runner,
+    binding: &LeaseBinding,
+    closed: impl Fn() -> bool,
+    frame: LinkFrame,
+) -> Option<LinkFrame> {
+    let gate = runner.link_gate().lock().await;
+    if admit(gate.as_ref(), binding, closed()) == Admission::Replaced {
+        tracing::debug!("node: dropping a secret frame from a replaced link");
+        return None;
+    }
+    let reply = runner.secret_frame(frame)?;
+    drop(gate);
+    Some(LinkFrame::SecretReply(reply))
+}
+
 /// A fresh capabilities report, for [`LinkFrame::Capabilities`].
 pub(super) type Report =
     std::sync::Arc<dyn Fn() -> BoxFuture<'static, MachineCapabilities> + Send + Sync>;
@@ -241,6 +260,9 @@ pub(super) async fn serve_link(
         .unwrap_or_default();
     match adopt(&runner, &binding, acked, || link.is_closed()).await {
         Adopted::Ready => {
+            // Before any frame of this link: a restarted backend's hello
+            // drops the secrets the previous process handed over.
+            runner.adopt_head(hello.head_session.as_deref(), &hello.lease_agents);
             runner.head_link().set(link.clone());
             runner.resend_setup_output(&link);
             // The backend listed the agents it still records: the
@@ -326,6 +348,17 @@ pub(super) async fn serve_link(
                         }))
                         .await;
                 });
+            }
+            LinkEvent::Frame(
+                frame @ (LinkFrame::SecretPut(_)
+                | LinkFrame::SecretForget(_)
+                | LinkFrame::SecretList(_)),
+            ) => {
+                if let Some(reply) =
+                    apply_secret(&runner, &binding, || link.is_closed(), frame).await
+                {
+                    let _ = link.send(&reply).await;
+                }
             }
             LinkEvent::Frame(frame) if frame.channel() == LinkChannel::Script => {
                 apply_script(&runner, &binding, &link, frame).await;

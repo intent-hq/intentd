@@ -154,6 +154,11 @@ async fn check_machine_prepares(
     require_prepared_checkout(&node, link_protocol(&node).await?)
 }
 
+/// How long the backend waits for a remote agent's machine to answer a
+/// secret frame, connecting included (node-link.md § Secrets on the
+/// machine).
+const MACHINE_SECRET_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How long the backend waits for a parent's machine to push before a
 /// sub-agent on another machine starts from the parent's last push.
 const PARENT_PUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(75);
@@ -797,6 +802,37 @@ impl RemoteLaunchPort for RemoteLaunch {
             match feature.node(svc, &record.node_id).await {
                 Ok(node) => node.machine_skills(query).await,
                 Err(_) => MachineSkills::Offline,
+            }
+        })
+    }
+
+    fn machine_secret<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        op: intent_services::feature_api::feature_ports::MachineSecretOp,
+    ) -> BoxFuture<'a, intent_services::feature_api::feature_ports::MachineSecretAnswer> {
+        use intent_services::feature_api::feature_ports::{MachineSecretAnswer, MachineSecretOp};
+        Box::pin(async move {
+            let forget = match &op {
+                MachineSecretOp::Forget { name } => Some(name.clone()),
+                MachineSecretOp::Put { .. } | MachineSecretOp::List => None,
+            };
+            let node = match svc.store().get_remote_agent(agent_id).await {
+                Ok(Some(record)) => match svc.remote_feature() {
+                    Some(feature) => match feature.node(svc, &record.node_id).await {
+                        Ok(node) if node.status().lease_id == record.lease_id => Some(node),
+                        _ => None,
+                    },
+                    None => None,
+                },
+                _ => None,
+            };
+            match node {
+                Some(node) => node.machine_secret(agent_id, op, MACHINE_SECRET_WAIT).await,
+                // No machine to reach: a forget has nothing left to drop.
+                None if forget.is_some() => MachineSecretAnswer::Forgotten(false),
+                None => MachineSecretAnswer::Offline,
             }
         })
     }

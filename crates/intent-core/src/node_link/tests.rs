@@ -85,22 +85,24 @@ fn the_binding_wire_shape_uses_decimal_string_generations() {
 }
 
 #[test]
-fn the_daemon_to_daemon_link_speaks_protocols_7_to_13() {
+fn the_daemon_to_daemon_link_speaks_protocols_7_to_14() {
     // 7 adds the correlated stop acknowledgement. A protocol-6 peer cannot
     // send `stopAck`, so it never links: a backend must not take a stop as
     // confirmed by a machine that cannot confirm it. 8 adds the script
     // frames, 9 final stops, 10 the prepared checkout, 11 the user MCP
-    // server proxies, 12 the machine's skills, 13 sub-agent checkouts; a
-    // protocol-7 peer still binds and runs agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 13 });
+    // server proxies, 12 the machine's skills, 13 sub-agent checkouts, 14
+    // agent secrets on the machine; a protocol-7 peer still binds and runs
+    // agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 14 });
     assert_eq!(SCRIPT_PROTOCOL, 8);
     assert_eq!(FINAL_STOP_PROTOCOL, 9);
     assert_eq!(PREPARED_CHECKOUT_PROTOCOL, 10);
     assert_eq!(MCP_PROXY_PROTOCOL, 11);
     assert_eq!(SKILLS_PROTOCOL, 12);
-    assert_eq!(SHARED_CHECKOUT_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    assert_eq!(SHARED_CHECKOUT_PROTOCOL, 13);
+    assert_eq!(SECRETS_PROTOCOL, NODE_LINK_PROTOCOLS.max);
     assert!(offers_prepared_checkout());
-    for version in 7..=13 {
+    for version in 7..=14 {
         ensure_protocol(version).unwrap();
     }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
@@ -261,6 +263,7 @@ fn later_additions_within_a_version_decode_on_an_older_peer() {
         binding: binding("head", 1),
         acked_seq: NodeCounter(0),
         lease_agents: Vec::new(),
+        head_session: None,
     }))
     .unwrap();
     assert!(
@@ -345,6 +348,9 @@ fn executor_link_requests_golden() {
             "response",
             "scriptStart",
             "scriptStop",
+            "secretForget",
+            "secretList",
+            "secretPut",
             "skills",
             "stop",
         ]
@@ -392,6 +398,7 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
             "scriptExited",
             "scriptOutput",
             "scriptStarted",
+            "secretReply",
             "skillsReply",
             "stopAck",
             "welcome"
@@ -420,6 +427,7 @@ fn every_frame() -> Vec<LinkFrame> {
             binding: binding("head", 3),
             acked_seq: NodeCounter(10),
             lease_agents: Vec::new(),
+            head_session: None,
         }),
         LinkFrame::Welcome(LinkWelcome {
             protocol: 7,
@@ -575,6 +583,29 @@ fn every_frame() -> Vec<LinkFrame> {
             outcome: FinalPush::Failed,
             error: Some("head refused the push".into()),
         }),
+        LinkFrame::SecretPut(SecretPut {
+            request_id,
+            agent_id: AgentId::from("a1"),
+            name: "API_KEY".into(),
+            value: SecretValue::from("canary-agent-secret"),
+        }),
+        LinkFrame::SecretForget(SecretForget {
+            request_id,
+            agent_id: AgentId::from("a1"),
+            name: Some("API_KEY".into()),
+        }),
+        LinkFrame::SecretList(SecretList {
+            request_id,
+            agent_id: AgentId::from("a1"),
+        }),
+        LinkFrame::SecretReply(SecretReply {
+            request_id,
+            agent_id: AgentId::from("a1"),
+            outcome: SecretOutcome::Ok,
+            names: Some(vec!["API_KEY".into()]),
+            forgotten: None,
+            error: None,
+        }),
     ]
 }
 
@@ -611,7 +642,7 @@ fn frames_are_routed_to_their_lane() {
             Control, Control, Control, Control, Control, Control, Control, Control, Control,
             Control, Journal, Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control,
             Control, Script, Script, Script, Script, Script, Control, Control, Journal, Control,
-            Control
+            Control, Control, Control, Control, Control
         ]
     );
 }
@@ -722,6 +753,7 @@ fn stop_and_stop_ack_wire_shapes() {
         binding: binding("head", 1),
         acked_seq: NodeCounter(0),
         lease_agents: vec![agent_id.clone()],
+        head_session: None,
     };
     let value = serde_json::to_value(LinkFrame::Hello(hello.clone())).unwrap();
     assert_eq!(value["leaseAgents"], json!([agent_id.0]));
@@ -1079,7 +1111,16 @@ fn script_frames_need_protocol_8_skills_frames_12_and_push_frames_13() {
                 })
         );
         let push = matches!(frame, LinkFrame::PushWip(_) | LinkFrame::PushWipReply(_));
-        let expected = if push {
+        let secret = matches!(
+            frame,
+            LinkFrame::SecretPut(_)
+                | LinkFrame::SecretForget(_)
+                | LinkFrame::SecretList(_)
+                | LinkFrame::SecretReply(_)
+        );
+        let expected = if secret {
+            SECRETS_PROTOCOL
+        } else if push {
             SHARED_CHECKOUT_PROTOCOL
         } else if skills {
             12
@@ -1285,4 +1326,111 @@ fn push_wip_frames_have_closed_bodies() {
             "{raw}"
         );
     }
+}
+
+/// The secret frames (`node-link.md` § Secrets on the machine) have the
+/// documented wire names and closed bodies.
+#[test]
+fn secret_frames_have_the_documented_shape_and_closed_bodies() {
+    let id = LinkId::new_v4();
+    let put = LinkFrame::SecretPut(SecretPut {
+        request_id: id,
+        agent_id: AgentId::from("a1"),
+        name: "API_KEY".into(),
+        value: SecretValue::from("v-1"),
+    });
+    assert_eq!(
+        serde_json::to_value(&put).unwrap(),
+        json!({ "type": "secretPut", "requestId": id, "agentId": "a1", "name": "API_KEY", "value": "v-1" })
+    );
+    let forget_all = LinkFrame::SecretForget(SecretForget {
+        request_id: id,
+        agent_id: AgentId::from("a1"),
+        name: None,
+    });
+    assert_eq!(
+        serde_json::to_value(&forget_all).unwrap(),
+        json!({ "type": "secretForget", "requestId": id, "agentId": "a1" })
+    );
+    let reply = LinkFrame::decode(
+        json!({ "type": "secretReply", "requestId": id, "agentId": "a1", "outcome": "failed", "error": "agent-not-on-lease" })
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            &reply,
+            LinkFrame::SecretReply(SecretReply {
+                outcome: SecretOutcome::Failed,
+                error: Some(error),
+                names: None,
+                ..
+            }) if error == "agent-not-on-lease"
+        ),
+        "{reply:?}"
+    );
+    for raw in [
+        json!({ "type": "secretPut", "requestId": id, "agentId": "a1", "name": "K", "value": "v", "extra": 1 }),
+        json!({ "type": "secretPut", "requestId": id, "agentId": "a1", "name": "K" }),
+        json!({ "type": "secretList", "requestId": id, "agentId": "a1", "name": "K" }),
+        json!({ "type": "secretForget", "agentId": "a1" }),
+        json!({ "type": "secretReply", "requestId": id, "agentId": "a1", "outcome": "maybe" }),
+    ] {
+        assert!(
+            LinkFrame::decode(raw.to_string().as_bytes()).is_err(),
+            "{raw}"
+        );
+    }
+}
+
+/// A secret value never shows in `Debug` output, nor in the error for a
+/// malformed secret frame.
+#[test]
+fn secret_values_never_render_in_debug_or_decode_errors() {
+    let frame = LinkFrame::SecretPut(SecretPut {
+        request_id: LinkId::new_v4(),
+        agent_id: AgentId::from("a1"),
+        name: "API_KEY".into(),
+        value: SecretValue::from("canary-agent-secret"),
+    });
+    let rendered = format!("{frame:?}");
+    assert!(!rendered.contains("canary-agent-secret"), "{rendered}");
+    assert!(rendered.contains("API_KEY"), "{rendered}");
+    for raw in [
+        json!({ "type": "secretPut", "requestId": "canary-agent-secret", "agentId": "a1", "name": "K", "value": "canary-agent-secret" }),
+        json!({ "type": "secretPut", "requestId": LinkId::new_v4(), "agentId": "a1", "name": "K", "value": "v", "canary-agent-secret": 1 }),
+        json!({ "type": "secretPut", "requestId": LinkId::new_v4(), "agentId": "a1", "name": 1, "value": ["canary-agent-secret"] }),
+        json!({ "type": "secretPut", "requestId": LinkId::new_v4(), "agentId": "a1", "name": "canary-agent-secret" }),
+    ] {
+        let Err(error) = LinkFrame::decode(raw.to_string().as_bytes()) else {
+            panic!("decoded {raw}");
+        };
+        let message = error.to_string();
+        assert!(!message.contains("canary-agent-secret"), "{message}");
+        assert!(message.contains("node-link-frame-invalid"), "{message}");
+    }
+}
+
+/// `hello.headSession` (protocol 14) is optional on the wire: an older
+/// backend's hello still decodes, without one.
+#[test]
+fn hello_head_session_is_optional() {
+    let mut hello = LinkHello {
+        protocol: NODE_LINK_PROTOCOLS,
+        intentd_version: "0.12.0".into(),
+        binding: binding("head", 3),
+        acked_seq: NodeCounter(0),
+        lease_agents: Vec::new(),
+        head_session: None,
+    };
+    let value = serde_json::to_value(LinkFrame::Hello(hello.clone())).unwrap();
+    assert!(value.get("headSession").is_none(), "{value}");
+    hello.head_session = Some("hs-1".into());
+    let value = serde_json::to_value(LinkFrame::Hello(hello.clone())).unwrap();
+    assert_eq!(value["headSession"], "hs-1");
+    assert_eq!(
+        LinkFrame::decode(value.to_string().as_bytes()).unwrap(),
+        LinkFrame::Hello(hello)
+    );
 }

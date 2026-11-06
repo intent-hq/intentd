@@ -186,6 +186,17 @@ struct Inner {
     /// Set when shutdown begins: an ordinary push still under way is
     /// cancelled, so the agent's last push starts within the budget.
     closing_signal: watch::Sender<bool>,
+    /// The backend's `headSession` and lease agents from the newest bound
+    /// hello (nodeProtocol 14): a secret is held only for an agent on the
+    /// lease, and a new session drops every secret.
+    head_session: Mutex<HeadSession>,
+}
+
+/// See [`Inner::head_session`].
+#[derive(Default)]
+struct HeadSession {
+    session: Option<String>,
+    lease_agents: HashSet<AgentId>,
 }
 
 #[derive(Default)]
@@ -762,8 +773,77 @@ impl Runner {
                 swept: tokio::sync::Notify::new(),
                 push_locks: Mutex::new(HashMap::new()),
                 closing_signal: watch::channel(false).0,
+                head_session: Mutex::new(HeadSession::default()),
             }),
         }
+    }
+
+    /// Adopt a bound hello's `headSession` and lease agents (nodeProtocol
+    /// 14). A different session, or none, means another backend process:
+    /// every secret this backend's agents held here is dropped.
+    pub(super) fn adopt_head(&self, session: Option<&str>, lease_agents: &[AgentId]) {
+        let mut head = lock(&self.inner.head_session);
+        if session.is_none() || head.session.as_deref() != session {
+            self.inner.head.secrets().clear();
+        }
+        head.session = session.map(str::to_owned);
+        head.lease_agents = lease_agents.iter().cloned().collect();
+    }
+
+    /// Apply one secret frame and build its reply; `None` for any other
+    /// frame. Never logs or returns a value.
+    pub(super) fn secret_frame(
+        &self,
+        frame: intent_core::node_link::LinkFrame,
+    ) -> Option<intent_core::node_link::SecretReply> {
+        use intent_core::node_link::{
+            LinkFrame, SecretOutcome, SecretReply, SECRET_AGENT_NOT_ON_LEASE, SECRET_INVALID_PARAMS,
+        };
+        use intent_services::secret_requests::HeldSecrets;
+        let (request_id, agent_id) = match &frame {
+            LinkFrame::SecretPut(put) => (put.request_id, put.agent_id.clone()),
+            LinkFrame::SecretForget(forget) => (forget.request_id, forget.agent_id.clone()),
+            LinkFrame::SecretList(list) => (list.request_id, list.agent_id.clone()),
+            _ => return None,
+        };
+        let failed = |error: &str| SecretReply {
+            request_id,
+            agent_id: agent_id.clone(),
+            outcome: SecretOutcome::Failed,
+            names: None,
+            forgotten: None,
+            error: Some(error.to_owned()),
+        };
+        let mut ok = SecretReply {
+            outcome: SecretOutcome::Ok,
+            error: None,
+            ..failed("")
+        };
+        let on_lease = lock(&self.inner.head_session)
+            .lease_agents
+            .contains(&agent_id)
+            || lock(&self.inner.state).workspaces.contains_key(&agent_id);
+        let secrets = self.inner.head.secrets();
+        Some(match frame {
+            LinkFrame::SecretPut(_) if !on_lease => failed(SECRET_AGENT_NOT_ON_LEASE),
+            LinkFrame::SecretPut(put) => {
+                if HeldSecrets::validate(&put.name, put.value.expose()).is_err() {
+                    failed(SECRET_INVALID_PARAMS)
+                } else {
+                    secrets.put(&agent_id, put.name, put.value.into_inner());
+                    ok
+                }
+            }
+            LinkFrame::SecretForget(forget) => {
+                ok.forgotten = Some(secrets.forget(&agent_id, forget.name.as_deref()));
+                ok
+            }
+            LinkFrame::SecretList(_) => {
+                ok.names = Some(secrets.names(&agent_id));
+                ok
+            }
+            _ => return None,
+        })
     }
 
     /// Start one process of a machine run for the link binding
@@ -1818,6 +1898,8 @@ impl Runner {
                         finished,
                         result: None,
                     };
+                    // The agent ends for good: its secrets go first.
+                    runner.inner.head.secrets().forget(&agent_id, None);
                     // The agent's script runs end first, so nothing still
                     // writes to its checkout while it is pushed and removed.
                     if !runner.inner.scripts.stop_agent(&agent_id).await {
@@ -2066,6 +2148,9 @@ impl Runner {
             };
             lock(&self.inner.state).sweeping.remove(&agent_id);
             self.inner.swept.notify_waiters();
+            // The backend no longer records the agent: nothing may use its
+            // secrets.
+            self.inner.head.secrets().forget(&agent_id, None);
             match removed {
                 Ok(()) => {
                     tracing::info!(agent = %agent_id, "node: removed the checkout of an agent its backend no longer records");

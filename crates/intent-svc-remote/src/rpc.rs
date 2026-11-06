@@ -107,6 +107,13 @@ impl HeadCalls {
         if !internal && workspace_api::route(method) != Route::Forward {
             return refusal(FORBIDDEN, workspace_api::unsupported_message(method));
         }
+        // A frame whose link support is newer than this link (agent
+        // secrets, nodeProtocol 14) is refused as the machine would.
+        if method.starts_with("secret.")
+            && shared.protocol() < intent_core::node_link::SECRETS_PROTOCOL
+        {
+            return refusal(FORBIDDEN, workspace_api::forward_refusal(method));
+        }
         let record = match shared.store.get_remote_agent(&request.agent_id).await {
             Ok(Some(record)) if record.lease_id == binding.lease_id => record,
             Ok(_) => {

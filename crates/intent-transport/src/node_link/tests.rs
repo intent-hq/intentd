@@ -45,6 +45,7 @@ fn hello(binding: LeaseBinding) -> LinkHello {
         binding,
         acked_seq: NodeCounter(0),
         lease_agents: Vec::new(),
+        head_session: None,
     }
 }
 

@@ -42,6 +42,7 @@ intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.136",
 intent-core = { path = "../intent-core", version = "0.11.136" }
 intent-store = { path = "../intent-store", version = "0.11.136" }
 intent-services = { path = "../intent-services", version = "0.11.136" }
+zeroize = "1.9"
 intent-app = { path = "../intent-app", version = "0.11.136" }
 intent-acp = { path = "../intent-acp", version = "0.11.136" }
 intent-providers = { path = "../intent-providers", version = "0.11.136" }

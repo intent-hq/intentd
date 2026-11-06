@@ -1490,6 +1490,21 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         Box::pin(async { MachineSkills::Offline })
     }
 
+    /// Send one secret frame for remote agent `agent_id` to its machine
+    /// (nodeProtocol 14, node-link.md § Secrets on the machine),
+    /// connecting on demand, and wait up to 10 s for the answer. A forget
+    /// for a machine that is not connected is queued in memory and sent
+    /// after the next bind. [`MachineSecretAnswer::Offline`] by default.
+    fn machine_secret<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        op: MachineSecretOp,
+    ) -> BoxFuture<'a, MachineSecretAnswer> {
+        let _ = (svc, agent_id, op);
+        Box::pin(async { MachineSecretAnswer::Offline })
+    }
+
     /// The executor link to `agent_id`'s machine for its machine runs,
     /// connecting on demand.
     ///
@@ -1530,6 +1545,52 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
             )))
         })
     }
+}
+
+/// One secret frame for [`RemoteLaunchPort::machine_secret`]. `Debug`
+/// never shows a value.
+pub enum MachineSecretOp {
+    /// Hold `value` as secret `name`.
+    Put {
+        name: String,
+        value: zeroize::Zeroizing<String>,
+    },
+    /// Drop secret `name`, or all of the agent's secrets.
+    Forget { name: Option<String> },
+    /// The held names.
+    List,
+}
+
+impl std::fmt::Debug for MachineSecretOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Put { name, .. } => f
+                .debug_struct("Put")
+                .field("name", name)
+                .finish_non_exhaustive(),
+            Self::Forget { name } => f.debug_struct("Forget").field("name", name).finish(),
+            Self::List => f.write_str("List"),
+        }
+    }
+}
+
+/// A machine's answer for [`RemoteLaunchPort::machine_secret`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MachineSecretAnswer {
+    /// `Put` held the value.
+    Stored,
+    /// `Forget`: whether anything was dropped.
+    Forgotten(bool),
+    /// `List`: the held names, sorted.
+    Names(Vec<String>),
+    /// `Forget` for a machine that is not connected: sent after its next
+    /// bind.
+    Queued,
+    /// No link came up, it is older than nodeProtocol 14, or it did not
+    /// answer in time.
+    Offline,
+    /// The machine refused, with its fixed code.
+    Failed(String),
 }
 
 /// A machine's answer for [`RemoteLaunchPort::machine_skills`].

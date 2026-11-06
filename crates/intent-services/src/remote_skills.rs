@@ -210,4 +210,4 @@ fn sorted(mut skills: Vec<MachineSkill>) -> Vec<MachineSkill> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
