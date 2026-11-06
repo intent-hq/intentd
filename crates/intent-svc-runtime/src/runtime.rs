@@ -1210,9 +1210,41 @@ impl RuntimePort for RuntimeFeature {
                 let mut target = svc.browser_client_target(&workspace_id).await?;
                 let new_tabs =
                     registry_tabs.is_empty() && actions.iter().all(|a| a["action"] == "openTab");
+                // A human's latest sending device is a preference for new opens,
+                // never an ownership change or permission to run native automation.
+                let starts_new_tab = registry_tabs.is_empty()
+                    && actions.first().is_some_and(|a| a["action"] == "openTab");
+                if starts_new_tab && !matches!(target, ReverseTarget::Pinned(_)) {
+                    if let Some(agent) = agent_id.as_ref() {
+                        if let Some(client) = svc
+                            .store()
+                            .preferred_browser_sender(agent, &workspace_id)
+                            .await?
+                        {
+                            let preferred = ReverseTarget::Client(client);
+                            let eligible = if navigation {
+                                dispatch
+                                    .resolve_navigation(&preferred, &workspace_id)
+                                    .is_ok()
+                            } else {
+                                dispatch
+                                    .connection_snapshot(
+                                        &workspace_id,
+                                        std::slice::from_ref(&preferred),
+                                    )
+                                    .routes
+                                    .first()
+                                    .is_some_and(|route| route.error.is_none())
+                            };
+                            if eligible {
+                                target = preferred;
+                            }
+                        }
+                    }
+                }
                 if new_tabs
                     && !matches!(target, ReverseTarget::Pinned(_))
-                    && dispatch.resolve(&target).is_err()
+                    && dispatch.resolve_navigation(&target, &workspace_id).is_err()
                 {
                     target = ReverseTarget::Default;
                 }

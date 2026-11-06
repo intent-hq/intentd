@@ -21,6 +21,7 @@ impl NavigationRegistry {
             navigation: FakeRegistry::new(&[
                 ("desktop-a", None, desktop_live),
                 ("phone", None, true),
+                ("unsupported", None, false),
             ]),
         })
     }
@@ -223,4 +224,248 @@ async fn native_navigation_only_connection_explains_automation_unavailability() 
         .unwrap();
     assert_eq!(result["errorCode"], "browser-automation-unavailable");
     assert!(registry.navigation.calls.lock().unwrap().is_empty());
+}
+
+#[intent_test_macros::daemon_test]
+async fn native_navigation_prefers_latest_sender_only_for_new_unpinned_opens() {
+    use intent_core::{AgentId, ClientHostInfo};
+    use intent_services::feature_api::test_support::fixtures::session;
+    let registry = NavigationRegistry::new(true);
+    let (_tmp, _root, svc, _bus, ws) = setup(registry.desktop.clone()).await;
+    let svc = svc.with_reverse_dispatch(registry.clone());
+    let agent = AgentId::new();
+    svc.store()
+        .insert_agent_session(&session(&agent, &ws))
+        .await
+        .unwrap();
+    for device in ["phone", "offline", "unsupported"] {
+        svc.store()
+            .upsert_client(
+                &ClientId::from(device),
+                None,
+                None,
+                &ClientHostInfo::default(),
+            )
+            .await
+            .unwrap();
+    }
+    for (order, device, expected) in [
+        ("1", "phone", "phone"),
+        ("2", "desktop-a", "desktop-a"),
+        ("3", "offline", "desktop-a"),
+        ("4", "unsupported", "desktop-a"),
+        ("5", "phone", "phone"),
+    ] {
+        svc.store()
+            .record_browser_sender(&agent, order, order, Some(&ClientId::from(device)))
+            .await
+            .unwrap();
+        let result = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({"action":"openTab","url":"https://preview.test"})],
+                None,
+                Some(agent.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["result"]["host"], expected);
+    }
+    // A navigation-only sender cannot receive any automation in a batch.
+    svc.browser_exec(
+        ws.clone(),
+        vec![
+            json!({"action":"openTab","url":"https://preview.test"}),
+            json!({"action":"evaluate","script":"1"}),
+        ],
+        None,
+        Some(agent.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        registry.desktop.calls.lock().unwrap().last().unwrap().2,
+        ReverseTarget::Default
+    );
+    register_tab(
+        &svc,
+        &ws,
+        "existing-desktop",
+        "desktop-a",
+        Some(agent.as_str()),
+    )
+    .await;
+    let result = svc
+        .browser_exec(
+            ws.clone(),
+            vec![json!({"action":"showTab","tabId":"existing-desktop"})],
+            None,
+            Some(agent.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["result"]["host"], "desktop-a");
+    svc.set_workspace_browser_client(ws.clone(), Some(ClientId::from("desktop-a")))
+        .await
+        .unwrap();
+    let result = svc
+        .browser_exec(
+            ws,
+            vec![json!({"action":"openTab","url":"https://preview.test"})],
+            None,
+            Some(agent),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["result"]["host"], "desktop-a");
+}
+
+#[intent_test_macros::daemon_test]
+async fn browser_sender_delegation_inherits_only_nearest_same_workspace_receipt() {
+    use intent_core::{AgentId, ClientHostInfo};
+    use intent_services::feature_api::test_support::fixtures::{session, workspace};
+    let registry = NavigationRegistry::new(true);
+    let (_tmp, _root, svc, _bus, ws) = setup(registry.desktop.clone()).await;
+    let svc = svc.with_reverse_dispatch(registry);
+    svc.store()
+        .upsert_client(
+            &ClientId::from("phone"),
+            None,
+            None,
+            &ClientHostInfo::default(),
+        )
+        .await
+        .unwrap();
+    let parent = AgentId::new();
+    let child = AgentId::new();
+    let unrelated = AgentId::new();
+    let foreign = AgentId::new();
+    let foreign_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&workspace(&foreign_ws))
+        .await
+        .unwrap();
+    for (agent, home, ancestor) in [
+        (&parent, &ws, None),
+        (&child, &ws, Some(parent.clone())),
+        (&unrelated, &ws, None),
+        (&foreign, &foreign_ws, Some(parent.clone())),
+    ] {
+        let mut row = session(agent, home);
+        row.parent_agent_id = ancestor;
+        if agent == &unrelated {
+            row.metadata = Some(json!({"sponsorAgentId": parent}));
+        }
+        svc.store().insert_agent_session(&row).await.unwrap();
+    }
+    svc.store()
+        .record_browser_sender(&parent, "parent", "1", Some(&ClientId::from("phone")))
+        .await
+        .unwrap();
+    assert_eq!(
+        svc.store()
+            .preferred_browser_sender(&child, &ws)
+            .await
+            .unwrap(),
+        Some(ClientId::from("phone"))
+    );
+    let opened = svc
+        .browser_exec(
+            ws.clone(),
+            vec![json!({"action":"openTab","url":"https://preview.test"})],
+            None,
+            Some(child.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(opened["result"]["host"], "phone");
+    assert_eq!(
+        svc.store()
+            .preferred_browser_sender(&unrelated, &ws)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        svc.store()
+            .preferred_browser_sender(&foreign, &foreign_ws)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        svc.store()
+            .preferred_browser_sender(&child, &foreign_ws)
+            .await
+            .unwrap(),
+        None
+    );
+    svc.store()
+        .record_browser_sender(&child, "child", "2", Some(&ClientId::from("desktop-b")))
+        .await
+        .unwrap();
+    assert_eq!(
+        svc.store()
+            .preferred_browser_sender(&child, &ws)
+            .await
+            .unwrap(),
+        Some(ClientId::from("desktop-b"))
+    );
+    // Offline nearest receipt falls back ordinarily, never to the live ancestor.
+    let opened = svc
+        .browser_exec(
+            ws.clone(),
+            vec![json!({"action":"openTab","url":"https://preview.test"})],
+            None,
+            Some(child.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(opened["result"]["host"], "desktop-a");
+    svc.store()
+        .record_browser_sender(&child, "clear", "3", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        svc.store()
+            .preferred_browser_sender(&child, &ws)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        svc.store().latest_browser_sender(&parent).await.unwrap(),
+        Some(ClientId::from("phone"))
+    );
+    // Corrupt parent cycles terminate even without any receipt.
+    let cycle_a = AgentId::new();
+    let cycle_b = AgentId::new();
+    for (agent, ancestor) in [(&cycle_a, &cycle_b), (&cycle_b, &cycle_a)] {
+        let mut row = session(agent, &ws);
+        row.parent_agent_id = Some(ancestor.clone());
+        svc.store().insert_agent_session(&row).await.unwrap();
+    }
+    assert_eq!(
+        svc.store()
+            .preferred_browser_sender(&cycle_a, &ws)
+            .await
+            .unwrap(),
+        None
+    );
+    let mut ancestor = parent;
+    for _ in 0..16 {
+        let id = AgentId::new();
+        let mut row = session(&id, &ws);
+        row.parent_agent_id = Some(ancestor);
+        svc.store().insert_agent_session(&row).await.unwrap();
+        ancestor = id;
+    }
+    assert_eq!(
+        svc.store()
+            .preferred_browser_sender(&ancestor, &ws)
+            .await
+            .unwrap(),
+        None,
+        "lookup is bounded even on an excessively deep chain"
+    );
 }
