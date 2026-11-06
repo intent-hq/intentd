@@ -32471,6 +32471,22 @@ impl WorkspaceApi for Services {
             // (monorepo#3338) — rejected before any state change.
             self.validate_image_block_refs("agent.sendMessage", image_blocks.as_ref())
                 .await?;
+            // A message too large for a remote agent's link is refused here,
+            // before the runtime path persists or queues it.
+            if image_blocks
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|images| !images.is_empty())
+            {
+                let session = self.require_agent_session(&agent_id).await?;
+                self.ensure_fits_session_prompt(
+                    "agent.sendMessage",
+                    &session,
+                    &content,
+                    image_blocks.as_ref(),
+                )
+                .await?;
+            }
             // A named profile that was removed or whose provider is disabled
             // refuses the turn here, structured, before anything persists
             // (PROTOCOL §5.54), rather than as a prose spawn failure later.

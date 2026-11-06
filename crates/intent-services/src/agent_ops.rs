@@ -9970,7 +9970,7 @@ impl Services {
 
     /// [`Self::ensure_fits_remote_prompt`] for `session`, only when it runs
     /// on another machine.
-    async fn ensure_fits_session_prompt(
+    pub(crate) async fn ensure_fits_session_prompt(
         &self,
         method: &str,
         session: &AgentSession,
