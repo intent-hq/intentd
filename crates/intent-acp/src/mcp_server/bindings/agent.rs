@@ -741,7 +741,7 @@ async fn delegate(
                     Ok(entry) => entries.push(entry),
                     Err(_) => {
                         return Err(format!(
-                            "tasks entries must be task note id strings or {{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }} objects, got: {v}"
+                            "tasks entries must be task note id strings or {{ taskNoteId, specialist?, model?, provider?, reasoningEffort?, placement? }} objects, got: {v}"
                         ));
                     }
                 }

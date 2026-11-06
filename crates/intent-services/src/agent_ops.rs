@@ -12915,23 +12915,43 @@ impl Services {
                 "agent.delegate: greedy was removed; delegate a held task individually to force it past the conflict hold".to_string(),
             ));
         }
-        if input.placement.is_some() && input.tasks.is_some() {
-            return Err(Error::InvalidParams(
-                "agent.delegate: placement applies to a single delegation; delegate each task that needs one on its own".to_string(),
-            ));
-        }
-        let on_backend = match &input.placement {
-            Some(placement) => placement.runs_on_backend()?,
-            None => false,
+        // Every task's placement is checked before anything starts: a batch
+        // entry's own placement replaces the call's, and a task with neither
+        // follows the single-delegation rule.
+        let placements: Vec<Option<&intent_core::placement::AgentPlacement>> = match &input.tasks {
+            Some(entries) => entries
+                .iter()
+                .map(|entry| match entry {
+                    intent_core::BatchTaskEntry::Options(opts) if opts.placement.is_some() => {
+                        opts.placement.as_ref()
+                    }
+                    _ => input.placement.as_ref(),
+                })
+                .collect(),
+            None => vec![input.placement.as_ref()],
         };
-        if input.placement.is_some() && !on_backend && input.isolation.is_some() {
+        let mut explicit_remote = false;
+        let mut any_unplaced = false;
+        for placement in &placements {
+            match placement {
+                Some(placement) if placement.runs_on_backend()? => {}
+                Some(placement) => {
+                    if input.tasks.is_some() {
+                        placement.check_remote_supported()?;
+                    }
+                    explicit_remote = true;
+                }
+                None => any_unplaced = true,
+            }
+        }
+        if explicit_remote && input.isolation.is_some() {
             return Err(Error::InvalidParams(
                 "agent.delegate: placement and isolation cannot be combined; a remote agent always works in its own checkout".to_string(),
             ));
         }
         // A remote agent's sub-agents inherit its machine (see the create
         // seam), so they are placed unless they ask for the backend.
-        let inherits = input.placement.is_none()
+        let inherits = any_unplaced
             && self
                 .inherited_placement(parent_agent_id.as_ref())
                 .await?
@@ -12941,7 +12961,7 @@ impl Services {
                 "agent.delegate: a remote agent's sub-agents run on its machine, so isolation does not apply; pass placement { target: \"local\" } to use isolation on the backend".to_string(),
             ));
         }
-        let placed = inherits || (input.placement.is_some() && !on_backend);
+        let placed = inherits || explicit_remote;
         if input.tasks.is_some() {
             return self
                 .agent_delegate_batch_op(workspace_id, input, parent_agent_id, placed)
@@ -13629,8 +13649,8 @@ impl Services {
     /// the start subset through the unchanged single-task path (per-task
     /// agent creation, group enrollment honoring `waitMode`). Entries may be
     /// bare task-note ids or objects carrying per-task
-    /// `specialist`/`model`/`reasoningEffort` overrides of the top-level
-    /// defaults. No scheduler state is written: held tasks are simply not
+    /// `specialist`/`model`/`reasoningEffort`/`placement` overrides of the
+    /// top-level defaults. No scheduler state is written: held tasks are simply not
     /// started, and re-calling with the same list is idempotent
     /// (running/terminal tasks classify as `skipped`). The result enumerates
     /// EVERY supplied task with its disposition + reason, carries a top-level
@@ -13708,8 +13728,8 @@ impl Services {
         // already spawned. Per-entry `provider`/`model` overrides stay
         // per-row (`error` disposition via the single-task path), consistent
         // with the other per-entry options.
-        // Children placed on a remote machine (inherited from a remote
-        // parent) run the provider there, so this backend's installation
+        // Children placed on a remote machine (by a placement, or inherited
+        // from a remote parent) run the provider there, so this backend's installation
         // says nothing about it: each child's machine admission checks it
         // and fails only that child's row.
         if let Some(provider_param) = input.provider.as_deref() {
@@ -13841,6 +13861,9 @@ impl Services {
                         wait_mode: input.wait_mode.clone(),
                         skip_auto_commit: input.skip_auto_commit,
                         isolation: input.isolation.clone(),
+                        placement: opts
+                            .and_then(|o| o.placement.clone())
+                            .or_else(|| input.placement.clone()),
                         ..Default::default()
                     };
                     match Box::pin(self.agent_delegate_op(
