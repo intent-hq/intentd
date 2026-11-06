@@ -358,6 +358,32 @@ struct Settled {
     stopped: bool,
 }
 
+/// Add to `settled` the submodules populated in the checkout at `cwd` that
+/// are not among `pins` (a setup script initialized them, now or at an
+/// earlier launch): the first turn's notice names them and the agent's
+/// `setupStatus` lists them as `unsentSubmodules`.
+async fn unsent_submodules(
+    settled: &mut Settled,
+    cwd: &Path,
+    pins: &[intent_core::node_link::SubmodulePin],
+) {
+    let (cwd, pins) = (cwd.to_path_buf(), pins.to_vec());
+    let paths =
+        tokio::task::spawn_blocking(move || intent_git::node_git::unpinned_submodules(&cwd, &pins))
+            .await
+            .unwrap_or_default();
+    let Some(notice) = setup::unsent_notice(&paths) else {
+        return;
+    };
+    settled.notice = Some(match settled.notice.take() {
+        Some(setup) => format!("{setup}\n\n{notice}"),
+        None => notice,
+    });
+    if let Some(Value::Object(overlay)) = settled.overlay.as_mut() {
+        overlay.insert("unsentSubmodules".to_owned(), serde_json::json!(paths));
+    }
+}
+
 struct Agent {
     id: AgentId,
     workspace_id: WorkspaceId,
@@ -1325,7 +1351,7 @@ impl Runner {
                 fresh,
             })) => {
                 *lock(&agent.worktree) = Some(cwd.clone());
-                let settled = match &output {
+                let mut settled = match &output {
                     Some(output) => {
                         self.settle_setup(
                             &agent,
@@ -1339,6 +1365,9 @@ impl Runner {
                     }
                     None => Settled::default(),
                 };
+                if output.is_some() && agent.checkout_of.is_none() && !settled.stopped {
+                    unsent_submodules(&mut settled, &cwd, &agent.submodules).await;
+                }
                 *lock(&agent.setup_output) = None;
                 if settled.stopped {
                     Err(None)

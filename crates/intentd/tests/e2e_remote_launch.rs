@@ -2464,6 +2464,7 @@ async fn a_remote_agents_setup_script_runs_on_the_machine_after_its_submodules()
     let reply = turn(&mut rpc_ws, &mut events, (&ws_id, &agent_id), "hello", 50).await;
     assert!(reply.contains("echo:"), "{reply}");
     assert!(!reply.contains("workspace setup failed"), "{reply}");
+    assert!(!reply.contains("set up on this machine"), "{reply}");
 
     let setup = setup_until(&mut rpc_ws, (&ws_id, &agent_id), 100, |setup| {
         setup["output"]
@@ -2509,6 +2510,7 @@ async fn a_remote_agents_setup_script_runs_on_the_machine_after_its_submodules()
     let value = wsapi_value(&details);
     assert_eq!(value["setup"]["state"], "completed", "{value}");
     assert_eq!(value["setup"]["exitCode"], 0, "{value}");
+    assert!(value["setup"].get("unsentSubmodules").is_none(), "{value}");
 
     let work = node_dir
         .join("executor")
@@ -2641,6 +2643,135 @@ async fn a_remote_agents_setup_script_runs_on_the_machine_after_its_submodules()
         !module_files.lines().any(|f| f == "built/out.txt"),
         "{module_files}"
     );
+}
+
+/// A submodule the setup script populates on the machine, not one of the
+/// agent's pins, is not carried: the agent's first turn names it and its
+/// `workspace.details().setupStatus` lists it (intent-hq/intent#8594).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remote_agent_is_told_about_a_submodule_its_setup_script_added() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping remote unsent-submodule e2e: node or git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-unsent-");
+    let upstream = |name: &str| {
+        let dir = scratch.path().join("upstream").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "--quiet"]);
+        std::fs::write(dir.join("README.md"), format!("{name}\n")).unwrap();
+        git(&dir, &["add", "README.md"]);
+        git(&dir, &["commit", "--quiet", "-m", name]);
+        dir
+    };
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet", "--initial-branch", "main"]);
+    for name in ["a", "x"] {
+        let url = upstream(name);
+        git(
+            &repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                url.to_str().unwrap(),
+                name,
+            ],
+        );
+    }
+    git(&repo, &["commit", "--quiet", "-m", "submodules"]);
+    // `x` is not populated on the backend, so it is not a pin.
+    git(&repo, &["submodule", "deinit", "--quiet", "-f", "x"]);
+    std::fs::create_dir_all(repo.join(".intent")).unwrap();
+    std::fs::write(
+        repo.join(".intent/config.json"),
+        json!({ "setupScript": "git -c protocol.file.allow=always submodule update --quiet --init --checkout x\n" })
+            .to_string(),
+    )
+    .unwrap();
+
+    let (_head, port, cfg, ws_id) =
+        start_backend_on(&scratch.path().join("head"), &repo, &[], true).await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let machine = start_machine(&node_dir, &backend_id).await;
+    ok(
+        &mut rpc_ws,
+        2,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let created = create_remote(&mut rpc_ws, &ws_id, "Remote", 10).await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    turn(&mut rpc_ws, &mut events, (&ws_id, &agent_id), "hello", 50).await;
+    // The fixture echoes the prompt; the notice rides the first one.
+    let reply = timeout(wait(), async {
+        let mut id = 60;
+        loop {
+            id += 1;
+            let session = ok(
+                &mut rpc_ws,
+                id,
+                "agent.getSession",
+                json!({ "workspaceId": ws_id, "agentId": agent_id }),
+            )
+            .await;
+            if let Some(first) = session["session"]["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|message| message["role"] == "assistant")
+            {
+                return first.to_string();
+            }
+            // timing-guard: poll interval for the reply to be recorded
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the first turn is recorded");
+    assert!(
+        reply.contains("x was set up on this machine by the setup script"),
+        "{reply}"
+    );
+    assert!(!reply.contains("a was set up"), "{reply}");
+    let work = node_dir
+        .join("executor")
+        .join(&machine.credential_id)
+        .join("agents")
+        .join(&agent_id)
+        .join("work");
+    assert!(work.join("x/README.md").exists(), "the script populated x");
+
+    let details = wsapi_turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        r#"wsapi const d = await ws.workspace.details(); return JSON.stringify({ marker: "turn-unsent", setup: d.setupStatus });"#,
+        "turn-unsent",
+        100,
+    )
+    .await;
+    let value = wsapi_value(&details);
+    assert_eq!(value["setup"]["state"], "completed", "{value}");
+    assert_eq!(value["setup"]["unsentSubmodules"], json!(["x"]), "{value}");
 }
 
 /// Whether `work` holds a setup script file (`setup-<uuid>.sh`).

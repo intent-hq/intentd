@@ -607,6 +607,25 @@ fn collect_pins(repo: &git2::Repository, prefix: &str, pins: &mut Vec<SubmoduleP
     Ok(())
 }
 
+/// Node side: the submodules populated in `checkout` that are not among
+/// `pins` (a setup script initialized them on the machine), top-most only,
+/// parents before children. Their work is not carried back to head.
+#[must_use]
+pub fn unpinned_submodules(checkout: &Path, pins: &[SubmodulePin]) -> Vec<String> {
+    let populated = submodule_pins(checkout).unwrap_or_default();
+    let mut unpinned: Vec<String> = Vec::new();
+    for found in populated {
+        let pinned = pins.iter().any(|pin| pin.path == found.path);
+        let under_unpinned = unpinned
+            .iter()
+            .any(|parent| found.path.starts_with(&format!("{parent}/")));
+        if !pinned && !under_unpinned {
+            unpinned.push(found.path);
+        }
+    }
+    unpinned
+}
+
 /// Why head will not serve a submodule repository for a module session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleRefusal {
