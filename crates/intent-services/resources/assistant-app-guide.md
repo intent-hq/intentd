@@ -567,6 +567,7 @@ The conversation header's **More** menu groups **Rename**, **Copy conversation**
 and per-agent **Notifications**; lifecycle actions appear under **Agent** when
 available. The footer shows specialist and harness metadata when present; select
 the harness version for details. **Move panel** opens the pane movement controls.
+Other panel menus place **Rename** under **Actions** when renaming is available.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/layout/tab-types/{AgentTabType,AgentViewSettingsDropdown}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte. -->
 
