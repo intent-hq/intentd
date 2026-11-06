@@ -196,6 +196,15 @@ pub enum Error {
         detail: String,
     },
 
+    /// A local-repo `workspace.create` could not refresh its base branch
+    /// (`git fetch <remote> <base>` before the worktree / `CoW` checkout; PROTOCOL
+    /// §9.2). Surfaces as `-32603` with a readable `message` and
+    /// `error.data = { code: "base-refresh-failed", category, detail, baseRef,
+    /// remote }`. `detail` is git's (bounded, credential-redacted) output.
+    /// Distinct from [`Error::CloneFailed`]: its classifier is fetch-specific.
+    #[error("{}", .0.message())]
+    BaseRefreshFailed(Box<BaseRefreshFailure>),
+
     /// The `voice.transcribe` provider API key is missing. Surfaces as
     /// `-32603` with the same "Internal error" message as the plain
     /// `Internal` shape plus machine-readable
@@ -633,6 +642,77 @@ impl CloneErrorCategory {
     }
 }
 
+/// Why a workspace base refresh (`git fetch`) failed (PROTOCOL §9.2
+/// `data.category`). Classified from the fetch's outcome and stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseRefreshErrorCategory {
+    /// The daemon killed the fetch at its wall-clock bound.
+    Timeout,
+    /// "Host key verification failed": the SSH host is not trusted yet.
+    SshHostKey,
+    /// No usable credential (SSH key / agent, HTTPS credential).
+    AuthRequired,
+    /// The remote host could not be reached (DNS, connect, route).
+    Network,
+    /// The remote repository or path does not exist.
+    RepoNotFound,
+    /// The remote refused access to an existing repository (HTTP 403).
+    AccessDenied,
+    /// Anything else; `detail` still carries git's message.
+    Other,
+}
+
+impl BaseRefreshErrorCategory {
+    /// Stable wire identifier (`error.data.category`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::SshHostKey => "ssh-host-key",
+            Self::AuthRequired => "auth-required",
+            Self::Network => "network",
+            Self::RepoNotFound => "repo-not-found",
+            Self::AccessDenied => "access-denied",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Payload of [`Error::BaseRefreshFailed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseRefreshFailure {
+    pub category: BaseRefreshErrorCategory,
+    /// Git's fetch output (bounded tail), credentials redacted.
+    pub detail: String,
+    /// Canonical base branch name (remote prefix stripped).
+    pub base_ref: String,
+    /// Remote name (e.g. `origin`).
+    pub remote: String,
+}
+
+impl BaseRefreshFailure {
+    /// One-line wire `message`: `Couldn't update <base> from <remote>:
+    /// <cause>`, where the cause is the first meaningful line of `detail`
+    /// (skipping blank, `hint:` and `warning:` lines). The full text stays in
+    /// `detail`.
+    #[must_use]
+    pub fn message(&self) -> String {
+        let cause = self
+            .detail
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                let lower = line.to_ascii_lowercase();
+                !line.is_empty() && !lower.starts_with("hint:") && !lower.starts_with("warning:")
+            })
+            .unwrap_or_else(|| self.detail.trim());
+        format!(
+            "Couldn't update {} from {}: {cause}",
+            self.base_ref, self.remote
+        )
+    }
+}
+
 /// Message for [`Error::RetireUnsupported`].
 fn retire_unsupported_message(workspace_id: &str, plain_folder: bool) -> String {
     if plain_folder {
@@ -701,6 +781,7 @@ impl Error {
                 | CloneErrorCategory::Other => -32603,
             },
             Error::Internal(_)
+            | Error::BaseRefreshFailed(_)
             | Error::GitAuthorization(_)
             | Error::VoiceNotConfigured { .. }
             | Error::ListenerDown

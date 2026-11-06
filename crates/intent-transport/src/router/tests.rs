@@ -2808,6 +2808,33 @@ fn model_unavailable_and_machine_update_required_map_to_their_error_data() {
 }
 
 #[tokio::test]
+async fn base_refresh_failed_maps_to_documented_envelope() {
+    let rpc = super::domain_to_rpc(intent_core::Error::BaseRefreshFailed(Box::new(
+        intent_core::BaseRefreshFailure {
+            category: intent_core::BaseRefreshErrorCategory::AuthRequired,
+            detail: "git@github.com: Permission denied (publickey).".to_string(),
+            base_ref: "main".to_string(),
+            remote: "origin".to_string(),
+        },
+    )));
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(
+        rpc.message,
+        "Couldn't update main from origin: git@github.com: Permission denied (publickey)."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "base-refresh-failed",
+            "category": "auth-required",
+            "detail": "git@github.com: Permission denied (publickey).",
+            "baseRef": "main",
+            "remote": "origin",
+        })
+    );
+}
+
+#[tokio::test]
 async fn clone_failed_maps_to_structured_error_data() {
     // A classified clone failure (clone failure taxonomy, PROTOCOL §9.1;
     // monorepo#825/#826) carries the documented human message plus

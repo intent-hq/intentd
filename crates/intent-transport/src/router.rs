@@ -360,6 +360,20 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": category.as_str(), "detail": detail })),
         },
+        // Failed workspace base refresh (§9.2): readable message (the
+        // variant's Display, already redacted by the producer) plus the
+        // machine-readable `base-refresh-failed` envelope.
+        ref e @ Error::BaseRefreshFailed(ref failure) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "base-refresh-failed",
+                "category": failure.category.as_str(),
+                "detail": failure.detail,
+                "baseRef": failure.base_ref,
+                "remote": failure.remote,
+            })),
+        },
         // Missing voice provider API key: same -32603 code and "Internal
         // error" message as before (deliberately not the variant's Display,
         // which carries the detail), plus machine-readable `data.code` with

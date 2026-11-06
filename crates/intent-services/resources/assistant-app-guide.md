@@ -562,9 +562,15 @@ It ships with Intent releases on npm. It is unrelated to the experimental deskto
 ## Start or continue work
 
 When a new workspace uses a remote-tracking base branch from a local repository,
-Intent fetches that branch before creating the checkout. If the fetch fails,
-creation stops; restore access to the remote and retry. Explicit commits, tags,
-and local-only branches still use their local state.
+Intent fetches that branch before creating the checkout; progress shows
+"Updating <base> from <remote>…". If the fetch fails, creation stops and the
+error names the cause (sign-in, untrusted SSH host, network, timeout, missing
+repository, or access denied). The fetch runs on the machine Intent runs on,
+so for a remote daemon fix SSH keys, credentials or network there, not on
+your Mac, then try again. When the error offers **Continue from last-fetched
+<base>**, the workspace starts from the remote branch as last fetched (it may
+be out of date; unpushed local commits are not included). Explicit commits,
+tags, and local-only branches still use their local state.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/lib.rs; packages/intentd/crates/intent-git/src/fetch.rs. -->
 

@@ -38195,6 +38195,90 @@ mod clone_orchestration {
         assert!(frames.iter().all(|f| f.workspace_id == ws.id));
     }
 
+    /// Clone a seeded upstream so the source carries
+    /// `refs/remotes/origin/<branch>`; returns (upstream, source, branch).
+    fn seed_tracking_clone(prefix: &str) -> (TempDir, TempDir, String) {
+        let upstream = seed_repo(&format!("{prefix}-up"));
+        let source = unique_dir(&format!("{prefix}-src"));
+        let repo = git2::Repository::clone(upstream.0.to_str().unwrap(), &source.0).unwrap();
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+        (upstream, source, branch)
+    }
+
+    async fn worktree_create_phases(skip_base_refresh: Option<bool>) -> Vec<(String, String, i64)> {
+        let (_upstream, source, branch) = seed_tracking_clone("intentd-prog-base");
+        let root = unique_dir("intentd-prog-base-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new_isolated(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus.clone());
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        svc.create_workspace(
+            WorkspaceCreate {
+                repository_path: Some(source.0.to_string_lossy().to_string()),
+                branch: Some("prog-base".to_string()),
+                base_ref: Some(branch.clone()),
+                skip_base_refresh,
+                progress_id: Some("prog-base-1".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create");
+        let frames = drain_clone_frames(&mut sub).await;
+        assert_progress_stream(&frames, "prog-base-1");
+        frames
+            .iter()
+            .filter(|f| f.event_type == "git:clone:progress")
+            .map(|f| {
+                (
+                    f.data["phase"].as_str().unwrap_or_default().to_string(),
+                    f.data["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .replace(&branch, "<base>"),
+                    f.data["percent"].as_i64().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// A worktree create whose base refresh runs reports "Updating <base>
+    /// from <remote>..." before the fetch, then the worktree step, so a slow
+    /// fetch is not shown as "Creating linked worktree..." (M5).
+    #[intent_test_macros::daemon_test]
+    async fn progress_id_worktree_create_reports_base_refresh_before_worktree() {
+        let phases = worktree_create_phases(None).await;
+        let refresh = phases
+            .iter()
+            .position(|(p, _, _)| p == "base-refresh")
+            .unwrap_or_else(|| panic!("base-refresh milestone emitted: {phases:?}"));
+        assert_eq!(phases[refresh].1, "Updating <base> from origin...");
+        assert_eq!(phases[refresh].2, 20, "nominal base-refresh percent");
+        let worktree = phases
+            .iter()
+            .position(|(p, _, _)| p == "worktree")
+            .unwrap_or_else(|| panic!("worktree milestone emitted: {phases:?}"));
+        assert!(
+            refresh < worktree,
+            "base-refresh precedes worktree: {phases:?}"
+        );
+    }
+
+    /// `skipBaseRefresh: true` fetches nothing, so no base-refresh milestone.
+    #[intent_test_macros::daemon_test]
+    async fn progress_id_skip_base_refresh_emits_no_base_refresh_milestone() {
+        let phases = worktree_create_phases(Some(true)).await;
+        assert!(
+            !phases.iter().any(|(p, _, _)| p == "base-refresh"),
+            "no base-refresh milestone when skipped: {phases:?}"
+        );
+        assert!(phases.iter().any(|(p, _, _)| p == "worktree"), "{phases:?}");
+    }
+
     /// Direct mode (`isNewRepo`): the daemon-initialized repo path streams
     /// checkout + finalizing milestones and one terminal done.
     #[intent_test_macros::daemon_test]

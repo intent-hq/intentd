@@ -1514,6 +1514,13 @@ pub struct WorkspaceCreate {
     /// Git remote used to resolve `baseRef` when provisioning the worktree
     /// (default `origin`; e.g. `upstream` for forks). Not persisted.
     pub remote: Option<String>,
+    /// Skip the base-branch fetch a local-repo worktree / `CoW` create runs
+    /// before checkout (PROTOCOL §5.1 worktree provisioning; §9.2): the base
+    /// resolves from local state, so a branch base starts at the existing
+    /// `refs/remotes/<remote>/<baseRef>` as last fetched. Used by "Continue
+    /// from last-fetched" after `base-refresh-failed`. Default `false`; not
+    /// persisted.
+    pub skip_base_refresh: Option<bool>,
     /// GitHub-style clone URL (https or ssh). When set and `repositoryPath` is
     /// not already an existing local git repo, the daemon clones the URL into
     /// `clonePath` (or a default derived from the workspaces root) *before*
