@@ -1476,7 +1476,10 @@ async fn head_serves_attachment_bytes_to_lease_agents_of_the_workspace() {
     assert_eq!(first["fileName"], "big.bin");
     assert_eq!(
         first["sha256"],
-        format!("{:x}", sha2::Sha256::digest(vec![b'x'; big])),
+        sha2::Sha256::digest(vec![b'x'; big])
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
     );
     let rest = answered(
         forward(

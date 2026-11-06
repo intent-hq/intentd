@@ -2399,7 +2399,8 @@ impl Services {
     /// The bytes of attachment `attachment_id` for a remote agent of
     /// `workspace_id` whose `ws.file.getAttachment` runs on its machine (the
     /// node link's `file.attachmentData`): the same lookup and store read as
-    /// a local copy, at most `max_bytes`. An attachment of another workspace
+    /// a local copy, at most `max_bytes` (whole, or per piece with `range`,
+    /// see `file_ops::attachment_data`). An attachment of another workspace
     /// reads as an unknown id.
     ///
     /// # Errors
@@ -2411,6 +2412,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         attachment_id: &str,
         max_bytes: u64,
+        range: Option<(u64, u64)>,
     ) -> Result<serde_json::Value> {
         // The same membership gate as a local copy, as the bound agent.
         self.require_member(workspace_id).await?;
@@ -2427,9 +2429,11 @@ impl Services {
             self.chief_cwd_root.as_deref(),
         )
         .await;
-        tokio::task::spawn_blocking(move || file_ops::attachment_data(&root, &record, max_bytes))
-            .await
-            .map_err(|e| Error::Internal(format!("attachment read failed: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            file_ops::attachment_data(&root, &record, max_bytes, range)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("attachment read failed: {e}")))?
     }
 
     /// Resolve the effective auto-commit state for a workspace (spec Diagnosis

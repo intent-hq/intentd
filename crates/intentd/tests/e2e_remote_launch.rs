@@ -1156,6 +1156,11 @@ fn oversized_prompt_images() -> (String, Value) {
     ("x".repeat(60 * 1024), json!([block.clone(), block]))
 }
 
+/// `bytes` as lowercase hex.
+fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// A `wsapi:` reply's returned value: the agent returns `JSON.stringify(…)`,
 /// which the reply carries as a JSON string.
 fn wsapi_value(reply: &str) -> Value {
@@ -1394,7 +1399,7 @@ async fn machine_runs(
     assert_eq!(copied["a"]["size"], large.len(), "{copied}");
     assert_eq!(
         copied["hash"],
-        format!("{:x}", Sha256::digest(&large)),
+        lower_hex(&Sha256::digest(&large)),
         "{copied}"
     );
 

@@ -24,8 +24,8 @@ use intent_core::node_link::{
 use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
     GIT_ROOTS_METHOD, INTERNAL_METHODS, MAX_FORWARDED_ATTACHMENTS, MAX_LINK_ATTACHMENT_BYTES,
-    MCP_PROXY_CALL_TOOL_METHOD, MCP_PROXY_LINK_TIMEOUT, MCP_PROXY_LIST_TOOLS_METHOD,
-    PLACEMENT_HELP_METHOD,
+    MAX_LINK_ATTACHMENT_CHUNK_BYTES, MCP_PROXY_CALL_TOOL_METHOD, MCP_PROXY_LINK_TIMEOUT,
+    MCP_PROXY_LIST_TOOLS_METHOD, PLACEMENT_HELP_METHOD,
 };
 use intent_core::remote_launch::{RemoteAgentRecord, RemotePlacementView};
 use intent_core::{with_caller, AgentSession, Caller, Error, WorkspaceApi};
@@ -192,9 +192,15 @@ impl HeadCalls {
                     format!("{ATTACHMENT_DATA_METHOD} needs a string `attachmentId`"),
                 );
             };
+            let args = request.params.get("args");
+            let (range, max_bytes) = match attachment_range(args) {
+                Ok(Some(range)) => (Some(range), MAX_LINK_ATTACHMENT_CHUNK_BYTES),
+                Ok(None) => (None, MAX_LINK_ATTACHMENT_BYTES),
+                Err(message) => return refusal(INVALID_PARAMS, message),
+            };
             return match self
                 .services
-                .remote_attachment_data(&record.workspace_id, id, MAX_LINK_ATTACHMENT_BYTES)
+                .remote_attachment_data(&record.workspace_id, id, max_bytes, range)
                 .await
             {
                 Ok(value) => LinkOutcome::Ok(value),
@@ -363,6 +369,25 @@ impl HeadCalls {
                 ),
             ),
         }
+    }
+}
+
+/// The piece of an [`ATTACHMENT_DATA_METHOD`] frame: `None` without
+/// `offset` and `length` (the whole file), else both as integers with a
+/// `length` of at least 1.
+fn attachment_range(args: Option<&Value>) -> std::result::Result<Option<(u64, u64)>, String> {
+    let field = |key: &str| args.and_then(|args| args.get(key));
+    if field("offset").is_none() && field("length").is_none() {
+        return Ok(None);
+    }
+    match (
+        field("offset").and_then(Value::as_u64),
+        field("length").and_then(Value::as_u64),
+    ) {
+        (Some(offset), Some(length)) if length > 0 => Ok(Some((offset, length))),
+        _ => Err(format!(
+            "{ATTACHMENT_DATA_METHOD} needs `offset` and `length` together, as integers with `length` at least 1"
+        )),
     }
 }
 
