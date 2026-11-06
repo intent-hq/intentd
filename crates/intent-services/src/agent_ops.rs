@@ -12915,35 +12915,41 @@ impl Services {
                 "agent.delegate: greedy was removed; delegate a held task individually to force it past the conflict hold".to_string(),
             ));
         }
-        // Every task's placement is checked before anything starts: a batch
-        // entry's own placement replaces the call's, and a task with neither
-        // follows the single-delegation rule.
-        let placements: Vec<Option<&intent_core::placement::AgentPlacement>> = match &input.tasks {
-            Some(entries) => entries
-                .iter()
-                .map(|entry| match entry {
-                    intent_core::BatchTaskEntry::Options(opts) if opts.placement.is_some() => {
-                        opts.placement.as_ref()
-                    }
-                    _ => input.placement.as_ref(),
-                })
-                .collect(),
-            None => vec![input.placement.as_ref()],
-        };
-        let mut explicit_remote = false;
-        let mut any_unplaced = false;
-        for placement in &placements {
-            match placement {
-                Some(placement) if placement.runs_on_backend()? => {}
-                Some(placement) => {
-                    if input.tasks.is_some() {
-                        placement.check_remote_supported()?;
-                    }
-                    explicit_remote = true;
-                }
-                None => any_unplaced = true,
+        // Every placement in the call is checked before anything starts.
+        // Each task then resolves like the batch start loop: the last object
+        // entry for an id wins (a bare duplicate does not reset it), its
+        // placement replaces the call's, and a task with neither follows
+        // the single-delegation rule.
+        let check = |placement: &intent_core::placement::AgentPlacement| -> Result<bool> {
+            let on_backend = placement.runs_on_backend()?;
+            if !on_backend && input.tasks.is_some() {
+                placement.check_remote_supported()?;
             }
+            Ok(on_backend)
+        };
+        let mut resolved: Vec<Option<bool>> = Vec::new();
+        match &input.tasks {
+            Some(entries) => {
+                let top = input.placement.as_ref().map(&check).transpose()?;
+                let mut by_id: HashMap<&str, Option<bool>> = HashMap::new();
+                for entry in entries {
+                    match entry {
+                        intent_core::BatchTaskEntry::Options(opts) => {
+                            let own = opts.placement.as_ref().map(&check).transpose()?;
+                            by_id.insert(opts.task_note_id.0.as_str(), own);
+                        }
+                        intent_core::BatchTaskEntry::Id(id) => {
+                            by_id.entry(id.0.as_str()).or_insert(None);
+                        }
+                    }
+                }
+                resolved.extend(by_id.into_values().map(|own| own.or(top)));
+            }
+            None => resolved.push(input.placement.as_ref().map(&check).transpose()?),
         }
+        let explicit_remote = resolved.contains(&Some(false));
+        let explicit_backend = resolved.contains(&Some(true));
+        let any_unplaced = resolved.contains(&None);
         if explicit_remote && input.isolation.is_some() {
             return Err(Error::InvalidParams(
                 "agent.delegate: placement and isolation cannot be combined; a remote agent always works in its own checkout".to_string(),
@@ -12963,8 +12969,11 @@ impl Services {
         }
         let placed = inherits || explicit_remote;
         if input.tasks.is_some() {
+            // Some task runs on the backend: an explicit local placement, or
+            // none from a parent that is not remote.
+            let any_on_backend = explicit_backend || (any_unplaced && !inherits);
             return self
-                .agent_delegate_batch_op(workspace_id, input, parent_agent_id, placed)
+                .agent_delegate_batch_op(workspace_id, input, parent_agent_id, any_on_backend)
                 .await;
         }
         // Keep the child's creation, group enrollment and initial send on
@@ -13666,7 +13675,7 @@ impl Services {
         workspace_id: WorkspaceId,
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
-        placed: bool,
+        any_on_backend: bool,
     ) -> Result<Value> {
         use batch::{
             classify_batch_tasks, project_unlock_plan, relations_unknown_ids, BatchDisposition,
@@ -13729,12 +13738,13 @@ impl Services {
         // per-row (`error` disposition via the single-task path), consistent
         // with the other per-entry options.
         // Children placed on a remote machine (by a placement, or inherited
-        // from a remote parent) run the provider there, so this backend's installation
-        // says nothing about it: each child's machine admission checks it
-        // and fails only that child's row.
+        // from a remote parent) run the provider there, so this backend's
+        // installation says nothing about them: each child's machine
+        // admission checks it and fails only that child's row. The check
+        // still runs when any task runs on the backend.
         if let Some(provider_param) = input.provider.as_deref() {
             self.ensure_selectable_provider("agent.delegate", provider_param)?;
-            if !placed {
+            if any_on_backend {
                 self.ensure_provider_available_for(
                     "agent.delegate",
                     provider_param,

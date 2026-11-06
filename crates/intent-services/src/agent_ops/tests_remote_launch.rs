@@ -1259,6 +1259,18 @@ async fn a_batch_refuses_bad_placements_before_any_task_starts() {
             "omit os, arch",
         ),
         (
+            "malformed batch placement every entry replaces",
+            AgentDelegateInput {
+                placement: Some(placement(json!({"target": "local", "os": "macos"}))),
+                tasks: Some(vec![
+                    entry(json!({"taskNoteId": first.0, "placement": {"target": "local"}})),
+                    entry(json!({"taskNoteId": second.0, "placement": {"target": "local"}})),
+                ]),
+                ..Default::default()
+            },
+            "omit os, arch",
+        ),
+        (
             "exclusive entry",
             AgentDelegateInput {
                 tasks: Some(vec![
@@ -1294,4 +1306,70 @@ fn a_batch_entry_placement_is_never_null() {
         serde_json::from_value::<intent_core::BatchTaskOptions>(json!({"taskNoteId": "n1"}))
             .expect("omitted placement");
     assert!(omitted.placement.is_none());
+}
+
+/// A duplicated task id resolves its placement as the batch starts it: the
+/// last object entry wins and a bare duplicate does not reset it, so the
+/// `isolation` check never refuses a task for a placement it does not get.
+#[tokio::test]
+async fn a_duplicated_batch_task_is_checked_with_the_placement_it_starts_with() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let parent = remote_agent(&svc, &ws).await;
+    let first = seed_task(&svc, &ws, "First").await;
+    let second = seed_task(&svc, &ws, "Second").await;
+    let before = remote.needs.lock().unwrap().len();
+    let shared = || Some("shared".to_string());
+
+    let local_then_bare = batch_from(
+        &svc,
+        &ws,
+        &parent,
+        AgentDelegateInput {
+            isolation: shared(),
+            tasks: Some(vec![
+                entry(json!({"taskNoteId": first.0, "placement": {"target": "local"}})),
+                bare(&first),
+            ]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a bare duplicate keeps the local placement");
+    assert_eq!(
+        local_then_bare["summary"]["started"], 1,
+        "{local_then_bare}"
+    );
+
+    let remote_then_plain = batch_from(
+        &svc,
+        &ws,
+        &parent,
+        AgentDelegateInput {
+            placement: Some(placement(json!({"target": "local"}))),
+            isolation: shared(),
+            tasks: Some(vec![
+                entry(json!({"taskNoteId": second.0, "placement": {"target": "remote"}})),
+                entry(json!({"taskNoteId": second.0})),
+            ]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the last object entry drops the remote placement");
+    assert_eq!(
+        remote_then_plain["summary"]["started"], 1,
+        "{remote_then_plain}"
+    );
+
+    assert_eq!(
+        remote.needs.lock().unwrap().len(),
+        before,
+        "no machine asked"
+    );
+    for (result, task) in [(&local_then_bare, &first), (&remote_then_plain, &second)] {
+        let agent = child(&svc, &ws, row(result, task)).await;
+        assert!(agent.node_id.is_none(), "{agent:?}");
+    }
 }
