@@ -32685,6 +32685,21 @@ impl WorkspaceApi for Services {
             )?;
             self.validate_image_block_refs("agent.editAndRegenerate", image_blocks.as_ref())
                 .await?;
+            // Refused before the agent is stopped or its transcript cut.
+            if image_blocks
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|images| !images.is_empty())
+            {
+                let session = self.require_agent_session(&agent_id).await?;
+                self.ensure_fits_session_prompt(
+                    "agent.editAndRegenerate",
+                    &session,
+                    &content,
+                    image_blocks.as_ref(),
+                )
+                .await?;
+            }
             // Principal stamp (multiplayer w2): the edited message is a
             // fresh human-authored user row.
             let options = crate::agent_manager::TurnOptions {
