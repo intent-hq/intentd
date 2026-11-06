@@ -2600,6 +2600,114 @@ mod final_stops {
         node.shutdown();
     }
 
+    /// Below nodeProtocol 9 the record (and placement) outlive the ack by
+    /// the grace, so a second final stop of the agent then (deleted, then
+    /// its workspace retired) gets the settled stop's id back. It must not
+    /// begin the stop again: its ack settles nothing, so that begin would
+    /// leave the agent's machine runs ending for good (review of
+    /// intentd#3102).
+    #[tokio::test]
+    async fn a_second_final_stop_during_the_grace_begins_nothing() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        backend.expose(&mut machine).await.shutdown();
+        let mut quick = tuning();
+        quick.final_stop_check = Duration::from_secs(3600);
+        // The grace never ends during the test: the record stays.
+        quick.legacy_push_grace = Duration::from_secs(3600);
+        let node = backend.bare_with(&machine, quick).await;
+        let agent = placed(&backend, &node, &machine).await;
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        bound(&node).await;
+        let shared = node.shared_ref();
+        shared.set_protocol_for_test(intent_core::node_link::FINAL_STOP_PROTOCOL - 1);
+        let stop_id = node.final_stop(&agent, FinalStopReason::AgentDeleted).await;
+        let sent = link
+            .expect(|frame| match frame {
+                LinkFrame::Stop {
+                    agent_id, stop_id, ..
+                } if agent_id == agent => Some(stop_id),
+                _ => None,
+            })
+            .await;
+        assert_eq!(sent, stop_id);
+        link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        tokio::time::timeout(wait(), async {
+            while shared.resending_for_test(stop_id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the resender handles the ack");
+        assert!(shared.in_grace_for_test(stop_id));
+        assert_eq!(shared.final_settles_for_test(), vec![agent.clone()]);
+        assert_eq!(shared.final_begin_count_for_test(), 1);
+
+        // The second final stop, within the grace: same record, same id.
+        assert_eq!(
+            node.final_stop(&agent, FinalStopReason::WorkspaceRetired)
+                .await,
+            stop_id
+        );
+        assert_eq!(
+            shared.final_begin_count_for_test(),
+            shared.final_settles_for_test().len(),
+            "every begin of the agent's final stop is matched by a settle"
+        );
+        assert!(!shared.has_pending_stops(), "nothing left to acknowledge");
+        node.shutdown();
+    }
+
+    /// A bind can queue a settled final stop again (the machine reports
+    /// its agent running while the record lingers): it is sent, so the
+    /// agent stops, but it begins nothing, since its ack settles nothing.
+    #[tokio::test]
+    async fn a_settled_final_stop_queued_again_at_bind_begins_nothing() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        backend.expose(&mut machine).await.shutdown();
+        let mut quick = tuning();
+        quick.final_stop_check = Duration::from_secs(3600);
+        quick.legacy_push_grace = Duration::from_secs(3600);
+        let node = backend.bare_with(&machine, quick).await;
+        let agent = placed(&backend, &node, &machine).await;
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        bound(&node).await;
+        let shared = node.shared_ref();
+        shared.set_protocol_for_test(intent_core::node_link::FINAL_STOP_PROTOCOL - 1);
+        let stop_id = node.final_stop(&agent, FinalStopReason::AgentDeleted).await;
+        let sent = link
+            .expect(|frame| match frame {
+                LinkFrame::Stop {
+                    agent_id, stop_id, ..
+                } if agent_id == agent => Some(stop_id),
+                _ => None,
+            })
+            .await;
+        assert_eq!(sent, stop_id);
+        link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        tokio::time::timeout(wait(), async {
+            while shared.resending_for_test(stop_id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the resender handles the ack");
+        assert_eq!(shared.final_begin_count_for_test(), 1);
+
+        // As the bind's claim does for a recorded stop of a running agent.
+        shared.queue_final_stop_for_test(&agent, stop_id);
+        assert!(shared.has_pending_stops(), "sent again, so the agent stops");
+        assert_eq!(
+            shared.final_begin_count_for_test(),
+            shared.final_settles_for_test().len(),
+            "every begin of the agent's final stop is matched by a settle"
+        );
+        node.shutdown();
+    }
+
     /// `remoteMachines.remove` waits the longer budget only on a link that
     /// speaks final stops.
     #[tokio::test]

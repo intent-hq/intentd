@@ -510,29 +510,35 @@ impl Shared {
         durable: bool,
         unless_settled: bool,
     ) -> bool {
-        let replaced = {
+        let (replaced, settled) = {
             let mut stops = lock(&self.stops);
-            if unless_settled && lock(&self.settled_finals).contains(&stop_id) {
+            let settled = lock(&self.settled_finals).contains(&stop_id);
+            if unless_settled && settled {
                 return false;
             }
-            stops.insert(
+            let replaced = stops.insert(
                 agent_id.clone(),
                 QueuedStop {
                     stop_id,
                     final_stop: true,
                     durable,
                 },
-            )
+            );
+            (replaced, settled)
         };
         // Every queued final stop (requested, loaded at startup or on a
         // dial, or claimed at bind) begins for the agent's machine runs: the
         // machine stops its scripts itself, and none may start until the
-        // stop is over.
-        #[cfg(test)]
-        lock(&self.final_begins).push(agent_id.clone());
-        if let Some(svc) = &self.services {
-            svc.feature_runtime()
-                .machine_runs_final_stop_begun(svc, agent_id);
+        // stop is over. Except one this process already settled (a bind
+        // sends it again to an agent the machine still runs): its runs are
+        // settled, and its ack settles nothing, so nothing begins.
+        if !settled {
+            #[cfg(test)]
+            lock(&self.final_begins).push(agent_id.clone());
+            if let Some(svc) = &self.services {
+                svc.feature_runtime()
+                    .machine_runs_final_stop_begun(svc, agent_id);
+            }
         }
         self.watch_stop_exit(agent_id);
         if replaced.is_some_and(|old| old.stop_id != stop_id) {
@@ -584,7 +590,12 @@ impl Shared {
         stop_id: StopId,
         durable: bool,
     ) {
-        self.queue_final_stop(agent_id, stop_id, durable);
+        // A request for a stop this process already settled (its record,
+        // and so its id, outlives the ack below nodeProtocol 9 by the
+        // grace) is moot: the machine acknowledged it.
+        if !self.queue_final_stop_unless(agent_id, stop_id, durable, true) {
+            return;
+        }
         let Some(link) = self.current_link() else {
             self.wake();
             return;
@@ -1206,6 +1217,19 @@ impl Shared {
     #[cfg(test)]
     pub(crate) fn final_settles_for_test(&self) -> Vec<AgentId> {
         lock(&self.final_settles).clone()
+    }
+
+    /// How many times a final stop began (queued) for any agent.
+    #[cfg(test)]
+    pub(crate) fn final_begin_count_for_test(&self) -> usize {
+        lock(&self.final_begins).len()
+    }
+
+    /// Queue final stop `stop_id` of `agent_id` as recorded, as a bind's
+    /// claim does.
+    #[cfg(test)]
+    pub(crate) fn queue_final_stop_for_test(&self, agent_id: &AgentId, stop_id: StopId) {
+        self.queue_final_stop(agent_id, stop_id, true);
     }
 
     /// Whether final stop `stop_id` waits out its grace.
