@@ -116,7 +116,19 @@ pub(crate) struct Tuning {
     /// welcome's agents are claimed.
     #[cfg(test)]
     pub before_claim: BeforePublish,
+    /// Test seam: holds a below-nodeProtocol-9 grace task between dropping
+    /// its record and leaving `Shared::in_grace`.
+    #[cfg(test)]
+    pub grace_gate: GraceGate,
 }
+
+/// A test gate in a grace task: it notifies the first [`Notify`] on
+/// reaching the gate, then waits for the second.
+///
+/// [`Notify`]: tokio::sync::Notify
+#[cfg(test)]
+#[derive(Clone, Default, Debug)]
+pub(crate) struct GraceGate(pub Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>);
 
 /// A test hook run with the connector's state just before a bound link is
 /// published.
@@ -168,6 +180,8 @@ impl Default for Tuning {
             before_publish: BeforePublish::default(),
             #[cfg(test)]
             before_claim: BeforePublish::default(),
+            #[cfg(test)]
+            grace_gate: GraceGate::default(),
         }
     }
 }
@@ -248,6 +262,11 @@ pub(crate) struct Shared {
     /// Final stops acknowledged below nodeProtocol 9 whose records wait out
     /// [`Tuning::legacy_push_grace`]: never queued again.
     in_grace: Mutex<std::collections::HashSet<StopId>>,
+    /// Final stops this process settled (acknowledged, or dropped past
+    /// their bound), so each settles once: a later ack of the same stop, or
+    /// a load that listed its record before it was dropped, settles nothing
+    /// and queues nothing. Never pruned: one id per agent ended for good.
+    settled_finals: Mutex<std::collections::HashSet<StopId>>,
     /// This connector's own handle, for tasks that must not keep it alive.
     self_ref: Mutex<std::sync::Weak<Shared>>,
     /// The protocol the current (or last) link negotiated.
@@ -477,28 +496,55 @@ impl Shared {
     /// stop (or an older final stop). `durable` when its record is in the
     /// store, so the acknowledgement finishes that record.
     fn queue_final_stop(&self, agent_id: &AgentId, stop_id: StopId, durable: bool) {
+        self.queue_final_stop_unless(agent_id, stop_id, durable, false);
+    }
+
+    /// [`Self::queue_final_stop`], except that with `unless_settled` a stop
+    /// this process already settled is not queued again (decided under the
+    /// queue's lock, like [`Self::claim_final_settle`]). Returns whether it
+    /// was queued.
+    fn queue_final_stop_unless(
+        &self,
+        agent_id: &AgentId,
+        stop_id: StopId,
+        durable: bool,
+        unless_settled: bool,
+    ) -> bool {
+        let (replaced, settled) = {
+            let mut stops = lock(&self.stops);
+            let settled = lock(&self.settled_finals).contains(&stop_id);
+            if unless_settled && settled {
+                return false;
+            }
+            let replaced = stops.insert(
+                agent_id.clone(),
+                QueuedStop {
+                    stop_id,
+                    final_stop: true,
+                    durable,
+                },
+            );
+            (replaced, settled)
+        };
         // Every queued final stop (requested, loaded at startup or on a
         // dial, or claimed at bind) begins for the agent's machine runs: the
         // machine stops its scripts itself, and none may start until the
-        // stop is over.
-        #[cfg(test)]
-        lock(&self.final_begins).push(agent_id.clone());
-        if let Some(svc) = &self.services {
-            svc.feature_runtime()
-                .machine_runs_final_stop_begun(svc, agent_id);
+        // stop is over. Except one this process already settled (a bind
+        // sends it again to an agent the machine still runs): its runs are
+        // settled, and its ack settles nothing, so nothing begins.
+        if !settled {
+            #[cfg(test)]
+            lock(&self.final_begins).push(agent_id.clone());
+            if let Some(svc) = &self.services {
+                svc.feature_runtime()
+                    .machine_runs_final_stop_begun(svc, agent_id);
+            }
         }
         self.watch_stop_exit(agent_id);
-        let replaced = lock(&self.stops).insert(
-            agent_id.clone(),
-            QueuedStop {
-                stop_id,
-                final_stop: true,
-                durable,
-            },
-        );
         if replaced.is_some_and(|old| old.stop_id != stop_id) {
             self.stops_changed.send_modify(|n| *n += 1);
         }
+        true
     }
 
     /// End `agent_id` for good with `reason`: record its final stop when
@@ -544,7 +590,12 @@ impl Shared {
         stop_id: StopId,
         durable: bool,
     ) {
-        self.queue_final_stop(agent_id, stop_id, durable);
+        // A request for a stop this process already settled (its record,
+        // and so its id, outlives the ack below nodeProtocol 9 by the
+        // grace) is moot: the machine acknowledged it.
+        if !self.queue_final_stop_unless(agent_id, stop_id, durable, true) {
+            return;
+        }
         let Some(link) = self.current_link() else {
             self.wake();
             return;
@@ -613,7 +664,25 @@ impl Shared {
                     .await;
                 continue;
             };
-            if lock(&self.in_grace).contains(&stop_id) {
+            // Both read in one step under the queue's lock, which a legacy
+            // ack's claim holds while it enters the grace: a stop is never
+            // seen settled but not yet in its grace.
+            let (in_grace, settled) = {
+                let _stops = lock(&self.stops);
+                let in_grace = lock(&self.in_grace).contains(&stop_id);
+                (in_grace, lock(&self.settled_finals).contains(&stop_id))
+            };
+            if in_grace {
+                continue;
+            }
+            if settled {
+                // Settled already, by an ack whose drop of the record failed
+                // or that this load listed before the drop: drop it now
+                // (again), settling nothing.
+                let _ = self
+                    .store
+                    .finish_final_stop(&record.agent_id, &record.stop_id)
+                    .await;
                 continue;
             }
             if crate::final_stop::expired(
@@ -635,13 +704,17 @@ impl Shared {
                         continue;
                     }
                 }
-                self.confirm_stop(&record.agent_id, stop_id);
+                if !self.claim_final_settle(&record.agent_id, stop_id, true) {
+                    // Its ack settled it while this load dropped the record.
+                    continue;
+                }
                 // No ack settles this stop, so nothing tracks its exit.
                 lock(&self.stop_exits).remove(&record.agent_id);
                 self.final_stop_over(&record.agent_id).await;
                 continue;
             }
-            self.queue_final_stop(&record.agent_id, stop_id, true);
+            // Not if an ack settled it after this load listed its record.
+            self.queue_final_stop_unless(&record.agent_id, stop_id, true, true);
         }
     }
 
@@ -688,6 +761,51 @@ impl Shared {
             drop(stops);
             self.stops_changed.send_modify(|n| *n += 1);
         }
+    }
+
+    /// Claim the settling of final stop `stop_id` of `agent_id`: true for
+    /// the first caller only (an ack, or an expiry that dropped its record),
+    /// so the stop settles once however its acks, expiries and loads
+    /// interleave. With `dequeue` (an expiry) the stop also leaves the
+    /// queue in the same step, so an ack still in flight settles nothing;
+    /// an ack leaves the queue itself once it is handled. Decided under the
+    /// queue's lock, taken before [`Shared::settled_finals`] and
+    /// [`Shared::in_grace`] (each taken alone under it).
+    fn claim_final_settle(&self, agent_id: &AgentId, stop_id: StopId, dequeue: bool) -> bool {
+        self.claim_final_settle_with(agent_id, stop_id, dequeue, false)
+    }
+
+    /// [`Self::claim_final_settle`]; with `grace` (an ack below
+    /// nodeProtocol 9) the stop enters [`Shared::in_grace`] in the same
+    /// step, so no load drops its record during the grace.
+    fn claim_final_settle_with(
+        &self,
+        agent_id: &AgentId,
+        stop_id: StopId,
+        dequeue: bool,
+        grace: bool,
+    ) -> bool {
+        let removed = {
+            let mut stops = lock(&self.stops);
+            if !lock(&self.settled_finals).insert(stop_id) {
+                return false;
+            }
+            if grace {
+                lock(&self.in_grace).insert(stop_id);
+            }
+            let queued = dequeue
+                && stops
+                    .get(agent_id)
+                    .is_some_and(|queued| queued.stop_id == stop_id);
+            if queued {
+                stops.remove(agent_id);
+            }
+            queued
+        };
+        if removed {
+            self.stops_changed.send_modify(|n| *n += 1);
+        }
+        true
     }
 
     /// The machine revoked this binding's credential, which stops its agents
@@ -844,10 +962,15 @@ impl Shared {
             {
                 Ok(acked) => {
                     tracing::debug!(agent = %agent_id, outcome = ?acked.outcome, final_push = ?acked.final_push, "remote machine: stop acknowledged");
-                    if queued.durable {
-                        self.finish_final_stop(&agent_id, stop_id, final_stop).await;
-                    }
-                    if queued.final_stop {
+                    // A recorded stop settles only when this ack owns its
+                    // record: an expiry may have dropped and settled it
+                    // while the ack was in flight.
+                    let settles = if queued.durable {
+                        self.finish_final_stop(&agent_id, stop_id, final_stop).await
+                    } else {
+                        queued.final_stop && self.claim_final_settle(&agent_id, stop_id, false)
+                    };
+                    if settles {
                         // The agent is ended for good, even when a link below
                         // nodeProtocol 9 got the stop as a plain one.
                         self.final_stop_over(&agent_id).await;
@@ -873,37 +996,61 @@ impl Shared {
     /// (and, unless the session can come back, the agent's placement). On a
     /// link below nodeProtocol 9 the acknowledgement does not wait for the
     /// exit push, so the record, and the push it admits, is kept for
-    /// [`Tuning::legacy_push_grace`] first.
-    async fn finish_final_stop(&self, agent_id: &AgentId, stop_id: StopId, sent_final: bool) {
+    /// [`Tuning::legacy_push_grace`] first. Returns whether this ack
+    /// settles the stop: it claimed the settling and (from nodeProtocol 9)
+    /// dropped the record; not when an expiry or another ack settled it
+    /// first, nor when the drop failed (a later load resends or expires it).
+    async fn finish_final_stop(
+        &self,
+        agent_id: &AgentId,
+        stop_id: StopId,
+        sent_final: bool,
+    ) -> bool {
         if !sent_final {
-            // Acknowledged: not queued again while its record waits out
-            // the grace.
-            lock(&self.in_grace).insert(stop_id);
+            // Acknowledged: not queued again, nor dropped as expired, while
+            // its record waits out the grace.
+            if !self.claim_final_settle_with(agent_id, stop_id, false, true) {
+                return false;
+            }
             let store = self.store.clone();
             let grace = self.tuning.legacy_push_grace;
             let agent_id = agent_id.clone();
             let shared = self.weak();
+            #[cfg(test)]
+            let gate = self.tuning.grace_gate.0.clone();
             // caller-binding: allow — drops one acknowledged final stop's record after the push grace
             tokio::spawn(async move {
                 tokio::time::sleep(grace).await;
-                if let Some(shared) = shared.upgrade() {
-                    lock(&shared.in_grace).remove(&stop_id);
-                }
+                // Drop the record before leaving the grace: a load that
+                // listed it earlier then finds it in the grace, or finds it
+                // gone. Either way it is settled, so it settles nothing.
                 if let Err(error) = store
                     .finish_final_stop(&agent_id, &stop_id.to_string())
                     .await
                 {
                     tracing::warn!(agent = %agent_id, %error, "remote machine: could not drop an acknowledged final stop");
                 }
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    gate.0.notify_one();
+                    gate.1.notified().await;
+                }
+                if let Some(shared) = shared.upgrade() {
+                    lock(&shared.in_grace).remove(&stop_id);
+                }
             });
-            return;
+            return true;
         }
-        if let Err(error) = self
+        match self
             .store
             .finish_final_stop(agent_id, &stop_id.to_string())
             .await
         {
-            tracing::warn!(agent = %agent_id, %error, "remote machine: could not drop an acknowledged final stop; the next start resends it");
+            Ok(dropped) => dropped && self.claim_final_settle(agent_id, stop_id, false),
+            Err(error) => {
+                tracing::warn!(agent = %agent_id, %error, "remote machine: could not drop an acknowledged final stop; the next load resends or expires it");
+                false
+            }
         }
     }
 
@@ -1070,6 +1217,40 @@ impl Shared {
     #[cfg(test)]
     pub(crate) fn final_settles_for_test(&self) -> Vec<AgentId> {
         lock(&self.final_settles).clone()
+    }
+
+    /// How many times a final stop began (queued) for any agent.
+    #[cfg(test)]
+    pub(crate) fn final_begin_count_for_test(&self) -> usize {
+        lock(&self.final_begins).len()
+    }
+
+    /// Queue final stop `stop_id` of `agent_id` as recorded, as a bind's
+    /// claim does.
+    #[cfg(test)]
+    pub(crate) fn queue_final_stop_for_test(&self, agent_id: &AgentId, stop_id: StopId) {
+        self.queue_final_stop(agent_id, stop_id, true);
+    }
+
+    /// Whether final stop `stop_id` waits out its grace.
+    #[cfg(test)]
+    pub(crate) fn in_grace_for_test(&self, stop_id: StopId) -> bool {
+        lock(&self.in_grace).contains(&stop_id)
+    }
+
+    /// Whether a task is still resending stop `stop_id`.
+    #[cfg(test)]
+    pub(crate) fn resending_for_test(&self, stop_id: StopId) -> bool {
+        lock(&self.resending).contains_key(&stop_id)
+    }
+
+    /// Settle the final stops `records` listed earlier, as a load does.
+    #[cfg(test)]
+    pub(crate) async fn settle_listed_for_test(
+        &self,
+        records: Vec<intent_core::remote_launch::RemoteFinalStopRecord>,
+    ) {
+        self.settle_listed_final_stops(records).await;
     }
 
     #[cfg(test)]
@@ -1312,6 +1493,7 @@ impl RemoteNode {
             status: Mutex::new(status),
             stops: Mutex::new(BTreeMap::new()),
             in_grace: Mutex::new(std::collections::HashSet::new()),
+            settled_finals: Mutex::new(std::collections::HashSet::new()),
             setup_outputs: Mutex::default(),
             self_ref: Mutex::new(std::sync::Weak::new()),
             protocol: std::sync::atomic::AtomicU32::new(0),
