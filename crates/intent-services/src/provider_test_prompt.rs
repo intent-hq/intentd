@@ -211,6 +211,7 @@ pub(crate) async fn provider_test_prompt_for<S: std::hash::BuildHasher>(
         Ok(cmd) => cmd,
         Err(reason) => return Ok(failure("not-installed", reason)),
     };
+    let cmd = cmd.with_setup_cache_repair();
     let outcome = run_one_shot_acp(
         Some((
             provider_id,

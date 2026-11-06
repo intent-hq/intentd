@@ -427,11 +427,6 @@ async fn run(
         receipt_path,
         ..
     } = job;
-    tokio::pin!(cancelled);
-    tokio::select! {
-        _ = prepared.repair_npx_cache() => {},
-        () = &mut cancelled => return None,
-    }
     let child = prepared.command.spawn().ok()?;
     let pid = child.id()?;
     let mut group = ChildGroup {

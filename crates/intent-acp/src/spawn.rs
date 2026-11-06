@@ -907,29 +907,11 @@ impl SpawnedAgent {
 /// before spawning. The neutral directory remains owned through process cleanup.
 pub struct PreparedProvider {
     pub command: Command,
-    npx_package: Option<&'static str>,
-    npx_environment: crate::npx_cache::CommandEnvironment,
     npx_launch_dir: Option<NpxLaunchDir>,
     agent_tmp_dir: Option<AgentTempDir>,
     /// The demotion applied to `command`, checked against the child once it
     /// is spawned.
     priority: AgentPriority,
-}
-
-impl PreparedProvider {
-    /// Mark a launch whose caller replaced inheritance with a complete environment.
-    pub fn mark_environment_complete(&mut self) {
-        self.npx_environment = crate::npx_cache::CommandEnvironment::Complete;
-    }
-
-    /// Repair missing install metadata before launching a prepared npm command.
-    pub async fn repair_npx_cache(&self) -> bool {
-        if let Some(package) = self.npx_package {
-            crate::npx_cache::repair_npx_cache(&self.command, package, self.npx_environment).await
-        } else {
-            false
-        }
-    }
 }
 
 /// Build a launch without starting a process.
@@ -962,8 +944,6 @@ pub fn prepare_provider(opts: &SpawnOptions) -> AcpResult<PreparedProvider> {
     );
     Ok(PreparedProvider {
         command,
-        npx_package: opts.npx_fallback_package.filter(|_| opts.via_npx()),
-        npx_environment: crate::npx_cache::CommandEnvironment::Inherit,
         npx_launch_dir,
         agent_tmp_dir,
         priority,
@@ -1027,8 +1007,6 @@ pub fn prepare_npx_package(opts: &SpawnOptions, script: &str) -> AcpResult<Prepa
         .stderr(Stdio::null());
     Ok(PreparedProvider {
         command,
-        npx_package: Some(package),
-        npx_environment: crate::npx_cache::CommandEnvironment::Inherit,
         npx_launch_dir: Some(dir),
         agent_tmp_dir: None,
         priority,
@@ -1038,26 +1016,20 @@ pub fn prepare_npx_package(opts: &SpawnOptions, script: &str) -> AcpResult<Prepa
 /// Prepare and spawn a provider.
 /// # Errors
 /// Returns launch-directory, process, or stdio setup failures.
-pub async fn spawn_provider(
-    opts: &SpawnOptions<'_>,
-    hooks: ConnectionHooks,
-) -> AcpResult<SpawnedAgent> {
-    spawn_prepared_provider(opts, prepare_provider(opts)?, hooks).await
+pub fn spawn_provider(opts: &SpawnOptions, hooks: ConnectionHooks) -> AcpResult<SpawnedAgent> {
+    spawn_prepared_provider(opts, prepare_provider(opts)?, hooks)
 }
 
 /// Spawn a previously validated launch without rebuilding its environment.
 /// # Errors
 /// Returns process/stdio setup failures, like `spawn_provider`.
-pub async fn spawn_prepared_provider(
-    opts: &SpawnOptions<'_>,
+pub fn spawn_prepared_provider(
+    opts: &SpawnOptions,
     prepared: PreparedProvider,
     hooks: ConnectionHooks,
 ) -> AcpResult<SpawnedAgent> {
-    prepared.repair_npx_cache().await;
     let PreparedProvider {
         command: mut cmd,
-        npx_package: _,
-        npx_environment: _,
         npx_launch_dir,
         agent_tmp_dir,
         priority,
@@ -1322,9 +1294,7 @@ mod kill_tests {
             "INTENT_TEST_PIDFILE".to_string(),
             pidfile.display().to_string(),
         );
-        let mut agent = spawn_provider(&opts, ConnectionHooks::default())
-            .await
-            .expect("spawn sh child");
+        let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn sh child");
 
         let mut grandchild_pid = None;
         for _ in 0..100 {
@@ -1385,9 +1355,8 @@ mod kill_tests {
             "INTENT_TEST_PIDFILE".to_string(),
             pidfile.display().to_string(),
         );
-        let mut agent = spawn_provider(&opts, ConnectionHooks::default())
-            .await
-            .expect("spawn bash child");
+        let mut agent =
+            spawn_provider(&opts, ConnectionHooks::default()).expect("spawn bash child");
 
         let mut grandchild_pid = None;
         for _ in 0..250 {
@@ -2663,9 +2632,7 @@ mod agent_tmp_tests {
             opts.agent_tmp_root = Some(&root);
             opts.extra_env
                 .insert("INTENT_TEST_OUT".to_string(), out.display().to_string());
-            let agent = spawn_provider(&opts, ConnectionHooks::default())
-                .await
-                .expect("spawn sh");
+            let agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn sh");
             launches.push((agent, out));
         }
         let mut dirs = Vec::new();

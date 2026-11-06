@@ -1,237 +1,260 @@
-//! Recover missing npm exec metadata without replacing a shared installation.
+//! Best-effort repair used only by the live provider setup test.
 
-use std::fmt::Write as _;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
-use serde_json::{json, Value};
-use sha2::{Digest, Sha512};
-use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 
-/// Prevent user npm settings from suppressing the cache manifest on installation.
+/// Prevent npm settings from suppressing the install's cache manifest.
 pub const NPX_SAVE_ARG: &str = "--save=true";
 
-/// Whether a command inherits process variables or holds a complete snapshot.
+/// Includes admission, process startup, npm configuration and cache I/O.
+pub const NPX_CACHE_REPAIR_BUDGET: Duration = Duration::from_secs(3);
+
+/// Whether the actual adapter command inherits process variables.
 #[derive(Clone, Copy)]
 pub enum CommandEnvironment {
     Inherit,
     Complete,
 }
 
-/// Restore only an absent cache-root manifest for an installed, reviewed pin.
-/// Config discovery uses the launch's npm installation, environment and cwd.
-/// Failure is advisory: the original provider launch still supplies its error.
-pub async fn repair_npx_cache(
+/// Restore an absent manifest for a reviewed adapter pin during provider setup.
+/// The caller returns within the budget. `keep_alive` stays with the owned job
+/// until its process tree has exited, including after cancellation or timeout.
+pub async fn repair_npx_cache<T: Send + 'static>(
     command: &Command,
     package: &str,
     environment: CommandEnvironment,
+    keep_alive: T,
 ) -> bool {
-    // npm.cmd cleanup cannot yet own its node.exe process tree.
-    if !cfg!(unix) {
-        return false;
-    }
-    if !intent_providers::ACP_PROVIDERS.iter().any(|provider| {
-        provider.npx_only_package == Some(package) || provider.fallback_npx_package == Some(package)
-    }) {
-        return false;
-    }
-    let Some(cache) = cache_root(command, environment).await else {
-        return false;
-    };
-    let package = package.to_owned();
-    tokio::task::spawn_blocking(move || repair_manifest(&cache, &package))
-        .await
-        .unwrap_or(false)
-}
-
-async fn cache_root(launch: &Command, environment: CommandEnvironment) -> Option<PathBuf> {
-    let launch = launch.as_std();
-    let npx = Path::new(launch.get_program());
-    let npm_name = match npx.file_name()?.to_str()? {
-        "npx" => "npm",
-        "npx.cmd" => "npm.cmd",
-        "npx.exe" => "npm.exe",
-        "npx-cli.js" => "npm-cli.js",
-        _ => return None,
-    };
-    let npm = npx.with_file_name(npm_name);
-    if !npm.is_file() {
-        return None;
-    }
-    let mut command = Command::new(npm);
-    command
-        .args(["config", "get", "cache", "--workspaces=false"])
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    if let Some(cwd) = launch.get_current_dir() {
-        command.current_dir(cwd);
-    }
-    if matches!(environment, CommandEnvironment::Inherit) {
-        command.envs(std::env::vars_os());
-    }
-    for (key, value) in launch.get_envs() {
-        if let Some(value) = value {
-            command.env(key, value);
-        } else {
-            command.env_remove(key);
-        }
-    }
     #[cfg(unix)]
-    command.process_group(0);
-    let child = command.spawn().ok()?;
-    let mut probe = CacheProbe { child };
-    let stdout = probe.child.stdout.take()?;
-    let result = tokio::time::timeout(Duration::from_secs(3), async {
-        let mut bytes = Vec::new();
-        stdout.take(65_536).read_to_end(&mut bytes).await.ok()?;
-        let status = probe.child.wait().await.ok()?;
-        if !status.success() {
-            return None;
-        }
-        let output = std::str::from_utf8(&bytes).ok()?;
-        let output = output.trim_end_matches(['\r', '\n']);
-        if output.contains(['\r', '\n']) {
-            return None;
-        }
-        let cache = PathBuf::from(output);
-        cache.is_absolute().then_some(cache)
-    })
-    .await;
-    if result.is_err() {
-        probe.stop();
-        let _ = tokio::time::timeout(Duration::from_millis(500), probe.child.wait()).await;
-    }
-    result.ok().flatten()
-}
-
-struct CacheProbe {
-    child: Child,
-}
-
-impl CacheProbe {
-    fn stop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.child.id() {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid.cast_signed()),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-        let _ = self.child.start_kill();
-    }
-}
-
-impl Drop for CacheProbe {
-    fn drop(&mut self) {
-        if self.child.id().is_some() {
-            self.stop();
-        }
-    }
-}
-
-fn real_directory(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
-}
-
-fn repair_manifest(cache: &Path, package: &str) -> bool {
-    let Some((name, version)) = package.rsplit_once('@') else {
-        return false;
-    };
-    let mut hash = String::with_capacity(16);
-    for byte in Sha512::digest(package.as_bytes()).iter().take(8) {
-        write!(hash, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    let npx = cache.join("_npx");
-    let install = npx.join(&hash[..16]);
-    let manifest = install.join("package.json");
-    if !real_directory(cache) || !real_directory(&npx) || !real_directory(&install) {
-        return false;
-    }
-    let Ok(identity) = std::fs::symlink_metadata(&install) else {
-        return false;
-    };
-    if !matches!(std::fs::symlink_metadata(&manifest), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
     {
-        return false;
+        unix::repair(command, package, environment, keep_alive).await
     }
-    let mut dependency = install.join("node_modules");
-    if !real_directory(&dependency) {
-        return false;
+    #[cfg(not(unix))]
+    {
+        let _ = (command, package, environment, keep_alive);
+        false
     }
-    for segment in name.split('/') {
-        dependency.push(segment);
-        if !real_directory(&dependency) {
+}
+
+#[cfg(unix)]
+mod unix {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::process::Stdio;
+    use std::sync::{Arc, LazyLock};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use nix::errno::Errno;
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+    use tokio::process::{Child, Command};
+    use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+
+    use super::{CommandEnvironment, NPX_CACHE_REPAIR_BUDGET};
+
+    static REPAIR_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
+    const SCRIPT: &str = include_str!("../resources/npm-cache-repair.cjs");
+
+    pub(super) async fn repair<T: Send + 'static>(
+        command: &Command,
+        package: &str,
+        environment: CommandEnvironment,
+        keep_alive: T,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + NPX_CACHE_REPAIR_BUDGET;
+        if !intent_providers::ACP_PROVIDERS.iter().any(|provider| {
+            provider.npx_only_package == Some(package)
+                || provider.fallback_npx_package == Some(package)
+        }) {
             return false;
         }
+        let Some(snapshot) = LaunchSnapshot::capture(command) else {
+            return false;
+        };
+        let package = package.to_owned();
+        let (cancel, mut cancelled) = oneshot::channel::<()>();
+        let job = intent_core::caller::spawn_with_current_caller(async move {
+            let permit = tokio::select! {
+                permit = REPAIR_SLOTS.clone().acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return false,
+                },
+                _ = &mut cancelled => return false,
+            };
+            if !matches!(
+                cancelled.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ) {
+                return false;
+            }
+            let started = tokio::task::spawn_blocking(move || {
+                snapshot.start(package, environment, keep_alive, permit)
+            })
+            .await;
+            let Ok(Some(mut running)) = started else {
+                return false;
+            };
+            running.finish(&mut cancelled).await
+        });
+        let repaired = tokio::time::timeout_at(deadline, job)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false);
+        drop(cancel);
+        repaired
     }
-    let package_manifest = dependency.join("package.json");
-    if !std::fs::symlink_metadata(&package_manifest).is_ok_and(|m| m.file_type().is_file()) {
-        return false;
+
+    struct LaunchSnapshot {
+        npm: PathBuf,
+        cwd: Option<PathBuf>,
+        env: Vec<(OsString, Option<OsString>)>,
+        expires: u128,
     }
-    let read = || -> Option<Value> {
-        let mut bytes = Vec::new();
-        std::fs::File::open(&package_manifest)
-            .ok()?
-            .take(65_536)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        serde_json::from_slice(&bytes).ok()
-    };
-    let Some(installed) = read() else {
-        return false;
-    };
-    if installed["name"].as_str() != Some(name) || installed["version"].as_str() != Some(version) {
-        return false;
-    }
-    let publish = || -> std::io::Result<()> {
-        let candidate_path = install.join(format!(".intent-manifest-{}.tmp", uuid::Uuid::new_v4()));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate_path)?;
-        let candidate = ManifestCandidate(candidate_path);
-        let dependencies = std::collections::BTreeMap::from([(name, version)]);
-        serde_json::to_writer(
-            &mut file,
-            &json!({"private":true,"dependencies":dependencies}),
-        )?;
-        file.flush()?;
-        drop(file);
-        if !real_directory(&npx) || !real_directory(&install) {
-            return Err(std::io::ErrorKind::NotFound.into());
+
+    impl LaunchSnapshot {
+        fn capture(command: &Command) -> Option<Self> {
+            let command = command.as_std();
+            let npx = Path::new(command.get_program());
+            let npm_name = match npx.file_name()?.to_str()? {
+                "npx" => "npm",
+                "npx-cli.js" => "npm-cli.js",
+                _ => return None,
+            };
+            Some(Self {
+                npm: npx.with_file_name(npm_name),
+                cwd: command.get_current_dir().map(Path::to_owned),
+                env: command
+                    .get_envs()
+                    .map(|(key, value)| (key.to_owned(), value.map(std::ffi::OsStr::to_owned)))
+                    .collect(),
+                expires: (SystemTime::now().duration_since(UNIX_EPOCH).ok()?
+                    + NPX_CACHE_REPAIR_BUDGET)
+                    .as_millis(),
+            })
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let current = std::fs::symlink_metadata(&install)?;
-            if (identity.dev(), identity.ino()) != (current.dev(), current.ino()) {
-                return Err(std::io::ErrorKind::NotFound.into());
+
+        fn start<T: Send + 'static>(
+            self,
+            package: String,
+            environment: CommandEnvironment,
+            keep_alive: T,
+            permit: OwnedSemaphorePermit,
+        ) -> Option<RunningRepair<T>> {
+            let mut command = Command::new("node");
+            command
+                .args(["-e", SCRIPT, "--"])
+                .arg(package)
+                .arg(self.npm)
+                .arg(self.expires.to_string())
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .process_group(0);
+            if let Some(cwd) = self.cwd {
+                command.current_dir(cwd);
+            }
+            if matches!(environment, CommandEnvironment::Inherit) {
+                command.envs(std::env::vars_os());
+            }
+            for (key, value) in self.env {
+                if let Some(value) = value {
+                    command.env(key, value);
+                } else {
+                    command.env_remove(key);
+                }
+            }
+            crate::AgentPriority::from_env().apply(&mut command);
+            let child = command.spawn().ok()?;
+            let pid = child.id()?;
+            Some(RunningRepair {
+                child,
+                pid,
+                keep_alive: Some(keep_alive),
+                permit: Some(permit),
+                cleaned: false,
+            })
+        }
+    }
+
+    struct RunningRepair<T> {
+        child: Child,
+        pid: u32,
+        keep_alive: Option<T>,
+        permit: Option<OwnedSemaphorePermit>,
+        cleaned: bool,
+    }
+
+    impl<T> RunningRepair<T> {
+        async fn finish(&mut self, cancelled: &mut oneshot::Receiver<()>) -> bool {
+            let status = tokio::select! {
+                status = self.child.wait() => status.ok(),
+                _ = cancelled => None,
+            };
+            let descendants = if self.child.id().is_some() {
+                crate::descendant_pids(self.pid).await
+            } else {
+                Vec::new()
+            };
+            let group = Pid::from_raw(self.pid.cast_signed());
+            // The process group can outlive its already-waited leader.
+            let _ = killpg(group, Signal::SIGKILL);
+            let _ = self.child.start_kill();
+            let _ = self.child.wait().await;
+            crate::sweep_escaped_descendants(&descendants).await;
+            while !matches!(killpg(group, None), Err(Errno::ESRCH)) {
+                if group_has_live_members(self.pid).await == Some(false) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            self.cleaned = true;
+            status.is_some_and(|status| status.success())
+        }
+    }
+
+    async fn group_has_live_members(group: u32) -> Option<bool> {
+        let mut ps = Command::new("ps");
+        ps.args(["-axo", "pgid=,stat="])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(2), ps.output())
+            .await
+            .ok()?
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let mut observed = false;
+        for line in String::from_utf8(output.stdout).ok()?.lines() {
+            let mut fields = line.split_whitespace();
+            let pid: u32 = fields.next()?.parse().ok()?;
+            let state = fields.next()?.as_bytes().first().copied()?;
+            observed = true;
+            if pid == group && !matches!(state, b'Z' | b'X') {
+                return Some(true);
             }
         }
-        #[cfg(not(unix))]
-        let _ = &identity;
-        std::fs::hard_link(&candidate.0, &manifest)
-    };
-    let repaired = publish().is_ok();
-    if repaired {
-        tracing::info!(
-            package,
-            "restored missing npx cache manifest before adapter launch"
-        );
+        observed.then_some(false)
     }
-    repaired
-}
 
-struct ManifestCandidate(PathBuf);
-
-impl Drop for ManifestCandidate {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+    impl<T> Drop for RunningRepair<T> {
+        fn drop(&mut self) {
+            if self.cleaned {
+                return;
+            }
+            if self.child.id().is_some() {
+                let _ = killpg(Pid::from_raw(self.pid.cast_signed()), Signal::SIGKILL);
+                let _ = self.child.start_kill();
+            }
+            // An interrupted reaper must not remove a possibly live tree's cwd.
+            std::mem::forget(self.keep_alive.take());
+            std::mem::forget(self.permit.take());
+        }
     }
 }

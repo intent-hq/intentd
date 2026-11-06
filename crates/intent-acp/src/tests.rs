@@ -556,7 +556,7 @@ async fn stderr_capture_written_to_daily_log_file() {
         stderr_log_dir: Some(dir.clone()),
         ..ConnectionHooks::default()
     };
-    let mut agent = spawn_provider(&opts, hooks).await.expect("spawn sh child");
+    let mut agent = spawn_provider(&opts, hooks).expect("spawn sh child");
 
     // Concatenate every daily file in the capture dir rather than assuming
     // today's name: the writer rotates by UTC date, so a rollover between
@@ -623,7 +623,6 @@ async fn spawn_provider_classifies_missing_bare_command() {
     let opts = SpawnOptions::new(&provider);
     assert_eq!(opts.launch_target().0, LaunchMode::BareCommand);
     let err = spawn_provider(&opts, ConnectionHooks::default())
-        .await
         .err()
         .expect("missing bare command must fail to spawn");
     assert!(
@@ -654,7 +653,6 @@ async fn spawn_provider_classifies_missing_resolved_binary() {
     opts.provider_binary = Some(&missing);
     assert_eq!(opts.launch_target().0, LaunchMode::ResolvedBinary);
     let err = spawn_provider(&opts, ConnectionHooks::default())
-        .await
         .err()
         .expect("missing resolved binary must fail to spawn");
     assert!(
@@ -685,7 +683,6 @@ async fn spawn_provider_keeps_missing_cwd_enoent_as_spawn() {
     opts.cwd = Some(&gone);
     assert_eq!(opts.launch_target().0, LaunchMode::ResolvedBinary);
     let err = spawn_provider(&opts, ConnectionHooks::default())
-        .await
         .err()
         .expect("missing cwd must fail to spawn");
     match &err {
@@ -715,7 +712,6 @@ async fn spawn_provider_keeps_missing_interpreter_enoent_as_spawn() {
     opts.provider_binary = Some(&script);
     assert_eq!(opts.launch_target().0, LaunchMode::ResolvedBinary);
     let err = spawn_provider(&opts, ConnectionHooks::default())
-        .await
         .err()
         .expect("missing interpreter must fail to spawn");
     match &err {
@@ -749,7 +745,6 @@ async fn spawn_provider_relative_bare_command_present_in_cwd_is_not_provider_not
     opts.cwd = Some(tmp.path());
     assert_eq!(opts.launch_target().0, LaunchMode::BareCommand);
     let err = spawn_provider(&opts, ConnectionHooks::default())
-        .await
         .err()
         .expect("missing interpreter must fail to spawn");
     match &err {
@@ -909,9 +904,7 @@ async fn spawn_provider_runs_npx_launch_in_a_neutral_dir() {
     opts.npx_fallback_package = provider.npx_only_package;
     assert_eq!(opts.launch_target().0, LaunchMode::NpxFallback);
 
-    let mut agent = spawn_provider(&opts, ConnectionHooks::default())
-        .await
-        .expect("spawn fake npx");
+    let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn fake npx");
     let (npx_cwd, entries) = read_npx_report(&report).await;
     let status = agent.child_mut().wait().await.expect("wait fake npx");
     assert!(
@@ -988,9 +981,7 @@ async fn spawn_provider_npx_launch_is_isolated_from_the_launch_roots_ancestors()
     opts.npx_fallback_package = provider.npx_only_package;
     assert!(opts.via_npx());
 
-    let mut agent = spawn_provider(&opts, ConnectionHooks::default())
-        .await
-        .expect("spawn fake npx");
+    let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn fake npx");
     let (npx_cwd, entries) = read_npx_report(&report).await;
     let status = agent.child_mut().wait().await.expect("wait fake npx");
     assert!(
@@ -1106,9 +1097,7 @@ async fn spawn_provider_real_npx_ignores_matching_ancestor_workspaces_and_siblin
         );
         // The previous launch dir is still alive (`alive`), so npm now sees two
         // same-named sentinels under the matching glob.
-        let mut agent = spawn_provider(&opts, ConnectionHooks::default())
-            .await
-            .expect("spawn real npx");
+        let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn real npx");
         let status = tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(120)),
             agent.child_mut().wait(),
@@ -1233,9 +1222,7 @@ async fn spawn_provider_real_npx_ignores_inherited_npm_workspace_selectors() {
     }
     assert!(opts.via_npx());
 
-    let mut agent = spawn_provider(&opts, ConnectionHooks::default())
-        .await
-        .expect("spawn real npx");
+    let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn real npx");
     let status = tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(120)),
         agent.child_mut().wait(),
@@ -1286,7 +1273,6 @@ async fn spawn_provider_npx_launch_does_not_depend_on_the_workspace_existing() {
     assert!(opts.via_npx());
 
     let mut agent = spawn_provider(&opts, ConnectionHooks::default())
-        .await
         .expect("npx launch must not require the workspace directory");
     let (npx_cwd, _) = read_npx_report(&report).await;
     assert_ne!(npx_cwd, gone);
@@ -1623,9 +1609,7 @@ async fn spawn_real_child_handshake() {
     };
 
     let opts = SpawnOptions::new(&provider);
-    let mut agent = spawn_provider(&opts, ConnectionHooks::default())
-        .await
-        .expect("spawn sh mock");
+    let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn sh mock");
 
     let result = crate::handshake::handshake(agent.connection(), &provider)
         .await

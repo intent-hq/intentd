@@ -1370,7 +1370,6 @@ impl Runner {
                                 notes,
                                 (cwd, &tmp),
                             )
-                            .await
                             .map(|started| (started, bridge, mcp))
                             .map_err(|error| Some(format!("{}: {error}", codes::START))),
                     }
@@ -1599,7 +1598,7 @@ impl Runner {
         }
     }
 
-    async fn start(
+    fn start(
         &self,
         agent: &Agent,
         (launch, profile): (&ProviderLaunch, Option<&ProfileEnv>),
@@ -1633,7 +1632,7 @@ impl Runner {
                 .extra_env
                 .insert(key.to_owned(), tmp.to_string_lossy().into_owned());
         }
-        let spawned = intent_acp::spawn_provider(&options, hooks).await?;
+        let spawned = intent_acp::spawn_provider(&options, hooks)?;
         let (child, connection, npx_launch_dir, agent_tmp_dir) = spawned.into_parts();
         // An npx launch runs from its launch directory; keep it until the
         // agent is gone.

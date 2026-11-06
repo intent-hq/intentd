@@ -201,6 +201,7 @@ pub(crate) struct AcpAdapterCommand {
     /// npx-run adapters get the longer cold-install timeout budget and start
     /// in a neutral [`NpxLaunchDir`] rather than `cwd`.
     via_npx: bool,
+    repair_cache_for_setup: bool,
     /// Parent of the per-launch [`NpxLaunchDir`]; `None` is the OS temp dir.
     npx_launch_root: Option<PathBuf>,
     /// Test-only widening of the `initialize` / `session/new` budgets (see
@@ -210,6 +211,11 @@ pub(crate) struct AcpAdapterCommand {
 }
 
 impl AcpAdapterCommand {
+    pub(crate) fn with_setup_cache_repair(mut self) -> Self {
+        self.repair_cache_for_setup = self.via_npx;
+        self
+    }
+
     pub(crate) fn is_codex(&self) -> bool {
         self.installed_cli == Some(intent_providers::installed_cli::InstalledCli::Codex)
     }
@@ -428,6 +434,7 @@ impl AcpAdapterCommand {
             auth_required_stdout_marker: None,
             cwd: None,
             via_npx: true,
+            repair_cache_for_setup: false,
             npx_launch_root: None,
             #[cfg(test)]
             setup_budget: None,
@@ -447,6 +454,7 @@ impl AcpAdapterCommand {
             auth_required_stdout_marker: None,
             cwd: None,
             via_npx: false,
+            repair_cache_for_setup: false,
             npx_launch_root: None,
             #[cfg(test)]
             setup_budget: None,
@@ -630,9 +638,9 @@ pub(crate) struct SpawnedAdapter {
 /// or escaped from it).
 struct HeldWhileLive {
     npx_launch_dir: Option<Arc<NpxLaunchDir>>,
-    slot: OwnedSemaphorePermit,
+    slot: Arc<OwnedSemaphorePermit>,
     installed: Option<Arc<PreparedInstalled>>,
-    preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
+    preparation_guard: Option<Arc<crate::provider_preparation::LaunchGuard>>,
 }
 
 /// The adapter process plus [`HeldWhileLive`], dereferencing to the
@@ -865,6 +873,8 @@ async fn spawn_admitted_adapter(
     slot: OwnedSemaphorePermit,
     preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
 ) -> Result<SpawnedAdapter, String> {
+    let slot = Arc::new(slot);
+    let preparation_guard = preparation_guard.map(Arc::new);
     let npx_launch_dir = if let Some(installed) = &cmd.installed {
         installed.npx_dir.clone()
     } else if cmd.via_npx {
@@ -884,7 +894,8 @@ async fn spawn_admitted_adapter(
     }
 
     let npx_package = cmd.args.iter().find(|arg| {
-        cmd.via_npx
+        cmd.repair_cache_for_setup
+            && cmd.via_npx
             && intent_providers::ACP_PROVIDERS.iter().any(|provider| {
                 provider.npx_only_package == Some(arg.as_str())
                     || provider.fallback_npx_package == Some(arg.as_str())
@@ -896,7 +907,13 @@ async fn spawn_admitted_adapter(
         } else {
             intent_acp::npx_cache::CommandEnvironment::Inherit
         };
-        intent_acp::npx_cache::repair_npx_cache(&command, package, environment).await;
+        let ownership = (
+            cmd.clone(),
+            npx_launch_dir.clone(),
+            slot.clone(),
+            preparation_guard.clone(),
+        );
+        intent_acp::npx_cache::repair_npx_cache(&command, package, environment, ownership).await;
     }
 
     let mut child = command
