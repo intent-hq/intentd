@@ -145,6 +145,20 @@ impl SpecialistsWatcher {
         super::shared_watch::wait_tier_watches_live(&self.workspace_watchers, &budget).await;
     }
 
+    /// Flush any pending window (e.g. from watch-setup events) and wait
+    /// until the debounce loop has done so.
+    #[cfg(test)]
+    async fn settle(&self) {
+        let done = Arc::new(tokio::sync::Notify::new());
+        if self
+            .raw_tx
+            .send(SpecialistsMsg::Settle(Arc::clone(&done)))
+            .is_ok()
+        {
+            done.notified().await;
+        }
+    }
+
     /// Deregister a workspace at runtime (#611): tear down its project-tier
     /// watch and drop any pending flush so it stops emitting.
     pub(crate) fn remove_workspace(&self, workspace_id: &WorkspaceId) {
@@ -220,6 +234,10 @@ enum SpecialistsMsg {
     /// Workspace resumed (unarchive): re-registers the path WITHOUT re-priming
     /// the fingerprint, plus a flush so changes missed while suspended emit.
     Resume(WorkspaceId, PathBuf),
+    /// Test seam: flush every pending window now, then notify. Lets a test
+    /// start from an empty schedule instead of racing watch-setup noise.
+    #[cfg(test)]
+    Settle(Arc<tokio::sync::Notify>),
 }
 
 /// Watch a single root, forwarding `*.md` and directory-level events.
@@ -355,6 +373,11 @@ async fn debounce_loop(
                     // Catch-up: flush after the normal debounce so the
                     // re-registered watch's own events coalesce into it.
                     pending.insert(ws_id, tokio::time::Instant::now() + DEBOUNCE);
+                }
+                #[cfg(test)]
+                Some(SpecialistsMsg::Settle(done)) => {
+                    flush_all(&bus, &workspace_paths, user_dir.as_ref(), &mut fingerprints, &mut pending).await;
+                    done.notify_one();
                 }
                 None => {
                     // All senders dropped: flush and exit
@@ -741,20 +764,31 @@ mod tests {
         watcher.wait_established(LIVENESS).await;
         // Let the OS watch establish before mutating (FSEvents/inotify warm-up).
         tokio::time::sleep(Duration::from_millis(250)).await;
+        // Watch setup itself emits raw changes that open a (silent) window.
+        // Flush it now: otherwise a runner stall spanning both that window's
+        // deadline and this warm-up lets the burst's first write race the
+        // flush, which then emits for a partial burst (#8710, seen 8/200
+        // under STALL=1).
+        watcher.settle().await;
 
-        // Rapid burst, written back to back. The window is fixed from the
-        // first change (the schedule tests below pin that deterministically),
-        // so when the burst takes less than `DEBOUNCE` the first flush reads
-        // the fingerprint after every write has landed, and any later flush
-        // (a late notification) is suppressed by the unchanged fingerprint:
-        // exactly one event. A loaded or stalled runner can stretch these
-        // writes past `DEBOUNCE` (intent-hq/intent#8710); a split is then
+        // Rapid burst of three writes, 50 ms apart. The awaits matter: on
+        // this current-thread runtime they let the debounce loop receive
+        // each raw change separately, so without the debounce every write
+        // would emit its own event (a mutation that bypasses the window
+        // fails here). The window is fixed from the first change (the
+        // schedule tests below pin that deterministically), so when the
+        // burst takes less than `DEBOUNCE` the first flush reads the
+        // fingerprint after every write has landed, and any later flush (a
+        // late notification) is suppressed by the unchanged fingerprint:
+        // exactly one event. A loaded or stalled runner can stretch the
+        // burst past `DEBOUNCE` (intent-hq/intent#8710); a split is then
         // correct behaviour, so only a missing event or more events than
-        // writes is a failure. (A replayed pre-start event, e.g. FSEvents
-        // re-delivering the tier `mkdir`, could open a window before the
-        // burst; the warm-up above keeps it clear of all but a >250 ms burst.)
+        // writes is a failure there.
         let burst_start = Instant::now();
         for i in 0..3 {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             std::fs::write(
                 proj.join(format!("custom{i}.md")),
                 specialist_md(&format!("Custom {i}"), "body"),
