@@ -9926,9 +9926,9 @@ impl Services {
     ) -> Result<()> {
         use intent_acp::session::ContentBlock;
         use intent_core::node_link::MAX_FRAME_BYTES;
-        if !image_blocks
+        if image_blocks
             .and_then(Value::as_array)
-            .is_some_and(|images| !images.is_empty())
+            .is_none_or(Vec::is_empty)
         {
             return Ok(());
         }
