@@ -763,24 +763,27 @@ impl Shared {
 
     /// Send `agent_id`'s queued secret forgets on `link`, in order, under
     /// its secret lock; those of the name `superseded` (a `secretPut` about
-    /// to replace it) are dropped instead. Whatever cannot be sent stays
-    /// queued. Returns whether all were sent.
+    /// to replace it) are dropped instead. A forget leaves the queue only
+    /// once it is sent, so a cancelled flush loses none. Returns whether all
+    /// were sent.
     async fn flush_secret_forgets(
         &self,
         link: &NodeLink,
         agent_id: &AgentId,
         superseded: Option<&str>,
     ) -> bool {
-        let mut mine: std::collections::VecDeque<_> = {
-            let mut queued = lock(&self.secret_forgets);
-            let (mine, rest): (Vec<_>, Vec<_>) =
-                queued.drain(..).partition(|(agent, _)| agent == agent_id);
-            *queued = rest;
-            mine.into_iter()
-                .filter(|(_, name)| superseded.is_none() || name.as_deref() != superseded)
-                .collect()
-        };
-        while let Some((agent_id, name)) = mine.pop_front() {
+        if let Some(name) = superseded {
+            lock(&self.secret_forgets)
+                .retain(|(agent, forget)| agent != agent_id || forget.as_deref() != Some(name));
+        }
+        loop {
+            let Some(name) = lock(&self.secret_forgets)
+                .iter()
+                .find(|(agent, _)| agent == agent_id)
+                .map(|(_, name)| name.clone())
+            else {
+                return true;
+            };
             let frame = LinkFrame::SecretForget(SecretForget {
                 request_id: LinkId::new_v4(),
                 agent_id: agent_id.clone(),
@@ -788,13 +791,16 @@ impl Shared {
             });
             if let Err(error) = link.send(&frame).await {
                 tracing::warn!(%error, "remote machine: a queued secret forget was not sent");
-                let mut queued = lock(&self.secret_forgets);
-                queued.push((agent_id, name));
-                queued.extend(mine);
                 return false;
             }
+            let mut queued = lock(&self.secret_forgets);
+            if let Some(at) = queued
+                .iter()
+                .position(|(agent, forget)| agent == agent_id && *forget == name)
+            {
+                queued.remove(at);
+            }
         }
-        true
     }
 
     /// Send stop `stop_id` on `link` and resend it after 5 s, doubling to

@@ -434,4 +434,15 @@ async fn secret_frames_hold_values_for_leased_agents_until_the_backend_restarts(
         "a put still on its way after the final stop is refused"
     );
     assert!(held(&a1).is_empty());
+
+    // A restored agent keeps its id: its launch lets it hold secrets again.
+    h.runner
+        .launch(match launch("a1") {
+            LinkFrame::Launch(command) => command,
+            _ => unreachable!(),
+        })
+        .await;
+    h.runner.adopt_head(Some("hs-2"), std::slice::from_ref(&a1));
+    let again = reply(apply_secret(&h.runner, &b, OPEN, put(11, "a1", "API_KEY")).await);
+    assert_eq!(again.outcome, SecretOutcome::Ok, "{again:?}");
 }

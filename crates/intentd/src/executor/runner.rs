@@ -988,6 +988,11 @@ impl Runner {
     /// frames that caused them; a failed start is journaled as the agent's
     /// exit with an error code.
     pub(super) async fn launch(&self, command: LaunchCommand) {
+        // A launch brings an ended agent back (a restored agent keeps its
+        // id): it may hold secrets again.
+        lock(&self.inner.head_session)
+            .ended
+            .remove(&command.agent_id);
         self.claim_checkout(&command.agent_id).await;
         // Provider discovery reads the filesystem; keep it off the runtime.
         let launch = self.inner.launch.clone();
