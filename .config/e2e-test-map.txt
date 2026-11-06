@@ -109,3 +109,8 @@ crates/intent-git/src/fetch.rs                       intentd::suite_wss_repo   e
 # Agent temp folders: spawn wiring and the runtime that holds them.
 crates/intent-acp/src/spawn.rs                       intentd::suite_wss_agents e2e_mock_agent_tmpdir
 crates/intent-services/src/agent_manager/runtime.rs  intentd::suite_wss_agents e2e_mock_agent_tmpdir
+# Human sender-device capture and browser routing across the secure transport.
+crates/intent-core/src/browser_message.rs intentd::suite_wss_a_f e2e_wss_browser_tabs
+crates/intent-transport/src/conn.rs intentd::suite_wss_a_f e2e_wss_browser_tabs
+crates/intent-services/src/agent_ops.rs intentd::suite_wss_a_f e2e_wss_browser_tabs
+crates/intent-store/src/browser_sender_repo.rs intentd::suite_wss_a_f e2e_wss_browser_tabs

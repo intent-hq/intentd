@@ -20,6 +20,7 @@ pub mod agent_configs;
 pub(crate) mod agent_logs;
 pub mod agent_runtime;
 pub mod agent_tmp;
+pub mod browser_message;
 pub mod caller;
 pub mod chief_cwd;
 pub mod cli_env;

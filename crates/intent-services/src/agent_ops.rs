@@ -5567,6 +5567,10 @@ impl Services {
         if is_qualified_monitor_message(message) {
             return;
         }
+        if message.role == "user" {
+            intent_core::browser_message::accept_browser_message(agent_id, &message.id);
+            self.persist_browser_sender(agent_id).await;
+        }
         let mut payload = agent_message_event_payload(agent_id, message, turn_id);
         let mut last_payload = agent_last_message_event_payload(agent_id, message, turn_id);
         // Serve-time author (multiplayer w2): a user-row echo carries the
@@ -18274,6 +18278,9 @@ impl Services {
         {
             return (existing.clone(), position);
         }
+        // The receipt is scoped to human wire front doors, including
+        // sendToTask (whose legacy runtime delivery uses Automatic origin).
+        intent_core::browser_message::accept_browser_message(agent_id, &id);
         let queued = QueuedMessage {
             monitor_turn,
             delivery_groups: None,
@@ -20159,6 +20166,20 @@ impl Services {
         Ok(count)
     }
 
+    pub(crate) async fn persist_browser_sender(&self, agent_id: &AgentId) {
+        if let Some((submission, received_order, client)) =
+            intent_core::browser_message::accepted_browser_message(agent_id)
+        {
+            if let Err(error) = self
+                .store
+                .record_browser_sender(agent_id, &submission, &received_order, client.as_ref())
+                .await
+            {
+                tracing::warn!(%agent_id, %error, "could not persist browser sender preference");
+            }
+        }
+    }
+
     /// Publish `agent:queue:updated` with the **current** queue snapshot.
     /// Looks up the owning workspace from the agent session — when the session
     /// row is missing (e.g. an idempotent remove on an unknown agent) or no bus
@@ -20195,6 +20216,7 @@ impl Services {
         workspace_id: &WorkspaceId,
     ) {
         self.persist_queue_snapshot(agent_id).await;
+        self.persist_browser_sender(agent_id).await;
         self.publish_queue_event(agent_id, workspace_id).await;
     }
 

@@ -1147,9 +1147,13 @@ loopback addresses instead open servers on the connected daemon through its
 authenticated tunnel.
 
 Agent-requested native previews require the companion iOS implementation and are
-not yet a generally released option. On supporting builds, a new preview opens
-on connected iOS when no eligible desktop is connected and no other client is
-explicitly pinned. Native tabs stay on that device when a desktop reconnects or
+not yet a generally released option. On supporting builds, new previews prefer
+the device that sent your latest message in that conversation, when connected
+and capable. Otherwise they use an eligible desktop, then connected iOS.
+A delegated helper follows its parent's preference until you message the helper
+directly. Unrelated conversations do not share this preference.
+An explicitly pinned browser device takes precedence. Automatic updates and
+messages from other agents do not change your device preference. Native tabs stay on that device when a desktop reconnects or
 the primary client changes. Agents can open, show, focus, navigate and close
 their native tabs; page inspection, clicking, screenshots, viewport emulation
 and other browser automation require a separate desktop tab. Request acceptance

@@ -37,7 +37,7 @@ const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 
 struct Daemon {
     child: GuardedChild,
-    _data_dir: tempfile::TempDir,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
@@ -155,7 +155,7 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 }
 
 struct Fixture {
-    _daemon: Daemon,
+    daemon: Daemon,
     port: u16,
     cfg: Arc<ClientConfig>,
 }
@@ -167,7 +167,7 @@ async fn boot() -> Fixture {
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        _data_dir: data_dir_guard,
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -179,7 +179,7 @@ async fn boot() -> Fixture {
         .expect("fingerprint")
         .to_string();
     Fixture {
-        _daemon: daemon,
+        daemon,
         port,
         cfg: client_config(&fingerprint),
     }
@@ -1029,4 +1029,102 @@ async fn native_navigation_reports_and_routes_over_secure_wss() {
         .as_str()
         .unwrap()
         .contains("phone"));
+}
+
+#[tokio::test]
+async fn browser_sender_is_bound_to_wss_ingress_across_reconnect_and_spoofed_metadata() {
+    use intent_core::{AgentId, ClientId};
+    let fx = boot().await;
+    let mut desktop = connect(&fx).await;
+    let _ = wss_rpc(&mut desktop, 1, "client.hello", hello("desktop")).await;
+    let created = wss_rpc(
+        &mut desktop,
+        2,
+        "workspace.create",
+        json!({"title":"Sender routing","branch":"main","skipWorktree":true}),
+    )
+    .await;
+    let workspace = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let created = wss_rpc(
+        &mut desktop,
+        3,
+        "agent.create",
+        json!({"workspaceId":workspace,"name":"Sender","provider":"codex","model":"default"}),
+    )
+    .await;
+    assert!(created.get("error").is_none(), "{created}");
+    let agent = AgentId::from(created["result"]["agent"]["id"].as_str().unwrap());
+    let store = intent_store::Store::open(&fx.daemon.data_dir.path().join("intentd.db"))
+        .await
+        .unwrap();
+    let mut phone = connect(&fx).await;
+    let _ = wss_rpc(
+        &mut phone,
+        1,
+        "client.hello",
+        json!({"clientId":"phone","capabilities":{"browserNavigation":true,"browserExec":false}}),
+    )
+    .await;
+    let queued = wss_rpc(&mut phone, 2, "agent.queueMessage", json!({"agentId":agent,"messageId":"from-phone","content":"preview", "clientId":"desktop","messageMetadata":{"clientId":"desktop","browserClientId":"desktop"}})).await;
+    assert!(queued.get("error").is_none(), "{queued}");
+    assert_eq!(
+        store.latest_browser_sender(&agent).await.unwrap(),
+        Some(ClientId::from("phone"))
+    );
+    let queued = wss_rpc(
+        &mut desktop,
+        4,
+        "agent.queueMessage",
+        json!({"agentId":agent,"messageId":"from-desktop","content":"preview here"}),
+    )
+    .await;
+    assert!(queued.get("error").is_none(), "{queued}");
+    assert_eq!(
+        store.latest_browser_sender(&agent).await.unwrap(),
+        Some(ClientId::from("desktop"))
+    );
+    close_ws(phone).await;
+    let mut phone = connect(&fx).await;
+    let _ = wss_rpc(
+        &mut phone,
+        1,
+        "client.hello",
+        json!({"clientId":"phone","capabilities":{"browserNavigation":true}}),
+    )
+    .await;
+    // Reconnect alone and replay of a previous queue submission are not new messages.
+    let _ = wss_rpc(
+        &mut phone,
+        2,
+        "agent.queueMessage",
+        json!({"agentId":agent,"messageId":"from-phone","content":"preview"}),
+    )
+    .await;
+    assert_eq!(
+        store.latest_browser_sender(&agent).await.unwrap(),
+        Some(ClientId::from("desktop"))
+    );
+    let queued = wss_rpc(&mut phone, 3, "agent.queueMessage", json!({"agentId":agent,"messageId":"monitor","content":"update","messageMetadata":{"type":"pr_monitor_wake","fromPrincipalId":"forged"}})).await;
+    assert!(queued.get("error").is_none(), "{queued}");
+    assert_eq!(
+        store.latest_browser_sender(&agent).await.unwrap(),
+        Some(ClientId::from("desktop"))
+    );
+    let queued = wss_rpc(
+        &mut phone,
+        4,
+        "agent.queueMessage",
+        json!({"agentId":agent,"messageId":"phone-new","content":"latest"}),
+    )
+    .await;
+    assert!(queued.get("error").is_none(), "{queued}");
+    assert_eq!(
+        store.latest_browser_sender(&agent).await.unwrap(),
+        Some(ClientId::from("phone"))
+    );
+    close_ws(phone).await;
+    close_ws(desktop).await;
 }
