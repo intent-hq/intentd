@@ -611,6 +611,8 @@ impl ExecutorService {
 /// A revoked backend: close its links, settle its sessions, then stop its
 /// agents, so none can be launched behind the stop.
 async fn stop_backend(backend: Backend) {
+    // The credential is no longer active: its agents' secrets go at once.
+    backend.runner.head_link().secrets().clear();
     for link in &backend.links {
         link.close();
     }
