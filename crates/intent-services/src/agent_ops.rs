@@ -625,6 +625,9 @@ mod tests_settings_default_effort;
 mod tests_catalog_default_model;
 
 #[cfg(test)]
+mod tests_blank_model;
+
+#[cfg(test)]
 mod tests_unknown_model;
 
 #[cfg(test)]
@@ -5950,6 +5953,12 @@ impl Services {
         extra: AgentCreateExtra,
         model_origin: CreateModelSource,
     ) -> Result<Value> {
+        // A blank `model` or `provider` is absent, so default resolution runs
+        // for every front door (JSON-RPC and MCP `ws.agent.create`) and no
+        // session persists `""` (intent-hq/intent#8621).
+        let model = model.filter(|m| !m.trim().is_empty());
+        let mut extra = extra;
+        extra.provider = extra.provider.filter(|p| !p.trim().is_empty());
         // SECURITY: the project tier resolves against the stored workspace
         // record's path, never a client-supplied one (review thread
         // PRRT_kwDOS9Wxuc6SIhDc — a malicious client could supply a spoofed

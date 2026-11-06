@@ -7042,5 +7042,8 @@ mod catalog_lists;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod blank_model_tests;
+
 mod bounded_read;
 pub use bounded_read::REFUSE_OVER_CAP_WITHOUT_MAX_BYTES;
