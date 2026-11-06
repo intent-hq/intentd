@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.140] - 2026-11-06
+
+### 🚀 Features
+
+- Classified base-refresh-failed error, skipBaseRefresh, base-refresh progress ([#3091](https://github.com/intent-hq/intentd/pull/3091))
+- Tell a remote agent about submodules its setup script added on the machine ([#3092](https://github.com/intent-hq/intentd/pull/3092))
+
+### 🐛 Bug Fixes
+
+- *(remote)* Settle an expired final stop once and bind no link after shutdown ([#3098](https://github.com/intent-hq/intentd/pull/3098))
+- *(remote)* Refuse images too large for a remote agent's link before any effect ([#3087](https://github.com/intent-hq/intentd/pull/3087))
+- List a remote agent's git roots at their paths on its machine ([#3089](https://github.com/intent-hq/intentd/pull/3089))
+- *(remote)* Copy attachments of any size to a remote agent in pieces ([#3088](https://github.com/intent-hq/intentd/pull/3088))
+
+### 🧪 Testing
+
+- *(store)* Stamp the unrelated insert in the large-save row test ([#8616](https://github.com/intent-hq/intentd/pull/8616)) ([#3100](https://github.com/intent-hq/intentd/pull/3100))
+- Serve the payload sweep's account search from a loopback directory ([#3095](https://github.com/intent-hq/intentd/pull/3095))
+
+### ⚙️ Miscellaneous Tasks
+
+- Update Cargo.toml dependencies
+- *(deps)* Upgrade sqlx to 0.9 and bundled SQLite to 3.51.3 ([#3074](https://github.com/intent-hq/intentd/pull/3074))
+
+
 ## [0.11.139] - 2026-11-06
 
 ### 🐛 Bug Fixes
