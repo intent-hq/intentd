@@ -24,7 +24,7 @@ pub(crate) fn run(cwd: &Path, command: &[OsString]) -> ExitCode {
     }
     #[cfg(not(unix))]
     match child.status() {
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1).clamp(0, 255) as u8),
+        Ok(status) => ExitCode::from(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1)),
         Err(error) => {
             eprintln!(
                 "plugin-exec: cannot start {}: {error}",

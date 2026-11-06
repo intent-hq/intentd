@@ -19,7 +19,7 @@ fn skill(name: &str) -> String {
 }
 
 struct Fixture {
-    tmp: tempfile::TempDir,
+    _tmp: tempfile::TempDir,
     root: PathBuf,
     data: PathBuf,
 }
@@ -30,7 +30,11 @@ fn fixture(name: &str) -> Fixture {
     write(&root.join(MANIFEST_FILE), &manifest(name));
     let root = root.canonicalize().unwrap();
     let data = tmp.path().join("plugin-data").join(name);
-    Fixture { tmp, root, data }
+    Fixture {
+        _tmp: tmp,
+        root,
+        data,
+    }
 }
 
 fn load(f: &Fixture) -> LoadedPlugin {
@@ -123,7 +127,7 @@ fn skills_are_one_level_deep_and_bad_entries_are_skipped() {
 #[test]
 fn symlink_escapes_are_isolated_to_their_component() {
     let f = fixture("p");
-    let outside = f.tmp.path().join("outside");
+    let outside = f.root.parent().unwrap().parent().unwrap().join("outside");
     write(&outside.join("SKILL.md"), &skill("evil"));
     write(&f.root.join("skills/good/SKILL.md"), &skill("good"));
     std::os::unix::fs::symlink(&outside, f.root.join("skills/evil")).unwrap();

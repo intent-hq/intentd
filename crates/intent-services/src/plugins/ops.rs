@@ -307,24 +307,19 @@ fn copy_dir(from: &Path, to: &Path, remaining: &mut usize) -> Result<()> {
         let (src, dst) = (entry.path(), to.join(&name));
         let kind = entry.file_type().map_err(io_error("read plugin folder"))?;
         if kind.is_symlink() {
-            copy_link(&src, &dst)?;
+            // Links are copied as links so containment checks still apply;
+            // Windows plugin folders skip them.
+            #[cfg(unix)]
+            {
+                let target = std::fs::read_link(&src).map_err(io_error("copy plugin"))?;
+                std::os::unix::fs::symlink(target, &dst).map_err(io_error("copy plugin"))?;
+            }
         } else if kind.is_dir() {
             copy_dir(&src, &dst, remaining)?;
         } else if kind.is_file() {
             std::fs::copy(&src, &dst).map_err(io_error("copy plugin"))?;
         }
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn copy_link(src: &Path, dst: &Path) -> Result<()> {
-    let target = std::fs::read_link(src).map_err(io_error("copy plugin"))?;
-    std::os::unix::fs::symlink(target, dst).map_err(io_error("copy plugin"))
-}
-
-#[cfg(not(unix))]
-fn copy_link(_src: &Path, _dst: &Path) -> Result<()> {
     Ok(())
 }
 
