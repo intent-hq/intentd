@@ -7,6 +7,9 @@ run on intentd#3021), each forcing a full re-run with no code at fault. As in
 release-plz.yml (scripts/test-release-plz-network.py), ci.yml turns off HTTP/2
 multiplexing and raises cargo's own retries for every job, and the heavy PR
 jobs download the locked crates with backoff before their first build.
+nightly-payload-sweep.yml's full-scale job gets the same settings and fetch:
+its first `cargo test` died on the same framing error (serde_with, run
+41963501305, intent-hq/intent#8585), so the fixture test never ran.
 Requires PyYAML.
 
 Run: python3 -B scripts/test-ci-cargo-network.py
@@ -19,6 +22,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / '.github/workflows/ci.yml'
 RELEASE_PLZ = ROOT / '.github/workflows/release-plz.yml'
+NIGHTLY_SWEEP = ROOT / '.github/workflows/nightly-payload-sweep.yml'
 FETCH_RUN = 'python3 -I -B scripts/fetch-locked-crates.py'
 NETWORK_ENV = {'CARGO_HTTP_MULTIPLEXING': 'false', 'CARGO_NET_RETRY': '10'}
 # PR-reachable jobs that build the workspace; each fetches before its first build.
@@ -82,6 +86,34 @@ class CiCargoNetwork(unittest.TestCase):
     def test_this_suite_runs_in_release_scripts(self):
         steps = self.doc['jobs']['release-scripts']['steps']
         self.assertIn('python3 -B scripts/test-ci-cargo-network.py', yaml.safe_dump(steps, width=10_000))
+
+
+class NightlyPayloadSweepCargoNetwork(unittest.TestCase):
+    def setUp(self):
+        self.job = load(NIGHTLY_SWEEP)['jobs']['sweep']
+        self.steps = self.job['steps']
+
+    def test_job_env_disables_multiplexing_and_raises_retries(self):
+        env = self.job.get('env') or {}
+        for key, value in NETWORK_ENV.items():
+            self.assertEqual(env.get(key), value, f'sweep job env {key} (quoted string)')
+        for step in self.steps:
+            for key in (*NETWORK_ENV, 'CARGO_NET_OFFLINE'):
+                self.assertNotIn(key, step.get('env') or {}, f'{step.get("name")} overrides {key}')
+
+    def test_locked_crates_are_fetched_after_the_toolchain_and_before_the_sweep(self):
+        fetches = [i for i, s in enumerate(self.steps) if s.get('run') == FETCH_RUN]
+        self.assertEqual(len(fetches), 1, 'one retrying crate fetch')
+        fetch = fetches[0]
+        toolchain = next(i for i, s in enumerate(self.steps) if s.get('uses', '').startswith(TOOLCHAIN))
+        first_cargo = next(i for i, s in enumerate(self.steps) if runs_cargo(s))
+        self.assertLess(toolchain, fetch, 'the pinned toolchain is installed before fetching')
+        self.assertLess(fetch, first_cargo, f'fetch precedes {self.steps[first_cargo].get("name")!r}')
+        self.assertNotIn('if', self.steps[fetch], 'the fetch runs on every sweep')
+        self.assertNotIn('continue-on-error', self.steps[fetch], 'a failed fetch fails the job')
+
+    def test_fetch_script_documents_this_caller(self):
+        self.assertIn('nightly-payload-sweep.yml', (ROOT / 'scripts/fetch-locked-crates.py').read_text())
 
 
 if __name__ == '__main__':
