@@ -201,6 +201,16 @@ Open Settings and use these sidebar labels (English labels shown):
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
+In test builds with **Full width**, open **Settings → Appearance → Full width**.
+It is on by default. Turn it off to
+center the conversation, composer, and status content within an **800 px** limit.
+Narrower panels still use the available width, and aurora still covers the full
+panel. The chat pane's **More** menu also offers **Full width**, **Chat aurora**,
+and **Collapse tool activity** beside **Font**. These shortcuts change the same
+Appearance preferences for all chats on this device.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/ChatAppearanceSettings.svelte; src/lib/components/chat/ChatContentLane.svelte; src/features/layout/tab-types/AgentViewSettingsDropdown.svelte. Test-build behavior pending its frontend release. -->
+
 When the user asks the Assistant to change a setting, `ws.app.settings.propose` shows a
 change card the user applies or discards; the card can be undone. It accepts only
 settings whose definition has `proposable: true`. Credentials, remote access and
