@@ -88,10 +88,10 @@ class Download(unittest.TestCase):
 
     def test_network_errors_and_timeouts_are_retried(self):
         failures = [cache.urllib.error.URLError('reset'), TimeoutError('timed out'), ConnectionResetError(),
-                    cache.http.client.IncompleteRead(b'')]
-        calls, sleeps, data, error = self.run_download(failures, delays=(1, 1, 1, 1))
+                    cache.ssl.SSLError('bad record mac'), cache.http.client.IncompleteRead(b'')]
+        calls, sleeps, data, error = self.run_download(failures, delays=(1,) * 5)
         self.assertIsNone(error)
-        self.assertEqual((len(calls), data), (5, b'ok'))
+        self.assertEqual((len(calls), data), (6, b'ok'))
 
     def test_client_errors_fail_without_retry(self):
         for code in (403, 404, 429):
@@ -119,10 +119,11 @@ class Download(unittest.TestCase):
                 raise http_error(504)
             Path(dest).write_bytes(b'corrupt archive')
         with tempfile.TemporaryDirectory() as temp, patch.object(cache, 'fetch', fetch), \
-                patch.object(cache.time, 'sleep'), contextlib.redirect_stderr(io.StringIO()):
+                patch.object(cache.time, 'sleep') as sleep, contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
                 cache.install(Path(temp))
         self.assertEqual(len(attempts), 2)
+        sleep.assert_called_once_with(cache.RETRY_DELAYS[0])
         self.assertIn('/mozilla/sccache/releases/download/v', attempts[0])
 
 

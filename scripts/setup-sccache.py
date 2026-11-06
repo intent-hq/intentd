@@ -14,6 +14,7 @@ from pathlib import Path
 import platform
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -89,10 +90,10 @@ def fetch(url, dest):
 def transient(error):
     if isinstance(error, urllib.error.HTTPError):
         return error.code >= 500
-    return isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException))
+    return isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException))
 
 
-def download(url, dest, delays=RETRY_DELAYS, sleep=time.sleep):
+def download(url, dest, delays=RETRY_DELAYS, sleep=None):
     """fetch() with bounded retries on transient failures; re-raises the last error."""
     for attempt, delay in enumerate((*delays, None), start=1):
         try:
@@ -102,7 +103,7 @@ def download(url, dest, delays=RETRY_DELAYS, sleep=time.sleep):
                 raise
             print(f"::warning::sccache download attempt {attempt} failed ({error}); "
                   f"retrying in {delay}s", file=sys.stderr)
-            sleep(delay)
+            (sleep or time.sleep)(delay)
 
 
 def install(directory):
