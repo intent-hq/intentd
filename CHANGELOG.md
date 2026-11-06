@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.137] - 2026-11-06
+
+### 🚀 Features
+
+- *(providers)* Add Cursor as an ACP agent provider ([#3073](https://github.com/intent-hq/intentd/pull/3073))
+- *(remote)* Keep a remote agent's secrets on its machine (nodeProtocol 14) ([#3081](https://github.com/intent-hq/intentd/pull/3081))
+
+### 🐛 Bug Fixes
+
+- Treat a blank agent.create model as absent ([#3069](https://github.com/intent-hq/intentd/pull/3069))
+- *(agent)* Let a batch delegation choose a machine ([#3082](https://github.com/intent-hq/intentd/pull/3082))
+
+### 📚 Documentation
+
+- List Cmd+Shift+[ / ] for workspace tabs in assistant guide ([#3068](https://github.com/intent-hq/intentd/pull/3068))
+- Describe workspace creation progress ([#3080](https://github.com/intent-hq/intentd/pull/3080))
+- Describe full width chat controls ([#3079](https://github.com/intent-hq/intentd/pull/3079))
+
+
 ## [0.11.136] - 2026-11-05
 
 ### 🚀 Features
