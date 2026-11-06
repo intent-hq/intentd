@@ -12,7 +12,7 @@
 //! The node's internal frames (its commit-policy read, a call's cards, the
 //! placement text and an attachment's bytes) are answered here directly.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +23,7 @@ use intent_core::node_link::{
 };
 use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
-    INTERNAL_METHODS, MAX_FORWARDED_ATTACHMENTS, MAX_LINK_ATTACHMENT_BYTES,
+    GIT_ROOTS_METHOD, INTERNAL_METHODS, MAX_FORWARDED_ATTACHMENTS, MAX_LINK_ATTACHMENT_BYTES,
     MCP_PROXY_CALL_TOOL_METHOD, MCP_PROXY_LINK_TIMEOUT, MCP_PROXY_LIST_TOOLS_METHOD,
     PLACEMENT_HELP_METHOD,
 };
@@ -278,11 +278,7 @@ impl HeadCalls {
             .get_workspace(&record.workspace_id)
             .await
         {
-            Ok(workspace) => workspace
-                .worktree_path
-                .or(workspace.repository_path)
-                .filter(|path| !path.is_empty())
-                .map(PathBuf::from),
+            Ok(workspace) => crate::launch::checkout_path(&workspace),
             Err(error) => {
                 tracing::debug!(%error, "no workspace checkout for a remote agent's git roots");
                 None
@@ -317,10 +313,6 @@ impl HeadCalls {
         Value::Array(rows)
     }
 }
-
-/// The forwarded call whose roots head lists as the agent's machine has
-/// them.
-const GIT_ROOTS_METHOD: &str = "git.listRoots";
 
 impl HeadCalls {
     /// One of the provider's proxied user MCP requests (nodeProtocol 11),

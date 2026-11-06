@@ -25,7 +25,7 @@ use intent_acp::{HostFrameRouter, McpBridge, NormalizedMcpServer, WorkspaceMcpSe
 use intent_core::node_link::{LinkOutcome, McpProxy, PREPARED_CHECKOUT_PROTOCOL, SECRETS_PROTOCOL};
 use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
-    MCP_PROXY_LINK_TIMEOUT, PLACEMENT_HELP_METHOD,
+    GIT_ROOTS_METHOD, MCP_PROXY_LINK_TIMEOUT, PLACEMENT_HELP_METHOD,
 };
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
@@ -272,35 +272,40 @@ async fn described_server(
 /// The forwarded call whose `setupStatus` the machine replaces.
 const DETAILS_METHOD: &str = "workspace.details";
 
-/// The forwarded call whose roots the machine resolves in the checkout.
-const GIT_ROOTS_METHOD: &str = "git.listRoots";
-
 /// Head's `git.listRoots` rows with each relative `path` made absolute in
-/// `checkout`, with that repository's branch read there. Absolute paths (an
-/// older backend's) and a non-list answer are left as they are.
-fn resolve_roots(checkout: &Path, mut roots: Value) -> Value {
-    for row in roots.as_array_mut().into_iter().flatten() {
-        let Some(fields) = row.as_object_mut() else {
-            continue;
-        };
-        let Some(rel) = fields
-            .get("path")
-            .and_then(Value::as_str)
-            .filter(|path| Path::new(path).is_relative())
-        else {
-            continue;
-        };
-        let path = checkout.join(rel);
-        fields.insert(
-            "path".to_owned(),
-            Value::String(path.to_string_lossy().into_owned()),
-        );
-        match intent_git::status::current_branch_at(&path) {
-            Some(branch) => fields.insert("branch".to_owned(), Value::String(branch)),
-            None => fields.remove("branch"),
-        };
-    }
-    roots
+/// `checkout`, with that repository's branch read there. A relative row
+/// whose repository is not checked out on this machine is left out.
+/// Absolute paths (an older backend's) and a non-list answer are left as
+/// they are.
+fn resolve_roots(checkout: &Path, roots: Value) -> Value {
+    let Value::Array(rows) = roots else {
+        return roots;
+    };
+    let rows = rows
+        .into_iter()
+        .filter_map(|mut row| {
+            let Some(rel) = row
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| Path::new(path).is_relative())
+            else {
+                return Some(row);
+            };
+            let path = checkout.join(rel);
+            std::fs::symlink_metadata(path.join(".git")).ok()?;
+            let fields = row.as_object_mut()?;
+            match intent_git::status::current_branch_at(&path) {
+                Some(branch) => fields.insert("branch".to_owned(), Value::String(branch)),
+                None => fields.remove("branch"),
+            };
+            fields.insert(
+                "path".to_owned(),
+                Value::String(path.to_string_lossy().into_owned()),
+            );
+            Some(row)
+        })
+        .collect();
+    Value::Array(rows)
 }
 
 /// How long the node waits for head to answer its own policy read.

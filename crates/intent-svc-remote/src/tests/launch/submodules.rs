@@ -729,5 +729,13 @@ async fn a_remote_agents_git_roots_are_its_carried_submodules_relative_to_the_ch
             "head's branch is not the machine's: {root}"
         );
     }
+
+    // An agent placed before pins were captured has no submodules on its
+    // machine, so no root.
+    let (before, mut view) = f.placed().await;
+    view.submodules = None;
+    f.set_view(&before, &view).await;
+    let none = answered(forward(&link, &before, "git.listRoots", json!({})).await);
+    assert_eq!(none, json!([]));
     f.node.shutdown();
 }

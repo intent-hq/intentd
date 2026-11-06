@@ -1150,8 +1150,9 @@ async fn secret_env_is_refused_on_an_older_link() {
 
 /// Head lists a remote agent's git roots relative to its checkout; the
 /// machine makes each one absolute in the agent's checkout and reads its
-/// branch there. A row head already made absolute (an older backend) and
-/// a non-list answer pass through (intent-hq/intent#8692).
+/// branch there, and leaves out one not checked out on the machine. A row
+/// head already made absolute (an older backend) passes through
+/// (intent-hq/intent#8692).
 #[tokio::test]
 async fn git_roots_from_head_are_resolved_in_the_agents_checkout() {
     let dir = tempfile::tempdir().unwrap();
@@ -1184,6 +1185,7 @@ async fn git_roots_from_head_are_resolved_in_the_agents_checkout() {
                     .respond(LinkOutcome::Ok(json!([
                         { "id": "r-1", "path": "a/b", "source": "auto" },
                         { "id": "r-2", "path": "/backend/ws/c", "branch": "main" },
+                        { "id": "r-3", "path": "missing", "source": "auto" },
                     ])))
                     .await
                     .unwrap();
