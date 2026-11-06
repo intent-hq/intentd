@@ -565,6 +565,11 @@ It ships with Intent releases on npm. It is unrelated to the experimental deskto
 
 ## Start or continue work
 
+The **New Workspace** form focuses the prompt box when it opens, so you can type
+your task immediately.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/modals/NewSpaceModal.svelte. -->
+
 When a new workspace uses a remote-tracking base branch from a local repository,
 Intent fetches that branch before creating the checkout; progress shows
 "Updating <base> from <remote>…". If the fetch fails, creation stops and the
