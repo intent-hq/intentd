@@ -827,7 +827,6 @@ async fn run_sweep(scale: &LargeStateScale, baseline_file: &str) {
     sweep_lane(&mut client, &event_rows, &mut measured, &mut failures).await;
     sweep_rows(&daemon, &table, &mut measured, &mut failures).await;
     let rows_done = started.elapsed();
-    failures.extend(account_directory_problems(&daemon.accounts));
     sweep_goldens(&mut client, CANNOT_EXERCISE, &ctx, &mut failures).await;
     sweep_goldens(
         &mut client,
@@ -866,6 +865,8 @@ async fn run_sweep(scale: &LargeStateScale, baseline_file: &str) {
         report_path.display(),
         text.lines().take(40).collect::<Vec<_>>().join("\n")
     );
+
+    failures.extend(account_directory_problems(&daemon.accounts));
 
     let offenders: BTreeMap<(String, String), usize> = measured
         .iter()
@@ -906,7 +907,9 @@ async fn run_sweep(scale: &LargeStateScale, baseline_file: &str) {
 
 /// The sweep must stay off the network: `host.invite.searchAccounts`
 /// (`default` + `max`) has to have been served by the loopback directory,
-/// and nothing else may have asked it for a path it does not serve.
+/// and nothing else may have asked it for a path it does not serve. Checked
+/// after every pass (rows, goldens, snapshots, bulk) so a stray request from
+/// any of them is reported.
 fn account_directory_problems(accounts: &proxies::AccountDirectory) -> Vec<String> {
     let mut problems = Vec::new();
     if accounts.hits() < 2 {

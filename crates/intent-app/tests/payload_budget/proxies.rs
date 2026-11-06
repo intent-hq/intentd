@@ -692,6 +692,12 @@ const ACCOUNT_SEARCH_MAX: usize = 10;
 /// there failed the sweep, intent-hq/intent#8703). Every reply carries the
 /// most accounts the method returns, each with a maximal login and long
 /// name and avatar fields, so the sweep measures the largest page.
+///
+/// The override redirects every GitHub API read that honours
+/// `github_api_base_uri` (invite identity and collaboration verification
+/// too), not only account search. Those paths get a 404 and are reported as
+/// unexpected requests: a row that needs them must teach this directory the
+/// endpoint rather than reach the real GitHub.
 pub struct AccountDirectory {
     base: String,
     hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
