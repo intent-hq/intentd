@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.142] - 2026-11-06
+
+### 🚀 Features
+
+- App-wide Agent Plugins with skills and MCP servers for every provider ([#3101](https://github.com/intent-hq/intentd/pull/3101))
+
+### 📚 Documentation
+
+- Clarify codebase selection and branch recovery ([#3108](https://github.com/intent-hq/intentd/pull/3108))
+
+### 🧪 Testing
+
+- Make specialists burst debounce test load-independent ([#3106](https://github.com/intent-hq/intentd/pull/3106))
+
+
 ## [0.11.141] - 2026-11-06
 
 ### 🐛 Bug Fixes
