@@ -9,7 +9,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -41,7 +41,7 @@ async fn boot() -> Fixture {
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(common::registry_with_default_provider(&dir))
         .with_event_bus(bus.clone());
@@ -207,7 +207,8 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
     .await;
 
     // Await the batched wake landing in the subscriber's conversation.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     let mut req_id = 6;
     loop {
         let text = conversation_text(&mut rpc, req_id, &ws_id, &subscriber).await;

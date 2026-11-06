@@ -29,7 +29,7 @@ jobs:
           fi
           # The /releases/latest URL redirects to /releases/tag/vX.Y.Z;
           # read the tag off the final URL (no API rate limits, no JSON).
-          final_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+          final_url=$(curl --retry 5 --retry-connrefused -fsSLI -o /dev/null -w '%{url_effective}' \
             https://github.com/cli/cli/releases/latest)
           tag="${final_url##*/}"
           version="${tag#v}"
@@ -59,8 +59,8 @@ jobs:
           cd "$tmp"
           asset="gh_${GH_VERSION}_macOS_arm64.zip"
           base="https://github.com/cli/cli/releases/download/v${GH_VERSION}"
-          curl -fsSLO "$base/$asset"
-          curl -fsSLO "$base/gh_${GH_VERSION}_checksums.txt"
+          curl --retry 5 --retry-connrefused -fsSLO "$base/$asset"
+          curl --retry 5 --retry-connrefused -fsSLO "$base/gh_${GH_VERSION}_checksums.txt"
           grep " ${asset}\$" "gh_${GH_VERSION}_checksums.txt" | shasum -a 256 -c -
           ditto -x -k "$asset" extracted
           mkdir -p "$dest"

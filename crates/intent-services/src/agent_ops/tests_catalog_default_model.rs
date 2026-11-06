@@ -41,7 +41,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
     registry
         .apply(&[("model.defaultProvider".into(), json!("auggie"))])
         .expect("seed default provider");
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_settings_registry(registry)
         .with_specialist_dirs(
             Some(specialists_dir.path().to_path_buf()),

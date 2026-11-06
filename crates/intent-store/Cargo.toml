@@ -1,6 +1,6 @@
 [package]
 name = "intent-store"
-version = "0.10.46"
+version = "0.11.141"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,11 +8,25 @@ license.workspace = true
 description = "SQLite + file-tree persistence (repositories, migrations, locking)"
 
 [package.metadata.cargo-shear]
-# Compiled separately by tests/store_pool_api.rs to assert rejected pool APIs.
-ignored-paths = ["tests/ui/store_pool_*.rs"]
+# Compiled separately by tests/store_pool_api.rs, tests/note_write_lock_api.rs
+# and tests/agent_session_summary_api.rs to assert rejected pool,
+# note-write-lock and summary write-back APIs.
+ignored-paths = [
+    "tests/ui/store_pool_*.rs",
+    "tests/ui/note_write_lock_*.rs",
+    "tests/ui/agent_session_summary_*.rs",
+]
+
+[features]
+# Note write-lock observation seams (`Store::note_content_lock_users` /
+# `note_content_locks_idle`) for other crates' tests. Enable only from
+# `[dev-dependencies]`: Cargo then turns it on for builds that also compile
+# test targets (`cargo test`, `--all-targets`), never for release/packaging
+# builds of the daemon.
+test-support = []
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.10.46" }
+intent-core = { path = "../intent-core", version = "0.11.141" }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,18 +39,16 @@ image = { version = "0.25.6", default-features = false, features = ["png", "jpeg
 flate2 = "1.1.9"
 futures-util = "0.3"
 async-stream = "0.3"
-
-hmac = "0.12"
 sha2 = "0.10"
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-html5gum = { version = "=0.8.4", default-features = false }
-html5ever = "=0.29.1"
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
-regex = "1"
+intentd-test-support = { path = "../intentd-test-support" }
+# The same copy sqlx links (`links = "sqlite3"`): tests/store_open_fsync_stall.rs
+# wraps its VFS and tests/sqlite_version.rs asserts the >= 3.51.3 floor.
+libsqlite3-sys = { workspace = true }
 trybuild = "1"
 tempfile = "3"
 tokio = { workspace = true }

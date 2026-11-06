@@ -2,13 +2,52 @@
 use super::*;
 use serde_json::json;
 
+/// A local github.com stand-in that answers every request (`GET /user`
+/// included) with the owner's account: sharing requires a connected owner
+/// forge, and the result must not depend on the host's own credentials.
+async fn owner_forge() -> String {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                if stream.read_exact(&mut byte).await.is_err() {
+                    break;
+                }
+                request.push(byte[0]);
+            }
+            let body = json!({"id":9000,"login":"owner","name":"Owner","avatar_url":null,
+                "html_url":"https://github.com/owner"})
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    url
+}
+
 pub(super) async fn start_roster() -> (Server, Services) {
     let (_, bus, store, settings, dir) = make_services(None, None).await;
     let reverse_registry = Arc::new(PrimaryReverseRegistry::new());
-    let services = Services::new(store.clone())
+    let forge = owner_forge().await;
+    let services = Services::new_isolated(store.clone())
         .with_settings_registry(settings.clone())
         .with_event_bus(bus.clone())
-        .with_reverse_dispatch(reverse_registry.clone());
+        .with_reverse_dispatch(reverse_registry.clone())
+        .with_gitlab_secret_store(intent_core::FileSecretStore::with_path(
+            dir.path().join("secrets.json"),
+        ))
+        .with_source_control(Arc::new(
+            intent_sourcecontrol::github::GitHubSourceControl::new("owned-fixture", Some(&forge))
+                .unwrap(),
+        ));
     let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
     let tls = ensure_tls_certificate(dir.path()).unwrap();
     let tokens = Arc::new(AsyncTokenStore::new(Arc::new(MemTokenStore::default())));
@@ -155,37 +194,40 @@ async fn watch(client: &mut Guest) {
 }
 
 async fn own_event(client: &mut Guest, kind: &str, id: &str) -> Value {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match client.ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] != "events.event" {
-                        continue;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match client.ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] != "events.event" {
+                            continue;
+                        }
+                        assert_eq!(v["jsonrpc"], "2.0");
+                        let event = &v["params"]["event"];
+                        if event["type"]
+                            .as_str()
+                            .is_some_and(|t| t.starts_with("client:"))
+                        {
+                            assert_eq!(
+                                event["data"]["principalId"],
+                                client.principal.id.as_str(),
+                                "guest saw another person"
+                            );
+                        }
+                        if event["type"] == kind && event["data"]["clientId"] == id {
+                            return event["data"].clone();
+                        }
                     }
-                    assert_eq!(v["jsonrpc"], "2.0");
-                    let event = &v["params"]["event"];
-                    if event["type"]
-                        .as_str()
-                        .is_some_and(|t| t.starts_with("client:"))
-                    {
-                        assert_eq!(
-                            event["data"]["principalId"],
-                            client.principal.id.as_str(),
-                            "guest saw another person"
-                        );
+                    Some(Ok(Message::Ping(bytes))) => {
+                        client.ws.send(Message::Pong(bytes)).await.unwrap();
                     }
-                    if event["type"] == kind && event["data"]["clientId"] == id {
-                        return event["data"].clone();
-                    }
+                    other => panic!("expected device event: {other:?}"),
                 }
-                Some(Ok(Message::Ping(bytes))) => {
-                    client.ws.send(Message::Pong(bytes)).await.unwrap();
-                }
-                other => panic!("expected device event: {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("own device event")
 }

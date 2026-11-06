@@ -12,13 +12,45 @@
 pub mod claude_npx;
 #[cfg(unix)]
 pub mod codex_npx;
+#[cfg(unix)]
+pub mod uds_exchange;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use std::sync::{Arc, Mutex, Once};
 use std::thread::ThreadId;
 use std::time::Duration;
+
+/// Names an async test helper's caller when the helper panics.
+///
+/// `#[track_caller]` is a no-op on an `async fn` (rust-lang/rust#110011), so
+/// an async helper's failure reports a line inside the helper. A sync
+/// `#[track_caller]` fn that captures `Location::caller()` and returns the
+/// future can hold this guard inside it: any panic in the future — an
+/// assertion, a timeout, an `unwrap()` — then also prints the calling test
+/// line. See `test_helper_track_caller_lint`.
+pub struct CallerOnPanic(pub &'static std::panic::Location<'static>);
+
+impl Drop for CallerOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("note: the failing helper was called at {}", self.0);
+        }
+    }
+}
+
+/// The libtest name of test `name` declared in the module whose
+/// `module_path!()` is `module_path`: that path below the crate root, then
+/// `name`. A test re-executing its own binary with `--exact` must pass this,
+/// not the bare function name: a test file built as a module of a suite target
+/// (`tests/suite_*.rs`) names its tests `<file>::<test>`, and an `--exact`
+/// filter matching nothing makes libtest exit 0 having run no test at all.
+pub fn exact_test_name(module_path: &str, name: &str) -> String {
+    match module_path.split_once("::") {
+        Some((_, below_root)) => format!("{below_root}::{name}"),
+        None => name.to_owned(),
+    }
+}
 
 /// The four repository retirement feeds share the response connection. Their
 /// typed, nonsecret envelopes are notifications, never an RPC acknowledgment.
@@ -90,16 +122,11 @@ fn force_hermetic_root_guard() {
 }
 
 /// Apply the timeout multiplier from the environment for coverage
-/// instrumentation. Reads `INTENTD_TEST_TIMEOUT_MULTIPLIER` (defaults to 1.0;
-/// non-finite values are ignored and values below 1.0 are clamped so budgets
-/// can only be extended; overflow saturates to `Duration::MAX`).
+/// instrumentation: delegates to [`intentd_test_support::test_timeout`]
+/// (`INTENTD_TEST_TIMEOUT_MULTIPLIER`, defaults to 1.0, never below 1.0,
+/// capped at 20x, saturating to `Duration::MAX`).
 pub fn test_timeout(base: Duration) -> Duration {
-    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|m| m.is_finite())
-        .unwrap_or(1.0);
-    Duration::try_from_secs_f64(base.as_secs_f64() * multiplier.max(1.0)).unwrap_or(Duration::MAX)
+    intentd_test_support::test_timeout(base)
 }
 
 /// Shared budget for waiting on daemon startup (UDS/socket ready): 60s base,
@@ -328,7 +355,7 @@ fn retained_dir_report(test: &str, original: &Path, retained: &Path) -> String {
 ///
 /// In-process integration tests must chain
 /// `.with_workspaces_root(root.path().to_path_buf())` onto every
-/// `Services::new(...)` so tests never resolve the real `~/intent/workspaces`.
+/// `Services::new_isolated(...)` so tests never resolve the real `~/intent/workspaces`.
 /// The returned `TempDir` guard must be held for the full test lifetime: it
 /// removes the tree on drop (including on panic), so dropping it early would
 /// let the services layer recreate — and leak — the root. Set
@@ -342,7 +369,7 @@ pub fn hermetic_workspaces_root() -> tempfile::TempDir {
 /// provider fallback, so in-process tests that create/delegate agents without
 /// an explicit provider or model must chain
 /// `.with_settings_registry(common::registry_with_default_provider(dir))`
-/// onto `Services::new(...)` to have a configured default to resolve to. The
+/// onto `Services::new_isolated(...)` to have a configured default to resolve to. The
 /// `providers.paths` override points auggie at a deterministic executable so
 /// availability checks (`agent.delegate`) pass without the real binary on
 /// the test host.
@@ -367,18 +394,22 @@ pub fn registry_with_default_provider(
     registry
 }
 
-/// Wait until a freshly spawned `intentd serve` child accepts connections on
+/// Wait until a freshly spawned `intentd serve` child serves application RPCs on
 /// its UDS `socket`, budgeted by [`daemon_startup_timeout`]. Fails fast —
 /// panicking with the daemon log — if the child exits before listening, so
 /// tests don't keep polling a dead daemon for the full window. Unix-only
 /// (UDS); gated so test binaries without `#![cfg(unix)]` still compile
 /// `common` on non-Unix targets and keep the ctor guard.
 #[cfg(unix)]
-pub async fn await_daemon_listening(child: &mut Child, socket: &Path, log_path: &Path) {
+pub async fn await_daemon_listening(
+    child: &mut std::process::Child,
+    socket: &Path,
+    log_path: &Path,
+) {
     let budget = daemon_startup_timeout();
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if tokio::net::UnixStream::connect(socket).await.is_ok() {
+        if daemon_is_ready(socket).await {
             return;
         }
         if let Ok(Some(status)) = child.try_wait() {
@@ -399,32 +430,54 @@ pub async fn await_daemon_listening(child: &mut Child, socket: &Path, log_path: 
     }
 }
 
-/// One `system.status` round-trip over the daemon's UDS control socket. The
-/// whole connect + write + read sequence shares a single `budget` timeout so a
-/// wedged daemon cannot stall the readiness poll below beyond that bound.
-#[cfg(unix)]
+/// A listening startup socket is not application readiness. Probe only a read;
+/// never retry a test's writes or open its store while migrations are running.
+#[cfg(any(unix, windows))]
+pub async fn daemon_is_ready(socket: &Path) -> bool {
+    try_status_rpc(socket, Duration::from_secs(1))
+        .await
+        .is_ok_and(|reply| reply["result"].is_object())
+}
+
+/// One `system.status` round-trip over the daemon's local control transport
+/// (UDS on Unix, named pipe on Windows). The whole connect + write + read
+/// sequence shares a single `budget` timeout, including a busy pipe instance.
+#[cfg(any(unix, windows))]
 async fn try_status_rpc(socket: &Path, budget: Duration) -> Result<serde_json::Value, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let rpc = async {
+        #[cfg(unix)]
         let stream = tokio::net::UnixStream::connect(socket)
             .await
             .map_err(|e| format!("uds connect failed: {e}"))?;
+        #[cfg(unix)]
         let (read_half, mut write_half) = stream.into_split();
+        #[cfg(windows)]
+        let (read_half, mut write_half) = {
+            let pipe = intent_transport::pipe_name_for_socket_path(socket)
+                .map_err(|e| format!("pipe name failed: {e}"))?;
+            // A busy pipe is not ready yet; the caller's bounded poll retries
+            // this read-only probe on a fresh connection, never a test write.
+            let stream = tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(&pipe)
+                .map_err(|e| format!("pipe connect failed: {e}"))?;
+            tokio::io::split(stream)
+        };
         let frame = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"system.status\",\"params\":{}}\n";
         write_half
             .write_all(frame.as_bytes())
             .await
-            .map_err(|e| format!("uds write failed: {e}"))?;
+            .map_err(|e| format!("control write failed: {e}"))?;
         write_half
             .flush()
             .await
-            .map_err(|e| format!("uds write failed: {e}"))?;
+            .map_err(|e| format!("control write failed: {e}"))?;
         let mut buf = String::new();
         BufReader::new(read_half)
             .read_line(&mut buf)
             .await
-            .map_err(|e| format!("uds read failed: {e}"))?;
+            .map_err(|e| format!("control read failed: {e}"))?;
         serde_json::from_str(buf.trim_end()).map_err(|e| format!("invalid JSON frame: {e}"))
     };
     tokio::time::timeout(budget, rpc)
@@ -614,7 +667,11 @@ pub fn hermetic_serve_command(data_dir: &Path) -> std::process::Command {
 /// Sets no TCP-port env override, preserving explicit pins and listener restarts.
 pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve").env("INTENTD_DATA_DIR", data_dir);
+    // A sandbox daemon's shell may export the user-tier relocation; fixtures
+    // own their user tier through HOME.
+    cmd.arg("serve")
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env_remove("INTENTD_USER_SPECIALISTS_DIR");
     hermetic_fixture_identity(&mut cmd, data_dir);
     cmd
 }
@@ -626,7 +683,20 @@ pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Comma
 /// The private secrets file may contain deliberately seeded state and is never
 /// truncated (restarts must retain it); symlinks and non-files are rejected.
 /// Intentional identity tests can layer private mock configuration afterwards.
+///
+/// Also pins startup resume off ([`RESUME_ON_START_TEST_DEFAULT_ENV`] =
+/// `off`) unless the command already sets a value for it (an
+/// [`opt_into_resume_on_start`] opt-in survives a later reset; an
+/// `env_remove` or an inherited host value does not). Every daemon fixture
+/// passes through here — `serve_spawn_lint.rs` requires it — so no restart
+/// can quietly resume an interrupted turn on a headless CI runner.
 pub fn hermetic_fixture_identity(cmd: &mut std::process::Command, data_dir: &Path) {
+    let resume_is_caller_owned = cmd.get_envs().any(|(key, value)| {
+        key == std::ffi::OsStr::new(RESUME_ON_START_TEST_DEFAULT_ENV) && value.is_some()
+    });
+    if !resume_is_caller_owned {
+        cmd.env(RESUME_ON_START_TEST_DEFAULT_ENV, "off");
+    }
     let gh_config_dir = data_dir.join("gh-config");
     match std::fs::create_dir(&gh_config_dir) {
         Ok(()) => {}
@@ -674,6 +744,7 @@ pub fn hermetic_fixture_identity(cmd: &mut std::process::Command, data_dir: &Pat
 /// Deliberate mock-token exception. Call only with a test-owned synthetic token
 /// and a loopback API mock; a statement-local fixture-identity marker names the
 /// scenario. Restore private paths first so generic overrides cannot leak in.
+#[track_caller]
 pub fn mock_github_token(cmd: &mut std::process::Command, data_dir: &Path, token: &str) {
     hermetic_fixture_identity(cmd, data_dir);
     let endpoint = |key: &str| {
@@ -704,7 +775,9 @@ pub fn mock_github_token(cmd: &mut std::process::Command, data_dir: &Path, token
 /// The PTY driver execs the daemon through bash. Copy the supported constructor's
 /// complete environment, including explicit removals, into its wrapper command.
 /// `portable_pty` snapshots the environment at construction; `env_remove` deletes
-/// inherited entries from that snapshot as well as explicit overrides.
+/// inherited entries from that snapshot as well as explicit overrides. The
+/// snapshot cannot tell an inherited resume-on-start value from an explicit
+/// one, so PTY daemons always take the constructor's `off` pin.
 pub fn hermetic_pty_fixture_identity(cmd: &mut portable_pty::CommandBuilder, data_dir: &Path) {
     let isolated = hermetic_serve_command(data_dir);
     for (key, value) in isolated.get_envs() {
@@ -770,6 +843,7 @@ pub fn enable_ws_api(data_dir: &std::path::Path) {
 /// `agent.delegate`'s `ensure_provider_available`) stay hermetic — no real
 /// auggie binary required on the test host (monorepo#3162). Appends to an
 /// existing seeded config; no-op if a `[model]` table is already present.
+#[track_caller]
 pub fn seed_default_provider(data_dir: &std::path::Path) {
     std::fs::create_dir_all(data_dir).expect("mkdir data dir");
     let path = data_dir.join("config.toml");
@@ -790,42 +864,24 @@ pub fn seed_default_provider(data_dir: &std::path::Path) {
     std::fs::write(&path, text).expect("seed config.toml with model.defaultProvider");
 }
 
-/// Seed `config.toml` with `[agents] resumeInterruptedOnStart = "off"` so a
-/// restarted daemon does NOT auto-resume pending interrupted agents. Restart
-/// suites that assert rows stay pending in `agent.listInterrupted` need this
-/// pin: the setting defaults to `auto`, which resumes on headless hosts (no
-/// display) — exactly what CI runners are. Appends to an existing seeded
-/// config; idempotent when the pin is already present (restart suites call
-/// this on every daemon boot). Panics if an `[agents]` table exists WITHOUT
-/// the pin — silently skipping would only surface as a flake on headless
-/// runners.
-pub fn disable_resume_on_start(data_dir: &std::path::Path) {
-    std::fs::create_dir_all(data_dir).expect("mkdir data dir");
-    let path = data_dir.join("config.toml");
-    let mut text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => panic!("read {}: {e}", path.display()),
-    };
-    if text.lines().any(|l| l.trim_start().starts_with("[agents]")) {
-        if text
-            .lines()
-            .any(|l| l.trim() == "resumeInterruptedOnStart = \"off\"")
-        {
-            return;
-        }
-        panic!(
-            "{} already has an [agents] table without resumeInterruptedOnStart = \
-             \"off\" — disable_resume_on_start cannot append a second table; merge \
-             the pin into the existing [agents] table at the test site instead",
-            path.display()
-        );
-    }
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str("\n[agents]\nresumeInterruptedOnStart = \"off\"\n");
-    std::fs::write(&path, text).expect("seed config.toml with agents.resumeInterruptedOnStart");
+/// Daemon env seam (defined in `intent_core`, read in `intentd` `main.rs`;
+/// an invalid value fails daemon startup) that resolves an
+/// `agents.resumeInterruptedOnStart` of `auto` — the schema default, also
+/// written by the generated config template on a fresh data dir — while an
+/// explicit `on` / `off`, `--resume-all`, and update restarts still win.
+/// [`hermetic_fixture_identity`] pins it to `off` for every fixture daemon:
+/// `auto` resumes interrupted agents only on headless hosts, so restart
+/// suites used to pick up an extra agent turn on CI runners alone
+/// (intent-hq/intent#6058, intent-hq/intent#7706).
+pub const RESUME_ON_START_TEST_DEFAULT_ENV: &str =
+    intent_core::settings_file::RESUME_ON_START_TEST_DEFAULT_ENV;
+
+/// Opt a fixture daemon back into startup resume of interrupted agents.
+/// Sets `on` (not the production `auto`) so recovery tests resume on every
+/// host, display or not. Survives a later [`hermetic_fixture_identity`]
+/// reset; call on every boot that should resume.
+pub fn opt_into_resume_on_start(cmd: &mut std::process::Command) {
+    cmd.env(RESUME_ON_START_TEST_DEFAULT_ENV, "on");
 }
 
 /// The pinned-TLS WebSocket client stream type shared by the WSS e2e suites.
@@ -1009,17 +1065,43 @@ pub async fn wss_connect_with_retry(port: u16, cfg: Arc<rustls::ClientConfig>, u
     }
 }
 
+/// The process a [`DaemonGuard`] owns: an `intentd_test_support::GuardedChild`
+/// on Unix — its own process group, killed with the group on drop and by a
+/// watchdog when the test process itself dies (a nextest timeout runs no
+/// `Drop`) — and a plain `Child` on Windows, which has no process groups.
+#[cfg(unix)]
+pub type DaemonChild = intentd_test_support::GuardedChild;
+/// See the Unix definition; Windows has no process groups to guard.
+#[cfg(not(unix))]
+// raw-child: allow — GuardedChild is Unix-only; Windows has no process groups
+pub type DaemonChild = std::process::Child;
+
+/// Spawn `cmd` as a [`DaemonChild`] (see there for the platform split).
+///
+/// # Errors
+///
+/// Any error from spawning the command.
+pub fn spawn_guarded(cmd: &mut std::process::Command) -> std::io::Result<DaemonChild> {
+    #[cfg(unix)]
+    {
+        intentd_test_support::GuardedChild::spawn(cmd)
+    }
+    #[cfg(not(unix))]
+    {
+        cmd.spawn()
+    }
+}
+
 /// RAII guard for a spawned `intentd serve` process.
 ///
-/// Ensures the daemon child process is killed on drop (SIGKILL to the process
-/// group) and optionally removes the temp data directory. This prevents leaked
-/// daemon processes when tests panic or abort before explicit cleanup.
-///
-/// The guard sends SIGKILL to the process group (not just the parent PID),
-/// which also terminates any child processes spawned by the daemon (e.g., Node
-/// mock agents in ACP provider tests).
+/// Holds a [`DaemonChild`], so on Unix the daemon and everything left in its
+/// process group are killed when the guard drops, on panic, and — via the
+/// `GuardedChild` watchdog — when the test process is killed (nextest
+/// timeout) before any `Drop` runs. ACP providers start process groups of
+/// their own (intent-acp), so they are outside this sweep. Optionally removes
+/// the temp data directory on drop.
 pub struct DaemonGuard {
-    child: Child,
+    child: DaemonChild,
     data_dir: Option<PathBuf>,
 }
 
@@ -1027,7 +1109,7 @@ impl DaemonGuard {
     /// Create a new daemon guard that will kill the child process on drop.
     ///
     /// If `cleanup_data_dir` is true, the data directory will be removed on drop.
-    pub fn new(child: Child, data_dir: PathBuf, cleanup_data_dir: bool) -> Self {
+    pub fn new(child: DaemonChild, data_dir: PathBuf, cleanup_data_dir: bool) -> Self {
         Self {
             child,
             data_dir: if cleanup_data_dir {
@@ -1039,7 +1121,7 @@ impl DaemonGuard {
     }
 
     /// Create a daemon guard that only kills the process (no data dir cleanup).
-    pub fn process_only(child: Child) -> Self {
+    pub fn process_only(child: DaemonChild) -> Self {
         Self {
             child,
             data_dir: None,
@@ -1048,23 +1130,29 @@ impl DaemonGuard {
 
     /// Get a mutable reference to the child process.
     ///
-    /// Useful for calling `wait()`, `try_wait()`, or `kill()` explicitly.
-    pub fn child_mut(&mut self) -> &mut Child {
+    /// Useful for `try_wait()` or signalling. To stop the daemon, call
+    /// [`DaemonGuard::kill_tree`] rather than `kill()` + `wait()`: reaping the
+    /// leader first leaves nothing for the group sweep to name.
+    pub fn child_mut(&mut self) -> &mut DaemonChild {
         &mut self.child
     }
 
-    /// Take ownership of the child process, consuming the guard.
+    /// Force-kill the daemon (its whole process group on Unix) and reap it,
+    /// e.g. to simulate a crash before restarting on the same data dir.
     ///
-    /// The caller is responsible for cleanup after this point.
-    pub fn into_child(mut self) -> Child {
-        let child = std::mem::replace(
-            &mut self.child,
-            // Placeholder - will be dropped immediately after we return the real child
-            unsafe { std::mem::zeroed() },
-        );
-        // Prevent Drop from running by forgetting self
-        std::mem::forget(self);
-        child
+    /// # Errors
+    ///
+    /// Any error from waiting on the child.
+    pub fn kill_tree(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        {
+            self.child.kill_tree()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+            self.child.wait()
+        }
     }
 
     /// Disable data directory cleanup on drop.
@@ -1078,10 +1166,9 @@ impl DaemonGuard {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
-        // SIGKILL the process (or process group if set).
-        // Ignore errors - the process may have already exited.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Kill (and reap) the daemon before removing its data directory.
+        // Errors are ignored: the process may have already exited.
+        let _ = self.kill_tree();
 
         // Clean up data directory if requested.
         if let Some(ref dir) = self.data_dir {
@@ -1126,6 +1213,7 @@ pub fn conversation_fingerprint(convo: &serde_json::Value) -> Vec<serde_json::Va
 /// Row-by-row description of how two [`conversation_fingerprint`]s differ
 /// (changed / added / removed rows by index, each with its projected row),
 /// for assertion messages; empty when the fingerprints are equal.
+#[track_caller]
 pub fn fingerprint_diff(before: &[serde_json::Value], after: &[serde_json::Value]) -> String {
     let mut out = String::new();
     for i in 0..before.len().max(after.len()) {
@@ -1146,6 +1234,34 @@ pub fn fingerprint_diff(before: &[serde_json::Value], after: &[serde_json::Value
     out
 }
 
+#[cfg(test)]
+mod exact_test_name_tests {
+    use super::exact_test_name;
+
+    #[test]
+    fn standalone_target_root_keeps_the_bare_name() {
+        assert_eq!(exact_test_name("e2e_x", "probe"), "probe");
+    }
+
+    #[test]
+    fn suite_module_and_nested_modules_are_prefixed_below_the_root() {
+        assert_eq!(exact_test_name("suite_e2e::e2e_x", "probe"), "e2e_x::probe");
+        assert_eq!(
+            exact_test_name("suite_e2e::e2e_x::inner", "probe"),
+            "e2e_x::inner::probe"
+        );
+        assert_eq!(exact_test_name("e2e_x::inner", "probe"), "inner::probe");
+    }
+
+    /// The name this module computes for itself is the one libtest lists, so
+    /// `--exact` re-execs of it select exactly this test.
+    #[test]
+    fn computed_name_matches_the_running_test() {
+        let name = exact_test_name(module_path!(), "computed_name_matches_the_running_test");
+        assert_eq!(std::thread::current().name(), Some(name.as_str()));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1156,13 +1272,14 @@ mod tests {
         // Spawn a sleep process. Detach all three stdio streams so the child
         // never inherits nextest's stdout/stderr capture pipes — an inherited
         // pipe is what nextest's leak detector keys on (intent-hq/intent#4284).
-        let child = Command::new("sleep")
-            .arg("3600")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sleep");
+        let child = spawn_guarded(
+            Command::new("sleep")
+                .arg("3600")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .expect("spawn sleep");
         let pid = child.id();
 
         {
@@ -1233,11 +1350,11 @@ mod tests {
                     caught_panic();
                     ready_tx.send((original, retained, owner)).expect("ready");
                     release_rx
-                        .recv_timeout(Duration::from_secs(5))
+                        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
                         .expect("release");
                 });
                 let (failed_original, failed_retained, failed_owner) = ready_rx
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
                     .expect("retained");
                 // KEEP_TMP intentionally leaves the original occupied, so name
                 // reuse only applies to the ordinary rename-on-panic policy.

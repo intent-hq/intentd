@@ -14,17 +14,14 @@
 //! an in-process shortcut — it exercises the same wire path production agents
 //! use to rename their workspace on the first turn.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use intent_acp::{EventSink, SpawnOptions};
 use intent_core::events::WORKSPACE_UPDATED;
-use intent_core::{
-    now_iso, AgentId, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
-};
+use intent_core::{now_iso, AgentId, Workspace, WorkspaceApi, WorkspaceId};
 use intent_providers::ProviderConfig;
 use intent_services::{AgentManager, BusEventSink, EventBus, Services};
 use intent_store::Store;
@@ -38,49 +35,9 @@ fn slug_workspace(id: &WorkspaceId) -> Workspace {
         id: id.clone(),
         title: id.as_str().to_string(),
         branch: id.as_str().to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -106,7 +63,7 @@ async fn mock_agent_renames_workspace_via_mcp_set_title_tool() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());

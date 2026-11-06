@@ -111,7 +111,12 @@ async fn checkout_owner_avatar_is_opted_in_per_capture_without_extra_requests() 
         .await;
     assert_eq!(invalid["error"]["code"], -32602);
     assert_eq!(server.count(), before + 1);
-    assert!(h.store.list_workspaces(true).await.unwrap().is_empty());
+    assert!(h
+        .store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap()
+        .is_empty());
     client.close().await;
     h.finish().await;
 }

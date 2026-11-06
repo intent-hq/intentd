@@ -159,8 +159,11 @@ impl WsInner {
         let heartbeat_task = tokio::spawn(self.clone().heartbeat_loop());
         // REV-2: `client:*` events for the shared registry (no-op when the
         // UDS listener already spawned the publisher).
-        self.reverse_registry
-            .spawn_client_event_publisher(self.api.clone());
+        if let Some(ready) = self.dispatch.ready() {
+            ready
+                .reverse_registry
+                .spawn_client_event_publisher(ready.api.clone());
+        }
         st.started = true;
         st.port = Some(port);
         st.start_task = None;
@@ -218,6 +221,11 @@ impl WsInner {
             // (7) await every listener closure so the port is fully released.
             for task in running.accept_tasks.drain(..) {
                 let _ = task.await;
+            }
+            // After the accept loops are gone: close executor links and
+            // fence out every connection accepted before now.
+            if let Some(links) = &self.executor_links {
+                links.close_all().await;
             }
             let _ = running.heartbeat_task.await;
         }

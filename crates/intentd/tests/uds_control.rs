@@ -8,10 +8,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -20,21 +21,20 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
-fn spawn_daemon(data_dir: &PathBuf) -> Child {
+fn spawn_daemon(data_dir: &PathBuf) -> GuardedChild {
     spawn_daemon_with_env(data_dir, &[])
 }
 
-fn spawn_daemon_with_env(data_dir: &PathBuf, extra_env: &[(&str, &str)]) -> Child {
+fn spawn_daemon_with_env(data_dir: &PathBuf, extra_env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -48,13 +48,13 @@ fn spawn_daemon_with_env(data_dir: &PathBuf, extra_env: &[(&str, &str)]) -> Chil
         cmd.env(key, value);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
-async fn await_socket(socket: &PathBuf) -> bool {
+async fn await_socket(socket: &std::path::Path) -> bool {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if UnixStream::connect(socket).await.is_ok() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -211,14 +211,17 @@ async fn status_then_stop_shuts_down_and_restarts_cleanly() {
             .output()
             .expect("run intentd stop")
     });
-    let reaped = timeout(Duration::from_secs(15), async {
-        loop {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return true;
+    let reaped = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap_or(false);
     assert!(reaped, "daemon did not exit after stop");
@@ -406,7 +409,8 @@ async fn booted_daemon_holds_at_most_the_inotify_instance_ceiling() {
     // Sample across a settle window rather than once: a late-created extra
     // watcher (a family that deferred its own creation past the markers)
     // must not slip in behind a single early read.
-    let settle_until = tokio::time::Instant::now() + Duration::from_secs(1);
+    let settle_until =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(1));
     loop {
         let instances = inotify_instances(daemon.child.id());
         assert!(

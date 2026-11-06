@@ -286,8 +286,17 @@ fn channel_event_types_are_all_collaborator_visible() {
             // internally and re-reads caller-scoped rows; it never forwards
             // the event payload (including the unrelated principal id).
             .filter(|t| {
+                // Workspace consumes these as invalidations only. The
+                // member-execution filter admits git-root events, and the
+                // delta re-reads an authorized row without their host paths.
                 !(channel == Channel::Workspace
-                    && t.as_str() == intent_core::events::HOST_MEMBERS_CHANGED)
+                    && matches!(
+                        t.as_str(),
+                        intent_core::events::HOST_MEMBERS_CHANGED
+                            | intent_core::events::GIT_ROOT_REGISTERED
+                            | intent_core::events::GIT_ROOT_UPDATED
+                            | intent_core::events::GIT_ROOT_UNREGISTERED
+                    ))
             })
             .filter(|t| !intent_core::events::is_collaborator_event_type(t))
             .collect();
@@ -798,6 +807,28 @@ fn note_subscribe_params_projection_mirrors_note_list() {
         assert!(err.contains("projection"), "{err}");
     }
 
+    // `maxContentBytes` (truncated note reads): absent / null → unbounded;
+    // a positive integer is the limit; the protocol's invalid vectors are a
+    // -32602 before the ack.
+    for (raw, want) in [
+        (r#"{"workspaceId":"w"}"#, None),
+        (r#"{"workspaceId":"w","maxContentBytes":null}"#, None),
+        (
+            r#"{"workspaceId":"w","maxContentBytes":512000}"#,
+            Some(512_000),
+        ),
+        (r#"{"workspaceId":"w","maxContentBytes":7.0}"#, Some(7)),
+    ] {
+        let v = parse(raw);
+        let p = parse_note_subscribe_params(v.as_object().unwrap()).unwrap();
+        assert_eq!(p.max_content_bytes, want, "{raw}");
+    }
+    for bad in ["0", "-1", "1.5", "\"10\"", "true"] {
+        let v = parse(&format!(r#"{{"workspaceId":"w","maxContentBytes":{bad}}}"#));
+        let err = parse_note_subscribe_params(v.as_object().unwrap()).unwrap_err();
+        assert_eq!(err, "maxContentBytes must be a positive integer", "{bad}");
+    }
+
     // The shared parser (task/agent channels) keeps treating the key as an
     // ignored unknown param — no new validation on those channels.
     let v = parse(r#"{"workspaceId":"w","projection":"bogus"}"#);
@@ -864,6 +895,8 @@ fn channel_event_types_full_matrix() {
         "workspace:attention-changed",
         "workspace:displayStatus-changed",
         "workspace:waiting-changed",
+        "workspace:scriptsRunning-changed",
+        "workspace:backgroundTasksRunning-changed",
         "pr:linked",
         "pr:updated",
         "pr:unlinked",
@@ -874,7 +907,7 @@ fn channel_event_types_full_matrix() {
     ] {
         assert!(ws.iter().any(|s| s == t), "workspace missing {t}");
     }
-    assert_eq!(ws.len(), 14);
+    assert_eq!(ws.len(), 23);
     // Comment channel — creation and deletion refresh the affected thread.
     assert_eq!(
         channel_event_types(Channel::Comment),
@@ -2239,7 +2272,7 @@ fn merge_live_turn_rebudgets_slim_page_evicting_oldest_persisted_rows() {
         })
         .collect();
     // Live turn: 400 capped tool_result blocks ≈ 800KB after slimming —
-    // alone over the 512KB budget.
+    // alone over the page budget.
     let capped = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES);
     let live_blocks: Vec<Value> = (0..400)
         .map(|i| {
@@ -2274,12 +2307,21 @@ fn merge_live_turn_rebudgets_slim_page_evicting_oldest_persisted_rows() {
         arr.len()
     );
     let page_bytes = serde_json::to_string(arr).unwrap().len();
-    // One-row floor aside, the kept page hugs the budget: the live turn
-    // (~0.9MB slim) anchors, so allow budget + one row's slack.
+    // The live turn (~0.9MB slim) alone is over the budget, so it is cut to
+    // fit (§5.5 single-row bound): its newest blocks become contiguous
+    // `bodyOmitted` stubs that keep their ids, and the page fits the budget.
     assert!(
-        page_bytes <= SLIM_PAGE_BUDGET_BYTES * 2,
+        page_bytes <= SLIM_PAGE_BUDGET_BYTES + 64,
         "merged page must be re-budgeted, got {page_bytes} bytes"
     );
+    let live_out = arr.last().unwrap()["contentBlocks"].as_array().unwrap();
+    assert_eq!(live_out.len(), 400, "every live block keeps its slot");
+    let first_stub = live_out
+        .iter()
+        .position(|b| b["bodyOmitted"] == true)
+        .expect("stubs");
+    assert!(live_out[first_stub..].iter().enumerate().all(|(i, b)| *b
+        == json!({ "id": format!("msg-live:{}", first_stub + i), "type": "tool_result", "bodyOmitted": true })));
     // The continuation cursor was re-minted at the oldest KEPT row's seq, so
     // `agent.getConversation {{ nextToken }}` resumes at the first evicted row.
     assert_eq!(snapshot["truncated"], true);
@@ -2402,14 +2444,15 @@ fn twenty_message_live_overlay_caps_full_and_slim_pages_without_losing_history()
 }
 
 /// Byte eviction can shorten a count-bounded page further. An oversized live
-/// anchor still serves alone, and every displaced persisted row is reachable.
+/// anchor is cut to fit (a text preview), so it no longer crowds the page
+/// out, and every displaced persisted row is reachable.
 #[test]
 fn configured_live_overlay_preserves_byte_budget_and_one_message_floor() {
     for limit in [1, 5, 20, 50] {
         for live_bytes in [200 * 1024, 600 * 1024] {
             let messages: Vec<Value> = (0..5)
             .map(|seq| json!({ "id": format!("m-{seq}"), "seq": seq,
-                "role": "user", "contentBlocks": [{ "type": "text", "text": "p".repeat(90 * 1024) }] }))
+                "role": "user", "contentBlocks": [{ "type": "text", "text": "p".repeat(80 * 1024) }] }))
             .collect();
             let mut snapshot = json!({ "messages": messages, "totalMessages": 5,
             "truncated": false, "nextToken": null });
@@ -2424,21 +2467,23 @@ fn configured_live_overlay_preserves_byte_budget_and_one_message_floor() {
                 limit,
             );
             let rows = snapshot["messages"].as_array().unwrap();
-            assert_eq!(
-                rows.len(),
-                if live_bytes > SLIM_PAGE_BUDGET_BYTES {
-                    1
-                } else {
-                    limit.min(4)
-                }
-            );
+            let oversized = live_bytes > SLIM_PAGE_BUDGET_BYTES;
+            // An oversized live row is cut to a ~2KB preview, so all five
+            // persisted rows fit beside it; a 200 KiB one leaves room for 3.
+            assert_eq!(rows.len(), limit.min(if oversized { 6 } else { 4 }));
             assert_eq!(rows.last().unwrap()["id"], "live");
+            let live_block = &rows.last().unwrap()["contentBlocks"][0];
+            assert_eq!(live_block["textTruncated"] == true, oversized);
             let bytes: usize = rows
                 .iter()
                 .map(intent_services::pagination::serialized_size)
                 .sum();
-            assert!(bytes <= SLIM_PAGE_BUDGET_BYTES || rows.len() == 1);
+            assert!(bytes <= SLIM_PAGE_BUDGET_BYTES);
             assert_eq!(snapshot["totalMessages"], 6);
+            if rows.len() == 6 {
+                assert_eq!(snapshot["truncated"], false, "nothing was evicted");
+                continue;
+            }
             assert_eq!(snapshot["truncated"], true);
             let older = intent_services::pagination::page_window(
                 5,
@@ -2588,6 +2633,7 @@ mod task_delta_re_read {
                 &ws(),
                 &note_event(event_type, "n-1"),
                 Some(NoteListProjection::Slim),
+                None,
             )
             .await
             .expect("delta");
@@ -2596,12 +2642,56 @@ mod task_delta_re_read {
             assert_eq!(row["contentPreview"].as_str().map(str::len), Some(500));
             assert_eq!(row["contentLength"].as_i64(), Some(1000));
         }
-        let delta = note_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"), None)
+        let delta = note_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"), None, None)
             .await
             .expect("delta");
         let row = &delta["updated"][0];
         assert_eq!(row["content"].as_str().map(str::len), Some(1000));
         assert!(row.get("contentPreview").is_none(), "full row: {row}");
+    }
+
+    #[tokio::test]
+    async fn note_delta_max_content_bytes_truncates_like_note_get() {
+        // Truncated note reads: `added`/`updated` re-reads of a large note
+        // carry the cut prefix plus the markers, the same row `note.get`
+        // serves; a note under the limit arrives full without markers, and
+        // slim rows ignore the limit.
+        let mut note = note_with(None);
+        note.content = "line one\nline two\nline three\n".to_string();
+        let full_bytes = note.content.len();
+        let api = StaticNoteApi::new(Some(note.clone()));
+        for (event_type, key) in [(NOTE_CREATED, "added"), (NOTE_UPDATED, "updated")] {
+            let delta = note_delta(&api, &ws(), &note_event(event_type, "n-1"), None, Some(20))
+                .await
+                .expect("delta");
+            let row = &delta[key][0];
+            assert_eq!(row["content"], "line one\nline two\n");
+            assert_eq!(row["contentTruncated"], true);
+            assert_eq!(row["contentBytes"], full_bytes);
+            assert_eq!(row, &intent_core::note_bounded_row(note.clone(), 20));
+        }
+        let delta = note_delta(
+            &api,
+            &ws(),
+            &note_event(NOTE_UPDATED, "n-1"),
+            None,
+            Some(1_000),
+        )
+        .await
+        .expect("delta");
+        assert_eq!(delta["updated"][0], serde_json::to_value(&note).unwrap());
+        let delta = note_delta(
+            &api,
+            &ws(),
+            &note_event(NOTE_UPDATED, "n-1"),
+            Some(NoteListProjection::Slim),
+            Some(5),
+        )
+        .await
+        .expect("delta");
+        let row = &delta["updated"][0];
+        assert!(row.get("content").is_none() && row.get("contentTruncated").is_none());
+        assert_eq!(row["contentLength"].as_u64(), Some(full_bytes as u64));
     }
 
     #[tokio::test]
@@ -2813,6 +2903,170 @@ mod task_delta_re_read {
     }
 }
 
+// --- workspace channel — retired workspaces are opt-in (includeRetired) ----
+
+mod workspace_retired_opt_in {
+    use super::*;
+    use intent_core::{
+        chief_workspace, BoxFuture, Result, Workspace, WorkspaceApi, WorkspaceId,
+        WorkspaceListFilter, WorkspaceStatus,
+    };
+
+    /// `ws-live` is Active, `ws-retired` is Retired; the list honors the
+    /// filter like the store does.
+    struct RetiredApi;
+
+    fn row(id: &str) -> Workspace {
+        let mut ws = Workspace {
+            id: WorkspaceId::from(id),
+            ..chief_workspace()
+        };
+        if id == "ws-retired" {
+            ws.status = WorkspaceStatus::Retired;
+            ws.archived = true;
+            ws.retired_at = Some("2026-10-22T00:00:00Z".to_string());
+        }
+        ws
+    }
+
+    impl WorkspaceApi for RetiredApi {
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            Box::pin(async move { Ok(row(id.as_str())) })
+        }
+
+        fn list_workspaces(
+            &self,
+            filter: WorkspaceListFilter,
+        ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+            Box::pin(async move {
+                Ok(["ws-live", "ws-retired"]
+                    .into_iter()
+                    .map(row)
+                    .filter(|w| filter.admits(w))
+                    .collect())
+            })
+        }
+    }
+
+    fn event(event_type: &str, id: &str) -> Event {
+        Event {
+            id: "evt-1".into(),
+            event_type: event_type.to_string(),
+            timestamp: now_iso(),
+            workspace_id: WorkspaceId::from(id),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            actor: EventActor {
+                actor_type: ActorType::System,
+                ..Default::default()
+            },
+            data: json!({ "workspaceId": id }),
+        }
+    }
+
+    fn snapshot_ids(v: &Value) -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The seq-0 snapshot excludes retired rows unless the subscriber opted
+    /// in; the generic channel snapshot never includes them.
+    #[tokio::test]
+    async fn snapshot_excludes_retired_unless_opted_in() {
+        assert_eq!(
+            snapshot_ids(&workspace_snapshot(&RetiredApi, false).await),
+            vec!["ws-live"]
+        );
+        assert_eq!(
+            snapshot_ids(&workspace_snapshot(&RetiredApi, true).await),
+            vec!["ws-live", "ws-retired"]
+        );
+        let generic = channel_snapshot(
+            &RetiredApi,
+            Channel::Workspace,
+            &WorkspaceId::from(String::new()),
+            None,
+        )
+        .await;
+        assert_eq!(snapshot_ids(&generic), vec!["ws-live"]);
+    }
+
+    /// For a subscriber that did not opt in, a retire transition arrives as a
+    /// removal and a retired row is never added; an opted-in subscriber gets
+    /// the retired row as an update.
+    #[tokio::test]
+    async fn retire_is_a_removal_unless_opted_in() {
+        let retire = event(WORKSPACE_UPDATED, "ws-retired");
+        let d = workspace_delta(&RetiredApi, &retire, None, false)
+            .await
+            .unwrap();
+        assert_eq!(d, json!({ "removedIds": ["ws-retired"] }));
+
+        let mut visible: HashSet<String> = ["ws-retired".to_string()].into();
+        let d = workspace_delta(&RetiredApi, &retire, Some(&mut visible), false)
+            .await
+            .unwrap();
+        assert_eq!(d, json!({ "removedIds": ["ws-retired"] }));
+        assert!(visible.is_empty(), "removed from the shown set");
+        assert!(
+            workspace_delta(&RetiredApi, &retire, Some(&mut visible), false)
+                .await
+                .is_none(),
+            "a non-administrator never gets a tombstone for an id it was not shown"
+        );
+        assert!(workspace_delta(
+            &RetiredApi,
+            &event(WORKSPACE_CREATED, "ws-retired"),
+            None,
+            false
+        )
+        .await
+        .is_none());
+
+        let d = workspace_delta(&RetiredApi, &retire, None, true)
+            .await
+            .unwrap();
+        assert_eq!(d["updated"][0]["id"], "ws-retired", "{d}");
+        assert_eq!(d["updated"][0]["status"], "Retired", "{d}");
+        let d = workspace_delta(
+            &RetiredApi,
+            &event(WORKSPACE_UPDATED, "ws-live"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(d["updated"][0]["id"], "ws-live", "{d}");
+    }
+
+    /// `workspace.subscribe { includeRetired }` is an optional strict bool:
+    /// only omission means `false`; any supplied non-boolean, `null`
+    /// included, is rejected (PROTOCOL §5.1).
+    #[test]
+    fn subscribe_params_parse_include_retired() {
+        let parse = |v: Value| parse_workspace_subscribe_params(v.as_object().unwrap());
+        assert!(!parse(json!({})).unwrap().include_retired);
+        assert!(
+            !parse(json!({ "includeRetired": false }))
+                .unwrap()
+                .include_retired
+        );
+        assert!(parse(json!({ "includeRetired": null })).is_err());
+        assert!(parse(json!({ "includeRetired": 1 })).is_err());
+        assert!(
+            parse(json!({ "includeRetired": true }))
+                .unwrap()
+                .include_retired
+        );
+        assert!(parse(json!({ "includeRetired": "yes" })).is_err());
+    }
+}
+
 // --- workspace_delta — the virtual Chief workspace never rides a delta -----
 
 mod workspace_delta_chief {
@@ -2886,13 +3140,17 @@ mod workspace_delta_chief {
             // Id resolved from `data.workspaceId` …
             let from_data = workspace_event(event_type, "w", Some(CHIEF_WORKSPACE_ID));
             assert!(
-                workspace_delta(&api, &from_data, None).await.is_none(),
+                workspace_delta(&api, &from_data, None, false)
+                    .await
+                    .is_none(),
                 "{event_type} with data.workspaceId=__chief__ must map to no delta"
             );
             // … and from the event's own `workspaceId` fallback.
             let from_event = workspace_event(event_type, CHIEF_WORKSPACE_ID, None);
             assert!(
-                workspace_delta(&api, &from_event, None).await.is_none(),
+                workspace_delta(&api, &from_event, None, false)
+                    .await
+                    .is_none(),
                 "{event_type} scoped to __chief__ must map to no delta"
             );
         }
@@ -2912,17 +3170,28 @@ mod workspace_delta_chief {
             &api,
             &workspace_event(WORKSPACE_UPDATED, "w", Some("w")),
             None,
+            false,
         )
         .await
         .expect("real workspace update maps to a delta");
         assert_eq!(d["updated"][0]["id"], "w", "delta: {d}");
-        let d = workspace_delta(&api, &workspace_event(WORKSPACE_CREATED, "w", None), None)
-            .await
-            .expect("real workspace create maps to a delta");
+        let d = workspace_delta(
+            &api,
+            &workspace_event(WORKSPACE_CREATED, "w", None),
+            None,
+            false,
+        )
+        .await
+        .expect("real workspace create maps to a delta");
         assert_eq!(d["added"][0]["id"], "w", "delta: {d}");
-        let d = workspace_delta(&api, &workspace_event(WORKSPACE_DELETED, "w", None), None)
-            .await
-            .expect("real workspace delete maps to a delta");
+        let d = workspace_delta(
+            &api,
+            &workspace_event(WORKSPACE_DELETED, "w", None),
+            None,
+            false,
+        )
+        .await
+        .expect("real workspace delete maps to a delta");
         assert_eq!(d["removedIds"][0], "w", "delta: {d}");
         assert_eq!(api.reads.load(Ordering::SeqCst), 2);
     }
@@ -3008,6 +3277,46 @@ mod workspace_delta_list_projection {
     }
 
     #[tokio::test]
+    async fn external_pr_changes_refresh_home_rows_without_a_status_transition() {
+        use intent_core::events::{
+            GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED, PR_MONITOR_CANCELLED,
+            PR_MONITOR_CHANGED, PR_MONITOR_COMPLETED, PR_MONITOR_REGISTERED,
+        };
+        for event_type in [
+            GIT_ROOT_REGISTERED,
+            GIT_ROOT_UPDATED,
+            GIT_ROOT_UNREGISTERED,
+            PR_MONITOR_REGISTERED,
+            PR_MONITOR_CHANGED,
+            PR_MONITOR_COMPLETED,
+            PR_MONITOR_CANCELLED,
+        ] {
+            assert!(
+                channel_event_types(Channel::Workspace)
+                    .iter()
+                    .any(|t| t == event_type),
+                "Home must subscribe to {event_type}"
+            );
+            let delta = workspace_delta(
+                &DetailWorkspaceApi,
+                &workspace_event(event_type),
+                None,
+                false,
+            )
+            .await
+            .expect("external PR changes refresh the background list row");
+            assert_eq!(delta["updated"][0]["id"], "w");
+            assert_eq!(
+                delta["updated"][0]["pullRequests"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                WORKSPACE_LIST_PR_CAP
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn delta_rows_are_slimmed_like_the_seq_0_snapshot() {
         // The `workspace` channel re-reads via `workspace.get` (full detail
         // row); the pushed `added` / `updated` row must nonetheless be the
@@ -3019,9 +3328,14 @@ mod workspace_delta_list_projection {
             (WORKSPACE_UPDATED, "updated"),
             (PR_UPDATED, "updated"),
         ] {
-            let d = workspace_delta(&DetailWorkspaceApi, &workspace_event(event_type), None)
-                .await
-                .expect("delta");
+            let d = workspace_delta(
+                &DetailWorkspaceApi,
+                &workspace_event(event_type),
+                None,
+                false,
+            )
+            .await
+            .expect("delta");
             let row = &d[key][0];
             let obj = row.as_object().expect("row object");
             for detail in ["tokenUsage", "setupScript", "contextLinks", "diskUsage"] {
@@ -3267,6 +3581,93 @@ mod agent_delta_list_projection {
                  projection as agent.list.\n{}",
                 format_key_bytes_table(total, &per_key)
             );
+        }
+    }
+
+    /// `agent_get` for one agent whose remote placement is `isolation`
+    /// (`None`: a local agent, no placement fields at all).
+    struct PlacedAgentApi {
+        isolation: Option<&'static str>,
+    }
+
+    impl WorkspaceApi for PlacedAgentApi {
+        fn agent_get(
+            &self,
+            _agent_id: AgentId,
+            _workspace_id: Option<WorkspaceId>,
+        ) -> BoxFuture<'_, Result<AgentLite>> {
+            let mut row = json!({
+                "id": "agent-1",
+                "workspaceId": "w",
+                "name": "Worker",
+                "status": "active",
+                "createdAt": "t0",
+                "updatedAt": "t1",
+                "messageCount": 0,
+                "metadata": { "isBackground": false },
+            });
+            if let Some(isolation) = self.isolation {
+                let placed = json!({
+                    "nodeId": "node-1",
+                    "leaseId": "lease-1",
+                    "nodeName": "Mac mini",
+                    "placement": { "target": "remote", "os": "macos", "nodeId": "node-1" },
+                    "effectiveIsolation": isolation,
+                    "placementError": { "code": "node-capacity", "detail": "full" },
+                });
+                row.as_object_mut()
+                    .unwrap()
+                    .extend(placed.as_object().unwrap().clone());
+            }
+            Box::pin(async move { Ok(serde_json::from_value(row).expect("placed row")) })
+        }
+    }
+
+    /// Remote agents showed "Provisioning" on their list row until opened
+    /// (cloudlands-fe v2.268.0): the list delta stripped the placement
+    /// fields, so the `pending` → `isolated` change never reached the list.
+    /// The delta row now carries them (all but the detail-only `leaseId`),
+    /// and a local agent's row carries none.
+    #[tokio::test]
+    async fn delta_rows_carry_the_remote_placement_and_its_isolation_change() {
+        for isolation in ["pending", "isolated"] {
+            let api = PlacedAgentApi {
+                isolation: Some(isolation),
+            };
+            let d = agent_delta(&api, &agent_event(AGENT_UPDATED))
+                .await
+                .expect("delta");
+            let row = &d["updated"][0];
+            assert_eq!(row["effectiveIsolation"], json!(isolation), "{row}");
+            assert_eq!(row["nodeId"], json!("node-1"), "{row}");
+            assert_eq!(row["nodeName"], json!("Mac mini"), "{row}");
+            assert_eq!(
+                row["placement"],
+                json!({ "target": "remote", "os": "macos", "nodeId": "node-1" })
+            );
+            assert_eq!(row["placementError"]["code"], json!("node-capacity"));
+            assert!(
+                row.get("leaseId").is_none(),
+                "leaseId is detail-only: {row}"
+            );
+        }
+
+        let d = agent_delta(
+            &PlacedAgentApi { isolation: None },
+            &agent_event(AGENT_UPDATED),
+        )
+        .await
+        .expect("delta");
+        let row = d["updated"][0].as_object().expect("row object");
+        for key in [
+            "nodeId",
+            "leaseId",
+            "nodeName",
+            "placement",
+            "effectiveIsolation",
+            "placementError",
+        ] {
+            assert!(!row.contains_key(key), "local agent row carries `{key}`");
         }
     }
 }
@@ -5490,7 +5891,7 @@ mod channel_membership {
 
         fn list_workspaces(
             &self,
-            _include_archived: bool,
+            _filter: intent_core::WorkspaceListFilter,
         ) -> BoxFuture<'_, intent_core::Result<Vec<Workspace>>> {
             let mut ids: Vec<String> = self.members.lock().unwrap().iter().cloned().collect();
             ids.sort();
@@ -5643,8 +6044,11 @@ mod channel_membership {
     /// Every `subscription.push` delta on the bulk lane until it stays quiet.
     async fn deltas(rx: &mut OutboundReceiver) -> Vec<Value> {
         let mut out = Vec::new();
-        while let Ok(Some(frame)) =
-            tokio::time::timeout(Duration::from_millis(300), rx.bulk.recv()).await
+        while let Ok(Some(frame)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            rx.bulk.recv(),
+        )
+        .await
         {
             let v: Value = serde_json::from_str(&frame).unwrap();
             assert_eq!(v["method"], "subscription.push");
@@ -5897,6 +6301,38 @@ mod channel_membership {
 
     fn workspace_subscribe() -> Value {
         json!({"jsonrpc":"2.0","id":1,"method":"workspace.subscribe","params":{}})
+    }
+
+    #[tokio::test]
+    async fn workspace_git_root_events_refresh_only_authorized_rows_without_host_paths() {
+        let (_, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], workspace_subscribe()).await;
+        for kind in [
+            intent_core::events::GIT_ROOT_REGISTERED,
+            intent_core::events::GIT_ROOT_UPDATED,
+            intent_core::events::GIT_ROOT_UNREGISTERED,
+        ] {
+            for ws in ["ws-2", "ws-1"] {
+                h.bus
+                    .publish(&event(
+                        kind,
+                        ws,
+                        None,
+                        json!({
+                            "workspaceId": ws,
+                            "gitRoot": {"path": "/private/host/repository"}
+                        }),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let updates = deltas(&mut h.rx).await;
+            assert_eq!(updates.len(), 1, "only the authorized workspace updates");
+            assert_eq!(updates[0]["updated"][0]["id"], "ws-1");
+            assert!(!updates[0].to_string().contains("/private/host/repository"));
+            assert!(updates[0]["updated"][0].get("gitRoot").is_none());
+        }
+        drop(h.subs);
     }
 
     /// The global `workspace` channel under a guest: a `workspace:deleted`
@@ -6339,4 +6775,163 @@ mod progressive_history {
             intent_services::pagination::remint_backward_token(1).unwrap()
         );
     }
+}
+
+/// [`visible_workspace_seed`]: the visible-id seed of a non-administrator's
+/// paged workspace snapshot.
+mod visible_workspace_seed_tests {
+    use super::*;
+    use intent_core::{chief_workspace, BoxFuture, Result, WorkspaceApi, WorkspaceListFilter};
+
+    /// The caller's whole list is `ws-1`..`ws-3`, or a store error.
+    struct SeedApi {
+        fail: bool,
+    }
+
+    impl WorkspaceApi for SeedApi {
+        fn list_workspaces(
+            &self,
+            _filter: WorkspaceListFilter,
+        ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+            let fail = self.fail;
+            Box::pin(async move {
+                if fail {
+                    return Err(intent_core::Error::Internal("store down".into()));
+                }
+                Ok(["ws-1", "ws-2", "ws-3"]
+                    .into_iter()
+                    .map(|id| Workspace {
+                        id: WorkspaceId::from(id),
+                        ..chief_workspace()
+                    })
+                    .collect())
+            })
+        }
+    }
+
+    fn ids(set: &HashSet<String>) -> Vec<&str> {
+        let mut out: Vec<&str> = set.iter().map(String::as_str).collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_complete_page_seeds_its_own_ids() {
+        let page = json!([{ "id": "ws-1" }]);
+        let seed = visible_workspace_seed(&SeedApi { fail: false }, &page, None, false).await;
+        assert_eq!(ids(&seed), ["ws-1"]);
+    }
+
+    #[tokio::test]
+    async fn a_partial_page_seeds_the_whole_visible_list() {
+        let page = json!([{ "id": "ws-1" }]);
+        let seed =
+            visible_workspace_seed(&SeedApi { fail: false }, &page, Some("token"), false).await;
+        assert_eq!(ids(&seed), ["ws-1", "ws-2", "ws-3"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_full_read_falls_back_to_the_page() {
+        let page = json!([{ "id": "ws-1" }]);
+        let seed =
+            visible_workspace_seed(&SeedApi { fail: true }, &page, Some("token"), false).await;
+        assert_eq!(ids(&seed), ["ws-1"]);
+    }
+}
+
+// --- Single-message bound on live chat deltas (§7.1) ----------------------
+
+/// Full mode: once a live text block's accumulated text passes the page
+/// budget, every chunk delta carries the snapshot's preview shape instead of
+/// the whole text, so each chunk frame stays within the read budget.
+#[test]
+fn full_mode_text_chunk_past_budget_sends_the_cut_marker() {
+    use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+    let mut s = ChatDeltaState::new(
+        &agent(),
+        DeltaEncoding::Full,
+        Some(ConversationProjection::Slim),
+    );
+    let piece = "t".repeat(64 * 1024);
+    let mut total = 0;
+    for _ in 0..10 {
+        let d = s
+            .chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!(piece)))
+            .expect("chunk delta");
+        total += piece.len();
+        let frame = build_delta_push("sub-1", 1, &d);
+        assert!(
+            frame.len() <= intent_transport_read_budget(),
+            "chunk frame {} bytes over budget",
+            frame.len()
+        );
+        let entity = d["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(d["updated"].as_array().unwrap())
+            .next()
+            .unwrap();
+        let block = &entity["block"];
+        if total > SLIM_PAGE_BUDGET_BYTES {
+            assert_eq!(block["textTruncated"], true);
+            assert_eq!(block["textBytes"], total);
+            assert_eq!(
+                block["text"].as_str().unwrap().len(),
+                SLIM_PROJECTION_BUDGET_BYTES
+            );
+        } else {
+            assert_eq!(block["text"].as_str().unwrap().len(), total);
+            assert!(block.get("textTruncated").is_none());
+        }
+    }
+    assert!(total > 600 * 1024);
+}
+
+fn intent_transport_read_budget() -> usize {
+    crate::catalog::READ_PAYLOAD_BUDGET_BYTES
+}
+
+/// A delta that fits is returned unchanged; an oversized one is split into
+/// deltas that each fit, keeping entity order and buckets, with `removedIds`
+/// on the last one.
+#[test]
+fn split_chat_delta_bounds_every_part_and_keeps_order() {
+    let small = json!({ "added": [{ "block": { "id": "a" } }], "updated": [], "removedIds": [] });
+    assert_eq!(split_chat_delta(small.clone(), 480_000), vec![small]);
+
+    let body = "x".repeat(2_000);
+    let entity =
+        |i: usize| json!({ "messageId": "m", "block": { "id": format!("m:{i}"), "output": body } });
+    let added: Vec<Value> = (0..150).map(entity).collect();
+    let updated: Vec<Value> = (150..400).map(entity).collect();
+    let delta = json!({ "added": added, "updated": updated, "removedIds": ["m:999"] });
+    let parts = split_chat_delta(delta, 480_000);
+    assert!(parts.len() > 1);
+    let mut ids = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        assert!(intent_services::pagination::serialized_size(part) <= 480_000);
+        let last = i == parts.len() - 1;
+        assert_eq!(
+            part["removedIds"],
+            if last { json!(["m:999"]) } else { json!([]) }
+        );
+        for e in part["added"].as_array().unwrap() {
+            let id = e["block"]["id"].as_str().unwrap().to_string();
+            let n: usize = id[2..].parse().unwrap();
+            assert!(n < 150, "added entities stay added");
+            ids.push(n);
+        }
+        for e in part["updated"].as_array().unwrap() {
+            let id = e["block"]["id"].as_str().unwrap().to_string();
+            let n: usize = id[2..].parse().unwrap();
+            assert!(n >= 150, "updated entities stay updated");
+            ids.push(n);
+        }
+    }
+    assert_eq!(
+        ids,
+        (0..400).collect::<Vec<_>>(),
+        "every entity once, in order"
+    );
 }

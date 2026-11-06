@@ -1,6 +1,6 @@
 [package]
 name = "intent-nodes"
-version = "0.10.46"
+version = "0.11.141"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,10 +8,13 @@ license.workspace = true
 description = "Node provider contracts and static host adapter"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.10.46" }
+intent-core = { path = "../intent-core", version = "0.11.141" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true

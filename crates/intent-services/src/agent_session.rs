@@ -41,6 +41,7 @@ use crate::image_dimensions::{self, ProbeContext};
 use crate::repository_admission::lifecycle::physical_owner::{
     RepositoryCreationOwner, RepositoryPhysicalOwner,
 };
+use crate::stack_frame::boxed_await;
 use crate::{file_ops, token_usage, usage_stats, Services};
 
 /// Preserve live provider diagnostics without adding assistant content or
@@ -165,6 +166,21 @@ mod tests_meta;
 /// the error through the terminal-failure path, which emits the pair itself.
 pub(crate) const PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX: &str =
     "session/prompt transport closed before output:";
+
+/// Prefix marking a prompt ended by a stale daemon cancel: it resolved
+/// `stopReason: "cancelled"` before any `session/update` or client request,
+/// on a turn-worker attempt that started shortly after the daemon wrote
+/// `session/cancel` for this agent (`AgentManager::stale_cancels`). Every daemon-initiated cancel aborts the
+/// turn worker (`interrupt_inner`) or drops the prompt future first
+/// (idle-timeout settle), so the worker never sees the cancel it asked for —
+/// but ACP cancels are notifications, and an adapter that applies one late
+/// (the Claude adapter processes cancels asynchronously) ends the NEXT
+/// prompt instead. [`Services::run_prompt_turn`] returns this for
+/// turn-worker turns, without the empty marker row or any terminal event, so
+/// the worker redrives the prompt once instead of leaving a silent idle
+/// agent.
+pub(crate) const PROMPT_SPURIOUS_CANCEL_PREFIX: &str =
+    "session/prompt cancelled before output without a daemon cancel:";
 
 /// Suffix appended to the wrapped idle-timeout error when the timed-out turn
 /// DID receive `session/update` traffic before going silent (`session/prompt
@@ -371,6 +387,12 @@ pub(crate) struct AcpSessionOpened {
     /// a concurrent recreate won the CAS (see `modes`).
     pub thought_level: Option<ThoughtLevelOption>,
     pub config_options: Option<Value>,
+    /// The model id the session-open fill persisted onto a session spawned
+    /// without one (`fill_identity_from_session_open`) — exactly what the
+    /// child runs. The manager records it as the handle's spawned model.
+    /// `None` when nothing was filled (or the fill lost to a concurrent
+    /// write).
+    pub filled_model: Option<String>,
 }
 
 /// A provider's reasoning-effort selector: the `thought_level`-category select
@@ -426,6 +448,9 @@ impl ThoughtLevelOption {
 /// order.
 struct Transcript {
     callback_routes: Arc<CallbackToolRoutes>,
+    /// Apply Cursor's tool-naming pass ([`intent_acp::session::apply_cursor_tool_names`])
+    /// to this turn's tool calls; set only for Cursor sessions.
+    cursor_tool_names: bool,
     /// Assistant `AgentMessage` id minted at turn start (the block-id prefix).
     message_id: String,
     blocks: Vec<Value>,
@@ -473,6 +498,9 @@ struct Transcript {
     /// Image references examined for the pending buffer (cap, see
     /// [`MAX_IMAGE_REFS_PER_BLOCK`]).
     media_refs_seen: usize,
+    /// Whether this turn's first provider output was already reported to
+    /// the shared quota cache (once per turn, off the per-chunk path).
+    provider_output_seen: bool,
 }
 
 /// Cap on Markdown image references examined per text block — bounds both
@@ -499,6 +527,7 @@ impl Transcript {
     fn new(message_id: String) -> Self {
         Self {
             callback_routes: Arc::default(),
+            cursor_tool_names: false,
             message_id,
             blocks: Vec::new(),
             text: String::new(),
@@ -514,11 +543,17 @@ impl Transcript {
             pending_media: BTreeMap::new(),
             media_scan_pos: 0,
             media_refs_seen: 0,
+            provider_output_seen: false,
         }
     }
 
     fn with_callback_routes(mut self, routes: Arc<CallbackToolRoutes>) -> Self {
         self.callback_routes = routes;
+        self
+    }
+
+    fn with_cursor_tool_names(mut self, enabled: bool) -> Self {
+        self.cursor_tool_names = enabled;
         self
     }
 
@@ -896,6 +931,17 @@ impl Transcript {
     /// block), or `None` when the id was never seen. ACP `tool_call_update`s
     /// are name-less — the name only arrives on the first `tool_call` — so
     /// the completion-side registry claim resolves the name here.
+    /// The status recorded for a known tool call.
+    fn tool_status_for(&self, tool_call_id: &str) -> Option<&'static str> {
+        let &i = self.tool_use_index.get(tool_call_id)?;
+        match self.blocks[i]["metadata"]["status"].as_str()? {
+            "completed" => Some("completed"),
+            "error" => Some("error"),
+            "started" => Some("started"),
+            _ => None,
+        }
+    }
+
     fn tool_name_for(&self, tool_call_id: &str) -> Option<&str> {
         let &i = self.tool_use_index.get(tool_call_id)?;
         self.blocks[i].get("name").and_then(Value::as_str)
@@ -1254,6 +1300,26 @@ pub(crate) fn open_tool_call_stall_ms() -> u64 {
     15 * 60 * 1000
 }
 
+/// Reason prefix of the daemon's terminal provider-stall blocker
+/// (intent-hq/intent#5395). Shared by the raise and by
+/// [`is_daemon_stall_blocker_reason`] so the two cannot drift; reserved —
+/// the agent-facing `reportBlocker` / `requestDiscussion` reject it.
+pub(crate) const PROVIDER_STALL_BLOCKER_PREFIX: &str = "Turn ended after a provider stall: ";
+
+/// Reason prefix of the daemon's blocker for a failed unsolicited (harness
+/// wake) provider turn. Shared and reserved like
+/// [`PROVIDER_STALL_BLOCKER_PREFIX`].
+pub(crate) const UNSOLICITED_STALL_BLOCKER_PREFIX: &str = "Unsolicited provider activity stopped: ";
+
+/// Whether a persisted blocker reason is a daemon-raised provider-stall
+/// blocker (intent-hq/intent#7182): prefix-anchored on the reserved daemon
+/// prefixes — the remainder carries per-stall details (durations, tool
+/// label, provider error) so a whole-string match is not possible.
+pub(crate) fn is_daemon_stall_blocker_reason(reason: &str) -> bool {
+    reason.starts_with(PROVIDER_STALL_BLOCKER_PREFIX)
+        || reason.starts_with(UNSOLICITED_STALL_BLOCKER_PREFIX)
+}
+
 /// Terminal provider-stall threshold (intent-hq/intent#5395): once a turn has
 /// gone this many ms with zero `session/update` traffic AND no recorded tool
 /// call open, [`run_prompt_turn`](Services::run_prompt_turn) ends the turn
@@ -1520,13 +1586,25 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 /// The deprecated `providers.active` is deliberately NOT consulted — the
 /// boot migration ([`crate::settings::migrate_active_provider_setting`])
 /// carries a legacy value into `model.defaultProvider` once at startup.
-pub(crate) fn derived_default_provider(
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
     settings.model.default_provider.as_deref().and_then(|id| {
+        let id = id.trim();
+        // A profile reference is kept verbatim, even when it is malformed or
+        // its profile is gone: the selection gate then fails it with
+        // `provider-profile-replacement-required` instead of reading it as
+        // unset or running the base's Default account (PROTOCOL §5.54).
+        if crate::provider_profiles::is_qualified_ref(id) {
+            return Some(id.to_string());
+        }
         // Accept the candidate only when it names a registered provider
         // (whitespace-trimmed, so padded settings values still resolve).
-        intent_providers::find_provider(id.trim()).map(|p| p.id.to_string())
+        intent_providers::find_provider(id).map(|p| p.id.to_string())
     })
 }
 
@@ -1544,7 +1622,7 @@ pub(crate) fn derived_default_provider(
 /// that may not be installed. Spawn-adjacent callers surface
 /// [`no_default_provider_error`] instead; stats-attribution callers (which
 /// pass `configured_default: None`) fall to their existing `"unknown"` tail.
-pub(crate) fn resolve_provider_id(
+pub fn resolve_provider_id(
     provider: Option<&str>,
     configured_default: Option<&str>,
 ) -> Option<String> {
@@ -1556,6 +1634,54 @@ pub(crate) fn resolve_provider_id(
                 .filter(|p| !p.is_empty())
                 .map(std::string::ToString::to_string)
         })
+}
+
+/// [`resolve_provider_id`] reduced to the base provider id: a named profile
+/// reference (`<base>@<profileId>`, PROTOCOL §5.54) runs its base provider's
+/// adapter, so provider-keyed protocol shaping (session `_meta`, usage
+/// semantics, orchestrator tooling) keys on the base. Selection identity and
+/// native-session ownership keep the full reference.
+pub(crate) fn resolve_base_provider_id(
+    provider: Option<&str>,
+    configured_default: Option<&str>,
+) -> Option<String> {
+    resolve_provider_id(provider, configured_default)
+        .map(|id| intent_providers::base_provider_id(&id).to_owned())
+}
+
+/// The provider a legacy session — one whose `provider` column is NULL —
+/// is pinned onto. Every session pins its provider at create time, so a NULL
+/// column only survives on rows written before that rule: they are repaired
+/// once, never re-read from a later `model.defaultProvider` change.
+///
+/// Precedence: the provider the session's last committed turn actually ran
+/// (`last_turn_provider`, normalized through the registry so legacy
+/// default-provider aliases map to a canonical id; a profile reference is
+/// kept as-is) → the settings-derived
+/// default in effect now (a session that never ran a turn). `None` only when
+/// neither resolves; callers surface [`no_default_provider_error`]. A store
+/// read error is returned, never treated as "no last turn".
+pub(crate) async fn legacy_session_provider(
+    services: &Services,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Result<Option<String>> {
+    // A store error must not read as "never ran": falling through to the
+    // current default would pin exactly the wrong provider permanently.
+    let (_, last_turn) = services
+        .store
+        .get_agent_session_last_turn_model(workspace_id, agent_id)
+        .await?;
+    // A named profile reference (`<base>@<profileId>`, PROTOCOL §5.54) is
+    // kept as-is: the session ran that profile, not its base's Default.
+    let last_turn = last_turn.map(|raw| raw.trim().to_string()).and_then(|raw| {
+        if crate::provider_profiles::is_qualified_ref(&raw) {
+            Some(raw)
+        } else {
+            intent_providers::find_provider_or_legacy_alias(&raw).map(|p| p.id.to_string())
+        }
+    });
+    Ok(last_turn.or_else(|| derived_default_provider(&services.effective_settings())))
 }
 
 /// Resolve the provider id the agent's failing TURN ran on, for event
@@ -1648,7 +1774,7 @@ pub(crate) fn no_default_provider_error(context: &str) -> Error {
 /// gracefully to today's opaque `Internal` error — the transient classifiers
 /// keep their broader match because their retry/fail-fast outcome is cheap
 /// to get wrong in comparison.
-fn is_acp_auth_required(e: &AcpError) -> bool {
+pub(crate) fn is_acp_auth_required(e: &AcpError) -> bool {
     match e {
         AcpError::Auth(_) => true,
         AcpError::Rpc(rpc) => {
@@ -1694,10 +1820,83 @@ fn prompt_size_error(e: &AcpError) -> Option<Error> {
 /// turn. Everything else keeps the existing opaque
 /// `Error::Internal("{context} failed: {e}")` shape (`context` is the ACP
 /// method name, e.g. `session/new`).
+#[cfg(test)]
 fn map_acp_session_error(context: &str, e: &AcpError, provider_id: &str) -> Error {
+    map_acp_session_error_for(context, e, &AuthOwner::bare(provider_id))
+}
+
+/// Whose auth verdict a runtime failure belongs to (PROTOCOL §5.54): the
+/// session's selection — a bare provider id, or a named profile reference
+/// with the saved settings it runs under. A profile failure demotes only that
+/// profile's verdict, never the base provider's Default verdict or another
+/// profile's.
+pub(crate) struct AuthOwner {
+    selection: String,
+    profile: Option<intent_acp::ProfileEnv>,
+    /// The selection may run with an overlay that could not be read: its
+    /// verdict is unknown, so nothing is demoted (never the bare Default).
+    unresolved: bool,
+}
+
+impl AuthOwner {
+    #[cfg(test)]
+    fn bare(provider_id: &str) -> Self {
+        Self {
+            selection: provider_id.to_owned(),
+            profile: None,
+            unresolved: false,
+        }
+    }
+
+    pub(crate) fn demote(&self) {
+        if self.unresolved {
+            return;
+        }
+        match &self.profile {
+            Some(profile) => crate::provider_auth::demote_profile_auth_verdict(profile),
+            None => crate::provider_auth::demote_auth_verdict(&self.selection),
+        }
+    }
+}
+
+impl Services {
+    /// The [`AuthOwner`] of `agent_id`'s resolved selection. A profile (or
+    /// overridden Default) whose saved settings cannot be read demotes
+    /// nothing. Neither does a live process still running with earlier
+    /// settings (PROTOCOL §5.54 activation): its failure says nothing about
+    /// the saved account, which a newer process would use, nor about the
+    /// bare installation once overrides are cleared.
+    pub(crate) async fn auth_owner(&self, agent_id: &AgentId, selection: &str) -> AuthOwner {
+        let (profile, mut unresolved) = if crate::provider_profiles::may_have_overlay(selection) {
+            match Box::pin(self.resolve_profile_env(selection)).await {
+                Ok(profile) => (profile, false),
+                Err(_) => (None, true),
+            }
+        } else {
+            (None, false)
+        };
+        if let Some(live) = self
+            .profile_activation()
+            .live_fingerprint(agent_id, selection)
+        {
+            let saved = profile
+                .as_ref()
+                .map_or("", |p: &intent_acp::ProfileEnv| p.fingerprint());
+            unresolved |= live != saved;
+        }
+        AuthOwner {
+            selection: selection.to_owned(),
+            profile,
+            unresolved,
+        }
+    }
+}
+
+fn map_acp_session_error_for(context: &str, e: &AcpError, owner: &AuthOwner) -> Error {
+    let provider_id = owner.selection.as_str();
     if is_acp_auth_required(e) {
-        crate::provider_auth::demote_auth_verdict(provider_id);
-        return crate::host_execution::ai_authorization_error(
+        owner.demote();
+        return crate::execution_call::ai_authorization_error(
             Error::InvalidParams(format!(
                 "{context}: {}",
                 crate::provider_auth::not_authenticated_message(provider_id)
@@ -1919,6 +2118,7 @@ fn build_session_meta(
 pub(crate) struct LocalPromptInput<'a> {
     pub(crate) connection: &'a Connection,
     pub(crate) captured: Option<crate::agent_manager::RepositoryPromptInput>,
+    pub(crate) required: Option<Box<crate::repository_read_source::MonitorPromptAdmission>>,
 }
 
 impl Services {
@@ -1926,6 +2126,17 @@ impl Services {
     /// `media`): the workspace root (or the agent's sandbox path, `CoW`
     /// containment) plus the assets root, resolved ONCE per turn so the
     /// per-chunk probe does no store reads.
+    /// Whether the agent runs on the Cursor provider (one store read per
+    /// turn); gates Cursor's tool-naming pass.
+    async fn is_cursor_session(&self, agent_id: &AgentId) -> bool {
+        self.store
+            .get_agent_session_without_messages(agent_id)
+            .await
+            .ok()
+            .and_then(|session| session.provider)
+            .is_some_and(|p| intent_providers::base_provider_id(&p) == "cursor")
+    }
+
     async fn image_probe_context(
         &self,
         agent_id: &AgentId,
@@ -1933,7 +2144,13 @@ impl Services {
     ) -> ProbeContext {
         ProbeContext {
             workspace_id: workspace_id.0.clone(),
-            workspace_root: file_ops::resolve_root(&self.store, workspace_id, Some(agent_id)).await,
+            workspace_root: file_ops::resolve_root(
+                &self.store,
+                workspace_id,
+                Some(agent_id),
+                self.chief_cwd_root.as_deref(),
+            )
+            .await,
             assets_root: self.assets_root.clone(),
         }
     }
@@ -2158,7 +2375,7 @@ impl Services {
     /// automatic turn on the user's behalf, so uncertainty must fall through
     /// to the observable idle path, never spin a turn on stale state.
     pub(crate) async fn truncation_redrive_eligible(&self, agent_id: &AgentId) -> bool {
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+        let Ok(session) = self.store.get_agent_session_summary(agent_id).await else {
             return false;
         };
         if session.parent_agent_id.is_none() {
@@ -2694,6 +2911,82 @@ impl Services {
         }
     }
 
+    /// Fill a session's still-unset `model` from what the provider reports at
+    /// session open — the model select's `currentValue`, a selectable option
+    /// id (never the D13 display name, monorepo#1534, and never the adapter's
+    /// floating `"default"` alias: no concrete model is known then and the
+    /// column stays NULL) — so a session created without a resolvable model
+    /// (cold catalog cache, legacy row) ends up pinned to what it runs.
+    /// Fill-only through [`intent_store::Store::fill_agent_session_identity_if_null`]:
+    /// a value already set (or set concurrently) is never overwritten.
+    /// Returns the model that actually landed, which the manager records as
+    /// the child's spawned model (no respawn, no `model_changed` row). A NULL
+    /// `reasoning_effort` is filled at the turn boundary from the level the
+    /// provider confirmed instead (`AgentManager::maybe_persist_effort_change_notice`).
+    /// Best-effort: failures are logged, never propagated.
+    async fn fill_identity_from_session_open(
+        &self,
+        stored: &AgentSession,
+        config_options: Option<&[SessionConfigOption]>,
+    ) -> Option<String> {
+        let blank = |v: Option<&str>| v.is_none_or(|v| v.trim().is_empty());
+        let model = blank(stored.model.as_deref())
+            .then(|| config_options.and_then(model_select))
+            .flatten()
+            .map(|select| select.current_value.0.to_string())
+            .filter(|m| {
+                !m.trim().is_empty()
+                    && !m.contains(char::is_whitespace)
+                    && !m.eq_ignore_ascii_case("default")
+            });
+        let model = model?;
+        match self
+            .store
+            .fill_agent_session_identity_if_null(
+                &stored.workspace_id,
+                &stored.id,
+                Some(&model),
+                None,
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(true) => {
+                // Report what actually landed: a column a concurrent write
+                // set first keeps that writer's value.
+                let landed = match self.store.get_agent_session_summary(&stored.id).await {
+                    Ok(row) => row,
+                    Err(e) => {
+                        tracing::warn!(agent = %stored.id, error = %e, "re-read filled session failed");
+                        return None;
+                    }
+                };
+                let filled_model =
+                    (landed.model.as_deref() == Some(model.as_str())).then_some(model);
+                tracing::info!(
+                    agent_id = %stored.id,
+                    model = ?landed.model,
+                    field = "model",
+                    "legacy session repaired"
+                );
+                self.invalidate_agent_list_cache(&stored.workspace_id);
+                self.publish_agent_mutation_event(
+                    &stored.workspace_id,
+                    &stored.id,
+                    intent_core::events::AGENT_UPDATED,
+                    json!({ "agentId": stored.id.0, "modelId": landed.model }),
+                )
+                .await;
+                filled_model
+            }
+            Ok(false) => None,
+            Err(e) => {
+                tracing::warn!(agent = %stored.id, error = %e, "fill session identity failed");
+                None
+            }
+        }
+    }
+
     /// D14 companion to [`persist_effective_model`](Self::persist_effective_model):
     /// resolve an EXPLICITLY selected model id's display identity against the
     /// session-open `configOptions` and persist it to `resolved_model`. The
@@ -2808,31 +3101,71 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<PreparedAcpSession> {
+        self.prepare_acp_session_with_review_context(
+            conn,
+            callbacks,
+            agent_id,
+            cwd,
+            mcp_servers,
+            None,
+        )
+        .await
+    }
+
+    async fn prepare_acp_session_with_review_context(
+        &self,
+        conn: &Connection,
+        callbacks: Option<&CallbackClient>,
+        agent_id: &AgentId,
+        cwd: impl Into<PathBuf>,
+        mcp_servers: Vec<McpServer>,
+        native: Option<
+            &crate::repository_admission::lifecycle::native_allocation::NativeAllocation,
+        >,
+    ) -> Result<PreparedAcpSession> {
+        let context = native.map(
+            crate::repository_admission::lifecycle::native_allocation::NativeAllocation::context,
+        );
         // Load the session up front so the store write is scoped to the owning
         // workspace (the store's `set_acp_session_id` now requires it as a
         // defense-in-depth guard). This call is only reached after the caller
         // resolved this agent id inside a workspace-scoped path.
-        let stored = self.store.get_agent_session(agent_id).await?;
+        let stored = self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await?;
         let workspace_id = stored.workspace_id.clone();
         // Resolve provider using the same precedence as spawn path (provider
         // field → configured default), then build provider-specific _meta.
         // Reached only after a successful spawn (which resolved the same
         // inputs), so a fall-through here is a settings race — fail loudly
         // rather than fabricating a positional default (monorepo#3044).
-        let provider_id = resolve_provider_id(
+        let selection = resolve_provider_id(
             stored.provider.as_deref(),
             derived_default_provider(&self.effective_settings()).as_deref(),
         )
         .ok_or_else(|| no_default_provider_error("session/new"))?;
+        // Protocol shaping keys on the base; auth failures belong to the
+        // selection (a profile never demotes the Default verdict).
+        let provider_id = intent_providers::base_provider_id(&selection).to_owned();
+        let owner = self.auth_owner(agent_id, &selection).await;
         let is_orchestrator = self
             .resolve_session_is_orchestrator(&provider_id, &stored)
             .await;
-        let meta = build_session_meta(
+        let mut meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),
             Some(&stored.name),
             is_orchestrator,
         );
+        if let Some(context) = context {
+            if !callbacks.is_some_and(CallbackClient::supports_review_monitoring) {
+                return Err(Error::Unsupported(
+                    "Private native startup unavailable".into(),
+                ));
+            }
+            context.insert_into(meta.get_or_insert_with(Default::default));
+        }
         self.publish_status_event(
             &workspace_id,
             agent_id,
@@ -2853,7 +3186,38 @@ impl Services {
                     },
                 )
         }
-        .map_err(|e| map_acp_session_error("session/new", &e, &provider_id))?;
+        .map_err(|e| map_acp_session_error_for("session/new", &e, &owner))?;
+        if let Some(native) = native {
+            native
+                .bind_response(&opened.response.session_id.0)
+                .map_err(|_| Error::Forbidden("Private native startup unavailable".into()))?;
+        }
+        if let Some(context) = context {
+            let exact = opened
+                .query
+                .as_ref()
+                .and_then(
+                    intent_acp::callback_registration::CallbackQuery::pending_review_monitoring,
+                )
+                .is_some_and(|pending| pending.matches_context(context));
+            if !exact {
+                // A response is not permission to persist or use a mismatched
+                // allocation. Join only the original requested startup attempt.
+                if let Some(callbacks) = callbacks {
+                    callbacks
+                        .retire_review_context(&opened.response.session_id.0, context)
+                        .await
+                        .map_err(|_| {
+                            Error::Internal("Private native retirement unconfirmed".into())
+                        })?;
+                }
+                return Err(if native.is_some_and(crate::repository_admission::lifecycle::native_allocation::NativeAllocation::is_retired) {
+                    Error::Forbidden("Private native startup unavailable".into())
+                } else {
+                    Error::Unsupported("Private native startup unavailable".into())
+                });
+            }
+        }
         if provider_id == "codex" {
             crate::codex_session_title::confirm(
                 conn,
@@ -2862,7 +3226,7 @@ impl Services {
                 std::time::Duration::from_secs(20),
             )
             .await
-            .map_err(|e| map_acp_session_error("Codex title setup", &e, &provider_id))?;
+            .map_err(|e| map_acp_session_error_for("Codex title setup", &e, &owner))?;
         }
         Ok(PreparedAcpSession {
             response: opened.response,
@@ -2976,6 +3340,20 @@ impl Services {
         replacing: bool,
     ) -> Result<RepositorySessionOutcome<AcpSessionOpened>> {
         let (conn, callbacks) = conn;
+        if let Some(callbacks) =
+            callbacks.filter(|callbacks| callbacks.supports_review_monitoring())
+        {
+            return self
+                .create_owned_review_session(
+                    callbacks.clone(),
+                    agent_id.clone(),
+                    cwd.into(),
+                    mcp_servers,
+                    creation,
+                    replacing,
+                )
+                .await;
+        }
         let outcome = creation
             .initialize_compatible(|| async {
                 let prepared = self
@@ -2997,6 +3375,28 @@ impl Services {
         })
     }
 
+    /// Record the profile settings a just-opened native session belongs to
+    /// (no-op for a bare selection).
+    async fn bind_profile_native_session(&self, stored: &AgentSession) {
+        let Some(selection) = resolve_provider_id(
+            stored.provider.as_deref(),
+            derived_default_provider(&self.effective_settings()).as_deref(),
+        ) else {
+            return;
+        };
+        if let Some(fingerprint) = self
+            .profile_process_fingerprint(&stored.id, &selection)
+            .await
+        {
+            // An unbound session already reads as the empty Default
+            // fingerprint, so a Default without overrides writes nothing.
+            if Self::native_session_binding_differs(stored, &fingerprint) {
+                self.bind_native_session_settings(&stored.workspace_id, &stored.id, &fingerprint)
+                    .await;
+            }
+        }
+    }
+
     async fn finish_created_acp_session(
         &self,
         prepared: PreparedAcpSession,
@@ -3010,10 +3410,11 @@ impl Services {
         } = prepared;
         // On CAS loss the provider metadata belongs to the losing candidate.
         // Preserve the winner's usage, effective model and effort metadata.
-        let (modes, thought_level) = if canonical == resp.session_id.0.as_ref() {
+        let (modes, thought_level, filled_model) = if canonical == resp.session_id.0.as_ref() {
             if replacing {
                 self.clear_context_usage(&stored.id);
             }
+            Box::pin(self.bind_profile_native_session(&stored)).await;
             self.persist_effective_model(
                 &stored.workspace_id,
                 &stored.id,
@@ -3028,9 +3429,13 @@ impl Services {
                 thought_level.as_ref(),
             )
             .await;
-            (resp.modes, thought_level)
+            let filled_model = Box::pin(
+                self.fill_identity_from_session_open(&stored, resp.config_options.as_deref()),
+            )
+            .await;
+            (resp.modes, thought_level, filled_model)
         } else {
-            (None, None)
+            (None, None, None)
         };
         AcpSessionOpened {
             config_options: (canonical == resp.session_id.0.as_ref())
@@ -3039,6 +3444,7 @@ impl Services {
             session_id: canonical,
             modes,
             thought_level,
+            filled_model,
         }
     }
 
@@ -3054,13 +3460,14 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Option<AcpSessionOpened>> {
+        // `prepare_acp_load` boxes its body; its own future is pointer-sized.
         let Some(prepared) = self
             .prepare_acp_load(conn, None, init, agent_id, cwd, mcp_servers)
             .await?
         else {
             return Ok(None);
         };
-        Ok(Some(self.finish_acp_load(prepared).await))
+        Ok(Some(boxed_await(|| self.finish_acp_load(prepared)).await))
     }
 
     pub(crate) async fn resume_repository_acp_session(
@@ -3073,6 +3480,34 @@ impl Services {
         creation: RepositoryCreationOwner,
     ) -> Result<Option<RepositorySessionOutcome<AcpSessionOpened>>> {
         let (conn, callbacks) = conn;
+        let stored = self.store.get_agent_session_summary(agent_id).await?;
+        if let Some(session_id) = &stored.acp_session_id {
+            if self
+                .store
+                .get_review_context_enrollment(&stored.workspace_id, agent_id, session_id)
+                .await?
+                .is_some()
+            {
+                let callbacks = callbacks
+                    .filter(|client| client.supports_review_monitoring())
+                    .ok_or_else(|| {
+                        Error::Unsupported(
+                            "Private native history requires original admission".into(),
+                        )
+                    })?;
+                return self
+                    .load_owned_review_session(
+                        callbacks.clone(),
+                        init.clone(),
+                        agent_id.clone(),
+                        cwd.into(),
+                        mcp_servers,
+                        creation,
+                    )
+                    .await
+                    .map(Some);
+            }
+        }
         let outcome = creation
             .initialize_compatible(|| async {
                 let prepared = self
@@ -3108,11 +3543,55 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Option<PreparedAcpLoad>> {
-        let stored = self.store.get_agent_session(agent_id).await?;
+        boxed_await(|| {
+            self.prepare_acp_load_with_review(
+                conn,
+                callbacks,
+                init,
+                agent_id,
+                cwd.into(),
+                mcp_servers,
+                None,
+            )
+        })
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "original startup owners and admission inputs remain explicit"
+    )]
+    async fn prepare_acp_load_with_review(
+        &self,
+        conn: &Connection,
+        callbacks: Option<&CallbackClient>,
+        init: &InitializeResponse,
+        agent_id: &AgentId,
+        cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
+        review: Option<(
+            &crate::repository_admission::lifecycle::physical_owner::RepositoryReviewBootstrap,
+            &crate::repository_admission::lifecycle::native_allocation::NativeAllocation,
+        )>,
+    ) -> Result<Option<PreparedAcpLoad>> {
+        let stored =
+            boxed_await(|| self.store.get_agent_session_without_messages(agent_id)).await?;
         let workspace_id = stored.workspace_id.clone();
         let Some(acp_session_id) = stored.acp_session_id.clone() else {
             return Ok(None);
         };
+        if review.is_none()
+            && boxed_await(|| {
+                self.store
+                    .get_review_context_enrollment(&workspace_id, agent_id, &acp_session_id)
+            })
+            .await?
+            .is_some()
+        {
+            return Err(Error::Unsupported(
+                "Private native history requires original admission".into(),
+            ));
+        }
         if !session::supports_load_session(init) {
             return Ok(None);
         }
@@ -3147,47 +3626,122 @@ impl Services {
         // id here may be a legacy default alias (`acp`/`augment`/`default`)
         // from a persisted row — an alias spawns the same default binary, so
         // it must not read as a provider change.
-        let (_, last_turn_provider) = self
-            .store
-            .get_agent_session_last_turn_model(&workspace_id, agent_id)
-            .await?;
+        let (_, last_turn_provider) = boxed_await(|| {
+            self.store
+                .get_agent_session_last_turn_model(&workspace_id, agent_id)
+        })
+        .await?;
         if let Some(owner) = last_turn_provider {
-            let canonical = |id: &str| intent_providers::provider_config(id).id;
+            // A profile reference is its own owner: a native session never
+            // crosses profiles or a profile and Default (PROTOCOL §5.54).
+            let canonical = crate::provider_profiles::canonical_selection;
             if canonical(&owner) != canonical(&provider_id) {
+                let same_base = intent_providers::base_provider_id(&owner)
+                    == intent_providers::base_provider_id(&provider_id);
                 tracing::info!(
                     agent = %agent_id,
                     from = %owner,
                     to = %provider_id,
-                    "cross-provider switch: skipping session/load of the old provider's session"
+                    "{}",
+                    if same_base {
+                        "provider profile switch: skipping session/load of the previous profile's session"
+                    } else {
+                        "cross-provider switch: skipping session/load of the old provider's session"
+                    }
                 );
                 return Ok(None);
             }
         }
+        // A profile's native session also belongs to the settings it was
+        // opened under: after an edit takes effect (account or home may
+        // differ) recreate with Intent history instead of loading it.
+        if let Some(fingerprint) =
+            boxed_await(|| self.profile_process_fingerprint(agent_id, &provider_id)).await
+        {
+            if !Self::native_session_bound_to(&stored, &fingerprint) {
+                tracing::info!(
+                    agent = %agent_id,
+                    provider = %provider_id,
+                    "profile settings changed: skipping session/load of the earlier settings' session"
+                );
+                return Ok(None);
+            }
+        }
+        let owner = boxed_await(|| self.auth_owner(agent_id, &provider_id)).await;
+        let provider_id = intent_providers::base_provider_id(&provider_id).to_owned();
         // Resume path: no `sessionTitle` — the durable thread already has its
         // title and `session/load` behavior must stay unchanged (monorepo#3151).
-        let is_orchestrator = self
-            .resolve_session_is_orchestrator(&provider_id, &stored)
-            .await;
+        let is_orchestrator =
+            boxed_await(|| self.resolve_session_is_orchestrator(&provider_id, &stored)).await;
         let meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),
             None,
             is_orchestrator,
         );
-        self.publish_status_event(
-            &workspace_id,
-            agent_id,
-            "session-load",
-            "Resuming session\u{2026}",
-            "info",
-        )
+        boxed_await(|| {
+            self.publish_status_event(
+                &workspace_id,
+                agent_id,
+                "session-load",
+                "Resuming session\u{2026}",
+                "info",
+            )
+        })
         .await;
-        let opened = if let Some(callbacks) = callbacks {
-            callbacks
-                .load_session(&acp_session_id, cwd, mcp_servers, meta)
+        let opened = if let Some((bootstrap, native)) = review {
+            let unavailable =
+                || Error::Forbidden("Private native history requires original admission".into());
+            let callbacks = callbacks.ok_or_else(unavailable)?;
+            if bootstrap.loaded_session().map_err(|_| unavailable())? != acp_session_id
+                || native.is_retired()
+            {
+                return Err(unavailable());
+            }
+            bootstrap
+                .with_current(|| Ok(()))
+                .map_err(|_| unavailable())?;
+            let prepared = boxed_await(|| {
+                callbacks.prepare_review_history(&acp_session_id, native.context().clone())
+            })
+            .await
+            .map_err(|_| unavailable())?;
+            let target = prepared
+                .load_target(cwd.clone(), mcp_servers.clone(), meta.clone())
+                .map_err(|_| unavailable())?;
+            let verified = boxed_await(|| bootstrap.verify_history(prepared.messages()))
+                .await
+                .map_err(|_| unavailable())?;
+            let admitted = boxed_await(|| verified.admit(Arc::new(self.clone())))
+                .await
+                .map_err(|_| unavailable())?;
+            admitted
+                .retain_native_context()
+                .map_err(|_| unavailable())?;
+            let opened = boxed_await(|| {
+                prepared.load(callbacks, cwd, mcp_servers, meta, admitted.bind_load(target))
+            })
+            .await;
+            if let Ok(opened) = &opened {
+                if native.is_retired()
+                    || !opened
+                        .query
+                        .as_ref()
+                        .and_then(intent_acp::callback_registration::CallbackQuery::pending_review_monitoring)
+                        .is_some_and(|receipt| receipt.matches_context(native.context()))
+                {
+                    boxed_await(|| native.join()).await.map_err(|_| {
+                        Error::Internal("Private native retirement unconfirmed".into())
+                    })?;
+                    return Err(unavailable());
+                }
+            }
+            opened
+        } else if let Some(callbacks) = callbacks {
+            boxed_await(|| callbacks.load_session(&acp_session_id, cwd, mcp_servers, meta))
                 .await
         } else {
-            session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta)
+            boxed_await(|| session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta))
                 .await
                 .map(
                     |response| intent_acp::callback_registration::CallbackSession {
@@ -3196,16 +3750,18 @@ impl Services {
                     },
                 )
         }
-        .map_err(|e| map_acp_session_error("session/load", &e, &provider_id))?;
+        .map_err(|e| map_acp_session_error_for("session/load", &e, &owner))?;
         if provider_id == "codex" {
-            crate::codex_session_title::confirm(
-                conn,
-                &acp_session_id,
-                &stored.name,
-                std::time::Duration::from_secs(20),
-            )
+            boxed_await(|| {
+                crate::codex_session_title::confirm(
+                    conn,
+                    &acp_session_id,
+                    &stored.name,
+                    std::time::Duration::from_secs(20),
+                )
+            })
             .await
-            .map_err(|e| map_acp_session_error("Codex title setup", &e, &provider_id))?;
+            .map_err(|e| map_acp_session_error_for("Codex title setup", &e, &owner))?;
         }
         Ok(Some(PreparedAcpLoad {
             response: opened.response,
@@ -3236,11 +3792,15 @@ impl Services {
             thought_level.as_ref(),
         )
         .await;
+        let filled_model =
+            Box::pin(self.fill_identity_from_session_open(&stored, resp.config_options.as_deref()))
+                .await;
         AcpSessionOpened {
             session_id,
             modes: resp.modes,
             config_options: resp.config_options.map(|options| json!(options)),
             thought_level,
+            filled_model,
         }
     }
 
@@ -3332,6 +3892,7 @@ impl Services {
             prompt,
             turn_id,
             None,
+            false,
         )
         .await
     }
@@ -3350,10 +3911,12 @@ impl Services {
         prompt: crate::provider_images::PreparedPrompt,
         turn_id: Option<&str>,
         mut local: Option<LocalPromptInput<'_>>,
+        redrive_spurious_cancel: bool,
     ) -> Result<StopReason> {
         // The worker prepares this outbound copy before committing its
         // first-turn context. Persisted originals and local capture are untouched.
         let prompt = prompt.into_blocks();
+        let required = local.as_ref().is_some_and(|input| input.required.is_some());
         // Mint the assistant message id at turn START (CS-0 D1) so streaming
         // block ids `{messageId}:{index}` match the blocks ultimately persisted.
         let message_id = Uuid::now_v7().to_string();
@@ -3365,7 +3928,8 @@ impl Services {
                     .map(|input| input.connection.callback_tool_routes())
                     .unwrap_or_default(),
             )
-            .with_probe_context(self.image_probe_context(agent_id, workspace_id).await);
+            .with_probe_context(self.image_probe_context(agent_id, workspace_id).await)
+            .with_cursor_tool_names(self.is_cursor_session(agent_id).await);
         // Turn wall-clock start, for the global usage-stats longest-run MAX.
         let turn_started = std::time::Instant::now();
         // Publish the in-flight turn so a `chat.subscribe` arriving mid-turn can
@@ -3507,6 +4071,21 @@ impl Services {
             let attempt_result = {
                 let prompt_fut = async {
                     if let Some(input) = local.as_mut() {
+                        if required {
+                            let admission = input.required.take().ok_or_else(|| {
+                                AcpError::Transport(
+                                    "required monitor prompt already consumed".into(),
+                                )
+                            })?;
+                            return Box::pin(session::prompt_with_required_admission(
+                                input.connection,
+                                acp_session_id,
+                                prompt.clone(),
+                                &activity,
+                                admission,
+                            ))
+                            .await;
+                        }
                         let guidance = match input.captured.as_mut() {
                             Some(original) => original.prepare().await,
                             None => None,
@@ -3604,7 +4183,8 @@ impl Services {
             // Only a recognized pre-start policy rejection may change modes and
             // replay the untouched prompt. Reuse the output/client-work guards
             // above, and recheck after the asynchronous mode change.
-            if !closed
+            if !required
+                && !closed
                 && !any_update_received
                 && conn.client_request_seq() == client_request_watermark
             {
@@ -3660,7 +4240,8 @@ impl Services {
             }
             match &attempt_result {
                 Err(e)
-                    if fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES
+                    if !required
+                        && fetch_retry_attempt < MAX_TRANSIENT_PROMPT_FETCH_RETRIES
                         && !closed
                         && !any_update_received
                         && conn.client_request_seq() == client_request_watermark
@@ -3804,8 +4385,39 @@ impl Services {
         // BEFORE the terminal emits below, so a redriven attempt never
         // flashes a failed turn at the FE. Any error after streamed content
         // keeps the existing terminal emit path unchanged.
+        // A remote agent's automatic switch (quota failover, or the timed
+        // return home) is unconfirmed until the node runs it: the node
+        // starts the agent asynchronously, so a start failure (a backup not
+        // signed in there, a failed checkout) surfaces as this first prompt
+        // failing before any output. Undo the switch and fail with what to
+        // do — never a silent redrive or a further failover
+        // (intent-hq/intent#8317).
+        let remote_switch_failed = match &result {
+            Err(e)
+                if !updates_applied
+                    && blocks.is_empty()
+                    && !matches!(e, AcpError::PromptIdleTimeout(_))
+                    && self.remote_switch_pending(agent_id) =>
+            {
+                self.fail_remote_failover(workspace_id, agent_id, &e.to_string())
+                    .await
+            }
+            _ => None,
+        };
         let pre_output_transport_failure = matches!(&result, Err(e) if transport_closed_error(e))
             && !updates_applied
+            && blocks.is_empty()
+            && remote_switch_failed.is_none();
+        // Stale-cancel classification (see [`PROMPT_SPURIOUS_CANCEL_PREFIX`]).
+        // `redrive_spurious_cancel` is set only when the turn worker took a
+        // fresh stale-cancel mark for this attempt. A client request
+        // (permission prompt, fs write, terminal) means the turn may have had
+        // side effects or a user decision, so it settles instead.
+        let spurious_cancel = redrive_spurious_cancel
+            && matches!(&result, Ok(StopReason::Cancelled))
+            && !closed
+            && !any_update_received
+            && conn.client_request_seq() == client_request_watermark
             && blocks.is_empty();
         // Idle-timeout classification (warn-and-continue): the turn went the
         // whole idle window with no `session/update` traffic. The partial
@@ -3826,6 +4438,7 @@ impl Services {
         // blocks (`ws.app.question.ask`) — computed BEFORE the append consumes
         // `blocks`, used for the pending-questions marker write below.
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        let secret_request_ids = crate::secret_requests::secret_request_ids_in(&blocks);
         // Proposal ids carried by this turn's lifted proposal-resource blocks
         // (both the registry/array path and the wrapped-echo path in
         // `record_tool` land as persisted blocks) — computed BEFORE the
@@ -3867,6 +4480,20 @@ impl Services {
                 )
                 .await;
         }
+        if spurious_cancel {
+            tracing::warn!(
+                agent = %agent_id,
+                "prompt resolved cancelled before any output right after a daemon cancel — handing it back to the worker for one redrive"
+            );
+            trace_stream_lifecycle(
+                Some(message_id.as_str()),
+                "message",
+                "spurious_cancel",
+                Some(turn_started.elapsed()),
+                block_count,
+                "redrive",
+            );
+        }
         // Record the silent tail for `agent.diagnostics`
         // (intent-hq/monorepo#2669). A pre-output transport failure is
         // excluded: the attempt is invisible (the worker may silently
@@ -3879,6 +4506,7 @@ impl Services {
         // insert leaves one stale u64, which the diagnostics read (it
         // iterates live sessions) never serves.
         if !pre_output_transport_failure
+            && !spurious_cancel
             && self.store.get_agent_session_summary(agent_id).await.is_ok()
         {
             self.record_turn_silent_tail(agent_id, silent_tail_ms);
@@ -3976,7 +4604,7 @@ impl Services {
             .ok()
             .map(|stop| serde_json::to_value(stop).unwrap_or(Value::Null))
             .filter(|v| !matches!(v.as_str(), Some("end_turn" | "stream_complete") | None));
-        if !blocks.is_empty() || abnormal_finish_reason.is_some() {
+        if !spurious_cancel && (!blocks.is_empty() || abnormal_finish_reason.is_some()) {
             let row_metadata = abnormal_finish_reason
                 .as_ref()
                 .map(|reason| json!({ "finishReason": reason }));
@@ -4059,6 +4687,12 @@ impl Services {
         if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
+        // Persisted secret-request cards (§5.56) put their requests in front
+        // of the user: surface them for the needs_attention derivation.
+        if message_persisted {
+            self.surface_secret_requests(workspace_id, agent_id, &secret_request_ids)
+                .await;
+        }
         // Stored-on-write pending-proposals recording (PROTOCOL §5.5): a
         // proposal-bearing tail merges its `{ proposalId, messageId }`
         // entries into the session's ordered pending set (dedupe by id,
@@ -4095,8 +4729,12 @@ impl Services {
         // its predecessor via [`TurnBookkeeping`]) so a delayed task from
         // turn N can neither skew turn N+1's stats delta nor overwrite its
         // newer cumulative snapshot.
-        let run_completed = result.is_ok();
-        if turn_usage.is_some() || turn_cost.is_some() || run_completed {
+        // A stale-cancel attempt is not a completed run (the redrive is), but
+        // any usage the provider reported for it is still recorded —
+        // including a `_meta`-only bill (grok), which the task below resolves
+        // via `prompt_meta_turn_usage`, so `turn_meta` alone also schedules it.
+        let run_completed = result.is_ok() && !spurious_cancel;
+        if turn_usage.is_some() || turn_cost.is_some() || turn_meta.is_some() || run_completed {
             let services = self.clone();
             let agent_id_task = agent_id.clone();
             let workspace_id_task = workspace_id.clone();
@@ -4169,6 +4807,14 @@ impl Services {
                 }
             }
         }
+        // Stale daemon cancel: nothing was persisted and no terminal event
+        // fires — the turn worker redrives the prompt and that attempt closes
+        // the turn (see [`PROMPT_SPURIOUS_CANCEL_PREFIX`]).
+        if spurious_cancel {
+            return Err(Error::Internal(format!(
+                "{PROMPT_SPURIOUS_CANCEL_PREFIX} stopReason cancelled"
+            )));
+        }
         // Post-output transient fetch failure (intent-hq/intent#5419): the
         // turn is about to fail terminally exactly as today (Error status,
         // `agent:failed`, no redrive), but the death would otherwise only be
@@ -4237,7 +4883,7 @@ impl Services {
         {
             let reason = match open_tool_call {
                 Some(label) => format!(
-                    "Turn ended after a provider stall: no session/update from the provider for \
+                    "{PROVIDER_STALL_BLOCKER_PREFIX}no session/update from the provider for \
                      {silent:?} with tool call {label} still open (open-tool terminal threshold \
                      {:?}; error class: provider stall). The tool call never reported completion \
                      and emitted nothing for the whole window, so the turn was failed instead of \
@@ -4246,7 +4892,7 @@ impl Services {
                     Duration::from_millis(open_tool_terminal_ms),
                 ),
                 None => format!(
-                    "Turn ended after a provider stall: no session/update from the provider for \
+                    "{PROVIDER_STALL_BLOCKER_PREFIX}no session/update from the provider for \
                      {silent:?} with no tool call in flight (terminal threshold {:?}; error class: \
                      provider stall). The provider is neither streaming nor running a tool, so the \
                      turn was failed instead of waiting for the idle timeout; the agent is stopping \
@@ -4255,6 +4901,8 @@ impl Services {
                     Duration::from_millis(stall_terminal_ms),
                 ),
             };
+            // The reserved reason prefix marks it daemon-raised, so the
+            // agent's next successful turn clears it (intent-hq/intent#7182).
             if let Err(raise_err) = self
                 .agent_request_attention_op(
                     workspace_id.clone(),
@@ -4309,13 +4957,18 @@ impl Services {
                     .get_agent_session_token_usage(workspace_id, agent_id)
                     .await
                 {
-                    Ok((_, _, provider, _)) => resolve_provider_id(
+                    Ok((_, _, provider, _)) => match resolve_provider_id(
                         provider.as_deref(),
                         derived_default_provider(&self.effective_settings()).as_deref(),
-                    )
+                    ) {
+                        Some(provider_id) => {
+                            self.auth_owner(agent_id, &provider_id).await.demote();
+                            Some(provider_id)
+                        }
+                        None => None,
+                    }
                     .map(|provider_id| {
-                        crate::provider_auth::demote_auth_verdict(&provider_id);
-                        crate::host_execution::ai_authorization_error(
+                        crate::execution_call::ai_authorization_error(
                             Error::InvalidParams(format!(
                                 "session/prompt: {}",
                                 crate::provider_auth::not_authenticated_message(&provider_id)
@@ -4332,8 +4985,9 @@ impl Services {
             }
             _ => None,
         };
-        let prompt_actionable_error =
-            prompt_auth_error.or_else(|| result.as_ref().err().and_then(prompt_size_error));
+        let prompt_actionable_error = remote_switch_failed
+            .or(prompt_auth_error)
+            .or_else(|| result.as_ref().err().and_then(prompt_size_error));
         // Quota-exhaustion observation: resolved in the SAME pre-persist seam
         // as the auth mapping above, for the same reason — this is the last
         // place the structured `AcpError` still exists, before the final
@@ -4362,8 +5016,35 @@ impl Services {
             }
             _ => (false, None),
         };
+        // Backup failover (PROTOCOL §5.54): a quota rejection with an untried
+        // backup profile of the same base switches the agent onto it here,
+        // before any terminal effect, so this attempt is swallowed — no
+        // Error status / stop_reason, no `agent:failed` — and the turn worker
+        // redrives the same user message on the backup. Output this attempt
+        // already persisted stays in the transcript. Only a worker-armed turn
+        // can fail over, and the chain is bounded per user turn.
+        let quota_outcome = if prompt_quota_failure && prompt_actionable_error.is_none() {
+            self.try_quota_failover(
+                workspace_id,
+                agent_id,
+                prompt_quota_provider.as_deref(),
+                &result
+                    .as_ref()
+                    .err()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            )
+            .await
+        } else {
+            crate::quota_failover::QuotaFailoverOutcome::Terminal
+        };
+        let quota_failover = quota_outcome.switched();
+        // A remote agent whose backups cannot run on its machine fails with
+        // the actionable message instead of the raw quota error.
+        let prompt_actionable_error =
+            prompt_actionable_error.or_else(|| quota_outcome.into_refusal());
         if let Err(e) = &result {
-            if !pre_output_transport_failure && !prompt_idle_timeout {
+            if !pre_output_transport_failure && !prompt_idle_timeout && !quota_failover {
                 let fallback = Error::Internal(format!("session/prompt failed: {e}"));
                 let wrapped = prompt_actionable_error.as_ref().unwrap_or(&fallback);
                 if !crate::agent_manager::prompt_cancellation_error(wrapped) {
@@ -4398,7 +5079,9 @@ impl Services {
         // registration order) when any were drained — omitted otherwise
         // (monorepo#732 fix wave: live delivery of turn-end attachments).
         if !pre_output_transport_failure {
-            let outcome = if result.is_err() {
+            let outcome = if quota_failover {
+                "quota_failover"
+            } else if result.is_err() {
                 "failed"
             } else if suspected_truncated && truncation_redrive {
                 "suspected_truncated_redrive"
@@ -4460,6 +5143,14 @@ impl Services {
         // the redrive is still trying to resume it. On cap exhaustion the
         // flag is false and this arm fires as today (advisory fields
         // included), so watchers get exactly one idle per stall episode.
+        // A successful turn retires a daemon-raised provider-stall blocker
+        // (intent-hq/intent#7182) before the idle emit, so watchers woken by
+        // the idle observe the cleared state. A cancelled turn or an armed
+        // truncation redrive is not a successful completion.
+        if matches!(&result, Ok(stop) if *stop != StopReason::Cancelled) && !truncation_redrive {
+            self.clear_daemon_stall_blocker_after_success(workspace_id, agent_id)
+                .await;
+        }
         match &result {
             Ok(_) if truncation_redrive => {
                 tracing::debug!(
@@ -4514,8 +5205,8 @@ impl Services {
                 // without a follow-up read. The lookup is a single indexed row
                 // read per idle event; a store error is swallowed and the
                 // event still fires with the base payload.
-                if let Ok(session) = self.store.get_agent_session(agent_id).await {
-                    data["agentName"] = Value::String(session.name);
+                if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
+                    data["agentName"] = Value::String(session.name.clone());
                     data["isBackground"] = Value::Bool(session.is_background);
                     // Mute hint: present only when true (absent ≠ false, like
                     // `workspaceArchived`) so notification clients stay quiet
@@ -4523,7 +5214,7 @@ impl Services {
                     if session.notifications_muted {
                         data["notificationsMuted"] = Value::Bool(true);
                     }
-                    if let Some(report) = session.completion_report {
+                    if let Some(report) = session.completion_report.clone() {
                         data["completionReport"] = Value::String(report.clone());
                         data["report"] = Value::String(report);
                     }
@@ -4539,7 +5230,10 @@ impl Services {
                 // (scheduled/running) background hooks is waiting, not
                 // stalled — stamp `waitingOnHooks` (omitted when none) so
                 // subscribers and the completion-watch wake can surface it.
-                self.annotate_waiting_on_hooks(agent_id, &mut data).await;
+                self.ports
+                    .runtime()
+                    .annotate_waiting_on_hooks(self, agent_id, &mut data)
+                    .await;
                 // Idle-visibility (unified external-wait, mirrors the hook
                 // stamp above): same `waitingOnPrMonitors` stamp for active
                 // PR monitors (omitted when none).
@@ -4555,6 +5249,12 @@ impl Services {
                 // correct if the daemon is killed immediately after the event.
                 self.record_group_completion_pre_publish(workspace_id, agent_id, &data)
                     .await;
+                // Observable idle means this turn is complete. The worker keeps
+                // its slot through the post-turn tail; graceful shutdown must
+                // not record that tail as an interrupted turn.
+                if let Some(manager) = self.agent_manager() {
+                    manager.mark_turn_settled_if_slot_held(agent_id);
+                }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_IDLE, data)
                     .await;
             }
@@ -4566,6 +5266,16 @@ impl Services {
                 tracing::debug!(
                     agent = %agent_id,
                     "agent:idle suppressed — ready-to-send queue non-empty",
+                );
+            }
+            Err(e) if quota_failover => {
+                // Swallowed (PROTOCOL §5.54 Backup failover): the agent now
+                // runs on a backup and stays busy until the redriven turn
+                // ends; that turn emits its own terminal events.
+                tracing::debug!(
+                    agent = %agent_id,
+                    error = %e,
+                    "quota failure switched to a backup profile — the worker redrives the turn",
                 );
             }
             Err(e) if pre_output_transport_failure => {
@@ -4640,7 +5350,12 @@ impl Services {
             }
         }
         result.map_err(|e| {
-            if pre_output_transport_failure {
+            if quota_failover {
+                Error::Internal(format!(
+                    "{} {e}",
+                    crate::quota_failover::PROMPT_QUOTA_FAILOVER_PREFIX
+                ))
+            } else if pre_output_transport_failure {
                 Error::Internal(format!("{PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX} {e}"))
             } else if idle_timeout_streamed {
                 // Streamed-activity marker for the worker's consecutive-
@@ -4899,7 +5614,8 @@ impl Services {
         let message_id = Uuid::now_v7().to_string();
         let mut transcript = Transcript::new(message_id.clone())
             .with_callback_routes(routes)
-            .with_probe_context(self.image_probe_context(agent_id, workspace_id).await);
+            .with_probe_context(self.image_probe_context(agent_id, workspace_id).await)
+            .with_cursor_tool_names(self.is_cursor_session(agent_id).await);
         // Live-turn slot + abort-safe guard, same contract as a prompt turn:
         // a `chat.subscribe` arriving mid-wake reconstructs the partial
         // message, and an abort (preempting prompt / stop) clears the slot.
@@ -4974,6 +5690,7 @@ impl Services {
         let block_count = blocks.len();
         let preview_text_blocks = text_block_strings(&blocks);
         let questions_persisted = crate::agent_ops::question_block_count_in(&blocks) > 0;
+        let secret_request_ids = crate::secret_requests::secret_request_ids_in(&blocks);
         // Same pre-append proposal-id scan as the prompt-turn persist
         // (PROTOCOL §5.5, pending proposals).
         let proposal_ids = crate::tool_block::proposal_ids_in(&blocks);
@@ -5053,6 +5770,11 @@ impl Services {
         if marker_moved {
             self.maybe_emit_display_status_changed(workspace_id).await;
         }
+        // Same §5.56 surfacing as the prompt-turn persist.
+        if message_persisted {
+            self.surface_secret_requests(workspace_id, agent_id, &secret_request_ids)
+                .await;
+        }
         // Same stored-on-write pending-proposals recording as the prompt-turn
         // persist (PROTOCOL §5.5).
         if message_persisted && !proposal_ids.is_empty() {
@@ -5069,12 +5791,17 @@ impl Services {
                 error,
             )
             .await;
-            if let Err(raise_error) = self.agent_request_attention_op(
-                workspace_id.clone(),
-                "blocker".to_string(),
-                format!("Unsolicited provider activity stopped: {error}. Retry the agent to continue."),
-                Some(agent_id.clone()),
-            ).await {
+            if let Err(raise_error) = self
+                .agent_request_attention_op(
+                    workspace_id.clone(),
+                    "blocker".to_string(),
+                    format!(
+                        "{UNSOLICITED_STALL_BLOCKER_PREFIX}{error}. Retry the agent to continue."
+                    ),
+                    Some(agent_id.clone()),
+                )
+                .await
+            {
                 tracing::warn!(agent = %agent_id, error = %raise_error, "failed to raise attention for stalled native tool");
             }
             Some(persisted)
@@ -5102,6 +5829,14 @@ impl Services {
         );
         self.publish_agent_event(workspace_id, agent_id, AGENT_STREAM_END, end_data)
             .await;
+        if failure.is_none() && !empty_response {
+            // Successful wake turn: same stall-blocker retirement as the
+            // prompt-turn settlement (intent-hq/intent#7182). An empty wake is
+            // not a success — `recover_empty_harness_wake` handles it — so it
+            // leaves the stall blocker pending.
+            self.clear_daemon_stall_blocker_after_success(workspace_id, agent_id)
+                .await;
+        }
         if let Some(error) = &failure {
             self.flush_deferred_attention(agent_id, workspace_id).await;
             self.publish_agent_event(
@@ -5258,13 +5993,13 @@ impl Services {
         if empty_wake_response {
             data["emptyWakeResponse"] = Value::Bool(true);
         }
-        if let Ok(session) = self.store.get_agent_session(agent_id).await {
-            data["agentName"] = Value::String(session.name);
+        if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
+            data["agentName"] = Value::String(session.name.clone());
             data["isBackground"] = Value::Bool(session.is_background);
             if session.notifications_muted {
                 data["notificationsMuted"] = Value::Bool(true);
             }
-            if let Some(report) = session.completion_report {
+            if let Some(report) = session.completion_report.clone() {
                 data["completionReport"] = Value::String(report.clone());
                 data["report"] = Value::String(report);
             }
@@ -5275,7 +6010,10 @@ impl Services {
             Value::Bool(!self.waiting_watches_for_parent(agent_id).is_empty());
         // Idle-visibility: same `waitingOnHooks` stamp as the prompt-turn
         // idle (omitted when the agent owns no active hook).
-        self.annotate_waiting_on_hooks(agent_id, &mut data).await;
+        self.ports
+            .runtime()
+            .annotate_waiting_on_hooks(self, agent_id, &mut data)
+            .await;
         // Idle-visibility (unified external-wait): same `waitingOnPrMonitors`
         // stamp as the prompt-turn idle (omitted when the agent owns no
         // active monitor).
@@ -5376,7 +6114,7 @@ impl Services {
             .get_agent_session_token_usage(workspace_id, agent_id)
             .await
         {
-            Ok((_, _, provider, _)) => resolve_provider_id(
+            Ok((_, _, provider, _)) => resolve_base_provider_id(
                 provider.as_deref(),
                 derived_default_provider(&self.effective_settings()).as_deref(),
             ),
@@ -5437,7 +6175,7 @@ impl Services {
             .await
         {
             Ok((_, _, provider, stored)) => {
-                let provider_id = resolve_provider_id(
+                let provider_id = resolve_base_provider_id(
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 );
@@ -5576,7 +6314,7 @@ impl Services {
         // below).
         let provider_id = prev_readable
             .then(|| {
-                resolve_provider_id(
+                resolve_base_provider_id(
                     provider.as_deref(),
                     derived_default_provider(&self.effective_settings()).as_deref(),
                 )
@@ -5715,11 +6453,34 @@ impl Services {
         workspace_id: &WorkspaceId,
         transcript: &mut Transcript,
     ) -> bool {
-        let Some(mapped) =
+        let Some(mut mapped) =
             session::map_notification_with_callback_routes(note, &transcript.callback_routes)
         else {
             return false;
         };
+        if transcript.cursor_tool_names {
+            if let MappedUpdate::ToolCall(call) = &mut mapped {
+                session::apply_cursor_tool_names(call);
+            }
+        }
+        // A timed return home is announced at home's first output, ahead of
+        // it, and the output proves the configuration's quota to every
+        // conversation (PROTOCOL §5.54 backup failover).
+        if matches!(
+            mapped,
+            MappedUpdate::Chunk { .. } | MappedUpdate::ToolCall(_)
+        ) {
+            if !transcript.provider_output_seen {
+                transcript.provider_output_seen = true;
+                self.note_provider_working(agent_id);
+            }
+            // A remote agent's pending quota failover is confirmed (and
+            // announced) by its first output on the backup; so is a switch
+            // its user made, once the run producing it is the switched one.
+            self.confirm_remote_model_switch(agent_id);
+            Box::pin(self.complete_remote_failover(workspace_id, agent_id)).await;
+            Box::pin(self.announce_provider_return_if_pending(workspace_id, agent_id)).await;
+        }
         let message_id = transcript.message_id.clone();
         match mapped {
             MappedUpdate::Chunk {
@@ -5826,7 +6587,14 @@ impl Services {
                 }
                 return false;
             }
-            MappedUpdate::ToolCall(tc) => {
+            MappedUpdate::ToolCall(mut tc) => {
+                // §5.5b: a backgrounded marker without an explicit status
+                // keeps the tool's recorded status (never reopens it).
+                if tc.keeps_status {
+                    if let Some(status) = transcript.tool_status_for(&tc.tool_call_id) {
+                        tc.status = status;
+                    }
+                }
                 // §7.1 deterministic attach: claim the pending `AtToolResult`
                 // registry batch for this terminal call (nonce match against
                 // the echoed output, `workspace_api` FIFO fallback). A hit
@@ -6116,14 +6884,14 @@ impl Services {
         if event_type == AGENT_FAILED
             && (data.get("parentAgentId").is_none() || data.get("agentName").is_none())
         {
-            if let Ok(session) = self.store.get_agent_session(agent_id).await {
+            if let Ok(session) = self.store.get_agent_session_summary(agent_id).await {
                 if let Some(map) = data.as_object_mut() {
-                    if let Some(parent) = session.parent_agent_id {
+                    if let Some(parent) = session.parent_agent_id.clone() {
                         map.entry("parentAgentId".to_string())
                             .or_insert(Value::String(parent.0));
                     }
                     map.entry("agentName".to_string())
-                        .or_insert(Value::String(session.name));
+                        .or_insert(Value::String(session.name.clone()));
                 }
             }
         }
@@ -6221,3 +6989,6 @@ impl Services {
         .await
     }
 }
+
+#[path = "agent_session/review_startup.rs"]
+mod review_startup;

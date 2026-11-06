@@ -115,6 +115,14 @@ impl HostExecError {
 ///
 /// Returns an invalid-params `HostExecError` when required parameters are missing or malformed.
 pub fn parse_args(params: &Map<String, Value>) -> Result<HostExecArgs, HostExecError> {
+    // `secretEnv` belongs to the agent `ws.host.exec` binding only (PROTOCOL
+    // §5.56): the agent path resolves and strips it before parsing, so its
+    // presence here means a client connection, which has no agent identity.
+    if params.contains_key("secretEnv") {
+        return Err(HostExecError::invalid(
+            "Invalid parameter: secretEnv is only available to agents through ws.host.exec",
+        ));
+    }
     let command = params
         .get("command")
         .and_then(Value::as_str)
@@ -700,7 +708,7 @@ mod tests {
         let store = intent_store::Store::open(&tmp.path().join("store.db"))
             .await
             .unwrap();
-        let services = crate::Services::new(store.clone());
+        let services = crate::Services::new_isolated(store.clone());
         let runtime = services.host_exec_runtime();
         let pid_file = tmp.path().join("pid");
         let fifo = tmp.path().join("gate");
@@ -710,25 +718,31 @@ mod tests {
         }))).unwrap();
         let caller_runtime = runtime.clone();
         let caller = tokio::spawn(async move { caller_runtime.run(&services, args).await });
-        let pid = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-                    if let Ok(pid) = pid.trim().parse::<i32>() {
-                        break pid;
+        let pid = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                        if let Ok(pid) = pid.trim().parse::<i32>() {
+                            break pid;
+                        }
                     }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+            },
+        )
         .await
         .unwrap();
         // The caller disappearing must not detach the command from shutdown.
         caller.abort();
         let _ = caller.await;
         runtime.begin_shutdown();
-        tokio::time::timeout(Duration::from_secs(10), runtime.shutdown())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            runtime.shutdown(),
+        )
+        .await
+        .unwrap();
         assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err());
         store.close().await;
     }

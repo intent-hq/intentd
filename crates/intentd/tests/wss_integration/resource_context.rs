@@ -36,24 +36,27 @@ fn context(mut params: Value, workspace: &WorkspaceId, routed: bool) -> Value {
 
 /// Preserve notifications arriving before a response (including fast export builds).
 async fn notification(c: &mut PresenceClient, method: &str, key: &str, value: &Value) -> Value {
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if let Some(i) = c
-                .skipped
-                .iter()
-                .position(|v| v["method"] == method && v["params"][key] == *value)
-            {
-                let v = c.skipped.remove(i);
-                assert_eq!(v["jsonrpc"], "2.0");
-                return v["params"].clone();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                if let Some(i) = c
+                    .skipped
+                    .iter()
+                    .position(|v| v["method"] == method && v["params"][key] == *value)
+                {
+                    let v = c.skipped.remove(i);
+                    assert_eq!(v["jsonrpc"], "2.0");
+                    return v["params"].clone();
+                }
+                let v = c
+                    .next_within(Duration::from_secs(10))
+                    .await
+                    .expect("notification");
+                c.skipped.push(v);
             }
-            let v = c
-                .next_within(Duration::from_secs(10))
-                .await
-                .expect("notification");
-            c.skipped.push(v);
-        }
-    })
+        },
+    )
     .await
     .expect("notification deadline")
 }
@@ -488,24 +491,27 @@ async fn resource_context_upload_replay_commit_and_abort() {
 }
 
 async fn transfer_event(c: &mut PresenceClient, export: &Value, kind: &str) -> Value {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            if let Some(i) = c.skipped.iter().position(|v| {
-                v["method"] == "events.event"
-                    && v["params"]["event"]["type"] == kind
-                    && v["params"]["event"]["data"]["exportId"] == *export
-            }) {
-                let v = c.skipped.remove(i);
-                assert_eq!(v["jsonrpc"], "2.0");
-                return v["params"]["event"].clone();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            loop {
+                if let Some(i) = c.skipped.iter().position(|v| {
+                    v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == kind
+                        && v["params"]["event"]["data"]["exportId"] == *export
+                }) {
+                    let v = c.skipped.remove(i);
+                    assert_eq!(v["jsonrpc"], "2.0");
+                    return v["params"]["event"].clone();
+                }
+                let v = c
+                    .next_within(Duration::from_secs(10))
+                    .await
+                    .expect("export event");
+                c.skipped.push(v);
             }
-            let v = c
-                .next_within(Duration::from_secs(10))
-                .await
-                .expect("export event");
-            c.skipped.push(v);
-        }
-    })
+        },
+    )
     .await
     .expect("export event deadline")
 }
@@ -759,23 +765,26 @@ async fn resource_context_terminal_and_exec_stream_followups() {
         )
         .await;
         rpc(&mut c,"terminal.write",context(json!({"terminalId":term,"data":base64::engine::general_purpose::STANDARD.encode(b"resource-routing\n")}),&ws,routed)).await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let buffer = rpc(
-                    &mut c,
-                    "terminal.getBuffer",
-                    context(json!({"terminalId":term}), &ws, routed),
-                )
-                .await;
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(buffer["data"].as_str().unwrap())
-                    .unwrap();
-                if String::from_utf8_lossy(&bytes).contains("resource-routing") {
-                    break;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let buffer = rpc(
+                        &mut c,
+                        "terminal.getBuffer",
+                        context(json!({"terminalId":term}), &ws, routed),
+                    )
+                    .await;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(buffer["data"].as_str().unwrap())
+                        .unwrap();
+                    if String::from_utf8_lossy(&bytes).contains("resource-routing") {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+            },
+        )
         .await
         .expect("terminal output");
         rpc(
@@ -886,21 +895,24 @@ async fn resource_context_export_building_abort_and_late_cleanup() {
     drop(writer);
     transfer_event(&mut c, &export, "workspace:transfer:progress").await;
     // The build cleans asynchronously; wait on session retirement, not a sleep.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let reply = c
-                .call(
-                    2,
-                    "workspace.export.read",
-                    json!({"exportId":export,"seq":0,"workspaceId":ws}),
-                )
-                .await;
-            if reply["error"]["data"]["code"] == "not-found" {
-                break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let reply = c
+                    .call(
+                        2,
+                        "workspace.export.read",
+                        json!({"exportId":export,"seq":0,"workspaceId":ws}),
+                    )
+                    .await;
+                if reply["error"]["data"]["code"] == "not-found" {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(

@@ -95,9 +95,12 @@ pub(crate) async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(30), ws.next())
-            .await
-            .unwrap_or_else(|_| panic!("wss rpc {method} timed out"));
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            ws.next(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("wss rpc {method} timed out"));
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -122,7 +125,8 @@ pub(crate) async fn await_workspace_updated(
     pred: impl Fn(&Value) -> bool,
 ) -> Value {
     eprintln!("await workspace:updated ({what})");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())

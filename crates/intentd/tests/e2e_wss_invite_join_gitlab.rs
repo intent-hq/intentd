@@ -28,7 +28,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 #[path = "common/invitation_fixture_lifecycle.rs"]
 mod fixture_lifecycle;
 
@@ -73,6 +73,9 @@ const INTRUDER_GL_LOGIN: &str = "glab-intruder";
 const OWNER_GH_TOKEN: &str = "gho_e2e_gh_owner_token";
 const OWNER_GH_ID: u64 = 100;
 const OWNER_GH_LOGIN: &str = "gh-owner";
+/// Sharing requires a connected owner forge: hosts that are not testing a
+/// specific owner connection boot with GitHub connected.
+const OWNER_FORGE: &[(&str, &str)] = &[("GITHUB_TOKEN", OWNER_GH_TOKEN)];
 
 /// The bound instance: `sourceControl.gitlab.host` defaults to gitlab.com.
 const HOST: &str = "gitlab.com";
@@ -294,9 +297,12 @@ async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(30), ws.next())
-            .await
-            .unwrap_or_else(|_| panic!("wss rpc {method} timed out"));
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            ws.next(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("wss rpc {method} timed out"));
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -316,16 +322,19 @@ async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
 /// One `/invite` round-trip that waits out the listener-wide start throttle:
 /// a request refused `invite-flow-busy` is retried until admitted, bounded.
 async fn admitted_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
-    timeout(Duration::from_secs(90), async {
-        loop {
-            let v = wss_rpc(ws, id, method, params.clone()).await;
-            if v["error"]["data"]["code"] != json!("invite-flow-busy") {
-                return v;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(90)),
+        async {
+            loop {
+                let v = wss_rpc(ws, id, method, params.clone()).await;
+                if v["error"]["data"]["code"] != json!("invite-flow-busy") {
+                    return v;
+                }
+                // timing-guard: poll interval (the start throttle refills one token per 5 s)
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            // timing-guard: poll interval (the start throttle refills one token per 5 s)
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap_or_else(|_| panic!("{method} (id {id}) was never admitted by the start throttle"))
 }
@@ -435,10 +444,13 @@ impl GithubUser {
     #[cfg(feature = "repository-test-fixtures")]
     async fn held_reads(&self, n: usize) {
         let mut rx = self.held.subscribe();
-        timeout(Duration::from_secs(30), rx.wait_for(|held| *held >= n))
-            .await
-            .expect("a held GET /user arrives")
-            .expect("held counter alive");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            rx.wait_for(|held| *held >= n),
+        )
+        .await
+        .expect("a held GET /user arrives")
+        .expect("held counter alive");
     }
 
     /// Answer one `GET /user` (holding it first while `hold` is set).
@@ -786,16 +798,19 @@ async fn boot(mock: &MockForge, credentials: &[(&str, &str)]) -> Host {
             gitlab_identity(HOST_GL_ID)
         };
         let mut owner = connect_ws(port, cfg.clone(), TOKEN).await;
-        timeout(Duration::from_secs(10), async {
-            loop {
-                let me = wss_rpc(&mut owner, 199, "principal.me", json!({})).await;
-                if me["result"]["identity"] == expected {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let me = wss_rpc(&mut owner, 199, "principal.me", json!({})).await;
+                    if me["result"]["identity"] == expected {
+                        break;
+                    }
+                    // timing-guard: synchronize the configured fixture's startup profile refresh
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                // timing-guard: synchronize the configured fixture's startup profile refresh
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("primary startup profile refresh");
     }
@@ -847,7 +862,8 @@ fn github_identity(id: u64) -> Value {
 /// Wait up to `secs` for the next `events.event` notification of type
 /// `event_type` on `ws` (other frames are skipped); returns the event object.
 async fn next_event(ws: &mut Ws, event_type: &str, secs: u64) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "timed out waiting for {event_type}");
@@ -873,25 +889,28 @@ async fn next_event(ws: &mut Ws, event_type: &str, secs: u64) -> Value {
 /// `window_ms` (a negative assertion: the socket stayed quiet).
 #[cfg(feature = "repository-test-fixtures")]
 async fn stays_quiet(ws: &mut Ws, event_type: &str, window_ms: u64) -> bool {
-    timeout(Duration::from_millis(window_ms), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json frame");
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!(event_type)
-                    {
-                        return v;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(window_ms)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json frame");
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"] == json!(event_type)
+                        {
+                            return v;
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .is_err()
 }
@@ -962,7 +981,9 @@ fn preview_invite_row(
 
 async fn assert_preview_pin_identity_over_wss(method: &str) {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
+    // The owner connection settles at boot; count forge traffic from here.
+    let baseline = mock.requests.load(Ordering::SeqCst);
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     let ws_id = create_workspace(&mut owner, 1, "Preview requirements").await;
     let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
@@ -1031,11 +1052,14 @@ async fn assert_preview_pin_identity_over_wss(method: &str) {
             "exact response shape for {method} {name}"
         );
     }
-    assert_eq!(
-        mock.requests.load(Ordering::SeqCst),
-        0,
-        "preview never calls a forge"
-    );
+    let forge_calls = mock.requests.load(Ordering::SeqCst) - baseline;
+    if method == "invite.inspect" {
+        assert_eq!(forge_calls, 0, "inspect never calls a forge");
+    } else {
+        // A challenge checks only the owner's own forge connection (at most
+        // one `GET /user` per call), never the pinned account's forge.
+        assert!(forge_calls <= 5, "{method}: {forge_calls} forge calls");
+    }
 }
 
 #[tokio::test]
@@ -1052,7 +1076,9 @@ async fn challenge_exposes_pin_identity_including_legacy_and_unpinned_over_wss()
 async fn preview_pin_identity_is_not_exposed_for_invalid_or_closed_invites_over_wss() {
     use intent_core::InviteErrorKind;
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
+    // The owner connection settles at boot; count forge traffic from here.
+    let baseline = mock.requests.load(Ordering::SeqCst);
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     let ws_id = create_workspace(&mut owner, 1, "Private requirements").await;
     let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
@@ -1106,7 +1132,7 @@ async fn preview_pin_identity_is_not_exposed_for_invalid_or_closed_invites_over_
     }
     assert_eq!(
         mock.requests.load(Ordering::SeqCst),
-        0,
+        baseline,
         "invalid preview never calls a forge"
     );
 }
@@ -1114,7 +1140,9 @@ async fn preview_pin_identity_is_not_exposed_for_invalid_or_closed_invites_over_
 #[tokio::test]
 async fn preview_pin_identity_keeps_provider_host_and_account_enforcement_over_wss() {
     let mock = spawn_mock_forge().await;
-    let host = boot(&mock, &[]).await;
+    let host = boot(&mock, OWNER_FORGE).await;
+    // The owner connection settles at boot; count forge traffic from here.
+    let baseline = mock.requests.load(Ordering::SeqCst);
     let mut owner = connect_ws(host.port, host.cfg.clone(), TOKEN).await;
     let ws_id = create_workspace(&mut owner, 1, "Pin enforcement").await;
     let store = intent_store::Store::open(&host.dir.path().join("intentd.db"))
@@ -1190,7 +1218,10 @@ async fn preview_pin_identity_keeps_provider_host_and_account_enforcement_over_w
                 .is_none());
         }
     }
-    assert_eq!(mock.requests.load(Ordering::SeqCst), 0);
+    // Each accept checks only the owner's own forge connection (at most one
+    // `GET /user`); the pin is enforced without a forge call.
+    let forge_calls = mock.requests.load(Ordering::SeqCst) - baseline;
+    assert!(forge_calls <= 4, "{forge_calls} forge calls");
 }
 
 /// (a) + (c): a GitLab-only host mints invites and admits a GitLab guest;

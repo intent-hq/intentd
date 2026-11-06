@@ -8,7 +8,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -135,7 +135,7 @@ async fn mcp_servers_lifecycle_redaction_and_status_event() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
@@ -311,11 +311,14 @@ async fn spawn_http_fixture(script: &str) -> (tokio::process::Child, String) {
         .expect("spawn mock http mcp server");
     let stdout = child.stdout.take().expect("fixture stdout");
     let mut lines = BufReader::new(stdout).lines();
-    let line = timeout(Duration::from_secs(10), lines.next_line())
-        .await
-        .expect("timed out waiting for fixture PORT line")
-        .expect("read fixture stdout")
-        .expect("fixture exited before announcing PORT");
+    let line = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        lines.next_line(),
+    )
+    .await
+    .expect("timed out waiting for fixture PORT line")
+    .expect("read fixture stdout")
+    .expect("fixture exited before announcing PORT");
     let port = line
         .strip_prefix("PORT=")
         .expect("fixture PORT line")
@@ -348,7 +351,7 @@ async fn mcp_servers_http_probe_running_and_unreachable() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),
@@ -518,7 +521,7 @@ async fn mcp_servers_workspace_scoped_toggle_and_list() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone())
             .with_secret_store(Arc::new(InMemorySecretStore::default())),

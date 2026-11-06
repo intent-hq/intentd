@@ -8,7 +8,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -45,7 +45,7 @@ async fn boot() -> Fixture {
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.path().join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_workspaces_root(workspaces_root)
         .with_event_bus(bus.clone());
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
@@ -94,6 +94,7 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
     .expect("response timeout")
 }
 
+#[track_caller]
 fn run_git(args: &[&str], dir: &Path) -> String {
     let out = std::process::Command::new("git")
         .args(args)

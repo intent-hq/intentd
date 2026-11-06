@@ -15,6 +15,9 @@
 //! serves plain `ws://` with no TLS acceptor and no bearer-token enforcement;
 //! it is the only path in this module that ever bypasses those checks.
 
+mod executor;
+mod startup;
+
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::IpAddr;
@@ -329,6 +332,10 @@ pub struct WsOptions {
     /// pre-abort state deterministically instead of racing the deadline.
     /// `None` (production) reaps on the deadline.
     pub heartbeat_gate: Option<watch::Receiver<bool>>,
+    /// Test seam for recovery: one bulk slot, with bulk writes held until true.
+    /// Priority responses and inbound requests keep progressing. None preserves
+    /// production capacity and scheduling.
+    pub recovery_bulk_gate: Option<watch::Receiver<bool>>,
 }
 
 impl Default for WsOptions {
@@ -346,6 +353,7 @@ impl Default for WsOptions {
             guest_limits: SharedGuestLimits::default(),
             cleanup_gate: None,
             heartbeat_gate: None,
+            recovery_bulk_gate: None,
         }
     }
 }
@@ -369,8 +377,7 @@ pub(crate) struct ClientHandle {
 /// Shared listener state (the TS server instance). Lifecycle methods are in
 /// [`crate::lifecycle`]; transport mechanics are below.
 pub(crate) struct WsInner {
-    pub api: Arc<dyn WorkspaceApi>,
-    pub bus: EventBus,
+    pub dispatch: crate::startup::StartupDispatch,
     /// TLS acceptor for secure listeners; `None` puts the listener in the
     /// insecure dev-mode plain-`ws://` accept path.
     pub acceptor: Option<TlsAcceptor>,
@@ -396,32 +403,16 @@ pub(crate) struct WsInner {
     pub external_stop_generation: AtomicU64,
     pub state: tokio::sync::Mutex<StartState>,
     pub stop_gate: tokio::sync::Mutex<()>,
-    /// REV-1 first-client-sticky reverse-dispatch target set. Every accepted
-    /// connection registers its per-connection [`ReverseChannel`] here so
-    /// agent-initiated reverse RPCs (`browser.exec`) can be routed to the
-    /// first-connected live client. Defaults to a fresh (empty) registry, so
-    /// standalone / test wiring keeps the pre-REV-1 behavior (agent-initiated
-    /// reverse RPCs still surface `NoClient` when the composition root did not
-    /// share a registry across listeners).
-    pub reverse_registry: Arc<PrimaryReverseRegistry>,
-    /// Server pairing info provider for `server.pairingInfo` / `server.rotateToken`
-    /// fast-path (§5.2). `None` means the methods are unavailable on this listener.
-    pub server_pairing_info: Option<Arc<dyn crate::server::ServerPairingInfo>>,
-    /// System control surface (§5.7) for `system.status`/`system.shutdown`. When
-    /// present, fast-path `system.*` RPCs are handled inline on the connection
-    /// loop. Shared with the UDS listener; `None` in test harnesses that don't
-    /// wire a daemon control surface.
-    pub control: Option<Arc<dyn crate::control::SystemControl>>,
-    /// Daemon-wide outstanding-slow-path-RPC cap shared with the UDS listener
-    /// (`server.maxOutstandingRpcs`); unlimited unless the composition root
-    /// wires one through [`WsOptions::rpc_limiter`].
-    pub rpc_limiter: RpcLimiter,
     /// `/tunnel` caps and timeouts (from [`WsOptions::tunnel_limits`]).
     pub tunnel_limits: crate::tunnel::TunnelLimits,
     /// Test-only post-deregistration gate (from [`WsOptions::cleanup_gate`]).
     pub cleanup_gate: Option<watch::Receiver<bool>>,
     /// Test-only reaper gate (from [`WsOptions::heartbeat_gate`]).
     pub heartbeat_gate: Option<watch::Receiver<bool>>,
+    /// Test seam for recovery: one bulk slot, with bulk writes held until true.
+    /// Priority responses and inbound requests keep progressing. None preserves
+    /// production capacity and scheduling.
+    pub recovery_bulk_gate: Option<watch::Receiver<bool>>,
     /// Admission permits for `/invite` connections
     /// ([`MAX_INVITE_CONNECTIONS`]); a permit is acquired before the `101`
     /// and travels with the connection task.
@@ -433,6 +424,9 @@ pub(crate) struct WsInner {
     /// Guest connection admission ([`GuestConnectionLimits`]): seats are
     /// taken before the `101` and travel with the connection task.
     pub guests: Arc<GuestRegistry>,
+    /// The executor link served on `/node/link` and `/node/git`; `None`
+    /// answers those paths with `404`.
+    pub executor_links: Option<Arc<crate::node_link::ExecutorLinks>>,
 }
 
 /// The HTTPS+WSS listener. Cheap to clone (`Arc` inside); `start()`/`stop()` are
@@ -460,8 +454,14 @@ impl WsApiServer {
     ) -> Result<Self> {
         let acceptor = build_acceptor(tls)?;
         let inner = WsInner {
-            api,
-            bus,
+            dispatch: crate::startup::StartupDispatch::normal(crate::startup::ReadyServices {
+                api,
+                bus,
+                rpc_limiter: options.rpc_limiter.clone(),
+                reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
+                server_pairing_info: None,
+                control,
+            }),
             acceptor: Some(acceptor),
             token_store: Some((**token_store).clone()),
             enabled: options.enabled,
@@ -479,16 +479,14 @@ impl WsApiServer {
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
             stop_gate: tokio::sync::Mutex::new(()),
-            reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
-            server_pairing_info: None,
-            control,
-            rpc_limiter: options.rpc_limiter,
             tunnel_limits: options.tunnel_limits,
             cleanup_gate: options.cleanup_gate,
             heartbeat_gate: options.heartbeat_gate,
+            recovery_bulk_gate: options.recovery_bulk_gate,
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
+            executor_links: None,
         };
         Ok(Self {
             inner: Arc::new(inner),
@@ -506,8 +504,14 @@ impl WsApiServer {
         control: Option<Arc<dyn crate::control::SystemControl>>,
     ) -> Self {
         let inner = WsInner {
-            api,
-            bus,
+            dispatch: crate::startup::StartupDispatch::normal(crate::startup::ReadyServices {
+                api,
+                bus,
+                rpc_limiter: options.rpc_limiter.clone(),
+                reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
+                server_pairing_info: None,
+                control,
+            }),
             acceptor: None,
             token_store: None,
             enabled: options.enabled,
@@ -523,20 +527,60 @@ impl WsApiServer {
             external_stop_generation: AtomicU64::new(0),
             state: tokio::sync::Mutex::new(StartState::default()),
             stop_gate: tokio::sync::Mutex::new(()),
-            reverse_registry: Arc::new(PrimaryReverseRegistry::new()),
-            server_pairing_info: None,
-            control,
-            rpc_limiter: options.rpc_limiter,
             tunnel_limits: options.tunnel_limits,
             cleanup_gate: options.cleanup_gate,
             heartbeat_gate: options.heartbeat_gate,
+            recovery_bulk_gate: options.recovery_bulk_gate,
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
+            executor_links: None,
         };
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    /// Build the same listener with restricted startup dispatch and no Store.
+    ///
+    /// # Errors
+    /// Returns TLS configuration errors without exposing a listener.
+    pub fn new_startup(
+        dispatch: crate::startup::StartupDispatch,
+        tls: Option<&TlsCertificate>,
+        token_store: Option<&Arc<AsyncTokenStore>>,
+        options: WsOptions,
+    ) -> Result<Self> {
+        let acceptor = tls.map(build_acceptor).transpose()?;
+        let inner = WsInner {
+            dispatch,
+            acceptor,
+            token_store: token_store.map(|s| (**s).clone()),
+            enabled: options.enabled,
+            auth_enabled: tls.is_some() && options.auth_enabled,
+            locality_is_local: crate::host::resolve_is_local(false, options.locality_override),
+            bind_addresses: options.bind_addresses.clone(),
+            base_port: options.base_port,
+            fingerprint: tls.map(|t| t.fingerprint256.clone()),
+            heartbeat_interval: options.heartbeat_interval,
+            heartbeat_timeout: options.heartbeat_timeout,
+            clients: Mutex::new(HashMap::new()),
+            next_client_id: AtomicU64::new(0),
+            external_stop_generation: AtomicU64::new(0),
+            state: tokio::sync::Mutex::new(StartState::default()),
+            stop_gate: tokio::sync::Mutex::new(()),
+            tunnel_limits: options.tunnel_limits,
+            cleanup_gate: options.cleanup_gate,
+            heartbeat_gate: options.heartbeat_gate,
+            recovery_bulk_gate: options.recovery_bulk_gate,
+            invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
+            redeem_throttle: crate::invite::new_redeem_throttle(),
+            guests: GuestRegistry::new(options.guest_limits),
+            executor_links: None,
+        };
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
     }
 
     /// [`new`](Self::new) variant that shares an existing REV-1 primary
@@ -585,7 +629,7 @@ impl WsApiServer {
     fn install_registry(server: &mut Self, reverse_registry: Arc<PrimaryReverseRegistry>) {
         let inner = Arc::get_mut(&mut server.inner)
             .expect("WsApiServer inner not yet shared before install_registry");
-        inner.reverse_registry = reverse_registry;
+        inner.dispatch.services_mut().reverse_registry = reverse_registry;
     }
 
     /// Install server pairing info provider on the inner state. Uses the same
@@ -600,7 +644,21 @@ impl WsApiServer {
     ) {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("WsApiServer inner not yet shared before install_pairing_info");
-        inner.server_pairing_info = Some(server_pairing_info);
+        inner.dispatch.services_mut().server_pairing_info = Some(server_pairing_info);
+    }
+
+    /// Serve the daemon-to-daemon executor link on `/node/link` and
+    /// `/node/git`. Uses the same `Arc::get_mut` pattern as
+    /// `install_registry`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (called after `start`
+    /// published clones).
+    pub fn install_executor_links(&mut self, links: Arc<crate::node_link::ExecutorLinks>) {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("WsApiServer inner not yet shared before install_executor_links");
+        inner.executor_links = Some(links);
     }
 
     /// Start the listener, returning the bound port (single-flight).
@@ -686,6 +744,15 @@ impl WsApiServer {
     }
 }
 
+impl std::ops::Deref for WsInner {
+    type Target = crate::startup::ReadyServices;
+    fn deref(&self) -> &Self::Target {
+        self.dispatch
+            .ready()
+            .expect("ordinary dispatch requires readiness")
+    }
+}
+
 impl WsInner {
     /// Accept TCP connections until `shutdown` fires. When a TLS acceptor is
     /// configured the raw TCP stream is first wrapped in TLS (production posture,
@@ -709,14 +776,18 @@ impl WsInner {
                             tracing::info!(failures, "ws accept recovered");
                         }
                         let me = self.clone();
+                        // Taken at accept, before `stop()` can advance it, so
+                        // an executor connection accepted before a stop can
+                        // never bind after it.
+                        let epoch = me.executor_links.as_ref().map_or(0, |l| l.epoch());
                         tokio::spawn(async move {
                             let _ = tcp.set_nodelay(true);
                             let result = match me.acceptor.clone() {
                                 Some(acceptor) => match acceptor.accept(tcp).await {
-                                    Ok(tls) => me.handle_conn(tls).await,
+                                    Ok(tls) => me.handle_conn(tls, epoch).await,
                                     Err(e) => Err(e),
                                 },
-                                None => me.handle_conn(tcp).await,
+                                None => me.handle_conn(tcp, epoch).await,
                             };
                             if let Err(e) = result {
                                 tracing::debug!(error = %e, "ws connection setup failed");
@@ -787,7 +858,7 @@ impl WsInner {
     /// Parse the HTTP head from an established stream (TLS or plain TCP), and
     /// either answer `/health`, reject a bad `/ws` upgrade (401/403/404), or
     /// perform the WebSocket handshake and start the connection loop.
-    async fn handle_conn<S>(self: Arc<Self>, mut stream: S) -> std::io::Result<()>
+    async fn handle_conn<S>(self: Arc<Self>, mut stream: S, epoch: u64) -> std::io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -802,9 +873,20 @@ impl WsInner {
         let target = req.path.unwrap_or("");
         let path = target.split('?').next().unwrap_or(target);
         let (mut origin, mut authorization, mut ws_key) = (None, None, None);
+        let mut has_origin = false;
+        let mut binding_headers: Vec<(String, String)> = Vec::new();
         let mut ws_extensions: Vec<String> = Vec::new();
         for h in req.headers.iter() {
+            if h.name
+                .get(..9)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-intent-"))
+            {
+                if let Some(v) = header_str(h.value) {
+                    binding_headers.push((h.name.to_owned(), v));
+                }
+            }
             if h.name.eq_ignore_ascii_case("origin") {
+                has_origin = true;
                 origin = header_str(h.value);
             } else if h.name.eq_ignore_ascii_case("authorization") {
                 authorization = header_str(h.value);
@@ -821,6 +903,37 @@ impl WsInner {
         if method.eq_ignore_ascii_case("GET") && path == "/health" {
             return self.write_health(&mut stream).await;
         }
+        // Readiness is read once per upgrade: the node-mode decision and the
+        // bootstrap/ordinary split below must see the same dispatch, or
+        // startup finishing between two reads would let a refused path take
+        // an ordinary connection.
+        let (ready, node_mode) = match self.dispatch.ready() {
+            Some(ready) => (true, ready.api.node_mode()),
+            None => (false, false),
+        };
+        // Node mode serves only `NODE_MODE_HTTP_PATHS` (health, the JSON-RPC
+        // socket and the executor link); the guest invite endpoint and the
+        // preview tunnel belong to the orchestration node mode turns off. One
+        // gate ahead of every route. A not-yet-ready upgrade goes to the
+        // bootstrap seat, which serves only `/ws` with the startup status.
+        if node_mode && !crate::catalog::node_mode_serves_path(path) {
+            return reject(&mut stream, 403, "Forbidden").await;
+        }
+        if path == crate::node_link::LINK_PATH || path == crate::node_link::GIT_PATH {
+            return self
+                .executor_upgrade(
+                    stream,
+                    executor::ExecutorRequest {
+                        path,
+                        authorization: authorization.as_deref(),
+                        has_origin,
+                        key: ws_key,
+                        headers: &binding_headers,
+                        epoch,
+                    },
+                )
+                .await;
+        }
         if path != "/ws" && path != "/tunnel" && path != INVITE_PATH {
             return reject(&mut stream, 404, "Not Found").await;
         }
@@ -831,6 +944,11 @@ impl WsInner {
         }
         if !is_allowed_origin(origin.as_deref()) {
             return reject(&mut stream, 403, "Forbidden").await;
+        }
+        if !ready {
+            return self
+                .bootstrap_upgrade(stream, path, target, authorization.as_deref(), ws_key)
+                .await;
         }
         // `/invite` (multiplayer w4): the ONE unauthenticated endpoint. It
         // has no bearer token by construction — the invitee holds only the
@@ -997,6 +1115,17 @@ impl WsInner {
     where
         W: AsyncWrite + Unpin,
     {
+        if self.dispatch.ready().is_none() {
+            let phase = self.dispatch.status().snapshot().phase;
+            let body = if phase == intent_core::startup::StartupPhase::Failed {
+                "{\"status\":\"failed\"}"
+            } else {
+                "{\"status\":\"starting\"}"
+            };
+            let response = format!("HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(response.as_bytes()).await?;
+            return stream.shutdown().await;
+        }
         let count = self.clients.lock().expect("ws clients poisoned").len();
         let guests = self.guests.connections();
         let body =
@@ -1291,7 +1420,7 @@ impl WsInner {
             Revoked(std::result::Result<intent_core::PrincipalRevocation, ()>),
             RoleChanged(bool),
             Incoming(Option<std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>),
-            Outbound(String),
+            Outbound(crate::OutboundFrame),
             Command(Option<ConnCmd>),
         }
 
@@ -1299,7 +1428,12 @@ impl WsInner {
         // Two-lane outbound queue: RPC responses on the priority lane, event/
         // subscription pushes on the bulk lane; `recv()` drains priority first
         // so responses overtake queued bulk traffic on a saturated link.
-        let (app_tx, mut app_rx) = conn::outbound_channel();
+        let mut bulk_gate = self.recovery_bulk_gate.clone();
+        let (app_tx, mut app_rx) = if bulk_gate.is_some() {
+            conn::outbound_channel_with_capacity(1)
+        } else {
+            conn::outbound_channel()
+        };
         let mut subs = ConnSubs::default();
         let credential_binding = admitted
             .as_ref()
@@ -1308,6 +1442,7 @@ impl WsInner {
             true,
             caller.clone(),
             credential_binding.clone(),
+            None,
             async {
                 if credential_binding.is_some() {
                     crate::context::ReadConnectionGuard::bind(
@@ -1320,6 +1455,7 @@ impl WsInner {
             },
         )
         .await;
+        let mut discard_private_output = false;
         let mut rotation = admitted.as_mut().and_then(|c| c.rotation.take());
         subs.pairing.admitted = admitted;
         // Bind reverse authority independently of hello metadata. Members may
@@ -1362,230 +1498,255 @@ impl WsInner {
         if revoked_principal.is_none() {
             revocations = None;
         }
-        loop {
-            // Only revocation has priority; keep ordinary traffic fair so
-            // a queued request burst cannot starve replies or heartbeats.
-            let input = if subs.pairing.revoked {
-                Input::Revoked(Err(()))
-            } else {
-                tokio::select! {
-                    biased;
-                    () = crate::auth::await_rotation(&mut rotation) => Input::Revoked(Err(())),
-                    revoked = recv_revocation(&mut revocations) => Input::Revoked(revoked),
-                    input = async {
-                        tokio::select! {
-                            change = async { role_changes.as_mut().expect("guarded").recv().await }, if role_changes.is_some() => Input::RoleChanged(change.is_some()),
-                            incoming = stream.next() => Input::Incoming(incoming),
-                            Some(frame) = app_rx.recv() => Input::Outbound(frame),
-                            cmd = cmd_rx.recv() => Input::Command(cmd),
-                        }
-                    } => input,
-                }
-            };
-            match input {
-                Input::Revoked(revoked) => {
-                    match revoked {
-                        Ok(ref revocation)
-                            if Some(&revocation.principal_id) != revoked_principal.as_ref() => {}
-                        _ => {
-                            read_connection.retire();
-                            // Stop streams and event producers before the bounded
-                            // response drain; only already-admitted replies may leave.
-                            let control = revoked
-                                .ok()
-                                .and_then(|r| r.final_event)
-                                .map(|event| subs.removal_control(&event))
-                                .unwrap_or_default();
-                            subs = ConnSubs::default();
-                            reverse.close();
-                            // Deliver in-flight RPC responses before the
-                            // close: when the revocation is the caller's own
-                            // `principal.revokeSelf`, the broadcast fires
-                            // inside the handler, so its response may not be
-                            // queued yet — it holds a reserved priority slot
-                            // until it is. Drain until the lane is idle,
-                            // bounded so a stuck handler cannot keep a revoked
-                            // connection open.
-                            let deadline = tokio::time::Instant::now() + REVOKE_FLUSH_GRACE;
-                            for frame in control {
-                                if !matches!(
-                                    tokio::time::timeout_at(
-                                        deadline,
-                                        sink.send(Message::Text(frame.into()))
-                                    )
-                                    .await,
-                                    Ok(Ok(()))
-                                ) {
-                                    break;
-                                }
+        let connection = async {
+            loop {
+                // Only revocation has priority; keep ordinary traffic fair so
+                // a queued request burst cannot starve replies or heartbeats.
+                let input = if subs.pairing.revoked {
+                    Input::Revoked(Err(()))
+                } else {
+                    tokio::select! {
+                        biased;
+                        () = crate::auth::await_rotation(&mut rotation) => Input::Revoked(Err(())),
+                        revoked = recv_revocation(&mut revocations) => Input::Revoked(revoked),
+                        input = async {
+                            tokio::select! {
+                                change = async { role_changes.as_mut().expect("guarded").recv().await }, if role_changes.is_some() => Input::RoleChanged(change.is_some()),
+                                incoming = stream.next() => Input::Incoming(incoming),
+                                Some(frame) = app_rx.recv_with_bulk_gate(&mut bulk_gate) => Input::Outbound(frame),
+                                cmd = cmd_rx.recv() => Input::Command(cmd),
                             }
-                            while !app_tx.priority_idle() {
-                                let next =
-                                    tokio::time::timeout_at(deadline, app_rx.recv_priority()).await;
-                                let Ok(Some(frame)) = next else { break };
-                                if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
-                                    continue;
-                                }
-                                if serde_json::from_str::<serde_json::Value>(&frame)
-                                    .is_ok_and(|value| value.get("method").is_some())
-                                {
-                                    continue;
-                                }
-                                if !matches!(
-                                    tokio::time::timeout_at(
-                                        deadline,
-                                        sink.send(Message::Text(frame.into()))
-                                    )
-                                    .await,
-                                    Ok(Ok(()))
-                                ) {
-                                    break;
-                                }
+                        } => input,
+                    }
+                };
+                match input {
+                    Input::Revoked(revoked) => {
+                        match revoked {
+                            Ok(ref revocation)
+                                if Some(&revocation.principal_id) != revoked_principal.as_ref() => {
                             }
-                            let _ = sink
-                                .send(Message::Close(Some(CloseFrame {
-                                    code: CloseCode::Policy,
-                                    reason: "credential revoked".into(),
-                                })))
-                                .await;
-                            break;
-                        }
-                    }
-                }
-                Input::RoleChanged(change) => {
-                    if !change {
-                        role_changes = None;
-                        continue;
-                    }
-                    // Notifications run outside the incoming-frame caller scope.
-                    // Reuse this connection's authenticated caller for the role check.
-                    let allowed = crate::context::with_request_context(
-                        true,
-                        caller.clone(),
-                        crate::context::may_manage_workspaces(self.api.as_ref()),
-                    )
-                    .await;
-                    reverse.set_browser_member(allowed);
-                    if allowed {
-                        if let Some(identity) = subs.hello_identity.clone() {
-                            reverse_guard.bind(identity);
-                        }
-                    } else {
-                        reverse_guard.unbind();
-                    }
-                    reverse_guard.refresh_devices();
-                }
-                Input::Incoming(incoming) => match incoming {
-                    Some(Err(e)) => {
-                        // Over-limit inbound message or frame (monorepo#495):
-                        // tell the client why with a 1009 (Message Too Big)
-                        // close frame before terminating; other read errors
-                        // keep the bare drop.
-                        if matches!(e, tokio_tungstenite::tungstenite::Error::Capacity(_)) {
-                            let _ = sink
-                                .send(Message::Close(Some(CloseFrame {
-                                    code: CloseCode::Size,
-                                    reason: "message exceeds inbound size limit".into(),
-                                })))
-                                .await;
-                        }
-                        break;
-                    }
-                    Some(Ok(Message::Text(text))) => {
-                        // The `system.*` control surface IS wired here (the
-                        // composition root shares `Some(control)` with the UDS
-                        // listener); UDS-only methods (`system.shutdown`,
-                        // `system.importLegacy`) reject remote callers with -32001.
-                        // `host.status` IS answered here, with the resolved WSS
-                        // locality (remote unless overridden, §5.14).
-                        // Wrap in connection context (is_tcp=true for WSS) so server.*
-                        // RPCs gate on real origin, not the locality flag (§5.2), and
-                        // bind the caller resolved at upgrade (multiplayer w1).
-                        let frame_ok = intent_core::caller::with_wire_credential(
-                            credential_binding.clone(),
-                            crate::context::with_request_context(
-                                true,
-                                caller.clone(),
-                                read_connection.run(async {
-                                    crate::context::with_repository_frame(&text, || {
-                                        conn::process_frame(
-                                            &text,
-                                            &self.api,
-                                            &self.bus,
-                                            &app_tx,
-                                            &mut subs,
-                                            &reverse,
-                                            &reverse_guard,
-                                            self.control.as_ref(),
-                                            self.server_pairing_info.as_ref(),
-                                            &mut client_id,
-                                            self.locality_is_local,
-                                            &self.rpc_limiter,
+                            _ => {
+                                read_connection.retire();
+                                // Stop streams and event producers before the bounded
+                                // response drain; only already-admitted replies may leave.
+                                let control = revoked
+                                    .ok()
+                                    .and_then(|r| r.final_event)
+                                    .map(|event| subs.removal_control(&event))
+                                    .unwrap_or_default();
+                                subs = ConnSubs::default();
+                                reverse.close();
+                                // Deliver in-flight RPC responses before the
+                                // close: when the revocation is the caller's own
+                                // `principal.revokeSelf`, the broadcast fires
+                                // inside the handler, so its response may not be
+                                // queued yet — it holds a reserved priority slot
+                                // until it is. Drain until the lane is idle,
+                                // bounded so a stuck handler cannot keep a revoked
+                                // connection open.
+                                let deadline = tokio::time::Instant::now() + REVOKE_FLUSH_GRACE;
+                                for frame in control {
+                                    if !matches!(
+                                        tokio::time::timeout_at(
+                                            deadline,
+                                            sink.send(Message::Text(frame.into()))
                                         )
-                                    })
-                                    .await
-                                }),
-                            ),
+                                        .await,
+                                        Ok(Ok(()))
+                                    ) {
+                                        break;
+                                    }
+                                }
+                                while !app_tx.priority_idle() {
+                                    let next =
+                                        tokio::time::timeout_at(deadline, app_rx.recv_priority())
+                                            .await;
+                                    let Ok(Some(frame)) = next else { break };
+                                    if frame.is_private()
+                                        || frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES
+                                    {
+                                        continue;
+                                    }
+                                    if serde_json::from_str::<serde_json::Value>(&frame)
+                                        .is_ok_and(|value| value.get("method").is_some())
+                                    {
+                                        continue;
+                                    }
+                                    if !matches!(
+                                        tokio::time::timeout_at(
+                                            deadline,
+                                            frame.write_wss(&mut sink)
+                                        )
+                                        .await,
+                                        Ok(Ok(()))
+                                    ) {
+                                        break;
+                                    }
+                                }
+                                let _ = sink
+                                    .send(Message::Close(Some(CloseFrame {
+                                        code: CloseCode::Policy,
+                                        reason: "credential revoked".into(),
+                                    })))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                    Input::RoleChanged(change) => {
+                        if !change {
+                            role_changes = None;
+                            continue;
+                        }
+                        // Notifications run outside the incoming-frame caller scope.
+                        // Reuse this connection's authenticated caller for the role check.
+                        let allowed = crate::context::with_request_context(
+                            true,
+                            caller.clone(),
+                            crate::context::may_manage_workspaces(self.api.as_ref()),
                         )
                         .await;
-                        if !frame_ok {
+                        subs.apply_browser_authority(&reverse, &reverse_guard, allowed);
+                    }
+                    Input::Incoming(incoming) => match incoming {
+                        Some(Err(e)) => {
+                            // Over-limit inbound message or frame (monorepo#495):
+                            // tell the client why with a 1009 (Message Too Big)
+                            // close frame before terminating; other read errors
+                            // keep the bare drop.
+                            if matches!(e, tokio_tungstenite::tungstenite::Error::Capacity(_)) {
+                                let _ = sink
+                                    .send(Message::Close(Some(CloseFrame {
+                                        code: CloseCode::Size,
+                                        reason: "message exceeds inbound size limit".into(),
+                                    })))
+                                    .await;
+                            }
                             break;
                         }
-                    }
-                    Some(Ok(Message::Ping(payload))) => {
-                        if sink.send(Message::Pong(payload)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Pong(_))) => last_pong.store(mono_ms(), Ordering::Relaxed),
-                    None | Some(Ok(Message::Close(_))) => break,
-                    Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
-                },
-                Input::Outbound(frame) => {
-                    // Last-resort backstop for non-response frames
-                    // (subscription pushes/events): oversized router
-                    // responses are already replaced with a `-32010` error
-                    // at serialization, where the request id is known.
-                    if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
-                        tracing::error!(
-                            frame_bytes = frame.len(),
-                            limit = crate::MAX_OUTBOUND_MESSAGE_BYTES,
-                            "dropping oversized outbound WSS frame"
-                        );
-                        continue;
-                    }
-                    if sink.send(Message::Text(frame.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Input::Command(cmd) => match cmd {
-                    None => break,
-                    Some(ConnCmd::Ping) => {
-                        if sink.send(Message::Ping(Bytes::new())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(ConnCmd::Close) => {
-                        read_connection.retire();
-                        let _ = sink
-                            .send(Message::Close(Some(CloseFrame {
-                                code: CloseCode::Away,
-                                reason: "Server shutting down".into(),
-                            })))
+                        Some(Ok(Message::Text(text))) => {
+                            // The `system.*` control surface IS wired here (the
+                            // composition root shares `Some(control)` with the UDS
+                            // listener); UDS-only methods (`system.shutdown`,
+                            // `system.gitCredential`) reject remote callers with -32001.
+                            // `host.status` IS answered here, with the resolved WSS
+                            // locality (remote unless overridden, §5.14).
+                            // Wrap in connection context (is_tcp=true for WSS) so server.*
+                            // RPCs gate on real origin, not the locality flag (§5.2), and
+                            // bind the caller resolved at upgrade (multiplayer w1).
+                            let frame_ok = intent_core::desktop::with_connection(
+                                reverse_guard.desktop_connection(),
+                                intent_core::caller::with_wire_credential(
+                                    credential_binding.clone(),
+                                    crate::context::with_request_context(
+                                        true,
+                                        caller.clone(),
+                                        read_connection.run(async {
+                                            crate::context::with_repository_frame(&text, || {
+                                                conn::process_frame(
+                                                    &text,
+                                                    &self.api,
+                                                    &self.bus,
+                                                    &app_tx,
+                                                    &mut subs,
+                                                    &reverse,
+                                                    &reverse_guard,
+                                                    self.control.as_ref(),
+                                                    self.server_pairing_info.as_ref(),
+                                                    &mut client_id,
+                                                    self.locality_is_local,
+                                                    &self.rpc_limiter,
+                                                )
+                                            })
+                                            .await
+                                        }),
+                                    ),
+                                ),
+                            )
                             .await;
-                        break;
+                            if !frame_ok {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            if sink.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Pong(_))) => last_pong.store(mono_ms(), Ordering::Relaxed),
+                        None | Some(Ok(Message::Close(_))) => break,
+                        Some(Ok(Message::Binary(_) | Message::Frame(_))) => {}
+                    },
+                    Input::Outbound(frame) => {
+                        // Last-resort backstop for non-response frames
+                        // (subscription pushes/events): oversized router
+                        // responses are already replaced with a `-32010` error
+                        // at serialization, where the request id is known.
+                        if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
+                            tracing::error!(
+                                frame_bytes = frame.len(),
+                                limit = crate::MAX_OUTBOUND_MESSAGE_BYTES,
+                                "dropping oversized outbound WSS frame"
+                            );
+                            continue;
+                        }
+                        if !app_tx
+                            .recovery
+                            .prepare_frame(&frame)
+                            .finish(async { frame.write_wss(&mut sink).await.is_ok() })
+                            .await
+                        {
+                            discard_private_output = frame.is_private();
+                            #[cfg(feature = "repository-test-fixtures")]
+                            crate::private_output::fixture_discarded_queue(&mut app_rx);
+                            break;
+                        }
                     }
-                },
+                    Input::Command(cmd) => match cmd {
+                        None => break,
+                        Some(ConnCmd::Ping) => {
+                            if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(ConnCmd::Close) => {
+                            read_connection.retire();
+                            let _ = sink
+                                .send(Message::Close(Some(CloseFrame {
+                                    code: CloseCode::Away,
+                                    reason: "Server shutting down".into(),
+                                })))
+                                .await;
+                            break;
+                        }
+                    },
+                }
             }
+        };
+        tokio::select! {
+            biased;
+            () = app_tx.recovery.cancelled() => {},
+            () = connection => {},
         }
         read_connection.retire();
         drop(subs);
         reverse.close();
         drop(reverse_guard);
+        drop(app_rx);
+        if app_tx.recovery.is_closed() {
+            drop(sink);
+            drop(stream);
+            self.deregister(id);
+            return;
+        }
         if let Some(mut gate) = self.cleanup_gate.clone() {
             let _ = gate.wait_for(|open| *open).await;
         }
-        let _ = sink.close().await;
+        // Closing flushes buffered data; cancellation or denied private output
+        // must instead discard the sink and its queued bytes.
+        if !app_tx.recovery.is_closed() && !discard_private_output {
+            let _ = sink.close().await;
+        }
         self.deregister(id);
     }
 }

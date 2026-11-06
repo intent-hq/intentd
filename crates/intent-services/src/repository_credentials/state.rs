@@ -5,6 +5,7 @@ impl RepositoryConnectionDirectory {
         Self {
             epoch: Uuid::new_v4(),
             daemon_id,
+            native_contexts: crate::repository_admission::lifecycle::native_allocation::NativeContextRetirements::default(),
             state: Mutex::new(State {
                 status: RepositoryConnectionState::Unverified,
                 published: None,
@@ -74,6 +75,7 @@ impl RepositoryConnectionDirectory {
     pub(crate) fn begin_mutation(&self, ticket: &RepositoryMutationTicket) -> Result<()> {
         let mut state = self.lock()?;
         self.owns_reservation(&state, ticket)?;
+        self.native_contexts.retire();
         if ticket.kind != RepositoryMutationKind::Refresh {
             let current = state.generation;
             state.generation = state.advance(current)?;
@@ -123,6 +125,11 @@ impl RepositoryConnectionDirectory {
             .ok_or(RepositoryCredentialError::StaleMutation)?;
         if ticket.epoch != self.epoch || active.id != ticket.id || active.kind != ticket.kind {
             return Err(RepositoryCredentialError::StaleMutation);
+        }
+        if !matches!(settled, SettledCredentialState::Indeterminate)
+            && !self.native_contexts.settled()
+        {
+            return Err(RepositoryCredentialError::Indeterminate);
         }
         let previous = active.previous.clone();
         let previous_child_enabled = active.previous_child_enabled;
@@ -385,6 +392,7 @@ impl RepositoryConnectionDirectory {
     /// Retire the directory at daemon shutdown. Old admissions cannot be rebound.
     pub(crate) fn retire(&self) -> Result<()> {
         let mut state = self.lock()?;
+        self.native_contexts.retire();
         state.status = RepositoryConnectionState::Retired;
         state.reservation = None;
         state.active = None;
@@ -402,6 +410,7 @@ impl RepositoryConnectionDirectory {
         if !self.current_stamp(&state, stamp) || state.secret_revision != stamp.secret_revision {
             return Ok(false);
         }
+        self.native_contexts.retire();
         let current = state.generation;
         state.generation = state.advance(current)?;
         state.status = RepositoryConnectionState::Disconnected;
@@ -467,7 +476,7 @@ impl RepositoryConnectionDirectory {
 }
 
 impl State {
-    fn child_idle(&self) -> Result<()> {
+    pub(super) fn child_idle(&self) -> Result<()> {
         match &self.child_active {
             Some(active) if active.indeterminate => Err(RepositoryCredentialError::Indeterminate),
             Some(_) => Err(RepositoryCredentialError::Mutating),
@@ -492,7 +501,7 @@ impl State {
             .as_ref()
             .ok_or(RepositoryCredentialError::Missing)
     }
-    fn advance(&mut self, value: u64) -> Result<u64> {
+    pub(super) fn advance(&mut self, value: u64) -> Result<u64> {
         value.checked_add(1).ok_or_else(|| {
             self.status = RepositoryConnectionState::Retired;
             self.reservation = None;

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Offline metadata classifier regressions using real git diffs."""
+import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -15,6 +17,10 @@ class Fixture(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.repo = Path(tmp.name)
         self.git('init', '-q')
+        # No background maintenance: git >= 2.47 detaches it after commit and
+        # fetch, and it races TemporaryDirectory.cleanup on .git/objects.
+        for key, value in [('maintenance.auto', 'false'), ('gc.auto', '0'), ('fetch.writeCommitGraph', 'false')]:
+            self.git('config', key, value)
         self.git('config', 'user.name', 'Fixture')
         self.git('config', 'user.email', 'fixture@example.invalid')
         self.write('Cargo.toml', '[workspace]\nmembers = ["crates/*"]\n')
@@ -108,6 +114,16 @@ class MetadataTests(Fixture):
         self.replace('crates/intentd/Cargo.toml', 'path = "../intent-core"', 'features = ["extra"], path = "../intent-core"')
         self.classify(False)
 
+    def test_version_bump_with_stale_lockfile_rejected(self):
+        # Without the lockfile bump every `--locked` build fails; the PR CI
+        # fast path skips `check`, so the classifier must refuse it.
+        self.bump()
+        self.replace('Cargo.lock', 'name = "intentd"\nversion = "0.9.135"', 'name = "intentd"\nversion = "0.9.134"')
+        self.classify(False)
+        # Lockfile left out of the diff entirely.
+        self.git('checkout', self.base, '--', 'Cargo.lock')
+        self.classify(False)
+
     def test_external_lock_version_rejected(self):
         self.bump()
         self.replace('Cargo.lock', 'name = "external"\nversion = "0.9.134"', 'name = "external"\nversion = "0.9.135"')
@@ -167,6 +183,72 @@ class MetadataTests(Fixture):
     def test_notes_only_rejected(self):
         self.write('CHANGELOG.md', 'Notes\n')
         self.classify(False)
+
+
+class ExactParentTests(Fixture):
+    """--exact-parent (main pushes): head must be a single commit on base."""
+
+    def run_exact(self, base, head):
+        result = subprocess.run(['bash', str(SCRIPT), '--exact-parent', base, head], cwd=self.repo,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_release_commit_directly_on_the_previous_tip(self):
+        self.bump()
+        self.assertEqual(self.run_exact(self.base, self.commit()), 'fast_path=true')
+
+    def test_non_ancestor_push_that_rolls_back_code_is_rejected(self):
+        original = self.base
+        self.write('crates/intentd/src/main.rs', 'fn main() { println!("fixed code"); }\n')
+        before = self.commit()
+        self.git('checkout', '-q', '--detach', original)
+        self.bump()
+        after = self.commit()
+        self.assertEqual(self.run_exact(before, after), 'fast_path=false')
+
+    def test_release_with_an_intermediate_commit_is_rejected(self):
+        self.write('crates/intentd/src/main.rs', 'fn main() { println!("code"); }\n')
+        self.commit()
+        self.bump()
+        self.assertEqual(self.run_exact(self.base, self.commit()), 'fast_path=false')
+
+    def test_merge_commit_is_rejected(self):
+        self.git('checkout', '-q', '-b', 'side')
+        self.bump()
+        side = self.commit()
+        self.git('checkout', '-q', '-')
+        self.git('merge', '-q', '--no-ff', '-m', 'merge', side)
+        self.assertEqual(self.run_exact(self.base, self.git('rev-parse', 'HEAD')), 'fast_path=false')
+
+
+class FixtureHygieneTests(Fixture):
+    def test_git_never_spawns_background_maintenance(self):
+        # git >= 2.47 detaches `maintenance run --auto` after commit/fetch; it
+        # kept writing .git/objects while TemporaryDirectory.cleanup ran,
+        # failing CI with "Directory not empty: 'objects'". Force every
+        # maintenance task due via a global config so only the fixture's
+        # repo-local settings can keep git from spawning it.
+        tmp = tempfile.TemporaryDirectory(prefix='release-metadata-trace-')
+        self.addCleanup(tmp.cleanup)
+        scratch = Path(tmp.name)
+        (scratch / 'gitconfig').write_text(
+            '[gc]\n\tauto = 1\n'
+            '[maintenance "geometric-repack"]\n\tauto = -1\n'
+            '[maintenance "commit-graph"]\n\tauto = -1\n'
+            '[fetch]\n\twriteCommitGraph = true\n')
+        trace = scratch / 'trace.json'
+        env = {**os.environ, 'GIT_CONFIG_GLOBAL': str(scratch / 'gitconfig'), 'GIT_TRACE2_EVENT': str(trace)}
+        for key in [k for k in env if k.startswith('GIT_CONFIG_') and k != 'GIT_CONFIG_GLOBAL']:
+            env.pop(key)
+        self.write('CHANGELOG.md', '# Changelog\nMore\n')
+        self.git('remote', 'add', 'origin', str(self.repo))
+        for args in (['commit', '-qam', 'more'], ['fetch', '-q', '--no-tags', 'origin', 'HEAD'], ['gc', '--auto']):
+            subprocess.run(['git', *args], cwd=self.repo, env=env, check=True, capture_output=True)
+        spawned = [event['argv'] for event in map(json.loads, trace.read_text().splitlines())
+                   if event.get('event') == 'child_start' and 'argv' in event]
+        background = [argv for argv in spawned if {'maintenance', 'gc', 'commit-graph', 'repack'} & set(argv)]
+        self.assertEqual(background, [])
 
 
 if __name__ == '__main__':

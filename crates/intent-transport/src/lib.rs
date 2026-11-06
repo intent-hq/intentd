@@ -15,7 +15,9 @@ pub use context::{
     current_caller, is_tcp_connection, with_caller, with_connection_context, with_request_context,
     Caller,
 };
-pub use control::{FileWatchStatus, IdleUpdateCheckStatus, SystemControl, SystemStatus};
+pub use control::{
+    FileWatchStatus, IdleUpdateCheckStatus, RemoteLinks, SystemControl, SystemStatus,
+};
 pub use host_env::{
     detect_has_display, detect_host_environment, local_hostname, pretty_hostname, HostEnvironment,
 };
@@ -32,9 +34,11 @@ pub use router::handle_message;
 pub use rpc_limit::RpcLimiter;
 pub use server::{
     advertised_hosts, collect_bind_interfaces, collect_local_ips, collect_local_ipv6s,
-    PairingSnapshot, ServerPairingInfo,
+    MachineRoutesResolver, PairingSnapshot, ServerPairingInfo,
 };
-pub use tls::{ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
+pub use tls::{
+    ensure_tls_certificate, generate_certificate, inspect_cert, CertStatus, TlsCertificate,
+};
 pub use ws::{
     GuestConnectionLimits, SharedGuestLimits, WsApiServer, WsOptions, GUEST_CAP_RETRY_AFTER_SECS,
 };
@@ -54,7 +58,7 @@ fn disable_node_compile_cache() {
 }
 
 mod accept_backoff;
-mod annotation_subscription;
+mod agent_workers;
 pub mod auth;
 pub(crate) mod browser;
 pub mod catalog;
@@ -71,15 +75,22 @@ mod host_ops;
 mod invite;
 pub mod lifecycle;
 pub mod listener;
+pub mod node_link;
 pub mod pairing;
 mod panic_guard;
+mod plain_folder_gate;
 mod presence;
+mod private_output;
+mod retired_gate;
+pub use private_output::OutboundFrame;
 mod protocol;
 mod provider_setup;
 pub mod reverse;
 pub mod router;
 pub(crate) mod rpc_limit;
 pub mod server;
+mod stack_frame;
+pub mod startup;
 mod subscriptions;
 pub mod tls;
 pub mod tunnel;

@@ -15,7 +15,8 @@
 // session/update `update` objects echoed verbatim before the text response.
 import readline from 'node:readline';
 import fs from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
+import os from 'node:os';
 
 const SESSION_ID = 'mock-session-1';
 
@@ -93,6 +94,25 @@ function log(msg) {
 // to this fixture, excluding the Node executable and script path, so tests
 // can verify provider selection. MOCK_AGENT_LOG_CODEX_POLICY opts into only
 // the daemon-owned policy JSON and selected CODEX_PATH, never other env values.
+// MOCK_AGENT_LOG_TMPDIR opts into `tmp`: the child's TMPDIR / TMP / TEMP,
+// Node's `os.tmpdir()` and a file `mktemp` created from a shell, so tests can
+// prove each agent gets its own temp folder that shells and tools honor.
+function tmpReport() {
+  let mktemp = null;
+  try {
+    mktemp = execFileSync('sh', ['-c', 'mktemp'], { encoding: 'utf8' }).trim();
+  } catch (err) {
+    log(`mktemp failed: ${err.message}`);
+  }
+  return {
+    TMPDIR: process.env.TMPDIR ?? null,
+    TMP: process.env.TMP ?? null,
+    TEMP: process.env.TEMP ?? null,
+    osTmpdir: os.tmpdir(),
+    mktemp,
+  };
+}
+
 function logSessionCall(method, sessionId, meta, cwd) {
   const path = process.env.MOCK_AGENT_SESSION_LOG;
   if (!path) return;
@@ -115,6 +135,7 @@ function logSessionCall(method, sessionId, meta, cwd) {
               codexPath: process.env.CODEX_PATH ?? null,
             } }
           : {}),
+        ...(process.env.MOCK_AGENT_LOG_TMPDIR === '1' ? { tmp: tmpReport() } : {}),
       }) + '\n'
     );
   } catch (err) {
@@ -410,6 +431,48 @@ function modelDefaultEffort(behavior) {
   return behavior.modelSelection?.thinking?.[effectiveModel]?.current ?? 'high';
 }
 
+// Provider worker reports (PROTOCOL §5.5b), driven by `behavior.asyncTasks`:
+// `{ spawnOn, command?, autoCompleteOn?, completeAfterMs? }`. A prompt
+// containing `spawnOn` streams a backgrounded Bash tool call (mixed +
+// metadata-only AIR markers) and an `async_task_spawned` report; when it also
+// contains `autoCompleteOn`, the task is reported completed `completeAfterMs`
+// later — BETWEEN turns. `_session/async_task/stop` stops a running
+// task (state frame first, then `{ stopped: true }`), logging each request to
+// MOCK_AGENT_STOP_LOG.
+const asyncTasks = new Map();
+const AIR_BACKGROUNDED = { jetbrains: { air: { asyncTasks: { backgrounded: true } } } };
+function maybeSpawnAsyncTask(behavior, params) {
+  const workers = behavior.asyncTasks;
+  if (!workers || typeof workers.spawnOn !== 'string' || !extractPromptText(params).includes(workers.spawnOn)) {
+    return;
+  }
+  const sessionId = (params && params.sessionId) || SESSION_ID;
+  const taskId = `bg-${asyncTasks.size + 1}`;
+  const toolCallId = `tool-${taskId}`;
+  const command = workers.command || 'sleep 300';
+  const update = (u) => note('session/update', { sessionId, update: u });
+  update({ sessionUpdate: 'tool_call', toolCallId, title: 'Bash', kind: 'execute', status: 'in_progress',
+    rawInput: { command, run_in_background: true } });
+  update({ sessionUpdate: 'tool_call_update', toolCallId, status: 'completed',
+    rawOutput: `Command running in background with ID: ${taskId}`, _meta: AIR_BACKGROUNDED });
+  update({ sessionUpdate: 'tool_call_update', toolCallId, _meta: AIR_BACKGROUNDED });
+  // A mixed marker with a genuine field but no status must not reopen the tool.
+  update({ sessionUpdate: 'tool_call_update', toolCallId,
+    rawOutput: `Output is being written to /tmp/${taskId}.output`, _meta: AIR_BACKGROUNDED });
+  asyncTasks.set(taskId, 'running');
+  update({ sessionUpdate: 'async_task_spawned', asyncTaskId: taskId, name: command, taskType: 'shell',
+    canStop: true, showInTranscript: true, toolCallId });
+  const autoComplete = typeof workers.autoCompleteOn === 'string'
+    && extractPromptText(params).includes(workers.autoCompleteOn);
+  if (autoComplete && Number.isFinite(workers.completeAfterMs)) {
+    setTimeout(() => {
+      if (asyncTasks.get(taskId) !== 'running') return;
+      asyncTasks.set(taskId, 'completed');
+      update({ sessionUpdate: 'async_task_state_update', asyncTaskId: taskId, state: 'completed', toolCallId });
+    }, workers.completeAfterMs);
+  }
+}
+
 async function handlePrompt(id, params) {
   promptCount += 1;
   // Record every prompt this child receives when MOCK_AGENT_PROMPT_LOG points
@@ -447,6 +510,7 @@ async function handlePrompt(id, params) {
   } catch {
     behavior = {};
   }
+  maybeSpawnAsyncTask(behavior, params);
   if (behavior.sandboxPolicy) {
     const policy = behavior.sandboxPolicy;
     const allowed = policy.allowedByMode?.[sandboxMode] || policy.allowed;
@@ -522,7 +586,30 @@ async function handlePrompt(id, params) {
     typeof behavior.promptRpcErrorAttempts === 'number' && behavior.promptRpcErrorAttempts > 0
       ? behavior.promptRpcErrorAttempts
       : 0;
-  const attempt = exitGate > 0 || rpcGate > 0 ? getAndIncrementAttempt() : 0;
+  // `exitDuringPromptOnAttempt` exits on exactly that attempt only (e.g. a
+  // transport failure on a later spawn after an earlier attempt failed).
+  const exitOn =
+    typeof behavior.exitDuringPromptOnAttempt === 'number' && behavior.exitDuringPromptOnAttempt > 0
+      ? behavior.exitDuringPromptOnAttempt
+      : 0;
+  // `cancelledBeforeOutputAttempts` answers the first N prompt attempts with
+  // `stopReason: "cancelled"` and no session/update at all, modelling a late
+  // `session/cancel` from a preempted turn landing on the NEW prompt (the
+  // Claude adapter handles the cancel notification asynchronously). With
+  // `cancelledAfterChunk` the gated attempts stream one text
+  // chunk first, so the cancelled turn is NOT output-free. The gate itself
+  // is applied after the exit gates below.
+  const cancelGate =
+    typeof behavior.cancelledBeforeOutputAttempts === 'number' &&
+    behavior.cancelledBeforeOutputAttempts > 0
+      ? behavior.cancelledBeforeOutputAttempts
+      : 0;
+  const attempt =
+    exitGate > 0 || rpcGate > 0 || exitOn > 0 || cancelGate > 0 ? getAndIncrementAttempt() : 0;
+  if (exitOn > 0 && attempt === exitOn) {
+    log(`exiting during prompt (attempt ${attempt} = exitDuringPromptOnAttempt)`);
+    process.exit(1);
+  }
   if (exitGate > 0 && attempt <= exitGate) {
     // Pipe-holding descendant (monorepo#3592): on the LAST gated attempt (the
     // one the daemon classifies as a terminal failure), leave a same-group
@@ -538,6 +625,35 @@ async function handlePrompt(id, params) {
     }
     log(`exiting during prompt (attempt ${attempt}/${exitGate})`);
     process.exit(1);
+  }
+  // Checked after the exit gates above so combining them keeps their meaning.
+  if (cancelGate > 0 && attempt <= cancelGate) {
+    if (typeof behavior.cancelledAfterChunk === 'string') {
+      note('session/update', {
+        sessionId: SESSION_ID,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: behavior.cancelledAfterChunk },
+        },
+      });
+    }
+    // `cancelledAfterClientRequest` makes one client request (an fs read)
+    // first, modelling a turn that may have had side effects before the
+    // cancel landed.
+    if (behavior.cancelledAfterClientRequest) {
+      await callClientService('fs/read_text_file', {
+        sessionId: SESSION_ID,
+        path: 'cancelled-after-client-request-probe',
+      }).catch(() => {});
+    }
+    log(`resolving prompt as cancelled (attempt ${attempt}/${cancelGate})`);
+    // `cancelledPromptMeta` is echoed as the cancelled response's `_meta`
+    // (e.g. a grok `_meta.usage` bill for the cancelled attempt).
+    const cancelled = { stopReason: 'cancelled' };
+    if (behavior.cancelledPromptMeta && typeof behavior.cancelledPromptMeta === 'object') {
+      cancelled._meta = behavior.cancelledPromptMeta;
+    }
+    return result(id, cancelled);
   }
   // Provider prompt failure (monorepo#479): optionally stream one
   // agent_message_chunk (the provider's pre-failure warning) and then answer
@@ -557,6 +673,30 @@ async function handlePrompt(id, params) {
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: behavior.streamBeforeErrorText },
           },
+        });
+      }
+      // `toolCallBeforeError` (a command string) runs one completed tool
+      // call before the failure, modelling partial work a mid-turn failure
+      // leaves behind (quota failover must replay it to the next provider).
+      if (typeof behavior.toolCallBeforeError === 'string' && behavior.toolCallBeforeError.length > 0) {
+        const toolCallId = `pre-error-tool-${promptCount}`;
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: {
+            sessionUpdate: 'tool_call', toolCallId, title: 'Bash', kind: 'execute',
+            status: 'in_progress', rawInput: { command: behavior.toolCallBeforeError },
+          },
+        });
+        // `toolCallBeforeErrorNoOutput` completes the call with no rawOutput
+        // (a tool that printed nothing).
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: behavior.toolCallBeforeErrorNoOutput
+            ? { sessionUpdate: 'tool_call_update', toolCallId, status: 'completed' }
+            : {
+                sessionUpdate: 'tool_call_update', toolCallId, status: 'completed',
+                rawOutput: `ran: ${behavior.toolCallBeforeError}`,
+              },
         });
       }
       log(`failing session/prompt with JSON-RPC error ${behavior.promptRpcError.code}`);
@@ -777,6 +917,21 @@ async function handlePrompt(id, params) {
     : active.toolCall
       ? [active.toolCall]
       : [];
+  if (typeof active.attachmentRetrievalLog === 'string') {
+    const blocks = Array.isArray(params?.prompt) ? params.prompt : [];
+    const notice = blocks.find((block) => block?.text?.startsWith('[Attachment:'));
+    const attachmentId = notice?.text?.match(/attachmentId: ([^.]+)\./)?.[1];
+    if (!attachmentId) throw new Error('missing attachment notice');
+    const retrieval = await callWorkspaceTool({
+      name: 'workspace_api',
+      arguments: {
+        code: `return await ws.file.getAttachment(${JSON.stringify(attachmentId)})`,
+        summary: 'Retrieve delivered source attachment',
+      },
+    });
+    fs.appendFileSync(active.attachmentRetrievalLog,
+      JSON.stringify({ attachmentId, result: retrieval }) + '\n');
+  }
   const toolResults = [];
   for (const toolCall of toolCalls) {
     try {
@@ -1084,11 +1239,20 @@ async function dispatch(msg) {
       // makes the daemon's resume path (`session/load`) reachable for the
       // poisoned-session e2e (monorepo#940). Default stays false so existing
       // tests keep the no-resume behavior.
+      if (process.env.MOCK_AGENT_INIT_LOG) {
+        try {
+          fs.appendFileSync(process.env.MOCK_AGENT_INIT_LOG,
+            JSON.stringify({ clientCapabilities: msg.params?.clientCapabilities ?? null }) + '\n');
+        } catch (err) {
+          log(`init log write failed: ${err.message}`);
+        }
+      }
       return result(msg.id, {
         protocolVersion: 1,
         agentCapabilities: {
           loadSession: behavior.loadSession === true || behavior.advertiseLoadSession === true,
         },
+        ...(behavior.agentInfo ? { agentInfo: behavior.agentInfo } : {}),
       });
     case 'authenticate':
       return result(msg.id, {});
@@ -1111,9 +1275,18 @@ async function dispatch(msg) {
       // upstream body lives in `data`), modelling a provider whose allowance
       // is already spent when the daemon opens the session — before any
       // prompt — so spawn-path failure attribution can be pinned.
+      // `sessionNewRpcErrorAttempts` gates the rejection to the first N
+      // session/new calls (counter in MOCK_AGENT_ATTEMPT_FILE, persisted
+      // across spawns), so a later spawn — e.g. on a backup profile — opens.
       if (behavior.sessionNewRpcError) {
-        log(`failing session/new with JSON-RPC error ${behavior.sessionNewRpcError.code}`);
-        return send({ jsonrpc: '2.0', id: msg.id, error: behavior.sessionNewRpcError });
+        const gate =
+          typeof behavior.sessionNewRpcErrorAttempts === 'number' && behavior.sessionNewRpcErrorAttempts > 0
+            ? behavior.sessionNewRpcErrorAttempts
+            : 0;
+        if (gate === 0 || getAndIncrementAttempt() <= gate) {
+          log(`failing session/new with JSON-RPC error ${behavior.sessionNewRpcError.code}`);
+          return send({ jsonrpc: '2.0', id: msg.id, error: behavior.sessionNewRpcError });
+        }
       }
       // Stash the session-setup-delivered MCP servers (STAB-156) so
       // `callWorkspaceTool` can reach the bridge without an `--mcp-config`.
@@ -1362,6 +1535,21 @@ async function dispatch(msg) {
         result(pendingPromptIds.shift(), { stopReason: 'cancelled' });
       }
       return;
+    case '_session/async_task/stop': {
+      const p = msg.params || {};
+      if (process.env.MOCK_AGENT_STOP_LOG) {
+        try {
+          fs.appendFileSync(process.env.MOCK_AGENT_STOP_LOG, JSON.stringify(p) + '\n');
+        } catch (err) {
+          log(`stop log write failed: ${err.message}`);
+        }
+      }
+      if (asyncTasks.get(p.asyncTaskId) !== 'running') return result(msg.id, { stopped: false });
+      asyncTasks.set(p.asyncTaskId, 'stopped');
+      note('session/update', { sessionId: p.sessionId, update: {
+        sessionUpdate: 'async_task_state_update', asyncTaskId: p.asyncTaskId, state: 'stopped' } });
+      return result(msg.id, { stopped: true });
+    }
     default:
       if (msg.id !== undefined)
         send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: `no ${msg.method}` } });

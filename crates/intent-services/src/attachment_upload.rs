@@ -388,7 +388,13 @@ impl Services {
         idempotency: Option<(&str, Option<&str>, &str)>,
     ) -> Result<serde_json::Value> {
         let store = &self.store;
-        let root = crate::file_ops::resolve_root(store, &workspace_id, None).await;
+        let root = crate::file_ops::resolve_root(
+            store,
+            &workspace_id,
+            None,
+            self.chief_cwd_root.as_deref(),
+        )
+        .await;
         if root.is_empty() {
             return Err(Error::Internal(
                 "workspace has no resolved filesystem root".to_string(),
@@ -744,6 +750,48 @@ impl Services {
         }
     }
 
+    /// Refuse an upload continuation that writes (`chunk` / `commit`) when
+    /// the upload's workspace is retired (PROTOCOL §5.1 "Read-only while
+    /// retired"): the RPC gate cannot resolve an `uploadId`-only call to its
+    /// workspace, so the session's workspace is checked here. An unknown
+    /// upload id is left to the caller's own lookup.
+    pub(crate) async fn refuse_upload_if_retired(&self, upload_id: &str) -> Result<()> {
+        let workspace_id = self
+            .attachment_uploads
+            .lock()
+            .expect("attachment upload registry poisoned")
+            .get(upload_id)
+            .map(|s| s.workspace_id.clone());
+        match workspace_id {
+            Some(workspace_id) => self.refuse_if_retired(&workspace_id).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Drop every in-flight upload session of `workspace_id` and delete its
+    /// staging directory (`workspace.retire`): a retired workspace accepts
+    /// no further chunks or commits. A session mid-commit is dropped too;
+    /// its commit re-checks the retired state before placing anything.
+    pub(crate) async fn abort_workspace_attachment_uploads(&self, workspace_id: &WorkspaceId) {
+        let dirs: Vec<PathBuf> = {
+            let mut uploads = self
+                .attachment_uploads
+                .lock()
+                .expect("attachment upload registry poisoned");
+            let ids: Vec<String> = uploads
+                .iter()
+                .filter(|(_, s)| &s.workspace_id == workspace_id)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter()
+                .filter_map(|id| uploads.remove(id).map(|s| s.staging_dir))
+                .collect()
+        };
+        for dir in dirs {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+        }
+    }
+
     /// `file.attachmentUpload.chunk`: stage one seq-numbered slice of the
     /// payload. `data` is base64; the decoded slice is written to its own
     /// `chunk-<seq>` file, so retrying a seq is idempotent (same bytes land
@@ -1001,6 +1049,13 @@ impl Services {
             )),
             sha256: Some(declared_sha.clone()),
         });
+        // A retire that landed while the payload was assembling: the
+        // folder is gone, so nothing may be placed into it. The archive
+        // fence (held by retire from its row flip through the folder sweep)
+        // spans the check AND the placement, so a retire cannot start
+        // between them and the placement can never recreate a swept folder.
+        let fence = self.archive_fence.acquire(&workspace_id).await;
+        self.refuse_if_retired(&workspace_id).await?;
         let result = self
             .place_attachment_registered(
                 workspace_id.clone(),
@@ -1020,6 +1075,7 @@ impl Services {
                 );
                 e
             })?;
+        drop(fence);
 
         // Session retired; staging deleted.
         self.attachment_uploads
@@ -1147,7 +1203,7 @@ mod tests {
         let mut row = crate::tests::workspace(ws);
         row.worktree_path = Some(checkout.to_string_lossy().into_owned());
         store.insert_workspace(&row).await.expect("seed workspace");
-        let svc = Services::new(store).with_workspaces_root(ws_root.to_path_buf());
+        let svc = Services::new_isolated(store).with_workspaces_root(ws_root.to_path_buf());
         (db_dir, svc)
     }
 
@@ -1163,14 +1219,12 @@ mod tests {
 
         let root = crate::test_support::test_tempdir("fixture-db-cleanup-");
         let mut residue = Vec::new();
-        for (index, test) in [
-            "attachment_upload::tests::upload_multi_chunk_out_of_order_with_retry_commits",
-            "transfer_export::tests::export_guards_and_abort",
-            "transfer_export::tests::export_build_failure_cleans_up_and_allows_retry",
-            "transfer_import::tests::import_lifecycle_begin_chunk_commit",
-        ]
-        .into_iter()
-        .enumerate()
+        // intent-svc-transfer runs the same check over its own fixture
+        // consumers (fixture_cleanup_tests).
+        for (index, test) in
+            ["attachment_upload::tests::upload_multi_chunk_out_of_order_with_retry_commits"]
+                .into_iter()
+                .enumerate()
         {
             let scratch = root.path().join(index.to_string());
             std::fs::create_dir(&scratch).unwrap();
@@ -1187,7 +1241,9 @@ mod tests {
                 .stdout(log.try_clone().unwrap())
                 .stderr(log);
             let mut child = GuardedChild::spawn(&mut command).unwrap();
-            let status = child.wait_with_timeout(Duration::from_secs(120)).unwrap();
+            let status = child
+                .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(120)))
+                .unwrap();
             let output = std::fs::read_to_string(&log_path).unwrap();
             assert!(
                 status.is_some_and(|status| status.success()) && output.contains("1 passed"),
@@ -2301,24 +2357,38 @@ mod tests {
     /// Regression (monorepo#2275): expired sessions don't hold cap slots or
     /// staging dirs — the next `begin` reclaims them — while a session kept
     /// live by ongoing chunk activity is never reclaimed.
+    ///
+    /// The TTL is pinned generous via the `INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS`
+    /// seam and every idle period is synthesized by advancing the paused
+    /// runtime clock, so real scheduling stalls are negligible next to the
+    /// TTL. With a 1s TTL and 250ms wall-clock sleeps, a stall of more than
+    /// 750ms between keep-alive chunks expired the "live" session under CI
+    /// load (`merge_group` coverage-all run 41256445158, which ejected
+    /// intentd#2891; same pattern as intent-hq/intent#4880).
     #[tokio::test]
     async fn begin_reclaims_expired_sessions_and_spares_active_ones() {
         let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
             "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
-            "1000",
+            "3600000",
         )]);
+        let ttl = super::attachment_upload_idle_ttl();
         let ws = WorkspaceId("ws-up-reclaim".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
         let (_db_dir, svc) = seeded_services(&ws, &ws_root.0, &checkout.0).await;
 
-        // Fill all 4 slots, then let them all go idle past the TTL.
+        // Fill all 4 slots, then let them all go idle past the TTL on the
+        // runtime clock. The clock is handed back before each service call
+        // (the store's pool-acquire timeouts are tokio timers a paused
+        // clock would auto-advance).
         let payload = b"reclaim-me".to_vec();
         let mut stale_ids = Vec::new();
         for _ in 0..4 {
             stale_ids.push(begin(&svc, &ws, &payload).await);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        tokio::time::pause();
+        tokio::time::advance(ttl * 2).await;
+        tokio::time::resume();
 
         // A 5th begin succeeds — the expired sessions no longer count — and
         // their staging dirs are swept.
@@ -2332,11 +2402,13 @@ mod tests {
         }
 
         // Ongoing chunk activity keeps a session alive well past one TTL of
-        // wall time (5 x 250ms > 1000ms), with a 4x cadence-to-TTL margin so
-        // a stalled CI scheduler doesn't expire the "live" session.
+        // runtime-clock time (5 x TTL/2 = 2.5 TTL), each gap only half the
+        // TTL so the remaining half-TTL margin dwarfs any real stall.
         let mid = payload.len() / 2;
         for _ in 0..5 {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            tokio::time::pause();
+            tokio::time::advance(ttl / 2).await;
+            tokio::time::resume();
             svc.file_attachment_upload_chunk_op(live_id.clone(), 0, b64(&payload[..mid]))
                 .await
                 .expect("keep-alive chunk");
@@ -2346,7 +2418,7 @@ mod tests {
             .expect("final chunk");
         svc.file_attachment_upload_commit_op(live_id)
             .await
-            .expect("active session commits after > TTL wall time");
+            .expect("active session commits after > TTL of idle-clock time");
     }
 
     /// Regression (monorepo#2275): a pipelined commit racing an in-flight

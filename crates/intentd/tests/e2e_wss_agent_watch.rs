@@ -38,10 +38,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,14 +63,13 @@ const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
         if std::thread::panicking() {
             if let Ok(log) = std::fs::read_to_string(self.data_dir.path().join("daemon.log")) {
                 eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
@@ -82,7 +82,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-watch-")
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -97,7 +97,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path, deadline: tokio::time::Instant) -> bool {
@@ -198,6 +198,7 @@ async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
 /// Daemon startup and every poll/event wait below is clamped to this deadline,
 /// and each RPC round-trip is separately capped by [`rpc_read_budget`], so a
 /// stall always panics naming its own step with headroom before the kill.
+// fixed-deadline: allow — stays under nextest's unscaled 180 s slow-timeout kill (.config/nextest.toml) so a stall panics naming its step
 const TEST_BUDGET: Duration = Duration::from_secs(150);
 
 /// Per-test deadline clamp, started at the top of each test — before the daemon
@@ -301,9 +302,7 @@ fn gate(test: &str) -> Option<String> {
 }
 
 async fn seed_workspace_only(data_dir: &Path) -> String {
-    use intent_core::{
-        now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    };
+    use intent_core::{now_iso, Workspace, WorkspaceId};
     use intent_store::Store;
     let store = Store::open(&data_dir.join("intentd.db"))
         .await
@@ -315,49 +314,9 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             id: ws.clone(),
             title: "WSS-WATCH-E2E".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         })
         .await
         .expect("insert ws");

@@ -6,10 +6,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", &format!("itd-wss-scr-{prefix}-"))
 }
 
-fn spawn_serve(data_dir: &Path) -> Child {
+fn spawn_serve(data_dir: &Path) -> GuardedChild {
     let log = std::fs::File::options()
         .create(true)
         .append(true)
@@ -40,15 +41,16 @@ fn spawn_serve(data_dir: &Path) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    common::hermetic_serve_command(data_dir)
-        .env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve")
+    GuardedChild::spawn(
+        common::hermetic_serve_command(data_dir)
+            .env("INTENTD_DATA_DIR", data_dir)
+            .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env("INTENTD_AUTH_TOKEN", TOKEN)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log)),
+    )
+    .expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -241,7 +243,7 @@ async fn next_script_change<S>(
 
 /// Boot (or re-boot) a daemon over an existing data dir, returning the child
 /// and a pinned-TLS WSS client config for its live port.
-async fn boot(data_dir: &Path) -> (Child, u16, Arc<ClientConfig>) {
+async fn boot(data_dir: &Path) -> (GuardedChild, u16, Arc<ClientConfig>) {
     let child = spawn_serve(data_dir);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -255,9 +257,8 @@ async fn boot(data_dir: &Path) -> (Child, u16, Arc<ClientConfig>) {
     (child, port, client_config(&fingerprint))
 }
 
-fn stop(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+fn stop(mut child: GuardedChild) {
+    let _ = child.kill_tree();
 }
 
 /// A minimal committed git repo for `workspace.create` (the store row is what
@@ -295,7 +296,8 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     F: FnMut(&Value) -> bool,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(120));
     let mut id = id_base;
     loop {
         let st = wss_rpc(
@@ -722,6 +724,7 @@ const LOST_AT_DAEMON_STOP_ERROR: &str = "lost: the daemon stopped while the scri
 
 /// Serialized `ScriptRuntimeState` omits cleared fields (`skip_serializing_if`);
 /// a `null` anywhere in a runtime payload is a contract break.
+#[track_caller]
 fn assert_no_nulls(value: &Value, ctx: &str) {
     match value {
         Value::Null => panic!("{ctx}: null field (cleared fields must be omitted)"),
@@ -749,14 +752,17 @@ fn assert_lost_command_state(st: &Value, ctx: &str) {
     assert_no_nulls(st, ctx);
 }
 
-/// Read `script:state` events off a subscribed connection until one for
-/// `script_id` satisfies `pred`; asserts the §6.5 notification envelope on
-/// every frame and returns the matching event `data`.
-async fn next_script_state<S, F>(
+/// Read `script:state` / `script:changed` events off a subscribed connection
+/// until one satisfies `pred` (given the whole event); asserts the §6.5
+/// notification envelope and `script_id` on every frame and returns the
+/// matching event `data`. `awaiting` names the wait in the timeout panic. The actor is not asserted: settlement is
+/// daemon-attributed.
+async fn next_script_event<S, F>(
     ws: &mut WebSocketStream<S>,
     subscription_id: &str,
     workspace_id: &str,
     script_id: &str,
+    awaiting: &str,
     mut pred: F,
 ) -> Value
 where
@@ -766,7 +772,7 @@ where
     loop {
         let next = timeout(common::rpc_read_timeout(), ws.next())
             .await
-            .expect("script:state timed out");
+            .unwrap_or_else(|_| panic!("timed out awaiting {awaiting} for {script_id}"));
         match next {
             Some(Ok(Message::Text(text))) => {
                 let frame: Value = serde_json::from_str(&text).expect("json frame");
@@ -780,12 +786,15 @@ where
                     "subscription envelope: {frame}"
                 );
                 let event = &frame["params"]["event"];
-                assert_eq!(event["type"], "script:state", "event type: {frame}");
+                assert!(
+                    event["type"] == "script:state" || event["type"] == "script:changed",
+                    "event type: {frame}"
+                );
                 assert_eq!(event["workspaceId"], workspace_id, "workspace: {frame}");
                 assert_eq!(event["data"]["scriptId"], script_id, "script: {frame}");
                 assert!(event["id"].is_string(), "event id: {frame}");
                 assert!(event["timestamp"].is_string(), "timestamp: {frame}");
-                if pred(&event["data"]) {
+                if pred(event) {
                     return event["data"].clone();
                 }
             }
@@ -806,7 +815,7 @@ async fn boot_with_command_script(
     title: &str,
     script_id: &str,
 ) -> (
-    Child,
+    GuardedChild,
     u16,
     Arc<ClientConfig>,
     WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
@@ -850,7 +859,11 @@ async fn boot_with_command_script(
 /// A command script whose process is `SIGKILL`ed out of band (no `script.stop`)
 /// reaches `exited` with an `exitCode` on `script.status` within the liveness
 /// bound, and the terminal transition is published as a `script:state` event
-/// — the run never sits `running` with a dead pid.
+/// — the run never sits `running` with a dead pid. One-off settlement is a
+/// separately enqueued finalizer that follows the `exited` publication
+/// (scripts.md, "Completion, failure and cancellation"), so the active-list
+/// check waits for the settlement `script:changed` carrying `archivedAt`
+/// rather than racing it.
 #[tokio::test]
 async fn out_of_band_kill_reaches_exited_over_wss() {
     let data_dir_guard = scratch_dir("oob-kill");
@@ -863,7 +876,7 @@ async fn out_of_band_kill_reaches_exited_over_wss() {
         &mut sub,
         3,
         "events.subscribe",
-        json!({ "eventTypes": ["script:state"], "workspaceId": ws_id }),
+        json!({ "eventTypes": ["script:state", "script:changed"], "workspaceId": ws_id }),
     )
     .await;
     let subscription_id = subscribed["subscriptionId"]
@@ -913,18 +926,44 @@ async fn out_of_band_kill_reaches_exited_over_wss() {
         "previouslyRunning is a hydration marker only: {exited}"
     );
     assert_no_nulls(&exited, "exited status");
+
+    // The terminal transition is published as script:state with the same
+    // exitCode the status read reported.
+    let event = next_script_event(
+        &mut sub,
+        &subscription_id,
+        &ws_id,
+        "oob-1",
+        "exited script:state",
+        |event| {
+            assert!(
+                event["type"] != "script:changed"
+                    || event["data"]["script"]["archivedAt"].is_null(),
+                "archive change precedes the exited script:state: {event}"
+            );
+            event["type"] == "script:state" && event["data"]["status"] == json!("exited")
+        },
+    )
+    .await;
+    // Settlement follows `exited`: only its archive change makes the retired
+    // one-off absent from the active list.
+    let settled = next_script_event(
+        &mut sub,
+        &subscription_id,
+        &ws_id,
+        "oob-1",
+        "settlement script:changed carrying archivedAt",
+        |event| {
+            event["type"] == "script:changed" && event["data"]["script"]["archivedAt"].is_string()
+        },
+    )
+    .await;
+    assert_eq!(settled["action"], "updated", "settlement change: {settled}");
     let listed = wss_rpc(&mut ws, 200, "script.list", json!({ "workspaceId": ws_id })).await;
     assert!(
         listed["scripts"].as_array().unwrap().is_empty(),
         "retired one-off is absent: {listed}"
     );
-
-    // The terminal transition is published as script:state with the same
-    // exitCode the status read reported.
-    let event = next_script_state(&mut sub, &subscription_id, &ws_id, "oob-1", |data| {
-        data["status"] == json!("exited")
-    })
-    .await;
     assert_eq!(event["exitCode"], exit_code, "event exitCode: {event}");
     assert!(event["stoppedAt"].is_string(), "event stoppedAt: {event}");
     assert!(
@@ -1080,17 +1119,19 @@ async fn durable_command_evidence_survives_daemon_restart_over_wss() {
         json!({"workspaceId":workspace,"scriptId":"durable"}),
     )
     .await;
-    timeout(Duration::from_secs(30), async {
-        while !ready.exists() {
-            // timing-guard: wait until the independently supervised child is running
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while !ready.exists() {
+                // timing-guard: wait until the independently supervised child is running
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
     .await
     .expect("command ready");
     drop(ws);
-    daemon.child_mut().kill().unwrap();
-    daemon.child_mut().wait().unwrap();
+    daemon.kill_tree().unwrap();
     drop(daemon);
     let (child, port, cfg) = boot(data.path()).await;
     let _daemon = common::DaemonGuard::process_only(child);
@@ -1105,12 +1146,15 @@ async fn durable_command_evidence_survives_daemon_restart_over_wss() {
     assert_lost_command_state(&state, "wrapper caller was lost");
     assert!(!evidence_root.join("wss-run/result.json").exists());
     std::fs::write(release, "release").unwrap();
-    timeout(Duration::from_secs(30), async {
-        while !evidence_root.join("wss-run/result.json").exists() {
-            // timing-guard: wait for atomic publication of OS exit evidence
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while !evidence_root.join("wss-run/result.json").exists() {
+                // timing-guard: wait for atomic publication of OS exit evidence
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
     .await
     .expect("durable exit receipt");
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))

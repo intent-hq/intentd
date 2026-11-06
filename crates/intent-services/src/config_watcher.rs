@@ -694,7 +694,8 @@ mod tests {
             let store = intent_store::Store::open(&dir.path().join("settings.db"))
                 .await
                 .unwrap();
-            let services = crate::Services::new(store).with_settings_registry(registry.clone());
+            let services =
+                crate::Services::new_isolated(store).with_settings_registry(registry.clone());
             let entered = Arc::new(tokio::sync::Notify::new());
             let release = Arc::new(tokio::sync::Semaphore::new(0));
             let reload: PreparedReload = Arc::new({
@@ -930,7 +931,8 @@ mod tests {
         let store = intent_store::Store::open(&dir.path().join("store.db"))
             .await
             .unwrap();
-        let services = crate::Services::new(store).with_settings_registry(registry.clone());
+        let services =
+            crate::Services::new_isolated(store).with_settings_registry(registry.clone());
         let snapshot = registry.snapshot();
         let notice = registry.subscribe();
         let revision = services
@@ -1072,7 +1074,7 @@ mod tests {
             .await
             .unwrap();
         let bus = crate::events::bus::EventBus::new(store.clone());
-        let services = crate::Services::new(store.clone())
+        let services = crate::Services::new_isolated(store.clone())
             .with_settings_registry(registry.clone())
             .with_event_bus(bus.clone());
         let control = Arc::new(PreparedRuntimeHook {
@@ -1403,11 +1405,12 @@ mod tests {
     #[expect(clippy::await_holding_lock)]
     async fn watcher_re_subscribes_after_a_failed_re_registration() {
         use crate::events::shared_watch::WatchFault;
-        use crate::events::LIVENESS;
+        use crate::events::TestBudget;
 
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let budget = TestBudget::liveness();
         let base = tempfile::tempdir().expect("tempdir");
         let ancestor = base.path().join("parent");
         let cfg_dir = ancestor.join("cfg");
@@ -1424,9 +1427,9 @@ mod tests {
         let hub = SharedWatchHub::with_watch_fault(&fault);
         let (sub_ancestor, _rx_ancestor, _) =
             hub.subscribe_with(&ancestor, RecursiveMode::NonRecursive);
-        sub_ancestor.wait_established(LIVENESS).await;
+        sub_ancestor.probe().wait_live(budget.remaining()).await;
         let (sub_wide, _rx_wide, _) = hub.subscribe_with(&ancestor, RecursiveMode::Recursive);
-        sub_wide.wait_established(LIVENESS).await;
+        sub_wide.probe().wait_live(budget.remaining()).await;
         drop(sub_wide);
 
         let (tx, mut rx) = mpsc::unbounded_channel::<SettingsChanged>();
@@ -1445,7 +1448,7 @@ mod tests {
         watcher
             .probe()
             .expect("subscribed")
-            .wait_live(LIVENESS)
+            .wait_live(budget.remaining())
             .await;
         assert_eq!(fault.attempts(), 2);
         // Let the spawned loop observe the live registration and park in its
@@ -1458,7 +1461,7 @@ mod tests {
 
         // The re-subscription lands as the fourth `watch()` on `cfg`; the
         // fresh handle is stored right after it is enqueued.
-        let probe = tokio::time::timeout(LIVENESS, async {
+        let probe = tokio::time::timeout(budget.remaining(), async {
             loop {
                 if fault.attempts() >= 4 {
                     if let Some(probe) = watcher.probe() {
@@ -1470,12 +1473,12 @@ mod tests {
         })
         .await
         .expect("watcher must re-subscribe after its channel is closed");
-        probe.wait_live(LIVENESS).await;
+        probe.wait_live(budget.remaining()).await;
 
         let tmp = cfg_dir.join(".config.toml.editor-save");
         std::fs::write(&tmp, "[git]\nautoCommit = false\n").expect("write tmp");
         std::fs::rename(&tmp, reg.config_path()).expect("rename over config");
-        let notice = tokio::time::timeout(LIVENESS, rx.recv())
+        let notice = tokio::time::timeout(budget.remaining(), rx.recv())
             .await
             .expect("the re-subscribed watcher should observe the atomic save")
             .expect("watcher task alive");
@@ -1492,11 +1495,12 @@ mod tests {
     #[expect(clippy::await_holding_lock)]
     async fn watcher_catches_up_on_an_edit_made_while_unwatched() {
         use crate::events::shared_watch::WatchFault;
-        use crate::events::LIVENESS;
+        use crate::events::TestBudget;
 
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let budget = TestBudget::liveness();
         let base = tempfile::tempdir().expect("tempdir");
         let ancestor = base.path().join("parent");
         let cfg_dir = ancestor.join("cfg");
@@ -1511,9 +1515,9 @@ mod tests {
         let hub = SharedWatchHub::with_watch_fault(&fault);
         let (sub_ancestor, _rx_ancestor, _) =
             hub.subscribe_with(&ancestor, RecursiveMode::NonRecursive);
-        sub_ancestor.wait_established(LIVENESS).await;
+        sub_ancestor.probe().wait_live(budget.remaining()).await;
         let (sub_wide, _rx_wide, _) = hub.subscribe_with(&ancestor, RecursiveMode::Recursive);
-        sub_wide.wait_established(LIVENESS).await;
+        sub_wide.probe().wait_live(budget.remaining()).await;
         drop(sub_wide);
 
         let (tx, mut rx) = mpsc::unbounded_channel::<SettingsChanged>();
@@ -1532,7 +1536,7 @@ mod tests {
         watcher
             .probe()
             .expect("subscribed")
-            .wait_live(LIVENESS)
+            .wait_live(budget.remaining())
             .await;
         assert_eq!(fault.attempts(), 2);
         tokio::task::yield_now().await;
@@ -1541,7 +1545,7 @@ mod tests {
 
         // The loop has dropped its dead handle and is sleeping out the backoff
         // before the fourth `watch()`: nothing watches `cfg` right now.
-        tokio::time::timeout(LIVENESS, async {
+        tokio::time::timeout(budget.remaining(), async {
             while !(fault.attempts() == 3 && watcher.probe().is_none()) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1552,7 +1556,7 @@ mod tests {
 
         // No second edit: only the catch-up read on re-establishment can
         // surface the change.
-        let notice = tokio::time::timeout(LIVENESS, rx.recv())
+        let notice = tokio::time::timeout(budget.remaining(), rx.recv())
             .await
             .expect("the re-subscribed watcher must catch up on the unwatched edit")
             .expect("watcher task alive");

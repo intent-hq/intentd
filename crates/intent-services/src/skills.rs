@@ -110,6 +110,59 @@ static DISCOVERY_CACHE: std::sync::LazyLock<Mutex<HashMap<String, CacheEntry>>> 
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static SKILL_IO_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
+/// Upper bound on remembered collisions, so a pathological skill tree cannot
+/// grow the set without limit. Past it, new collisions log at debug.
+const MAX_REPORTED_COLLISIONS: usize = 1024;
+
+/// Collisions already reported at warn level, keyed by (name, kept path,
+/// shadowed path). Every skills scan re-detects the same collisions, so
+/// warning on each one flooded the daemon log (intent-hq/intent#8480).
+#[derive(Default)]
+struct ReportedCollisions {
+    seen: HashSet<(String, String, String)>,
+    cap_reported: bool,
+}
+
+/// How a detected collision should be logged.
+#[derive(Debug, PartialEq, Eq)]
+enum CollisionReport {
+    /// First sighting this daemon run: warn.
+    New,
+    /// Already warned about (or the set is full): debug only.
+    Repeat,
+    /// The set just filled up: warn once that later new collisions are
+    /// logged at debug, so the cut-off is never silent.
+    CapReached,
+}
+
+impl ReportedCollisions {
+    fn record(&mut self, key: (String, String, String)) -> CollisionReport {
+        if self.seen.contains(&key) {
+            return CollisionReport::Repeat;
+        }
+        if self.seen.len() >= MAX_REPORTED_COLLISIONS {
+            if self.cap_reported {
+                return CollisionReport::Repeat;
+            }
+            self.cap_reported = true;
+            return CollisionReport::CapReached;
+        }
+        self.seen.insert(key);
+        CollisionReport::New
+    }
+}
+
+static REPORTED_COLLISIONS: std::sync::LazyLock<Mutex<ReportedCollisions>> =
+    std::sync::LazyLock::new(|| Mutex::new(ReportedCollisions::default()));
+
+fn record_collision(name: &str, kept: &str, shadowed: &str) -> CollisionReport {
+    let key = (name.to_owned(), kept.to_owned(), shadowed.to_owned());
+    REPORTED_COLLISIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record(key)
+}
+
 /// Public API: discover skills for a workspace
 pub(crate) async fn discover_skills(workspace_path: &str) -> Vec<SkillMetadata> {
     let payload = load_skills_payload(workspace_path).await;
@@ -134,6 +187,63 @@ pub(crate) fn invalidate_skills_cache(workspace_path: &Path) {
     let mut cache = DISCOVERY_CACHE.lock().unwrap();
     if let Some(entry) = cache.get_mut(key.as_deref().unwrap_or(NO_WORKSPACE_CACHE_KEY)) {
         entry.dirty = true;
+    }
+}
+
+/// Discovery on a remote agent's machine (node-link.md § Skills on the
+/// machine): user roots under `home` (the daemon's own `CLAUDE_CONFIG_DIR`
+/// as for local agents), then project roots in `checkout`. Name-sorted.
+/// Fresh and blocking, like [`discover_skills_sync`].
+#[must_use]
+pub fn discover_on_machine(
+    checkout: Option<&Path>,
+    home: Option<PathBuf>,
+) -> Vec<intent_core::node_link::MachineSkill> {
+    let checkout = checkout.and_then(|path| path.canonicalize().ok());
+    let checkout = checkout.as_ref().map(|path| path.to_string_lossy());
+    let mut skills = scan_skills_sync(checkout.as_deref(), home).skills;
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+        .into_iter()
+        .map(SkillMetadata::into_machine)
+        .collect()
+}
+
+/// The `<available_skills>` prompt catalog of a machine's skills; empty
+/// when there are none.
+#[must_use]
+pub fn machine_catalog(skills: &[intent_core::node_link::MachineSkill]) -> String {
+    let skills: Vec<_> = skills
+        .iter()
+        .cloned()
+        .map(SkillMetadata::from_machine)
+        .collect();
+    build_skills_catalog(&skills)
+}
+
+impl SkillMetadata {
+    pub(crate) fn into_machine(self) -> intent_core::node_link::MachineSkill {
+        intent_core::node_link::MachineSkill {
+            name: self.name,
+            description: self.description,
+            location: self.location,
+            resource_directory: self.resource_directory,
+            scope: self.scope,
+            allowed_tools: self.allowed_tools,
+            compatibility: self.compatibility,
+        }
+    }
+
+    pub(crate) fn from_machine(skill: intent_core::node_link::MachineSkill) -> Self {
+        Self {
+            name: skill.name,
+            description: skill.description,
+            location: skill.location,
+            resource_directory: skill.resource_directory,
+            scope: skill.scope,
+            allowed_tools: skill.allowed_tools,
+            compatibility: skill.compatibility,
+        }
     }
 }
 
@@ -380,6 +490,10 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
     let mut scan_state = ScanState::default();
     let mut project_watch_directories = HashSet::new();
 
+    let plugin_paths = home_override
+        .as_ref()
+        .map(|home| crate::plugins::PluginPaths::new(home.join(".intent")))
+        .or_else(crate::plugins::PluginPaths::user);
     // Visit the winning tier first so canonical deduplication cannot erase it.
     for target in get_scan_targets(workspace_path, home_override)
         .into_iter()
@@ -399,12 +513,33 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
 
                 if let Some(existing) = discovered_by_name.get(&name) {
                     let existing: &DiscoveredSkill = existing;
-                    eprintln!(
-                        "WARN: Skill name collision detected, keeping higher-precedence skill: name={}, kept={}, shadowed={}",
-                        name,
-                        if target.precedence >= existing.precedence { &parsed.metadata.location } else { &existing.metadata.location },
-                        if target.precedence >= existing.precedence { &existing.metadata.location } else { &parsed.metadata.location }
-                    );
+                    let (kept, shadowed) = if target.precedence >= existing.precedence {
+                        (&parsed.metadata.location, &existing.metadata.location)
+                    } else {
+                        (&existing.metadata.location, &parsed.metadata.location)
+                    };
+                    match record_collision(&name, kept, shadowed) {
+                        CollisionReport::New => tracing::warn!(
+                            name = %name,
+                            kept = %kept,
+                            shadowed = %shadowed,
+                            "Skill name collision detected, keeping higher-precedence skill"
+                        ),
+                        CollisionReport::CapReached => tracing::warn!(
+                            name = %name,
+                            kept = %kept,
+                            shadowed = %shadowed,
+                            limit = MAX_REPORTED_COLLISIONS,
+                            "Skill name collision detected; reported-collision limit reached, \
+                             further new collisions are logged at debug"
+                        ),
+                        CollisionReport::Repeat => tracing::debug!(
+                            name = %name,
+                            kept = %kept,
+                            shadowed = %shadowed,
+                            "Skill name collision (already reported)"
+                        ),
+                    }
                 }
 
                 if !discovered_by_name.contains_key(&name)
@@ -423,6 +558,15 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
                 }
             }
         }
+    }
+
+    if let Some(paths) = plugin_paths {
+        add_plugin_skills(
+            &paths,
+            &mut discovered_by_name,
+            &mut observed_paths,
+            &mut scan_state,
+        );
     }
 
     let mut skills: Vec<SkillMetadata> = discovered_by_name
@@ -574,10 +718,10 @@ fn walk_directory(
     let mut entries = match std::fs::read_dir(current_path) {
         Ok(entries) => entries,
         Err(e) => {
-            eprintln!(
-                "WARN: Failed to read potential skills directory: path={}, error={}",
-                current_path.display(),
-                e
+            tracing::warn!(
+                path = %current_path.display(),
+                error = %e,
+                "Failed to read potential skills directory"
             );
             return;
         }
@@ -638,14 +782,52 @@ fn walk_directory(
                     skill_files,
                 );
                 if scan_state.scanned_directories >= MAX_SCANNED_DIRECTORIES {
-                    eprintln!(
-                        "WARN: Skills discovery stopped after reaching directory scan limit: rootPath={}, limit={}",
-                        current_path.display(),
-                        MAX_SCANNED_DIRECTORIES
+                    tracing::warn!(
+                        root_path = %current_path.display(),
+                        limit = MAX_SCANNED_DIRECTORIES,
+                        "Skills discovery stopped after reaching directory scan limit"
                     );
                     return;
                 }
             }
+        }
+    }
+}
+
+/// Enabled user plugins contribute `<plugin>:<skill>` entries. They rank below
+/// every directory tier, so a loose skill with the same name still wins.
+fn add_plugin_skills(
+    paths: &crate::plugins::PluginPaths,
+    discovered_by_name: &mut BTreeMap<String, DiscoveredSkill>,
+    observed_paths: &mut HashSet<PathBuf>,
+    scan_state: &mut ScanState,
+) {
+    observed_paths.insert(paths.plugins_dir());
+    observed_paths.insert(paths.registry_file());
+    for installed in crate::plugins::list_installed(paths) {
+        let crate::plugins::InstalledPlugin::Loaded { plugin, entry } = installed else {
+            continue;
+        };
+        observed_paths.insert(plugin.root.join(crate::plugins::MANIFEST_FILE));
+        observed_paths.insert(plugin.root.join("skills"));
+        if !entry.enabled {
+            continue;
+        }
+        for skill in &plugin.skills {
+            observed_paths.insert(skill.file.clone());
+            let Some(parsed) = parse_skill_file(&skill.file, scan_state) else {
+                continue;
+            };
+            let name = crate::plugins::skill_name(&plugin.manifest.name, &parsed.metadata.name);
+            discovered_by_name
+                .entry(name.clone())
+                .or_insert(DiscoveredSkill {
+                    metadata: SkillMetadata {
+                        name,
+                        ..parsed.metadata
+                    },
+                    precedence: 0,
+                });
         }
     }
 }
@@ -675,10 +857,10 @@ fn parse_skill_file(skill_path: &Path, state: &mut ScanState) -> Option<ParsedSk
     }) {
         Ok(content) => content,
         Err(e) => {
-            eprintln!(
-                "WARN: Failed to read skill file: skillPath={}, error={}",
-                skill_path.display(),
-                e
+            tracing::warn!(
+                skill_path = %skill_path.display(),
+                error = %e,
+                "Failed to read skill file"
             );
             return None;
         }
@@ -687,17 +869,17 @@ fn parse_skill_file(skill_path: &Path, state: &mut ScanState) -> Option<ParsedSk
     let parsed = parse_skill_content(&content)?;
 
     if parsed.name.is_none() {
-        eprintln!(
-            "WARN: Skipping skill missing required name field: skillPath={}",
-            skill_path.display()
+        tracing::warn!(
+            skill_path = %skill_path.display(),
+            "Skipping skill missing required name field"
         );
         return None;
     }
 
     if parsed.description.is_none() {
-        eprintln!(
-            "WARN: Skipping skill missing required description field: skillPath={}",
-            skill_path.display()
+        tracing::warn!(
+            skill_path = %skill_path.display(),
+            "Skipping skill missing required description field"
         );
         return None;
     }
@@ -712,11 +894,11 @@ fn parse_skill_file(skill_path: &Path, state: &mut ScanState) -> Option<ParsedSk
         .and_then(|n| n.to_str())
     {
         if name != parent_dir_name {
-            eprintln!(
-                "WARN: Skill name does not match parent directory name: skillPath={}, name={}, parentDirectoryName={}",
-                skill_path.display(),
-                name,
-                parent_dir_name
+            tracing::warn!(
+                skill_path = %skill_path.display(),
+                name = %name,
+                parent_directory_name = %parent_dir_name,
+                "Skill name does not match parent directory name"
             );
         }
     }
@@ -725,10 +907,10 @@ fn parse_skill_file(skill_path: &Path, state: &mut ScanState) -> Option<ParsedSk
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
-        eprintln!(
-            "WARN: Skill name does not match the Agent Skills naming convention: skillPath={}, name={}",
-            skill_path.display(),
-            name
+        tracing::warn!(
+            skill_path = %skill_path.display(),
+            name = %name,
+            "Skill name does not match the Agent Skills naming convention"
         );
     }
 
@@ -1268,6 +1450,82 @@ mod tests {
         );
     }
 
+    /// intent-hq/intent#8480: every scan re-detects the same collision, so
+    /// the warning is emitted once per daemon run and later scans log at
+    /// debug instead of flooding the daemon log.
+    #[tokio::test]
+    async fn skill_collision_warns_once_across_scans() {
+        clear_cache();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home_dir = temp_dir.path().join("home");
+        let workspace_path = temp_dir.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace_path).await.unwrap();
+        for root in [".augment", ".intent"] {
+            write_skill(
+                &workspace_path.join(root).join("skills"),
+                "noisy-skill",
+                &build_skill_content(
+                    &format!("name: noisy-skill\ndescription: from {root}"),
+                    "Use this skill when needed.",
+                ),
+            )
+            .await;
+        }
+
+        let warnings = crate::test_tracing::Warnings::default();
+        let _guard = warnings.install();
+        let workspace = workspace_path.to_string_lossy().into_owned();
+        for _ in 0..3 {
+            let payload = scan_skills_sync(Some(&workspace), Some(home_dir.clone()));
+            assert_eq!(payload.skills.len(), 1, "the collision still resolves");
+        }
+        let reported = warnings.containing("noisy-skill");
+        assert_eq!(
+            reported.len(),
+            1,
+            "one warning across three scans: {:?}",
+            warnings.all()
+        );
+        assert!(reported[0].contains("Skill name collision detected"));
+    }
+
+    /// Exercises a local set, not the process-wide one, so it cannot hide the
+    /// first warning from `skill_collision_warns_once_across_scans` when tests
+    /// share a process.
+    #[test]
+    fn reported_collisions_dedupe_and_warn_once_at_the_cap() {
+        let key = |n: &str, s: &str| (n.to_owned(), "/kept".to_owned(), s.to_owned());
+        let mut reported = ReportedCollisions::default();
+        assert_eq!(reported.record(key("a", "/s")), CollisionReport::New);
+        assert_eq!(reported.record(key("a", "/s")), CollisionReport::Repeat);
+        assert_eq!(
+            reported.record(key("a", "/other")),
+            CollisionReport::New,
+            "a different shadowed path is a new collision"
+        );
+        for i in reported.seen.len()..MAX_REPORTED_COLLISIONS {
+            assert_eq!(
+                reported.record(key(&format!("fill-{i}"), "/s")),
+                CollisionReport::New
+            );
+        }
+        assert_eq!(
+            reported.record(key("past-cap", "/s")),
+            CollisionReport::CapReached,
+            "the first collision past the cap says so at warn"
+        );
+        assert_eq!(
+            reported.record(key("past-cap-2", "/s")),
+            CollisionReport::Repeat,
+            "later new collisions stay at debug"
+        );
+        assert_eq!(
+            reported.record(key("a", "/s")),
+            CollisionReport::Repeat,
+            "known collisions stay at debug past the cap"
+        );
+    }
+
     #[tokio::test]
     async fn test_xml_escaping() {
         assert_eq!(escape_xml("&<>\""), "&amp;&lt;&gt;&quot;");
@@ -1385,5 +1643,59 @@ mod tests {
         let skills2 = discover_skills_test(&workspace_path.to_string_lossy(), home_dir).await;
         assert_eq!(skills2.len(), 1);
         assert_eq!(skills2[0].description, "Updated description");
+    }
+
+    /// A remote agent's machine scans its own home and the agent's
+    /// checkout; a project skill wins a name collision, and without a
+    /// checkout only user skills are found (node-link.md § Skills on the
+    /// machine).
+    #[tokio::test]
+    async fn machine_discovery_scans_its_home_and_the_checkout() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home = temp_dir.path().join("home");
+        let checkout = temp_dir.path().join("checkout");
+        tokio::fs::create_dir_all(&checkout).await.unwrap();
+        let skill = |name: &str, from: &str| {
+            build_skill_content(&format!("name: {name}\ndescription: from {from}"), "Body.")
+        };
+        write_skill(&home.join(".claude/skills"), "mine", &skill("mine", "home")).await;
+        write_skill(
+            &home.join(".agents/skills"),
+            "shared",
+            &skill("shared", "user"),
+        )
+        .await;
+        write_skill(
+            &checkout.join(".claude/skills"),
+            "shared",
+            &skill("shared", "checkout"),
+        )
+        .await;
+
+        let found = discover_on_machine(Some(&checkout), Some(home.clone()));
+        let names: Vec<_> = found
+            .iter()
+            .map(|s| (s.name.as_str(), s.description.as_str(), s.scope.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("mine", "from home", "user"),
+                ("shared", "from checkout", "project")
+            ],
+            "sorted by name; project wins"
+        );
+
+        let user_only = discover_on_machine(None, Some(home.clone()));
+        let names: Vec<_> = user_only
+            .iter()
+            .map(|s| (s.name.as_str(), s.scope.as_str()))
+            .collect();
+        assert_eq!(names, [("mine", "user"), ("shared", "user")]);
+
+        let catalog = machine_catalog(&found);
+        assert!(catalog.contains("<available_skills>"), "{catalog}");
+        assert!(catalog.contains("<name>mine</name>"), "{catalog}");
+        assert!(machine_catalog(&[]).is_empty());
     }
 }

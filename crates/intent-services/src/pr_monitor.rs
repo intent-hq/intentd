@@ -73,7 +73,7 @@ use std::time::{Duration, Instant};
 
 use intent_core::events::{
     PR_MONITOR_CANCELLED, PR_MONITOR_CHANGED, PR_MONITOR_COMPLETED, PR_MONITOR_EMITTED,
-    PR_MONITOR_REGISTERED,
+    PR_MONITOR_REFRESHED, PR_MONITOR_REGISTERED,
 };
 use intent_core::{
     now_iso, parse_iso, AgentId, AgentStatus, Error, PrMonitor, PrMonitorId, PrMonitorState,
@@ -85,19 +85,25 @@ use intent_sourcecontrol::{
 use intent_store::{NewEvent, PrMonitorListEntry, PrMonitorPollUpdate};
 use serde_json::{json, Value};
 
-use crate::hook_manager::CancelSettlement;
+use crate::feature_ports::CancelSettlement;
 use crate::pr_ops::{self, MergeRequirements};
 use crate::rate_limit::RATE_LIMIT_MAX_PAUSE;
 use crate::workspace_status::MonitorPrSignals;
 use crate::{publish_event, system_actor, Services};
 
 // Compiled storage/read primitives; the admitted caller directory wires these later.
+mod observation_feed;
 #[expect(
     dead_code,
     reason = "qualified reads await admitted caller-directory wiring"
 )]
 pub(crate) mod qualified_cache;
+mod qualified_events;
+mod qualified_poll;
+mod routing;
+pub(crate) use observation_feed::ObservationFeed;
 use qualified_cache::{CacheKey, CacheSlot};
+pub(crate) use routing::wire as qualified_pr_monitor_wire;
 
 use intent_core::config::{
     MAX_PR_CACHE_MAX_AGE_SECONDS, MAX_PR_MONITORS_PER_AGENT, MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
@@ -105,6 +111,31 @@ use intent_core::config::{
     MIN_PR_MONITOR_DEBOUNCE_SECONDS, MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
     MIN_PR_MONITOR_POLL_SECONDS, MIN_PR_MONITOR_QUOTA_SHARE_PERCENT,
 };
+
+/// Which active monitors one sweep considers: every monitor (deterministic
+/// test sweeps), the due set (the loop tick), or one workspace's monitors
+/// older than a minimum age (the `agent:idle` nudge).
+#[derive(Clone, Debug)]
+pub(crate) enum SweepScope {
+    All,
+    Due,
+    Nudge {
+        workspace_id: WorkspaceId,
+        min_age_secs: u64,
+    },
+}
+
+/// Whether `last_polled_at` lies within `secs` of `now`. A missing or
+/// malformed stamp counts as never polled.
+pub(crate) fn polled_within(
+    last_polled_at: Option<&str>,
+    secs: u64,
+    now: time::OffsetDateTime,
+) -> bool {
+    last_polled_at.and_then(parse_iso).is_some_and(|at| {
+        now - at < time::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+    })
+}
 
 /// Forge REST calls one distinct-PR poll is COSTED at on the steady-state
 /// GitHub path: the PR read, the reviews list, and the conversation-comment
@@ -298,12 +329,14 @@ fn pr_key_for(repo_ref: &RepoRef, pr_number: i64) -> PrKey {
 
 /// One active monitor as the due-sweep sees it: its staleness anchor (parsed
 /// `lastPolledAt`; registration and re-registration fetch their own baseline
-/// and stamp the field; `None` = never polled, sorts oldest) and whether its
-/// restart catch-up marker is still unattempted.
+/// and stamp the field; `None` = never polled, sorts oldest), whether its
+/// restart catch-up marker is still unattempted, and whether another fresh
+/// read saw its PR move since the monitor's last read ([`ObservationFeed`]).
 #[derive(Clone)]
 pub(crate) struct DueCandidate {
     pub(crate) anchor: Option<time::OffsetDateTime>,
     pub(crate) catch_up: bool,
+    pub(crate) observed: bool,
     pub(crate) interval: time::Duration,
     pub(crate) monitor: PrMonitor,
 }
@@ -332,9 +365,12 @@ fn catch_up_unattempted(
 /// monitors; the fastest interested workspace supplies the idle interval.
 /// A PR is due when its anchor exceeds both that interval and the global
 /// budget/configuration floor `interval` (or
-/// missing, or any sibling is catch-up-unattempted). Due PRs are ordered
-/// oldest anchor first (PR key breaks ties), the first `cap` are kept, and
-/// EVERY active monitor on a kept PR is returned in that order — siblings
+/// missing, or any sibling is catch-up-unattempted, or another read observed
+/// the PR move — [`ObservationFeed`]). Due PRs are ordered observed first,
+/// then oldest anchor first (PR key breaks ties), the first `cap` are kept —
+/// never fewer than the observed PRs, which a spacing hold or a small cap
+/// must not leave showing a lifecycle the workspace PR state already moved
+/// past — and EVERY active monitor on a kept PR is returned in that order — siblings
 /// share the one fetch and leave the tick with aligned `lastPolledAt`
 /// stamps, so a PR is fetched once per interval however many agents watch
 /// it and however staggered their registrations were.
@@ -347,6 +383,7 @@ pub(crate) fn select_due_pr_monitors(
     struct Group {
         anchor: Option<time::OffsetDateTime>,
         catch_up: bool,
+        observed: bool,
         interval: time::Duration,
         monitors: Vec<PrMonitor>,
     }
@@ -360,6 +397,7 @@ pub(crate) fn select_due_pr_monitors(
                 group.anchor = c.anchor;
             }
             group.catch_up |= c.catch_up;
+            group.observed |= c.observed;
             group.interval = group.interval.min(c.interval);
             group.monitors.push(c.monitor);
         } else {
@@ -369,25 +407,28 @@ pub(crate) fn select_due_pr_monitors(
                 Group {
                     anchor: c.anchor,
                     catch_up: c.catch_up,
+                    observed: c.observed,
                     interval: c.interval,
                     monitors: vec![c.monitor],
                 },
             ));
         }
     }
-    let mut due: Vec<(Option<time::OffsetDateTime>, PrKey, Vec<PrMonitor>)> = groups
+    let mut due: Vec<(bool, Option<time::OffsetDateTime>, PrKey, Vec<PrMonitor>)> = groups
         .into_iter()
         .filter(|(_, g)| {
             g.catch_up
+                || g.observed
                 || g.anchor
                     .is_none_or(|at| now - at >= interval.max(g.interval))
         })
-        .map(|(key, g)| (g.anchor, key, g.monitors))
+        .map(|(key, g)| (!g.observed, g.anchor, key, g.monitors))
         .collect();
-    due.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    due.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
+    let observed = due.iter().filter(|(unobserved, ..)| !unobserved).count();
     due.into_iter()
-        .take(cap)
-        .flat_map(|(_, _, monitors)| monitors)
+        .take(cap.max(observed))
+        .flat_map(|(.., monitors)| monitors)
         .collect()
 }
 
@@ -429,9 +470,87 @@ pub(crate) const PR_MONITOR_DEBOUNCE_MAX_WAIT_FACTOR: i32 = 5;
 /// due and starve the rotation.
 pub(crate) type PrMonitorCatchUp = Arc<Mutex<HashMap<PrMonitorId, time::OffsetDateTime>>>;
 
+/// A monitor's last `changed` wake that went into its owner's queue instead
+/// of starting a turn — the one entry a newer wake for the same monitor may
+/// replace ([`Services::replace_queued_pr_monitor_wake`]).
+///
+/// The emit baseline advances when a wake is QUEUED, not when the agent
+/// reads it, so the next wake's own change list only covers what moved
+/// after the queued one. Replacing the queued wake with it would lose the
+/// queued wake's changes; the replacement is instead rendered against
+/// `reported_baseline` — the baseline the queued wake was diffed from, i.e.
+/// the PR state the agent last actually read about.
+///
+/// Anything else that resets the baseline (re-registration, adoption, a
+/// qualified refresh, cancellation) forgets the record
+/// ([`Services::forget_queued_pr_monitor_wake`]): the agent has just read the
+/// PR state, so the queued wake is no longer the last report it saw. A wake
+/// that started a turn directly is delivered and records nothing.
+///
+/// In memory only, shared across [`Services`] clones. After a restart the
+/// rehydrated queue entry has no record, so a newer wake queues behind it
+/// (both delivered, the pre-fix behavior) rather than guessing its baseline.
+#[derive(Debug, Clone)]
+pub(crate) struct QueuedPrMonitorWake {
+    agent_id: AgentId,
+    message_id: String,
+    /// The emit baseline the queued wake was rendered against.
+    reported_baseline: Option<String>,
+}
+
+/// See [`QueuedPrMonitorWake`].
+pub(crate) type PrMonitorQueuedWakes = Arc<Mutex<HashMap<PrMonitorId, QueuedPrMonitorWake>>>;
+
+/// What [`Services::replace_queued_pr_monitor_wake`] did with the
+/// monitor's queued `changed` wake.
+enum QueuedWakeReplacement {
+    /// Nothing replaced: deliver the wake as rendered, keeping both.
+    None,
+    /// The queued entry was swapped, in one queue step, for this wake at
+    /// the back of the queue as entry `message_id`, which reports from
+    /// `reported_baseline`.
+    Requeued {
+        message_id: String,
+        reported_baseline: Option<String>,
+    },
+    /// The final wake was written into the queued entry's place.
+    InPlace,
+}
+
+/// Which wake a monitor transition renders; both report the coalesced
+/// `diff(baseline, snapshot)` and so can be re-rendered from an older
+/// baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoalescibleWake {
+    /// `reason: "changed"` — the consolidated change wake.
+    Changed,
+    /// `reason: "completed"` — the merged/closed final wake. It may replace
+    /// a queued `changed` wake but is itself never replaced or dropped.
+    Completed,
+}
+
+impl CoalescibleWake {
+    const fn reason(self) -> &'static str {
+        match self {
+            CoalescibleWake::Changed => "changed",
+            CoalescibleWake::Completed => "completed",
+        }
+    }
+
+    fn render(self, m: &PrMonitor, changes: &[String], snapshot: &PrMonitorSnapshot) -> String {
+        match self {
+            CoalescibleWake::Changed => render_change_wake(m, changes, snapshot),
+            CoalescibleWake::Completed => render_terminal_wake(m, changes, snapshot),
+        }
+    }
+}
+
 /// The diffable state of one monitored PR: the merge-requirements checklist
 /// plus the identity/comment-count fields the checklist itself does not
 /// carry. Persisted (JSON) as the monitor's baseline.
+// The bool fields are independent serde-defaulted persistence markers;
+// grouping them would change the persisted JSON shape.
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PrMonitorSnapshot {
@@ -451,6 +570,12 @@ pub(crate) struct PrMonitorSnapshot {
     /// silently instead of emitting a false post-upgrade wake.
     #[serde(default)]
     pub ejection_tracked: bool,
+    /// Whether this snapshot reports skipped checks as `skipped`. Baselines
+    /// persisted before skipped checks were told apart read `false`: their
+    /// skipped checks were encoded as `passed`, so the first tracked poll
+    /// re-encodes them silently instead of reporting `passed → skipped`.
+    #[serde(default)]
+    pub skipped_tracked: bool,
     /// No authoritative checks have been observed for this head yet. Internal
     /// persisted bookkeeping only; old snapshots retain their known baseline.
     #[serde(default)]
@@ -479,6 +604,31 @@ pub(crate) struct PrMonitorSnapshot {
     /// participates in the change diff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
+    /// The forge's own `updatedAt` for the PR (RFC 3339) as of the read that
+    /// produced this snapshot. The workspace PR pool reports it as a
+    /// monitor-derived entry's `updatedAt`, so same-state recency ordering
+    /// compares PR activity rather than monitor bookkeeping
+    /// ([`pr_monitor_pr_info`]). Absent on snapshots persisted before the
+    /// field existed. Internal persisted evidence only: never part of the
+    /// change diff (a bare `updatedAt` bump is not news) and omitted from
+    /// the public `lastSnapshot` projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_updated_at: Option<String>,
+    /// The head whose never-started-CI wake was already DELIVERED: stamped
+    /// on the snapshot that becomes the emit baseline and carried forward on
+    /// the same head, so a degraded read that clears the flag (and an
+    /// unrelated wake that moves the baseline meanwhile) never re-arms a
+    /// second stall wake for that head. Internal persisted bookkeeping only;
+    /// never part of the public projection or the change diff on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks_not_started_delivered: Option<String>,
+    /// `requirements.approvals.latestReviews` was carried forward from the
+    /// previous snapshot because this read's review fetch degraded. The
+    /// carried list keeps the emit anchor able to report a review submitted
+    /// meanwhile, but it is not an observation: the rendered checklist omits
+    /// it. Internal persisted bookkeeping only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub latest_reviews_carried: bool,
 }
 
 impl PrMonitorSnapshot {
@@ -512,6 +662,9 @@ pub struct SharedPrSnapshot {
     pub(crate) title: String,
     pub(crate) url: String,
     pub(crate) head_sha: Option<String>,
+    /// The forge's `updatedAt` for the PR (`None` when the forge reported
+    /// none); materialized into [`PrMonitorSnapshot::pr_updated_at`].
+    pub(crate) pr_updated_at: Option<String>,
     pub(crate) conversation_count: Option<i64>,
     pub(crate) review_comment_count: i64,
     pub(crate) requirements: MergeRequirements,
@@ -530,6 +683,10 @@ pub struct SharedPrSnapshot {
     /// ([`pr_ops::MergeRequirementsRead::merge_queue_reported`]) — what
     /// `github.pulls.get` carries as `isInMergeQueue` (`None` → key absent).
     pub(crate) merge_queue_reported: Option<bool>,
+    /// The read's inputs to the never-started-CI flag, re-derived against
+    /// the clock every time the snapshot is materialized or served
+    /// ([`Self::requirements_at`]).
+    pub(crate) checks_start: pr_ops::ChecksStartEvidence,
 }
 
 impl SharedPrSnapshot {
@@ -540,6 +697,29 @@ impl SharedPrSnapshot {
     /// rather than silently dropping it from the pending set (the event is
     /// monotonic — always reaches the wake — per intent-hq/monorepo#3479).
     pub(crate) fn materialize(&self, previous: Option<&PrMonitorSnapshot>) -> PrMonitorSnapshot {
+        self.materialize_at(previous, time::OffsetDateTime::now_utc())
+    }
+
+    /// The checklist as served at `now` (`ws.pr.snapshot`): the cached
+    /// requirements with the never-started-CI flag derived against the
+    /// clock, so a cached read still crosses the threshold.
+    pub(crate) fn requirements_at(&self, now: time::OffsetDateTime) -> MergeRequirements {
+        let mut requirements = self.requirements.clone();
+        requirements.checks_not_started = pr_ops::checks_not_started(
+            &requirements,
+            self.check_runs_known,
+            &self.checks_start,
+            now,
+        );
+        requirements
+    }
+
+    /// [`Self::materialize`] against an explicit clock.
+    pub(crate) fn materialize_at(
+        &self,
+        previous: Option<&PrMonitorSnapshot>,
+        now: time::OffsetDateTime,
+    ) -> PrMonitorSnapshot {
         let mut requirements = self.requirements.clone();
         let mut checks_unobserved = !self.check_runs_known;
         let same_head = previous.filter(|p| {
@@ -593,13 +773,50 @@ impl SharedPrSnapshot {
             true
         } else {
             if requirements.merge_queue_ejection.is_none() {
-                requirements.merge_queue_ejection =
-                    previous.and_then(|p| p.requirements.merge_queue_ejection.clone());
+                // Never resurrect a held event that records a merge (a
+                // baseline persisted before merged removals were filtered,
+                // or a PR that has since merged).
+                requirements.merge_queue_ejection = previous
+                    .and_then(|p| p.requirements.merge_queue_ejection.clone())
+                    .filter(|e| !e.records_merge(&requirements.state));
             }
             // The hold carries the observation forward, so tracked-ness
             // carries with it; an untracked previous stays untracked until
             // a probe actually answers.
             previous.is_some_and(|p| p.ejection_tracked)
+        };
+        // A degraded review read keeps the previously observed per-reviewer
+        // reviews (re-anchored to this read's head) rather than dropping
+        // them: an emit baseline without them would let the next answered
+        // read adopt a review submitted in between silently.
+        let latest_reviews_carried = requirements.approvals.latest_reviews.is_none();
+        if latest_reviews_carried {
+            requirements.approvals.latest_reviews = previous
+                .and_then(|p| p.requirements.approvals.latest_reviews.clone())
+                .map(|mut reviews| {
+                    for r in &mut reviews {
+                        r.reanchor(self.head_sha.as_deref());
+                    }
+                    reviews
+                });
+        }
+        let latest_reviews_carried =
+            latest_reviews_carried && requirements.approvals.latest_reviews.is_some();
+        // Only THIS read's own answered check runs count as observed — a
+        // carried-forward empty list may be stale (CI may have started since)
+        // — and only a head an earlier poll already saw may flag: the head's
+        // commit time can predate its push, so the first sighting of a head
+        // must not read "never started" before the forge registered its runs.
+        // Derived against `now` so a cached read still crosses the threshold.
+        requirements.checks_not_started = if same_head.is_some() {
+            pr_ops::checks_not_started(
+                &requirements,
+                self.check_runs_known && !checks_unobserved,
+                &self.checks_start,
+                now,
+            )
+        } else {
+            None
         };
         PrMonitorSnapshot {
             title: self.title.clone(),
@@ -611,16 +828,32 @@ impl SharedPrSnapshot {
             review_comment_count: self.review_comment_count,
             requirements,
             ejection_tracked,
+            skipped_tracked: true,
             checks_unobserved,
             checks_seed_pending,
             status_checks: Some(status_checks),
             required_check_names,
             observed_at: None,
+            pr_updated_at: self
+                .pr_updated_at
+                .clone()
+                .or_else(|| previous.and_then(|p| p.pr_updated_at.clone())),
+            latest_reviews_carried,
+            checks_not_started_delivered: same_head
+                .and_then(|p| p.checks_not_started_delivered.clone()),
         }
     }
 }
 
 impl SharedPrSnapshot {
+    /// Whether this read could feed the never-started-CI flag: zero checks
+    /// on a base branch that requires them. Check runs do not bump the PR's
+    /// `updatedAt`, so reusing such an entry could let a cached empty list
+    /// override CI that has since started — every poll re-reads instead.
+    fn awaits_first_check(&self) -> bool {
+        self.checks_start.checks_required && self.requirements.checks.total == 0
+    }
+
     /// Whether every read behind this snapshot answered — the precondition
     /// for a later poll to REUSE it instead of re-fetching: a degraded
     /// comment count, merge-requirements probe or any other checklist
@@ -777,6 +1010,7 @@ impl PrCacheEntry {
             && self.snapshot.is_complete()
             && self.cheap_polls < PR_MONITOR_MAX_CHEAP_POLLS
             && now.saturating_duration_since(self.fetched_at) < PR_MONITOR_MAX_CHEAP_AGE
+            && !self.snapshot.awaits_first_check()
     }
 }
 
@@ -1002,6 +1236,7 @@ async fn shared_snapshot_from_observation(
         title: observation.pr.title.clone(),
         url: observation.pr.url.clone(),
         head_sha: observation.pr.head_sha.clone(),
+        pr_updated_at: forge_updated_at(&observation.pr),
         conversation_count: Some(observation.conversation_count),
         review_comment_count: read.review_comment_count,
         requirements: read.requirements,
@@ -1010,6 +1245,7 @@ async fn shared_snapshot_from_observation(
         check_runs_known: read.check_runs_known,
         status_checks: read.status_checks,
         merge_queue_reported: read.merge_queue_reported,
+        checks_start: read.checks_start,
     };
     Ok((observation.pr, snapshot))
 }
@@ -1186,6 +1422,30 @@ async fn poll_pr(
                 entry.record_started_at = record_started_at;
                 entry.authorization.clone_from(&authorization);
                 entry.pr = pr.clone();
+                // Queue movement need not change updatedAt or mergeability.
+                // Keep the signal already returned by the folded observation
+                // even when the remaining checklist reuses the full fetch —
+                // the ejection too, or a re-queue before the next full fetch
+                // would hide it as superseded (intent-hq/intent#7523).
+                if let Some(observation) = &observation {
+                    let queue = observation.signals.is_in_merge_queue;
+                    entry.snapshot.merge_queue_reported = queue;
+                    entry.snapshot.requirements.is_in_merge_queue = queue.filter(|&q| q);
+                    entry.snapshot.requirements.merge_queue =
+                        pr_ops::queued_merge_queue_entry(&observation.signals);
+                    entry.snapshot.requirements.merge_queue_ejection = observation
+                        .signals
+                        .merge_queue_removal
+                        .as_ref()
+                        .and_then(|removal| {
+                            pr_ops::MergeQueueEjection::from_removal(
+                                removal,
+                                &entry.snapshot.requirements.state,
+                            )
+                        });
+                    // The observation answered, so its ejection is known.
+                    entry.snapshot.ejection_known = true;
+                }
                 Some(entry.clone())
             }
             _ => None,
@@ -1247,6 +1507,11 @@ async fn fetch_shared_snapshot_for(
     finish_shared_snapshot(sc, repo_ref, number, pr, read).await
 }
 
+/// The forge's `updatedAt` for `pr`, `None` when it reported none.
+fn forge_updated_at(pr: &PullRequest) -> Option<String> {
+    Some(pr.updated_at.clone()).filter(|at| !at.is_empty())
+}
+
 /// The conversation-comment read that completes a [`SharedPrSnapshot`]
 /// once the checklist is composed.
 async fn finish_shared_snapshot(
@@ -1275,6 +1540,7 @@ async fn finish_shared_snapshot(
         title: pr.title.clone(),
         url: pr.url.clone(),
         head_sha: pr.head_sha.clone(),
+        pr_updated_at: forge_updated_at(&pr),
         conversation_count,
         review_comment_count: read.review_comment_count,
         requirements: read.requirements,
@@ -1283,6 +1549,7 @@ async fn finish_shared_snapshot(
         check_runs_known: read.check_runs_known,
         status_checks: read.status_checks,
         merge_queue_reported: read.merge_queue_reported,
+        checks_start: read.checks_start,
     };
     Ok((pr, snapshot))
 }
@@ -1640,6 +1907,9 @@ pub(crate) fn waiting_on_pr_monitors_entry(m: &PrMonitor) -> Value {
 /// the repo identity when the monitor has no snapshot yet, and status
 /// resolved as snapshot state → draft flag → `completed` ⇒ closed (terminal
 /// covers both merged and closed; don't falsely claim merged) → open.
+/// `updatedAt` deliberately diverges from the FE: it is the snapshot's
+/// forge `prUpdatedAt` when persisted (the FE only sees the monitor row's
+/// time, and uses it solely for a monitor not yet in the daemon pool).
 pub(crate) fn pr_monitor_pr_info(m: &PrMonitorListEntry) -> PullRequestInfo {
     let status = match m.snapshot_state.as_deref() {
         Some("merged") => PullRequestStatus::Merged,
@@ -1665,10 +1935,17 @@ pub(crate) fn pr_monitor_pr_info(m: &PrMonitorListEntry) -> PullRequestInfo {
         url,
         title,
         status,
-        // Monitor-row timestamps stand in for the PR's own (the snapshot
-        // does not carry them), mirroring the FE merge.
+        // The snapshot's forge `updatedAt` when it carries one, so the
+        // pool's same-state recency order compares PR activity: the
+        // monitor row's own `updated_at` advances on every poll write and
+        // would rank a monitor-only PR as the freshest. Snapshots persisted
+        // before the field existed fall back to the row's timestamps. The
+        // snapshot carries no `createdAt`; the row's stands in.
         created_at: m.created_at.clone(),
-        updated_at: m.updated_at.clone(),
+        updated_at: m
+            .snapshot_pr_updated_at
+            .clone()
+            .unwrap_or_else(|| m.updated_at.clone()),
         base_ref: None,
         head_ref: None,
         head_sha: m.snapshot_head_sha.clone(),
@@ -1676,7 +1953,9 @@ pub(crate) fn pr_monitor_pr_info(m: &PrMonitorListEntry) -> PullRequestInfo {
         mergeable: m.snapshot_mergeable,
         mergeable_state: None,
         is_draft: m.snapshot_is_draft,
-        is_in_merge_queue: None,
+        is_in_merge_queue: m
+            .snapshot_is_in_merge_queue
+            .filter(|&queued| queued && status == PullRequestStatus::Open),
     }
 }
 
@@ -1709,6 +1988,38 @@ fn pr_monitor_wake_metadata(m: &PrMonitor, reason: &str, paused_until: Option<&s
         metadata["pausedUntil"] = Value::String(until.to_string());
     }
     metadata
+}
+
+/// An unresolved imported row is inspectable under native workspace admission,
+/// without treating its stored observation or pending text as authorized output.
+pub(crate) fn unresolved_pr_monitor_wire(
+    m: &PrMonitor,
+    reason: intent_store::MonitorTargetUnresolvedReason,
+) -> Value {
+    use intent_core::review_monitor::ReviewMonitorUnresolvedReason as Reason;
+    let reason = match reason {
+        intent_store::MonitorTargetUnresolvedReason::MissingProvenance => Reason::MissingProvenance,
+        intent_store::MonitorTargetUnresolvedReason::UnverifiedImport => Reason::UnverifiedImport,
+        intent_store::MonitorTargetUnresolvedReason::InvalidTarget => Reason::InvalidTarget,
+    };
+    recovery_pr_monitor_wire(m, reason)
+}
+
+/// Safe recovery controls for an original row whose private observation cannot
+/// presently be admitted. This does not change its persisted qualification.
+pub(crate) fn recovery_pr_monitor_wire(
+    m: &PrMonitor,
+    reason: intent_core::review_monitor::ReviewMonitorUnresolvedReason,
+) -> Value {
+    let mut safe = m.clone();
+    safe.pending_changes.clear();
+    safe.last_snapshot = None;
+    safe.last_error = None;
+    let mut value = pr_monitor_wire(&safe, None);
+    value["hasPendingChanges"] = json!(!m.pending_changes.is_empty());
+    value["monitorAvailability"] =
+        json!(intent_core::review_monitor::ReviewMonitorAvailability::Unresolved { reason });
+    value
 }
 
 /// The list-surface projection of one monitor: identity + lifecycle plus the
@@ -1771,6 +2082,7 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
                 "passed": r.checks.passed,
                 "failed": r.checks.failed,
                 "pending": r.checks.pending,
+                "skipped": r.checks.skipped,
                 "failingRequired": r.checks.failing_required.len(),
                 "pendingRequired": r.checks.pending_required.len(),
                 "requiredKnown": r.checks.required_known,
@@ -1799,13 +2111,182 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
         if let Some(queued) = r.is_in_merge_queue {
             last["isInMergeQueue"] = json!(queued);
         }
+        // Same presence rule: the queue position only while queued.
+        if let Some(entry) = &r.merge_queue {
+            last["mergeQueue"] = serde_json::to_value(entry).expect("serialize");
+        }
         // Same presence rule: only when the host reported an ejection event.
         if let Some(ejection) = &r.merge_queue_ejection {
             last["mergeQueueEjection"] = serde_json::to_value(ejection).expect("serialize");
         }
+        // Same presence rule: only while CI never started on the head.
+        if let Some(stall) = &r.checks_not_started {
+            last["checksNotStarted"] = serde_json::to_value(stall).expect("serialize");
+        }
         obj.insert("lastSnapshot".to_string(), last);
     }
     out
+}
+
+/// Upgrade backfill for a persisted anchor (the emit baseline or the last
+/// poll's snapshot) about to be diffed against `fresh`: an anchor persisted
+/// before a field was tracked lacks it, so the first poll that reads the
+/// field would either misreport history as news (a false post-upgrade wake)
+/// or, behind a both-sides guard in [`diff_snapshots`], stay silent forever.
+/// Each tracked-later field is adopted from `fresh` silently here, so only
+/// changes observed after tracking began are reported. `last_observed` is
+/// the last poll's snapshot before its own backfill.
+///
+/// Every optional persisted field is exercised by the
+/// `every_optional_field_dropped_from_an_upgraded_baseline_still_reports_changes`
+/// test: a new field that needs adoption here fails it.
+fn backfill_upgraded_anchor(
+    s: &mut PrMonitorSnapshot,
+    fresh: &PrMonitorSnapshot,
+    last_observed: Option<&PrMonitorSnapshot>,
+) {
+    // Freeze old combined evidence before adopting any fresh signals.
+    // Both persisted anchors must retain their own original subset.
+    if s.status_checks.is_none() {
+        s.status_checks = Some(s.requirements.checks.items.clone());
+    }
+    // An initial unreadable result is not an observed empty suite.
+    // Adopt its first complete checks silently, just like registration.
+    if !fresh.checks_unobserved && s.checks_seed_pending && s.head_sha == fresh.head_sha {
+        s.requirements.checks.clone_from(&fresh.requirements.checks);
+        s.checks_unobserved = false;
+        s.checks_seed_pending = false;
+        s.status_checks.clone_from(&fresh.status_checks);
+        s.required_check_names
+            .clone_from(&fresh.required_check_names);
+    }
+    if fresh.head_sha.as_ref().is_some_and(|h| !h.is_empty()) && s.head_sha == fresh.head_sha {
+        // Learning a formerly unknown flag is silent. Store that first
+        // known value in the emit anchor too, so a later real flip is
+        // reportable even if no unrelated wake advanced the anchor.
+        let mut known = s.known_required_checks();
+        for observed in last_observed
+            .filter(|p| p.head_sha == fresh.head_sha)
+            .into_iter()
+            .chain(std::iter::once(fresh))
+        {
+            let observed_known = observed.known_required_checks();
+            // A check first seen passing (or skipped) is silent too.
+            // Retain it even while its flag is unknown. Copy only
+            // missing passing/skipped names, keeping failures/removals
+            // pending for delivery.
+            let names: HashSet<_> = s
+                .requirements
+                .checks
+                .items
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            s.requirements.checks.items.extend(
+                observed
+                    .requirements
+                    .checks
+                    .items
+                    .iter()
+                    .filter(|c| {
+                        matches!(c.status.as_str(), "passed" | "skipped")
+                            && !names.contains(&c.name)
+                    })
+                    .cloned(),
+            );
+            let by_name: HashMap<_, _> = observed
+                .requirements
+                .checks
+                .items
+                .iter()
+                .map(|c| (&c.name, c.required))
+                .collect();
+            for check in &mut s.requirements.checks.items {
+                if !known.contains(&check.name) && observed_known.contains(&check.name) {
+                    if let Some(&required) = by_name.get(&check.name) {
+                        check.required = required;
+                        known.insert(check.name.clone());
+                    }
+                }
+            }
+        }
+        let required_known = if s.requirements.checks.items.is_empty() {
+            s.requirements.checks.required_known
+        } else {
+            s.requirements
+                .checks
+                .items
+                .iter()
+                .all(|c| known.contains(&c.name))
+        };
+        s.requirements.checks = pr_ops::MergeRequirementsChecks::from_items(
+            std::mem::take(&mut s.requirements.checks.items),
+            required_known,
+        );
+        s.required_check_names = Some(known);
+    }
+    if fresh.skipped_tracked && !s.skipped_tracked {
+        adopt_skipped_encoding(s, fresh);
+    }
+    // An anchor persisted before per-reviewer reviews were tracked
+    // (or registered on a degraded review read) has none: adopt the
+    // fresh list silently so the NEXT review is reportable, instead
+    // of the both-sides guard in the diff staying silent forever.
+    if s.requirements.approvals.latest_reviews.is_none()
+        && fresh.requirements.approvals.latest_reviews.is_some()
+    {
+        s.requirements
+            .approvals
+            .latest_reviews
+            .clone_from(&fresh.requirements.approvals.latest_reviews);
+    }
+    // An anchor persisted before ejection tracking has no event field at
+    // all: adopt whatever historical removal event the probe now reports,
+    // so only ejections observed after tracking began are reportable.
+    if fresh.ejection_tracked && !s.ejection_tracked {
+        s.requirements
+            .merge_queue_ejection
+            .clone_from(&fresh.requirements.merge_queue_ejection);
+        s.ejection_tracked = true;
+    }
+    // An ejection that predates the PR's current queue entry is
+    // history, not news (intent-hq/intent#7523: first observed
+    // after the re-queue, it was reported while the queue was about
+    // to land the PR). Adopt it silently, like the backfill above;
+    // persisting it in the baseline keeps the decision once a later
+    // poll loses the queue state (degraded probe, queue exit,
+    // terminal wake).
+    if fresh
+        .requirements
+        .merge_queue_ejection
+        .as_ref()
+        .is_some_and(|e| e.superseded_by_queue_entry(&fresh.requirements))
+    {
+        s.requirements
+            .merge_queue_ejection
+            .clone_from(&fresh.requirements.merge_queue_ejection);
+    }
+}
+
+/// Re-encode a baseline persisted before skipped checks were told apart:
+/// a check it recorded as `passed` that the tracked `fresh` snapshot reports
+/// as `skipped` was a skipped check under the old encoding, not a change.
+fn adopt_skipped_encoding(s: &mut PrMonitorSnapshot, fresh: &PrMonitorSnapshot) {
+    let skipped: HashSet<&str> = fresh
+        .requirements
+        .checks
+        .names_with("skipped")
+        .into_iter()
+        .collect();
+    let checks = &mut s.requirements.checks;
+    for check in &mut checks.items {
+        if check.status == "passed" && skipped.contains(check.name.as_str()) {
+            check.status = "skipped".into();
+            checks.passed -= 1;
+            checks.skipped += 1;
+        }
+    }
+    s.skipped_tracked = true;
 }
 
 /// Render the refreshed merge-requirements checklist as the wake's
@@ -1933,6 +2414,9 @@ impl Services {
         let (entry, fetched) = self
             .read_pr_with_fetched(repo_ref, number, PrReadPolicy::Serve { max_age })
             .await?;
+        if fetched {
+            self.observe_pr_record(repo_ref, &entry.pr);
+        }
         if let Err(e) = self
             .fold_served_pr(
                 repo_ref,
@@ -1952,6 +2436,65 @@ impl Services {
             );
         }
         Ok((entry, fetched))
+    }
+
+    /// Feed a PR record another path just read fresh from the forge (the
+    /// workspace PR refresh, an on-demand serve) to the monitor sweep: when
+    /// it shows a monitored PR in a lifecycle the monitor has not read yet,
+    /// the PR is marked and the loop is kicked so the monitor polls it now
+    /// rather than on its idle cadence ([`ObservationFeed`]). This keeps the
+    /// monitor card and wake in step with the workspace PR pill, which the
+    /// same read updates.
+    pub(crate) fn observe_pr_record(&self, repo_ref: &RepoRef, pr: &PullRequest) {
+        let key = pr_key_for(repo_ref, pr.number.cast_signed());
+        if self.pr_monitor_feed.lock().unwrap().observe(key, pr) {
+            tracing::debug!(
+                owner = %repo_ref.owner,
+                repo = %repo_ref.name,
+                pr_number = pr.number,
+                state = ?pr.state,
+                "pr monitor: another read saw a monitored PR move; polling it now"
+            );
+            self.pr_monitor_kick.notify_one();
+        }
+    }
+
+    /// [`Self::observe_pr_record`] for a read that updates one monitor only
+    /// (registration, check-now): seeds a missing baseline, otherwise
+    /// observes ([`ObservationFeed::seed_or_observe`]).
+    fn seed_or_observe_pr_record(&self, repo_ref: &RepoRef, pr: &PullRequest) {
+        let key = pr_key_for(repo_ref, pr.number.cast_signed());
+        if self
+            .pr_monitor_feed
+            .lock()
+            .unwrap()
+            .seed_or_observe(key, pr)
+        {
+            self.pr_monitor_kick.notify_one();
+        }
+    }
+
+    /// Project a monitor observation into existing same-head workspace/root
+    /// copies without replacing newer REST fields or making another forge call.
+    /// Monitor-only PRs are projected separately from the persisted snapshot.
+    async fn project_monitor_queue(&self, repo_ref: &RepoRef, entry: &PrCacheEntry) {
+        if let Err(error) = self
+            .fold_served_pr(
+                repo_ref,
+                &entry.pr,
+                entry.snapshot.merge_queue_reported,
+                false,
+            )
+            .await
+        {
+            tracing::warn!(
+                owner = %repo_ref.owner,
+                repo = %repo_ref.name,
+                pr_number = entry.pr.number,
+                error = %error,
+                "pr monitor: projecting queue state into workspace PRs failed"
+            );
+        }
     }
 
     /// The PRs under an active monitor, for the cache's retention pass
@@ -2153,7 +2696,7 @@ impl Services {
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap or another live agent in the workspace already monitors the PR, and propagates store or forge failures (e.g. when the PR cannot be fetched).
+    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap, the workspace is a plain folder, or another live agent in the workspace already monitors the PR, and propagates store or forge failures (e.g. when the PR cannot be fetched).
     pub async fn pr_monitor_register(
         &self,
         workspace_id: &WorkspaceId,
@@ -2219,7 +2762,7 @@ impl Services {
     ///
     /// # Errors
     ///
-    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap, and propagates store or forge failures (e.g. when the PR cannot be fetched).
+    /// Returns `Error::InvalidParams` when the agent is already at its monitor cap or the workspace is a plain folder, and propagates store or forge failures (e.g. when the PR cannot be fetched).
     pub async fn pr_monitor_try_register(
         &self,
         workspace_id: &WorkspaceId,
@@ -2228,6 +2771,11 @@ impl Services {
         repo_name: &str,
         pr_number: u64,
     ) -> Result<PrMonitorRegistration> {
+        // Plain folders have no PRs (§5.1): refuse before any forge call or
+        // write, so no `prMonitor:*` event can follow.
+        if self.is_plain_folder(workspace_id).await {
+            return Err(crate::plain_folder::git_only_refusal("PR monitoring"));
+        }
         let registration = self.pr_monitor_registration.enter(agent_id.clone());
         let _admission = registration.acquire().await;
         let _mutation = self.workspace_mutations.enter(workspace_id)?;
@@ -2272,6 +2820,15 @@ impl Services {
 
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
         let repo_ref = RepoRef::new(repo_owner, repo_name);
+        let target = intent_core::ReviewTarget {
+            repository: intent_core::RepositoryTarget {
+                provider: intent_core::RepositoryProvider::Github,
+                instance_base_url: "https://github.com".into(),
+                project_path: format!("{repo_owner}/{repo_name}"),
+            },
+            kind: intent_core::RepositoryResourceKind::PullRequest,
+            number: pr_number,
+        };
         // A full fetch, stored for the sweep and the on-demand readers
         // (the generation bump keeps an in-flight sweep read from
         // overwriting it) — or deferred while the forge quota is exhausted.
@@ -2291,7 +2848,10 @@ impl Services {
 
         let mut adopted_from = None;
         let mut monitor = match existing {
-            Some(m) => self.rearm_pr_monitor(m, baseline.clone(), &now).await?,
+            Some(m) => {
+                self.rearm_pr_monitor(m, &target, baseline.clone(), &now)
+                    .await?
+            }
             None => None,
         };
         if monitor.is_none() {
@@ -2323,7 +2883,7 @@ impl Services {
             if let Some(o) = adoptable {
                 let from = o.agent_id.clone();
                 monitor = self
-                    .adopt_pr_monitor(o, agent_id, baseline.clone(), &now)
+                    .adopt_pr_monitor(o, agent_id, &target, baseline.clone(), &now)
                     .await?;
                 adopted_from = monitor.is_some().then_some(from);
             }
@@ -2361,7 +2921,14 @@ impl Services {
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 };
-                self.store.insert_pr_monitor(&m).await?.then_some(m)
+                self.store
+                    .insert_qualified_pr_monitor(
+                        &m,
+                        &target,
+                        intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+                    )
+                    .await?
+                    .then_some(m)
             };
             if let Some(m) = inserted {
                 monitor = Some(m);
@@ -2373,7 +2940,9 @@ impl Services {
                 // Lost an insert race against a concurrent register of the
                 // same triple: re-arm the winner's row instead of surfacing
                 // the unique-index violation (the call stays idempotent).
-                monitor = self.rearm_pr_monitor(winner, baseline, &now).await?;
+                monitor = self
+                    .rearm_pr_monitor(winner, &target, baseline, &now)
+                    .await?;
             } else {
                 match self
                     .pr_monitor_holder(workspace_id, agent_id, repo_owner, repo_name, pr_number)
@@ -2391,13 +2960,17 @@ impl Services {
                     Some(PrMonitorHolder::Orphaned(o)) => {
                         transferred_from = None;
                         let from = o.agent_id.clone();
-                        monitor = self.adopt_pr_monitor(o, agent_id, baseline, &now).await?;
+                        monitor = self
+                            .adopt_pr_monitor(o, agent_id, &target, baseline, &now)
+                            .await?;
                         adopted_from = monitor.is_some().then_some(from);
                     }
                     Some(PrMonitorHolder::SettledChild(o)) => {
                         transferred_from = Some(o.clone());
                         let from = o.agent_id.clone();
-                        monitor = self.adopt_pr_monitor(o, agent_id, baseline, &now).await?;
+                        monitor = self
+                            .adopt_pr_monitor(o, agent_id, &target, baseline, &now)
+                            .await?;
                         adopted_from = monitor.is_some().then_some(from);
                     }
                     None => {}
@@ -2470,7 +3043,14 @@ impl Services {
             .read_pr(repo_ref, pr_number, PrReadPolicy::REFRESH)
             .await
         {
-            Ok(entry) => Ok(Some(entry.snapshot.materialize(None))),
+            Ok(entry) => {
+                // Seeds the feed baseline for a new PR; on a PR other monitors
+                // already watch, only the sweep may advance it (it polls every
+                // sibling), so this read is an observation.
+                self.seed_or_observe_pr_record(repo_ref, &entry.pr);
+                self.project_monitor_queue(repo_ref, &entry).await;
+                Ok(Some(entry.snapshot.materialize(None)))
+            }
             Err(Error::RateLimited(detail)) => {
                 self.pause_sweeps_for_rate_limit(sc, &detail).await;
                 Ok(None)
@@ -2511,6 +3091,14 @@ impl Services {
         else {
             return Ok(None);
         };
+        self.classify_pr_monitor_holder(owner, agent_id).await
+    }
+
+    async fn classify_pr_monitor_holder(
+        &self,
+        owner: PrMonitor,
+        agent_id: &AgentId,
+    ) -> Result<Option<PrMonitorHolder>> {
         if owner.agent_id == *agent_id {
             return Ok(None);
         }
@@ -2529,7 +3117,7 @@ impl Services {
         if child_of_caller && self.pr_monitor_child_settled(&session).await {
             return Ok(Some(PrMonitorHolder::SettledChild(owner)));
         }
-        let owner_agent_name = Some(session.name).filter(|n| !n.trim().is_empty());
+        let owner_agent_name = Some(session.name.clone()).filter(|n| !n.trim().is_empty());
         Ok(Some(PrMonitorHolder::Live(PrMonitorRefusal {
             owner,
             owner_agent_name,
@@ -2622,25 +3210,24 @@ impl Services {
         &self,
         mut m: PrMonitor,
         agent_id: &AgentId,
+        target: &intent_core::ReviewTarget,
         baseline: Option<String>,
         now: &str,
     ) -> Result<Option<PrMonitor>> {
         let polled_at = baseline.is_some().then_some(now);
+        let _reconcile = self.sweep_rate_limit.reconcile().await;
+        let pause = self
+            .sweeps_rate_limited()
+            .then(|| self.rate_limit_pause_error());
         let updated = self
             .store
-            .adopt_pr_monitor(
-                &m.monitor_id,
-                &m.agent_id,
+            .rearm_legacy_pr_monitor(
+                &m,
                 agent_id,
-                PrMonitorPollUpdate {
-                    last_snapshot: baseline.as_deref(),
-                    baseline_snapshot: baseline.as_deref(),
-                    pending_changes: &[],
-                    last_polled_at: polled_at,
-                    updated_at: now,
-                    expected_updated_at: &m.updated_at,
-                    ..Default::default()
-                },
+                target,
+                baseline.as_deref(),
+                now,
+                pause.as_deref(),
             )
             .await?;
         if !updated {
@@ -2651,6 +3238,7 @@ impl Services {
         // baseline just discarded; consume it so the adopter's first change
         // is debounced like any other, not fired immediately.
         self.consume_pr_monitor_catch_up(&m.monitor_id);
+        self.forget_queued_pr_monitor_wake(&m.monitor_id);
         tracing::info!(
             monitor = %m.monitor_id,
             from = %m.agent_id.0,
@@ -2665,7 +3253,7 @@ impl Services {
         m.pending_since = None;
         m.last_change_at = None;
         m.last_polled_at = polled_at.map(str::to_string);
-        m.last_error = None;
+        m.last_error = pause;
         m.updated_at = now.to_string();
         Ok(Some(m))
     }
@@ -2681,35 +3269,38 @@ impl Services {
     async fn rearm_pr_monitor(
         &self,
         mut m: PrMonitor,
+        target: &intent_core::ReviewTarget,
         baseline: Option<String>,
         now: &str,
     ) -> Result<Option<PrMonitor>> {
         let polled_at = baseline.is_some().then_some(now);
+        let _reconcile = self.sweep_rate_limit.reconcile().await;
+        let pause = self
+            .sweeps_rate_limited()
+            .then(|| self.rate_limit_pause_error());
         let updated = self
             .store
-            .update_pr_monitor_poll(
-                &m.monitor_id,
-                PrMonitorPollUpdate {
-                    last_snapshot: baseline.as_deref(),
-                    baseline_snapshot: baseline.as_deref(),
-                    pending_changes: &[],
-                    last_polled_at: polled_at,
-                    updated_at: now,
-                    expected_updated_at: &m.updated_at,
-                    ..Default::default()
-                },
+            .rearm_legacy_pr_monitor(
+                &m,
+                &m.agent_id,
+                target,
+                baseline.as_deref(),
+                now,
+                pause.as_deref(),
             )
             .await?;
         if !updated {
             return Ok(None);
         }
+        // The re-register's checklist is the owner's latest read.
+        self.forget_queued_pr_monitor_wake(&m.monitor_id);
         m.last_snapshot = baseline.clone();
         m.baseline_snapshot = baseline;
         m.pending_changes = Vec::new();
         m.pending_since = None;
         m.last_change_at = None;
         m.last_polled_at = polled_at.map(str::to_string);
-        m.last_error = None;
+        m.last_error = pause;
         m.updated_at = now.to_string();
         Ok(Some(m))
     }
@@ -2751,7 +3342,7 @@ impl Services {
     /// rows so the hot list/get enrichment cost is O(active monitors),
     /// never O(all monitor history in the workspace). Best-effort: a store
     /// read failure is logged and fails open to `false` (mirrors
-    /// [`Services::workspace_has_active_hooks`]) so list/get emission is
+    /// [`Services::workspace_has_active_hooks_or_script_monitors`]) so list/get emission is
     /// never wedged and activity is never fabricated.
     pub(crate) async fn workspace_has_active_pr_monitors(
         &self,
@@ -2868,7 +3459,7 @@ impl Services {
 
     /// Core cancel transition shared by [`Services::pr_monitor_cancel`] and
     /// the archive sweep ([`Services::cancel_workspace_pr_monitors`]),
-    /// mirroring [`Services::cancel_active_hook`]: guarded CAS write to
+    /// mirroring the runtime's `HookServicesExt::cancel_active_hook`: guarded CAS write to
     /// `cancelled`, catch-up-marker removal, `prMonitor:cancelled` emit. How
     /// the owner's deferred completion watches settle is the caller's
     /// [`CancelSettlement`] choice. Ends with the transition-only
@@ -2894,6 +3485,8 @@ impl Services {
             .lock()
             .unwrap()
             .remove(&monitor.monitor_id);
+        // A queued change wake stays queued; nothing later replaces it.
+        self.forget_queued_pr_monitor_wake(&monitor.monitor_id);
         self.emit_pr_monitor_event(PR_MONITOR_CANCELLED, &monitor, None)
             .await;
         match settlement {
@@ -2920,7 +3513,7 @@ impl Services {
     /// Archive sweep (`workspace.archive`): cancel every ACTIVE PR monitor
     /// in the workspace through the shared cancel transition
     /// ([`Services::cancel_active_pr_monitor`]), mirroring the hook sweep
-    /// ([`Services::cancel_workspace_hooks`]) — state persisted to
+    /// (the runtime's `HookServicesExt::cancel_workspace_hooks`) — state persisted to
     /// `cancelled`, `prMonitor:cancelled` emitted, waiting recomputed
     /// (§5.1). Each cancel is SILENT (no per-monitor wake) and DEFERRED
     /// ([`CancelSettlement::Deferred`]: no per-item completion backstop
@@ -2985,7 +3578,7 @@ impl Services {
     /// Retire sweep (`ws.agent.retire`): cancel every ACTIVE PR monitor
     /// owned by the retiring agent through the shared cancel transition
     /// ([`Services::cancel_active_pr_monitor`]), mirroring the hook sweep
-    /// ([`Services::cancel_agent_hooks`]) — state persisted to `cancelled`,
+    /// (the runtime's `HookServicesExt::cancel_agent_hooks`) — state persisted to `cancelled`,
     /// `prMonitor:cancelled` emitted, waiting recomputed (§5.1). NO wake
     /// notice: the owner retired itself and is inert, so parking a notice
     /// in its queue is noise (the backstop in `cancel_active_pr_monitor`
@@ -3083,7 +3676,13 @@ impl Services {
         )
         .await
         {
-            Ok(entry) => entry.snapshot,
+            Ok(entry) => {
+                // A check-now polls only this monitor, so it must not advance
+                // the baseline its sibling monitors (other workspaces) rely on.
+                self.seed_or_observe_pr_record(&repo_ref, &entry.pr);
+                self.project_monitor_queue(&repo_ref, &entry).await;
+                entry.snapshot
+            }
             Err(e) => {
                 self.record_pr_monitor_error(&monitor, &e.to_string()).await;
                 return Err(e);
@@ -3108,16 +3707,43 @@ impl Services {
     /// docs). Returns the task handle so the composition root can
     /// hold/abort it.
     #[must_use]
+    /// # Panics
+    /// Panics if the monitor control mutex is poisoned.
     pub fn spawn_pr_monitor_loop(&self) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
+        let (sender, mut controls) = tokio::sync::mpsc::channel::<
+            crate::repository_native_wire::monitor::flush::Command,
+        >(32);
+        let installed = {
+            let mut current = self.review_monitor_controls.lock().unwrap();
+            if current.as_ref().is_some_and(|sender| !sender.is_closed()) {
+                false
+            } else {
+                *current = Some(sender);
+                true
+            }
+        };
         intent_core::spawn_daemon(async move {
+            if !installed {
+                return;
+            }
+            let mut next = tokio::time::Instant::now() + services.pr_monitor_poll_interval();
             loop {
                 tokio::select! {
                     biased;
                     () = services.settings_tasks.closed() => break,
-                    () = tokio::time::sleep(services.pr_monitor_poll_interval()) => {}
+                    () = tokio::time::sleep_until(next) => {
+                        services.poll_due_pr_monitors().await;
+                        next = tokio::time::Instant::now() + services.pr_monitor_poll_interval();
+                    }
+                    // Another read saw a monitored PR move: poll it now. The
+                    // due-sweep picks only the marked PRs (everything else is
+                    // still fresh), so the regular cadence is unchanged.
+                    () = services.pr_monitor_kick.notified() => {
+                        services.poll_due_pr_monitors().await;
+                    }
+                    Some(command) = controls.recv() => command.run().await,
                 }
-                services.poll_due_pr_monitors().await;
             }
         })
     }
@@ -3209,13 +3835,44 @@ impl Services {
     /// either way; a full sweep (`skip_fresh == false`) plans no cadence and
     /// spends none.
     async fn sweep_pr_monitors(&self, skip_fresh: bool) {
+        self.sweep_pr_monitors_scoped(if skip_fresh {
+            SweepScope::Due
+        } else {
+            SweepScope::All
+        })
+        .await;
+    }
+
+    /// The `agent:idle` nudge: poll the workspace's active monitors whose
+    /// `lastPolledAt` is at least `min_age_secs` old (or missing) through
+    /// the due-sweep lanes, skipping fresher ones. Freshness is per PR: a PR
+    /// any workspace's monitor polled within `min_age_secs` is skipped, and a
+    /// nudged PR's fetch also refreshes other workspaces' stale monitors on
+    /// it (legacy lane). The shared rate-limit
+    /// gate, the quota-share deferral, and the debounced wake delivery all
+    /// apply exactly as on a loop tick; only the idle-tier cadence and the
+    /// per-tick fetch cap are replaced by the minimum age, because the
+    /// workspace was just active.
+    pub(crate) async fn nudge_workspace_pr_monitors(
+        &self,
+        workspace_id: &WorkspaceId,
+        min_age_secs: u64,
+    ) {
+        self.sweep_pr_monitors_scoped(SweepScope::Nudge {
+            workspace_id: workspace_id.clone(),
+            min_age_secs,
+        })
+        .await;
+    }
+
+    async fn sweep_pr_monitors_scoped(&self, scope: SweepScope) {
         let services = self.clone();
         if let Some(owner) =
             self.store_tasks
                 .spawn_draining(intent_sourcecontrol::traffic::inherit_context(async move {
                     intent_sourcecontrol::traffic::with_caller(
                         intent_sourcecontrol::traffic::Caller::PrMonitor,
-                        services.sweep_pr_monitors_accounted(skip_fresh),
+                        services.sweep_pr_monitors_accounted(scope),
                     )
                     .await;
                 }))
@@ -3226,7 +3883,42 @@ impl Services {
         }
     }
 
-    async fn sweep_pr_monitors_accounted(&self, skip_fresh: bool) {
+    async fn sweep_pr_monitors_accounted(&self, scope: SweepScope) {
+        // Each configured connection owns its own in-flight lane. The periodic
+        // loop never waits for GitLab before allowing another GitHub tick.
+        let services = self.clone();
+        let qualified_scope = scope.clone();
+        let qualified = self.store_tasks.spawn_draining(async move {
+            services
+                .sweep_qualified_pr_monitors_scoped(
+                    &qualified_scope,
+                    time::OffsetDateTime::now_utc(),
+                )
+                .await;
+        });
+        self.sweep_legacy_pr_monitors_accounted(&scope).await;
+        // Explicit deterministic sweeps await both lanes; the recurring loop
+        // leaves its bounded qualified fetch with the finite-task supervisor.
+        if !matches!(scope, SweepScope::Due) {
+            if let Some(qualified) = qualified {
+                let _ = qualified.await;
+            }
+        }
+    }
+
+    async fn sweep_legacy_pr_monitors_accounted(&self, scope: &SweepScope) {
+        // Hold the lane through load, selection and every poll, so the
+        // freshness each sweep reads cannot be invalidated by another sweep
+        // polling the same monitors meanwhile. A nudge never waits: a running
+        // sweep already covers whatever is due.
+        let _lane = if matches!(scope, SweepScope::Nudge { .. }) {
+            let Ok(lane) = self.legacy_pr_monitor_poll_lane.clone().try_lock_owned() else {
+                return;
+            };
+            lane
+        } else {
+            self.legacy_pr_monitor_poll_lane.clone().lock_owned().await
+        };
         let mut probed = None;
         if self.sweeps_rate_limited() {
             let lifted = match pr_ops::resolve_source_control(self.source_control.clone()).await {
@@ -3239,8 +3931,20 @@ impl Services {
             }
             probed = lifted;
         }
-        let monitors = match self.store.load_active_pr_monitors().await {
-            Ok(monitors) => monitors,
+        let monitors = match self.store.load_active_qualified_pr_monitors().await {
+            Ok(monitors) => monitors
+                .into_iter()
+                .filter(|row| {
+                    matches!(
+                        row.target(),
+                        intent_store::PersistedMonitorTarget::Resolved {
+                            provenance: intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+                            ..
+                        }
+                    )
+                })
+                .map(|row| row.monitor().clone())
+                .collect::<Vec<_>>(),
             Err(e) => {
                 tracing::warn!(error = %e, "pr monitor sweep: load failed; skipping tick");
                 return;
@@ -3248,6 +3952,7 @@ impl Services {
         };
         let monitored: HashSet<PrKey> = monitors.iter().map(pr_key).collect();
         prune_pr_cache(&self.pr_cache, &monitored);
+        self.pr_monitor_feed.lock().unwrap().retain(&monitored);
         if monitors.is_empty() {
             return;
         }
@@ -3258,12 +3963,34 @@ impl Services {
                 return;
             }
         };
-        let monitors = if skip_fresh {
-            let quota = self.pr_monitor_quota_window(&sc, probed).await;
-            self.select_due_pr_monitors(monitors, quota, time::OffsetDateTime::now_utc())
+        let monitors = match scope {
+            SweepScope::All => monitors,
+            SweepScope::Due => {
+                let quota = self.pr_monitor_quota_window(&sc, probed).await;
+                self.select_due_pr_monitors(monitors, quota, time::OffsetDateTime::now_utc())
+                    .await
+            }
+            SweepScope::Nudge {
+                workspace_id,
+                min_age_secs,
+            } => {
+                let now = time::OffsetDateTime::now_utc();
+                // Cheap pre-check before spending the shared quota probe.
+                if !monitors.iter().any(|m| {
+                    &m.workspace_id == workspace_id
+                        && !polled_within(m.last_polled_at.as_deref(), *min_age_secs, now)
+                }) {
+                    return;
+                }
+                let quota = self.pr_monitor_quota_window(&sc, probed).await;
+                self.select_due_pr_monitors_scoped(
+                    monitors,
+                    quota,
+                    now,
+                    Some((workspace_id, *min_age_secs)),
+                )
                 .await
-        } else {
-            monitors
+            }
         };
         let mut shared: HashMap<PrKey, std::result::Result<SharedPrSnapshot, String>> =
             HashMap::new();
@@ -3294,6 +4021,11 @@ impl Services {
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let repo_ref = monitor.repo();
+                    // Clear an observation mark before the fetch: a read that
+                    // sees the PR move while this fetch is in flight marks it
+                    // again (the baseline is still the pre-fetch state), so
+                    // a merge racing the fetch is polled on the next tick.
+                    let observed = self.pr_monitor_feed.lock().unwrap().take(&key);
                     // The timeout is defense in depth above the client-level
                     // network timeouts: a fetch that pends indefinitely maps
                     // to an error (recorded as `lastError` below) instead of
@@ -3316,14 +4048,23 @@ impl Services {
                             rate_limited = true;
                             Err(self.rate_limit_pause_error())
                         }
-                        Ok(result) => result
-                            .map(|entry| entry.snapshot)
-                            .map_err(|e| e.to_string()),
+                        Ok(Ok(read)) => {
+                            self.pr_monitor_feed
+                                .lock()
+                                .unwrap()
+                                .record_poll(key.clone(), &read.pr);
+                            self.project_monitor_queue(&repo_ref, &read).await;
+                            Ok(read.snapshot)
+                        }
+                        Ok(Err(error)) => Err(error.to_string()),
                         Err(_) => Err(format!(
                             "PR fetch timed out after {:?}",
                             self.pr_monitor_fetch_timeout
                         )),
                     };
+                    if observed && fetched.is_err() {
+                        self.pr_monitor_feed.lock().unwrap().restore(key);
+                    }
                     entry.insert(fetched).clone()
                 }
             };
@@ -3370,6 +4111,24 @@ impl Services {
         quota: Option<QuotaWindow>,
         now: time::OffsetDateTime,
     ) -> Vec<PrMonitor> {
+        self.select_due_pr_monitors_scoped(monitors, quota, now, None)
+            .await
+    }
+
+    /// [`Self::select_due_pr_monitors`], optionally narrowed to one
+    /// workspace's monitors for the `agent:idle` nudge: `nudge` replaces only
+    /// the workspace's idle-tier interval with its minimum age. The hourly
+    /// budget and quota cadence, the quota deferral, the catch-up rule, and
+    /// the per-tick fetch cap (with its spacing hold) are still computed over
+    /// every active monitor, so a nudge never polls a PR sooner than the
+    /// global budget allows.
+    async fn select_due_pr_monitors_scoped(
+        &self,
+        monitors: Vec<PrMonitor>,
+        quota: Option<QuotaWindow>,
+        now: time::OffsetDateTime,
+        nudge: Option<(&WorkspaceId, u64)>,
+    ) -> Vec<PrMonitor> {
         let distinct_prs = monitors.iter().map(pr_key).collect::<HashSet<_>>().len();
         let poll_secs = self.pr_monitor_poll_interval().as_secs();
         let budget_secs = effective_pr_monitor_interval_secs(
@@ -3394,20 +4153,53 @@ impl Services {
         };
         self.note_pr_monitor_cadence(distinct_prs, effective_secs, poll_secs, budget_secs, quota);
         let interval = time::Duration::seconds(effective_secs.cast_signed());
-        let workspace_ids: Vec<_> = monitors
+        // The spacing hold is global: measured over every active monitor.
+        let newest_anchor_age_secs = monitors
             .iter()
-            .map(|m| m.workspace_id.clone())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let intervals = match self
-            .workspace_automatic_check_intervals(&workspace_ids, now)
-            .await
-        {
-            Ok(intervals) => intervals,
-            Err(error) => {
-                tracing::warn!(%error, "pr monitor activity read failed; skipping tick");
-                return Vec::new();
+            .filter_map(|m| m.last_polled_at.as_deref().and_then(parse_iso))
+            .max()
+            .map(|at| u64::try_from((now - at).whole_seconds()).unwrap_or(0));
+        let (monitors, intervals) = if let Some((workspace_id, min_age_secs)) = nudge {
+            // The minimum age is a hard floor per PR across workspaces: a PR
+            // any sibling monitor polled inside it is skipped (every stamp
+            // kept), and a nudged PR carries EVERY sibling monitor — all
+            // stale by construction — so the shared fetch leaves aligned
+            // stamps and neither the next due sweep nor another workspace's
+            // nudge fetches the PR again within the floor. No catch-up
+            // marker can win the nudge's fetch.
+            let fresh_prs: HashSet<PrKey> = monitors
+                .iter()
+                .filter(|m| polled_within(m.last_polled_at.as_deref(), min_age_secs, now))
+                .map(pr_key)
+                .collect();
+            let nudged_prs: HashSet<PrKey> = monitors
+                .iter()
+                .filter(|m| &m.workspace_id == workspace_id)
+                .map(pr_key)
+                .filter(|key| !fresh_prs.contains(key))
+                .collect();
+            let monitors: Vec<_> = monitors
+                .into_iter()
+                .filter(|m| nudged_prs.contains(&pr_key(m)))
+                .collect();
+            let intervals = HashMap::from([(workspace_id.clone(), min_age_secs)]);
+            (monitors, intervals)
+        } else {
+            let workspace_ids: Vec<_> = monitors
+                .iter()
+                .map(|m| m.workspace_id.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            match self
+                .workspace_automatic_check_intervals(&workspace_ids, now)
+                .await
+            {
+                Ok(intervals) => (monitors, intervals),
+                Err(error) => {
+                    tracing::warn!(%error, "pr monitor activity read failed; skipping tick");
+                    return Vec::new();
+                }
             }
         };
         let catch_up = self.pr_monitor_catch_up.lock().unwrap().clone();
@@ -3415,7 +4207,13 @@ impl Services {
             .into_iter()
             .map(|monitor| DueCandidate {
                 anchor: monitor.last_polled_at.as_deref().and_then(parse_iso),
-                catch_up: catch_up_unattempted(&monitor, &catch_up),
+                catch_up: nudge.is_none() && catch_up_unattempted(&monitor, &catch_up),
+                observed: nudge.is_none()
+                    && self
+                        .pr_monitor_feed
+                        .lock()
+                        .unwrap()
+                        .is_changed(&pr_key(&monitor)),
                 interval: time::Duration::seconds(
                     i64::try_from(
                         intervals
@@ -3428,11 +4226,6 @@ impl Services {
                 monitor,
             })
             .collect();
-        let newest_anchor_age_secs = candidates
-            .iter()
-            .filter_map(|c| c.anchor)
-            .max()
-            .map(|at| u64::try_from((now - at).whole_seconds()).unwrap_or(0));
         select_due_pr_monitors(
             candidates,
             now,
@@ -3468,102 +4261,8 @@ impl Services {
         // values, which may have changed again in the meantime.
         let last_observed = previous.clone();
 
-        // Upgrade backfill: an anchor persisted before ejection tracking
-        // existed has no event field at all, so the first tracked poll would
-        // misread whatever historical removal event the probe now reports as
-        // news and emit a false post-upgrade wake. Adopt the fresh event
-        // into UNTRACKED anchors silently (persisted via the baseline
-        // write-back below) — only ejections observed after tracking began
-        // are reportable.
-        let backfill = |s: &mut PrMonitorSnapshot| {
-            // Freeze old combined evidence before adopting any fresh signals.
-            // Both persisted anchors must retain their own original subset.
-            if s.status_checks.is_none() {
-                s.status_checks = Some(s.requirements.checks.items.clone());
-            }
-            // An initial unreadable result is not an observed empty suite.
-            // Adopt its first complete checks silently, just like registration.
-            if !fresh.checks_unobserved && s.checks_seed_pending && s.head_sha == fresh.head_sha {
-                s.requirements.checks.clone_from(&fresh.requirements.checks);
-                s.checks_unobserved = false;
-                s.checks_seed_pending = false;
-                s.status_checks.clone_from(&fresh.status_checks);
-                s.required_check_names
-                    .clone_from(&fresh.required_check_names);
-            }
-            if fresh.head_sha.as_ref().is_some_and(|h| !h.is_empty())
-                && s.head_sha == fresh.head_sha
-            {
-                // Learning a formerly unknown flag is silent. Store that first
-                // known value in the emit anchor too, so a later real flip is
-                // reportable even if no unrelated wake advanced the anchor.
-                let mut known = s.known_required_checks();
-                for observed in last_observed
-                    .as_ref()
-                    .filter(|p| p.head_sha == fresh.head_sha)
-                    .into_iter()
-                    .chain(std::iter::once(&fresh))
-                {
-                    let observed_known = observed.known_required_checks();
-                    // A check first seen passing is silent too. Retain it even
-                    // while its flag is unknown. Copy only missing passing
-                    // names, keeping failures/removals pending for delivery.
-                    let names: HashSet<_> = s
-                        .requirements
-                        .checks
-                        .items
-                        .iter()
-                        .map(|c| c.name.clone())
-                        .collect();
-                    s.requirements.checks.items.extend(
-                        observed
-                            .requirements
-                            .checks
-                            .items
-                            .iter()
-                            .filter(|c| c.status == "passed" && !names.contains(&c.name))
-                            .cloned(),
-                    );
-                    let by_name: HashMap<_, _> = observed
-                        .requirements
-                        .checks
-                        .items
-                        .iter()
-                        .map(|c| (&c.name, c.required))
-                        .collect();
-                    for check in &mut s.requirements.checks.items {
-                        if !known.contains(&check.name) && observed_known.contains(&check.name) {
-                            if let Some(&required) = by_name.get(&check.name) {
-                                check.required = required;
-                                known.insert(check.name.clone());
-                            }
-                        }
-                    }
-                }
-                let required_known = if s.requirements.checks.items.is_empty() {
-                    s.requirements.checks.required_known
-                } else {
-                    s.requirements
-                        .checks
-                        .items
-                        .iter()
-                        .all(|c| known.contains(&c.name))
-                };
-                s.requirements.checks = pr_ops::MergeRequirementsChecks::from_items(
-                    std::mem::take(&mut s.requirements.checks.items),
-                    required_known,
-                );
-                s.required_check_names = Some(known);
-            }
-            if fresh.ejection_tracked && !s.ejection_tracked {
-                s.requirements
-                    .merge_queue_ejection
-                    .clone_from(&fresh.requirements.merge_queue_ejection);
-                s.ejection_tracked = true;
-            }
-        };
         if let Some(prev) = previous.as_mut() {
-            backfill(prev);
+            backfill_upgraded_anchor(prev, &fresh, last_observed.as_ref());
         }
 
         // Per-poll activity (fresh vs the LAST POLL's snapshot) anchors the
@@ -3572,6 +4271,11 @@ impl Services {
         let poll_activity = previous
             .as_ref()
             .is_some_and(|prev| !diff_snapshots(prev, &fresh).is_empty());
+        // Informational queue movement since the last poll (position, size,
+        // entry state, estimate): never a change line, only a UI re-read hint.
+        let queue_moved = previous
+            .as_ref()
+            .is_some_and(|prev| prev.requirements.merge_queue != fresh.requirements.merge_queue);
 
         // The emit baseline: the PR state as of the last delivered wake (or
         // registration). A row missing one (unparseable column) anchors on
@@ -3583,7 +4287,7 @@ impl Services {
             .and_then(|s| serde_json::from_str(s).ok())
             .or(previous);
         if let Some(base) = baseline.as_mut() {
-            backfill(base);
+            backfill_upgraded_anchor(base, &fresh, last_observed.as_ref());
         }
 
         // The coalesced net set: REPLACED (never accumulated) each poll, so
@@ -3675,6 +4379,12 @@ impl Services {
                 Some(json!({ "changes": updated.pending_changes })),
             )
             .await;
+        } else if queue_moved {
+            // Queue movement is informational: no change line, no wake.
+            // The UI-only re-read hint keeps the displayed position current
+            // (agent-owned subscriptions can never receive it).
+            self.emit_pr_monitor_event(PR_MONITOR_REFRESHED, &updated, None)
+                .await;
         }
 
         // Terminal fast-path: a merged/closed PR stops monitoring with an
@@ -3732,8 +4442,15 @@ impl Services {
     /// An unparseable/absent anchor emits immediately rather than stranding
     /// a pending wake forever.
     fn pr_monitor_debounce_elapsed(&self, monitor: &PrMonitor) -> bool {
+        self.pr_monitor_debounce_elapsed_at(monitor, time::OffsetDateTime::now_utc())
+    }
+
+    pub(crate) fn pr_monitor_debounce_elapsed_at(
+        &self,
+        monitor: &PrMonitor,
+        now: time::OffsetDateTime,
+    ) -> bool {
         let window = time::Duration::seconds(self.pr_monitor_debounce().as_secs().cast_signed());
-        let now = time::OffsetDateTime::now_utc();
         if let Some(since) = monitor.pending_since.as_deref().and_then(parse_iso) {
             if now - since >= window * PR_MONITOR_DEBOUNCE_MAX_WAIT_FACTOR {
                 return true;
@@ -3799,6 +4516,21 @@ impl Services {
         let changes = actionable_pending_changes(monitor);
         let message = render_change_wake(monitor, &changes, &snapshot);
         let now = now_iso();
+        // A delivered never-started-CI flag is remembered for its head, so a
+        // later degraded read cannot re-arm the same stall wake.
+        let delivered_snapshot = snapshot
+            .requirements
+            .checks_not_started
+            .as_ref()
+            .filter(|stall| {
+                snapshot.checks_not_started_delivered.as_deref() != Some(stall.head_sha.as_str())
+            })
+            .map(|stall| {
+                let mut stamped = snapshot.clone();
+                stamped.checks_not_started_delivered = Some(stall.head_sha.clone());
+                serde_json::to_string(&stamped).expect("serialize snapshot")
+            })
+            .or_else(|| monitor.last_snapshot.clone());
         // The delivered snapshot becomes the new emit baseline: the next
         // wake reports only what moves from here.
         if !self
@@ -3806,8 +4538,8 @@ impl Services {
             .update_pr_monitor_poll(
                 &monitor.monitor_id,
                 PrMonitorPollUpdate {
-                    last_snapshot: monitor.last_snapshot.as_deref(),
-                    baseline_snapshot: monitor.last_snapshot.as_deref(),
+                    last_snapshot: delivered_snapshot.as_deref(),
+                    baseline_snapshot: delivered_snapshot.as_deref(),
                     pending_changes: &[],
                     last_polled_at: monitor.last_polled_at.as_deref(),
                     updated_at: &now,
@@ -3822,7 +4554,8 @@ impl Services {
         #[cfg(test)]
         self.hold_periodic_commit("monitor").await;
         let mut emitted = monitor.clone();
-        emitted.baseline_snapshot = monitor.last_snapshot.clone();
+        emitted.last_snapshot.clone_from(&delivered_snapshot);
+        emitted.baseline_snapshot = delivered_snapshot;
         emitted.pending_changes = Vec::new();
         emitted.pending_since = None;
         emitted.last_change_at = None;
@@ -3838,8 +4571,14 @@ impl Services {
             .await;
             return Ok(false);
         }
-        self.wake_pr_monitor_owner(&emitted, &message, "changed")
-            .await;
+        self.wake_pr_monitor_owner_coalesced(
+            monitor,
+            &emitted,
+            &message,
+            &snapshot,
+            CoalescibleWake::Changed,
+        )
+        .await;
         self.emit_pr_monitor_event(PR_MONITOR_EMITTED, &emitted, None)
             .await;
         Ok(true)
@@ -3923,8 +4662,14 @@ impl Services {
             .lock()
             .unwrap()
             .remove(&completed.monitor_id);
-        self.wake_pr_monitor_owner(&completed, &message, "completed")
-            .await;
+        self.wake_pr_monitor_owner_coalesced(
+            monitor,
+            &completed,
+            &message,
+            snapshot,
+            CoalescibleWake::Completed,
+        )
+        .await;
         self.emit_pr_monitor_event(PR_MONITOR_COMPLETED, &completed, None)
             .await;
         // Completion flips the monitor's PR signal from open to merged, so
@@ -4017,9 +4762,17 @@ impl Services {
                 self.clear_pr_monitor_pause_annotations(None).await;
             }
         }
-        let monitors = self.store.load_active_pr_monitors().await?;
+        let monitors = self.store.load_active_qualified_pr_monitors().await?;
         let mut resumed = 0;
-        for mut monitor in monitors {
+        for record in monitors {
+            let legacy = matches!(
+                record.target(),
+                intent_store::PersistedMonitorTarget::Resolved {
+                    provenance: intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+                    ..
+                }
+            );
+            let mut monitor = record.monitor().clone();
             // Owner deleted, session row gone, or soft-retired — the
             // retire-time sweep ([`Services::cancel_agent_pr_monitors`])
             // could have been missed by a crash window.
@@ -4057,20 +4810,39 @@ impl Services {
             // Coalesced-era rows are a fixed point of the recompute and stay
             // on the normal catch-up poll, which folds downtime changes into
             // one consolidated wake.
-            if !monitor.pending_changes.is_empty() && !pending_survives_recompute(&monitor) {
+            // A legacy-shaped snapshot does not establish its writer. Imports
+            // and captured targets keep their exact pending bytes until their
+            // own recovery path has independently admitted the original target.
+            if legacy
+                && !monitor.pending_changes.is_empty()
+                && !pending_survives_recompute(&monitor)
+            {
                 self.emit_pending_changes(&monitor).await?;
             }
-            self.pr_monitor_catch_up
-                .lock()
-                .unwrap()
-                .insert(monitor.monitor_id.clone(), time::OffsetDateTime::now_utc());
+            if legacy {
+                self.pr_monitor_catch_up
+                    .lock()
+                    .unwrap()
+                    .insert(monitor.monitor_id.clone(), time::OffsetDateTime::now_utc());
+            }
             resumed += 1;
         }
         Ok(resumed)
     }
 
+    pub(crate) async fn settle_unresolved_monitor_cancel(&self, monitor: &PrMonitor) {
+        self.pr_monitor_catch_up
+            .lock()
+            .unwrap()
+            .remove(&monitor.monitor_id);
+        self.resettle_owner_after_pr_monitor_terminal(monitor).await;
+        self.maybe_emit_display_status_changed(&monitor.workspace_id)
+            .await;
+        self.maybe_emit_waiting_changed(&monitor.workspace_id).await;
+    }
+
     /// Idle-visibility deferral backstop (mirrors
-    /// [`Services::resettle_owner_after_hook_terminal`](crate::Services::resettle_owner_after_hook_terminal)):
+    /// the runtime's `HookServicesExt::resettle_owner_after_hook_terminal`):
     /// after a PR monitor reaches a terminal state, re-run the
     /// deferred-completion redelivery for the owner. A completion watch on
     /// an idle owner defers while it owns active PR monitors; the
@@ -4098,10 +4870,19 @@ impl Services {
     /// just terminated must still settle the owner's deferred completion
     /// watches (a successful wake makes the backstop a no-op — the
     /// queued/running wake turn owns the settlement).
-    async fn wake_pr_monitor_owner(&self, monitor: &PrMonitor, message: &str, reason: &str) {
+    ///
+    /// Returns the queue entry id when the wake was QUEUED (behind a busy
+    /// turn, or parked on an archived workspace / retired session) rather
+    /// than delivered into a turn, `None` otherwise.
+    async fn wake_pr_monitor_owner(
+        &self,
+        monitor: &PrMonitor,
+        message: &str,
+        reason: &str,
+    ) -> Option<String> {
         let paused_until = self.sweep_rate_limit_paused_until();
         let metadata = pr_monitor_wake_metadata(monitor, reason, paused_until.as_deref());
-        if let Err(e) = self
+        let queued = match self
             .deliver_wake_message(
                 &monitor.workspace_id,
                 &monitor.agent_id,
@@ -4110,16 +4891,203 @@ impl Services {
             )
             .await
         {
-            tracing::warn!(
-                monitor = %monitor.monitor_id.0,
-                agent = %monitor.agent_id.0,
-                error = %e,
-                "pr monitor owner wake delivery failed"
-            );
-        }
+            Ok(result) => (result["queued"] == json!(true))
+                .then(|| result["queuedMessage"]["id"].as_str().map(str::to_string))
+                .flatten(),
+            Err(e) => {
+                tracing::warn!(
+                    monitor = %monitor.monitor_id.0,
+                    agent = %monitor.agent_id.0,
+                    error = %e,
+                    "pr monitor owner wake delivery failed"
+                );
+                None
+            }
+        };
         if reason == "cancelled" || reason == "completed" {
             self.resettle_owner_after_pr_monitor_terminal(monitor).await;
         }
+        queued
+    }
+
+    /// Deliver a `changed` / `completed` wake so the owner never reads a
+    /// stale update for this monitor. When the monitor's previous `changed`
+    /// wake is still waiting, undelivered, in the owner's queue
+    /// ([`Services::replace_queued_pr_monitor_wake`]):
+    ///
+    /// - a newer `changed` wake takes its place at the BACK of the queue, in
+    ///   one queue step, so a failure or restart never leaves neither;
+    /// - the `completed` (merged/closed) wake takes over its PLACE in the
+    ///   queue, so the final update is not delayed behind work queued after
+    ///   the older one.
+    ///
+    /// Either way the wake is re-rendered to cover the replaced one's
+    /// changes too. Otherwise `message`, rendered against `before`'s
+    /// baseline, is delivered as usual. A `changed` wake that lands in the
+    /// queue is remembered as the entry the next wake may replace.
+    ///
+    /// `before` is the row image the wake was computed from; `after` is the
+    /// row as the emit / completion left it (its owner receives the wake).
+    async fn wake_pr_monitor_owner_coalesced(
+        &self,
+        before: &PrMonitor,
+        after: &PrMonitor,
+        message: &str,
+        snapshot: &PrMonitorSnapshot,
+        wake: CoalescibleWake,
+    ) {
+        let queued = match self
+            .replace_queued_pr_monitor_wake(after, snapshot, wake)
+            .await
+        {
+            QueuedWakeReplacement::None => self
+                .wake_pr_monitor_owner(after, message, wake.reason())
+                .await
+                .map(|id| (id, before.baseline_snapshot.clone())),
+            QueuedWakeReplacement::Requeued {
+                message_id,
+                reported_baseline,
+            } => Some((message_id, reported_baseline)),
+            QueuedWakeReplacement::InPlace => {
+                // The final wake now sits in the queue; same terminal
+                // backstop as the ordinary completed delivery.
+                self.forget_queued_pr_monitor_wake(&after.monitor_id);
+                self.resettle_owner_after_pr_monitor_terminal(after).await;
+                return;
+            }
+        };
+        let mut wakes = self.pr_monitor_queued_wakes.lock().unwrap();
+        match (wake, queued) {
+            (CoalescibleWake::Changed, Some((message_id, reported_baseline))) => {
+                wakes.insert(
+                    after.monitor_id.clone(),
+                    QueuedPrMonitorWake {
+                        agent_id: after.agent_id.clone(),
+                        message_id,
+                        reported_baseline,
+                    },
+                );
+            }
+            _ => {
+                wakes.remove(&after.monitor_id);
+            }
+        }
+    }
+
+    /// Replace the monitor's still-queued `changed` wake with this one,
+    /// re-rendered against the queued wake's baseline: `changed` swaps the
+    /// queued entry for a new one at the back of the queue in one queue step
+    /// ([`Services::replace_pending_wake_at_tail`]), so no failure or restart
+    /// can leave neither queued; `completed` rewrites the queued entry in
+    /// place.
+    ///
+    /// The replacement reports `diff(reported_baseline, snapshot)` — every
+    /// change since the last state the owner actually read about, so
+    /// nothing only the replaced wake carried is lost — under the newer
+    /// wake's reason and checklist. A queued `completed` (or any other) wake
+    /// is never replaced, since only `changed` wakes are recorded and the
+    /// queue helpers re-check the entry's metadata.
+    ///
+    /// Returns [`QueuedWakeReplacement::None`] (nothing touched; the caller
+    /// delivers normally, keeping both) when there is no record, the record
+    /// is for another owner, the entry was already popped for delivery or
+    /// touched since it was queued, or a `changed` replacement would be
+    /// empty because everything since the last report reverted.
+    async fn replace_queued_pr_monitor_wake(
+        &self,
+        monitor: &PrMonitor,
+        snapshot: &PrMonitorSnapshot,
+        wake: CoalescibleWake,
+    ) -> QueuedWakeReplacement {
+        let Some(prior) = self
+            .pr_monitor_queued_wakes
+            .lock()
+            .unwrap()
+            .remove(&monitor.monitor_id)
+        else {
+            return QueuedWakeReplacement::None;
+        };
+        if prior.agent_id != monitor.agent_id {
+            return QueuedWakeReplacement::None;
+        }
+        let Some(mut reported) = prior
+            .reported_baseline
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
+        else {
+            return QueuedWakeReplacement::None;
+        };
+        backfill_upgraded_anchor(&mut reported, snapshot, None);
+        let changes = diff_snapshots(&reported, snapshot);
+        if wake == CoalescibleWake::Changed && changes.is_empty() {
+            return QueuedWakeReplacement::None;
+        }
+        let message = wake.render(monitor, &changes, snapshot);
+        let monitor_id = json!(monitor.monitor_id);
+        let is_queued_change = |queued: &Value| {
+            queued["type"] == "pr_monitor_wake"
+                && queued["monitorId"] == monitor_id
+                && queued["reason"] == "changed"
+                && queued.get("resource").is_none()
+                && queued.get("monitorAvailability").is_none()
+        };
+        let paused_until = self.sweep_rate_limit_paused_until();
+        let metadata = pr_monitor_wake_metadata(monitor, wake.reason(), paused_until.as_deref());
+        let replacement = match wake {
+            CoalescibleWake::Changed => {
+                let Some(queued) = self.replace_pending_wake_at_tail(
+                    &monitor.agent_id,
+                    &prior.message_id,
+                    &message,
+                    &metadata,
+                    is_queued_change,
+                ) else {
+                    return QueuedWakeReplacement::None;
+                };
+                QueuedWakeReplacement::Requeued {
+                    message_id: queued.id,
+                    reported_baseline: prior.reported_baseline,
+                }
+            }
+            CoalescibleWake::Completed => {
+                if !self.rewrite_pending_wake(
+                    &monitor.agent_id,
+                    &prior.message_id,
+                    &message,
+                    &metadata,
+                    is_queued_change,
+                ) {
+                    return QueuedWakeReplacement::None;
+                }
+                QueuedWakeReplacement::InPlace
+            }
+        };
+        // One write-through of the swapped queue.
+        self.publish_queue_updated(&monitor.agent_id).await;
+        // The owner may have gone idle since the old entry was queued; the
+        // drain's own busy/archived/retired gates make this a no-op otherwise.
+        if let Some(manager) = self.agent_manager() {
+            manager
+                .try_drain_queue(monitor.agent_id.clone(), monitor.workspace_id.clone())
+                .await;
+        }
+        tracing::debug!(
+            monitor = %monitor.monitor_id.0,
+            agent = %monitor.agent_id.0,
+            reason = wake.reason(),
+            "pr monitor: replaced the owner's undelivered queued wake with a newer one"
+        );
+        replacement
+    }
+
+    /// Forget the monitor's queued-wake record ([`QueuedPrMonitorWake`]):
+    /// called wherever the baseline is reset outside a wake, so a later
+    /// wake never re-reports changes the owner has since read.
+    fn forget_queued_pr_monitor_wake(&self, monitor_id: &PrMonitorId) {
+        self.pr_monitor_queued_wakes
+            .lock()
+            .unwrap()
+            .remove(monitor_id);
     }
 
     /// Wake the FORMER owner of a monitor its parent just took over
@@ -4264,12 +5232,16 @@ impl Services {
             Some(a) => self.pr_monitors_for_agent(a).await?,
             None => self.pr_monitors_for_workspace(workspace_id).await?,
         };
-        let paused_until = self.sweep_rate_limit_paused_until();
-        let monitors: Vec<Value> = monitors
+        let mut projected = Vec::new();
+        for monitor in monitors
             .into_iter()
             .filter(|m| &m.workspace_id == workspace_id)
-            .map(|m| pr_monitor_wire(&m, paused_until.as_deref()))
-            .collect();
+        {
+            if let Some(value) = self.review_monitor_list_entry(&monitor).await? {
+                projected.push(value);
+            }
+        }
+        let monitors = projected;
         Ok(json!({ "monitors": monitors }))
     }
 
@@ -4280,6 +5252,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         monitor_id: &PrMonitorId,
     ) -> Result<Value> {
+        self.require_legacy_monitor_control(monitor_id).await?;
         let monitor = self
             .pr_monitor_cancel(workspace_id, monitor_id, None)
             .await?;
@@ -4297,6 +5270,17 @@ impl Services {
         monitor_id: &PrMonitorId,
         check: bool,
     ) -> Result<Value> {
+        if let Some(result) = crate::repository_native_wire::monitor::flush::flush(
+            self,
+            workspace_id,
+            monitor_id,
+            check,
+        )
+        .await?
+        {
+            return Ok(result);
+        }
+        self.require_legacy_monitor_control(monitor_id).await?;
         let flushed = if check {
             self.pr_monitor_check_and_flush(workspace_id, monitor_id)
                 .await?
@@ -4307,7 +5291,7 @@ impl Services {
     }
 
     /// Idle-visibility deferral (mirrors
-    /// [`Services::active_hooks_for_agent`](crate::Services::active_hooks_for_agent)):
+    /// the runtime's `HookServicesExt::active_hooks_for_agent`):
     /// the caller's ACTIVE PR monitors, oldest first. Empty when the agent
     /// owns no active monitor; a store failure is logged and reads as empty
     /// (visibility is best-effort and must never block an idle emit or wake
@@ -4326,20 +5310,35 @@ impl Services {
         }
     }
 
+    /// Generic agent summaries can disclose only proven legacy producer rows.
+    /// Keep internal waiting/adoption checks on the unfiltered method above.
+    pub(crate) async fn legacy_pr_monitor_wait_entries(&self, agent_id: &AgentId) -> Vec<Value> {
+        self.store
+            .list_qualified_pr_monitors_by_agent(agent_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|row| routing::legacy_output(row))
+            .map(intent_store::QualifiedPrMonitor::monitor)
+            .filter(|m| m.state == PrMonitorState::Active)
+            .map(waiting_on_pr_monitors_entry)
+            .collect()
+    }
+
     /// Workspace-batched variant of
     /// [`active_pr_monitors_for_agent`](Self::active_pr_monitors_for_agent)
     /// for `agent.list`: one store query for the whole workspace, grouped by
     /// owning agent id as light `waitingOnPrMonitors` entries (agents with no
     /// active monitor are absent). A store failure is logged and reads as
     /// empty, mirroring
-    /// [`Services::active_hooks_by_agent`](crate::Services::active_hooks_by_agent).
+    /// the runtime's `HookServicesExt::active_hooks_by_agent`.
     pub(crate) async fn active_pr_monitors_by_agent(
         &self,
         workspace_id: &WorkspaceId,
     ) -> HashMap<String, Vec<Value>> {
         let monitors = match self
             .store
-            .list_active_pr_monitors_by_workspace(workspace_id)
+            .list_qualified_pr_monitors_by_workspace(workspace_id)
             .await
         {
             Ok(monitors) => monitors,
@@ -4353,12 +5352,17 @@ impl Services {
             }
         };
         let mut by_agent: HashMap<String, Vec<Value>> = HashMap::new();
-        for m in monitors {
+        for record in monitors {
+            if !routing::legacy_output(&record) || record.monitor().state != PrMonitorState::Active
+            {
+                continue;
+            }
+            let m = record.monitor();
             let agent = m.agent_id.0.clone();
             by_agent
                 .entry(agent)
                 .or_default()
-                .push(waiting_on_pr_monitors_entry(&m));
+                .push(waiting_on_pr_monitors_entry(m));
         }
         by_agent
     }
@@ -4368,19 +5372,50 @@ impl Services {
     /// is omitted — never `[]` — otherwise, and an existing stamp is left
     /// untouched). Returns the stamped list (empty when nothing was stamped
     /// and no stamp was present). Mirrors
-    /// [`Services::annotate_waiting_on_hooks`](crate::Services::annotate_waiting_on_hooks).
+    /// the runtime's `HookServicesExt::annotate_waiting_on_hooks`.
     pub(crate) async fn annotate_waiting_on_pr_monitors(
         &self,
         agent_id: &AgentId,
         data: &mut Value,
     ) -> Vec<Value> {
-        self.annotate_waiting_on_script_monitors(agent_id, data)
+        self.ports
+            .runtime()
+            .annotate_waiting_on_script_monitors(self, agent_id, data)
             .await;
-        if let Some(existing) = data.get("waitingOnPrMonitors").and_then(Value::as_array) {
-            return existing.clone();
+        let records = self
+            .store
+            .list_qualified_pr_monitors_by_agent(agent_id)
+            .await
+            .unwrap_or_default();
+        let legacy: Vec<_> = records
+            .iter()
+            .filter(|row| routing::legacy_output(row))
+            .collect();
+        let entries: Vec<Value> =
+            if let Some(existing) = data.get("waitingOnPrMonitors").and_then(Value::as_array) {
+                existing
+                    .iter()
+                    .filter(|entry| {
+                        legacy.iter().any(|row| {
+                            entry.get("monitorId").and_then(Value::as_str)
+                                == Some(row.monitor().monitor_id.0.as_str())
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                legacy
+                    .iter()
+                    .map(|row| row.monitor())
+                    .filter(|m| m.state == PrMonitorState::Active)
+                    .map(waiting_on_pr_monitors_entry)
+                    .collect()
+            };
+        if entries.is_empty() {
+            if let Some(obj) = data.as_object_mut() {
+                obj.remove("waitingOnPrMonitors");
+            }
         }
-        let monitors = self.active_pr_monitors_for_agent(agent_id).await;
-        let entries: Vec<Value> = monitors.iter().map(waiting_on_pr_monitors_entry).collect();
         if !entries.is_empty() {
             if let Some(obj) = data.as_object_mut() {
                 obj.insert(
@@ -4399,7 +5434,11 @@ impl Services {
     /// no snapshot parsing. Best-effort: a store failure reads as empty so a
     /// snapshot build never fails on it.
     pub(crate) async fn active_pr_monitor_labels(&self, agent_id: &AgentId) -> Vec<String> {
-        let monitors = match self.store.list_pr_monitors_by_agent(agent_id).await {
+        let monitors = match self
+            .store
+            .list_qualified_pr_monitors_by_agent(agent_id)
+            .await
+        {
             Ok(monitors) => monitors,
             Err(e) => {
                 tracing::warn!(
@@ -4412,9 +5451,11 @@ impl Services {
         };
         monitors
             .into_iter()
-            .filter(|m| m.state == PrMonitorState::Active)
-            .map(|m| {
-                let label = monitor_label(&m);
+            .filter(routing::legacy_output)
+            .filter(|row| row.monitor().state == PrMonitorState::Active)
+            .map(|row| {
+                let m = row.monitor();
+                let label = monitor_label(m);
                 if m.pending_changes.is_empty() {
                     label
                 } else {
@@ -4433,6 +5474,18 @@ impl Services {
         monitor: &PrMonitor,
         extra: Option<Value>,
     ) {
+        // The global bus has consumers with no qualified recipient receipt.
+        // Qualified lifecycle output must use its scoped native route instead.
+        let Ok(record) = self
+            .store
+            .get_qualified_pr_monitor(&monitor.monitor_id)
+            .await
+        else {
+            return;
+        };
+        if !routing::legacy_output(&record) {
+            return;
+        }
         let mut data = json!({
             "workspaceId": monitor.workspace_id,
             "agentId": monitor.agent_id,
@@ -4461,17 +5514,24 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::fake_runtime::{scheduled_hook, FakeRuntime};
     mod ancestry_messages;
     mod ancestry_regression;
     mod compact_required_checks;
+    mod home_queue_regression;
+    mod implicit_repository;
+    mod merge_queue_position;
+    mod observation_feed_regression;
+    mod qualified_isolation;
+    mod qualified_recovery;
+    mod queued_wake_coalescing;
     mod quota_regression;
     mod qwen_regression;
+    mod registration_visibility;
     use std::path::PathBuf;
 
     use async_trait::async_trait;
-    use intent_core::{
-        AgentSession, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-    };
+    use intent_core::{AgentSession, Workspace};
     use intent_sourcecontrol::{
         AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
         IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability,
@@ -4526,6 +5586,9 @@ mod tests {
         mergeable_state: String,
         conversation_comments: usize,
         approvals: Vec<String>,
+        /// Reviews served after the `approvals` stand-ins, verbatim (ids,
+        /// commits, verdicts) — the per-reviewer latest-review tests.
+        extra_reviews: Vec<Review>,
         threads: Vec<ReviewThread>,
         checks: Vec<RollupCheck>,
         merge_queue_removal: Option<intent_sourcecontrol::MergeQueueRemoval>,
@@ -4569,6 +5632,9 @@ mod tests {
         /// The host's merge-queue report on the probe signals (`None` is
         /// a host not reporting it).
         in_merge_queue: Option<bool>,
+        /// The host's merge-queue entry (position, estimate) on the probe
+        /// signals; `None` while not queued or not reported.
+        merge_queue_entry: Option<intent_sourcecontrol::MergeQueueEntry>,
         /// Stands in for the forge's `updatedAt`: bumped by every
         /// [`StubForge::edit`] (as GitHub bumps it on reviews, comments,
         /// threads and pushes), left alone by [`StubForge::edit_quiet`] (as
@@ -4621,6 +5687,7 @@ mod tests {
                 mergeable_state: "clean".into(),
                 conversation_comments: 0,
                 approvals: vec![],
+                extra_reviews: vec![],
                 threads: vec![],
                 checks: vec![RollupCheck {
                     name: "build".into(),
@@ -4649,6 +5716,7 @@ mod tests {
                 updated_at: None,
                 folded: None,
                 in_merge_queue: None,
+                merge_queue_entry: None,
             }
         }
     }
@@ -4686,7 +5754,10 @@ mod tests {
                     verdict: ReviewVerdict::Approve,
                     body: None,
                     submitted_at: "2026-01-01T00:00:00Z".into(),
+                    id: None,
+                    commit_sha: None,
                 })
+                .chain(self.extra_reviews.iter().cloned())
                 .collect()
         }
 
@@ -4700,9 +5771,11 @@ mod tests {
                 checks: self.checks.clone(),
                 checks_head_sha: None,
                 checks_known: true,
+                head_committed_at: None,
                 branch_rules: None,
                 is_in_merge_queue: self.in_merge_queue,
                 merge_queue_removal: self.merge_queue_removal.clone(),
+                merge_queue_entry: self.merge_queue_entry.clone(),
             }
         }
     }
@@ -5163,49 +6236,11 @@ mod tests {
             id: id.clone(),
             title: "WS".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
             repository_owner: Some("o".into()),
             repository_name: Some("r".into()),
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
     }
 
@@ -5255,6 +6290,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 
@@ -5358,7 +6394,10 @@ mod tests {
         svc.event_bus.as_ref().unwrap().shutdown().await.unwrap();
         svc.store().close().await;
         let reopened = Store::open(&db.path).await.unwrap();
-        let session = reopened.get_agent_session(&owner).await.unwrap();
+        let session = reopened
+            .get_agent_session_with_transcript(&owner)
+            .await
+            .unwrap();
         if closing_manager {
             let queue = reopened.load_all_agent_queues().await.unwrap();
             assert_eq!(queue.len(), 1);
@@ -5465,7 +6504,11 @@ mod tests {
 
     /// The owner's persisted messages, serialized (wake assertions).
     async fn owner_messages(svc: &Services, owner: &AgentId) -> String {
-        let session = svc.store().get_agent_session(owner).await.unwrap();
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(owner)
+            .await
+            .unwrap();
         serde_json::to_string(&session.messages).unwrap()
     }
 
@@ -5490,6 +6533,7 @@ mod tests {
                     passed: 0,
                     failed: 0,
                     pending: 1,
+                    skipped: 0,
                     items: vec![pr_ops::MergeRequirementCheck {
                         name: "build".into(),
                         status: "pending".into(),
@@ -5505,6 +6549,7 @@ mod tests {
                     have: 0,
                     needed: Some(1),
                     changes_requested: 0,
+                    latest_reviews: None,
                 },
                 threads: pr_ops::MergeRequirementsThreads {
                     unresolved: Some(1),
@@ -5514,14 +6559,20 @@ mod tests {
                 merge_blocked_reason: None,
                 rules_known: true,
                 is_in_merge_queue: None,
+                checks_not_started: None,
                 merge_queue_ejection: None,
+                merge_queue: None,
             },
             ejection_tracked: true,
+            skipped_tracked: true,
             checks_unobserved: false,
             checks_seed_pending: false,
             status_checks: Some(Vec::new()),
             required_check_names: None,
             observed_at: None,
+            pr_updated_at: None,
+            checks_not_started_delivered: None,
+            latest_reviews_carried: false,
         };
         f(&mut s);
         s
@@ -6002,6 +7053,71 @@ mod tests {
         );
     }
 
+    /// An ejection older than the PR's current queue entry is superseded
+    /// (intent-hq/intent#7523), including across RFC 3339 offsets. Without a
+    /// strictly later, comparable entry time — not queued, no entry, no
+    /// `enqueuedAt`, unparseable, or an entry at or before the ejection —
+    /// it is not, so the monitor still reports it.
+    #[test]
+    fn an_ejection_is_superseded_only_by_a_later_queue_entry() {
+        let ejection = pr_ops::MergeQueueEjection {
+            at: "2026-10-21T13:18:28Z".into(),
+            reason: Some("failed_checks".into()),
+        };
+        let with = |queued: Option<bool>, enqueued_at: Option<&str>, entry: bool| {
+            snapshot(|s| {
+                s.requirements.merge_queue_ejection = Some(ejection.clone());
+                s.requirements.is_in_merge_queue = queued;
+                s.requirements.merge_queue = entry.then(|| intent_sourcecontrol::MergeQueueEntry {
+                    position: 1,
+                    queue_size: Some(1),
+                    state: Some("awaiting_checks".into()),
+                    enqueued_at: enqueued_at.map(Into::into),
+                    estimated_time_to_merge: None,
+                });
+            })
+            .requirements
+        };
+
+        for (label, requirements) in [
+            (
+                "re-queued",
+                with(Some(true), Some("2026-10-21T13:21:58Z"), true),
+            ),
+            (
+                "re-queued, other offset",
+                with(Some(true), Some("2026-10-21T15:21:58+02:00"), true),
+            ),
+        ] {
+            assert!(
+                ejection.superseded_by_queue_entry(&requirements),
+                "{label}: superseded"
+            );
+        }
+        for (label, requirements) in [
+            (
+                "entry predates ejection",
+                with(Some(true), Some("2026-10-21T13:00:00Z"), true),
+            ),
+            (
+                "same instant",
+                with(Some(true), Some("2026-10-21T13:18:28Z"), true),
+            ),
+            ("no enqueuedAt", with(Some(true), None, true)),
+            (
+                "unparseable enqueuedAt",
+                with(Some(true), Some("soon"), true),
+            ),
+            ("queued without entry", with(Some(true), None, false)),
+            ("not queued", with(None, Some("2026-10-21T13:21:58Z"), true)),
+        ] {
+            assert!(
+                !ejection.superseded_by_queue_entry(&requirements),
+                "{label}: still applies"
+            );
+        }
+    }
+
     /// A persisted baseline written before `mergeQueueEjection` existed still
     /// parses (serde default) and produces no phantom diff line against a
     /// fresh snapshot that also has no event — and reads as UNTRACKED, so
@@ -6029,6 +7145,7 @@ mod tests {
             title: s.title.clone(),
             url: s.url.clone(),
             head_sha: s.head_sha.clone(),
+            pr_updated_at: s.pr_updated_at.clone(),
             conversation_count: Some(s.conversation_count),
             review_comment_count: s.review_comment_count,
             requirements: s.requirements.clone(),
@@ -6037,7 +7154,416 @@ mod tests {
             check_runs_known: true,
             status_checks: s.status_checks.clone(),
             merge_queue_reported: s.requirements.is_in_merge_queue,
+            checks_start: pr_ops::ChecksStartEvidence::default(),
         }
+    }
+
+    // ── prUpdatedAt: the PR's own recency for the workspace PR pool ──
+
+    fn list_entry(updated_at: &str, pr_updated_at: Option<&str>) -> PrMonitorListEntry {
+        PrMonitorListEntry {
+            workspace_id: WorkspaceId::from("ws-1"),
+            repo_owner: "intent-hq".into(),
+            repo_name: "intent".into(),
+            pr_number: 7906,
+            state: PrMonitorState::Active,
+            created_at: "2026-10-27T01:25:13Z".into(),
+            updated_at: updated_at.into(),
+            snapshot_url: Some("https://github.com/intent-hq/intent/pull/7906".into()),
+            snapshot_title: Some("docs: routing".into()),
+            snapshot_head_sha: None,
+            snapshot_state: Some("open".into()),
+            snapshot_is_draft: Some(false),
+            snapshot_mergeable: Some(true),
+            snapshot_is_in_merge_queue: None,
+            snapshot_pr_updated_at: pr_updated_at.map(Into::into),
+        }
+    }
+
+    /// Regression: a monitor-only PR's pool entry used the monitor ROW's
+    /// `updated_at`, which advances on every poll write, so it out-ranked a
+    /// git-root PR GitHub had updated more recently on the same-state
+    /// recency tie-break (intentd#2733 lost the workspace card to
+    /// intent#7906). The entry now reports the forge's own `updatedAt`.
+    #[test]
+    fn monitor_pool_entry_reports_the_prs_updated_at_not_the_rows() {
+        let info = pr_monitor_pr_info(&list_entry(
+            "2026-10-27T08:45:53.044912803Z",
+            Some("2026-10-27T01:34:23Z"),
+        ));
+        assert_eq!(info.updated_at, "2026-10-27T01:34:23Z");
+        assert_eq!(info.created_at, "2026-10-27T01:25:13Z");
+    }
+
+    /// A snapshot persisted before `prUpdatedAt` existed (or a snapshotless
+    /// row) keeps the monitor row's timestamp — the pre-fix behavior.
+    #[test]
+    fn monitor_pool_entry_falls_back_to_the_row_without_a_forge_timestamp() {
+        let info = pr_monitor_pr_info(&list_entry("2026-10-27T08:45:53Z", None));
+        assert_eq!(info.updated_at, "2026-10-27T08:45:53Z");
+    }
+
+    /// The forge `updatedAt` is materialized into the persisted snapshot, a
+    /// read without one keeps the previous value, and a bare bump is never
+    /// a reportable change.
+    #[test]
+    fn pr_updated_at_is_materialized_and_never_diffed() {
+        let base = snapshot(|_| {});
+        let mut read = shared_from(&base, true);
+        read.pr_updated_at = Some("2026-10-27T01:00:00Z".into());
+        let first = read.materialize(None);
+        assert_eq!(first.pr_updated_at.as_deref(), Some("2026-10-27T01:00:00Z"));
+
+        read.pr_updated_at = Some("2026-10-27T02:00:00Z".into());
+        let bumped = read.materialize(Some(&first));
+        assert_eq!(
+            bumped.pr_updated_at.as_deref(),
+            Some("2026-10-27T02:00:00Z")
+        );
+        assert!(
+            diff_snapshots(&first, &bumped).is_empty(),
+            "a bare updatedAt bump is not news"
+        );
+
+        read.pr_updated_at = None;
+        let carried = read.materialize(Some(&bumped));
+        assert_eq!(
+            carried.pr_updated_at.as_deref(),
+            Some("2026-10-27T02:00:00Z"),
+            "a read without a forge timestamp keeps the previous one"
+        );
+    }
+
+    /// `prUpdatedAt` round-trips through the persisted JSON (absent on old
+    /// snapshots) and stays out of the public `lastSnapshot` projection.
+    #[test]
+    fn pr_updated_at_persists_but_is_not_on_the_wire() {
+        let s = snapshot(|s| s.pr_updated_at = Some("2026-10-27T01:34:23Z".into()));
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["prUpdatedAt"], json!("2026-10-27T01:34:23Z"));
+        let old: PrMonitorSnapshot =
+            serde_json::from_value(serde_json::to_value(snapshot(|_| {})).unwrap()).unwrap();
+        assert_eq!(old.pr_updated_at, None);
+
+        let ts = "2026-01-01T00:00:00Z".to_string();
+        let m = PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            agent_id: AgentId::from("agent-1"),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 42,
+            state: PrMonitorState::Active,
+            last_snapshot: Some(json.to_string()),
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        let wire = pr_monitor_wire(&m, None);
+        assert!(wire["lastSnapshot"].is_object());
+        assert!(wire["lastSnapshot"].get("prUpdatedAt").is_none());
+        assert!(!wire.to_string().contains("prUpdatedAt"));
+    }
+
+    // ── checksNotStarted: CI never started on the head (intentd#2531) ──
+
+    const NO_CI_HEAD: &str = "8c0e5137c0000000000000000000000000000000";
+
+    fn no_ci_now() -> time::OffsetDateTime {
+        intent_core::parse_iso("2026-10-21T04:00:00Z").unwrap()
+    }
+
+    /// A fresh read of `head` committed at `committed_at`, carrying zero
+    /// check runs on a base branch that requires checks.
+    fn zero_run_read(head: &str, committed_at: &str) -> SharedPrSnapshot {
+        let s = snapshot(|s| {
+            s.head_sha = Some(head.into());
+            s.requirements.checks = pr_ops::MergeRequirementsChecks::from_items(vec![], true);
+        });
+        let mut shared = shared_from(&s, true);
+        shared.checks_start = pr_ops::ChecksStartEvidence {
+            head_sha: Some(head.into()),
+            head_committed_at: Some(committed_at.into()),
+            checks_required: true,
+        };
+        shared
+    }
+
+    fn no_ci_lines(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
+        diff_snapshots(old, new)
+            .into_iter()
+            .filter(|l| l.starts_with("no checks reported for head"))
+            .collect()
+    }
+
+    #[test]
+    fn zero_run_head_past_threshold_surfaces_stalled_state_and_wakes_once() {
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        // The baseline: the same head, observed before the threshold passed.
+        let before = read.materialize_at(
+            None,
+            intent_core::parse_iso("2026-10-20T23:13:00Z").unwrap(),
+        );
+        assert_eq!(before.requirements.checks_not_started, None);
+
+        let now = read.materialize_at(Some(&before), no_ci_now());
+        let stall = now
+            .requirements
+            .checks_not_started
+            .clone()
+            .expect("flagged");
+        assert_eq!(stall.head_sha, NO_CI_HEAD);
+        assert_eq!(stall.head_committed_at, "2026-10-20T23:12:00Z");
+        assert_eq!(stall.threshold_minutes, 15);
+        assert_eq!(
+            no_ci_lines(&before, &now),
+            vec![
+                "no checks reported for head 8c0e5137 after 15+ min — CI may never have \
+                 started; push again (e.g. an empty commit) or rebase to trigger it \
+                 (expected only if the required checks are path-filtered or run only in \
+                 the merge queue)"
+            ]
+        );
+        // Once delivered (the baseline now carries the flag), later polls of
+        // the same stalled head stay quiet: one wake per head.
+        let later = read.materialize_at(Some(&now), no_ci_now() + time::Duration::hours(5));
+        assert!(later.requirements.checks_not_started.is_some());
+        assert!(diff_snapshots(&now, &later).is_empty());
+        // The wake's checklist carries the recovery hint while it holds.
+        let checklist = render_checklist(&now);
+        assert!(
+            checklist.contains(
+                "checks never started on head 8c0e5137 (none reported 15+ min after its \
+                 commit) — push again or rebase to trigger CI"
+            ),
+            "{checklist}"
+        );
+        assert!(!render_checklist(&before).contains("checks never started"));
+    }
+
+    #[test]
+    fn head_with_check_runs_never_reports_stalled_ci() {
+        let mut read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        read.requirements = snapshot(|_| {}).requirements;
+        assert_eq!(read.requirements.checks.total, 1, "fixture carries a run");
+        let baseline = read.materialize_at(None, no_ci_now());
+        let later = read.materialize_at(Some(&baseline), no_ci_now() + time::Duration::hours(5));
+        assert_eq!(later.requirements.checks_not_started, None);
+        assert!(no_ci_lines(&baseline, &later).is_empty());
+        assert_eq!(read.requirements_at(no_ci_now()).checks_not_started, None);
+    }
+
+    #[test]
+    fn freshly_pushed_head_inside_threshold_is_not_stalled_until_it_passes() {
+        // Pushed ten minutes ago: inside the threshold.
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-21T03:50:00Z");
+        let fresh = read.materialize_at(None, no_ci_now());
+        assert_eq!(fresh.requirements.checks_not_started, None);
+        assert_eq!(read.requirements_at(no_ci_now()).checks_not_started, None);
+        // The SAME cached read polled after the threshold flags it: the
+        // verdict is derived against the clock, not frozen at fetch time.
+        let later_at = no_ci_now() + time::Duration::minutes(6);
+        let later = read.materialize_at(Some(&fresh), later_at);
+        assert!(later.requirements.checks_not_started.is_some());
+        assert_eq!(no_ci_lines(&fresh, &later).len(), 1);
+        assert!(read.requirements_at(later_at).checks_not_started.is_some());
+    }
+
+    #[test]
+    fn stalled_ci_on_a_new_head_wakes_again_and_unobserved_checks_never_flag() {
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        let seen = read.materialize_at(None, no_ci_now());
+        let first = read.materialize_at(Some(&seen), no_ci_now());
+        assert!(first.requirements.checks_not_started.is_some());
+        // A re-push that also never started CI is a new head: its first
+        // sighting never flags (its commit time can predate the push)...
+        let next_head = "9d1f000000000000000000000000000000000000";
+        let repushed = zero_run_read(next_head, "2026-10-21T03:00:00Z");
+        let next_seen = repushed.materialize_at(Some(&first), no_ci_now());
+        assert_eq!(next_seen.requirements.checks_not_started, None);
+        // ...and the next poll of that head wakes again, once.
+        let next = repushed.materialize_at(Some(&next_seen), no_ci_now());
+        assert_eq!(
+            next.requirements
+                .checks_not_started
+                .as_ref()
+                .map(|s| s.head_sha.as_str()),
+            Some(next_head)
+        );
+        assert_eq!(no_ci_lines(&first, &next).len(), 1);
+
+        // A read whose check runs did not answer is unknown, not zero: the
+        // same-head carry-forward of an earlier empty list is stale evidence
+        // (CI may have started since) and never flags, matching the
+        // `ws.pr.snapshot` view of the same cached read.
+        let mut degraded = read.clone();
+        degraded.check_runs_known = false;
+        let carried = degraded.materialize_at(Some(&seen), no_ci_now());
+        assert!(
+            !carried.checks_unobserved,
+            "carry-forward keeps the old list"
+        );
+        assert_eq!(carried.requirements.checks_not_started, None);
+        assert_eq!(
+            degraded.requirements_at(no_ci_now()).checks_not_started,
+            None
+        );
+    }
+
+    #[test]
+    fn an_old_commit_pushed_just_now_is_not_flagged_on_first_sighting() {
+        // Committed an hour before it was pushed: on the first poll that
+        // sees the head GitHub may not have registered its runs yet.
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-21T03:00:00Z");
+        let previous_head = snapshot(|_| {});
+        let first = read.materialize_at(Some(&previous_head), no_ci_now());
+        assert_eq!(first.requirements.checks_not_started, None);
+        assert!(no_ci_lines(&previous_head, &first).is_empty());
+        let registration = read.materialize_at(None, no_ci_now());
+        assert_eq!(registration.requirements.checks_not_started, None);
+    }
+
+    #[test]
+    fn delivered_stall_wake_survives_a_degraded_read_and_an_unrelated_wake() {
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        let seen = read.materialize_at(None, no_ci_now());
+        let mut flagged = read.materialize_at(Some(&seen), no_ci_now());
+        assert_eq!(no_ci_lines(&seen, &flagged).len(), 1);
+        // Delivered: the emit stamps the head on the new baseline.
+        flagged.checks_not_started_delivered = Some(NO_CI_HEAD.into());
+        // A degraded rules read clears the flag; the marker rides along.
+        let mut degraded = read.clone();
+        degraded.checks_start.checks_required = false;
+        let mut cleared = degraded.materialize_at(Some(&flagged), no_ci_now());
+        assert_eq!(cleared.requirements.checks_not_started, None);
+        assert_eq!(
+            cleared.checks_not_started_delivered.as_deref(),
+            Some(NO_CI_HEAD)
+        );
+        // An unrelated change is delivered meanwhile: the flagless snapshot
+        // becomes the emit baseline.
+        cleared.conversation_count += 1;
+        let baseline = cleared.clone();
+        // The read recovers on the same head: no second stall wake.
+        let recovered = read.materialize_at(Some(&baseline), no_ci_now());
+        assert!(recovered.requirements.checks_not_started.is_some());
+        assert!(no_ci_lines(&baseline, &recovered).is_empty());
+        // A new head starts clean: the marker never carries across heads.
+        let other = zero_run_read(
+            "9d1f000000000000000000000000000000000000",
+            "2026-10-21T03:00:00Z",
+        )
+        .materialize_at(Some(&recovered), no_ci_now());
+        assert_eq!(other.checks_not_started_delivered, None);
+    }
+
+    #[test]
+    fn an_undelivered_stall_is_not_lost_to_a_degraded_read_and_an_unrelated_wake() {
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        let seen = read.materialize_at(None, no_ci_now());
+        // Flagged, but the debounce window has not delivered it yet.
+        let flagged = read.materialize_at(Some(&seen), no_ci_now());
+        assert!(flagged.requirements.checks_not_started.is_some());
+        // A degraded read clears it before delivery; an unrelated wake then
+        // delivers the flagless snapshot (nothing stamps a marker).
+        let mut degraded = read.clone();
+        degraded.checks_start.checks_required = false;
+        let mut baseline = degraded.materialize_at(Some(&flagged), no_ci_now());
+        baseline.conversation_count += 1;
+        assert_eq!(baseline.checks_not_started_delivered, None);
+        // Recovery still reports the stall once.
+        let recovered = read.materialize_at(Some(&baseline), no_ci_now());
+        assert_eq!(no_ci_lines(&baseline, &recovered).len(), 1);
+    }
+
+    #[test]
+    fn a_cached_empty_check_list_is_never_reused_while_ci_is_required() {
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        let mut pr = intent_sourcecontrol::PullRequest {
+            number: 42,
+            url: read.url.clone(),
+            title: read.title.clone(),
+            body: None,
+            state: intent_sourcecontrol::PrState::Open,
+            draft: false,
+            source_branch: "feat".into(),
+            target_branch: "main".into(),
+            author: "a".into(),
+            mergeable: Some(true),
+            mergeable_state: Some("blocked".into()),
+            head_sha: Some(NO_CI_HEAD.into()),
+            created_at: String::new(),
+            updated_at: "2026-10-21T03:59:00Z".into(),
+        };
+        let now = Instant::now();
+        let fingerprint = PrFingerprint::of(&pr, None);
+        // Zero checks on a base that requires them: always a full re-read,
+        // so CI that started without bumping `updatedAt` is seen.
+        let entry = PrCacheEntry::new(pr.clone(), read.clone(), now);
+        assert!(!entry.reusable(&fingerprint, now));
+        // Control: the same entry is reusable once CI is not required...
+        let mut no_ci = read.clone();
+        no_ci.checks_start.checks_required = false;
+        assert!(PrCacheEntry::new(pr.clone(), no_ci, now).reusable(&fingerprint, now));
+        // ...or once the head has a check.
+        let mut with_run = read;
+        with_run.requirements = snapshot(|_| {}).requirements;
+        pr.head_sha = Some(NO_CI_HEAD.into());
+        assert!(PrCacheEntry::new(pr, with_run, now).reusable(&fingerprint, now));
+    }
+
+    #[test]
+    fn stalled_ci_projects_into_last_snapshot_and_old_baselines_stay_quiet() {
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        let s = read.materialize_at(Some(&read.materialize_at(None, no_ci_now())), no_ci_now());
+        assert!(s.requirements.checks_not_started.is_some());
+        let ts = "2026-01-01T00:00:00Z".to_string();
+        let mut m = PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            agent_id: AgentId::from("agent-1"),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 42,
+            state: PrMonitorState::Active,
+            last_snapshot: Some(serde_json::to_string(&s).unwrap()),
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        assert_eq!(
+            pr_monitor_wire(&m, None)["lastSnapshot"]["checksNotStarted"],
+            json!({
+                "headSha": NO_CI_HEAD,
+                "headCommittedAt": "2026-10-20T23:12:00Z",
+                "thresholdMinutes": 15,
+            })
+        );
+        // Absent → key omitted, never null.
+        let quiet = snapshot(|_| {});
+        m.last_snapshot = Some(serde_json::to_string(&quiet).unwrap());
+        assert!(pr_monitor_wire(&m, None)["lastSnapshot"]
+            .get("checksNotStarted")
+            .is_none());
+        // A baseline persisted before the field existed parses and diffs
+        // silently against a fresh snapshot without the flag.
+        let mut wire = serde_json::to_value(&quiet).unwrap();
+        wire["requirements"]
+            .as_object_mut()
+            .unwrap()
+            .remove("checksNotStarted");
+        let old: PrMonitorSnapshot = serde_json::from_value(wire).unwrap();
+        assert!(diff_snapshots(&old, &quiet).is_empty());
     }
 
     /// A degraded merge-requirements probe (`ejection_known == false`) must
@@ -6074,6 +7600,42 @@ mod tests {
         let m = known.materialize(Some(&prev));
         assert_eq!(m.requirements.merge_queue_ejection, None);
         assert!(m.ejection_tracked);
+    }
+
+    /// Regression (cloudlands-fe#3524): a degraded probe never carries a
+    /// held event forward when it records a merge — a `merged` removal from
+    /// a baseline persisted before the filter existed, or any held event once
+    /// the PR itself has merged.
+    #[test]
+    fn materialize_never_holds_a_merge_as_an_ejection() {
+        let merged_removal = snapshot(|s| {
+            s.requirements.merge_queue_ejection = Some(pr_ops::MergeQueueEjection {
+                at: "2026-10-19T17:57:04Z".into(),
+                reason: Some("merged".into()),
+            });
+        });
+        let degraded = shared_from(&snapshot(|_| {}), false);
+        let m = degraded.materialize(Some(&merged_removal));
+        assert_eq!(m.requirements.merge_queue_ejection, None);
+        assert!(diff_snapshots(&merged_removal, &m)
+            .iter()
+            .all(|c| !c.starts_with("removed from the merge queue")));
+
+        let real = snapshot(|s| {
+            s.requirements.merge_queue_ejection = Some(pr_ops::MergeQueueEjection {
+                at: "2026-10-19T17:00:00Z".into(),
+                reason: Some("failed_checks".into()),
+            });
+        });
+        let degraded_merged =
+            shared_from(&snapshot(|s| s.requirements.state = "merged".into()), false);
+        assert_eq!(
+            degraded_merged
+                .materialize(Some(&real))
+                .requirements
+                .merge_queue_ejection,
+            None
+        );
     }
 
     #[test]
@@ -6170,6 +7732,90 @@ mod tests {
             diff_snapshots(&base, &added_green).is_empty(),
             "a check that appears already passed must stay quiet"
         );
+    }
+
+    /// Incident intentd#2581 at 6c92d3256 (run 39724275631): 23 passed and
+    /// `coverage-all` / `coverage-e2e` skipped must never read as
+    /// "all checks passed".
+    fn skipped_incident(done: bool) -> PrMonitorSnapshot {
+        snapshot(|s| {
+            let c = &mut s.requirements.checks;
+            let names: Vec<String> = (1..=23)
+                .map(|i| format!("job-{i:02}"))
+                .chain(["coverage-all".to_string(), "coverage-e2e".to_string()])
+                .collect();
+            c.items = names
+                .iter()
+                .map(|name| pr_ops::MergeRequirementCheck {
+                    name: name.clone(),
+                    status: match (done, name.starts_with("coverage")) {
+                        (false, _) => "pending",
+                        (true, true) => "skipped",
+                        (true, false) => "passed",
+                    }
+                    .into(),
+                    required: false,
+                    url: None,
+                })
+                .collect();
+            c.total = 25;
+            c.pending_required.clear();
+            if done {
+                (c.passed, c.skipped, c.pending) = (23, 2, 0);
+            } else {
+                c.pending = 25;
+            }
+        })
+    }
+
+    #[test]
+    fn suite_completion_with_skipped_checks_names_them() {
+        let changes = diff_snapshots(&skipped_incident(false), &skipped_incident(true));
+        assert!(
+            !changes.iter().any(|c| c.contains("all checks passed")),
+            "{changes:?}"
+        );
+        assert_eq!(
+            changes,
+            vec![
+                "all checks completed: 23 passed, 2 skipped (coverage-all, coverage-e2e)"
+                    .to_string()
+            ]
+        );
+        let checklist = render_checklist(&skipped_incident(true));
+        assert!(
+            checklist.contains(
+                "checks: 23 passed, 0 failed, 0 pending, 2 skipped (of 25); \
+                 skipped: coverage-all, coverage-e2e"
+            ),
+            "{checklist}"
+        );
+    }
+
+    #[test]
+    fn skipped_checks_completion_with_a_failure_lists_all_outcomes() {
+        let mut done = skipped_incident(true);
+        let c = &mut done.requirements.checks;
+        c.items[0].status = "failed".into();
+        (c.passed, c.failed) = (22, 1);
+        let changes = diff_snapshots(&skipped_incident(false), &done);
+        assert!(changes.iter().any(|c| {
+            c == "all checks completed: 22 passed, 1 failed, 2 skipped (coverage-all, coverage-e2e)"
+        }));
+    }
+
+    #[test]
+    fn baseline_without_skipped_count_parses_without_diff_lines() {
+        let current = snapshot(|_| {});
+        let mut legacy = serde_json::to_value(&current).unwrap();
+        legacy["requirements"]["checks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("skipped")
+            .expect("current baselines carry a skipped count");
+        let legacy: PrMonitorSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.requirements.checks.skipped, 0);
+        assert!(diff_snapshots(&legacy, &current).is_empty());
     }
 
     #[test]
@@ -6316,7 +7962,9 @@ mod tests {
         };
 
         let (_db, _root, svc, forge, ws, owner) = setup().await;
-        let svc = svc.with_pr_monitor_debounce_seconds(0);
+        // A window no poll here outlasts: every change stays pending until
+        // the explicit flush at the end, so each step asserts one state.
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
         forge.edit_quiet(|s| s.checks = cancelled_first.clone());
         let (monitor, requirements) = svc
             .pr_monitor_register(&ws, &owner, "o", "r", 42)
@@ -6376,15 +8024,16 @@ mod tests {
             "{checks:?}"
         );
         assert_eq!(checks.failing_required, vec!["CI Gate".to_string()]);
+        let red_line = "check CI Gate: passed → failed";
+        assert_eq!(row.pending_changes, vec![red_line.to_string()]);
         let text = owner_messages(&svc, &owner).await;
-        let reported = row
-            .pending_changes
-            .iter()
-            .filter(|c| c.as_str() == "check CI Gate: passed → failed")
-            .count()
-            + text.matches("check CI Gate: passed → failed").count();
-        assert_eq!(reported, 1, "{:?}\n{text}", row.pending_changes);
+        assert!(
+            !text.contains("pr_monitor_wake"),
+            "still debouncing: {text}"
+        );
 
+        // The twins reorder while the red status holds: no new change, so
+        // the one pending line is neither duplicated nor reversed.
         red.reverse();
         forge.edit(|s| s.checks = red.clone());
         svc.poll_pr_monitors().await;
@@ -6397,15 +8046,24 @@ mod tests {
             serde_json::from_str(row.last_snapshot.as_deref().expect("snapshot")).unwrap();
         let checks = &snapshot.requirements.checks;
         assert_eq!((checks.passed, checks.failed), (1, 1), "{checks:?}");
-        let text = owner_messages(&svc, &owner).await;
-        assert!(!text.contains("failed → passed"), "{text}");
-        assert!(
-            !row.pending_changes
-                .iter()
-                .any(|c| c.contains("CI Gate: failed")),
-            "{:?}",
-            row.pending_changes
+        assert_eq!(row.pending_changes, vec![red_line.to_string()]);
+
+        // Delivered exactly once, and only the red transition.
+        assert_eq!(
+            svc.pr_monitor_flush_op(&ws, &monitor.monitor_id, false)
+                .await
+                .unwrap()["flushed"],
+            true
         );
+        let text = owner_messages(&svc, &owner).await;
+        assert_eq!(text.matches(red_line).count(), 1, "{text}");
+        assert!(!text.contains("failed → passed"), "{text}");
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(row.pending_changes.is_empty(), "{:?}", row.pending_changes);
     }
 
     #[tokio::test]
@@ -6760,7 +8418,11 @@ mod tests {
             updated_at: ts,
         };
         svc.store().insert_note(&note).await.expect("task note");
-        let mut session = svc.store().get_agent_session(agent_id).await.unwrap();
+        let mut session = svc
+            .store()
+            .get_agent_session_with_transcript(agent_id)
+            .await
+            .unwrap();
         session.task_note_id = Some(note_id);
         svc.store()
             .update_agent_session(ws, &session)
@@ -6820,7 +8482,11 @@ mod tests {
         assert!(svc.pr_monitors_for_agent(child).await.unwrap().is_empty());
         assert_eq!(svc.pr_monitors_for_agent(parent).await.unwrap().len(), 1);
 
-        let child_session = svc.store().get_agent_session(child).await.unwrap();
+        let child_session = svc
+            .store()
+            .get_agent_session_with_transcript(child)
+            .await
+            .unwrap();
         assert_eq!(
             child_session.messages.len(),
             1,
@@ -6892,6 +8558,7 @@ mod tests {
     #[tokio::test]
     async fn a_parent_is_refused_while_its_child_is_still_working() {
         let (_db, _root, svc, _forge, ws, parent) = setup().await;
+        let svc = FakeRuntime::install(svc);
         let child = child_agent(&svc, &ws, "agent-child", &parent, AgentStatus::Active).await;
         let first = register(&svc, &ws, &child).await;
         link_task_note(&svc, &ws, &child, intent_core::TaskStatus::InProgress).await;
@@ -6960,19 +8627,9 @@ mod tests {
         svc.set_test_busy(&child, false);
 
         // Idle holding an active hook: the hook is a waiting reason too.
-        let out = svc
-            .hook_schedule_op(
-                &ws,
-                &child,
-                &json!({
-                    "name": "watcher",
-                    "code": "return { dispatch: false };",
-                    "delayMs": 10_000,
-                }),
-            )
-            .await
-            .expect("schedule");
-        let hook_id = intent_core::HookId::from(out["hook"]["hookId"].as_str().expect("hookId"));
+        let hook = scheduled_hook(&ws, &child, "watcher");
+        svc.store().insert_hook(&hook).await.expect("insert hook");
+        let hook_id = hook.hook_id.clone();
         let refused = svc
             .pr_monitor_start_op(&ws, &parent, 42, None)
             .await
@@ -6982,9 +8639,9 @@ mod tests {
             json!(true),
             "hook-holding child: {refused}"
         );
-        svc.hook_cancel_op(&ws, &hook_id, Some(&child))
-            .await
-            .expect("cancel hook");
+        FakeRuntime::of(&svc)
+            .cancel_hook(&svc, &hook_id, Some(&child))
+            .await;
 
         // Task still `in_progress`, but idle with nothing pending: the
         // predicates are OR'd, so the takeover proceeds.
@@ -7464,6 +9121,1113 @@ mod tests {
             forge.fetches() - before,
             1,
             "one shared fetch for the case-variant pair"
+        );
+    }
+
+    fn sc_review(author: &str, verdict: ReviewVerdict, at: &str, id: &str, commit: &str) -> Review {
+        Review {
+            author: author.into(),
+            verdict,
+            body: None,
+            submitted_at: at.into(),
+            id: Some(id.into()),
+            commit_sha: Some(commit.into()),
+        }
+    }
+
+    /// Regression for intentd#2605 (review 5639064405): the bot requested
+    /// changes again on a newer commit. The decision and counts stayed
+    /// `changes_requested` / 1, so the monitor used to report nothing; it now
+    /// reports the second review and the commit it covers.
+    #[tokio::test]
+    async fn a_repeated_changes_requested_review_on_a_new_commit_wakes_the_owner() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| {
+            s.head_sha = "c0f1e6f11".into();
+            s.extra_reviews = vec![sc_review(
+                "review-bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T09:00:00Z",
+                "5638000000",
+                "8c0e5137c",
+            )];
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+        let baseline = monitor.baseline_snapshot.clone().expect("baseline");
+        assert!(
+            baseline.contains("\"latestReviews\""),
+            "the checklist carries per-reviewer reviews: {baseline}"
+        );
+
+        forge.edit(|s| {
+            s.extra_reviews.push(sc_review(
+                "review-bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T17:01:00Z",
+                "5639064405",
+                "c0f1e6f11",
+            ));
+        });
+        assert!(svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("check"));
+        let text = owner_messages(&svc, &owner).await;
+        assert!(
+            text.contains(
+                "new review from review-bot: changes requested on c0f1e6f1 (current head)"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("review decision:"),
+            "the decision did not change: {text}"
+        );
+        assert!(
+            text.contains(
+                "latest reviews: review-bot changes requested on c0f1e6f1 (current head)"
+            ),
+            "the wake checklist shows the latest review: {text}"
+        );
+
+        // A quiet re-check reports nothing more.
+        assert!(!svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("re-check"));
+    }
+
+    /// A monitor registered before per-reviewer reviews were tracked has an
+    /// emit baseline without `latestReviews`. The first poll adopts the
+    /// current reviews silently; the NEXT review is reported (the review
+    /// finding on the intentd#2605 fix: without the adoption the both-sides
+    /// guard kept every upgraded monitor silent).
+    #[tokio::test]
+    async fn an_upgraded_monitor_without_latest_reviews_reports_the_next_review() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| {
+            s.extra_reviews = vec![sc_review(
+                "review-bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T09:00:00Z",
+                "1",
+                "aaaaaaaa",
+            )];
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let strip = |col: &Option<String>| -> Option<String> {
+            let mut v: Value = serde_json::from_str(col.as_deref()?).ok()?;
+            v.pointer_mut("/requirements/approvals")?
+                .as_object_mut()?
+                .remove("latestReviews");
+            serde_json::to_string(&v).ok()
+        };
+        let (last, baseline) = (strip(&row.last_snapshot), strip(&row.baseline_snapshot));
+        assert!(!baseline.as_deref().unwrap().contains("latestReviews"));
+        assert!(svc
+            .store()
+            .update_pr_monitor_poll(
+                &monitor.monitor_id,
+                PrMonitorPollUpdate {
+                    last_snapshot: last.as_deref(),
+                    baseline_snapshot: baseline.as_deref(),
+                    pending_changes: &[],
+                    pending_since: None,
+                    last_change_at: None,
+                    last_polled_at: row.last_polled_at.as_deref(),
+                    last_error: None,
+                    updated_at: &now_iso(),
+                    expected_updated_at: &row.updated_at,
+                },
+            )
+            .await
+            .unwrap());
+
+        assert!(
+            !svc.pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+                .await
+                .expect("adopting check"),
+            "existing reviews are history to an upgraded baseline"
+        );
+        forge.edit(|s| {
+            s.extra_reviews.push(sc_review(
+                "review-bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T17:01:00Z",
+                "2",
+                "aaaaaaaa",
+            ));
+        });
+        assert!(svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("check"));
+        let text = owner_messages(&svc, &owner).await;
+        assert!(
+            text.contains("new review from review-bot: changes requested on aaaaaaaa"),
+            "{text}"
+        );
+    }
+
+    /// One of two fully populated [`PrMonitorSnapshot`]s for
+    /// [`every_optional_field_dropped_from_an_upgraded_baseline_still_reports_changes`]:
+    /// `b` gives every field a different value. Plain struct literals with
+    /// no `..Default::default()`, so adding a persisted field anywhere in
+    /// the snapshot is a compile error here until both samples give it a
+    /// value (and the test then checks the upgrade path for it).
+    fn upgrade_sample(b: bool) -> PrMonitorSnapshot {
+        fn pick<T>(b: bool, a: T, other: T) -> T {
+            if b {
+                other
+            } else {
+                a
+            }
+        }
+        let head = pick(b, "aaaaaaaa", "bbbbbbbb");
+        PrMonitorSnapshot {
+            title: pick(b, "Add thing", "Add other thing").into(),
+            url: pick(
+                b,
+                "https://github.com/o/r/pull/42",
+                "https://github.com/o/r/pull/43",
+            )
+            .into(),
+            head_sha: Some(head.into()),
+            conversation_count: pick(b, 1, 3),
+            review_comment_count: pick(b, 2, 5),
+            requirements: MergeRequirements {
+                state: pick(b, "open", "closed").into(),
+                is_draft: b,
+                has_conflicts: b,
+                is_behind: b,
+                ancestry: intent_sourcecontrol::PrAncestry::Known {
+                    base_sha: pick(b, "base1", "base2").into(),
+                    head_sha: head.into(),
+                    behind_by: pick(b, 0, 4),
+                },
+                branch_update_required: Some(b),
+                mergeable: Some(!b),
+                checks: pr_ops::MergeRequirementsChecks {
+                    total: pick(b, 1, 2),
+                    passed: pick(b, 1, 0),
+                    failed: pick(b, 0, 1),
+                    pending: pick(b, 0, 1),
+                    skipped: pick(b, 1, 0),
+                    items: vec![pr_ops::MergeRequirementCheck {
+                        name: "build".into(),
+                        status: pick(b, "passed", "failed").into(),
+                        required: !b,
+                        url: Some(pick(b, "https://ci/1", "https://ci/2").into()),
+                    }],
+                    failing_required: vec![pick(b, "lint", "build").into()],
+                    pending_required: vec![pick(b, "docs", "lint").into()],
+                    required_known: !b,
+                },
+                approvals: pr_ops::MergeRequirementsApprovals {
+                    decision: pick(b, "approved", "changes_requested").into(),
+                    have: pick(b, 1, 0),
+                    needed: Some(pick(b, 1, 2)),
+                    changes_requested: pick(b, 0, 1),
+                    latest_reviews: Some(vec![pr_ops::LatestReview {
+                        reviewer: pick(b, "alice", "bob").into(),
+                        state: pick(b, "approved", "changes_requested").into(),
+                        submitted_at: pick(b, "2026-10-24T09:00:00Z", "2026-10-25T09:00:00Z")
+                            .into(),
+                        commit_sha: Some(head.into()),
+                        on_current_head: Some(!b),
+                        id: Some(pick(b, "1", "2").into()),
+                    }]),
+                },
+                threads: pr_ops::MergeRequirementsThreads {
+                    unresolved: Some(pick(b, 0, 2)),
+                    resolution_required: Some(!b),
+                },
+                merge_state_status: Some(pick(b, "CLEAN", "BLOCKED").into()),
+                merge_blocked_reason: Some(pick(b, "none", "checks failing").into()),
+                rules_known: !b,
+                is_in_merge_queue: Some(!b),
+                merge_queue_ejection: Some(pr_ops::MergeQueueEjection {
+                    at: pick(b, "2026-10-24T10:00:00Z", "2026-10-25T10:00:00Z").into(),
+                    reason: Some(pick(b, "failed_checks", "conflict").into()),
+                }),
+                merge_queue: Some(intent_sourcecontrol::MergeQueueEntry {
+                    position: pick(b, 1, 3),
+                    queue_size: Some(pick(b, 2, 4)),
+                    state: Some(pick(b, "QUEUED", "AWAITING_CHECKS").into()),
+                    // Before `a`'s ejection: an ejection that predates the
+                    // queue entry is adopted as history regardless of upgrades.
+                    enqueued_at: Some(
+                        pick(b, "2026-10-24T09:30:00Z", "2026-10-25T09:30:00Z").into(),
+                    ),
+                    estimated_time_to_merge: Some(pick(b, 60, 120)),
+                }),
+                checks_not_started: Some(pr_ops::ChecksNotStarted {
+                    head_sha: head.into(),
+                    head_committed_at: pick(b, "2026-10-24T08:00:00Z", "2026-10-25T08:00:00Z")
+                        .into(),
+                    threshold_minutes: pick(b, 10, 20),
+                }),
+            },
+            ejection_tracked: !b,
+            skipped_tracked: !b,
+            checks_unobserved: !b,
+            checks_seed_pending: !b,
+            status_checks: Some(vec![pr_ops::MergeRequirementCheck {
+                name: pick(b, "legacy", "legacy-2").into(),
+                status: "passed".into(),
+                required: false,
+                url: Some(pick(b, "https://ci/legacy", "https://ci/legacy-2").into()),
+            }]),
+            required_check_names: Some(BTreeSet::from([pick(b, "build", "lint").into()])),
+            observed_at: Some(pick(b, "2026-10-24T12:00:00Z", "2026-10-25T12:00:00Z").into()),
+            pr_updated_at: Some(pick(b, "2026-10-24T11:00:00Z", "2026-10-25T11:00:00Z").into()),
+            checks_not_started_delivered: Some(head.into()),
+            latest_reviews_carried: !b,
+        }
+    }
+
+    /// The JSON pointers of every field a value's `Serialize` impl leaves
+    /// out (`skip_serializing_if`) or writes as `null`, and of every empty
+    /// list or map (whose item fields would go unvisited). Read from the
+    /// TYPE's own serializer, so it covers fields a sample forgot to fill.
+    /// Limit: `#[serde(flatten)]` fields serialize as map entries, so a
+    /// skipped field inside one is not seen (none of the snapshot's types
+    /// flatten today).
+    mod field_paths {
+        use std::cell::RefCell;
+        use std::collections::BTreeSet;
+
+        use serde::ser::{self, Serialize};
+
+        pub fn empty<T: Serialize>(value: &T) -> BTreeSet<String> {
+            let rec = Rec {
+                path: RefCell::new(Vec::new()),
+                empty: RefCell::new(BTreeSet::new()),
+            };
+            value.serialize(&rec).expect("record fields");
+            rec.empty.into_inner()
+        }
+
+        struct Rec {
+            path: RefCell<Vec<String>>,
+            empty: RefCell<BTreeSet<String>>,
+        }
+
+        impl Rec {
+            fn pointer(&self, key: &str) -> String {
+                let path = self.path.borrow();
+                let mut segments: Vec<&str> = path.iter().map(String::as_str).collect();
+                segments.push(key);
+                format!("/{}", segments.join("/"))
+            }
+            fn field<T: ?Sized + Serialize>(&self, key: &str, value: &T) -> Result<(), Error> {
+                if value.serialize(Probe).is_err_and(|e| e.0 == NULL) {
+                    self.skip(key);
+                }
+                self.nested(key, value)
+            }
+            fn empty_here(&self, len: Option<usize>) {
+                if len == Some(0) {
+                    let pointer: String = self
+                        .path
+                        .borrow()
+                        .iter()
+                        .map(|s| format!("/{s}"))
+                        .collect::<Vec<_>>()
+                        .concat();
+                    self.empty.borrow_mut().insert(pointer);
+                }
+            }
+            fn nested<T: ?Sized + Serialize>(&self, key: &str, value: &T) -> Result<(), Error> {
+                self.path.borrow_mut().push(key.to_owned());
+                let r = value.serialize(self);
+                self.path.borrow_mut().pop();
+                r
+            }
+            fn skip(&self, key: &str) {
+                let pointer = self.pointer(key);
+                self.empty.borrow_mut().insert(pointer);
+            }
+        }
+
+        #[derive(Debug)]
+        pub struct Error(String);
+        impl std::fmt::Display for Error {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl std::error::Error for Error {}
+        impl ser::Error for Error {
+            fn custom<T: std::fmt::Display>(msg: T) -> Self {
+                Self(msg.to_string())
+            }
+        }
+
+        const NULL: &str = "null";
+
+        /// Errs with [`NULL`] only on a top-level `null` (looking through
+        /// newtypes), telling an empty `Option` apart. Compound values err
+        /// otherwise and count as written; [`Rec`] checks their contents.
+        struct Probe;
+
+        macro_rules! leaves {
+            ($($name:ident: $ty:ty),* $(,)?) => {
+                $(fn $name(self, _: $ty) -> Result<(), Error> { Ok(()) })*
+            };
+        }
+
+        impl ser::Serializer for Probe {
+            type Ok = ();
+            type Error = Error;
+            type SerializeSeq = ser::Impossible<(), Error>;
+            type SerializeTuple = ser::Impossible<(), Error>;
+            type SerializeTupleStruct = ser::Impossible<(), Error>;
+            type SerializeTupleVariant = ser::Impossible<(), Error>;
+            type SerializeMap = ser::Impossible<(), Error>;
+            type SerializeStruct = ser::Impossible<(), Error>;
+            type SerializeStructVariant = ser::Impossible<(), Error>;
+            leaves!(serialize_bool: bool, serialize_i8: i8, serialize_i16: i16, serialize_i32: i32,
+                serialize_i64: i64, serialize_u8: u8, serialize_u16: u16, serialize_u32: u32,
+                serialize_u64: u64, serialize_f32: f32, serialize_f64: f64, serialize_char: char,
+                serialize_str: &str, serialize_bytes: &[u8]);
+            fn serialize_none(self) -> Result<(), Error> {
+                Err(ser::Error::custom(NULL))
+            }
+            fn serialize_some<T: ?Sized + Serialize>(self, _: &T) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_unit(self) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_unit_struct(self, _: &'static str) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_unit_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_newtype_struct<T: ?Sized + Serialize>(
+                self,
+                _: &'static str,
+                v: &T,
+            ) -> Result<(), Error> {
+                v.serialize(self)
+            }
+            fn serialize_newtype_variant<T: ?Sized + Serialize>(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: &T,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+            fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+            fn serialize_tuple_struct(
+                self,
+                _: &'static str,
+                _: usize,
+            ) -> Result<Self::SerializeTupleStruct, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+            fn serialize_tuple_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: usize,
+            ) -> Result<Self::SerializeTupleVariant, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+            fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+            fn serialize_struct(
+                self,
+                _: &'static str,
+                _: usize,
+            ) -> Result<Self::SerializeStruct, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+            fn serialize_struct_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: usize,
+            ) -> Result<Self::SerializeStructVariant, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+        }
+
+        impl ser::Serializer for &Rec {
+            type Ok = ();
+            type Error = Error;
+            type SerializeSeq = Self;
+            type SerializeTuple = Self;
+            type SerializeTupleStruct = Self;
+            type SerializeTupleVariant = Self;
+            type SerializeMap = Self;
+            type SerializeStruct = Self;
+            type SerializeStructVariant = Self;
+            leaves!(serialize_bool: bool, serialize_i8: i8, serialize_i16: i16, serialize_i32: i32,
+                serialize_i64: i64, serialize_u8: u8, serialize_u16: u16, serialize_u32: u32,
+                serialize_u64: u64, serialize_f32: f32, serialize_f64: f64, serialize_char: char,
+                serialize_str: &str, serialize_bytes: &[u8]);
+            fn serialize_none(self) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_some<T: ?Sized + Serialize>(self, v: &T) -> Result<(), Error> {
+                v.serialize(self)
+            }
+            fn serialize_unit(self) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_unit_struct(self, _: &'static str) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_unit_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_newtype_struct<T: ?Sized + Serialize>(
+                self,
+                _: &'static str,
+                v: &T,
+            ) -> Result<(), Error> {
+                v.serialize(self)
+            }
+            fn serialize_newtype_variant<T: ?Sized + Serialize>(
+                self,
+                _: &'static str,
+                _: u32,
+                variant: &'static str,
+                v: &T,
+            ) -> Result<(), Error> {
+                self.field(variant, v)
+            }
+            fn serialize_seq(self, len: Option<usize>) -> Result<Self, Error> {
+                self.empty_here(len);
+                Ok(self)
+            }
+            fn serialize_tuple(self, _: usize) -> Result<Self, Error> {
+                Ok(self)
+            }
+            fn serialize_tuple_struct(self, _: &'static str, _: usize) -> Result<Self, Error> {
+                Ok(self)
+            }
+            fn serialize_tuple_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: usize,
+            ) -> Result<Self, Error> {
+                Ok(self)
+            }
+            fn serialize_map(self, len: Option<usize>) -> Result<Self, Error> {
+                self.empty_here(len);
+                Ok(self)
+            }
+            fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self, Error> {
+                Ok(self)
+            }
+            fn serialize_struct_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: usize,
+            ) -> Result<Self, Error> {
+                Ok(self)
+            }
+        }
+
+        macro_rules! seq_like {
+            ($($tr:ident :: $m:ident),*) => {$(
+                impl ser::$tr for &Rec {
+                    type Ok = ();
+                    type Error = Error;
+                    fn $m<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), Error> {
+                        self.nested("*", v)
+                    }
+                    fn end(self) -> Result<(), Error> {
+                        Ok(())
+                    }
+                }
+            )*};
+        }
+        seq_like!(
+            SerializeSeq::serialize_element,
+            SerializeTuple::serialize_element,
+            SerializeTupleStruct::serialize_field,
+            SerializeTupleVariant::serialize_field
+        );
+
+        impl ser::SerializeMap for &Rec {
+            type Ok = ();
+            type Error = Error;
+            fn serialize_key<T: ?Sized + Serialize>(&mut self, _: &T) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_value<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), Error> {
+                self.nested("*", v)
+            }
+            fn end(self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        macro_rules! struct_like {
+            ($($tr:ident),*) => {$(
+                impl ser::$tr for &Rec {
+                    type Ok = ();
+                    type Error = Error;
+                    fn serialize_field<T: ?Sized + Serialize>(&mut self, key: &'static str, v: &T) -> Result<(), Error> {
+                        self.field(key, v)
+                    }
+                    fn skip_field(&mut self, key: &'static str) -> Result<(), Error> {
+                        self.skip(key);
+                        Ok(())
+                    }
+                    fn end(self) -> Result<(), Error> {
+                        Ok(())
+                    }
+                }
+            )*};
+        }
+        struct_like!(SerializeStruct, SerializeStructVariant);
+    }
+
+    /// Every JSON pointer under `v` that names an object key (array items
+    /// by index), depth-first.
+    fn json_key_pointers(v: &Value, at: &str, out: &mut Vec<String>) {
+        match v {
+            Value::Object(map) => {
+                for (k, child) in map {
+                    let p = format!("{at}/{k}");
+                    out.push(p.clone());
+                    json_key_pointers(child, &p, out);
+                }
+            }
+            Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    json_key_pointers(child, &format!("{at}/{i}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn remove_json_key(v: &mut Value, pointer: &str) {
+        let (parent, key) = pointer.rsplit_once('/').unwrap();
+        v.pointer_mut(parent)
+            .and_then(Value::as_object_mut)
+            .unwrap_or_else(|| panic!("{pointer}: parent is not an object"))
+            .remove(key);
+    }
+
+    /// Persisted fields that never produce a change line of their own
+    /// (internal bookkeeping, or state the diff deliberately ignores). For
+    /// these the test only checks that an upgrade neither wakes falsely nor
+    /// diverges from a monitor that always had the field. Matches the field
+    /// pointer or anything under it (array indices written as `*`).
+    const UPGRADE_FIELDS_WITHOUT_CHANGE_LINES: &[(&str, &str)] = &[
+        (
+            "/requirements/ancestry",
+            "feeds the behind/branch-update lines, never its own",
+        ),
+        (
+            "/requirements/checks/skipped",
+            "a tally; per-check status lines carry the change",
+        ),
+        ("/requirements/checks/items/*/url", "a link, not PR state"),
+        (
+            "/requirements/approvals/latestReviews/*/commitSha",
+            "rendered within the review line",
+        ),
+        (
+            "/requirements/approvals/latestReviews/*/id",
+            "identity only; new reviews key on time",
+        ),
+        (
+            "/requirements/threads/resolutionRequired",
+            "a rule flag; unresolved counts report",
+        ),
+        (
+            "/requirements/mergeQueueEjection/reason",
+            "detail of the ejection event line",
+        ),
+        (
+            "/requirements/mergeQueue",
+            "informational queue movement, never a change line",
+        ),
+        ("/ejectionTracked", "persistence marker"),
+        ("/skippedTracked", "persistence marker"),
+        ("/checksUnobserved", "internal bookkeeping"),
+        ("/checksSeedPending", "internal bookkeeping"),
+        ("/statusChecks", "frozen legacy evidence, internal"),
+        ("/requiredCheckNames", "internal required-flag evidence"),
+        ("/observedAt", "freshness anchor; never diffed"),
+        (
+            "/prUpdatedAt",
+            "forge recency for pool ordering; never diffed",
+        ),
+        (
+            "/checksNotStartedDelivered",
+            "internal stall-wake bookkeeping",
+        ),
+        ("/latestReviewsCarried", "internal degraded-read marker"),
+    ];
+
+    /// Fields whose ABSENCE is a real persisted state, "unknown" (a degraded
+    /// or pre-field read), and whose unknown → known transition the diff
+    /// reports by design. An upgrade reads like a recovered degraded read:
+    /// at most one wake, after which the baseline holds the field and later
+    /// changes report normally (still checked). A new field must not be
+    /// added here to paper over silence; only over that one wake.
+    const UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT: &[(&str, &str)] = &[
+        (
+            "/headSha",
+            "unknown head; a known head reports as pushed commits",
+        ),
+        (
+            "/requirements/branchUpdateRequired",
+            "reported when it becomes available",
+        ),
+        ("/requirements/mergeable", "unknown → known mergeability"),
+        (
+            "/requirements/approvals/needed",
+            "unknown → known required approvals",
+        ),
+        ("/requirements/threads/unresolved", "threads readable again"),
+        (
+            "/requirements/mergeStateStatus",
+            "unknown → known merge state",
+        ),
+        (
+            "/requirements/mergeBlockedReason",
+            "reported when it becomes known",
+        ),
+        ("/requirements/isInMergeQueue", "unknown queue membership"),
+    ];
+
+    /// Fields shipped together with a persistence flag that reads `false`
+    /// on state saved before them. Removed alone, such a field reads as a
+    /// genuine "tracked, nothing yet" state whose next event IS news, so it
+    /// is tested removed together with its flags, as older state has it.
+    const UPGRADE_FIELDS_WITH_FLAGS: &[(&str, &[&str], &str)] = &[(
+        "/requirements/mergeQueueEjection",
+        &["/ejectionTracked"],
+        "ejection tracking (intentd#1519)",
+    )];
+
+    fn upgrade_field_listed(list: &[(&str, &str)], field: &str) -> bool {
+        list.iter().any(|(prefix, _)| {
+            field == *prefix
+                || field
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+
+    /// The field-by-field generalization of the hand-written upgrade tests
+    /// (intentd#1519 ejections, intentd#2623 skipped checks, intentd#2695
+    /// latest reviews): a monitor persisted before a field existed must
+    /// neither wake on the upgrade itself nor go quiet about later changes
+    /// to that field. Each optional field (one the snapshot still loads
+    /// without) is removed from a saved baseline in turn; the test then
+    /// runs the same backfill and diff as two polls of an upgraded monitor
+    /// and compares the change lines with a monitor that always had it.
+    /// The field list is read from the types, so a new field is covered
+    /// as soon as the samples above compile. Not covered: an upgrade that
+    /// re-encodes an existing value instead of adding a field (intentd#2623
+    /// stored skipped checks as `passed`); its own test guards that.
+    #[test]
+    fn every_optional_field_dropped_from_an_upgraded_baseline_still_reports_changes() {
+        let (a, b) = (upgrade_sample(false), upgrade_sample(true));
+        let (a_json, b_json) = (
+            serde_json::to_value(&a).unwrap(),
+            serde_json::to_value(&b).unwrap(),
+        );
+        // `a` is the saved state the fields are removed from, so it must
+        // write every field the types declare; `b` only supplies new values
+        // (a flag that is omitted while false is a valid one).
+        let empty = field_paths::empty(&a);
+        assert!(
+            empty.is_empty(),
+            "upgrade_sample(false) leaves {empty:?} empty: give every field (and every list) a \
+             value so the upgrade test covers it"
+        );
+        let generic = |p: &str| {
+            p.split('/')
+                .map(|s| if s.parse::<usize>().is_ok() { "*" } else { s })
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+
+        let mut pointers = Vec::new();
+        json_key_pointers(&a_json, "", &mut pointers);
+        let strip = |pointers: &[&String]| {
+            let mut stripped = a_json.clone();
+            for p in pointers {
+                remove_json_key(&mut stripped, p);
+            }
+            serde_json::from_value::<PrMonitorSnapshot>(stripped).ok()
+        };
+        let optional: Vec<String> = pointers
+            .into_iter()
+            .filter(|p| strip(&[p]).is_some())
+            .collect();
+        let mut failures = Vec::new();
+        let mut unknown_used = BTreeSet::new();
+        for pointer in &optional {
+            let field = generic(pointer);
+            if strip(&[pointer]).as_ref() == Some(&a) {
+                failures.push(format!(
+                    "{pointer}: removing it changes nothing, so the upgrade is not exercised. \
+                     Give it a non-default value in upgrade_sample(false)"
+                ));
+                continue;
+            }
+            let flags = UPGRADE_FIELDS_WITH_FLAGS
+                .iter()
+                .find(|(f, _, _)| *f == field)
+                .map_or(&[][..], |(_, flags, _)| *flags);
+            let mut removed = vec![pointer.clone()];
+            removed.extend(flags.iter().map(|f| (*f).to_owned()));
+            let old = strip(&removed.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|| panic!("{removed:?}: the stripped snapshot does not load"));
+
+            // Upgrade poll: the PR still reads as `a`. Nothing changed, so
+            // nothing may be pending against the backfilled baseline.
+            let mut base = old.clone();
+            backfill_upgraded_anchor(&mut base, &a, Some(&old));
+            let false_wake = diff_snapshots(&base, &a);
+            if !false_wake.is_empty() {
+                if !upgrade_field_listed(UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT, &field) {
+                    failures.push(format!(
+                        "{pointer}: the upgrade poll itself reports {false_wake:?}. Adopt the \
+                         field silently in backfill_upgraded_anchor (if it ships with a \
+                         persistence flag, list both in UPGRADE_FIELDS_WITH_FLAGS)"
+                    ));
+                    continue;
+                }
+                if false_wake.len() != 1 {
+                    failures.push(format!(
+                        "{pointer}: an unknown → known field may cost one wake line, the \
+                         upgrade poll reports {false_wake:?}"
+                    ));
+                    continue;
+                }
+                unknown_used.insert(field.clone());
+                // That wake is delivered: the baseline advances to the read.
+                base = a.clone();
+            }
+
+            // Change poll: the field now reads as in `b`.
+            let mut changed_json = a_json.clone();
+            match b_json.pointer(pointer) {
+                Some(v) => *changed_json.pointer_mut(pointer).unwrap() = v.clone(),
+                None => remove_json_key(&mut changed_json, pointer),
+            }
+            let changed: PrMonitorSnapshot = serde_json::from_value(changed_json)
+                .unwrap_or_else(|e| panic!("{pointer}: b's value does not load: {e}"));
+            let mut reference = a.clone();
+            backfill_upgraded_anchor(&mut reference, &changed, Some(&a));
+            let expected = diff_snapshots(&reference, &changed);
+            backfill_upgraded_anchor(&mut base, &changed, Some(&a));
+            let reported = diff_snapshots(&base, &changed);
+
+            let silent = upgrade_field_listed(UPGRADE_FIELDS_WITHOUT_CHANGE_LINES, &field);
+            if expected.is_empty() != silent {
+                failures.push(if silent {
+                    format!(
+                        "{pointer} is in UPGRADE_FIELDS_WITHOUT_CHANGE_LINES but a change \
+                         reports {expected:?}: remove it from the list"
+                    )
+                } else {
+                    format!(
+                        "{pointer}: changing it from upgrade_sample(false) to \
+                         upgrade_sample(true) reports nothing even without an upgrade. Give \
+                         the samples values the diff reports, or list the field in \
+                         UPGRADE_FIELDS_WITHOUT_CHANGE_LINES with a reason"
+                    )
+                });
+            } else if reported != expected {
+                failures.push(format!(
+                    "{pointer}: an upgraded monitor reports {reported:?}, one that always had \
+                     the field reports {expected:?}. Adopt the field in \
+                     backfill_upgraded_anchor"
+                ));
+            }
+        }
+        assert!(
+            optional
+                .iter()
+                .any(|p| p == "/requirements/approvals/latestReviews"),
+            "enumeration found {optional:?}"
+        );
+        // Every list entry must still name an optional field and still be
+        // needed, so an exemption cannot outlive its reason.
+        let fields: Vec<String> = optional.iter().map(|p| generic(p)).collect();
+        let listed = UPGRADE_FIELDS_WITHOUT_CHANGE_LINES
+            .iter()
+            .chain(UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT)
+            .map(|(f, _)| *f)
+            .chain(
+                UPGRADE_FIELDS_WITH_FLAGS
+                    .iter()
+                    .flat_map(|(f, flags, _)| std::iter::once(*f).chain(flags.iter().copied())),
+            );
+        for prefix in listed {
+            if !fields
+                .iter()
+                .any(|f| upgrade_field_listed(&[(prefix, "")], f))
+            {
+                failures.push(format!("{prefix} is listed but is no optional field"));
+            }
+        }
+        for (prefix, _) in UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT {
+            if !unknown_used
+                .iter()
+                .any(|f| upgrade_field_listed(&[(prefix, "")], f))
+            {
+                failures.push(format!(
+                    "{prefix} is in UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT but its upgrade no \
+                     longer wakes: remove it from the list"
+                ));
+            }
+        }
+        for (field, _, _) in UPGRADE_FIELDS_WITH_FLAGS {
+            let pointer = (*field).to_owned();
+            let Some(alone) = strip(&[&pointer]) else {
+                continue;
+            };
+            let mut base = alone.clone();
+            backfill_upgraded_anchor(&mut base, &a, Some(&alone));
+            if diff_snapshots(&base, &a).is_empty() {
+                failures.push(format!(
+                    "{field} is in UPGRADE_FIELDS_WITH_FLAGS but upgrades cleanly without its \
+                     flags: remove it from the list"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A baseline whose head was unknown still gets the older-commit line once
+    /// the review is known to be behind the head.
+    #[test]
+    fn an_older_commit_review_is_reported_after_an_unknown_head() {
+        let review = |on_head: Option<bool>| {
+            Some(vec![pr_ops::LatestReview {
+                reviewer: "review-bot".into(),
+                state: "changes_requested".into(),
+                submitted_at: "2026-10-24T09:00:00Z".into(),
+                commit_sha: Some("aaaaaaaa".into()),
+                on_current_head: on_head,
+                id: None,
+            }])
+        };
+        let unknown = snapshot(|s| {
+            s.head_sha = None;
+            s.requirements.approvals.latest_reviews = review(None);
+        });
+        let behind = snapshot(|s| {
+            s.head_sha = Some("bbbbbbbb".into());
+            s.requirements.approvals.latest_reviews = review(Some(false));
+        });
+        assert!(diff_snapshots(&unknown, &behind).iter().any(|l| l
+            == "review-bot's latest review (changes requested) is on an older commit aaaaaaaa; head is bbbbbbbb"));
+        assert!(
+            !diff_snapshots(&behind, &behind)
+                .iter()
+                .any(|l| l.contains("older commit")),
+            "reported once"
+        );
+    }
+
+    /// A carried-forward list (degraded review read) keeps the emit anchor
+    /// but is not rendered as if freshly read.
+    #[test]
+    fn a_carried_latest_review_list_is_not_rendered_in_the_checklist() {
+        let mut s = snapshot(|s| {
+            s.requirements.approvals.latest_reviews = Some(vec![pr_ops::LatestReview {
+                reviewer: "alice".into(),
+                state: "approved".into(),
+                submitted_at: "2026-10-24T09:00:00Z".into(),
+                commit_sha: Some("aaaaaaaa".into()),
+                on_current_head: Some(true),
+                id: None,
+            }]);
+        });
+        let harness = crate::harness::latest();
+        assert!(harness
+            .pr_checklist(&s)
+            .contains("latest reviews: alice approved"));
+        s.latest_reviews_carried = true;
+        assert!(!harness.pr_checklist(&s).contains("latest reviews"));
+    }
+
+    /// A push leaves an approval behind: reported once as an older-commit
+    /// review, not on every poll.
+    #[tokio::test]
+    async fn a_push_past_an_approval_reports_the_review_as_on_an_older_commit() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| {
+            s.extra_reviews = vec![sc_review(
+                "alice",
+                ReviewVerdict::Approve,
+                "2026-10-24T09:00:00Z",
+                "1",
+                "aaaaaaaa",
+            )];
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+        forge.edit(|s| s.head_sha = "bbbbbbbb".into());
+        assert!(svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("check"));
+        let text = owner_messages(&svc, &owner).await;
+        assert!(
+            text.contains(
+                "alice's latest review (approved) is on an older commit aaaaaaaa; head is bbbbbbbb"
+            ),
+            "{text}"
+        );
+        assert_eq!(text.matches("is on an older commit").count(), 1, "{text}");
+        assert!(!svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("re-check"));
+    }
+
+    /// A degraded review read keeps the observed reviews in the snapshot, so
+    /// a wake delivered meanwhile (which moves the emit baseline) cannot make
+    /// the next answered read adopt a review submitted in between silently.
+    #[tokio::test]
+    async fn a_degraded_review_read_does_not_swallow_a_later_review() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| {
+            s.extra_reviews = vec![sc_review(
+                "review-bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T09:00:00Z",
+                "1",
+                "aaaaaaaa",
+            )];
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+
+        forge.edit(|s| {
+            s.fail_list_reviews = true;
+            s.conversation_comments = 1;
+            s.extra_reviews.push(sc_review(
+                "review-bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T17:01:00Z",
+                "2",
+                "aaaaaaaa",
+            ));
+        });
+        assert!(svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("degraded check"));
+        let before = owner_messages(&svc, &owner).await;
+        assert!(before.contains("conversation comment"), "{before}");
+        assert!(
+            !before.contains("new review from"),
+            "reviews unreadable: {before}"
+        );
+
+        forge.edit(|s| s.fail_list_reviews = false);
+        assert!(svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("recovered check"));
+        let after = owner_messages(&svc, &owner).await;
+        assert!(
+            after.contains(
+                "new review from review-bot: changes requested on aaaaaaaa (current head)"
+            ),
+            "{after}"
+        );
+    }
+
+    #[test]
+    fn latest_review_lines_need_both_sides_and_stay_quiet_when_unchanged() {
+        let reviews = |id: &str, commit: &str, on_head: bool| {
+            Some(vec![pr_ops::LatestReview {
+                reviewer: "review-bot".into(),
+                state: "changes_requested".into(),
+                submitted_at: format!("2026-10-24T17:0{id}:00Z"),
+                commit_sha: Some(commit.into()),
+                on_current_head: Some(on_head),
+                id: Some(id.into()),
+            }])
+        };
+        let legacy = snapshot(|_| {});
+        let tracked =
+            snapshot(|s| s.requirements.approvals.latest_reviews = reviews("1", "aaaaaaaa", true));
+        assert!(
+            !diff_snapshots(&legacy, &tracked)
+                .iter()
+                .any(|l| l.contains("review")),
+            "a baseline persisted before the field existed is adopted silently"
+        );
+        assert!(
+            !diff_snapshots(&tracked, &legacy)
+                .iter()
+                .any(|l| l.contains("review")),
+            "unreadable reviews are not a change"
+        );
+        assert!(diff_snapshots(&tracked, &tracked).is_empty());
+
+        let newer =
+            snapshot(|s| s.requirements.approvals.latest_reviews = reviews("2", "aaaaaaaa", true));
+        assert_eq!(
+            diff_snapshots(&tracked, &newer),
+            vec!["new review from review-bot: changes requested on aaaaaaaa (current head)"]
+        );
+        let on_older = snapshot(|s| {
+            s.head_sha = Some("bbbbbbbbbb".into());
+            s.requirements.approvals.latest_reviews = reviews("2", "aaaaaaaa", false);
+        });
+        assert!(diff_snapshots(&tracked, &on_older).iter().any(|l| l
+            == "new review from review-bot: changes requested on aaaaaaaa (older commit; head is bbbbbbbb)"));
+        let stale = snapshot(|s| {
+            s.head_sha = Some("bbbbbbbbbb".into());
+            s.requirements.approvals.latest_reviews = reviews("1", "aaaaaaaa", false);
+        });
+        assert!(diff_snapshots(&tracked, &stale).iter().any(|l| l
+            == "review-bot's latest review (changes requested) is on an older commit aaaaaaaa; head is bbbbbbbb"));
+        assert!(
+            !diff_snapshots(&stale, &stale)
+                .iter()
+                .any(|l| l.contains("older commit")),
+            "reported once per transition"
         );
     }
 
@@ -8772,7 +11536,9 @@ mod tests {
 
         let folded = StubForge::new();
         folded.edit(busy_pr);
-        folded.edit(|s| s.folded = Some(FoldedRead::default()));
+        // Turning on the folded host capability is not a PR change: keep the
+        // PR record's `updatedAt` equal to the per-signal forge's.
+        folded.edit_quiet(|s| s.folded = Some(FoldedRead::default()));
         let snapshot = fetch_shared_snapshot(&folded, &repo, 42)
             .await
             .expect("folded fetch");
@@ -9010,9 +11776,12 @@ mod tests {
             let repo = repo.clone();
             async move { svc.serve_pr(&repo, 42).await }
         });
-        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("serve_pr reaches the miss→fetch window");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("serve_pr reaches the miss→fetch window");
         assert_eq!(forge.fetches(), 0, "parked before its own fetch");
 
         // The concurrent fill: another reader stores #42 while the first
@@ -9201,7 +11970,7 @@ mod tests {
 
         let forge = StubForge::new();
         forge.edit(busy_pr);
-        forge.edit(|s| {
+        forge.edit_quiet(|s| {
             s.folded = Some(FoldedRead {
                 overflow_reviews: true,
                 ..FoldedRead::default()
@@ -9220,7 +11989,7 @@ mod tests {
 
         let forge = StubForge::new();
         forge.edit(busy_pr);
-        forge.edit(|s| {
+        forge.edit_quiet(|s| {
             s.folded = Some(FoldedRead {
                 overflow_threads: true,
                 ..FoldedRead::default()
@@ -9248,7 +12017,7 @@ mod tests {
     async fn a_failing_folded_read_falls_back_and_a_rate_limited_one_propagates() {
         let repo = RepoRef::new("o", "r");
         let forge = StubForge::new();
-        forge.edit(|s| {
+        forge.edit_quiet(|s| {
             s.folded = Some(FoldedRead {
                 fail: true,
                 ..FoldedRead::default()
@@ -9267,7 +12036,7 @@ mod tests {
         // the failed observation attempt precedes the per-signal REST
         // fallback's eight reads, so this host pays nine, not eight.
         let forge = StubForge::new();
-        forge.edit(|s| {
+        forge.edit_quiet(|s| {
             s.folded = Some(FoldedRead {
                 fail: true,
                 ..FoldedRead::default()
@@ -9324,9 +12093,9 @@ mod tests {
             s.folded = Some(FoldedRead::default());
         });
         let folded = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
-        forge.edit(|s| s.folded.as_mut().unwrap().fail = true);
+        forge.edit_quiet(|s| s.folded.as_mut().unwrap().fail = true);
         let fallback = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
-        forge.edit(|s| s.folded.as_mut().unwrap().fail = false);
+        forge.edit_quiet(|s| s.folded.as_mut().unwrap().fail = false);
         let folded_again = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
         assert_eq!(forge.sub_fetches("pr_observation"), 3);
         assert_eq!(forge.sub_fetches("list_comments"), 1);
@@ -9795,15 +12564,17 @@ mod tests {
             .unwrap());
     }
 
-    /// Simulate `secs` of wall-clock passing for the due-sweep: shift every
-    /// active monitor's `lastPolledAt` back by that much (a missing stamp
-    /// stays missing).
-    async fn age_all(svc: &Services, secs: i64) {
+    /// Rewrite every active monitor's `lastPolledAt` through `restamp`,
+    /// preserving the rest of its poll state (a missing stamp stays missing).
+    async fn restamp_all(
+        svc: &Services,
+        restamp: impl Fn(time::OffsetDateTime) -> time::OffsetDateTime,
+    ) {
         for row in svc.store().load_active_pr_monitors().await.unwrap() {
             let Some(at) = row.last_polled_at.as_deref().and_then(parse_iso) else {
                 continue;
             };
-            let aged = (at - time::Duration::seconds(secs))
+            let restamped = restamp(at)
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap();
             assert!(svc
@@ -9816,7 +12587,7 @@ mod tests {
                         pending_changes: &row.pending_changes,
                         pending_since: row.pending_since.as_deref(),
                         last_change_at: row.last_change_at.as_deref(),
-                        last_polled_at: Some(&aged),
+                        last_polled_at: Some(&restamped),
                         last_error: row.last_error.as_deref(),
                         updated_at: &now_iso(),
                         expected_updated_at: &row.updated_at,
@@ -9825,6 +12596,25 @@ mod tests {
                 .await
                 .unwrap());
         }
+    }
+
+    /// Simulate `secs` of wall-clock passing for the due-sweep: shift every
+    /// active monitor's `lastPolledAt` back by that much. The shift is
+    /// relative to the stored stamp, so real time elapsed since that stamp
+    /// adds to it: use [`polled_ago_all`] when a test needs a monitor to stay
+    /// FRESH against a threshold.
+    async fn age_all(svc: &Services, secs: i64) {
+        restamp_all(svc, |at| at - time::Duration::seconds(secs)).await;
+    }
+
+    /// Stamp every active monitor's `lastPolledAt` exactly `secs` before
+    /// now. Unlike [`age_all`], the result does not depend on how much real
+    /// time passed since registration, so a test asserting "fresh" vs
+    /// "stale" against a minimum age keeps a wide margin on both sides of
+    /// the threshold on a loaded runner.
+    async fn polled_ago_all(svc: &Services, secs: i64) {
+        let at = time::OffsetDateTime::now_utc() - time::Duration::seconds(secs);
+        restamp_all(svc, |_| at).await;
     }
 
     #[tokio::test]
@@ -9947,6 +12737,337 @@ mod tests {
         );
     }
 
+    /// An `agent:idle` nudge polls the workspace's monitors whose last poll
+    /// is at least 60 s old even when the idle tier would wait, skips
+    /// fresher ones, other workspaces' PRs, and a rate-limit pause.
+    #[tokio::test]
+    async fn idle_nudge_polls_only_stale_monitors_in_the_workspace() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_poll_seconds(60);
+        let monitor = register(&svc, &ws, &owner).await;
+        let other_ws = WorkspaceId::new();
+        svc.store()
+            .insert_workspace(&workspace(&other_ws))
+            .await
+            .unwrap();
+        svc.store()
+            .insert_agent_session(&agent(&other_ws, "agent-other"))
+            .await
+            .unwrap();
+        let (other, _) = svc
+            .pr_monitor_register(&other_ws, &AgentId::from("agent-other"), "o", "r", 7)
+            .await
+            .expect("register");
+        make_workspace_idle(&svc, &ws).await;
+        make_workspace_idle(&svc, &other_ws).await;
+        let stamp = |id: PrMonitorId| {
+            let svc = svc.clone();
+            async move {
+                svc.store()
+                    .get_pr_monitor(&id)
+                    .await
+                    .unwrap()
+                    .last_polled_at
+            }
+        };
+
+        // Absolute stamps, well clear of the 60 s minimum age on both sides:
+        // a stamp relative to registration (e.g. "59 s older") turns stale
+        // after one real second of setup on a loaded runner.
+        polled_ago_all(&svc, 30).await;
+        forge.take_fetched_numbers();
+        let fresh = stamp(monitor.monitor_id.clone()).await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(forge.take_fetched_numbers().is_empty(), "polled < 60 s ago");
+        assert_eq!(stamp(monitor.monitor_id.clone()).await, fresh);
+
+        polled_ago_all(&svc, 120).await;
+        svc.sweep_rate_limit
+            .pause_for(std::time::Duration::from_secs(3600), false);
+        let paused = stamp(monitor.monitor_id.clone()).await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(forge.take_fetched_numbers().is_empty(), "rate-limit pause");
+        assert_eq!(stamp(monitor.monitor_id.clone()).await, paused);
+        svc.sweep_rate_limit.lift();
+
+        let other_before = stamp(other.monitor_id.clone()).await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert_eq!(forge.take_fetched_numbers(), vec![42], "one stale poll");
+        assert_ne!(stamp(monitor.monitor_id.clone()).await, paused);
+        assert_eq!(
+            stamp(other.monitor_id.clone()).await,
+            other_before,
+            "another workspace's PR is untouched"
+        );
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(forge.take_fetched_numbers().is_empty(), "just polled");
+    }
+
+    /// The nudge replaces only the idle tier: the hourly-budget cadence, the
+    /// quota-stretched cadence, and the per-tick fetch cap still bound it.
+    #[tokio::test]
+    async fn idle_nudge_honours_budget_quota_cadence_and_fetch_cap() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc
+            .with_pr_monitor_poll_seconds(60)
+            .with_pr_monitor_hourly_request_budget(100)
+            .with_pr_monitor_quota_share_percent(50);
+        let mut ids = Vec::new();
+        for pr in 1_u64..=3 {
+            let (m, _) = svc
+                .pr_monitor_register(&ws, &owner, "o", "r", pr)
+                .await
+                .expect("register");
+            ids.push(m.monitor_id);
+        }
+        make_workspace_idle(&svc, &ws).await;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stale = |secs: u64| {
+            let svc = svc.clone();
+            let ids = ids.clone();
+            async move {
+                let at = intent_core::iso_from_unix_secs((now_unix - secs).cast_signed());
+                for id in &ids {
+                    backdate(&svc, id, &at).await;
+                }
+            }
+        };
+        forge.take_fetched_numbers();
+
+        // Budget only (no quota signal): 3 PRs × 3 requests × 3600 / 100 =
+        // 324 s per PR. Two minutes stale is past the 60 s floor but not due.
+        stale(120).await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(forge.take_fetched_numbers().is_empty(), "budget cadence");
+        // Past the budget cadence the fetch cap allows one PR per nudge.
+        stale(400).await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert_eq!(forge.take_fetched_numbers().len(), 1, "fetch cap");
+
+        // Low quota: 20 requests left for an hour at a 50 % share pays for
+        // 3 × 3 × 3600 / 10 = 3240 s per PR; ten-minute-stale PRs wait.
+        forge.edit(|s| {
+            s.rate_limit_remaining = Some(20);
+            s.rate_limit_limit = Some(5_000);
+            s.rate_limit_reset_at = Some(now_unix + 3600);
+        });
+        stale(600).await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(forge.take_fetched_numbers().is_empty(), "quota cadence");
+        stale(2 * 86_400).await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert_eq!(
+            forge.take_fetched_numbers().len(),
+            1,
+            "a stretched cadence still caps the nudge at one fetch"
+        );
+        // A share that cannot pay for one fetch defers everything.
+        forge.edit(|s| s.rate_limit_remaining = Some(2));
+        stale(2 * 86_400).await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(forge.take_fetched_numbers().is_empty(), "quota deferral");
+    }
+
+    /// The 60 s floor holds per monitor: a fresh monitor's catch-up marker
+    /// does not win the nudge a fetch, and its `lastPolledAt` is kept.
+    #[tokio::test]
+    async fn idle_nudge_ignores_fresh_catch_up_monitors() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_poll_seconds(60);
+        let stale_monitor = register(&svc, &ws, &owner).await;
+        let (caught_up, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 7)
+            .await
+            .expect("register");
+        make_workspace_idle(&svc, &ws).await;
+        let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+        let stale = intent_core::iso_from_unix_secs(now_unix - 120);
+        let fresh = intent_core::iso_from_unix_secs(now_unix - 10);
+        backdate(&svc, &stale_monitor.monitor_id, &stale).await;
+        backdate(&svc, &caught_up.monitor_id, &fresh).await;
+        svc.pr_monitor_catch_up.lock().unwrap().insert(
+            caught_up.monitor_id.clone(),
+            time::OffsetDateTime::now_utc(),
+        );
+        forge.take_fetched_numbers();
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert_eq!(forge.take_fetched_numbers(), vec![42], "only the stale PR");
+        let polled = |id: PrMonitorId| {
+            let svc = svc.clone();
+            async move {
+                svc.store()
+                    .get_pr_monitor(&id)
+                    .await
+                    .unwrap()
+                    .last_polled_at
+            }
+        };
+        assert_ne!(
+            polled(stale_monitor.monitor_id.clone()).await.as_deref(),
+            Some(stale.as_str())
+        );
+        assert_eq!(
+            polled(caught_up.monitor_id.clone()).await.as_deref(),
+            Some(fresh.as_str()),
+            "a fresh catch-up monitor is not nudged"
+        );
+    }
+
+    /// Two workspaces watching one PR share its freshness: nudging A polls
+    /// the PR once and stamps B's stale sibling too, so neither the next due
+    /// sweep nor B's own nudge fetches the PR again within the 60 s floor.
+    #[tokio::test]
+    async fn idle_nudge_shares_pr_freshness_across_workspaces() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_poll_seconds(60);
+        let a = register(&svc, &ws, &owner).await;
+        let other_ws = WorkspaceId::new();
+        svc.store()
+            .insert_workspace(&workspace(&other_ws))
+            .await
+            .unwrap();
+        svc.store()
+            .insert_agent_session(&agent(&other_ws, "agent-other"))
+            .await
+            .unwrap();
+        let b = register(&svc, &other_ws, &AgentId::from("agent-other")).await;
+        make_workspace_idle(&svc, &ws).await;
+        let stamp = |id: PrMonitorId| {
+            let svc = svc.clone();
+            async move {
+                svc.store()
+                    .get_pr_monitor(&id)
+                    .await
+                    .unwrap()
+                    .last_polled_at
+            }
+        };
+        age_all(&svc, 120).await;
+        forge.take_fetched_numbers();
+        let b_before = stamp(b.monitor_id.clone()).await;
+
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert_eq!(forge.take_fetched_numbers(), vec![42], "one shared fetch");
+        assert_ne!(
+            stamp(b.monitor_id.clone()).await,
+            b_before,
+            "the stale sibling shares the fetch"
+        );
+        assert!(polled_within(
+            stamp(a.monitor_id.clone()).await.as_deref(),
+            60,
+            time::OffsetDateTime::now_utc()
+        ));
+
+        svc.poll_due_pr_monitors().await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "the due sweep sees the PR as fresh"
+        );
+        svc.nudge_workspace_pr_monitors(&other_ws, 60).await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "B's nudge sees the PR as fresh"
+        );
+    }
+
+    /// The 60 s floor is per PR: a sibling polled inside it keeps A's nudge
+    /// from fetching the PR, and both monitors keep their timestamps.
+    #[tokio::test]
+    async fn idle_nudge_skips_a_pr_with_a_fresh_sibling() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_poll_seconds(60);
+        let a = register(&svc, &ws, &owner).await;
+        let other_ws = WorkspaceId::new();
+        svc.store()
+            .insert_workspace(&workspace(&other_ws))
+            .await
+            .unwrap();
+        svc.store()
+            .insert_agent_session(&agent(&other_ws, "agent-other"))
+            .await
+            .unwrap();
+        let b = register(&svc, &other_ws, &AgentId::from("agent-other")).await;
+        let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+        let stale = intent_core::iso_from_unix_secs(now_unix - 120);
+        let fresh = intent_core::iso_from_unix_secs(now_unix - 30);
+        backdate(&svc, &a.monitor_id, &stale).await;
+        backdate(&svc, &b.monitor_id, &fresh).await;
+        forge.take_fetched_numbers();
+
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "PR polled 30 s ago"
+        );
+        let polled = |id: PrMonitorId| {
+            let svc = svc.clone();
+            async move {
+                svc.store()
+                    .get_pr_monitor(&id)
+                    .await
+                    .unwrap()
+                    .last_polled_at
+            }
+        };
+        assert_eq!(
+            polled(a.monitor_id.clone()).await.as_deref(),
+            Some(stale.as_str())
+        );
+        assert_eq!(
+            polled(b.monitor_id.clone()).await.as_deref(),
+            Some(fresh.as_str())
+        );
+    }
+
+    /// The nudge and the legacy sweep share one lane: a nudge skips while a
+    /// sweep holds it, a sweep waits for it, and the nudge after the sweep
+    /// re-reads `lastPolledAt` and does not poll the PR again.
+    #[tokio::test]
+    async fn idle_nudge_and_due_sweep_never_poll_concurrently() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_poll_seconds(60);
+        register(&svc, &ws, &owner).await;
+        age_all(&svc, 120).await;
+        forge.take_fetched_numbers();
+
+        let held = svc.legacy_pr_monitor_poll_lane.clone().lock_owned().await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "a nudge never overlaps a running sweep"
+        );
+        let sweep = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.poll_due_pr_monitors().await })
+        };
+        assert!(
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(200)),
+                async {
+                    while !sweep.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            )
+            .await
+            .is_err(),
+            "the sweep waits for the lane"
+        );
+        assert!(forge.take_fetched_numbers().is_empty());
+        drop(held);
+        sweep.await.unwrap();
+        assert_eq!(forge.take_fetched_numbers(), vec![42]);
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "the nudge re-reads the sweep's poll"
+        );
+    }
+
     async fn make_workspace_idle(svc: &Services, ws: &WorkspaceId) {
         sqlx::query("UPDATE workspace SET created_at = '2020-01-01T00:00:00Z', last_content_activity = '2020-01-01T00:00:00Z' WHERE id = ?")
             .bind(&ws.0)
@@ -9991,7 +13112,7 @@ mod tests {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
         register(&svc, &ws, &owner).await;
         make_workspace_idle(&svc, &ws).await;
-        age_all(&svc, 901).await;
+        age_all(&svc, 3601).await;
         forge.take_fetched_numbers();
         svc.poll_due_pr_monitors().await;
         assert_eq!(forge.take_fetched_numbers(), vec![42]);
@@ -10017,7 +13138,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(intervals[&ws], 900);
+        assert_eq!(intervals[&ws], 3600);
         assert_eq!(intervals[&WorkspaceId::from("missing")], 60);
     }
 
@@ -10495,7 +13616,8 @@ mod tests {
         // The deferral is decided by the registration's one quota probe;
         // once that probe is counted, the next await is the gate section.
         async fn probed(forge: &StubForge, n: usize) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let deadline = std::time::Instant::now()
+                + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
             while forge.sub_fetches("rate_limit_status") < n {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -12371,6 +15493,7 @@ mod tests {
         let candidate = |anchor, catch_up, pr| DueCandidate {
             anchor,
             catch_up,
+            observed: false,
             interval: time::Duration::ZERO,
             monitor: mk(pr),
         };
@@ -12715,6 +15838,177 @@ mod tests {
             .unwrap());
     }
 
+    /// Rewrite a monitor's persisted snapshot columns into the encoding used
+    /// before skipped checks were told apart: no `skippedTracked` marker, no
+    /// `skipped` count, and every skipped check recorded as `passed`.
+    async fn forge_pre_skipped_encoding(svc: &Services, id: &PrMonitorId) {
+        let row = svc.store().get_pr_monitor(id).await.unwrap();
+        let legacy = |col: &Option<String>| -> Option<String> {
+            let mut v: Value = serde_json::from_str(col.as_deref()?).ok()?;
+            v.as_object_mut()?.remove("skippedTracked");
+            let checks = v["requirements"]["checks"].as_object_mut()?;
+            let skipped = checks.remove("skipped")?.as_i64()?;
+            let passed = checks["passed"].as_i64()?;
+            checks.insert("passed".into(), json!(passed + skipped));
+            for item in checks.get_mut("items")?.as_array_mut()? {
+                if item["status"] == "skipped" {
+                    item["status"] = json!("passed");
+                }
+            }
+            serde_json::to_string(&v).ok()
+        };
+        let (last, baseline) = (legacy(&row.last_snapshot), legacy(&row.baseline_snapshot));
+        assert!(
+            last.is_some() && baseline.is_some(),
+            "both columns rewritten"
+        );
+        assert!(svc
+            .store()
+            .update_pr_monitor_poll(
+                id,
+                PrMonitorPollUpdate {
+                    last_snapshot: last.as_deref(),
+                    baseline_snapshot: baseline.as_deref(),
+                    pending_changes: &row.pending_changes,
+                    pending_since: row.pending_since.as_deref(),
+                    last_change_at: row.last_change_at.as_deref(),
+                    last_polled_at: row.last_polled_at.as_deref(),
+                    last_error: None,
+                    updated_at: &now_iso(),
+                    expected_updated_at: &row.updated_at,
+                },
+            )
+            .await
+            .unwrap());
+    }
+
+    /// The upgrade path for skipped checks: a baseline persisted before them
+    /// recorded `coverage-all` as `passed`. The first post-upgrade poll sees
+    /// it as `skipped` and must re-encode the baseline silently; a later real
+    /// `passed → skipped` transition is still reported.
+    #[tokio::test]
+    async fn a_pre_upgrade_baseline_adopts_skipped_checks_silently() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(MIN_PR_MONITOR_DEBOUNCE_SECONDS);
+        let check = |name: &str, state: CheckState| RollupCheck {
+            name: name.into(),
+            kind: RollupCheckKind::CheckRun,
+            state,
+            is_required: false,
+            url: None,
+            started_at: None,
+        };
+        forge.edit(|s| {
+            s.checks = vec![
+                check("build", CheckState::Success),
+                check("coverage-all", CheckState::Skipped),
+                check("lint", CheckState::Success),
+            ];
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+        forge_pre_skipped_encoding(&svc, &monitor.monitor_id).await;
+
+        forge.edit(|s| s.mergeable_state = "clean".into());
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            !row.pending_changes.iter().any(|c| c.contains("skipped")),
+            "the legacy encoding is adopted, not reported: {:?}",
+            row.pending_changes
+        );
+        let baseline: PrMonitorSnapshot =
+            serde_json::from_str(row.baseline_snapshot.as_deref().unwrap()).unwrap();
+        assert!(baseline.skipped_tracked);
+        assert_eq!(
+            (
+                baseline.requirements.checks.passed,
+                baseline.requirements.checks.skipped
+            ),
+            (2, 1)
+        );
+
+        forge.edit(|s| s.checks[2].state = CheckState::Skipped);
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            row.pending_changes
+                .iter()
+                .any(|c| c == "check lint: passed → skipped"),
+            "a real transition after adoption is reported: {:?}",
+            row.pending_changes
+        );
+    }
+
+    /// A check first seen already skipped on an unchanged head is silent,
+    /// like one first seen passing, but it must still be adopted into the
+    /// emit baseline so its later removal or required-flag flip reports.
+    #[tokio::test]
+    async fn a_check_first_seen_skipped_is_adopted_into_the_baseline() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(MIN_PR_MONITOR_DEBOUNCE_SECONDS);
+        let monitor = register(&svc, &ws, &owner).await;
+        let skipped = |name: &str| RollupCheck {
+            name: name.into(),
+            kind: RollupCheckKind::CheckRun,
+            state: CheckState::Skipped,
+            is_required: false,
+            url: None,
+            started_at: None,
+        };
+        forge.edit(|s| {
+            s.checks.push(skipped("coverage-all"));
+            s.checks.push(skipped("coverage-e2e"));
+        });
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            row.pending_changes.is_empty(),
+            "checks first seen skipped are silent: {:?}",
+            row.pending_changes
+        );
+
+        forge.edit(|s| {
+            s.checks.retain(|c| c.name != "coverage-all");
+            s.checks
+                .iter_mut()
+                .find(|c| c.name == "coverage-e2e")
+                .unwrap()
+                .is_required = true;
+        });
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            row.pending_changes
+                .iter()
+                .any(|c| c == "check removed: coverage-all"),
+            "{:?}",
+            row.pending_changes
+        );
+        assert!(
+            row.pending_changes
+                .iter()
+                .any(|c| c == "check coverage-e2e is now required to merge"),
+            "{:?}",
+            row.pending_changes
+        );
+    }
+
     /// The upgrade path for ejection tracking: a baseline persisted before
     /// `mergeQueueEjection` existed carries no event, so the first
     /// post-upgrade poll would misread whatever HISTORICAL removal event the
@@ -12869,6 +16163,209 @@ mod tests {
                 .count(),
             1,
             "no re-report after the wake: {text}"
+        );
+    }
+
+    /// A merge-queue ejection is news on the very next poll, even when that
+    /// poll reuses the previous full fetch: GitHub leaves `updatedAt` alone
+    /// on queue movement, so the fingerprint is unchanged and only the
+    /// folded observation sees the removal. Waiting for the next FULL fetch
+    /// let a re-queue land first, and the ejection was then suppressed as
+    /// superseded (intent-hq/intent#7523). A removal that records a merge
+    /// is still never an ejection.
+    #[tokio::test]
+    async fn a_cheap_poll_reports_a_merge_queue_ejection() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        forge.edit(|s| {
+            s.folded = Some(FoldedRead::default());
+            s.in_merge_queue = Some(true);
+            s.merge_queue_entry = Some(intent_sourcecontrol::MergeQueueEntry {
+                position: 1,
+                queue_size: Some(1),
+                state: Some("awaiting_checks".into()),
+                enqueued_at: Some("2026-10-21T13:10:00Z".into()),
+                estimated_time_to_merge: None,
+            });
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+        svc.poll_pr_monitors().await;
+        let _ = svc
+            .pr_monitor_flush(&ws, &monitor.monitor_id)
+            .await
+            .unwrap();
+
+        let eject = |reason: &str| {
+            let removal = intent_sourcecontrol::MergeQueueRemoval {
+                at: "2026-10-21T13:18:28Z".into(),
+                reason: Some(reason.into()),
+            };
+            move |s: &mut ForgeState| {
+                s.in_merge_queue = Some(false);
+                s.merge_queue_entry = None;
+                s.merge_queue_removal = Some(removal);
+            }
+        };
+        let poll_cheaply = async |reason: &str| {
+            forge.edit_quiet(eject(reason));
+            let rules_before = forge.sub_fetches("branch_rules");
+            svc.poll_pr_monitors().await;
+            assert_eq!(
+                forge.sub_fetches("branch_rules"),
+                rules_before,
+                "the poll reused the previous full fetch: {:?}",
+                forge_reads(&forge)
+            );
+            svc.store()
+                .get_pr_monitor(&monitor.monitor_id)
+                .await
+                .unwrap()
+                .pending_changes
+        };
+
+        let merged = poll_cheaply("merged").await;
+        assert!(
+            !merged
+                .iter()
+                .any(|c| c.starts_with("removed from the merge queue")),
+            "a merge-recording removal is no ejection: {merged:?}"
+        );
+        let _ = svc
+            .pr_monitor_flush(&ws, &monitor.monitor_id)
+            .await
+            .unwrap();
+        forge.edit_quiet(|s| {
+            s.in_merge_queue = Some(true);
+            s.merge_queue_removal = None;
+        });
+        svc.poll_pr_monitors().await;
+        let _ = svc
+            .pr_monitor_flush(&ws, &monitor.monitor_id)
+            .await
+            .unwrap();
+
+        let ejected = poll_cheaply("failed_checks").await;
+        assert!(
+            ejected
+                .iter()
+                .any(|c| c == "removed from the merge queue (failed checks)"),
+            "the cheap poll reports the ejection: {ejected:?}"
+        );
+    }
+
+    /// intent-hq/intent#7523 regression: the PR was ejected (13:18:28Z) and
+    /// re-queued (13:21:58Z) before the monitor first observed the ejection.
+    /// The stale event predates the current queue entry, so it is adopted as
+    /// history and never reported — not even once a later poll loses the
+    /// queue state — while a later ejection is still news.
+    #[tokio::test]
+    async fn an_ejection_older_than_the_current_queue_entry_is_not_reported() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        let stale = intent_sourcecontrol::MergeQueueRemoval {
+            at: "2026-10-21T13:18:28Z".into(),
+            reason: Some("failed_checks".into()),
+        };
+        forge.edit(|s| {
+            s.merge_queue_removal = Some(stale.clone());
+            s.in_merge_queue = Some(true);
+            s.merge_queue_entry = Some(intent_sourcecontrol::MergeQueueEntry {
+                position: 1,
+                queue_size: Some(1),
+                state: Some("awaiting_checks".into()),
+                enqueued_at: Some("2026-10-21T13:21:58Z".into()),
+                estimated_time_to_merge: None,
+            });
+        });
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            row.pending_changes
+                .iter()
+                .any(|c| c == "entered the merge queue"),
+            "the re-queue itself is observed: {:?}",
+            row.pending_changes
+        );
+        assert!(
+            !row.pending_changes
+                .iter()
+                .any(|c| c.starts_with("removed from the merge queue")),
+            "the superseded ejection is not reported: {:?}",
+            row.pending_changes
+        );
+        let last: PrMonitorSnapshot =
+            serde_json::from_str(row.last_snapshot.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            last.requirements
+                .merge_queue_ejection
+                .as_ref()
+                .map(|e| e.at.as_str()),
+            Some(stale.at.as_str()),
+            "the stale event stays in the snapshot as history"
+        );
+
+        // The decision persists once the queue state is lost before the
+        // wake: a degraded probe (the event is held, the queue state is
+        // not), then the PR leaving the queue with the stale event still
+        // the latest.
+        let assert_no_stale_line = |row: &PrMonitor, when: &str| {
+            assert!(
+                !row.pending_changes
+                    .iter()
+                    .any(|c| c.starts_with("removed from the merge queue")),
+                "{when}: the superseded ejection stays unreported: {:?}",
+                row.pending_changes
+            );
+        };
+        forge.edit(|s| s.fail_merge_requirements = true);
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_no_stale_line(&row, "degraded probe");
+        forge.edit(|s| {
+            s.fail_merge_requirements = false;
+            s.in_merge_queue = None;
+            s.merge_queue_entry = None;
+        });
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_no_stale_line(&row, "left the queue");
+
+        // The queue ejects the PR again: a NEW event, after the entry, is
+        // reported.
+        forge.edit(|s| {
+            s.merge_queue_removal = Some(intent_sourcecontrol::MergeQueueRemoval {
+                at: "2026-10-21T13:30:00Z".into(),
+                reason: Some("failed_checks".into()),
+            });
+            s.in_merge_queue = None;
+            s.merge_queue_entry = None;
+        });
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            row.pending_changes
+                .iter()
+                .any(|c| c == "removed from the merge queue (failed checks)"),
+            "a fresh ejection is still reported: {:?}",
+            row.pending_changes
         );
     }
 
@@ -13722,7 +17219,10 @@ mod tests {
             Some(intent_core::WorkspaceDisplayStatus::PrMerged),
             "the fresh terminal fold outranks the monitor's stale open snapshot"
         );
-        let list = svc.list_workspaces(false).await.unwrap();
+        let list = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .unwrap();
         assert_eq!(
             list.iter().find(|w| w.id == ws).unwrap().display_status,
             Some(intent_core::WorkspaceDisplayStatus::PrMerged),
@@ -14202,6 +17702,48 @@ mod tests {
         );
     }
 
+    /// `workspace.retire` on an Active workspace runs the archive teardown
+    /// first, so every ACTIVE PR monitor is cancelled as on archive.
+    #[intent_test_macros::daemon_test]
+    async fn workspace_retire_from_active_cancels_active_pr_monitors() {
+        use intent_core::WorkspaceApi;
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| s.pr_state = PrState::Open);
+        let (active, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 7)
+            .await
+            .expect("register");
+        assert!(svc.workspace_has_active_pr_monitors(&ws).await);
+        // Retire only admits a git worktree checkout: give the row one.
+        let scratch = crate::test_support::test_tempdir("intentd-retire-wt-");
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        row.repository_path = Some(scratch.path().join("repo").to_string_lossy().into_owned());
+        row.worktree_path = Some(
+            svc.workspaces_root
+                .clone()
+                .expect("test workspaces root")
+                .join(ws.as_str())
+                .join("wt")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+        svc.store().update_workspace(&row).await.unwrap();
+
+        let retired = svc
+            .retire_workspace(ws.clone(), None)
+            .await
+            .expect("retire");
+        assert_eq!(retired.status, intent_core::WorkspaceStatus::Retired);
+        let row = svc
+            .store()
+            .get_pr_monitor(&active.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(row.state, PrMonitorState::Cancelled);
+        assert!(!svc.workspace_has_active_pr_monitors(&ws).await);
+    }
+
     /// Regression for intent-hq/monorepo#1828: `workspace.archive` cancels
     /// every ACTIVE PR monitor in the workspace — state persisted to
     /// `cancelled`, `prMonitor:cancelled` emitted, owner told why — while
@@ -14283,7 +17825,8 @@ mod tests {
         // The owner learns why its watch stopped (store-only wake here: no
         // manager attached, so nothing can spawn a turn; the wake parks
         // behind the archived gate at most).
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
         loop {
             let text = owner_messages(&svc, &owner).await;
             if text.contains("workspace was archived") {
@@ -14307,6 +17850,18 @@ mod tests {
         );
     }
 
+    /// Wire `svc` to a settings registry loaded from a hand-edited
+    /// `[prMonitor]` config section, the input the read-time clamps guard
+    /// (the test overrides refuse out-of-range values instead). The `TempDir`
+    /// must outlive the returned service.
+    fn with_pr_monitor_config(svc: &Services, section: &str) -> (tempfile::TempDir, Services) {
+        let dir = crate::test_support::test_tempdir("intentd-pr-monitor-clamp-");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, format!("[prMonitor]\n{section}")).unwrap();
+        let registry = Arc::new(crate::settings_registry::SettingsRegistry::load(&path).unwrap());
+        (dir, svc.clone().with_settings_registry(registry))
+    }
+
     #[tokio::test]
     async fn poll_and_debounce_intervals_clamp_to_their_floors() {
         use intent_core::config::{
@@ -14321,10 +17876,10 @@ mod tests {
             svc.pr_monitor_debounce(),
             Duration::from_secs(DEFAULT_PR_MONITOR_DEBOUNCE_SECONDS)
         );
-        let clamped = svc
-            .clone()
-            .with_pr_monitor_poll_seconds(1)
-            .with_pr_monitor_debounce_seconds(1);
+        let (_dir, clamped) =
+            with_pr_monitor_config(&svc, "pollSeconds = 1\ndebounceSeconds = 0\n");
+        let effective = clamped.effective_settings().pr_monitor;
+        assert_eq!((effective.poll_seconds, effective.debounce_seconds), (1, 0));
         assert_eq!(
             clamped.pr_monitor_poll_interval(),
             Duration::from_secs(MIN_PR_MONITOR_POLL_SECONDS)
@@ -14333,6 +17888,96 @@ mod tests {
             clamped.pr_monitor_debounce(),
             Duration::from_secs(MIN_PR_MONITOR_DEBOUNCE_SECONDS)
         );
+    }
+
+    /// The test overrides refuse a value the daemon would not honour: the
+    /// read-time clamp would otherwise turn it into the nearest bound
+    /// silently, e.g. a `0` debounce into a 10s wait that a test expecting
+    /// an immediate wake mistakes for a delivery bug (intentd#2915).
+    #[tokio::test]
+    #[should_panic(expected = "with_pr_monitor_debounce_seconds(0) is below the 10s floor")]
+    async fn debounce_override_below_the_floor_panics_at_the_call_site() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        let _ = svc.with_pr_monitor_debounce_seconds(0);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "with_pr_monitor_poll_seconds(1) is below the 10s floor")]
+    async fn poll_override_below_the_floor_panics_at_the_call_site() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        let _ = svc.with_pr_monitor_poll_seconds(1);
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "with_pr_monitor_hourly_request_budget(0) is below the 60 requests/hour floor"
+    )]
+    async fn hourly_budget_override_below_the_floor_panics_at_the_call_site() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        let _ = svc.with_pr_monitor_hourly_request_budget(0);
+    }
+
+    #[tokio::test]
+    #[should_panic(
+        expected = "with_pr_monitor_hourly_request_budget(5001) is above the 5000 requests/hour ceiling"
+    )]
+    async fn hourly_budget_override_above_the_ceiling_panics_at_the_call_site() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        let _ = svc.with_pr_monitor_hourly_request_budget(MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET + 1);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "with_pr_monitor_quota_share_percent(0) is below the 1% floor")]
+    async fn quota_share_override_below_the_floor_panics_at_the_call_site() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        let _ = svc.with_pr_monitor_quota_share_percent(0);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "with_pr_monitor_quota_share_percent(101) is above the 100% ceiling")]
+    async fn quota_share_override_above_the_ceiling_panics_at_the_call_site() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        let _ = svc.with_pr_monitor_quota_share_percent(MAX_PR_MONITOR_QUOTA_SHARE_PERCENT + 1);
+    }
+
+    /// Every bound itself is a legal override and reads back unchanged.
+    #[tokio::test]
+    async fn overrides_at_their_bounds_are_honoured() {
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
+        assert_eq!(
+            svc.clone()
+                .with_pr_monitor_debounce_seconds(MIN_PR_MONITOR_DEBOUNCE_SECONDS)
+                .pr_monitor_debounce(),
+            Duration::from_secs(MIN_PR_MONITOR_DEBOUNCE_SECONDS)
+        );
+        assert_eq!(
+            svc.clone()
+                .with_pr_monitor_poll_seconds(MIN_PR_MONITOR_POLL_SECONDS)
+                .pr_monitor_poll_interval(),
+            Duration::from_secs(MIN_PR_MONITOR_POLL_SECONDS)
+        );
+        for budget in [
+            MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+        ] {
+            assert_eq!(
+                svc.clone()
+                    .with_pr_monitor_hourly_request_budget(budget)
+                    .pr_monitor_hourly_request_budget(),
+                budget
+            );
+        }
+        for percent in [
+            MIN_PR_MONITOR_QUOTA_SHARE_PERCENT,
+            MAX_PR_MONITOR_QUOTA_SHARE_PERCENT,
+        ] {
+            assert_eq!(
+                svc.clone()
+                    .with_pr_monitor_quota_share_percent(percent)
+                    .pr_monitor_quota_share_percent(),
+                percent
+            );
+        }
     }
 
     /// The hourly request budget getter clamps into [floor, ceiling]: a
@@ -14347,23 +17992,105 @@ mod tests {
             svc.pr_monitor_hourly_request_budget(),
             DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET
         );
+        for (configured, read) in [
+            (0, MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET),
+            (1_000_000, MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET),
+        ] {
+            let (_dir, clamped) =
+                with_pr_monitor_config(&svc, &format!("hourlyRequestBudget = {configured}\n"));
+            assert_eq!(
+                clamped
+                    .effective_settings()
+                    .pr_monitor
+                    .hourly_request_budget,
+                configured
+            );
+            assert_eq!(clamped.pr_monitor_hourly_request_budget(), read);
+        }
+    }
+
+    /// The quota share getter clamps into [1, 100] the same way.
+    #[tokio::test]
+    async fn quota_share_percent_clamps_to_floor_and_ceiling() {
+        use intent_core::config::DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT;
+        let (_db, _root, svc, _forge, _ws, _owner) = setup().await;
         assert_eq!(
-            svc.clone()
-                .with_pr_monitor_hourly_request_budget(0)
-                .pr_monitor_hourly_request_budget(),
-            MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET
+            svc.pr_monitor_quota_share_percent(),
+            DEFAULT_PR_MONITOR_QUOTA_SHARE_PERCENT
         );
-        assert_eq!(
-            svc.clone()
-                .with_pr_monitor_hourly_request_budget(1_000_000)
-                .pr_monitor_hourly_request_budget(),
-            MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET
+        for (configured, read) in [
+            (0, MIN_PR_MONITOR_QUOTA_SHARE_PERCENT),
+            (250, MAX_PR_MONITOR_QUOTA_SHARE_PERCENT),
+        ] {
+            let (_dir, clamped) =
+                with_pr_monitor_config(&svc, &format!("quotaSharePercent = {configured}\n"));
+            assert_eq!(
+                clamped.effective_settings().pr_monitor.quota_share_percent,
+                configured
+            );
+            assert_eq!(clamped.pr_monitor_quota_share_percent(), read);
+        }
+    }
+    #[intent_test_macros::daemon_test]
+    async fn qualified_and_legacy_identical_names_numbers_keep_independent_records() {
+        use crate::repository_read_source::tests::{run, ActualRead, ReadServer};
+        fn body(reply: &Value) -> Value {
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+        }
+        let provider = ReadServer::new().await;
+        let mut f = ActualRead::new(&provider).await;
+        let forge = StubForge::new();
+        f.auth.service = Arc::new(
+            f.auth
+                .service
+                .as_ref()
+                .clone()
+                .with_source_control(Arc::new(forge.clone())),
         );
+        f.auth
+            .registry
+            .apply(&[
+                ("workspaceApi.toonOutput".into(), json!(false)),
+                ("workspaceApi.maxOutputChars".into(), json!(0)),
+            ])
+            .unwrap();
+        let gl = body(&run(&f.server(), "return await ws.mr.monitor(4);").await);
+        let gh = body(
+            &run(
+                &f.server(),
+                "return await ws.pr.monitor(4,{repo:'group/project'});",
+            )
+            .await,
+        );
+        assert_ne!(gl["monitor"]["monitorId"], gh["monitor"]["monitorId"]);
+        assert_eq!(gl["monitor"]["repo"], gh["monitor"]["repo"]);
+        assert_eq!(gl["monitor"]["prNumber"], gh["monitor"]["prNumber"]);
         assert_eq!(
-            svc.clone()
-                .with_pr_monitor_hourly_request_budget(MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET)
-                .pr_monitor_hourly_request_budget(),
-            MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET
+            gl["monitor"]["resource"]["repository"]["provider"],
+            "gitlab"
+        );
+        assert!(
+            gh["monitor"].get("resource").is_none(),
+            "legacy shape remains unchanged"
+        );
+        let all = body(&run(&f.server(), "return await ws.pr.monitors();").await);
+        assert_eq!(all.as_array().unwrap().len(), 2);
+        let before = forge.get_pr_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let stopped = body(
+            &run(
+                &f.server(),
+                "return await ws.pr.unmonitor(4,{repo:'group/project'});",
+            )
+            .await,
+        );
+        assert_eq!(stopped["monitor"]["monitorId"], gh["monitor"]["monitorId"]);
+        let left = body(&run(&f.server(), "return await ws.mr.monitors();").await);
+        assert_eq!(left.as_array().unwrap().len(), 1);
+        assert_eq!(left[0]["monitorId"], gl["monitor"]["monitorId"]);
+        assert_eq!(
+            forge.get_pr_calls.load(std::sync::atomic::Ordering::SeqCst),
+            before
         );
     }
 }

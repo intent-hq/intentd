@@ -1,6 +1,8 @@
 //! Provider boundary only. Static hosts belong to their operator: release stops
 //! Intent agents through an authenticated control adapter, never the host.
 use intent_core::{nodes::LeaseOwner, Error, Result};
+
+pub mod journal;
 use std::{future::Future, pin::Pin};
 
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;

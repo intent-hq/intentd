@@ -91,8 +91,10 @@ fn select(root: &mut RepositoryRootContext, saved: &SavedReviewSelection) {
 
 #[test]
 fn only_exact_known_stamps_are_eligible() {
-    assert!(eligible_harness_version(Some("3.0")));
-    assert!(eligible_harness_version(Some("3.1")));
+    for version in intent_core::REPOSITORY_GUIDANCE_HARNESS_VERSIONS {
+        assert!(eligible_harness_version(Some(version)), "{version}");
+    }
+    let after_current = intent_core::harness_versions_after_current();
     for version in [
         None,
         Some(""),
@@ -114,10 +116,12 @@ fn only_exact_known_stamps_are_eligible() {
         Some("3.0\n"),
         Some(" 3.0"),
         Some("3.0\0"),
-        Some("3.2"),
         Some("99.0"),
         Some("unknown"),
-    ] {
+    ]
+    .into_iter()
+    .chain(after_current.iter().map(|v| Some(v.as_str())))
+    {
         assert!(!eligible_harness_version(version), "{version:?}");
         assert!(render(
             Some(&session(version)),
@@ -552,4 +556,53 @@ fn over_budget_inventory_keeps_complete_rows_and_reports_omitted_selection() {
     };
     assert!(worst.trailer().len() <= TRAILER_BUDGET);
     assert!(POLICY.len() + FACTS_HEADER.len() + TRAILER_BUDGET < MAX_GUIDANCE_BYTES);
+}
+
+#[test]
+fn monitor_guidance_preserves_old_stamps_and_features() {
+    let context = context();
+    for version in intent_core::REPOSITORY_GUIDANCE_HARNESS_VERSIONS
+        .iter()
+        .copied()
+    {
+        let mut owner = session(Some(version));
+        owner.harness_features = Some(json!({"prMonitor":false,"stateSnapshot":false}));
+        let before = owner.clone();
+        let output = render(
+            Some(&owner),
+            GuidanceContext::Current {
+                context: &context,
+                expected: &stamp(&context),
+            },
+        )
+        .unwrap();
+        let policy = output.text.split_once(FACTS_HEADER).unwrap().0;
+        assert_eq!(
+            policy,
+            if intent_core::harness_uses_repository_monitor_guidance(version) {
+                MONITOR_POLICY
+            } else {
+                POLICY
+            }
+        );
+        assert_eq!(owner.harness_version, before.harness_version);
+        assert_eq!(owner.harness_features, before.harness_features);
+        assert_eq!(facts(&output), facts(&render_context(&context)));
+    }
+    assert!(MONITOR_POLICY.len() + FACTS_HEADER.len() + TRAILER_BUDGET < MAX_GUIDANCE_BYTES);
+}
+
+#[test]
+fn current_monitor_guidance_golden_and_unavailable_context() {
+    let output = render(
+        Some(&session(Some("3.2"))),
+        GuidanceContext::Unavailable(ContextUnavailable::ContextChanged),
+    )
+    .unwrap();
+    assert_eq!(
+        output.text,
+        include_str!("repository_guidance_3_2_unavailable.txt")
+    );
+    assert!(output.context_stamp.is_none());
+    assert!(!output.text.contains("team/sub/app"));
 }

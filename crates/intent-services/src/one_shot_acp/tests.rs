@@ -411,14 +411,12 @@ const onPrompt = () => {{
         pidfile = pidfile.to_string_lossy(),
     ));
     let budget = Duration::from_millis(500);
-    // Upper bound = budget + spawn/setup + exit-observe/reap grace, with slack
-    // for a loaded host. Observed ~1.8 s on a quiet host; the hang this guards
-    // against never ends on its own.
-    let margin = Duration::from_secs(4);
+    // The hang this guards against never ends on its own, so the hang guard
+    // below catches it; PromptTimeout says the prompt budget ended the run.
     let slots = AdapterSlots::new(1);
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
-        Duration::from_secs(15),
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
         run_one_shot_acp_in(
             None,
             &slots,
@@ -440,10 +438,6 @@ const onPrompt = () => {{
         "expected PromptTimeout, got {err}"
     );
     assert!(elapsed >= budget, "finished before the budget: {elapsed:?}");
-    assert!(
-        elapsed < budget + margin,
-        "PromptTimeout arrived {elapsed:?} after start; budget {budget:?} + margin {margin:?}"
-    );
 
     let pid: i32 = std::fs::read_to_string(&pidfile)
         .expect("adapter wrote its pid")
@@ -546,11 +540,14 @@ async fn feed_requests(conn: &Connection, peer_out: &mut DuplexStream, requests:
         .await
         .expect("peer write");
     let expected = seq + requests.len() as u64;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while conn.client_request_seq() < expected {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while conn.client_request_seq() < expected {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("reader forwards every request");
 }
@@ -585,7 +582,10 @@ async fn response_pending_at_a_phase_boundary_is_carried_into_the_next_phase() {
     serve_requests_while(
         &mut responder,
         &mut requests,
-        tokio::time::timeout(Duration::from_millis(50), std::future::pending::<()>()),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
+            std::future::pending::<()>(),
+        ),
     )
     .await
     .expect_err("the phase clock ends the first phase");
@@ -600,20 +600,23 @@ async fn response_pending_at_a_phase_boundary_is_carried_into_the_next_phase() {
     let answer = serve_requests_while(
         &mut responder,
         &mut requests,
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let line = peer_in
-                    .next_line()
-                    .await
-                    .expect("peer read")
-                    .expect("peer line");
-                let msg: Value = serde_json::from_str(&line).expect("json");
-                if msg["id"] == json!(9001) {
-                    return msg;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                loop {
+                    let line = peer_in
+                        .next_line()
+                        .await
+                        .expect("peer read")
+                        .expect("peer line");
+                    let msg: Value = serde_json::from_str(&line).expect("json");
+                    if msg["id"] == json!(9001) {
+                        return msg;
+                    }
+                    assert_eq!(msg["method"], "x/fill", "unexpected line: {line}");
                 }
-                assert_eq!(msg["method"], "x/fill", "unexpected line: {line}");
-            }
-        }),
+            },
+        ),
     )
     .await
     .expect("the send carried across the phase boundary was never answered");
@@ -644,11 +647,11 @@ async fn phase_resolves_on_budget_while_a_response_send_is_pending_on_writer_cap
     )
     .await;
 
+    // fixed-deadline: allow — stays fixed: it is the phase clock under test, and `elapsed` is asserted against it
     let budget = Duration::from_millis(300);
-    let margin = Duration::from_secs(2);
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         serve_requests_while(
             &mut responder,
             &mut requests,
@@ -662,11 +665,10 @@ async fn phase_resolves_on_budget_while_a_response_send_is_pending_on_writer_cap
         outcome.is_err(),
         "the phase clock, not the send, ends the phase"
     );
+    // Only the phase clock can end the phase: the send stays pending (checked
+    // below), and before the fix the loop never returned — the hang guard
+    // above catches that.
     assert!(elapsed >= budget, "finished before the budget: {elapsed:?}");
-    assert!(
-        elapsed < budget + margin,
-        "phase resolved {elapsed:?} after start; budget {budget:?} + margin {margin:?}"
-    );
 
     // The first request was dequeued and its send left in flight (the loop
     // pulls no further request while one is pending), so the second is still
@@ -911,7 +913,8 @@ fn started_count(log: &std::path::Path) -> usize {
 
 /// Poll `cond` until it holds, failing with `what` if it never does.
 async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(20));
     while std::time::Instant::now() < deadline {
         if cond() {
             return;

@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use intent_core::config::DEFAULT_MAX_TOP_LEVEL_AGENTS;
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
-    model::{AgentDelegateInput, BatchTaskEntry},
+    model::{AgentDelegateInput, AgentWakeCreateOptions, BatchTaskEntry},
+    placement::AgentPlacement,
     AgentCreateExtra, AgentId, AgentStatus, AgentWakeOrCreateInput, Error, MessageOrigin, NoteId,
     WorkspaceApi, WorkspaceId, MAX_DELEGATION_DEPTH,
 };
@@ -219,12 +220,12 @@ pub(crate) const PRELUDE: &str = r"
         diagnostics: (opts) =>
             host({ method: 'agent.diagnostics', args: { ...(opts || {}) } }),
         snapshot: () => host({ method: 'agent.snapshot', args: {} }),
-        wakeOrCreate: (taskNoteId, contextMessage, model, messageMetadata, reasoningEffort) =>
-            host({ method: 'agent.wakeOrCreate', args: { taskNoteId, contextMessage, model, messageMetadata, reasoningEffort } }),
+        wakeOrCreate: (taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, options) =>
+            host({ method: 'agent.wakeOrCreate', args: { taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, options } }),
         readConversation: (agentId, opts) =>
             host({ method: 'agent.readConversation', args: { agentId, ...(opts || {}) } }),
-        getMessageBlock: (agentId, messageId, blockId) =>
-            host({ method: 'agent.getMessageBlock', args: { agentId, messageId, blockId } }),
+        getMessageBlock: (agentId, messageId, blockId, opts) =>
+            host({ method: 'agent.getMessageBlock', args: { agentId, messageId, blockId, ...(opts || {}) } }),
         summary: (agentId) => host({ method: 'agent.summary', args: { agentId } }),
         reportToParent: (report) =>
             host({ method: 'agent.reportToParent', args: { report } }),
@@ -283,22 +284,9 @@ pub(crate) async fn dispatch(
     method: &str,
     args: &Value,
 ) -> Result<Value, String> {
-    let read = dispatch_inner(api, ws, caller, eval_budget, method, args);
-    // Hooks evaluate as Daemon, but these agent-facing reads belong to the
-    // hook owner just as they do in a live MCP turn.
-    let mut out = if let Some(agent_id) =
-        caller.filter(|_| matches!(method, "status" | "getQueue" | "diagnostics"))
-    {
-        intent_core::with_caller(
-            intent_core::Caller::Agent {
-                agent_id: agent_id.clone(),
-            },
-            read,
-        )
-        .await?
-    } else {
-        read.await?
-    };
+    // No caller re-scope here: the host binds the frame's agent as the
+    // ambient caller for every binding, hooks included.
+    let mut out = dispatch_inner(api, ws, caller, eval_budget, method, args).await?;
     strip_agent_hidden_fields(&mut out);
     Ok(out)
 }
@@ -344,6 +332,36 @@ async fn dispatch_inner(
         }
         "retire" => retire(api, ws, caller, args).await,
         other => Err(format!("host: unknown method `agent.{other}`")),
+    }
+}
+
+/// The optional `placement` argument: absent means a local agent; `null`
+/// and anything that is not a valid placement object are rejected.
+fn placement_arg(args: &Value) -> Result<Option<AgentPlacement>, String> {
+    match args.get("placement") {
+        None => Ok(None),
+        Some(Value::Null) => Err(
+            "placement must be an object such as { target: \"remote\", os: \"macos\" }; omit it for a local agent".to_string(),
+        ),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|e| format!("invalid placement: {e}")),
+    }
+}
+
+/// Copy a remote launch's notice and node into a binding result.
+fn remote_fields(created: &Value, out: &mut Value) {
+    let Some(out) = out.as_object_mut() else {
+        return;
+    };
+    if let Some(notice) = created.get("notice").filter(|v| v.is_string()) {
+        out.insert("notice".to_string(), notice.clone());
+    }
+    let agent = created.get("agent").unwrap_or(created);
+    for key in ["nodeId", "nodeName"] {
+        if let Some(value) = agent.get(key).filter(|v| v.is_string()) {
+            out.insert(key.to_string(), value.clone());
+        }
     }
 }
 
@@ -398,6 +416,7 @@ async fn create(
         is_background: Some(is_background),
         provider: opt_str(args, "provider"),
         reasoning_effort: opt_str(args, "reasoningEffort"),
+        placement: placement_arg(args)?,
         ..AgentCreateExtra::default()
     };
     let created = api
@@ -483,13 +502,15 @@ async fn create(
     {
         tracing::warn!(agent = %agent_id, error = %e, "agent.create: failed to start child turn");
     }
-    Ok(json!({
+    let mut out = json!({
         "ok": true,
         "id": agent_id,
         "agentId": agent_id,
         "name": agent_name,
         "subscriptionId": subscription_id,
-    }))
+    });
+    remote_fields(&created, &mut out);
+    Ok(out)
 }
 
 /// Cap on live top-level agents for `ws.agent.create({ topLevel: true })`,
@@ -638,6 +659,7 @@ async fn create_top_level(
         is_background: Some(is_background),
         provider: opt_str(args, "provider"),
         reasoning_effort: opt_str(args, "reasoningEffort"),
+        placement: placement_arg(args)?,
         ..AgentCreateExtra::default()
     };
     // `parent_agent_id: None` is the independence seam: the new agent is
@@ -694,13 +716,15 @@ async fn create_top_level(
     {
         tracing::warn!(agent = %agent_id, error = %e, "agent.create(topLevel): failed to start agent turn");
     }
-    Ok(json!({
+    let mut out = json!({
         "ok": true,
         "id": agent_id,
         "agentId": agent_id,
         "name": agent_name,
         "sponsorAgentId": caller.as_str(),
-    }))
+    });
+    remote_fields(&created, &mut out);
+    Ok(out)
 }
 
 async fn delegate(
@@ -717,7 +741,7 @@ async fn delegate(
                     Ok(entry) => entries.push(entry),
                     Err(_) => {
                         return Err(format!(
-                            "tasks entries must be task note id strings or {{ taskNoteId, specialist?, model?, provider?, reasoningEffort? }} objects, got: {v}"
+                            "tasks entries must be task note id strings or {{ taskNoteId, specialist?, model?, provider?, reasoningEffort?, placement? }} objects, got: {v}"
                         ));
                     }
                 }
@@ -740,6 +764,7 @@ async fn delegate(
         skip_auto_commit: opt_bool(args, "skipAutoCommit"),
         isolation: opt_str(args, "isolation"),
         force: opt_bool(args, "force"),
+        placement: placement_arg(args)?,
         tasks,
         // Presence-sensitive: `greedy` is REMOVED and any supplied value
         // (even `null`) must reach the service layer for its rejection.
@@ -1446,7 +1471,7 @@ async fn diagnostics(
     let task_note_id = opt_str(args, "taskNoteId").map(NoteId::from_string);
     let stale = args.get("staleRespondingAfterMs").and_then(Value::as_i64);
     let v = api
-        .agent_diagnostics(ws.clone(), agent_id, task_note_id, stale)
+        .agent_diagnostics(ws.clone(), agent_id, task_note_id, stale, None)
         .await
         .map_err(map_err)?;
     Ok(merge_ok(v))
@@ -1494,6 +1519,26 @@ async fn wake_or_create(
     // depth-guard lookup's name (no second `agent_get` round-trip).
     let message_metadata =
         merge_sender_attribution(explicit_metadata(args), caller, caller_name.as_deref());
+    // Optional sixth argument `{ create? }`: the public create options,
+    // used only when a new agent is created.
+    let create = match args.get("options") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(options)) => {
+            if let Some(key) = options.keys().find(|k| k.as_str() != "create") {
+                return Err(format!(
+                    "wakeOrCreate options accept only `create`, not `{key}`"
+                ));
+            }
+            match options.get("create") {
+                None | Some(Value::Null) => None,
+                Some(create) => Some(
+                    serde_json::from_value::<AgentWakeCreateOptions>(create.clone())
+                        .map_err(|e| format!("invalid wakeOrCreate options.create: {e}"))?,
+                ),
+            }
+        }
+        Some(_) => return Err("wakeOrCreate options must be an object".to_string()),
+    };
     let v = api
         .agent_wake_or_create(
             ws.clone(),
@@ -1504,6 +1549,7 @@ async fn wake_or_create(
                 reasoning_effort: opt_str(args, "reasoningEffort"),
                 caller_agent_id: caller.cloned(),
                 message_metadata,
+                create,
                 ..Default::default()
             },
         )
@@ -1548,11 +1594,13 @@ async fn read_conversation(
     Ok(v)
 }
 
-/// `ws.agent.getMessageBlock`: one FULL content block of one persisted
+/// `ws.agent.getMessageBlock`: one content block of one persisted
 /// message — the on-demand hydration counterpart of the slim
 /// `readConversation` above. Block ids are the served identity (persisted
-/// assistant ids and the synthetic `{messageId}:{index}` ids both resolve),
-/// and the returned block is the full, unprojected body.
+/// assistant ids and the synthetic `{messageId}:{index}` ids both resolve).
+/// The block is capped like the router method (PROTOCOL §5.5 "Capped and
+/// paged block reads"): a large body pages through the optional
+/// `{ offset?, maxBytes? }` and the result's `nextOffset`.
 async fn get_message_block(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -1563,9 +1611,37 @@ async fn get_message_block(
     let _ = require_active_target(api, ws, &agent_id).await?;
     let message_id = req_str(args, "messageId").map_err(|_| "messageId is required".to_string())?;
     let block_id = req_str(args, "blockId").map_err(|_| "blockId is required".to_string())?;
-    api.agent_get_message_block(agent_id, message_id, block_id, Some(ws.clone()))
+    let page = message_block_page(args)?;
+    api.agent_get_message_block(agent_id, message_id, block_id, Some(ws.clone()), page)
         .await
         .map_err(map_err)
+}
+
+/// Parse the optional `offset` / `maxBytes` paging options of
+/// `ws.agent.getMessageBlock`; the same messages as the router reject
+/// invalid values. Agents page in [`intent_core::AGENT_MESSAGE_BLOCK_MAX_BYTES`]
+/// pieces: an absent / `null` `maxBytes` defaults to it and a larger one is
+/// clamped down to it (the core cap still clamps small values up).
+pub(crate) fn message_block_page(args: &Value) -> Result<intent_core::MessageBlockPage, String> {
+    let int = |key: &str, min: u64, msg: &str| -> Result<Option<u64>, String> {
+        match args.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_u64()
+                .filter(|n| *n >= min)
+                .map(Some)
+                .ok_or_else(|| msg.to_string()),
+        }
+    };
+    Ok(intent_core::MessageBlockPage {
+        offset: int("offset", 0, "offset must be a non-negative integer")?,
+        max_bytes: Some(
+            int("maxBytes", 1, "maxBytes must be a positive integer")?
+                .map_or(intent_core::AGENT_MESSAGE_BLOCK_MAX_BYTES, |b| {
+                    b.min(intent_core::AGENT_MESSAGE_BLOCK_MAX_BYTES)
+                }),
+        ),
+    })
 }
 
 async fn summary(
@@ -1632,6 +1708,12 @@ async fn request_attention(
 /// wait for them first. On success the caller's settled descendants are
 /// cascade-retired with it (each with the full retire cleanup), and
 /// restoring the caller later does NOT restore them.
+///
+/// Also FAILS (invalid params, nothing mutated) when the caller is the
+/// workspace's last active top-level agent (no parent, not background, not
+/// retired): an agent may not leave the workspace without a visible agent.
+/// This holds from a background hook too: the call is always scoped as the
+/// agent caller.
 async fn retire(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -1646,6 +1728,9 @@ async fn retire(
         reason = reason.as_deref().unwrap_or("(none)"),
         "agent.retire: soft-retiring agent session"
     );
+    // The service's last-top-level-agent guard keys on `Caller::Agent`; the
+    // host binds the frame's agent around every binding, so a hook retire
+    // reaches it as the owner (dispatch `owner_scope_tests`).
     let v = api
         .agent_retire(caller.clone(), Some(ws.clone()), reason.clone())
         .await
@@ -2042,6 +2127,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn message_block_page_defaults_and_clamps_to_agent_page_size() {
+        use intent_core::AGENT_MESSAGE_BLOCK_MAX_BYTES as AGENT_MAX;
+        let page = message_block_page(&json!({})).unwrap();
+        assert_eq!(page.offset, None);
+        assert_eq!(page.max_bytes, Some(AGENT_MAX));
+        assert_eq!(page.cap(), 102_400);
+        let page = message_block_page(&json!({ "maxBytes": null, "offset": 7 })).unwrap();
+        assert_eq!((page.offset, page.max_bytes), (Some(7), Some(AGENT_MAX)));
+        let page = message_block_page(&json!({ "maxBytes": 480_000 })).unwrap();
+        assert_eq!(page.cap(), 102_400, "agent requests clamp down to 100 KiB");
+        let page = message_block_page(&json!({ "maxBytes": 50_000 })).unwrap();
+        assert_eq!(page.cap(), 50_000);
+        let page = message_block_page(&json!({ "maxBytes": 1 })).unwrap();
+        assert_eq!(page.cap(), intent_core::MESSAGE_BLOCK_MIN_BYTES);
+        assert_eq!(
+            message_block_page(&json!({ "maxBytes": 0 })).unwrap_err(),
+            "maxBytes must be a positive integer"
+        );
+        assert_eq!(
+            message_block_page(&json!({ "offset": -1 })).unwrap_err(),
+            "offset must be a non-negative integer"
+        );
+    }
+
+    #[test]
     fn agent_list_filter_omits_terminal_rows_by_default() {
         let f = parse_agent_list_filter(&json!({})).expect("empty args parse");
         assert!(f.retains(AgentStatus::Active, None));
@@ -2432,9 +2542,7 @@ mod tests {
 
     mod list_specialists {
         use super::super::*;
-        use intent_core::{
-            BoxFuture, Result, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-        };
+        use intent_core::{BoxFuture, Result, Workspace};
 
         /// `WorkspaceApi` fake: `get_workspace` serves a row with a worktree
         /// path (so the binding forwards it as the project-tier root) and
@@ -2453,49 +2561,10 @@ mod tests {
                         id,
                         title: "Agent".to_string(),
                         branch: "main".to_string(),
-                        base_ref: None,
-                        base_commit_sha: None,
-                        status: WorkspaceStatus::Active,
-                        status_message: None,
-                        status_image_asset_id: None,
-                        activity: WorkspaceActivity::Idle,
-                        attention: WorkspaceAttention::None,
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         updated_at: "2026-01-01T00:00:00Z".to_string(),
-                        last_activity: None,
-                        last_content_activity: None,
-                        tags: vec![],
-                        path: None,
-                        repository_path: None,
-                        repository_owner: None,
-                        repository_name: None,
                         worktree_path: Some("/tmp/ws-root".to_string()),
-                        scope: None,
-                        skip_worktree: false,
-                        setup_script: None,
-                        is_remote: false,
-                        default_model: None,
-                        pr_number: None,
-                        pr_url: None,
-                        pr_status: None,
-                        active_pull_request: None,
-                        pull_requests: None,
-                        context_links: None,
-                        archived: false,
-                        archived_at: None,
-                        task_stats: None,
-                        agent_summary: None,
-                        diff_summary: None,
-                        token_usage: None,
-                        cow_supported: None,
-                        browser_client_id: None,
-                        pull_requests_total: None,
-                        display_status: None,
-                        waiting: false,
-                        checkout_mode: None,
-                        disk_usage: None,
-                        pending_delete_at: None,
-                        membership: None,
+                        ..Default::default()
                     })
                 })
             }

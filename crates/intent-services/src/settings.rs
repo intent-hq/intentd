@@ -208,7 +208,7 @@ type MutationHook<T> = Arc<Mutex<Option<Box<dyn FnOnce() -> T + Send>>>>;
 /// most one blocking-pool thread total (not one per request). Cache entries are
 /// invalidated on successful writes and expire on TTL.
 #[derive(Clone)]
-pub(crate) struct AsyncSecretStore {
+pub struct AsyncSecretStore {
     paired_gitlab: Option<std::path::PathBuf>,
     repository_gate: Arc<OnceLock<GitlabCredentialGate>>,
     repository_write: Option<Arc<RepositorySettingsWrite>>,
@@ -438,6 +438,13 @@ impl AsyncSecretStore {
         wrapper
     }
 
+    pub(crate) fn paired_gitlab_source(&self) -> Result<intent_core::FileSecretStore> {
+        self.paired_gitlab
+            .as_ref()
+            .map(intent_core::FileSecretStore::with_path)
+            .ok_or_else(|| Error::Internal("original paired GitLab source unavailable".into()))
+    }
+
     pub(crate) fn is_paired_gitlab_store(&self, store: &intent_core::FileSecretStore) -> bool {
         self.paired_gitlab.as_deref() == Some(store.path())
     }
@@ -478,7 +485,12 @@ impl AsyncSecretStore {
     /// `Err` on timeout / backing-error. Concurrent callers for the same `account`
     /// are coalesced into a single `spawn_blocking`; a cached result is served
     /// without touching the backing store until it expires.
-    pub(crate) async fn load(&self, account: &str) -> Result<Option<String>> {
+    #[expect(
+        clippy::missing_errors_doc,
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn load(&self, account: &str) -> Result<Option<String>> {
         let action = {
             let mut state = self.state.lock().unwrap();
             match state.entries.get(account) {
@@ -1228,10 +1240,27 @@ impl SettingDefinition {
         if self.sensitive {
             m.insert("sensitive".into(), json!(true));
         }
+        // Always present (unlike the presence-detected flags above): a client
+        // reads its absence as an older daemon, not as "proposable".
+        m.insert("proposable".into(), json!(self.proposable()));
         if let Some(impact) = self.token_impact {
             m.insert("tokenImpact".into(), json!(impact));
         }
         Value::Object(m)
+    }
+
+    /// Whether an Assistant chat settings-change card may change this setting
+    /// (`proposable` on the wire, §5.12). Secrets, read-only keys and the
+    /// security-relevant families in [`PROPOSAL_EXCLUDED_PREFIXES`] /
+    /// [`PROPOSAL_EXCLUDED_PATHS`] are never proposable; clients refuse a card
+    /// change to a daemon setting unless this flag is `true`.
+    pub(crate) fn proposable(&self) -> bool {
+        !self.sensitive
+            && !self.read_only
+            && !PROPOSAL_EXCLUDED_PATHS.contains(&self.path)
+            && !PROPOSAL_EXCLUDED_PREFIXES
+                .iter()
+                .any(|prefix| self.path.starts_with(prefix))
     }
 
     /// Attach an approximate token-impact annotation (`tokenImpact` on the
@@ -1284,10 +1313,17 @@ impl SettingDefinition {
                     ))
                 }
             },
+            // A nullable number (no default) accepts `null` as "unset".
+            SettingType::Number { .. } if value.is_null() && self.default_value.is_none() => {}
             SettingType::Number { min, max } => {
                 let Some(n) = value.as_f64() else {
                     return invalid(format!("{}: expected a number", self.path));
                 };
+                if WHOLE_DAY_PATHS.contains(&self.path)
+                    && (n.fract() != 0.0 || n > f64::from(u32::MAX))
+                {
+                    return invalid(format!("{}: expected a whole number of days", self.path));
+                }
                 if let Some(min) = min {
                     if n < min {
                         return invalid(format!("{}: must be >= {min}", self.path));
@@ -1303,6 +1339,45 @@ impl SettingDefinition {
         Ok(())
     }
 }
+
+/// Setting families an Assistant chat card must never change, even though
+/// they are neither sensitive nor read-only: the listener, auth and tunnel
+/// (`server.`), guest access (`sharing.`), forge endpoints, OAuth clients and
+/// credential routing (`sourceControl.`), account companions of stored
+/// secrets (`accounts.`), and running agents for other daemons
+/// (`remoteAgents.`). Users change these in Settings.
+const PROPOSAL_EXCLUDED_PREFIXES: &[&str] = &[
+    "server.",
+    "sharing.",
+    "sourceControl.",
+    "accounts.",
+    "remoteAgents.",
+];
+
+/// Individual settings an Assistant chat card must never change: the primary
+/// identity key, the Git SSH key, executables the daemon runs (provider CLIs,
+/// auggie, the terminal shell), data/workspace locations, the command
+/// permission rules, the prompt rules injected into every agent's system
+/// prompt, opaque client/daemon state blobs and the daemon's mode.
+const PROPOSAL_EXCLUDED_PATHS: &[&str] = &[
+    "identity.provider",
+    "userRules",
+    "workspaceRules",
+    "workspace.sshKeyPath",
+    "providers.paths",
+    "context.auggiePath",
+    "workspace.defaultShell",
+    "storage.dataDir",
+    "workspaces.root",
+    "workspace.worktreesLocation",
+    "permissions.rules",
+    "quickActions.providerSettings",
+    "repos.known",
+    "workspace.changeHistory",
+    "workspaceInitializer.state",
+    "hardwareConsole.state",
+    "daemon.mode",
+];
 
 /// Look up a definition by dotted `path`, or `None` when unknown.
 pub(crate) fn find_definition(path: &str) -> Option<SettingDefinition> {
@@ -1529,6 +1604,13 @@ fn memory_budget_max_mb() -> f64 {
 /// clients a value is settable that the write path refuses. Clamping keeps the
 /// asymmetry strictly one-directional (catalog bound ≤ parse bound), which is
 /// the invariant every claim in these doc comments depends on.
+/// A catalog byte bound as a number; the bounds are far below 2^53, so the
+/// conversion is exact.
+#[expect(clippy::cast_precision_loss)]
+fn bytes_bound(bytes: u64) -> f64 {
+    bytes as f64
+}
+
 // MiB counts above 2^53 do not occur; loss-free in f64.
 #[expect(clippy::cast_precision_loss)]
 fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
@@ -1679,7 +1761,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         None,
     );
     providers_active.read_only = true;
-    let mut definitions = vec![
+    vec![
         // --- Group A: providers / agents -----------------------------------
         providers_active,
         object(
@@ -1817,6 +1899,31 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "workspace",
             false,
         ),
+        // Whole days; 0 (the default) turns the idle auto-archive sweep off.
+        number(
+            AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH,
+            "Auto-archive idle workspaces (days)",
+            "Archive workspaces with no activity for this many days; archiving stops their agents, hooks and monitors and keeps their folders, and workspaces with uncommitted changes or unpushed commits are skipped (0 = off, the default)",
+            "workspace",
+            Some(0.0),
+            None,
+            f64::from(intent_core::settings_file::DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS),
+        ),
+        // Optional positive integer; the absent key (no default) is off.
+        SettingDefinition {
+            path: PURGE_ARCHIVED_AFTER_DAYS_PATH,
+            label: "Purge archived workspace folders (days)",
+            description: "Delete the folders of workspaces archived longer than this many days to free disk space; conversations, notes, tasks and the git branch are kept, and folders with uncommitted changes are skipped (absent = off)",
+            category: "workspace",
+            ty: SettingType::Number {
+                min: Some(1.0),
+                max: None,
+            },
+            default_value: None,
+            sensitive: false,
+            read_only: false,
+            token_impact: None,
+        },
         // --- Group A: MCP ----------------------------------------------------
         boolean(
             "mcp.enableUserServers",
@@ -2398,6 +2505,30 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             72.0,
         ),
         number(
+            "scripts.outputRetentionHours",
+            "Script output retention hours",
+            "Saved script run logs on disk older than this many hours are deleted, except the current run of a running script (0 disables the sweep; max 87600; applies live at each hourly sweep, no restart required)",
+            "scripts",
+            Some(0.0),
+            Some(f64::from(
+                intent_core::config::SCRIPT_OUTPUT_RETENTION_HOURS_MAX,
+            )),
+            f64::from(intent_core::config::DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS),
+        ),
+        number(
+            "scripts.outputMaxBytesPerRun",
+            "Script output max bytes per run",
+            "Largest on-disk log kept for one script run; past it the oldest output is dropped (64 KiB-1 GiB; applies to runs started after the change)",
+            "scripts",
+            Some(bytes_bound(
+                intent_core::config::SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN,
+            )),
+            Some(bytes_bound(
+                intent_core::config::SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX,
+            )),
+            bytes_bound(intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN),
+        ),
+        number(
             "workspaceApi.maxOutputChars",
             "Max workspace API output chars",
             "Max characters of one workspace_api tool result before the output is redirected to a file (0 = unlimited; min 1000 when non-zero)",
@@ -2457,6 +2588,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         )
         .with_token_impact("~50 tokens/session"),
         boolean(
+            "agentFeatures.desktopControl",
+            "Desktop control",
+            "Expose consent-based desktop control (ws.desktop.*) to agents; applies to new sessions only",
+            "agentFeatures",
+            true,
+        )
+        .with_token_impact("~50 tokens/session"),
+        boolean(
             "agentFeatures.richChatBlocks",
             "Rich chat blocks",
             "Include rich chat block guidance (mermaid, ws-block, nav-link) in agent prompts; applies to new sessions only",
@@ -2472,6 +2611,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             true,
         )
         .with_token_impact("~180 tokens/session"),
+        boolean(
+            "agentFeatures.secretRequests",
+            "Secret requests",
+            "Let top-level agents ask you for secrets (ws.secret.*) that Intent holds in memory and passes only to that agent's ws.host.exec calls; needs Host exec; applies to new sessions only",
+            "agentFeatures",
+            false,
+        )
+        .with_token_impact("~260 tokens/session"),
         boolean(
             "agentFeatures.attentionRequests",
             "Attention requests",
@@ -2599,17 +2746,23 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(86_400.0),
             120.0,
         ),
-    ];
-    definitions.extend(
-        intent_providers::ACP_PROVIDERS
-            .iter()
-            .filter_map(|provider| {
-                provider.access_token().map(|token| {
-                    secret(token.setting_path, token.label, token.guidance, "providers")
-                })
-            }),
-    );
-    definitions
+        enumerated(
+            "remoteAgents.permission",
+            "Remote agent permissions",
+            "How provider permission prompts of remote agents are answered on this machine, since no client is attached (allowAll, autoByRisk or denyAll)",
+            "remoteAgents",
+            &["allowAll", "autoByRisk", "denyAll"],
+            "allowAll",
+        ),
+        enumerated(
+            "daemon.mode",
+            "Daemon mode",
+            "regular runs the full daemon; node turns its own orchestration off (no workspaces, local agents, hooks, scripts or monitors) and serves only the node-mode method list. Changeable only over the local socket; takes effect at the next daemon start. intentd serve --node selects node mode for one run without changing this",
+            "daemon",
+            &["regular", "node"],
+            "regular",
+        ),
+    ]
 }
 
 /// The effective `workspace.branchPrefix` (default empty) — prepended to
@@ -2688,6 +2841,94 @@ pub fn report_to_parent_debounce_seconds(settings: &SettingsFile) -> u32 {
 #[must_use]
 pub fn history_replay_tool_content_chars(settings: &SettingsFile) -> usize {
     settings.agents.history_replay_tool_content_chars as usize
+}
+
+/// Settings path of the idle auto-archive window (PROTOCOL §5.12).
+pub(crate) const AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH: &str = "workspace.autoArchiveIdleAfterDays";
+
+/// Settings path of the automatic purge window (PROTOCOL §5.12).
+pub(crate) const PURGE_ARCHIVED_AFTER_DAYS_PATH: &str = "workspace.purgeArchivedAfterDays";
+
+/// The deprecated predecessor of [`PURGE_ARCHIVED_AFTER_DAYS_PATH`]. No
+/// catalog entry remains (older clients hide their toggle); the key still
+/// parses so [`migrate_auto_retire_setting`] can carry it over, and writes
+/// from old clients are tolerated-and-ignored.
+pub(crate) const DEPRECATED_AUTO_RETIRE_PATH: &str = "workspace.autoRetireArchivedAfterDays";
+
+/// Day-count settings that must be whole numbers.
+const WHOLE_DAY_PATHS: [&str; 2] = [
+    AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH,
+    PURGE_ARCHIVED_AFTER_DAYS_PATH,
+];
+
+/// The effective `workspace.autoArchiveIdleAfterDays` setting: `Some(days)`
+/// when the idle auto-archive sweep is on, `None` when it is `0` (the
+/// default, off) — read live from the settings snapshot at each sweep.
+#[must_use]
+pub fn auto_archive_idle_after_days(settings: &SettingsFile) -> Option<u32> {
+    Some(settings.workspace.auto_archive_idle_after_days).filter(|days| *days > 0)
+}
+
+/// The effective `workspace.purgeArchivedAfterDays` setting: `Some(days)`
+/// when the automatic purge sweep is on, `None` when the key is absent (or a
+/// hand-edited `0`) — read live from the settings snapshot at each sweep.
+/// While the new key is unset, a (hand-edited or not yet migrated) legacy
+/// `autoRetireArchivedAfterDays` still applies.
+#[must_use]
+pub fn purge_archived_after_days(settings: &SettingsFile) -> Option<u32> {
+    settings
+        .workspace
+        .purge_archived_after_days
+        .or(settings.workspace.auto_retire_archived_after_days)
+        .filter(|days| *days > 0)
+}
+
+/// One-time boot migration of the deprecated
+/// `workspace.autoRetireArchivedAfterDays` to `workspace.purgeArchivedAfterDays`
+/// (same value semantics). When only the legacy key is set its value is
+/// carried over; when both are set the new key wins. Either way the legacy
+/// key is removed from config.toml in the same atomic, comment-preserving
+/// [`SettingsRegistry::apply`] batch. A file without the legacy key is never
+/// rewritten.
+///
+/// # Errors
+///
+/// Never errors today: a failed rewrite is logged and skipped (the file
+/// stays intact and the purge sweep keeps honoring the legacy key, so the
+/// next boot retries). The `Result` keeps parity with the other startup
+/// migrations.
+pub fn migrate_auto_retire_setting(registry: &SettingsRegistry) -> Result<()> {
+    let snapshot = registry.snapshot();
+    let workspace = &snapshot.effective.workspace;
+    let Some(legacy) = workspace.auto_retire_archived_after_days else {
+        return Ok(());
+    };
+    let carried = workspace.purge_archived_after_days.is_none() && legacy > 0;
+    let mut changes: Vec<(String, Value)> = Vec::with_capacity(2);
+    if carried {
+        changes.push((PURGE_ARCHIVED_AFTER_DAYS_PATH.to_string(), json!(legacy)));
+    }
+    changes.push((DEPRECATED_AUTO_RETIRE_PATH.to_string(), Value::Null));
+    if let Err(e) = registry.apply(&changes) {
+        tracing::warn!(
+            error = %e,
+            "failed to migrate workspace.autoRetireArchivedAfterDays to \
+             workspace.purgeArchivedAfterDays; continuing (next boot retries)"
+        );
+        return Ok(());
+    }
+    if carried {
+        tracing::info!(
+            days = legacy,
+            "migrated workspace.autoRetireArchivedAfterDays to workspace.purgeArchivedAfterDays"
+        );
+    } else {
+        tracing::info!(
+            "removed deprecated workspace.autoRetireArchivedAfterDays from config.toml; \
+             the already-set workspace.purgeArchivedAfterDays wins"
+        );
+    }
+    Ok(())
 }
 
 /// The effective `agents.toolPayloadRetentionDays` setting: `Some(days)` when
@@ -3325,6 +3566,33 @@ impl<'a> SettingsService<'a> {
         Ok(out)
     }
 
+    /// Completion must distinguish confirmed absence from a failed read. Public
+    /// display getters keep their separate best-effort behavior.
+    pub(crate) async fn completion_value(&self, path: &str) -> Result<Value> {
+        let def = find_definition(path)
+            .ok_or_else(|| Error::InvalidParams(format!("unknown setting: {path}")))?;
+        let value = if def.sensitive {
+            match self.secrets().load_fresh(def.path).await? {
+                Some(_) => json!(REDACTED_PLACEHOLDER),
+                None => Value::Null,
+            }
+        } else if let Some(registry) = self.registry_for(def.path) {
+            wire_value(&def, registry.get(def.path).unwrap_or(Value::Null))
+        } else {
+            match self.store.get_setting(def.path).await? {
+                Some(raw) => serde_json::from_str(&raw).map_err(|_| {
+                    Error::Internal("stored setting cannot be projected for completion".into())
+                })?,
+                None => def.default_value.clone().unwrap_or(Value::Null),
+            }
+        };
+        let mut out = json!({"path": def.path, "value": value});
+        if let Some(origin) = self.origin_for(def.path) {
+            out["origin"] = json!(origin);
+        }
+        Ok(out)
+    }
+
     /// Capture ordinary server values while the revision gate is held. Hook
     /// compensation compares these again after secret rollback releases the
     /// gate, so it cannot undo a newer server-settings commit.
@@ -3368,6 +3636,7 @@ impl<'a> SettingsService<'a> {
             // hard rejection would fail whole batches from old clients).
             if RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
                 || path == DEPRECATED_ACTIVE_PROVIDER_PATH
+                || path == DEPRECATED_AUTO_RETIRE_PATH
                 || path == "agents.flushQueuedMessages"
             {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
@@ -3382,16 +3651,6 @@ impl<'a> SettingsService<'a> {
                 return Err(Error::InvalidParams(format!("{path} is read-only")));
             }
             def.validate(&value)?;
-            if intent_providers::ACP_PROVIDERS
-                .iter()
-                .filter_map(intent_providers::ProviderConfig::access_token)
-                .any(|token| token.setting_path == path)
-                && value.as_str().is_some_and(|token| token.trim().is_empty())
-            {
-                return Err(Error::InvalidParams(format!(
-                    "{path}: token must not be blank; use settings.reset to remove it"
-                )));
-            }
             let value = if path == "sharing.machineName" {
                 let name = value.as_str().expect("string validated above");
                 json!(
@@ -3863,100 +4122,6 @@ async fn join_all_pinned<T>(
 
 #[cfg(test)]
 mod tests {
-    #[intent_test_macros::daemon_test]
-    async fn provider_access_tokens_store_replace_remove_and_redact() {
-        let dir = crate::test_support::test_tempdir("provider-token-settings");
-        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
-        let registry = SettingsRegistry::load(dir.path().join("config.toml")).unwrap();
-        let raw = Arc::new(InMemorySecretStore::default());
-        let secrets = AsyncSecretStore::new(raw.clone());
-        let svc = SettingsService::new(&store, &secrets, Some(&registry));
-        raw.store("unrelated.apiKey", "existing-api-key").unwrap();
-        for path in [
-            "providers.claude-code.accessToken",
-            "providers.codex.accessToken",
-        ] {
-            assert_eq!(svc.get(path).await.unwrap()["value"], Value::Null);
-            let missing = svc
-                .update(&json!([{ "path": path, "value": REDACTED_PLACEHOLDER }]))
-                .await;
-            assert!(matches!(missing, Err(Error::InvalidParams(_))));
-            for token in ["synthetic-original-token", "synthetic-replacement-token"] {
-                let applied = svc
-                    .update(&json!([{ "path": path, "value": token }]))
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    applied,
-                    vec![json!({"path":path,"value":REDACTED_PLACEHOLDER})]
-                );
-                assert_eq!(raw.load(path).unwrap().as_deref(), Some(token));
-                assert_eq!(store.get_setting(path).await.unwrap(), None);
-                assert_eq!(registry.get(path), None);
-                let read = svc.get(path).await.unwrap();
-                assert_eq!(read["value"], REDACTED_PLACEHOLDER);
-                assert_eq!(read["definition"]["sensitive"], true);
-                let list = svc.list().await.unwrap();
-                assert!(!list.to_string().contains(token));
-                assert_eq!(
-                    list["settings"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .find(|s| s["path"] == path)
-                        .unwrap()["value"],
-                    REDACTED_PLACEHOLDER
-                );
-                svc.update(&json!([{ "path": path, "value": REDACTED_PLACEHOLDER }]))
-                    .await
-                    .unwrap();
-                assert_eq!(raw.load(path).unwrap().as_deref(), Some(token));
-            }
-            for invalid in [
-                Value::Null,
-                json!(42),
-                json!(""),
-                json!("  \n\t"),
-                json!({"token":"synthetic-invalid"}),
-            ] {
-                assert!(matches!(
-                    svc.update(&json!([{ "path": path, "value": invalid }]))
-                        .await,
-                    Err(Error::InvalidParams(_))
-                ));
-                assert_eq!(
-                    raw.load(path).unwrap().as_deref(),
-                    Some("synthetic-replacement-token")
-                );
-            }
-            svc.reset(path).await.unwrap();
-            assert_eq!(raw.load(path).unwrap(), None);
-            assert_eq!(svc.get(path).await.unwrap()["value"], Value::Null);
-            svc.reset(path).await.unwrap();
-        }
-        assert_eq!(
-            raw.load("unrelated.apiKey").unwrap().as_deref(),
-            Some("existing-api-key")
-        );
-        for path in [
-            "providers.auggie.accessToken",
-            "providers.unknown.accessToken",
-            "providers.claude.accessToken",
-        ] {
-            assert!(matches!(svc.get(path).await, Err(Error::InvalidParams(_))));
-            assert!(matches!(
-                svc.update(&json!([{ "path": path, "value": "synthetic-unsupported" }]))
-                    .await,
-                Err(Error::InvalidParams(_))
-            ));
-            assert!(matches!(
-                svc.reset(path).await,
-                Err(Error::InvalidParams(_))
-            ));
-            assert_eq!(raw.load(path).unwrap(), None);
-        }
-    }
-
     use super::*;
 
     #[intent_test_macros::daemon_test]
@@ -4041,19 +4206,25 @@ mod tests {
                     .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(5), notice.changed())
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            notice.changed(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(registry.get("git.autoCommit"), Some(json!(false)));
         std::fs::rename(&path, dir.path().join("config.saved")).unwrap();
         std::fs::create_dir(&path).unwrap();
         drop(held);
-        let error = tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .expect_err("database refusal must trigger failing registry compensation");
+        let error = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("database refusal must trigger failing registry compensation");
         assert!(!error.no_effect());
         assert_eq!(registry.get("git.autoCommit"), Some(json!(false)));
         assert!(path.is_dir());
@@ -4070,7 +4241,7 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let registry = Arc::new(SettingsRegistry::load(&path).unwrap());
         let bus = crate::EventBus::new(store.clone());
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_settings_registry(registry.clone())
             .with_event_bus(bus.clone());
         let mut events = bus.subscribe(SubscriptionFilter {
@@ -4087,10 +4258,13 @@ mod tests {
         assert_eq!(applied["applied"][0]["origin"], got["origin"]);
         assert_eq!(got["origin"], json!("file"));
         assert_eq!(applied["revision"], got["revision"]);
-        let first_event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-            .await
-            .expect("initial write event")
-            .unwrap();
+        let first_event = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            events.recv(),
+        )
+        .await
+        .expect("initial write event")
+        .unwrap();
         assert_eq!(first_event[0].data["changes"], applied["applied"]);
         assert_eq!(first_event[0].data["revision"], got["revision"]);
 
@@ -4116,10 +4290,13 @@ mod tests {
             .settings_update(json!([{"path": "git.autoCommit", "value": false}]))
             .await
             .unwrap();
-        let next_event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-            .await
-            .expect("next real mutation event")
-            .unwrap();
+        let next_event = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            events.recv(),
+        )
+        .await
+        .expect("next real mutation event")
+        .unwrap();
         assert_eq!(next_event[0].data["changes"], next["applied"]);
         assert_eq!(next_event[0].data["revision"], next["revision"]);
     }
@@ -4137,7 +4314,7 @@ mod tests {
             std::fs::write(&path, seed).unwrap();
             let registry = Arc::new(SettingsRegistry::load(&path).unwrap());
             let bus = crate::EventBus::new(store.clone());
-            let services = crate::Services::new(store)
+            let services = crate::Services::new_isolated(store)
                 .with_settings_registry(registry.clone())
                 .with_event_bus(bus.clone());
             let mut events = bus.subscribe(SubscriptionFilter {
@@ -4186,10 +4363,13 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(applied["revision"], json!(1));
-            let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-                .await
-                .expect("successful update event")
-                .unwrap();
+            let event = tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+                events.recv(),
+            )
+            .await
+            .expect("successful update event")
+            .unwrap();
             assert_eq!(event.len(), 1);
             assert_eq!(event[0].data["revision"], applied["revision"]);
             assert_eq!(event[0].data["changes"], applied["applied"]);
@@ -4260,6 +4440,157 @@ mod tests {
         assert_eq!(def.category, "linear");
         assert!(matches!(def.ty, SettingType::String));
         assert!(def.default_value.is_none());
+    }
+
+    /// Every setting an Assistant chat card may change, pinned so that adding
+    /// a daemon setting is a reviewed decision: a new non-sensitive setting is
+    /// proposable by default and lands in this list, unless it belongs in
+    /// `PROPOSAL_EXCLUDED_PREFIXES` / `PROPOSAL_EXCLUDED_PATHS` because it
+    /// controls access, credentials, executables, locations or opaque state.
+    /// Clients apply any proposable path through `settings.update`, so this
+    /// list is also the set chat cards must be able to apply.
+    #[test]
+    fn proposable_settings_are_pinned() {
+        let expected: &[&str] = &[
+            "providers.enabled",
+            "providers.fastMode",
+            "model.default",
+            "model.defaultProvider",
+            "model.providerDefaults",
+            "model.defaultReasoningEffort",
+            "quickActions.defaultModel",
+            "quickActions.typeOverrides",
+            "quickActions.defaultReasoningEffort",
+            "quickActions.typeReasoningEffortOverrides",
+            "specialists.default",
+            "workspace.branchPrefix",
+            "git.autoCommit",
+            "workspace.cowIsolation",
+            "workspace.autoArchiveIdleAfterDays",
+            "workspace.purgeArchivedAfterDays",
+            "mcp.enableUserServers",
+            "mcp.disabledServers",
+            "notifications.enabled",
+            "notifications.soundEnabled",
+            "notifications.soundOnlyWhenUnfocused",
+            "notifications.volume",
+            "rtk.enabled",
+            "voice.provider",
+            "voice.language",
+            "voice.openai.model",
+            "voice.workspaceVocabulary.maxTerms",
+            "voice.vocabulary",
+            "context.enabled",
+            "context.allowIndexing",
+            "logging.level",
+            "agents.maxConcurrent",
+            "agents.memoryBudgetMb",
+            "agents.acpNodeMaxOldSpaceMb",
+            "agents.maxConcurrentAdapters",
+            "agents.maxTopLevelAgents",
+            "agents.idleReapMinutes",
+            "agents.reportToParentDebounceSeconds",
+            "agents.historyReplayToolContentChars",
+            "agents.toolPayloadRetentionDays",
+            "agents.resumeInterruptedOnStart",
+            "events.streamRetentionHours",
+            "scripts.outputRetentionHours",
+            "scripts.outputMaxBytesPerRun",
+            "workspaceApi.maxOutputChars",
+            "workspaceApi.toonOutput",
+            "agentFeatures.backgroundHooks",
+            "agentFeatures.hostExec",
+            "agentFeatures.scripts",
+            "agentFeatures.terminalAccess",
+            "agentFeatures.browserAutomation",
+            "agentFeatures.desktopControl",
+            "agentFeatures.richChatBlocks",
+            "agentFeatures.structuredQuestions",
+            "agentFeatures.secretRequests",
+            "agentFeatures.attentionRequests",
+            "agentFeatures.stateSnapshot",
+            "agentFeatures.prMonitor",
+            "agentFeatures.taskGraph",
+            "agentFeatures.peerAgents",
+            "agentFeatures.mcpTools",
+            "prMonitor.maxPerAgent",
+            "prMonitor.debounceSeconds",
+            "prMonitor.pollSeconds",
+            "prMonitor.hourlyRequestBudget",
+            "prMonitor.quotaSharePercent",
+            "prCache.maxAgeSeconds",
+            "updates.checkOnIdle",
+            "updates.idleCheckIntervalMinutes",
+            "updates.idleGraceSeconds",
+        ];
+        let actual: Vec<&str> = definitions()
+            .iter()
+            .filter(|def| def.proposable())
+            .map(|def| def.path)
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "classify the new or changed setting: add it to this list if a chat \
+             card may change it, or to PROPOSAL_EXCLUDED_PATHS / \
+             PROPOSAL_EXCLUDED_PREFIXES if it is security-relevant"
+        );
+    }
+
+    /// Sensitive, read-only and excluded settings are never proposable, and
+    /// the wire definition always carries the flag so a client can tell a
+    /// refusal apart from an older daemon that omits it.
+    #[test]
+    fn proposable_flag_is_on_the_wire_and_excludes_security_relevant_settings() {
+        for def in definitions() {
+            let wire = def.definition_json();
+            assert_eq!(
+                wire.get("proposable"),
+                Some(&json!(def.proposable())),
+                "{} must always carry proposable",
+                def.path
+            );
+            if def.sensitive || def.read_only {
+                assert!(!def.proposable(), "{} must not be proposable", def.path);
+            }
+        }
+        for path in [
+            "server.port",
+            "server.bindAddress",
+            "server.auth.enabled",
+            "server.auth.token",
+            "server.originAllowList",
+            "sharing.maxGuestConnections",
+            "sourceControl.github.apiBaseUrl",
+            "sourceControl.github.exposeGitCredentialToChildren",
+            "accounts.sentry.organization",
+            "identity.provider",
+            "workspace.sshKeyPath",
+            "workspace.defaultShell",
+            "providers.paths",
+            "context.auggiePath",
+            "storage.dataDir",
+            "permissions.rules",
+            "userRules",
+            "workspaceRules",
+            "specialists.dir",
+            "linear.token",
+            "remoteAgents.permission",
+            "daemon.mode",
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.proposable(), "{path} must not be proposable");
+            assert_eq!(def.definition_json()["proposable"], json!(false), "{path}");
+        }
+        for path in [
+            "agentFeatures.hostExec",
+            "prMonitor.pollSeconds",
+            "agents.maxConcurrent",
+            "agents.memoryBudgetMb",
+            "workspace.purgeArchivedAfterDays",
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert_eq!(def.definition_json()["proposable"], json!(true), "{path}");
+        }
     }
 
     /// `accounts.sentry.token` must be sensitive so `settings.update` persists
@@ -4445,20 +4776,48 @@ mod tests {
     /// before returning `None` — models a locked / prompting OS keychain that
     /// used to hang `settings.list` indefinitely.
     #[derive(Debug)]
-    struct HangingSecretStore {
-        hang_for: Duration,
+    /// A wedged keychain: every call blocks until the test opens the gate.
+    /// An answer that arrives while the gate is still shut came from the
+    /// wrapper's timeout, never from the store — proof with no clock. Hold
+    /// [`GatedSecretStore::open_on_drop`] so the parked blocking-pool threads
+    /// exit when the test ends.
+    #[derive(Default)]
+    struct GatedSecretStore {
+        open: Mutex<bool>,
+        opened: std::sync::Condvar,
     }
-    impl SecretStore for HangingSecretStore {
+    impl GatedSecretStore {
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+        /// Opens the gate when dropped — also on a failed assertion, whose
+        /// runtime shutdown would otherwise wait on the parked threads.
+        fn open_on_drop(self: &Arc<Self>) -> impl Drop {
+            struct OpenOnDrop(Arc<GatedSecretStore>);
+            impl Drop for OpenOnDrop {
+                fn drop(&mut self) {
+                    self.0.open();
+                }
+            }
+            OpenOnDrop(Arc::clone(self))
+        }
+        fn wait(&self) {
+            let open = self.open.lock().unwrap();
+            drop(self.opened.wait_while(open, |open| !*open).unwrap());
+        }
+    }
+    impl SecretStore for GatedSecretStore {
         fn load(&self, _account: &str) -> Result<Option<String>> {
-            std::thread::sleep(self.hang_for);
+            self.wait();
             Ok(None)
         }
         fn store(&self, _account: &str, _value: &str) -> Result<()> {
-            std::thread::sleep(self.hang_for);
+            self.wait();
             Ok(())
         }
         fn delete(&self, _account: &str) -> Result<()> {
-            std::thread::sleep(self.hang_for);
+            self.wait();
             Ok(())
         }
     }
@@ -4475,15 +4834,13 @@ mod tests {
         // Compressed load budget (`with_timings`) so the timeout path runs in
         // milliseconds instead of the production 3s default.
         let load_timeout = Duration::from_millis(100);
-        // Hang for well over the per-op budget so a naive implementation would
-        // stall for `N_sensitive * hang_for` and blow past the test's outer
-        // timeout — but short enough that the blocking-pool shutdown at
-        // end-of-test doesn't hold up the whole test binary.
-        let secrets: Arc<dyn SecretStore> = Arc::new(HangingSecretStore {
-            hang_for: Duration::from_millis(750),
-        });
+        // The keychain stays wedged until the list has answered, so a list
+        // that waits on the store instead of its load budget hangs into the
+        // guard below.
+        let gated = Arc::new(GatedSecretStore::default());
+        let _open = gated.open_on_drop();
         let secrets = AsyncSecretStore::with_timings(
-            secrets,
+            gated.clone(),
             load_timeout,
             DEFAULT_WRITE_TIMEOUT,
             DEFAULT_CACHE_TTL,
@@ -4491,17 +4848,13 @@ mod tests {
         );
         let svc = SettingsService::new(&store, &secrets, None);
 
-        let started = std::time::Instant::now();
-        // Outer cap: single-flight + TTL cache in AsyncSecretStore bounds the
-        // total latency to ONE keychain budget — well under the per-call
-        // stall the store models. A generous slack absorbs task-spawn
-        // overhead on cold runners.
-        let cap = load_timeout + Duration::from_secs(2);
-        let list = timeout(cap, svc.list())
-            .await
-            .expect("settings.list must not hang when the keychain stalls")
-            .expect("settings.list must not return a domain error");
-        let elapsed = started.elapsed();
+        let list = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            svc.list(),
+        )
+        .await
+        .expect("settings.list must not hang when the keychain stalls")
+        .expect("settings.list must not return a domain error");
 
         // Every sensitive entry MUST redact to `null` (absent) — the timed-out
         // load is treated as "not present" so the response is well-formed.
@@ -4519,10 +4872,6 @@ mod tests {
             }
         }
         assert!(sensitive_seen > 0, "catalog must contain sensitive entries");
-        assert!(
-            elapsed < cap,
-            "settings.list took {elapsed:?} — timeout cap was {cap:?}",
-        );
 
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
@@ -4547,11 +4896,12 @@ mod tests {
         // stays well over the budget but short enough that the blocking-pool
         // shutdown at end-of-test doesn't hold up the whole test binary.
         let write_timeout = Duration::from_millis(150);
-        let secrets: Arc<dyn SecretStore> = Arc::new(HangingSecretStore {
-            hang_for: Duration::from_millis(750),
-        });
+        // Wedged until the update has answered: only the write budget can end
+        // it, and an update that waits on the store hangs into the guard.
+        let gated = Arc::new(GatedSecretStore::default());
+        let _open = gated.open_on_drop();
         let secrets = AsyncSecretStore::with_timings(
-            secrets,
+            gated.clone(),
             DEFAULT_LOAD_TIMEOUT,
             write_timeout,
             DEFAULT_CACHE_TTL,
@@ -4559,25 +4909,16 @@ mod tests {
         );
         let svc = SettingsService::new(&store, &secrets, None);
 
-        let started = std::time::Instant::now();
-        // AsyncSecretStore's write budget is `write_timeout`; use it plus a
-        // small slack so the assertion measures the bounded write path.
-        let cap = write_timeout + Duration::from_secs(2);
         let err = timeout(
-            cap,
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
             svc.update(&json!([{ "path": "linear.token", "value": "irrelevant" }])),
         )
         .await
         .expect("settings.update must not hang past the budget")
         .expect_err("hung keychain must surface an error, not success");
-        let elapsed = started.elapsed();
         assert!(
             matches!(err, Error::Internal(_)),
             "expected Error::Internal, got {err:?}",
-        );
-        assert!(
-            elapsed < cap,
-            "settings.update took {elapsed:?}, cap {cap:?}"
         );
 
         for suffix in ["", "-wal", "-shm"] {
@@ -5053,7 +5394,7 @@ mod tests {
             Duration::from_secs(60),
             Duration::from_secs(60),
         ));
-        let mut services = crate::Services::new(store).with_settings_registry(registry);
+        let mut services = crate::Services::new_isolated(store).with_settings_registry(registry);
         services.secrets = secrets.clone();
         let writer = services.clone();
         let update = intent_core::spawn_daemon(async move {
@@ -5064,15 +5405,20 @@ mod tests {
                 ]))
                 .await
         });
-        tokio::task::spawn_blocking(move || parked_rx.recv_timeout(Duration::from_secs(5)))
-            .await
-            .unwrap()
-            .expect("sibling delete parked");
-        timeout(Duration::from_secs(5), async {
-            while !secrets.timed_out(REFRESH_SECRET_ACCOUNT) {
-                tokio::task::yield_now().await;
-            }
+        tokio::task::spawn_blocking(move || {
+            parked_rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
         })
+        .await
+        .unwrap()
+        .expect("sibling delete parked");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while !secrets.timed_out(REFRESH_SECRET_ACCOUNT) {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("write timeout fired");
         assert!(
@@ -5213,7 +5559,7 @@ mod tests {
             release: Mutex::new(rx),
             once: std::sync::atomic::AtomicBool::new(true),
         });
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_secret_store(secrets)
             .with_settings_registry(registry)
             .with_event_bus(bus);
@@ -5251,30 +5597,36 @@ mod tests {
                     .await
             }
         });
-        timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .expect("actual secret write entered");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .expect("actual secret write entered");
         if during_settle {
             // The initial write timeout puts its handle into detached; the
             // settler takes it out before waiting. Observe that handoff, not
             // an arbitrary sleep that might cancel the wrong stage.
-            timeout(Duration::from_secs(5), async {
-                loop {
-                    let (timed_out, taken) = {
-                        let state = services.secrets.state.lock().unwrap();
-                        let timed_out = state.last_warn.contains_key(SECRET_ACCOUNT);
-                        let taken = state.mutations.iter().any(|record| {
-                            record.account == SECRET_ACCOUNT
-                                && record.settling.load(std::sync::atomic::Ordering::SeqCst) > 0
-                        });
-                        (timed_out, taken)
-                    };
-                    if timed_out && taken {
-                        break;
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                async {
+                    loop {
+                        let (timed_out, taken) = {
+                            let state = services.secrets.state.lock().unwrap();
+                            let timed_out = state.last_warn.contains_key(SECRET_ACCOUNT);
+                            let taken = state.mutations.iter().any(|record| {
+                                record.account == SECRET_ACCOUNT
+                                    && record.settling.load(std::sync::atomic::Ordering::SeqCst) > 0
+                            });
+                            (timed_out, taken)
+                        };
+                        if timed_out && taken {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
                     }
-                    tokio::task::yield_now().await;
-                }
-            })
+                },
+            )
             .await
             .expect("settler owns the timed-out mutation");
         }
@@ -5290,9 +5642,12 @@ mod tests {
         // Always release real blocking work, including when RED asserts below.
         release.release();
         if !returned_early {
-            timeout(Duration::from_secs(5), &mut shutdown)
-                .await
-                .expect("shutdown settles the cancelled settings owner");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                &mut shutdown,
+            )
+            .await
+            .expect("shutdown settles the cancelled settings owner");
         }
         assert!(
             !returned_early,
@@ -5357,9 +5712,12 @@ mod tests {
                     .await
             }
         });
-        timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .expect("write parked");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .expect("write parked");
         assert_eq!(
             raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
             if delete { None } else { Some("new-token") }
@@ -5455,10 +5813,13 @@ mod tests {
             (2, other_secret["applied"].clone()),
             (3, expected),
         ] {
-            let events = timeout(Duration::from_secs(5), sub.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let events = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                sub.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].event_type, "settings:changed");
             assert_eq!(
@@ -5493,9 +5854,12 @@ mod tests {
                 ]))
                 .await
         });
-        timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .unwrap();
         {
             let _revision = services.settings_revision_gate.write().await;
             services
@@ -5527,10 +5891,13 @@ mod tests {
             .settings_update(json!([{ "path": "git.autoCommit", "value": false }]))
             .await
             .unwrap();
-        let events = timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let events = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(events[0].data["revision"], json!(1));
         assert_eq!(
             events[0].data["changes"][0]["path"],
@@ -5576,7 +5943,7 @@ mod tests {
         let entered = Arc::new(tokio::sync::Notify::new());
         let (tx, rx) = std::sync::mpsc::channel();
         let mut release = ReleaseWrite(Some(tx));
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_settings_registry(registry.clone())
             .with_secret_store(Arc::new(RejectThenParkRollback {
                 inner: raw.clone(),
@@ -5593,9 +5960,12 @@ mod tests {
                 ]))
                 .await
         });
-        timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .expect("rollback parked");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .expect("rollback parked");
         let mut second = services.settings_update(json!([
             { "path": SECRET_ACCOUNT, "value": "second-write" }
         ]));
@@ -5653,7 +6023,7 @@ mod tests {
             .pin("notifications.volume", json!(0.5), "TEST_PIN")
             .unwrap();
         let raw = Arc::new(CountWrites(std::sync::atomic::AtomicUsize::new(0)));
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_secret_store(raw.clone())
             .with_settings_registry(registry);
         for entry in [
@@ -5727,10 +6097,12 @@ mod tests {
             result
         };
         let driver = async {
-            tokio::task::spawn_blocking(move || parked_rx.recv_timeout(Duration::from_secs(5)))
-                .await
-                .unwrap()
-                .expect("the sibling delete must park");
+            tokio::task::spawn_blocking(move || {
+                parked_rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+            })
+            .await
+            .unwrap()
+            .expect("the sibling delete must park");
             let rollback_claimed_delete = || {
                 secrets.timed_out(REFRESH_SECRET_ACCOUNT)
                     && secrets.detached_len(REFRESH_SECRET_ACCOUNT) == 0
@@ -5749,10 +6121,12 @@ mod tests {
         let err = result.expect_err("the timed-out sibling clear must surface");
         assert!(matches!(err, Error::Internal(_)), "got {err:?}");
 
-        tokio::task::spawn_blocking(move || done_rx.recv_timeout(Duration::from_secs(5)))
-            .await
-            .unwrap()
-            .expect("the parked delete must complete");
+        tokio::task::spawn_blocking(move || {
+            done_rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+        })
+        .await
+        .unwrap()
+        .expect("the parked delete must complete");
         assert_eq!(
             raw_secrets.load(SECRET_ACCOUNT).unwrap().as_deref(),
             Some("glo_device"),
@@ -5823,15 +6197,15 @@ mod tests {
         let svc = SettingsService::new(&store, &secrets, None);
 
         let entries = json!([{ "path": SECRET_ACCOUNT, "value": "glpat-pasted" }]);
-        let started = Instant::now();
-        let err = svc
-            .update(&entries)
-            .await
-            .expect_err("the timed-out sibling clear must surface");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "update must return once the settle cap expires, not wait for the delete"
-        );
+        // The delete stays parked until after the update has answered, so an
+        // update that waits for it instead of the settle cap hangs here.
+        let err = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            svc.update(&entries),
+        )
+        .await
+        .expect("update must return once the settle cap expires, not wait for the delete")
+        .expect_err("the timed-out sibling clear must surface");
         match &err {
             Error::Internal(msg) => assert!(
                 msg.contains("credential state is unknown"),
@@ -5867,10 +6241,12 @@ mod tests {
         );
 
         release_tx.send(()).unwrap();
-        tokio::task::spawn_blocking(move || done_rx.recv_timeout(Duration::from_secs(5)))
-            .await
-            .unwrap()
-            .expect("the parked delete must complete once released");
+        tokio::task::spawn_blocking(move || {
+            done_rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+        })
+        .await
+        .unwrap()
+        .expect("the parked delete must complete once released");
         assert!(
             secrets
                 .settle_detached(REFRESH_SECRET_ACCOUNT)
@@ -6593,6 +6969,97 @@ mod tests {
     /// registered in `KNOWN_PATHS`; its description states that the sweep
     /// shrinks stored payloads older than N days to the replay preview and
     /// that 0 disables it. The live accessor maps 0 to `None`.
+    /// `scripts.outputRetentionHours` and `scripts.outputMaxBytesPerRun` are
+    /// catalog entries in `KNOWN_PATHS` with the `intent_core` bounds and
+    /// defaults, so `settings.get` / `settings.update` accept them.
+    #[tokio::test]
+    #[expect(clippy::float_cmp, clippy::cast_precision_loss)]
+    async fn script_output_settings_are_in_catalog_and_round_trip() {
+        use intent_core::config::{
+            DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN, DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS,
+            SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX, SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN,
+            SCRIPT_OUTPUT_RETENTION_HOURS_MAX,
+        };
+        let bounds = [
+            (
+                "scripts.outputRetentionHours",
+                0.0,
+                f64::from(SCRIPT_OUTPUT_RETENTION_HOURS_MAX),
+                f64::from(DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS),
+            ),
+            (
+                "scripts.outputMaxBytesPerRun",
+                SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN as f64,
+                SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX as f64,
+                DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN as f64,
+            ),
+        ];
+        for (path, min, max, default) in bounds {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert_eq!(def.category, "scripts");
+            assert!(!def.sensitive && !def.read_only);
+            assert!(
+                matches!(def.ty, SettingType::Number { min: Some(lo), max: Some(hi) } if lo == min && hi == max),
+                "{path}: {:?}",
+                def.ty
+            );
+            assert_eq!(def.default_value, Some(json!(default)));
+            assert!(KNOWN_PATHS.contains(&path), "{path} not in KNOWN_PATHS");
+            assert!(def.validate(&json!(max + 1.0)).is_err());
+        }
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-scripts-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-scripts-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+        let mut notices = registry.subscribe();
+
+        let got = svc.get("scripts.outputRetentionHours").await.expect("get");
+        assert_eq!(got["value"], json!(168.0));
+        assert_eq!(got["origin"], json!("default"));
+        svc.update(&json!([
+            { "path": "scripts.outputRetentionHours", "value": 0 },
+            { "path": "scripts.outputMaxBytesPerRun", "value": 1_048_576 },
+        ]))
+        .await
+        .expect("update");
+        assert!(notices.has_changed().expect("registry alive"));
+        let changed = notices.borrow_and_update().changed.clone();
+        for path in [
+            "scripts.outputRetentionHours",
+            "scripts.outputMaxBytesPerRun",
+        ] {
+            assert!(changed.contains(path), "{path} notice: {changed:?}");
+        }
+        let live = registry.snapshot().effective.clone();
+        assert_eq!(intent_core::config::script_output_retention_hours(&live), 0);
+        assert_eq!(
+            intent_core::config::script_output_max_bytes_per_run(&live),
+            1_048_576
+        );
+        let got = svc.get("scripts.outputMaxBytesPerRun").await.expect("get");
+        assert_eq!(got["value"], json!(1_048_576.0));
+        assert_eq!(got["origin"], json!("file"));
+        let err = svc
+            .update(&json!([{ "path": "scripts.outputMaxBytesPerRun", "value": 0 }]))
+            .await
+            .expect_err("0 is below the cap minimum");
+        assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
     #[test]
     fn tool_payload_retention_days_catalog_entry_is_toml_backed() {
         let def = find_definition("agents.toolPayloadRetentionDays")
@@ -6767,6 +7234,314 @@ mod tests {
                 "{}{suffix}",
                 tmp.display()
             )));
+        }
+    }
+
+    /// `workspace.purgeArchivedAfterDays` (PROTOCOL §5.12) is a TOML-backed
+    /// optional positive integer: absent (`null`) means off and has no
+    /// implicit default; zero, negative and non-integer values reject.
+    #[test]
+    fn purge_catalog_entry_is_an_optional_positive_integer() {
+        let def = find_definition(PURGE_ARCHIVED_AFTER_DAYS_PATH)
+            .expect("workspace.purgeArchivedAfterDays missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "workspace");
+        assert!(matches!(def.ty, SettingType::Number { min: Some(1.0), .. }));
+        assert_eq!(def.default_value, None, "absent = off; no implicit value");
+        assert!(KNOWN_PATHS.contains(&PURGE_ARCHIVED_AFTER_DAYS_PATH));
+        def.validate(&json!(7)).expect("7 days is legal");
+        def.validate(&json!(1)).expect("1 day is legal");
+        def.validate(&json!(7.0))
+            .expect("a whole float is an integer");
+        def.validate(&Value::Null).expect("null turns it off");
+        for bad in [json!(0), json!(-1), json!(1.5), json!("7"), json!(true)] {
+            assert!(def.validate(&bad).is_err(), "{bad} must reject");
+        }
+        assert!(def.definition_json().get("defaultValue").is_none());
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(purge_archived_after_days(&settings), None);
+        settings.workspace.purge_archived_after_days = Some(7);
+        assert_eq!(purge_archived_after_days(&settings), Some(7));
+        // A hand-edited 0 in config.toml reads as off, never "purge now".
+        settings.workspace.purge_archived_after_days = Some(0);
+        assert_eq!(purge_archived_after_days(&settings), None);
+    }
+
+    /// The legacy `autoRetireArchivedAfterDays` has no catalog entry (older
+    /// clients hide their toggle) but still drives the purge sweep while
+    /// the new key is unset; the new key always wins.
+    #[test]
+    fn legacy_auto_retire_key_is_uncataloged_but_still_honored() {
+        assert!(find_definition(DEPRECATED_AUTO_RETIRE_PATH).is_none());
+        assert!(KNOWN_PATHS.contains(&DEPRECATED_AUTO_RETIRE_PATH));
+        let mut settings = SettingsFile::default();
+        settings.workspace.auto_retire_archived_after_days = Some(5);
+        assert_eq!(purge_archived_after_days(&settings), Some(5));
+        settings.workspace.purge_archived_after_days = Some(9);
+        assert_eq!(purge_archived_after_days(&settings), Some(9));
+    }
+
+    /// `workspace.autoArchiveIdleAfterDays` (PROTOCOL §5.12) is a whole
+    /// number of days with default `0` (off).
+    #[test]
+    fn auto_archive_catalog_entry_defaults_to_off_and_allows_zero() {
+        let def = find_definition(AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH)
+            .expect("workspace.autoArchiveIdleAfterDays missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "workspace");
+        assert!(matches!(def.ty, SettingType::Number { min: Some(0.0), .. }));
+        assert_eq!(def.default_value, Some(json!(0.0)));
+        assert!(KNOWN_PATHS.contains(&AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH));
+        for ok in [json!(0), json!(1), json!(7), json!(30.0)] {
+            def.validate(&ok)
+                .unwrap_or_else(|e| panic!("{ok} must pass: {e}"));
+        }
+        for bad in [json!(-1), json!(1.5), json!("7"), json!(true), Value::Null] {
+            assert!(def.validate(&bad).is_err(), "{bad} must reject");
+        }
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(
+            auto_archive_idle_after_days(&settings),
+            None,
+            "off by default"
+        );
+        settings.workspace.auto_archive_idle_after_days = 7;
+        assert_eq!(auto_archive_idle_after_days(&settings), Some(7));
+        settings.workspace.auto_archive_idle_after_days = 0;
+        assert_eq!(auto_archive_idle_after_days(&settings), None);
+        settings.workspace.auto_archive_idle_after_days = 14;
+        assert_eq!(auto_archive_idle_after_days(&settings), Some(14));
+    }
+
+    fn temp_settings_service_paths(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let id = uuid::Uuid::new_v4();
+        (
+            std::env::temp_dir().join(format!("intentd-settings-{tag}-{id}.db")),
+            std::env::temp_dir().join(format!("intentd-settings-{tag}-{id}.toml")),
+        )
+    }
+
+    fn remove_temp_settings_files(db: &std::path::Path, config: &std::path::Path) {
+        let _ = std::fs::remove_file(config);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                db.display()
+            )));
+        }
+    }
+
+    /// The purge setting round-trips through the registry-wired service:
+    /// absent reads `null` with `default` origin, `settings.update` persists
+    /// to config.toml, invalid values reject with `-32602` naming the key and
+    /// keep the prior value, `null` turns it off by removing the key, and
+    /// `settings.reset` removes it too.
+    #[tokio::test]
+    async fn purge_setting_round_trips_via_registry() {
+        let (tmp, config_path) = temp_settings_service_paths("purge");
+        let store = Store::open(&tmp).await.expect("open store");
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+        let path = PURGE_ARCHIVED_AFTER_DAYS_PATH;
+
+        let got = svc.get(path).await.expect("get");
+        assert_eq!(got["value"], Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+
+        svc.update(&json!([{ "path": path, "value": 7 }]))
+            .await
+            .expect("update");
+        let got = svc.get(path).await.expect("get");
+        assert_eq!(got["value"], json!(7.0));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("purgeArchivedAfterDays = 7"), "{text}");
+        assert_eq!(
+            purge_archived_after_days(&registry.snapshot().effective),
+            Some(7)
+        );
+
+        for value in [json!(0), json!(-3), json!(2.5)] {
+            let err = svc
+                .update(&json!([{ "path": path, "value": value }]))
+                .await
+                .expect_err("invalid value must reject");
+            assert!(
+                matches!(err, Error::InvalidParams(ref msg) if msg.contains(path)),
+                "expected InvalidParams naming {path} for {value}, got {err:?}"
+            );
+        }
+        assert_eq!(
+            purge_archived_after_days(&registry.snapshot().effective),
+            Some(7)
+        );
+
+        svc.update(&json!([{ "path": path, "value": null }]))
+            .await
+            .expect("null turns purge off");
+        assert_eq!(
+            purge_archived_after_days(&registry.snapshot().effective),
+            None
+        );
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.trim_start().starts_with("purgeArchivedAfterDays")),
+            "{text}"
+        );
+
+        svc.update(&json!([{ "path": path, "value": 30 }]))
+            .await
+            .expect("update");
+        let reset = svc.reset(path).await.expect("reset");
+        assert_eq!(reset["value"], Value::Null);
+        assert_eq!(reset["origin"], json!("default"));
+        assert_eq!(
+            purge_archived_after_days(&registry.snapshot().effective),
+            None
+        );
+
+        // An old client still writing the legacy key is tolerated and ignored.
+        svc.update(&json!([{ "path": DEPRECATED_AUTO_RETIRE_PATH, "value": 3 }]))
+            .await
+            .expect("legacy write is ignored, not rejected");
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("autoRetireArchivedAfterDays"), "{text}");
+
+        remove_temp_settings_files(&tmp, &config_path);
+    }
+
+    /// The auto-archive setting round-trips: absent reads `0` (off) with
+    /// `default` origin, a positive window persists and turns it on, `0`
+    /// persists and turns it off, negatives and fractions reject, and
+    /// `settings.reset` returns to off.
+    #[tokio::test]
+    async fn auto_archive_setting_round_trips_via_registry() {
+        let (tmp, config_path) = temp_settings_service_paths("autoarchive");
+        let store = Store::open(&tmp).await.expect("open store");
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+        let path = AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH;
+
+        let got = svc.get(path).await.expect("get");
+        assert_eq!(got["value"], json!(0.0));
+        assert_eq!(got["origin"], json!("default"));
+        assert_eq!(
+            auto_archive_idle_after_days(&registry.snapshot().effective),
+            None,
+            "off by default"
+        );
+
+        svc.update(&json!([{ "path": path, "value": 7 }]))
+            .await
+            .expect("7 turns auto-archive on");
+        assert_eq!(
+            auto_archive_idle_after_days(&registry.snapshot().effective),
+            Some(7)
+        );
+        svc.update(&json!([{ "path": path, "value": 0 }]))
+            .await
+            .expect("0 turns auto-archive off");
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("autoArchiveIdleAfterDays = 0"), "{text}");
+        assert_eq!(
+            auto_archive_idle_after_days(&registry.snapshot().effective),
+            None
+        );
+
+        for value in [json!(-1), json!(2.5), Value::Null] {
+            let err = svc
+                .update(&json!([{ "path": path, "value": value }]))
+                .await
+                .expect_err("invalid value must reject");
+            assert!(
+                matches!(err, Error::InvalidParams(ref msg) if msg.contains(path)),
+                "expected InvalidParams naming {path} for {value}, got {err:?}"
+            );
+        }
+
+        svc.update(&json!([{ "path": path, "value": 14 }]))
+            .await
+            .expect("update");
+        assert_eq!(
+            auto_archive_idle_after_days(&registry.snapshot().effective),
+            Some(14)
+        );
+        let reset = svc.reset(path).await.expect("reset");
+        assert_eq!(reset["origin"], json!("default"));
+        assert_eq!(
+            auto_archive_idle_after_days(&registry.snapshot().effective),
+            None
+        );
+
+        remove_temp_settings_files(&tmp, &config_path);
+    }
+
+    /// The boot migration renames the legacy key: carried over when only it
+    /// is set, dropped when the new key is already set, and a file without
+    /// it is never rewritten. Comments survive the rewrite.
+    #[test]
+    fn migrate_auto_retire_setting_renames_the_legacy_key() {
+        let cases: [(&str, Option<u32>); 3] = [
+            (
+                "# keep me\n[workspace]\nautoRetireArchivedAfterDays = 5\n",
+                Some(5),
+            ),
+            (
+                "[workspace]\nautoRetireArchivedAfterDays = 5\npurgeArchivedAfterDays = 9\n",
+                Some(9),
+            ),
+            ("[workspace]\npurgeArchivedAfterDays = 4\n", Some(4)),
+        ];
+        for (text, expected) in cases {
+            let (_db, config_path) = temp_settings_service_paths("migrate-retire");
+            std::fs::write(&config_path, text).expect("write config");
+            let before = std::fs::metadata(&config_path)
+                .and_then(|m| m.modified())
+                .ok();
+            let registry = SettingsRegistry::load(&config_path).expect("load registry");
+            migrate_auto_retire_setting(&registry).expect("migrate");
+            let after = std::fs::read_to_string(&config_path).expect("read config");
+            assert!(!after.contains("autoRetireArchivedAfterDays"), "{after}");
+            assert_eq!(
+                registry
+                    .snapshot()
+                    .effective
+                    .workspace
+                    .purge_archived_after_days,
+                expected,
+                "{text}"
+            );
+            assert_eq!(
+                purge_archived_after_days(&registry.snapshot().effective),
+                expected
+            );
+            if text.starts_with("# keep me") {
+                assert!(after.contains("# keep me"), "{after}");
+                assert!(after.contains("purgeArchivedAfterDays = 5"), "{after}");
+            }
+            if !text.contains("autoRetireArchivedAfterDays") {
+                assert_eq!(after, text, "a file without the legacy key is untouched");
+                let unchanged = std::fs::metadata(&config_path)
+                    .and_then(|m| m.modified())
+                    .ok();
+                assert_eq!(before, unchanged);
+            }
+            // Idempotent: a second boot does nothing.
+            migrate_auto_retire_setting(&registry).expect("migrate again");
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), after);
+            let _ = std::fs::remove_file(&config_path);
         }
     }
 
@@ -7023,8 +7798,10 @@ mod tests {
             ("agentFeatures.scripts", true),
             ("agentFeatures.terminalAccess", true),
             ("agentFeatures.browserAutomation", true),
+            ("agentFeatures.desktopControl", true),
             ("agentFeatures.richChatBlocks", true),
             ("agentFeatures.structuredQuestions", true),
+            ("agentFeatures.secretRequests", false),
             ("agentFeatures.attentionRequests", true),
             ("agentFeatures.stateSnapshot", true),
             ("agentFeatures.prMonitor", true),
@@ -7125,8 +7902,10 @@ mod tests {
             ("agentFeatures.scripts", "~240 tokens/session"),
             ("agentFeatures.terminalAccess", "~50 tokens/session"),
             ("agentFeatures.browserAutomation", "~50 tokens/session"),
+            ("agentFeatures.desktopControl", "~50 tokens/session"),
             ("agentFeatures.richChatBlocks", "~310 tokens/session"),
             ("agentFeatures.structuredQuestions", "~180 tokens/session"),
+            ("agentFeatures.secretRequests", "~260 tokens/session"),
             ("agentFeatures.attentionRequests", "~340 tokens/session"),
             ("agentFeatures.stateSnapshot", "~50 tokens/turn"),
             ("agentFeatures.prMonitor", "~290 tokens/session"),
@@ -7330,6 +8109,92 @@ mod tests {
         assert_eq!(intent_core::config::DEFAULT_PR_CACHE_MAX_AGE_SECONDS, 60);
         assert_eq!(intent_core::config::MIN_PR_CACHE_MAX_AGE_SECONDS, 10);
         assert_eq!(intent_core::config::MAX_PR_CACHE_MAX_AGE_SECONDS, 600);
+    }
+
+    /// Daemon-to-daemon remote agents: `remoteAgents.permission` (default
+    /// `allowAll`) on the machine and `daemon.mode`. Both are TOML-backed,
+    /// owner-editable and round-trip through the registry; no setting
+    /// switches remote agents on or off.
+    #[tokio::test]
+    async fn remote_agents_settings_round_trip_via_registry() {
+        for (path, category, default) in [
+            ("remoteAgents.permission", "remoteAgents", json!("allowAll")),
+            ("daemon.mode", "daemon", json!("regular")),
+        ] {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert!(!def.sensitive, "{path} must be non-secret");
+            assert!(!def.read_only, "{path} must be editable");
+            assert_eq!(def.category, category, "{path} category");
+            assert_eq!(def.default_value, Some(default), "{path} default");
+            assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
+        }
+        for retired in ["remoteAgents.enabled", "experimental.remoteAgents"] {
+            assert!(find_definition(retired).is_none(), "{retired} is retired");
+            assert!(!KNOWN_PATHS.contains(&retired), "{retired} is retired");
+        }
+        let SettingType::Enum(values) = find_definition("remoteAgents.permission").unwrap().ty
+        else {
+            panic!("remoteAgents.permission must be an enum");
+        };
+        assert_eq!(values, ["allowAll", "autoByRisk", "denyAll"]);
+        let SettingType::Enum(values) = find_definition("daemon.mode").unwrap().ty else {
+            panic!("daemon.mode must be an enum");
+        };
+        assert_eq!(values, ["regular", "node"]);
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-remote-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-remote-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let effective = registry.snapshot().effective.clone();
+        assert_eq!(
+            effective.remote_agents.permission,
+            intent_core::settings_file::RemoteAgentPermission::AllowAll
+        );
+        assert_eq!(
+            effective.daemon.mode,
+            intent_core::settings_file::DaemonMode::Regular
+        );
+
+        svc.update(&json!([
+            { "path": "remoteAgents.permission", "value": "denyAll" },
+            { "path": "daemon.mode", "value": "node" },
+        ]))
+        .await
+        .expect("update");
+        let effective = registry.snapshot().effective.clone();
+        assert_eq!(
+            effective.remote_agents.permission,
+            intent_core::settings_file::RemoteAgentPermission::DenyAll
+        );
+        assert_eq!(
+            effective.daemon.mode,
+            intent_core::settings_file::DaemonMode::Node
+        );
+        for path in ["remoteAgents.permission", "daemon.mode"] {
+            let got = svc.get(path).await.expect("get");
+            assert_eq!(got["origin"], json!("file"), "{path} origin");
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "TOML-backed {path} must never write a SQLite settings row"
+            );
+        }
+        let err = svc
+            .update(&json!([{ "path": "remoteAgents.permission", "value": "ask" }]))
+            .await
+            .expect_err("an unknown permission must reject");
+        assert!(matches!(err, Error::InvalidParams(_)), "{err}");
+        let reset = svc.reset("remoteAgents.permission").await.expect("reset");
+        assert_eq!(reset["value"], json!("allowAll"));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&config_path);
     }
 
     /// `[updates]` exposes one TOML-backed boolean (`checkOnIdle`, default
@@ -8582,6 +9447,62 @@ mod tests {
         }
     }
 
+    /// A file from a build that still had the remote-agent switches
+    /// (`remoteAgents.enabled`, `experimental.remoteAgents`) loads: both are
+    /// discarded (no catalog entry), stripped from the file, and
+    /// `remoteAgents.permission` is kept.
+    #[tokio::test]
+    async fn import_legacy_settings_discards_retired_remote_agent_switches() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-legacyra-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-legacyra-{tag}.toml"));
+        std::fs::write(
+            &config_path,
+            "# my config\n[remoteAgents]\nenabled = true\npermission = \"denyAll\"\n\n[experimental]\nremoteAgents = true\n",
+        )
+        .expect("seed config");
+        let registry = SettingsRegistry::load(&config_path).expect("retired keys must load");
+        assert_eq!(
+            registry.snapshot().effective.remote_agents.permission,
+            intent_core::settings_file::RemoteAgentPermission::DenyAll
+        );
+        assert!(find_definition("remoteAgents.enabled").is_none());
+        assert!(find_definition("experimental.remoteAgents").is_none());
+
+        let mut stripped = import_legacy_settings(&registry, &store)
+            .await
+            .expect("import");
+        stripped.sort();
+        assert_eq!(
+            stripped,
+            vec![
+                "experimental".to_string(),
+                "remoteAgents.enabled".to_string()
+            ]
+        );
+        for path in ["remoteAgents.enabled", "experimental.remoteAgents"] {
+            assert_eq!(store.get_setting(path).await.expect("read"), None, "{path}");
+        }
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("enabled"), "{text}");
+        assert!(!text.contains("experimental"), "{text}");
+        assert!(text.contains("permission = \"denyAll\""), "{text}");
+        assert!(text.contains("# my config"), "{text}");
+
+        let registry2 = SettingsRegistry::load(&config_path).expect("clean reload");
+        assert!(registry2.legacy_values().is_empty());
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
     /// A hand-edited file can carry the legacy key as a TOML table header
     /// (`[model.workspaceOverrides]`) instead of an inline table. The capture
     /// and strip paths must handle that form too — the one-shot migration
@@ -8896,7 +9817,7 @@ mod rollback_order_tests {
             newer: concurrent.then_some((newer_entered.clone(), Mutex::new(newer_release_rx))),
             write_order: Mutex::new(Vec::new()),
         });
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_settings_registry(registry)
             .with_secret_store(secrets.clone())
             .with_event_bus(bus);
@@ -8916,15 +9837,18 @@ mod rollback_order_tests {
             {"path":SECRET_ACCOUNT, "value":"newer-pat"}
         ]));
         if concurrent {
-            timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .expect("rollback parked");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                entered.notified(),
+            )
+            .await
+            .expect("rollback parked");
             assert!(
                 poll_fn(|cx| Poll::Ready(newer.as_mut().poll(cx).is_pending())).await,
                 "the newer request must remain pending while compensation is parked"
             );
             let ordinary = timeout(
-                Duration::from_secs(3),
+                intentd_test_support::test_timeout(Duration::from_secs(3)),
                 services.settings_get("notifications.volume".into()),
             )
             .await
@@ -8942,9 +9866,12 @@ mod rollback_order_tests {
         if concurrent {
             // Polling the outer request starts an owned task. Hold its backing
             // write through the intermediate assertions and revision-one probe.
-            timeout(Duration::from_secs(5), newer_entered.notified())
-                .await
-                .expect("newer write parked");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                newer_entered.notified(),
+            )
+            .await
+            .expect("newer write parked");
             assert_eq!(
                 *secrets.write_order.lock().unwrap(),
                 [
@@ -8986,10 +9913,13 @@ mod rollback_order_tests {
             );
             assert_eq!(raw.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
             assert_eq!(raw.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
-            let events = timeout(Duration::from_secs(5), sub.recv())
-                .await
-                .expect("newer settings event")
-                .unwrap();
+            let events = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                sub.recv(),
+            )
+            .await
+            .expect("newer settings event")
+            .unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].data["revision"], json!(2));
             assert_eq!(
@@ -9037,7 +9967,7 @@ mod rollback_order_tests {
         ] {
             raw.store(account, value).unwrap();
         }
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_secret_store(Arc::new(RejectSecondSecret {
                 raw: raw.clone(),
                 reject_rollback: true,
@@ -9121,7 +10051,7 @@ mod rollback_order_tests {
         .unwrap();
         let entered = Arc::new(tokio::sync::Notify::new());
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_secret_store(Arc::new(ParkFailure {
                 raw: raw.clone(),
                 entered: entered.clone(),
@@ -9138,9 +10068,12 @@ mod rollback_order_tests {
                 ]))
                 .await
         });
-        timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             raw.load(crate::github_auth_ops::SECRET_ACCOUNT)
                 .unwrap()
@@ -9149,14 +10082,17 @@ mod rollback_order_tests {
         );
         match action {
             "revoke" => {
-                timeout(Duration::from_secs(3), services.github_revoke())
-                    .await
-                    .expect("revoke remains responsive during unrelated secret write")
-                    .unwrap();
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(3)),
+                    services.github_revoke(),
+                )
+                .await
+                .expect("revoke remains responsive during unrelated secret write")
+                .unwrap();
             }
             "alias" => {
                 timeout(
-                    Duration::from_secs(3),
+                    intentd_test_support::test_timeout(Duration::from_secs(3)),
                     services.source_control_revoke("github".into(), None),
                 )
                 .await
@@ -9170,10 +10106,13 @@ mod rollback_order_tests {
                     crate::github_auth_ops::credential_tests::accept_identity(),
                 )
                 .await;
-                timeout(Duration::from_secs(5), flow)
-                    .await
-                    .unwrap()
-                    .unwrap();
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    flow,
+                )
+                .await
+                .unwrap()
+                .unwrap();
             }
             _ => unreachable!(),
         }
@@ -9364,10 +10303,13 @@ mod rollback_order_tests {
             .await
             .unwrap();
         assert_eq!(next["revision"], json!(1));
-        let events = timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let events = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data["revision"], json!(1));
         assert_eq!(events[0].data["changes"], next["applied"]);
@@ -9414,7 +10356,7 @@ mod rollback_order_tests {
         )
         .unwrap();
         let services = Arc::new(
-            crate::Services::new(store)
+            crate::Services::new_isolated(store)
                 .with_settings_registry(registry)
                 .with_secret_store(Arc::new(raw.clone()))
                 .with_event_bus(bus)
@@ -9435,9 +10377,12 @@ mod rollback_order_tests {
                 ]))
                 .await
         });
-        timeout(Duration::from_secs(5), parked.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            parked.notified(),
+        )
+        .await
+        .unwrap();
         eprintln!(
             "at compensating hook: token={:?}; method={:?}",
             raw.load(crate::github_auth_ops::SECRET_ACCOUNT).unwrap(),
@@ -9445,10 +10390,13 @@ mod rollback_order_tests {
                 .unwrap()
         );
         if revoke {
-            let revoked = timeout(Duration::from_secs(5), services.github_revoke())
-                .await
-                .unwrap()
-                .unwrap();
+            let revoked = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                services.github_revoke(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(revoked["ok"], json!(true));
         } else {
             raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "oauth-completed")
@@ -9460,11 +10408,14 @@ mod rollback_order_tests {
             .unwrap();
         }
         release.notify_one();
-        let error = timeout(Duration::from_secs(5), update)
-            .await
-            .unwrap()
-            .unwrap()
-            .expect_err("start failed");
+        let error = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            update,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("start failed");
         let ordinary = services
             .settings_get("server.wsApi.enabled".into())
             .await
@@ -9570,7 +10521,7 @@ mod rollback_order_tests {
         let parked = Arc::new(tokio::sync::Notify::new());
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let services = Arc::new(
-            crate::Services::new(store)
+            crate::Services::new_isolated(store)
                 .with_settings_registry(registry)
                 .with_secret_store(Arc::new(PausedRollbackStore {
                     raw,
@@ -9590,11 +10541,14 @@ mod rollback_order_tests {
                 ]))
                 .await
         });
-        timeout(Duration::from_secs(5), parked.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            parked.notified(),
+        )
+        .await
+        .unwrap();
         let newer = timeout(
-            Duration::from_secs(3),
+            intentd_test_support::test_timeout(Duration::from_secs(3)),
             services.settings_update(json!([
                 {"path":"server.wsApi.enabled","value":true}
             ])),
@@ -9616,10 +10570,13 @@ mod rollback_order_tests {
             Some(5181),
             "stale compensation must not stop the newer listener"
         );
-        let events = timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let events = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].data,
@@ -9687,7 +10644,7 @@ mod port_assignment_publication_tests {
                     event_types: vec!["settings:changed".into()],
                     ..Default::default()
                 });
-                let services = crate::Services::new(store)
+                let services = crate::Services::new_isolated(store)
                     .with_settings_registry(registry.clone())
                     .with_event_bus(bus);
                 let control = Arc::new(AssignPort {
@@ -9712,10 +10669,13 @@ mod port_assignment_publication_tests {
                             .unwrap(),
                     )
                 };
-                let events = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
+                let events = tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    sub.recv(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
                 assert_eq!(events.len(), 1);
                 let changes = &events[0].data["changes"];
                 let assignment = changes
@@ -9753,7 +10713,7 @@ mod port_assignment_publication_tests {
             event_types: vec!["settings:changed".into()],
             ..Default::default()
         });
-        let services = crate::Services::new(store)
+        let services = crate::Services::new_isolated(store)
             .with_settings_registry(registry.clone())
             .with_event_bus(bus);
         let control = Arc::new(AssignPort {
@@ -9776,10 +10736,13 @@ mod port_assignment_publication_tests {
             registry.snapshot().ws_api_port_policy(),
             crate::WsApiPortPolicy::Fixed(5183)
         );
-        let events = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let events = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].data["changes"],
@@ -9813,7 +10776,7 @@ mod port_assignment_publication_tests {
         let parked = Arc::new(tokio::sync::Notify::new());
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let services = Arc::new(
-            crate::Services::new(store)
+            crate::Services::new_isolated(store)
                 .with_settings_registry(registry.clone())
                 .with_event_bus(bus)
                 .with_secret_store(Arc::new(PausedRollbackStore {
@@ -9839,9 +10802,12 @@ mod port_assignment_publication_tests {
                 ]))
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(5), parked.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            parked.notified(),
+        )
+        .await
+        .unwrap();
         let assigned = services
             .settings_get("server.wsApi.port".into())
             .await
@@ -9851,10 +10817,13 @@ mod port_assignment_publication_tests {
             assigned["revision"], 1,
             "assignment must have a revision before another reader enters"
         );
-        let first = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let first = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(
             first[0].data["changes"],
@@ -9877,14 +10846,158 @@ mod port_assignment_publication_tests {
             final_port["revision"], 2,
             "old rollback must not announce newer assignment again"
         );
-        let second = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let second = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].data["changes"], newer["applied"]);
         let mut next = Box::pin(sub.recv());
         assert!(poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx).is_pending())).await);
         assert_eq!(control.starts.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod completion_read_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    struct FailedBatch {
+        original: Arc<dyn SecretStore>,
+        compensation: bool,
+        failures: Arc<AtomicU8>,
+    }
+    impl SecretStore for FailedBatch {
+        fn load(&self, account: &str) -> Result<Option<String>> {
+            self.original.load(account)
+        }
+        fn store(&self, account: &str, value: &str) -> Result<()> {
+            if account == "linear.token" && value == "failed-batch-write" {
+                self.failures.fetch_or(1, Ordering::SeqCst);
+                return Err(Error::Internal(
+                    "injected original batch persistence failure".into(),
+                ));
+            }
+            if self.compensation
+                && account == "sourceControl.gitlab.token"
+                && value == "pat-original"
+                && self.failures.load(Ordering::SeqCst) != 0
+            {
+                self.failures.fetch_or(2, Ordering::SeqCst);
+                return Err(Error::Internal(
+                    "injected credential compensation failure".into(),
+                ));
+            }
+            self.original.store(account, value)
+        }
+        fn delete(&self, account: &str) -> Result<()> {
+            self.original.delete(account)
+        }
+    }
+    pub(crate) fn failed_batch(
+        original: &AsyncSecretStore,
+        compensation: bool,
+    ) -> (AsyncSecretStore, Arc<AtomicU8>) {
+        let mut store = original.clone();
+        let failures = Arc::new(AtomicU8::new(0));
+        store.inner = Arc::new(FailedBatch {
+            original: original.inner.clone(),
+            compensation,
+            failures: failures.clone(),
+        });
+        (store, failures)
+    }
+
+    struct ControlledRead {
+        original: Arc<dyn SecretStore>,
+        failure: Arc<AtomicU8>,
+    }
+    impl SecretStore for ControlledRead {
+        fn load(&self, account: &str) -> Result<Option<String>> {
+            if account == "linear.token" {
+                match self.failure.load(Ordering::SeqCst) {
+                    1 => return Err(Error::Internal("completion backing read failed".into())),
+                    2 => std::thread::sleep(Duration::from_millis(200)),
+                    _ => {}
+                }
+            }
+            self.original.load(account)
+        }
+        fn store(&self, account: &str, value: &str) -> Result<()> {
+            self.original.store(account, value)
+        }
+        fn delete(&self, account: &str) -> Result<()> {
+            self.original.delete(account)
+        }
+    }
+    pub(crate) fn controlled(original: &AsyncSecretStore) -> (AsyncSecretStore, Arc<AtomicU8>) {
+        let failure = Arc::new(AtomicU8::new(0));
+        let mut store = original.clone();
+        store.inner = Arc::new(ControlledRead {
+            original: original.inner.clone(),
+            failure: failure.clone(),
+        });
+        store.load_timeout = Duration::from_millis(40);
+        store.cache_ttl = Duration::ZERO;
+        (store, failure)
+    }
+    #[intent_test_macros::daemon_test]
+    async fn completion_value_sqlite_failure_is_not_a_default() {
+        let dir = crate::test_support::test_tempdir("completion-read-sqlite");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        store.set_setting("git.autoCommit", "false").await.unwrap();
+        let secrets = AsyncSecretStore::new(Arc::new(InMemorySecretStore::default()));
+        let service = SettingsService::new(&store, &secrets, None);
+        assert_eq!(
+            service.completion_value("git.autoCommit").await.unwrap()["value"],
+            false
+        );
+        store.read_pool().close().await;
+        assert!(
+            service.completion_value("git.autoCommit").await.is_err(),
+            "SQLite failure became a completion default"
+        );
+        // The public display getter remains intentionally best-effort.
+        assert_eq!(service.get("git.autoCommit").await.unwrap()["value"], true);
+        let raw: String =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = 'git.autoCommit'")
+                .fetch_one(store.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(raw, "false");
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn completion_value_redaction_absence_and_public_display_compatibility() {
+        let dir = crate::test_support::test_tempdir("completion-read-redaction");
+        let store = Store::open(&dir.path().join("state.db")).await.unwrap();
+        let raw = InMemorySecretStore::default();
+        raw.store("linear.token", "private-token").unwrap();
+        let (secrets, failure) = controlled(&AsyncSecretStore::new(Arc::new(raw.clone())));
+        let service = SettingsService::new(&store, &secrets, None);
+        assert_eq!(
+            service.completion_value("linear.token").await.unwrap(),
+            json!({"path":"linear.token", "value":REDACTED_PLACEHOLDER})
+        );
+        failure.store(1, Ordering::SeqCst);
+        assert!(service.completion_value("linear.token").await.is_err());
+        assert_eq!(
+            service.get("linear.token").await.unwrap()["value"],
+            Value::Null
+        );
+        assert_eq!(
+            raw.load("linear.token").unwrap().as_deref(),
+            Some("private-token")
+        );
+        failure.store(0, Ordering::SeqCst);
+        raw.delete("linear.token").unwrap();
+        assert_eq!(
+            service.completion_value("linear.token").await.unwrap(),
+            json!({"path":"linear.token", "value":Value::Null})
+        );
     }
 }

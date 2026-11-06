@@ -71,7 +71,18 @@ impl Api {
                         break;
                     }
                     buf.extend_from_slice(&chunk[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let length = String::from_utf8_lossy(&buf[..end])
+                        .lines()
+                        .find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + length {
                         break;
                     }
                 }
@@ -93,16 +104,47 @@ impl Api {
                     .unwrap_or(30);
                 let body = {
                     let items = records.lock().unwrap();
-                    if request.starts_with("POST ") {
+                    if url.path() == "/graphql" {
+                        // `pullRequests(headRefName:)` matches every head owner.
+                        let payload: serde_json::Value = request
+                            .split_once("\r\n\r\n")
+                            .and_then(|(_, body)| serde_json::from_str(body).ok())
+                            .unwrap_or_default();
+                        let head = &payload["variables"]["head"];
+                        let nodes: Vec<_> = items
+                            .iter()
+                            .filter(|p| p["state"] == "open" && p["head"]["ref"] == *head)
+                            .map(|p| {
+                                json!({"number":p["number"],"url":p["html_url"],
+                                    "title":p["title"],"state":"OPEN","isDraft":false,
+                                    "headRefName":p["head"]["ref"],"headRefOid":p["head"]["sha"],
+                                    "baseRefName":p["base"]["ref"],"author":{"login":"a"},
+                                    "createdAt":p["created_at"],"updatedAt":p["updated_at"]})
+                            })
+                            .collect();
+                        let more = nodes.len() > 100;
+                        let nodes: Vec<_> = nodes.into_iter().take(100).collect();
+                        json!({"data":{"repository":{"pullRequests":{
+                            "pageInfo":{"hasNextPage":more},"nodes":nodes}}}})
+                    } else if request.starts_with("POST ") {
                         items.last().cloned().unwrap()
                     } else if url.path().ends_with("/pulls") {
                         let filtered: Vec<_> = items
                             .iter()
                             .filter(|p| p["state"] == "open")
                             .filter(|p| {
-                                query
-                                    .get("head")
-                                    .is_none_or(|head| p["head"]["ref"] == *head)
+                                // GitHub filters on `owner:branch`; the bare
+                                // form is kept for the unscoped legacy path.
+                                query.get("head").is_none_or(|head| {
+                                    let owner =
+                                        p["head"]["repo"]["owner"]["login"].as_str().unwrap_or("o");
+                                    let branch = match head.split_once(':') {
+                                        Some((o, branch)) if o == owner => branch,
+                                        Some(_) => return false,
+                                        None => head,
+                                    };
+                                    p["head"]["ref"] == *branch
+                                })
                             })
                             .cloned()
                             .collect();
@@ -207,6 +249,16 @@ impl Api {
                 .unwrap(),
         )
     }
+}
+
+fn graphql_discovery(traffic: &Traffic) -> u64 {
+    traffic
+        .snapshot()
+        .counts
+        .iter()
+        .filter(|((_, o), _)| *o == Operation::Discovery)
+        .map(|(_, v)| v.graphql_requests)
+        .sum()
 }
 
 fn counts(traffic: &Traffic) -> (u64, u64, u64) {
@@ -377,7 +429,8 @@ async fn shared_discovery_exact_boundary_error_cap_and_corrupt_cursor_are_unknow
         (0, 0, None, 1, true),
         (100, 0, None, 2, true),
         (101, 2, None, 2, false),
-        (1001, 0, None, 10, false),
+        // Oversized: ten capped pages, then one head query (#7187).
+        (1001, 0, None, 10, true),
         (3, 0, Some("1"), 1, false),
         (3, 0, Some("bad"), 1, false),
         (100, 0, Some("2"), 2, false),
@@ -405,14 +458,235 @@ async fn shared_discovery_exact_boundary_error_cap_and_corrupt_cursor_are_unknow
             }
         })
         .await;
-        assert_eq!(counts(&traffic), (expected_pages, 0, 0));
-        assert!(api
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|p| !p.contains("head=")));
+        // An oversized repository adds one owner-scoped head query.
+        let head_queries = u64::from(size > 1000);
+        assert_eq!(counts(&traffic), (expected_pages + head_queries, 0, 0));
+        assert_eq!(graphql_discovery(&traffic), 0);
+        let requests = api.requests.lock().unwrap();
+        let heads: Vec<_> = requests.iter().filter(|p| p.contains("head=")).collect();
+        assert_eq!(heads.len() as u64, head_queries, "{heads:?}");
+        assert!(
+            heads.iter().all(|p| p.contains("head=o%3Amissing")),
+            "{heads:?}"
+        );
     }
+}
+
+/// intent-hq/intent#7187: a repository with more than 1,000 open PRs
+/// cannot be listed within the page cap. Discovery must still find the
+/// workspace PR with one head query scoped to the repository owner (never a
+/// contributor fork's same-name head, intent-hq/intent#8010), and must not
+/// re-list the whole repository every window.
+#[tokio::test]
+async fn shared_discovery_oversized_repository_uses_head_query() {
+    let mut data: Vec<_> = (1..=1200).map(|n| pull(n, "other")).collect();
+    data.push(pull(1300, "feature"));
+    let mut fork = pull(1301, "fork-feature");
+    fork["head"]["repo"] = json!({"owner":{"login":"contributor"}});
+    data.push(fork);
+    let api = Api::new(data).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let traffic = Traffic::default();
+    with_traffic(traffic.clone(), async {
+        let found = svc
+            .discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+            .await
+            .expect("an oversized repository is not a discovery failure");
+        assert_eq!(found.map(|pr| pr.number), Some(1300));
+        let fork = svc
+            .discover_shared_pr(sc.as_ref(), &repo, "fork-feature", None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fork.map(|pr| pr.number),
+            None,
+            "another owner's fork head is not the workspace's"
+        );
+        assert!(svc
+            .discover_shared_pr(sc.as_ref(), &repo, "missing", None, None)
+            .await
+            .unwrap()
+            .is_none());
+        // Ten capped listing pages once, then one head query per branch.
+        assert_eq!(counts(&traffic), (13, 1, 0));
+        assert_eq!(graphql_discovery(&traffic), 0);
+        for _ in 0..5 {
+            svc.pr_discovery.expire();
+            assert_eq!(
+                svc.discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+                    .await
+                    .unwrap()
+                    .map(|pr| pr.number),
+                Some(1300)
+            );
+        }
+        // Later windows re-read only the head, never the full list.
+        assert_eq!(counts(&traffic), (18, 6, 0));
+        assert_eq!(graphql_discovery(&traffic), 0);
+    })
+    .await;
+    let requests = api.requests.lock().unwrap();
+    let heads: Vec<_> = requests.iter().filter(|p| p.contains("head=")).collect();
+    assert_eq!(heads.len(), 8, "{heads:?}");
+    assert!(heads.iter().all(|p| p.contains("head=o%3A")), "{heads:?}");
+}
+
+fn fork_pull(number: u64, branch: &str, owner: &str) -> serde_json::Value {
+    let mut pr = pull(number, branch);
+    pr["head"]["repo"] = json!({"owner":{"login":owner}});
+    pr["user"] = json!({"login":owner});
+    pr
+}
+
+/// More than 1,000 open PRs: discovery uses the per-head query.
+fn oversized(extra: impl IntoIterator<Item = serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut data: Vec<_> = (1..=1001).map(|n| pull(n, "other")).collect();
+    data.extend(extra);
+    data
+}
+
+/// intent-hq/intent#8010: two forks with the same branch name. Only the
+/// workspace repository owner's head matches; another fork's PR, even a
+/// newer one, is never attached.
+#[tokio::test]
+async fn shared_discovery_head_query_ignores_other_forks_with_the_same_branch() {
+    let api = Api::new(oversized([
+        fork_pull(1300, "feature", "o"),
+        fork_pull(1301, "feature", "contributor"),
+        fork_pull(1302, "fork-only", "contributor"),
+    ]))
+    .await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let found = svc
+        .discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+        .await
+        .unwrap();
+    assert_eq!(found.map(|pr| pr.number), Some(1300));
+    let other = svc
+        .discover_shared_pr(sc.as_ref(), &repo, "fork-only", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        other.map(|pr| pr.number),
+        None,
+        "another fork's PR is not the workspace's"
+    );
+}
+
+/// intent-hq/intent#8010: a common head name (`main`) carried by more than
+/// one page of other forks' PRs neither fails discovery nor matches them.
+#[tokio::test]
+async fn shared_discovery_head_query_survives_many_fork_heads_with_a_common_name() {
+    let forks = (0..150).map(|i| fork_pull(2000 + i, "main", &format!("fork-{i}")));
+    let api = Api::new(oversized(forks)).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let found = svc
+        .discover_shared_pr(sc.as_ref(), &repo, "main", None, None)
+        .await
+        .expect("other forks' heads are not a discovery failure");
+    assert_eq!(found.map(|pr| pr.number), None);
+    api.pulls.lock().unwrap().push(fork_pull(3000, "main", "o"));
+    svc.pr_discovery.expire();
+    let own = svc
+        .discover_shared_pr(sc.as_ref(), &repo, "main", None, None)
+        .await
+        .unwrap();
+    assert_eq!(own.map(|pr| pr.number), Some(3000));
+}
+
+/// intent-hq/intent#8010: the head is scoped by head repository owner, not
+/// by PR author, so a PR opened by someone else from the workspace
+/// repository's branch still matches.
+#[tokio::test]
+async fn shared_discovery_head_query_matches_a_pr_authored_by_someone_else() {
+    let mut pr = fork_pull(1300, "feature", "o");
+    pr["user"] = json!({"login":"maintainer"});
+    let api = Api::new(oversized([pr])).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let found = svc
+        .discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+        .await
+        .unwrap()
+        .expect("head owner, not author, scopes the match");
+    assert_eq!((found.number, found.author.as_str()), (1300, "maintainer"));
+}
+
+/// intent-hq/intent#8010 on the repository-wide listing (at most 1,000 open
+/// PRs, i.e. most repositories): another fork's same-name head, even a newer
+/// one, never matches; the owner's head matches whoever authored it; a head
+/// whose fork was deleted matches nothing.
+#[tokio::test]
+async fn shared_discovery_listing_ignores_other_forks_with_the_same_branch() {
+    let mut authored = fork_pull(4, "authored", "o");
+    authored["user"] = json!({"login":"maintainer"});
+    let mut deleted = pull(5, "gone");
+    deleted["head"]["repo"] = serde_json::Value::Null;
+    let api = Api::new(vec![
+        fork_pull(1, "feature", "o"),
+        fork_pull(2, "feature", "contributor"),
+        fork_pull(3, "fork-only", "contributor"),
+        authored,
+        deleted,
+    ])
+    .await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let found = |branch: &'static str| {
+        let (svc, sc, repo) = (&svc, sc.clone(), repo.clone());
+        async move {
+            svc.discover_shared_pr(sc.as_ref(), &repo, branch, None, None)
+                .await
+                .unwrap()
+                .map(|pr| (pr.number, pr.author))
+        }
+    };
+    assert_eq!(found("feature").await, Some((1, "o".into())));
+    assert_eq!(found("fork-only").await, None, "another fork's PR");
+    assert_eq!(
+        found("authored").await,
+        Some((4, "maintainer".into())),
+        "head owner, not author, scopes the match"
+    );
+    assert_eq!(found("gone").await, None, "a deleted fork's head");
+}
+
+/// A head query that observes a PR open supersedes an older cached record of
+/// it, as the repository-wide listing does (intent-hq/intent#7187).
+#[tokio::test]
+async fn shared_discovery_oversized_head_query_supersedes_older_record() {
+    let mut data: Vec<_> = (1..=1001).map(|n| pull(n, "other")).collect();
+    let mut reopened = pull(1300, "feature");
+    reopened["state"] = json!("closed");
+    data.push(reopened);
+    let api = Api::new(data).await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    assert!(svc
+        .discover_shared_pr(sc.as_ref(), &repo, "missing", None, None)
+        .await
+        .unwrap()
+        .is_none());
+    let closed = svc
+        .shared_pr_record(sc.as_ref(), &repo, 1300)
+        .await
+        .unwrap();
+    assert_eq!(closed.state, PrState::Closed);
+    api.pulls.lock().unwrap().last_mut().unwrap()["state"] = json!("open");
+    let found = svc
+        .discover_shared_pr(sc.as_ref(), &repo, "feature", None, None)
+        .await
+        .unwrap();
+    assert_eq!(found.map(|pr| pr.number), Some(1300));
 }
 
 #[tokio::test]
@@ -1708,4 +1982,180 @@ async fn automatic_discovery_saturation(poll_seconds: u64) {
         .count();
     assert!(idle_requests >= 10, "idle repository must complete a listing within two retry intervals despite active demand: {idle_requests} HTTP requests, configured {poll_seconds}s");
     assert_eq!(idle_requests % 10, 0, "every admitted listing completes");
+}
+
+use crate::test_tracing::Warnings;
+
+/// intent-hq/intent#7264: one budget deferral is cached in the repository's
+/// shared listing slot, so every root of that repository receives it. One
+/// sweep must log one summary WARN for the repository, not one per root.
+#[tokio::test]
+async fn budget_deferral_logs_one_summary_per_repository_not_per_root() {
+    const ROOTS: usize = 5;
+    let api = Api::new(vec![]).await;
+    let (_t, svc, ws_id) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let mut checkouts = Vec::new();
+    for i in 0..ROOTS {
+        let checkout = SweepRepo::init(&format!("root-{i}"), Some("https://github.com/o/r.git"));
+        let root = sweep_root(&ws_id, &checkout.dir, Some(("o", "r")));
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        checkouts.push(checkout);
+    }
+    let traffic = Traffic::default();
+    let warnings = Warnings::default();
+    with_traffic(traffic.clone(), async {
+        svc.pr_discovery.exhaust_budget();
+        let guard = warnings.install();
+        svc.refresh_all_workspace_prs(0).await;
+        drop(guard);
+    })
+    .await;
+    assert_eq!(
+        counts(&traffic),
+        (0, 0, 0),
+        "a deferred listing sends no HTTP"
+    );
+    assert_eq!(
+        warnings.containing("root refresh failed"),
+        Vec::<String>::new(),
+        "a deferral is not a per-root failure"
+    );
+    assert_eq!(
+        warnings.containing("workspace refresh failed"),
+        Vec::<String>::new(),
+        "a deferral is not a per-workspace failure"
+    );
+    let summaries = warnings.containing("deferred by request budget");
+    assert_eq!(summaries.len(), 1, "one WARN per repository: {summaries:?}");
+    let summary = &summaries[0];
+    assert!(summary.contains("repo=o/r"), "{summary}");
+    assert!(summary.contains(&format!("roots={ROOTS}")), "{summary}");
+    assert!(summary.contains("workspaces=1"), "{summary}");
+    assert!(
+        summary.contains(&format!("deferred_reads={}", ROOTS + 1)),
+        "one fresh denial plus every slot-shared copy: {summary}"
+    );
+}
+
+/// The lease can also run out mid-listing (here: redirect hops spend all 40
+/// reserved attempts before page nine). That transport-side denial is cached
+/// in the same slot and must be summarized like an up-front deferral.
+#[tokio::test]
+async fn mid_listing_lease_denial_is_summarized_like_an_up_front_deferral() {
+    let api = Api::new((1..=801).map(|n| pull(n, "other")).collect()).await;
+    api.listing_redirects.store(4, Ordering::SeqCst);
+    let (_t, svc, ws_id) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let mut checkouts = Vec::new();
+    for i in 0..3 {
+        let checkout = SweepRepo::init(&format!("root-{i}"), Some("https://github.com/o/r.git"));
+        let root = sweep_root(&ws_id, &checkout.dir, Some(("o", "r")));
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        checkouts.push(checkout);
+    }
+    let traffic = Traffic::default();
+    let warnings = Warnings::default();
+    with_traffic(traffic.clone(), async {
+        let guard = warnings.install();
+        svc.refresh_all_workspace_prs(0).await;
+        drop(guard);
+    })
+    .await;
+    assert_eq!(
+        counts(&traffic),
+        (40, 0, 0),
+        "one listing spends its whole lease"
+    );
+    assert!(warnings.containing("root refresh failed").is_empty());
+    assert!(warnings.containing("workspace refresh failed").is_empty());
+    let summaries = warnings.containing("deferred by request budget");
+    assert_eq!(summaries.len(), 1, "{summaries:?}");
+    assert!(summaries[0].contains("roots=3"), "{}", summaries[0]);
+    assert!(summaries[0].contains("workspaces=1"), "{}", summaries[0]);
+}
+
+/// A deferral that does not fail its root (relink discovery after the linked
+/// PR merged) still reaches the summary through `deferred_reads` instead of
+/// disappearing at DEBUG, and the root's status delta still persists.
+#[tokio::test]
+async fn relink_discovery_deferral_is_counted_in_the_summary() {
+    let mut merged = pull(42, "root-0");
+    merged["state"] = json!("closed");
+    merged["merged"] = json!(true);
+    merged["merged_at"] = json!("2026-01-02T00:00:00Z");
+    let api = Api::new(vec![merged]).await;
+    let (_t, svc, ws_id) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let svc = svc.with_source_control(sc.clone());
+    let checkout = SweepRepo::init("root-0", Some("https://github.com/o/r.git"));
+    let mut root = sweep_root(&ws_id, &checkout.dir, Some(("o", "r")));
+    root.pr_number = Some(42);
+    svc.store().upsert_workspace_git_root(&root).await.unwrap();
+    let traffic = Traffic::default();
+    let warnings = Warnings::default();
+    with_traffic(traffic.clone(), async {
+        // The linked record is fresh in its slot; only listings are deferred.
+        svc.shared_pr_record(sc.as_ref(), &RepoRef::new("o", "r"), 42)
+            .await
+            .unwrap();
+        svc.pr_discovery.exhaust_budget();
+        let guard = warnings.install();
+        svc.refresh_all_workspace_prs(0).await;
+        drop(guard);
+    })
+    .await;
+    assert_eq!(counts(&traffic), (0, 1, 0), "only the warm-up record read");
+    assert!(warnings.containing("relink discovery failed").is_empty());
+    assert!(warnings.containing("root refresh failed").is_empty());
+    let summaries = warnings.containing("deferred by request budget");
+    assert_eq!(summaries.len(), 1, "{summaries:?}");
+    let summary = &summaries[0];
+    assert!(
+        summary.contains("roots=0"),
+        "the root refresh succeeded: {summary}"
+    );
+    assert!(summary.contains("workspaces=1"), "{summary}");
+    assert!(
+        summary.contains("deferred_reads=3"),
+        "workspace listing, linked listing, relink listing: {summary}"
+    );
+    let roots = svc.store().list_workspace_git_roots(&ws_id).await.unwrap();
+    assert_eq!(
+        roots[0].pr_status,
+        Some(intent_core::PullRequestStatus::Merged),
+        "the status delta persists despite the deferred relink"
+    );
+}
+
+/// Coalescing is only for budget deferrals: a real per-root failure keeps
+/// its own WARN for every root it affects.
+#[tokio::test]
+async fn non_deferral_root_failures_still_warn_per_root() {
+    let forge = StubForge {
+        fail_list_prs: true,
+        ..StubForge::default()
+    };
+    let (_t, svc, ws_id) = refresh_setup(forge, "main", None, false).await;
+    let mut checkouts = Vec::new();
+    for i in 0..2 {
+        let checkout = SweepRepo::init(&format!("root-{i}"), Some("https://github.com/o/r.git"));
+        let root = sweep_root(&ws_id, &checkout.dir, Some(("o", "r")));
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        checkouts.push(checkout);
+    }
+    let warnings = Warnings::default();
+    let guard = warnings.install();
+    svc.refresh_all_workspace_prs(0).await;
+    drop(guard);
+    assert_eq!(
+        warnings.containing("root refresh failed").len(),
+        2,
+        "{:?}",
+        warnings.all()
+    );
+    assert_eq!(warnings.containing("workspace refresh failed").len(), 1);
+    assert!(warnings.containing("deferred by request budget").is_empty());
 }

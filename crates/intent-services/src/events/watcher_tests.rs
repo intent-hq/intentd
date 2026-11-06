@@ -1151,7 +1151,7 @@ async fn linked_worktree_exclude_watch_adds_no_descriptor_outside_the_root() {
     // What the git metadata watcher holds for this worktree in production.
     let hub = SharedWatchHub::new();
     let (common_sub, _common_rx, _) = hub.subscribe_git_dir(&common);
-    common_sub.wait_established(LIVENESS).await;
+    common_sub.probe().wait_live(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
     let before = inotify_watched_inodes();
     assert!(
@@ -1330,11 +1330,13 @@ async fn budget_bounds_delayed_setup_plus_missing_event_to_one_deadline() {
     let event_wait = Instant::now();
     let ev = next_for(&mut sub, "never/arrives.txt", None, budget.remaining()).await;
     assert!(ev.is_none(), "no event was ever published");
+    // elapsed-assert: allow — tokio::time::pause(): Instant is virtual
     assert!(
         event_wait.elapsed().abs_diff(remainder) <= tick,
         "the event wait must take only the budget's remainder, not a fresh {total:?}: took {:?}",
         event_wait.elapsed()
     );
+    // elapsed-assert: allow — tokio::time::pause(): Instant is virtual
     assert!(
         started.elapsed().abs_diff(total) <= tick,
         "setup plus event wait must end at the shared deadline: took {:?}",

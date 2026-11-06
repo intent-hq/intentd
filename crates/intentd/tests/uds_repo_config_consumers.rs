@@ -18,7 +18,7 @@ use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
-mod common;
+use crate::common;
 
 struct TempDb {
     _dir: tempfile::TempDir,
@@ -58,10 +58,13 @@ async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
 
 async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     let mut line = String::new();
-    let n = timeout(Duration::from_secs(2), reader.read_line(&mut line))
-        .await
-        .expect("timed out waiting for a frame")
-        .expect("read failed");
+    let n = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("timed out waiting for a frame")
+    .expect("read failed");
     assert!(n > 0, "connection closed unexpectedly");
     serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
 }
@@ -147,7 +150,7 @@ async fn test_workspace_create_uses_repo_branch_prefix() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(common::registry_with_default_provider(ws_root.path())),
@@ -211,7 +214,7 @@ async fn test_workspace_create_setup_script_fallback() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_workspaces_root(ws_root.path().to_path_buf()),
     );
@@ -343,11 +346,11 @@ async fn test_script_list_bootstrap_from_repo() {
     let store = Store::open(&db.path).await.unwrap();
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+    let services: Arc<dyn WorkspaceApi> = Arc::new(intent_app::compose(
+        Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_workspaces_root(ws_root.path().to_path_buf()),
-    );
+    ));
 
     // Socket lives in a guarded dir under /tmp so the path stays short
     // (macOS SUN_LEN) and the file is swept even if the test panics.
@@ -438,7 +441,7 @@ async fn test_repo_instructions_in_system_prompt() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_event_bus(bus.clone())
             .with_workspaces_root(ws_root.path().to_path_buf()),
     );
@@ -492,8 +495,9 @@ async fn concurrent_script_list_no_duplicates() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf()));
+    let services: Arc<dyn WorkspaceApi> = Arc::new(intent_app::compose(
+        Services::new_isolated(store.clone()).with_workspaces_root(ws_root.path().to_path_buf()),
+    ));
     // Socket lives in a guarded dir under /tmp so the path stays short
     // (macOS SUN_LEN) and the file is swept even if the test panics.
     let sock_dir = common::test_tempdir_in("/tmp", "itd-rc-");

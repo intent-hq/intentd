@@ -281,3 +281,47 @@ async fn warmed_pool_counts_extra_queries_and_isolates_concurrent_spans() {
     assert_eq!(extra, 2, "a real extra application query must still count");
     pool.close().await;
 }
+
+/// Thread-local capture of every WARN-or-louder event as `message=... field=value`
+/// lines. Install with [`Warnings::install`] and keep the guard alive.
+#[derive(Clone, Default)]
+pub(crate) struct Warnings(Arc<Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{}={value:?} ", field.name());
+            }
+        }
+        if *event.metadata().level() > tracing::Level::WARN {
+            return;
+        }
+        let mut visitor = Visitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0);
+    }
+}
+
+impl Warnings {
+    pub(crate) fn install(&self) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        set_capture_default(tracing_subscriber::Registry::default().with(self.clone()))
+    }
+
+    pub(crate) fn all(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    pub(crate) fn containing(&self, needle: &str) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(needle))
+            .cloned()
+            .collect()
+    }
+}

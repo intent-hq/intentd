@@ -164,6 +164,7 @@ impl MockAgent {
 }
 
 /// Parse one prompt-script step object (exactly one recognized key).
+#[track_caller]
 fn parse_step(v: &Value) -> Step {
     if let Some(p) = v.get("update") {
         Step::Update(p.clone())
@@ -191,6 +192,7 @@ fn parse_step(v: &Value) -> Step {
 
 /// Load and parse a fixture, substituting `${ROOT}` (session worktree) and
 /// `${BIG}` (an oversized stderr line) tokens.
+#[track_caller]
 fn load_script(name: &str, root: &str) -> Script {
     let path = fixtures_dir().join(name);
     let raw = std::fs::read_to_string(&path)
@@ -366,6 +368,7 @@ fn spawn_prompt(
                         if cancelled.load(Ordering::SeqCst) {
                             break;
                         }
+                        // fixed-deadline: allow — not a deadline: the mock's cancel-flag re-check tick; stretching it only delays cancel detection
                         let _ = tokio::time::timeout(Duration::from_millis(25), fut).await;
                     }
                 }
@@ -454,6 +457,7 @@ fn build_inner(
         auth_required_stdout_marker: None,
         requests: Some(req_tx),
         notifications: Some(note_tx),
+        workers: None,
         auth_error_patterns: auth_patterns,
         stderr_log_dir: None,
         agent_id: None,
@@ -521,13 +525,17 @@ fn text_block(text: &str) -> ContentBlock {
 
 /// Receive the next streamed notification (with a generous timeout).
 async fn recv_note(rx: &mut mpsc::UnboundedReceiver<IncomingNotification>) -> IncomingNotification {
-    tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("notification timed out")
-        .expect("notification stream closed")
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        rx.recv(),
+    )
+    .await
+    .expect("notification timed out")
+    .expect("notification stream closed")
 }
 
 /// Assert a notification is an agent message chunk and return its text.
+#[track_caller]
 fn chunk_text(note: &IncomingNotification) -> String {
     match session::map_notification(note) {
         Some(MappedUpdate::Chunk {
@@ -871,7 +879,8 @@ impl TerminalHost for PtyTermHost {
             // command waits out the full 5s deadline. Revisit (e.g. an
             // explicit reader-drained signal from the PTY host) before
             // reusing this host for other commands.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let deadline = tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(5));
             let mut last = pty.scrollback(id).unwrap_or_default();
             loop {
                 tokio::time::sleep(Duration::from_millis(20)).await;

@@ -161,7 +161,11 @@ pub(crate) const PAIRING_PAYLOAD_VERSION: u32 = 1;
 /// through unchanged, but a token injected via `INTENTD_AUTH_TOKEN` may contain
 /// reserved characters (`&`, `=`, `%`, …) that would otherwise make the query
 /// string ambiguous.
-pub(crate) fn build_pairing_uri(
+///
+/// Public so `intentd pair --host` builds its operator-chosen-host payload
+/// with exactly the same encoding as `pairing.getInfo`.
+#[must_use]
+pub fn build_pairing_uri(
     hosts: &[String],
     port: u16,
     fingerprint: &str,

@@ -79,6 +79,50 @@ pub(crate) struct ProviderModelsFetch {
     pub models: Option<Vec<Value>>,
     /// Machine-readable reason when `models` is `None`.
     pub warning: Option<String>,
+    /// Structured cause of the failure, when known (PROTOCOL §5.30
+    /// `warningKind`).
+    pub warning_kind: Option<crate::model_catalog::ModelWarningKind>,
+}
+
+/// Why an installed-CLI catalog command could not be prepared: the
+/// human-readable `reason` (served verbatim as `warning`) plus the
+/// structured cause when it is one a client can act on.
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogUnavailable {
+    pub reason: String,
+    pub kind: Option<crate::model_catalog::ModelWarningKind>,
+}
+
+impl From<String> for CatalogUnavailable {
+    fn from(reason: String) -> Self {
+        Self { reason, kind: None }
+    }
+}
+
+impl From<&str> for CatalogUnavailable {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
+    }
+}
+
+impl From<crate::installed_cli::DiscoveryError> for CatalogUnavailable {
+    fn from(err: crate::installed_cli::DiscoveryError) -> Self {
+        Self {
+            kind: err
+                .cli_missing
+                .then_some(crate::model_catalog::ModelWarningKind::CliMissing),
+            reason: err.message,
+        }
+    }
+}
+
+/// The failure when no adapter launch can be built for `provider_id`: the
+/// pinned adapter runs through `npx`, so Node.js with `npx` is missing.
+pub(crate) fn adapter_unavailable(provider_id: &str) -> CatalogUnavailable {
+    CatalogUnavailable {
+        reason: crate::complete_ops::missing_one_shot_adapter_message(provider_id),
+        kind: Some(crate::model_catalog::ModelWarningKind::PrerequisiteMissing),
+    }
 }
 
 impl ProviderModelsFetch {
@@ -86,6 +130,7 @@ impl ProviderModelsFetch {
         Self {
             models: Some(models),
             warning: None,
+            warning_kind: None,
         }
     }
 
@@ -93,6 +138,15 @@ impl ProviderModelsFetch {
         Self {
             models: None,
             warning: Some(format!("{provider_id}: {reason}")),
+            warning_kind: None,
+        }
+    }
+
+    /// [`Self::unavailable`] keeping the failure's structured cause.
+    pub(crate) fn from_unavailable(provider_id: &str, err: CatalogUnavailable) -> Self {
+        Self {
+            warning_kind: err.kind,
+            ..Self::unavailable(provider_id, err.reason)
         }
     }
 }
@@ -118,6 +172,7 @@ pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFe
         "droid" => fetch_droid_models().await,
         "opencode" => fetch_opencode_models().await,
         "grok" => fetch_grok_models().await,
+        "cursor" => fetch_cursor_models_at(cursor_binary(None)).await,
         "unsloth" => fetch_unsloth_models().await,
         other => ProviderModelsFetch::unavailable(other, "no dynamic model source"),
     }
@@ -213,7 +268,10 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
 }
 
 /// Resolve the installed runtime once, then use that launch for the catalog.
-pub(crate) async fn installed_model_command(provider_id: &str) -> Result<AcpProbeCommand, String> {
+pub(crate) async fn installed_model_command(
+    provider_id: &str,
+    profile: Option<std::sync::Arc<intent_acp::ProfileEnv>>,
+) -> Result<AcpProbeCommand, CatalogUnavailable> {
     let provider = intent_providers::find_provider(provider_id).ok_or("unknown provider")?;
     let codex = provider_id == "codex";
     let npx = tokio::task::spawn_blocking(move || {
@@ -226,15 +284,18 @@ pub(crate) async fn installed_model_command(provider_id: &str) -> Result<AcpProb
     .await
     .map_err(|_| "adapter discovery failed")?;
     let cmd = crate::complete_ops::one_shot_launch(provider, None, npx, None)
-        .ok_or_else(|| crate::complete_ops::missing_one_shot_adapter_message(provider_id))?;
+        .ok_or_else(|| adapter_unavailable(provider_id))?;
     cmd.check_npx_version().await.map_err(|e| e.to_string())?;
-    cmd.prepare_installed_catalog().await
+    Ok(cmd
+        .with_profile(profile)
+        .prepare_installed_catalog()
+        .await?)
 }
 
 async fn fetch_installed_models(provider_id: &str) -> ProviderModelsFetch {
-    match installed_model_command(provider_id).await {
+    match installed_model_command(provider_id, None).await {
         Ok(cmd) => fetch_installed_models_at(provider_id, cmd).await,
-        Err(reason) => ProviderModelsFetch::unavailable(provider_id, reason),
+        Err(err) => ProviderModelsFetch::from_unavailable(provider_id, err),
     }
 }
 
@@ -491,13 +552,16 @@ pub(crate) async fn probe_pi_auth() -> Option<bool> {
 /// being installed. The probe runs the pinned adapter with that canonical CLI,
 /// matching session launches. The legacy `adapter_override` argument is ignored;
 /// it cannot replace the reviewed package or satisfy the installed-CLI gate.
-pub(crate) async fn probe_claude_code_auth(adapter_override: Option<PathBuf>) -> Option<bool> {
+pub(crate) async fn probe_claude_code_auth(
+    adapter_override: Option<PathBuf>,
+    profile: Option<std::sync::Arc<intent_acp::ProfileEnv>>,
+) -> Option<bool> {
     let provider = intent_providers::find_provider("claude-code")?;
     let _ = intent_providers::discover::resolve_npx_only_override(
         provider,
         adapter_override.as_deref().and_then(Path::to_str),
     );
-    let cmd = installed_model_command("claude-code").await.ok()?;
+    let cmd = installed_model_command("claude-code", profile).await.ok()?;
     let outcome = run_acp_probe(cmd, |v| parse::parse_acp_models(v, "claude-code")).await;
     claude_code_acp_auth_verdict(outcome)
 }
@@ -604,6 +668,50 @@ pub(crate) async fn fetch_grok_models() -> ProviderModelsFetch {
             &String::from_utf8_lossy(&output.stderr),
         ),
         Err(reason) => ProviderModelsFetch::unavailable("grok", reason),
+    }
+}
+
+/// The `cursor-agent` a launch would exec, honouring `providers.paths.cursor`.
+pub(crate) fn cursor_binary(explicit_path: Option<&str>) -> Option<PathBuf> {
+    find_provider_binary(
+        "cursor",
+        intent_providers::cursor::CURSOR_COMMAND,
+        explicit_path,
+    )
+}
+
+/// cursor: session-free ACP probe — `cursor-agent acp`, `initialize`, then
+/// `cursor/list_available_models` (no `session/new`, so no chat lands in the
+/// user's Cursor history). Signed out, the extension answers the
+/// auth-required error. Auth itself stays on `cursor-agent models`
+/// (`provider_auth`).
+pub(crate) async fn fetch_cursor_models_at(binary: Option<PathBuf>) -> ProviderModelsFetch {
+    let Some(bin) = binary else {
+        return ProviderModelsFetch::unavailable("cursor", "cursor-agent binary not found");
+    };
+    let mut cmd = AcpProbeCommand::binary(bin, vec!["acp".to_string()]);
+    for (key, value) in intent_providers::cursor::CURSOR_PLAIN_OUTPUT_ENV {
+        cmd = cmd.env(*key, *value);
+    }
+    let outcome = probe::run_acp_method_probe(
+        cmd,
+        CURSOR_LIST_MODELS_METHOD,
+        parse::parse_cursor_available_models,
+    )
+    .await;
+    cursor_fetch_outcome(outcome)
+}
+
+/// Cursor's session-free model listing extension method.
+const CURSOR_LIST_MODELS_METHOD: &str = "cursor/list_available_models";
+
+/// Map the Cursor probe onto the fetch contract (pure seam).
+fn cursor_fetch_outcome(outcome: Result<Vec<Value>, ProbeError>) -> ProviderModelsFetch {
+    match outcome {
+        Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
+            ProviderModelsFetch::unavailable("cursor", "authentication required")
+        }
+        other => finish("cursor", other),
     }
 }
 
@@ -722,6 +830,7 @@ fn unsloth_fetch_outcome(body: &str, total_ram_bytes: Option<u64>) -> ProviderMo
             warning: Some(format!(
                 "unsloth: {hidden} repo(s) hidden (estimated to exceed available memory, or size unknown)"
             )),
+            warning_kind: None,
         }
     } else {
         ProviderModelsFetch::ok(rows)

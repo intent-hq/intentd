@@ -5,10 +5,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,14 +31,13 @@ use uuid::Uuid;
 const TOKEN: &str = "cfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcf";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
@@ -49,7 +49,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-setup-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -66,13 +66,13 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if UnixStream::connect(socket).await.is_ok() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -199,9 +199,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -229,7 +232,8 @@ async fn await_running_setup_terminal<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     let mut attempt = 0;
     while tokio::time::Instant::now() < deadline {
         let list_resp = wss_rpc(
@@ -266,7 +270,8 @@ async fn await_buffer_contains<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     let mut attempt = 0;
     loop {
         let buffer = terminal_buffer(ws, base_id + attempt, terminal_id).await;
@@ -291,7 +296,8 @@ async fn await_terminal_omitted<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     let mut attempt = 0;
     loop {
         let list_resp = wss_rpc(
@@ -893,5 +899,90 @@ touch "${{MAIN_CHECKOUT}}/.should-not-run-{skip_marker_id}"
     assert!(
         !skip_marker_path.exists(),
         "skipWorktree should not execute setup script (marker not found under repo)"
+    );
+}
+
+/// Regression: a daemon started by launchd (or Finder) inherits only
+/// `/usr/bin:/bin:/usr/sbin:/sbin`. Saved scripts already run with the
+/// enhanced PATH (inherited dirs + Homebrew + user tool dirs), but the
+/// workspace setup script used the bare inherited PATH, so Homebrew tools
+/// such as `sccache` or `cargo-nextest` were not found and setup failed.
+/// The setup script must see the same enhanced PATH, with the inherited dirs
+/// still first.
+#[tokio::test]
+async fn setup_script_runs_with_enhanced_path_under_sparse_daemon_path() {
+    const SPARSE_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("PATH", SPARSE_PATH)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status_resp = common::await_wss_status(&socket).await;
+    let fingerprint = status_resp["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint");
+    let actual_port = u16::try_from(status_resp["result"]["port"].as_u64().expect("port"))
+        .expect("value fits in u16");
+    let mut wss = wss_connect(actual_port, fingerprint).await;
+
+    let repo_dir = create_test_repo();
+    let run_id = Uuid::new_v4().simple().to_string();
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s' "$PATH" > "${{WORKTREE_PATH}}/setup-path-{run_id}.txt"
+touch "${{WORKTREE_PATH}}/.setup-path-ran-{run_id}"
+"#
+    );
+    let create_resp = wss_rpc(
+        &mut wss,
+        1,
+        "workspace.create",
+        json!({
+            "title": "test-setup-path",
+            "repositoryPath": repo_dir.path().to_string_lossy(),
+            "setupScript": script
+        }),
+    )
+    .await;
+    let workspace_path = PathBuf::from(
+        create_resp["result"]["workspace"]["worktreePath"]
+            .as_str()
+            .unwrap_or_else(|| panic!("worktreePath should be set: {create_resp}")),
+    );
+
+    // Generous deadline: the first setup spawn may wait on a cold
+    // login-shell PATH probe before the script starts.
+    let marker = workspace_path.join(format!(".setup-path-ran-{run_id}"));
+    let mut found = false;
+    for _ in 0..600 {
+        if marker.exists() {
+            found = true;
+            break;
+        }
+        // timing-guard: poll interval while waiting on the setup marker file
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(found, "setup script should have run");
+
+    let seen = std::fs::read_to_string(workspace_path.join(format!("setup-path-{run_id}.txt")))
+        .expect("read setup PATH capture");
+    let dirs: Vec<&str> = seen.split(':').collect();
+    assert!(
+        dirs.contains(&"/opt/homebrew/bin"),
+        "setup script PATH must include Homebrew even when the daemon PATH is sparse; got {seen:?}"
+    );
+    assert!(
+        dirs.contains(&"/usr/local/bin"),
+        "setup script PATH must include /usr/local/bin; got {seen:?}"
+    );
+    assert!(
+        seen.starts_with(SPARSE_PATH),
+        "inherited daemon PATH dirs must keep precedence; got {seen:?}"
     );
 }

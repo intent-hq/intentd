@@ -242,7 +242,7 @@ async fn automatic_calls_honor_global_pause_and_restart_has_no_old_reservations(
     )
     .await
     .unwrap();
-    let restarted = Services::new(svc.store().clone()).with_source_control(forge.clone());
+    let restarted = Services::new_isolated(svc.store().clone()).with_source_control(forge.clone());
     intent_core::with_caller(owner_caller(&svc).await, restarted.pr_refresh_automatic(ws))
         .await
         .unwrap();

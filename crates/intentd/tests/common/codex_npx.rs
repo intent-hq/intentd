@@ -10,11 +10,11 @@ pub fn install(data_dir: &Path, script: &str) -> Vec<(String, String)> {
     let node = intent_providers::resolve_on_path("node").expect("node on PATH (gated)");
     let bin = data_dir.join("codex-toolchain");
     std::fs::create_dir_all(&bin).expect("create fake toolchain");
+    let codex = intent_providers::test_support::current_cli_script(
+        intent_providers::installed_cli::InstalledCli::Codex,
+    );
     for (name, body) in [
-        (
-            "codex",
-            "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'codex-cli 1.0.0\\n'\n",
-        ),
+        ("codex", codex.as_str()),
         ("node", "#!/bin/sh\nexec \"$MOCK_AGENT_NODE\" \"$@\"\n"),
         (
             "npx",
@@ -69,7 +69,7 @@ pub fn in_subprocess(test_name: &str) -> bool {
         .stderr(Stdio::from(log));
     let mut child = GuardedChild::spawn(&mut cmd).expect("spawn isolated WSS test");
     let status = child
-        .wait_with_timeout(Duration::from_secs(180))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(180)))
         .expect("wait for isolated WSS test")
         .expect("isolated WSS test timed out");
     assert!(

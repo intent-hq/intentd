@@ -20,10 +20,13 @@ use intent_core::events::{
     AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE,
     AGENT_RENAMED, AGENT_RESTORED, AGENT_RETIRED, AGENT_STARTED, AGENT_STATUS_CHANGED,
     AGENT_STREAM_END, AGENT_TOOL_CALL, AGENT_UPDATED, CHAT_STREAM_DELTA, COMMENT_ADDED,
-    COMMENT_DELETED, NOTE_CREATED, NOTE_DELETED, NOTE_PRESENCE, NOTE_UPDATED, PR_LINKED,
-    PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED, WORKSPACE_ACTIVITY_CHANGED,
-    WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED, WORKSPACE_WAITING_CHANGED,
+    COMMENT_DELETED, GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED, NOTE_CREATED,
+    NOTE_DELETED, NOTE_PRESENCE, NOTE_UPDATED, PR_LINKED, PR_MONITOR_CANCELLED, PR_MONITOR_CHANGED,
+    PR_MONITOR_COMPLETED, PR_MONITOR_REGISTERED, PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED,
+    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
+    WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
+    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_SCRIPTS_RUNNING_CHANGED, WORKSPACE_UPDATED,
+    WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{
     extract_spec_task_ids, note_list_slim_row, now_iso, AgentId, AgentLite, ConversationProjection,
@@ -91,13 +94,26 @@ pub(crate) struct NoteSubscribeParams {
     pub workspace_id: String,
     pub replace_group: Option<String>,
     pub projection: Option<NoteListProjection>,
+    /// Note-channel-only `maxContentBytes` (truncated note reads): fixed for
+    /// the subscription's lifetime, it bounds every full row's `content`
+    /// with [`intent_core::note_bounded_row`]. `None` keeps rows unchanged.
+    pub max_content_bytes: Option<usize>,
+    /// Note-channel-only snapshot page size (bounded reads): the seq-0
+    /// snapshot carries the first [`intent_core::note_read_bounds::note_list_page`]
+    /// of this many notes and the push adds `nextToken` for `note.list`.
+    pub snapshot_limit: usize,
 }
 
 /// Parsed `workspace.subscribe` params (§6.1). The workspace channel is global
-/// (per-user, no `workspaceId` scope); only `replaceGroup` is honored.
+/// (per-user, no `workspaceId` scope); `replaceGroup` and `includeRetired`
+/// are honored.
 #[derive(Debug)]
 pub(crate) struct WorkspaceSubscribeParams {
     pub replace_group: Option<String>,
+    /// `includeRetired` (default `false`): retired workspaces appear in the
+    /// seq-0 snapshot and deltas only when the subscriber opts in; without
+    /// it a retire transition is delivered as a `removedIds` removal.
+    pub include_retired: bool,
 }
 
 /// Parsed `comment.subscribe` params (§6.1). The comment channel is per-resource:
@@ -107,6 +123,10 @@ pub(crate) struct CommentSubscribeParams {
     pub workspace_id: String,
     pub note_id: String,
     pub replace_group: Option<String>,
+    /// Comment-channel snapshot page size (bounded reads): the seq-0
+    /// snapshot is the first `comment.list` page of this many threads and the
+    /// push adds `nextToken`. Ignored by the note-presence channel.
+    pub snapshot_limit: usize,
 }
 
 /// Parsed `chat.subscribe` params (CS-0). The chat channel is per-resource,
@@ -251,6 +271,8 @@ pub(crate) fn parse_subscribe_params(
         workspace_id,
         replace_group: replace_group(params),
         projection: None,
+        max_content_bytes: None,
+        snapshot_limit: intent_core::note_read_bounds::NOTE_LIST_DEFAULT_LIMIT,
     })
 }
 
@@ -270,17 +292,49 @@ pub(crate) fn parse_note_subscribe_params(
         Some(Value::String(s)) if s == "slim" => Some(NoteListProjection::Slim),
         Some(_) => return Err("projection must be \"slim\" or \"full\"".to_string()),
     };
+    parsed.max_content_bytes =
+        crate::router::max_content_bytes_param(params).map_err(str::to_string)?;
+    parsed.snapshot_limit = snapshot_limit_param(
+        params,
+        intent_core::note_read_bounds::NOTE_LIST_DEFAULT_LIMIT,
+        intent_core::note_read_bounds::NOTE_LIST_MAX_LIMIT,
+    )?;
     Ok(parsed)
 }
 
+/// The snapshot `limit` of a paged collection channel (bounded reads):
+/// absent / `null` → `default`; a positive integer → clamped to `max`;
+/// anything else → `-32602`.
+fn snapshot_limit_param(
+    params: &Map<String, Value>,
+    default: usize,
+    max: usize,
+) -> Result<usize, String> {
+    match params.get("limit") {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .filter(|n| *n >= 1)
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX).min(max))
+            .ok_or_else(|| "limit must be a positive integer".to_string()),
+    }
+}
+
 /// Validate `workspace.subscribe` params. The channel is global, so only the
-/// optional `replaceGroup` is read (§6.2).
-#[expect(clippy::unnecessary_wraps)] // params parser; keeps the uniform Result shape of its siblings
+/// optional `replaceGroup` and `includeRetired` (strict boolean: only
+/// omission means `false`; `null` or any non-boolean is `-32602`) are read
+/// (§6.2).
 pub(crate) fn parse_workspace_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<WorkspaceSubscribeParams, String> {
+    let include_retired = match params.get("includeRetired") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("includeRetired must be a boolean".to_string()),
+    };
     Ok(WorkspaceSubscribeParams {
         replace_group: replace_group(params),
+        include_retired,
     })
 }
 
@@ -301,6 +355,11 @@ pub(crate) fn parse_comment_subscribe_params(
         workspace_id,
         note_id,
         replace_group: replace_group(params),
+        snapshot_limit: snapshot_limit_param(
+            params,
+            intent_core::note_read_bounds::COMMENT_LIST_DEFAULT_LIMIT,
+            intent_core::note_read_bounds::COMMENT_LIST_MAX_LIMIT,
+        )?,
     })
 }
 
@@ -530,6 +589,75 @@ pub(crate) fn build_snapshot_push(subscription_id: &str, seq: u64, snapshot: &Va
     serde_json::to_string(&frame).unwrap_or_default()
 }
 
+/// [`build_snapshot_push`] for a paged collection snapshot (§6.9 "Paged
+/// snapshots"): the frame additionally carries `nextToken` — `null` when the
+/// snapshot is the whole collection, else the token the client passes to
+/// the channel's list read for the remaining rows.
+pub(crate) fn build_paged_snapshot_push(
+    subscription_id: &str,
+    seq: u64,
+    snapshot: &Value,
+    next_token: Option<&str>,
+) -> String {
+    let frame = json!({
+        "jsonrpc": "2.0",
+        "method": "subscription.push",
+        "params": {
+            "subscriptionId": subscription_id,
+            "kind": "snapshot",
+            "seq": seq,
+            "snapshot": snapshot,
+            "nextToken": next_token,
+        }
+    });
+    serde_json::to_string(&frame).unwrap_or_default()
+}
+
+/// The `workspace` / `agent` seq-0 snapshot (§6.9 "Paged snapshots"): the
+/// first page of the channel's list read and its continuation token, or
+/// `None` for any other channel. Every caller gets the paged frame. A read
+/// error degrades to an empty complete page, like [`channel_snapshot`].
+pub(crate) async fn paged_collection_snapshot(
+    api: &dyn WorkspaceApi,
+    channel: Channel,
+    workspace_id: &WorkspaceId,
+    include_retired: bool,
+) -> Option<(Value, Option<String>)> {
+    match channel {
+        Channel::Workspace => {
+            let filter = intent_core::WorkspaceListFilter::new(true, include_retired);
+            Some(
+                match api.list_workspaces_page(filter, true, None, None).await {
+                    Ok(page) => (
+                        serde_json::to_value(page.workspaces)
+                            .unwrap_or_else(|_| Value::Array(Vec::new())),
+                        page.next_token,
+                    ),
+                    Err(_) => (Value::Array(Vec::new()), None),
+                },
+            )
+        }
+        Channel::Agent => Some(
+            match api
+                .agent_list_page(
+                    workspace_id.clone(),
+                    intent_core::AgentListSelection::Active,
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(page) => (
+                    serde_json::to_value(page.agents).unwrap_or_else(|_| Value::Array(Vec::new())),
+                    page.next_token,
+                ),
+                Err(_) => (Value::Array(Vec::new()), None),
+            },
+        ),
+        _ => None,
+    }
+}
+
 /// Build a `subscription.push { kind: "delta", seq, delta }` notification
 /// (§3.3 / §6.3). `delta` carries the per-entity `{ added, updated, removedIds }`.
 pub(crate) fn build_delta_push(subscription_id: &str, seq: u64, delta: &Value) -> String {
@@ -558,6 +686,7 @@ pub(crate) async fn note_delta(
     workspace_id: &WorkspaceId,
     event: &Event,
     projection: Option<NoteListProjection>,
+    max_content_bytes: Option<usize>,
 ) -> Option<Value> {
     let note_id = event.data.get("noteId").and_then(Value::as_str)?;
     match event.event_type.as_str() {
@@ -566,14 +695,14 @@ pub(crate) async fn note_delta(
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            Some(json!({ "added": [note_row(note, projection)?] }))
+            Some(json!({ "added": [note_row(note, projection, max_content_bytes)?] }))
         }
         NOTE_UPDATED => {
             let note = api
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            Some(json!({ "updated": [note_row(note, projection)?] }))
+            Some(json!({ "updated": [note_row(note, projection, max_content_bytes)?] }))
         }
         NOTE_DELETED => Some(json!({ "removedIds": [note_id] })),
         _ => None,
@@ -583,11 +712,19 @@ pub(crate) async fn note_delta(
 /// Serialize one note-channel row under the subscription's projection: full
 /// (`None`) keeps the complete wire `Note` byte-identical to before;
 /// [`NoteListProjection::Slim`] serves the bounded `note.list` slim row
-/// (`content` → `contentPreview` + `contentLength`, §5.2).
-fn note_row(note: Note, projection: Option<NoteListProjection>) -> Option<Value> {
-    match projection {
-        Some(NoteListProjection::Slim) => Some(note_list_slim_row(note)),
-        None => serde_json::to_value(note).ok(),
+/// (`content` → `contentPreview` + `contentLength`, §5.2). A full row under
+/// `maxContentBytes` is cut by the truncated-read rule
+/// ([`intent_core::note_bounded_row`]); slim rows carry no `content`, so the
+/// limit has no effect on them.
+fn note_row(
+    note: Note,
+    projection: Option<NoteListProjection>,
+    max_content_bytes: Option<usize>,
+) -> Option<Value> {
+    match (projection, max_content_bytes) {
+        (Some(NoteListProjection::Slim), _) => Some(note_list_slim_row(note)),
+        (None, Some(limit)) => Some(intent_core::note_bounded_row(note, limit)),
+        (None, None) => serde_json::to_value(note).ok(),
     }
 }
 
@@ -849,9 +986,18 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             WORKSPACE_ATTENTION_CHANGED,
             WORKSPACE_DISPLAY_STATUS_CHANGED,
             WORKSPACE_WAITING_CHANGED,
+            WORKSPACE_SCRIPTS_RUNNING_CHANGED,
+            WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED,
             PR_LINKED,
             PR_UPDATED,
             PR_UNLINKED,
+            GIT_ROOT_REGISTERED,
+            GIT_ROOT_UPDATED,
+            GIT_ROOT_UNREGISTERED,
+            PR_MONITOR_REGISTERED,
+            PR_MONITOR_CHANGED,
+            PR_MONITOR_COMPLETED,
+            PR_MONITOR_CANCELLED,
         ],
         Channel::Comment => &[COMMENT_ADDED, COMMENT_DELETED],
         // The chat channel is the one consumer of the content-bearing
@@ -907,10 +1053,10 @@ pub(crate) async fn channel_snapshot(
         // Lite list: cheap status aggregates (taskStats/displayStatus/
         // cowSupported) only — no notes/sessions enrichment. Full list was
         // multi-MB.
-        Channel::Workspace => match api.list_workspaces_lite(true).await {
-            Ok(workspaces) => serde_json::to_value(workspaces).unwrap_or_else(|_| empty()),
-            Err(_) => empty(),
-        },
+        // Retired workspaces are opt-in: the generic path never includes
+        // them; `workspace.subscribe { includeRetired: true }` routes
+        // through [`workspace_snapshot`] directly.
+        Channel::Workspace => workspace_snapshot(api, false).await,
         Channel::Comment => match note_id {
             Some(note_id) => match api
                 .comment_list(
@@ -934,6 +1080,55 @@ pub(crate) async fn channel_snapshot(
         // note-presence channel's snapshot is the join's return value
         // (`note_presence_join`, served by `forward_note_presence_subscription`).
         Channel::Chat | Channel::NotePresence | Channel::PresenceFocus => empty(),
+    }
+}
+
+/// The `comment` channel's paged seq-0 snapshot (bounded reads): the first
+/// `comment.list` page of `limit` threads (comments included) and its
+/// `nextToken`. On a read error the snapshot degrades to the empty array.
+pub(crate) async fn comment_snapshot_page(
+    api: &dyn WorkspaceApi,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    limit: usize,
+) -> (Value, Option<String>) {
+    let Ok(result) = api
+        .comment_list(
+            workspace_id.clone(),
+            note_id.clone(),
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+    else {
+        return (Value::Array(Vec::new()), None);
+    };
+    let page = intent_core::note_read_bounds::PageRequest::new(Some(limit), limit, limit, None);
+    match intent_core::note_read_bounds::comment_list_page(
+        result.threads,
+        workspace_id.as_str(),
+        note_id.as_str(),
+        &page,
+        intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+    ) {
+        Ok((rows, next)) => (Value::Array(rows), next),
+        Err(_) => (Value::Array(Vec::new()), None),
+    }
+}
+
+/// The `workspace` channel's seq-0 snapshot: the lite list with archived
+/// rows (clients filter by `status`, intent-hq/monorepo#775) and retired rows
+/// only when the subscriber passed `includeRetired: true`. On a read error
+/// the snapshot degrades to the empty array.
+pub(crate) async fn workspace_snapshot(api: &dyn WorkspaceApi, include_retired: bool) -> Value {
+    let filter = intent_core::WorkspaceListFilter::new(true, include_retired);
+    match api.list_workspaces_lite(filter).await {
+        Ok(workspaces) => {
+            serde_json::to_value(workspaces).unwrap_or_else(|_| Value::Array(Vec::new()))
+        }
+        Err(_) => Value::Array(Vec::new()),
     }
 }
 
@@ -1159,8 +1354,8 @@ fn apply_resume_filter(snapshot: &mut Value, since: &str) {
 /// not block *count*, so a streaming turn with hundreds of capped blocks can
 /// weigh MBs on its own — added beside an at-budget persisted page, the seq-0
 /// frame would blow the budget the read path just enforced. The live turn is
-/// the newest row and the page's anchor (always kept, even alone over
-/// budget); oldest persisted rows are evicted until the page fits, with
+/// the newest row and the page's anchor (always kept; if it alone is over
+/// budget it is cut to fit, see `fit_oversized_slim_row`); oldest persisted rows are evicted until the page fits, with
 /// `truncated`/`nextToken` re-minted at the first evicted row (row `seq` is
 /// contiguous from 0, so a row's seq IS its global oldest-indexed position)
 /// so the client pulls the evicted rows via `agent.getConversation` exactly
@@ -1247,9 +1442,24 @@ fn rebudget_merged_page(
     };
     let mut lo = arr.len().saturating_sub(limit);
     if projection == Some(ConversationProjection::Slim) {
+        // Single-row bound (§5.5): a row that alone is over the budget — in
+        // practice the live turn — is cut to fit first, so the always-kept
+        // anchor can no longer push the seq-0 frame past the read budget.
         let sizes: Vec<usize> = arr[lo..]
-            .iter()
-            .map(intent_services::pagination::serialized_size)
+            .iter_mut()
+            .map(|row| {
+                let bytes = intent_services::pagination::serialized_size(row);
+                match row.get_mut("contentBlocks").and_then(Value::as_array_mut) {
+                    Some(blocks) if bytes > SLIM_PAGE_BUDGET_BYTES => {
+                        intent_services::tool_block::fit_oversized_slim_row(
+                            blocks,
+                            bytes,
+                            SLIM_PAGE_BUDGET_BYTES,
+                        )
+                    }
+                    _ => bytes,
+                }
+            })
             .collect();
         let (byte_lo, _hi) = intent_services::pagination::budget_page(
             &sizes,
@@ -1624,7 +1834,10 @@ impl ChatDeltaState {
             }
             let mut block = match self.encoding {
                 DeltaEncoding::Full => {
-                    json!({ "type": block_type, "id": block_id, "text": acc.clone() })
+                    let mut block =
+                        json!({ "type": block_type, "id": block_id, "text": acc.clone() });
+                    bound_live_text(self.projection, &mut block);
+                    block
                 }
                 // Only the fragment travels — per-chunk wire cost is
                 // O(chunk), not O(accumulated text). The accumulation above
@@ -1943,6 +2156,7 @@ impl ChatDeltaState {
                         if let Some(media) = self.media_acc.get(id) {
                             block["media"] = Value::Object(media.clone());
                         }
+                        bound_live_text(self.projection, &mut block);
                         block
                     }
                     _ => block.clone(),
@@ -2045,6 +2259,83 @@ impl ChatDeltaState {
     }
 }
 
+/// Single-message bound on the live text path (§7.1): under the slim
+/// projection, a full-text `text` / `thinking` block whose accumulated text
+/// has grown past the page budget is sent as the same preview the snapshot
+/// path serves — a prefix plus `textTruncated: true` / `textBytes` — so a
+/// full-mode chunk delta (or the degraded terminal frame) stays within the
+/// read budget. The full text is read through `agent.getMessageBlock`, which
+/// resolves the live turn. Blocks at or under the budget are untouched.
+fn bound_live_text(projection: Option<ConversationProjection>, block: &mut Value) {
+    if projection != Some(ConversationProjection::Slim) {
+        return;
+    }
+    let bytes = intent_services::pagination::serialized_size(block);
+    intent_services::tool_block::fit_oversized_slim_row(
+        std::slice::from_mut(block),
+        bytes,
+        SLIM_PAGE_BUDGET_BYTES,
+    );
+}
+
+/// Split one chat delta whose serialized size is over `budget` into several
+/// deltas that each fit (single-message bound, §7.1). The terminal reconcile
+/// and the `agent:message` row delta wrap every block of a row in its own
+/// entity (message pointer, role, seq, timestamp, `metadata`, …), so a row cut
+/// to fit the page budget can still produce a frame past the read budget.
+/// Entities keep their order (`added` before `updated`) and their bucket;
+/// `removedIds` and any other keys ride on the last delta. A delta that
+/// already fits is returned unchanged, as is a single entity too large on
+/// its own (it cannot be split further).
+pub(crate) fn split_chat_delta(delta: Value, budget: usize) -> Vec<Value> {
+    if intent_services::pagination::serialized_size(&delta) <= budget {
+        return vec![delta];
+    }
+    let Value::Object(mut obj) = delta else {
+        return vec![delta];
+    };
+    let mut take = |key: &str| match obj.remove(key) {
+        Some(Value::Array(items)) => items,
+        _ => Vec::new(),
+    };
+    let added = take("added");
+    let updated = take("updated");
+    let empty = json!({ "added": [], "updated": [], "removedIds": [] });
+    let base = intent_services::pagination::serialized_size(&empty);
+    let mut out = Vec::new();
+    let mut cur: (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
+    let mut size = base;
+    let entries = added
+        .into_iter()
+        .map(|e| (true, e))
+        .chain(updated.into_iter().map(|e| (false, e)));
+    for (is_added, entity) in entries {
+        let entity_bytes = intent_services::pagination::serialized_size(&entity) + 1;
+        if size + entity_bytes > budget && !(cur.0.is_empty() && cur.1.is_empty()) {
+            let (a, u) = std::mem::take(&mut cur);
+            out.push(json!({ "added": a, "updated": u, "removedIds": [] }));
+            size = base;
+        }
+        size += entity_bytes;
+        if is_added {
+            cur.0.push(entity);
+        } else {
+            cur.1.push(entity);
+        }
+    }
+    let (a, u) = cur;
+    let mut last = Map::new();
+    last.insert("added".into(), Value::Array(a));
+    last.insert("updated".into(), Value::Array(u));
+    last.insert(
+        "removedIds".into(),
+        obj.remove("removedIds").unwrap_or_else(|| json!([])),
+    );
+    last.extend(obj);
+    out.push(Value::Object(last));
+    out
+}
+
 /// Build a single-entity delta envelope, routing the entity to `added` (first
 /// sighting) or `updated` (a known block grown/changed).
 fn single_delta(added: bool, entity: &Value) -> Value {
@@ -2078,12 +2369,12 @@ pub(crate) async fn channel_delta(
         // The note channel uses the dedicated `forward_note_subscription`
         // path (which threads the subscription's v8.2 projection), so this
         // generic arm is unreachable for `Note`; full rows keep it faithful.
-        Channel::Note => note_delta(api, workspace_id, event, None).await,
+        Channel::Note => note_delta(api, workspace_id, event, None, None).await,
         Channel::Agent => agent_delta(api, event).await,
         // The workspace channel's tombstone scoping is stateful (the
         // forwarder threads the subscriber's visible-id set); this generic
         // arm is the unscoped administrator form.
-        Channel::Workspace => workspace_delta(api, event, None).await,
+        Channel::Workspace => workspace_delta(api, event, None, false).await,
         Channel::Comment => comment_delta(api, workspace_id, note_id?, event).await,
         // The task channel uses the stateful [`task_delta`] mapper directly in
         // the forwarder: it tracks the spec's task-link set across deltas so a
@@ -2124,12 +2415,14 @@ pub(crate) fn note_presence_delta(note_id: &NoteId, event: &Event) -> Option<Val
 /// enriched with the additive `specLinked` flag (same semantics as
 /// `task.list`, §5.4); the returned link set seeds the forwarder's stateful
 /// [`task_delta`] mapper so later spec-body edits can be diffed against it
-/// (monorepo#2407). On a read error both degrade to empty rather than
-/// failing the subscription.
+/// (monorepo#2407). The snapshot is the first bounded page (§6.9 "Paged
+/// snapshots"): the third value is the `nextToken` the client passes to the
+/// paged `task.list` for the rest (`None` when the page holds every task).
+/// On a read error all degrade to empty rather than failing the subscription.
 pub(crate) async fn task_snapshot(
     api: &dyn WorkspaceApi,
     workspace_id: &WorkspaceId,
-) -> (Value, HashSet<String>) {
+) -> (Value, HashSet<String>, Option<String>) {
     match api.list_notes(workspace_id).await {
         Ok(notes) => {
             let linked = notes
@@ -2137,14 +2430,20 @@ pub(crate) async fn task_snapshot(
                 .find(|n| n.id.as_str() == "spec")
                 .map(|n| extract_spec_task_ids(&n.content))
                 .unwrap_or_default();
-            let tasks: Vec<Value> = notes
+            let tasks: Vec<Note> = notes
                 .into_iter()
                 .filter(|n| n.metadata.task.is_some())
-                .filter_map(|n| task_note_value(n, &linked))
                 .collect();
-            (Value::Array(tasks), linked)
+            let (rows, next_token) = intent_core::note_read_bounds::task_snapshot_page(
+                tasks,
+                &linked,
+                workspace_id.as_str(),
+                intent_core::note_read_bounds::TASK_LIST_DEFAULT_LIMIT,
+                intent_core::note_read_bounds::NOTE_READ_BUDGET_BYTES,
+            );
+            (Value::Array(rows), linked, next_token)
         }
-        Err(_) => (Value::Array(Vec::new()), HashSet::new()),
+        Err(_) => (Value::Array(Vec::new()), HashSet::new(), None),
     }
 }
 
@@ -2332,6 +2631,32 @@ fn agent_list_row(mut agent: AgentLite) -> Option<Value> {
     serde_json::to_value(agent).ok()
 }
 
+/// The seed of a non-administrator `workspace` subscriber's visible-id set
+/// (multiplayer w3) for a paged seq-0 snapshot: the ids of the first page when
+/// it is the whole list (`next_token` is `None`), else the ids of the
+/// caller's whole membership-scoped list. That read stays on the server, so
+/// the frame is still one page while tombstones for rows on later pages (the
+/// client loads them through `workspace.list`) are still delivered. If that
+/// read fails, the seed falls back to the first page's ids: the subscriber
+/// may miss a tombstone, but no id it cannot see is ever disclosed.
+pub(crate) async fn visible_workspace_seed(
+    api: &dyn WorkspaceApi,
+    first_page: &Value,
+    next_token: Option<&str>,
+    include_retired: bool,
+) -> HashSet<String> {
+    if next_token.is_none() {
+        return visible_workspace_ids(first_page);
+    }
+    match api
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::new(true, include_retired))
+        .await
+    {
+        Ok(rows) => rows.into_iter().map(|ws| ws.id.0).collect(),
+        Err(_) => visible_workspace_ids(first_page),
+    }
+}
+
 /// The workspace ids a `workspace` channel subscriber has been shown so far,
 /// seeded from the snapshot rows — `id` of each — and maintained by
 /// [`workspace_delta`]. Only a non-administrator forwarder tracks one
@@ -2389,10 +2714,17 @@ pub(crate) fn visible_workspace_ids(snapshot: &Value) -> HashSet<String> {
 /// succeeds for a previously invisible workspace: it upserts as an
 /// `updated` delta (the channel's documented upsert semantics), which is
 /// how a connected guest's list gains the workspace without a reconnect.
+///
+/// Retired workspaces are opt-in (`include_retired`, from
+/// `workspace.subscribe { includeRetired }`): for a subscriber that did not
+/// opt in, a re-read that finds the workspace `Retired` is delivered as a
+/// `removedIds` removal (retire = removal for them), and no later event
+/// re-adds it.
 pub(crate) async fn workspace_delta(
     api: &dyn WorkspaceApi,
     event: &Event,
     visible: Option<&mut HashSet<String>>,
+    include_retired: bool,
 ) -> Option<Value> {
     let workspace_id = WorkspaceId::from(
         event
@@ -2415,6 +2747,9 @@ pub(crate) async fn workspace_delta(
         }
         WORKSPACE_CREATED => {
             let ws = api.get_workspace(workspace_id.clone()).await.ok()?;
+            if ws.is_retired() && !include_retired {
+                return None;
+            }
             if let Some(visible) = visible {
                 visible.insert(workspace_id.as_str().to_string());
             }
@@ -2436,9 +2771,18 @@ pub(crate) async fn workspace_delta(
         | WORKSPACE_ATTENTION_CHANGED
         | WORKSPACE_DISPLAY_STATUS_CHANGED
         | WORKSPACE_WAITING_CHANGED
+        | WORKSPACE_SCRIPTS_RUNNING_CHANGED
+        | WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED
         | PR_LINKED
         | PR_UPDATED
-        | PR_UNLINKED => {
+        | PR_UNLINKED
+        | GIT_ROOT_REGISTERED
+        | GIT_ROOT_UPDATED
+        | GIT_ROOT_UNREGISTERED
+        | PR_MONITOR_REGISTERED
+        | PR_MONITOR_CHANGED
+        | PR_MONITOR_COMPLETED
+        | PR_MONITOR_CANCELLED => {
             // Unshare (multiplayer w3): the forwarder runs under the
             // subscriber's caller, so the member named by
             // `changes.removedPrincipalId` sees its own removal as a
@@ -2452,6 +2796,18 @@ pub(crate) async fn workspace_delta(
                 return Some(json!({ "removedIds": [workspace_id.as_str()] }));
             }
             let ws = api.get_workspace(workspace_id.clone()).await.ok()?;
+            if ws.is_retired() && !include_retired {
+                // Retire = removal for a subscriber that did not opt in. A
+                // non-administrator only gets the tombstone for a workspace
+                // it was shown; the administrator path emits it like
+                // `workspace:deleted` does.
+                if let Some(visible) = visible {
+                    if !visible.remove(workspace_id.as_str()) {
+                        return None;
+                    }
+                }
+                return Some(json!({ "removedIds": [workspace_id.as_str()] }));
+            }
             if let Some(visible) = visible {
                 visible.insert(workspace_id.as_str().to_string());
             }

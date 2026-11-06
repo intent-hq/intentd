@@ -19,12 +19,14 @@ die() { echo "stub gh: $*" >&2; exit 99; }
 record() { echo "$1" >>"$STUB_DIR/calls"; }
 has_arg() { local arg; for arg in "${args[@]}"; do [[ "$arg" != "$1" ]] || return 0; done; return 1; }
 args=("$@")
-repo="" query="" target=""
+repo="" query="" target="" pattern="" output=""
 while (($#)); do
   case "$1" in
     --repo) repo=$2; shift ;;
     --jq) query=$2; shift ;;
     --target) target=$2; shift ;;
+    --pattern) pattern=$2; shift ;;
+    --output) output=$2; shift ;;
   esac
   shift
 done
@@ -78,9 +80,42 @@ lookup() {
 
 case "$1 $2" in
   'release view')
-    # Retained so regression tests also exercise the unchanged buggy script.
     [[ "$repo" == "$STUB_REPO" && "$3" == "channel-$STUB_CHANNEL" ]] || die 'wrong release lookup target'
-    lookup view ;;
+    if has_arg --json; then
+      # Alpha downgrade guard: draft state plus asset names. The live manifest
+      # (named like the uploaded file) exists when STUB_LIVE is set or an
+      # earlier run in this scenario uploaded one.
+      record assets
+      [[ "$STUB_CHANNEL" == alpha ]] || die 'only alpha reads the live manifest'
+      if [[ "${STUB_LIVE_ERROR:-}" == assets ]]; then
+        echo 'gh: Service Unavailable (HTTP 503)' >&2
+        exit 1
+      fi
+      live_name=""
+      [[ -z "${STUB_LIVE:-}" && ! -f "$STUB_DIR/uploaded.json" ]] || live_name=$(basename "$STUB_MANIFEST")
+      jq -nc --arg live "$live_name" --argjson draft "${STUB_DRAFT:-false}" \
+        '{isDraft: $draft, assets: ([{name: "notes.txt"}] + (if $live == "" then [] else [{name: $live}] end))}' | jq -r "$query"
+    else
+      # Retained so regression tests also exercise the unchanged buggy script.
+      lookup view
+    fi ;;
+  'release download')
+    record download
+    [[ "$repo" == "$STUB_REPO" && "$3" == "channel-$STUB_CHANNEL" ]] || die 'wrong release download target'
+    [[ "$pattern" == "$(basename "$STUB_MANIFEST")" && "$output" == - ]] || die 'download must read the live manifest to stdout'
+    if [[ "${STUB_LIVE_ERROR:-}" == download ]]; then
+      echo 'gh: download failed (HTTP 502)' >&2
+      exit 1
+    fi
+    if [[ -f "$STUB_DIR/uploaded.json" ]]; then
+      cat "$STUB_DIR/uploaded.json"
+      exit 0
+    fi
+    case "$STUB_LIVE" in
+      garbage) echo 'not json' ;;
+      noversion) echo '{"schema":1}' ;;
+      *) jq -nc --arg v "$STUB_LIVE" '{schema: 1, channel: "alpha", version: $v}' ;;
+    esac ;;
   'release create')
     record create
     [[ "$repo" == "$STUB_REPO" && "$3" == "channel-$STUB_CHANNEL" ]] || die 'wrong release create target'
@@ -163,13 +198,32 @@ run_case() (
   export STUB_SCENARIO=$1 STUB_DIR="$tmp/$1" STUB_REPO=mirror/releases STUB_CHANNEL=alpha STUB_TARGET=""
   mkdir -p "$STUB_DIR"
   : >"$STUB_DIR/calls"
+  : >"$STUB_DIR/args"
   export STUB_MANIFEST="$STUB_DIR/alpha manifest.json"
-  echo '{"version":"1.2.3"}' >"$STUB_MANIFEST"
+  new_version=1.2.3
+  # Alpha downgrade guard scenarios: STUB_LIVE is the version in the live
+  # channel manifest (unset: no manifest asset), new_version the one published.
   case "$1" in
     same_repo) export STUB_SCENARIO=absent STUB_REPO=$GITHUB_REPOSITORY STUB_TARGET=$GITHUB_SHA ;;
     stable|beta) export STUB_SCENARIO=absent STUB_CHANNEL=$1 ;;
     drafted) export STUB_DRAFT=true ;;
+    live_missing) export STUB_SCENARIO=existing ;;
+    live_newer) export STUB_SCENARIO=existing STUB_LIVE=0.11.32; new_version=0.11.31 ;;
+    live_equal) export STUB_SCENARIO=existing STUB_LIVE=0.11.32; new_version=0.11.32 ;;
+    live_older) export STUB_SCENARIO=existing STUB_LIVE=0.11.31; new_version=0.11.32 ;;
+    live_numeric_newer) export STUB_SCENARIO=existing STUB_LIVE=0.11.10; new_version=0.11.9 ;;
+    live_numeric_older) export STUB_SCENARIO=existing STUB_LIVE=0.11.9; new_version=0.11.10 ;;
+    live_release_vs_rc) export STUB_SCENARIO=existing STUB_LIVE=0.12.0; new_version=0.12.0-rc.1 ;;
+    live_rc_vs_release) export STUB_SCENARIO=existing STUB_LIVE=0.12.0-rc.1; new_version=0.12.0 ;;
+    live_rc_numeric) export STUB_SCENARIO=existing STUB_LIVE=0.12.0-rc.10; new_version=0.12.0-rc.9 ;;
+    live_garbage|live_noversion) export STUB_SCENARIO=existing STUB_LIVE=${1#live_} ;;
+    assets_error|download_error) export STUB_SCENARIO=existing STUB_LIVE=0.11.31 STUB_LIVE_ERROR=${1%_error}; new_version=0.11.32 ;;
+    race_newer) export STUB_SCENARIO=race STUB_LIVE=0.11.32; new_version=0.11.31 ;;
+    drafted_newer) export STUB_SCENARIO=existing STUB_DRAFT=true STUB_LIVE=0.11.32; new_version=0.11.31 ;;
+    new_invalid) export STUB_SCENARIO=existing; new_version=v1.2 ;;
+    beta_rollback|stable_rollback) export STUB_SCENARIO=existing STUB_CHANNEL=${1%_rollback} STUB_LIVE=9.9.9 ;;
   esac
+  jq -nc --arg v "$new_version" '{schema: 1, version: $v}' >"$STUB_MANIFEST"
   run_publisher
   case "$1" in
     forbidden|unauthorized|inaccessible|service|transport|partial)
@@ -183,20 +237,62 @@ run_case() (
         transport) contains "$STUB_DIR/stderr" 'no such host' ;;
       esac
       not_contains "$STUB_DIR/stderr" 'does not exist' ;;
-    absent|empty|same_repo|stable|beta)
+    absent|empty|same_repo)
+      [[ "$status" == 0 ]] || fail 'confirmed absence must allow creation'
+      expect_calls 'lookup create assets upload refresh-read draft publish' ;;
+    stable|beta)
       [[ "$status" == 0 ]] || fail 'confirmed absence must allow creation'
       expect_calls 'lookup create upload refresh-read draft publish' ;;
-    existing|drafted)
+    existing|drafted|live_missing)
       [[ "$status" == 0 ]] || fail 'existing release must accept upload'
+      expect_calls 'lookup assets upload refresh-read draft publish' ;;
+    live_equal|live_older|live_numeric_older|live_rc_vs_release)
+      [[ "$status" == 0 ]] || fail 'equal or newer version must publish'
+      expect_calls 'lookup assets download upload refresh-read draft publish'
+      contains "$STUB_DIR/stderr" "live alpha manifest on $STUB_REPO is $STUB_LIVE; publishing $new_version"
+      not_contains "$STUB_DIR/stdout" '::warning::' ;;
+    live_newer|live_numeric_newer|live_release_vs_rc|live_rc_numeric|race_newer|drafted_newer)
+      [[ "$status" == 0 ]] || fail 'an older version must be skipped, not fail the release'
+      case "$1" in
+        race_newer) expect_calls 'lookup create lookup assets download' ;;
+        # A skipped publish still repairs a channel release stuck in DRAFT.
+        drafted_newer) expect_calls 'lookup assets download refresh-read draft publish' ;;
+        *) expect_calls 'lookup assets download' ;;
+      esac
+      contains "$STUB_DIR/stdout" "::warning::Not publishing alpha $new_version to $STUB_REPO: the alpha channel already points at newer $STUB_LIVE."
+      contains "$STUB_DIR/stdout" 'to roll back on purpose, delete alpha manifest.json from channel-alpha and re-run'
+      [[ ! -f "$STUB_DIR/uploaded.json" ]] || fail 'older manifest was uploaded' ;;
+    live_garbage|live_noversion)
+      [[ "$status" != 0 ]] || fail 'an unreadable live manifest must fail publication'
+      expect_calls 'lookup assets download'
+      contains "$STUB_DIR/stderr" 'has no readable X.Y.Z[-prerelease] version'
+      not_contains "$STUB_DIR/stderr" 'not json' ;;
+    assets_error|download_error)
+      [[ "$status" != 0 ]] || fail 'a failed live manifest read must fail publication'
+      if [[ "$1" == assets_error ]]; then
+        expect_calls 'lookup assets'
+        contains "$STUB_DIR/stderr" 'HTTP 503'
+      else
+        expect_calls 'lookup assets download'
+        contains "$STUB_DIR/stderr" 'download failed (HTTP 502)'
+      fi
+      contains "$STUB_DIR/stderr" 'refusing to publish without the version check' ;;
+    new_invalid)
+      [[ "$status" != 0 ]] || fail 'an invalid new version must fail before any GitHub call'
+      [[ ! -s "$STUB_DIR/calls" ]] || fail "unexpected calls: $(tr '\n' ' ' <"$STUB_DIR/calls")"
+      contains "$STUB_DIR/stderr" 'has no valid X.Y.Z[-prerelease] .version' ;;
+    beta_rollback|stable_rollback)
+      [[ "$status" == 0 ]] || fail 'beta/stable rollbacks must still publish'
       expect_calls 'lookup upload refresh-read draft publish' ;;
     repeat)
       [[ "$status" == 0 ]] || fail 'first publication failed'
       run_publisher
       [[ "$status" == 0 ]] || fail 'same-version publication failed'
-      expect_calls 'lookup upload refresh-read draft publish lookup upload refresh-read draft publish' ;;
+      # The second run reads back the first run's manifest (same version).
+      expect_calls 'lookup assets upload refresh-read draft publish lookup assets download upload refresh-read draft publish' ;;
     race)
       [[ "$status" == 0 ]] || fail 'lost creation race must recover'
-      expect_calls 'lookup create lookup upload refresh-read draft publish'
+      expect_calls 'lookup create lookup assets upload refresh-read draft publish'
       contains "$STUB_DIR/stderr" 'HTTP 422' ;;
     reread_error|still_absent)
       [[ "$status" != 0 ]] || fail 'unconfirmed creation must fail'
@@ -208,15 +304,15 @@ run_case() (
       else contains "$STUB_DIR/stderr" 'does not exist'; fi ;;
     upload_error)
       [[ "$status" != 0 ]] || fail 'upload failure must fail publication'
-      expect_calls 'lookup upload'
+      expect_calls 'lookup assets upload'
       contains "$STUB_DIR/stderr" 'upload failed (HTTP 502)' ;;
     draft_error)
       [[ "$status" == 0 ]] || fail 'cosmetic refresh failure must stay fail-soft'
-      expect_calls 'lookup upload refresh-read draft'
+      expect_calls 'lookup assets upload refresh-read draft'
       contains "$STUB_DIR/stderr" 'skipping published_at refresh' ;;
     refresh_error)
       [[ "$status" != 0 ]] || fail 'failed mandatory re-publish must fail publication'
-      expect_calls 'lookup upload refresh-read draft publish publish publish publish publish'
+      expect_calls 'lookup assets upload refresh-read draft publish publish publish publish publish'
       contains "$STUB_DIR/stderr" 'un-draft failed (HTTP 503)'
       contains "$STUB_DIR/stderr" 'stuck in DRAFT' ;;
     *) fail "unknown scenario $1" ;;
@@ -227,7 +323,9 @@ run_case() (
 )
 
 if (($# == 0)); then
-  set -- forbidden service unauthorized inaccessible transport partial absent empty existing drafted same_repo stable beta repeat race reread_error still_absent upload_error draft_error refresh_error
+  set -- forbidden service unauthorized inaccessible transport partial absent empty existing drafted same_repo stable beta repeat race reread_error still_absent upload_error draft_error refresh_error \
+    live_missing live_newer live_equal live_older live_numeric_newer live_numeric_older live_release_vs_rc live_rc_vs_release live_rc_numeric \
+    live_garbage live_noversion assets_error download_error race_newer drafted_newer new_invalid beta_rollback stable_rollback
 fi
 failed=0
 for scenario in "$@"; do

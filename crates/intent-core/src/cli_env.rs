@@ -223,6 +223,12 @@ impl CodexEnvNames {
         self.0.contains(name)
     }
 
+    /// Add every name selected by `other` (for example a named profile's own
+    /// Codex home alongside the default home).
+    pub fn extend_from(&mut self, other: &Self) {
+        self.0.extend(other.0.iter().cloned());
+    }
+
     fn extend_providers(&mut self, config: &toml::Value) {
         let Some(providers) = config
             .get("model_providers")

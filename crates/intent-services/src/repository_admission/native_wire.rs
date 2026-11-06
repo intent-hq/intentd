@@ -47,11 +47,16 @@ pub(crate) mod review;
 
 #[path = "native_checkout.rs"]
 pub(crate) mod checkout;
+#[path = "native_child_git.rs"]
+pub(crate) mod child_git;
 #[path = "native_resource_read.rs"]
 pub(crate) mod resource;
 
 #[path = "native_selection.rs"]
 pub(crate) mod selection;
+
+#[path = "native_wire/monitor.rs"]
+pub(crate) mod monitor;
 
 const LEASE_LIMIT: usize = 64;
 const ROOT_LIMIT: usize = 128;
@@ -59,9 +64,70 @@ const NOTICE_LIMIT: usize = 64;
 const READ_LIMIT: usize = 64;
 const WORKER_LIMIT: usize = 2;
 const LEASE_TTL: Duration = Duration::from_secs(300);
-const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
-const FRAME_TTL: Duration = Duration::from_secs(15);
+const READ_TIMEOUT_BASE: Duration = Duration::from_secs(10);
+/// Production bound on acquiring a native request's source, credentials or
+/// authority. Read it through [`acquire_wait`].
+const ACQUIRE_BASE: Duration = Duration::from_secs(5);
+/// Production lifetime of an unstarted native request frame. Read it through
+/// [`frame_ttl`].
+const FRAME_TTL_BASE: Duration = Duration::from_secs(15);
+
+/// How long a native wire, review, resource-read or selection request may
+/// wait to acquire what it needs before it is refused.
+fn acquire_wait() -> Duration {
+    request_wait(ACQUIRE_BASE)
+}
+/// How long a native request frame stays admitted before it starts.
+fn frame_ttl() -> Duration {
+    request_wait(FRAME_TTL_BASE)
+}
+/// Bound on one native context read once its lease is held.
+fn read_timeout() -> Duration {
+    request_wait(READ_TIMEOUT_BASE)
+}
+/// Production keeps the fixed bounds.
+#[cfg(not(test))]
+const fn request_wait(base: Duration) -> Duration {
+    base
+}
+// Every non-test build (the daemon, and `repository-test-fixtures` e2e builds)
+// keeps the fixed bounds; checked at compile time, where no test can reach.
+#[cfg(not(test))]
+const _: () = assert!(
+    request_wait(ACQUIRE_BASE).as_nanos() == 5_000_000_000
+        && request_wait(READ_TIMEOUT_BASE).as_nanos() == 10_000_000_000
+        && request_wait(FRAME_TTL_BASE).as_nanos() == 15_000_000_000
+);
+/// Unit tests stretch the bounds (and every module's other request limits,
+/// so their production order holds) with `INTENTD_TEST_TIMEOUT_MULTIPLIER`, as
+/// every test budget does: coverage CI runs these real Git/SQLite workers on
+/// oversubscribed runners, where a fixed 5s acquire refused a prepare as
+/// "Repository review unavailable" (intentd#2581). The setting is read once
+/// per process so production deadlines and a test's paused-clock advances
+/// always agree.
+#[cfg(test)]
+fn request_wait(base: Duration) -> Duration {
+    static SETTING: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+        std::env::var(intentd_test_support::TIMEOUT_MULTIPLIER_ENV).ok()
+    });
+    stretched_request_wait(base, SETTING.as_deref())
+}
+/// Highest stretch for the request waits. These waits race fixed timers that
+/// do not stretch, and production relies on them firing first: the 5s acquire
+/// against the GitLab client's 30s request timeout (crossed from x6, when a
+/// held provider call fails before the acquire wait elapses), the 15s frame
+/// against `STAGE_TTL` (120s, from x8) and `LEASE_TTL` (300s, at x20), and a
+/// test waiting for real frame expiry against nextest's 180s kill (from x12).
+/// x4 keeps those orders and still covers coverage CI's x3. (The 10s read
+/// limits meet the GitLab client's 30s at x3; no test holds a provider call
+/// across a read deadline, and the suite passes at x20.)
+#[cfg(test)]
+const REQUEST_WAIT_MAX_STRETCH: u32 = 4;
+#[cfg(test)]
+fn stretched_request_wait(base: Duration, multiplier: Option<&str>) -> Duration {
+    intentd_test_support::scale_test_timeout(base, multiplier)
+        .min(base.saturating_mul(REQUEST_WAIT_MAX_STRETCH))
+}
 
 fn unavailable() -> Error {
     Error::Forbidden("Repository context unavailable".into())
@@ -125,8 +191,10 @@ pub(crate) fn connection(
         parent: RepositoryRetirement::default(),
         review: review::ConnectionState::default(),
         resource: resource::ConnectionState::default(),
+        child_git: child_git::ConnectionState::default(),
         checkout: checkout::ConnectionState::default(),
         selection: selection::ConnectionState::default(),
+        monitor: monitor::ConnectionState::default(),
         state: Mutex::new(ConnectionState::default()),
         notify: Notify::new(),
         permits: Arc::new(Semaphore::new(LEASE_LIMIT)),
@@ -146,8 +214,10 @@ struct Connection {
     parent: RepositoryRetirement,
     review: review::ConnectionState,
     resource: resource::ConnectionState,
+    child_git: child_git::ConnectionState,
     checkout: checkout::ConnectionState,
     selection: selection::ConnectionState,
+    monitor: monitor::ConnectionState,
     state: Mutex<ConnectionState>,
     notify: Notify,
     permits: Arc<Semaphore>,
@@ -243,6 +313,7 @@ impl Connection {
         self.resource.close();
         self.checkout.close();
         self.selection.close();
+        self.monitor.close();
         self.origin.retire();
         for lease in leases {
             lease.lifetime.retirement().end_scope();
@@ -292,10 +363,7 @@ impl Connection {
     }
 }
 impl Connection {
-    fn capture_native(
-        &self,
-        query: Option<&RepositoryContextQuery>,
-    ) -> Arc<dyn RepositoryReadRequestScope> {
+    fn capture_native(&self, query: Option<&RepositoryContextQuery>) -> Arc<Request> {
         let captured = (|| {
             self.entered()?;
             if NATIVE_REQUEST.try_with(|_| ()).is_ok() {
@@ -343,6 +411,7 @@ impl Connection {
             read_lane: Mutex::new(None),
             subscriptions: Mutex::new(subscriptions),
             queued_query: query.cloned(),
+            monitor_receipt: self.monitor.capture(),
         });
         if query.is_some() {
             let weak = Arc::downgrade(&request);
@@ -353,7 +422,7 @@ impl Connection {
             // caller-binding: allow — only finishes the original request lifetime; no service capability calls
             tokio::spawn(async move {
                 if let Some(retirement) = retirement {
-                    tokio::select! { () = retirement.native_cancelled() => return, () = tokio::time::sleep(FRAME_TTL) => {} }
+                    tokio::select! { () = retirement.native_cancelled() => return, () = tokio::time::sleep(frame_ttl()) => {} }
                 } else {
                     return;
                 }
@@ -366,6 +435,23 @@ impl Connection {
     }
 }
 impl RepositoryReadConnection for Connection {
+    fn capture_child_git(
+        &self,
+        frame: &intent_core::gitlab_child_git::GitlabChildGitFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        Some(child_git::capture_frame(self, frame.clone()))
+    }
+    fn capture_monitor_events(
+        &self,
+    ) -> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>> {
+        monitor::capture_events(self)
+    }
+    fn review_monitoring_hello(
+        &self,
+        support: intent_core::review_monitor::ReviewMonitorRecipientSupport,
+    ) -> Option<Arc<dyn intent_core::repository_request::ReviewMonitorHello>> {
+        monitor::hello(self, support)
+    }
     fn capture_checkout(
         &self,
         frame: &intent_core::repository_checkout::CheckoutFrame,
@@ -406,6 +492,11 @@ impl RepositoryReadConnection for Connection {
         &self,
     ) -> Option<Box<dyn intent_core::repository_request::RepositorySelectionRetirements>> {
         selection::take_retirements(self)
+    }
+    fn capture_monitor_history(
+        &self,
+    ) -> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>> {
+        monitor::capture_history(self)
     }
     fn capture(&self) -> Arc<dyn RepositoryReadRequestScope> {
         self.capture_native(None)
@@ -494,6 +585,7 @@ impl RepositoryReadRetirements for Receiver {
                                 };
                                 for id in ids { c.retire_id(&id); }
                             }
+                            Some(crate::Delivery::Monitor(_) | crate::Delivery::HistoryChanged | crate::Delivery::Fence(_)) => {},
                             Some(crate::Delivery::Lagged(_)) | None => c.close(),
                         }
                     },
@@ -520,10 +612,12 @@ struct Request {
     read_lane: Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>,
     subscriptions: Mutex<Vec<RepositorySubscription>>,
     queued_query: Option<RepositoryContextQuery>,
+    monitor_receipt: Option<Arc<monitor::Receipt>>,
 }
 #[derive(Clone)]
 enum RequestState {
     Ordinary,
+    Monitor(Arc<monitor::Projection>),
     Pending,
     Public,
     Capture(Arc<Lease>),
@@ -609,6 +703,17 @@ impl Drop for Request {
     }
 }
 impl RepositoryReadRequestScope for Request {
+    fn bind_private_output(
+        &self,
+        frame: &str,
+    ) -> Result<Option<Arc<dyn intent_core::repository_request::RepositoryPrivateOutput>>> {
+        let state = self.state.lock().map_err(|_| unavailable())?;
+        Ok(match &*state {
+            RequestState::Monitor(recipient) => Some(recipient.output(frame)),
+            _ => None,
+        })
+    }
+
     fn scope<'a>(&'a self, body: BoxFuture<'a, ()>) -> BoxFuture<'a, ()> {
         let owner = self.weak.upgrade().expect("owned request scope");
         Box::pin(NATIVE_REQUEST.scope(owner, body))
@@ -626,6 +731,10 @@ impl RepositoryReadRequestScope for Request {
             let state = self.state.lock().map_err(|_| unavailable())?.clone();
             match state {
                 RequestState::Ordinary | RequestState::Public => transfer(),
+                RequestState::Monitor(recipient) => {
+                    entered.map_err(|_| unavailable())?;
+                    recipient.with_current(transfer)
+                }
                 RequestState::Pending | RequestState::Reading(_) => Err(unavailable()),
                 RequestState::Capture(lease) => {
                     entered.map_err(|_| unavailable())?;
@@ -823,7 +932,7 @@ pub(crate) fn capture(
     let request = Request::current(services);
     Box::pin(async move {
         let request = request.map_err(|_| unavailable())?;
-        tokio::time::timeout(ACQUIRE_TIMEOUT, capture_inner(&request, query))
+        tokio::time::timeout(acquire_wait(), capture_inner(&request, query))
             .await
             .map_err(|_| unavailable())?
             .map_err(|_| unavailable())
@@ -1032,7 +1141,7 @@ pub(crate) fn read(
         let request = request.map_err(|_| unavailable())?;
         let lease = find_lease(&request, &query).map_err(|_| unavailable())?;
         *request.state.lock().map_err(|_| unavailable())? = RequestState::Reading(lease.clone());
-        let result = tokio::time::timeout(READ_TIMEOUT, read_inner(&request, &lease))
+        let result = tokio::time::timeout(read_timeout(), read_inner(&request, &lease))
             .await
             .map_err(|_| AdmissionError::Unavailable)
             .and_then(|r| r);
@@ -1316,7 +1425,7 @@ impl Request {
         observed: Option<&Arc<Observation>>,
         transfer: &mut (dyn FnMut() -> Result<()> + Send),
     ) -> Result<()> {
-        let result = tokio::time::timeout(READ_TIMEOUT, async {
+        let result = tokio::time::timeout(read_timeout(), async {
             let _credential = self.connection.caller.legacy_lease().await?;
             validate(self, lease).await?;
             let locks = if let Some(original) = observed {

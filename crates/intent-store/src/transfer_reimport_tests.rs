@@ -111,7 +111,7 @@ async fn reimport_reclaims_matching_orphans_from_each_metadata_table() {
             if table != conflict
                 && !(conflict == "attachments" && table == "attachment_idempotency_keys")
             {
-                sqlx::query(&format!("DELETE FROM {table}"))
+                sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
                     .execute(store.write_pool())
                     .await
                     .unwrap();
@@ -206,9 +206,9 @@ async fn reimport_preserves_live_workspaces_and_foreign_global_ids() {
                     .execute(store.write_pool()).await.unwrap();
             }
             table => {
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE {table} SET workspace_id = 'keeper' WHERE workspace_id = 'deleted'"
-                ))
+                )))
                 .execute(store.write_pool())
                 .await
                 .unwrap();
@@ -421,7 +421,7 @@ async fn delete_workspace_drains_orphan_metadata_in_bounded_batches() {
         "INSERT INTO attachments (id, workspace_id, file_name, size, uploaded_at, stored_path) SELECT 'attachment-' || n, 'deleted', 'f', 1, 't0', '.intent/attachments/f' FROM rows",
         "INSERT INTO attachment_idempotency_keys (workspace_id, key, attachment_id, fingerprint, created_at) SELECT 'deleted', 'key-' || n, 'attachment-' || n, 'fp', 't0' FROM rows",
     ] {
-        sqlx::query(&format!("WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n < 1201) {insert}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n < 1201) {insert}")))
             .execute(&mut *tx).await.unwrap();
     }
     tx.commit().await.unwrap();
@@ -447,9 +447,9 @@ async fn delete_workspace_drains_orphan_metadata_in_bounded_batches() {
             .iter()
             .enumerate()
             {
-                let remaining: i64 = sqlx::query_scalar(&format!(
+                let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                     "SELECT COUNT(*) FROM {table} WHERE workspace_id='deleted'"
-                ))
+                )))
                 .fetch_one(&mut *tx)
                 .await
                 .unwrap();
@@ -469,9 +469,10 @@ async fn delete_workspace_drains_orphan_metadata_in_bounded_batches() {
             }
         }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        tokio::join!(deletion, observer)
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(30)),
+        async { tokio::join!(deletion, observer) },
+    )
     .await
     .unwrap();
     assert_foreign_keys(&store).await;
@@ -536,7 +537,7 @@ async fn assert_recovery_retry(store: &Store) {
         "neither direction of foreign recovery ownership authorizes removal"
     );
     assert!(store
-        .get_agent_session(&AgentId::from("agent-keeper"))
+        .get_agent_session_with_transcript(&AgentId::from("agent-keeper"))
         .await
         .is_ok());
     assert_foreign_keys(store).await;
@@ -637,7 +638,7 @@ async fn workspace_recovery_cancellation_keeps_sessions_and_can_retry() {
             tx.commit().await.unwrap();
         }
     };
-    let held = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let held = tokio::time::timeout(intentd_test_support::test_timeout(std::time::Duration::from_secs(30)), async {
         tokio::select! {
             held = observe => held,
             result = &mut deleting => panic!("deletion finished before cancellation: {result:?}"),

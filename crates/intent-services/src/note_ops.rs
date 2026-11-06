@@ -87,23 +87,193 @@ pub(crate) fn apply_add(
 /// `note.edit` — first exact-match replacement. Returns
 /// `(new_content, match_position, was_empty)`; `match_position` is a scalar
 /// (char) offset, or `-1` when the note was empty.
+///
+/// When `old_text` has no exact match, it is retried against the note with
+/// its comment anchor markers (`<!--anchor:<uuid>:…-->`) stripped — the text
+/// agents and users actually see (intent-hq/intent#7186). The first projected
+/// match is mapped back to raw offsets and markers inside it are carried into
+/// the replacement (see [`carry_anchor_markers`]).
 pub(crate) fn apply_edit(old: &str, old_text: &str, new_text: &str) -> Result<(String, i64, bool)> {
     if old.is_empty() {
         return Ok((new_text.to_string(), -1, true));
     }
-    match old.find(old_text) {
-        None => Err(Error::Internal(format!(
-            "Text not found in note. Make sure old matches exactly (including whitespace and line breaks).\n\nNote content length: {} chars.\n\nSearched for:\n{}{}",
-            old.chars().count(),
-            truncate_chars(old_text, 200),
-            if old_text.chars().count() > 200 { "..." } else { "" }
-        ))),
-        Some(idx) => {
-            let new_content = format!("{}{}{}", &old[..idx], new_text, &old[idx + old_text.len()..]);
-            let match_position = i64::try_from(old[..idx].chars().count()).expect("value fits in i64");
-            Ok((new_content, match_position, false))
+    if let Some(idx) = old.find(old_text) {
+        let new_content = format!(
+            "{}{}{}",
+            &old[..idx],
+            new_text,
+            &old[idx + old_text.len()..]
+        );
+        let match_position = i64::try_from(old[..idx].chars().count()).expect("value fits in i64");
+        return Ok((new_content, match_position, false));
+    }
+    if let Some((from, to, replacement)) = marker_stripped_edit(old, old_text, new_text) {
+        let new_content = format!("{}{}{}", &old[..from], replacement, &old[to..]);
+        let match_position = i64::try_from(old[..from].chars().count()).expect("value fits in i64");
+        return Ok((new_content, match_position, false));
+    }
+    Err(Error::Internal(format!(
+        "Text not found in note. Make sure old matches exactly (including whitespace and line breaks).\n\nNote content length: {} chars.\n\nSearched for:\n{}{}",
+        old.chars().count(),
+        truncate_chars(old_text, 200),
+        if old_text.chars().count() > 200 { "..." } else { "" }
+    )))
+}
+
+/// A real comment anchor marker found while stripping markers for
+/// [`marker_stripped_edit`].
+struct StrippedMarker {
+    /// Byte offset in the stripped text where the marker sat.
+    proj: usize,
+    /// Byte range of the marker in the raw markdown.
+    raw: std::ops::Range<usize>,
+}
+
+/// Fallback for [`apply_edit`]: find the first occurrence of `old_text` in
+/// `md` with real anchor markers removed. Returns the raw byte range
+/// `[from, to)` it covers and the replacement for that range — `new_text`
+/// with the markers that sat strictly inside the range carried over. Markers
+/// adjacent to the match stay outside it, untouched.
+fn marker_stripped_edit(
+    md: &str,
+    old_text: &str,
+    new_text: &str,
+) -> Option<(usize, usize, String)> {
+    if old_text.is_empty() {
+        return None;
+    }
+    let mut text = String::with_capacity(md.len());
+    let mut map: Vec<usize> = Vec::with_capacity(md.len());
+    let mut markers: Vec<StrippedMarker> = Vec::new();
+    let mut i = 0;
+    while i < md.len() {
+        let rest = &md[i..];
+        if rest.starts_with(ANCHOR_MARKER_PREFIX) {
+            if let Some((_, len)) = parse_uuid_anchor_marker(rest) {
+                markers.push(StrippedMarker {
+                    proj: text.len(),
+                    raw: i..i + len,
+                });
+                i += len;
+                continue;
+            }
+        }
+        let ch = rest.chars().next().expect("in-bounds char");
+        text.push(ch);
+        map.extend(i..i + ch.len_utf8());
+        i += ch.len_utf8();
+    }
+    if markers.is_empty() {
+        return None;
+    }
+    let start = text.find(old_text)?;
+    let end = start + old_text.len();
+    let from = map[start];
+    let to = map[end - 1] + 1;
+    let inside: Vec<(usize, &str)> = markers
+        .iter()
+        .filter(|m| m.raw.start > from && m.raw.start < to)
+        .map(|m| (m.proj - start, &md[m.raw.clone()]))
+        .collect();
+    Some((from, to, carry_anchor_markers(old_text, new_text, &inside)))
+}
+
+/// Re-insert anchor markers that sat inside a replaced span into its
+/// replacement. `markers` are `(offset_in_old_text, marker_text)` in source
+/// order. Offsets inside the common prefix / suffix of `old_text` and
+/// `new_text` keep their position relative to it (start / point markers
+/// prefer the prefix side, end markers the suffix side, so an anchor bordering
+/// the changed region grows to cover its replacement). A start/end pair both
+/// inside the changed middle is re-inserted around the first occurrence of
+/// its anchored text in the new middle. Any other marker is dropped so the
+/// comment anchor-recovery pass (partial recovery, else orphaning) handles it.
+fn carry_anchor_markers(old_text: &str, new_text: &str, markers: &[(usize, &str)]) -> String {
+    if markers.is_empty() {
+        return new_text.to_string();
+    }
+    let (lo, ln) = (old_text.len(), new_text.len());
+    let mut prefix = old_text
+        .bytes()
+        .zip(new_text.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !old_text.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let mut suffix = old_text
+        .bytes()
+        .rev()
+        .zip(new_text.bytes().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(lo.min(ln) - prefix);
+    while !old_text.is_char_boundary(lo - suffix) {
+        suffix -= 1;
+    }
+    let (old_mid_end, new_mid_end) = (lo - suffix, ln - suffix);
+    let in_prefix = |k: usize| k <= prefix;
+    let in_suffix = |k: usize| k >= old_mid_end;
+    let role = |m: &str| {
+        let body = m.strip_prefix(ANCHOR_MARKER_PREFIX).expect("anchor marker");
+        let colon = body.find(':').expect("anchor marker id");
+        (
+            body[..colon].to_string(),
+            body[colon + 1..].starts_with("end"),
+        )
+    };
+    let mut placed: Vec<(usize, usize, &str)> = Vec::new();
+    let new_mid = &new_text[prefix..new_mid_end];
+    for (idx, &(k, marker)) in markers.iter().enumerate() {
+        let (id, is_end) = role(marker);
+        let target = if is_end {
+            if in_suffix(k) {
+                Some(k + ln - lo)
+            } else if in_prefix(k) {
+                Some(k)
+            } else {
+                None
+            }
+        } else if in_prefix(k) {
+            Some(k)
+        } else if in_suffix(k) {
+            Some(k + ln - lo)
+        } else {
+            None
+        };
+        let target = target.or_else(|| {
+            let partner = |want_end: bool| {
+                markers.iter().find(|(pk, pm)| {
+                    let (pid, p_end) = role(pm);
+                    pid == id && p_end == want_end && !in_prefix(*pk) && !in_suffix(*pk)
+                })
+            };
+            let (ks, ke) = if is_end {
+                let (ks, _) = partner(false)?;
+                (*ks, k)
+            } else {
+                let (ke, _) = partner(true)?;
+                (k, *ke)
+            };
+            if ks > ke {
+                return None;
+            }
+            let rel = new_mid.find(&old_text[ks..ke])?;
+            Some(prefix + rel + if is_end { ke - ks } else { 0 })
+        });
+        if let Some(pos) = target {
+            placed.push((pos, idx, marker));
         }
     }
+    placed.sort_by_key(|&(pos, idx, _)| (pos, idx));
+    let mut out = String::with_capacity(ln + placed.iter().map(|p| p.2.len()).sum::<usize>());
+    let mut cursor = 0;
+    for (pos, _, marker) in placed {
+        out.push_str(&new_text[cursor..pos]);
+        out.push_str(marker);
+        cursor = pos;
+    }
+    out.push_str(&new_text[cursor..]);
+    out
 }
 
 /// `note.editLines` — 1-based inclusive replace/delete/insert.
@@ -1909,6 +2079,113 @@ mod tests {
     #[test]
     fn edit_no_match_errors() {
         assert!(apply_edit("hello world", "zzz", "x").is_err());
+    }
+
+    const A1: &str = "11111111-1111-4111-8111-111111111111";
+    const A2: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn anchored(id: &str, text: &str) -> String {
+        format!("{}{text}{}", start_marker(id), end_marker(id))
+    }
+
+    #[test]
+    fn edit_exact_match_with_markers_is_unchanged() {
+        let md = format!("Alpha.\n{} line here.\n", anchored(A1, "Beta"));
+        let old = format!("{} line", anchored(A1, "Beta"));
+        let (new, pos, _) = apply_edit(&md, &old, "Gamma line").unwrap();
+        assert_eq!(new, "Alpha.\nGamma line here.\n");
+        assert_eq!(pos, 7);
+    }
+
+    #[test]
+    fn edit_matches_visible_text_and_keeps_anchor_issue_7186() {
+        let md = format!("Alpha line here.\n{} line here.\n", anchored(A1, "Beta"));
+        let (new, pos, empty) = apply_edit(&md, "Beta line here.", "Beta line edited.").unwrap();
+        assert_eq!(
+            new,
+            format!("Alpha line here.\n{} line edited.\n", anchored(A1, "Beta"))
+        );
+        // Raw markdown char offset, like the exact path: the start marker
+        // before "Beta" stays outside the replaced range.
+        assert_eq!(pos, i64::try_from(17 + start_marker(A1).len()).unwrap());
+        assert!(!empty);
+        assert_eq!(classify_anchor_state(&new, A1), AnchorState::Healthy);
+    }
+
+    #[test]
+    fn edit_spanning_whole_anchored_span_reattaches_to_replacement() {
+        let md = format!("x {} y", anchored(A1, "Beta line"));
+        let (new, _, _) = apply_edit(&md, "Beta line", "Gamma line").unwrap();
+        assert_eq!(new, format!("x {} y", anchored(A1, "Gamma line")));
+        let (new, _, _) = apply_edit(&md, "x Beta line y", "x Beta line z").unwrap();
+        assert_eq!(new, format!("x {} z", anchored(A1, "Beta line")));
+    }
+
+    #[test]
+    fn edit_reinserts_anchor_around_moved_target_text() {
+        let md = format!("one {} three", anchored(A1, "two"));
+        let (new, _, _) = apply_edit(&md, "one two three", "ONE (two) THREE").unwrap();
+        assert_eq!(new, format!("ONE ({}) THREE", anchored(A1, "two")));
+    }
+
+    #[test]
+    fn edit_drops_anchor_whose_text_is_gone_for_orphaning() {
+        let md = format!("keep one {} three keep", anchored(A1, "two"));
+        let (new, _, _) = apply_edit(&md, "one two three", "uno dos tres").unwrap();
+        assert_eq!(new, "keep uno dos tres keep");
+        assert_eq!(classify_anchor_state(&new, A1), AnchorState::Missing);
+    }
+
+    #[test]
+    fn edit_keeps_markers_at_span_boundaries_outside() {
+        let md = format!("{} tail", anchored(A1, "Beta"));
+        let (new, _, _) = apply_edit(&md, "Beta tail", "Beta end").unwrap();
+        assert_eq!(new, format!("{} end", anchored(A1, "Beta")));
+        let md = format!("a {}", anchored(A1, "Beta"));
+        let (new, _, _) = apply_edit(&md, "Beta", "Delta").unwrap();
+        assert_eq!(new, format!("a {}", anchored(A1, "Delta")));
+    }
+
+    #[test]
+    fn edit_partial_overlap_preserves_markers_in_unchanged_regions() {
+        let md = format!("Alpha {} Gamma", anchored(A1, "Beta"));
+        let (new, _, _) = apply_edit(&md, "Alpha Be", "Omega Be").unwrap();
+        assert_eq!(new, format!("Omega {} Gamma", anchored(A1, "Beta")));
+        assert_eq!(classify_anchor_state(&new, A1), AnchorState::Healthy);
+    }
+
+    #[test]
+    fn edit_with_shorter_replacement_keeps_anchor() {
+        let md = format!("Intro {} long tail", anchored(A1, "Beta"));
+        let (new, _, _) = apply_edit(&md, "Intro Beta long tail", "Beta tail").unwrap();
+        assert_eq!(new, format!("{} tail", anchored(A1, "Beta")));
+        let md = format!("Alpha {} Gamma", anchored(A1, "Beta"));
+        let (new, _, _) = apply_edit(&md, "Alpha Beta", "A Beta").unwrap();
+        assert_eq!(new, format!("A {} Gamma", anchored(A1, "Beta")));
+    }
+
+    #[test]
+    fn edit_projected_match_uses_first_occurrence() {
+        let md = format!("{} x. {} x.", anchored(A1, "Beta"), anchored(A2, "Beta"));
+        let (new, pos, _) = apply_edit(&md, "Beta x", "Beta y").unwrap();
+        assert_eq!(
+            new,
+            format!("{} y. {} x.", anchored(A1, "Beta"), anchored(A2, "Beta"))
+        );
+        assert_eq!(pos, i64::try_from(start_marker(A1).len()).unwrap());
+    }
+
+    #[test]
+    fn edit_exact_match_takes_precedence_over_projected_match() {
+        let md = format!("{} x. Beta x.", anchored(A1, "Beta"));
+        let (new, _, _) = apply_edit(&md, "Beta x", "Beta y").unwrap();
+        assert_eq!(new, format!("{} x. Beta y.", anchored(A1, "Beta")));
+    }
+
+    #[test]
+    fn edit_projection_ignores_non_uuid_marker_lookalikes() {
+        let md = "a <!--anchor:{id}:start-->b";
+        assert!(apply_edit(md, "a b", "x").is_err());
     }
 
     #[test]

@@ -15,10 +15,7 @@ use std::time::Duration;
 /// race and make both tests resolve the same db path (→ "database is locked").
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-use intent_core::{
-    now_iso, Config, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
-};
+use intent_core::{now_iso, Config, Workspace, WorkspaceApi, WorkspaceId};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 use intent_transport::serve_uds;
@@ -26,6 +23,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+#[track_caller]
 fn git(repo: &Path, args: &[&str]) {
     // The harness may inherit GIT_AUTHOR_*/GIT_COMMITTER_* (agent-spawned
     // shells do, post-#4142); env outranks the repo-local user.* config these
@@ -61,49 +59,11 @@ fn seed_workspace(id: &WorkspaceId, worktree: &str) -> Workspace {
         id: id.clone(),
         title: "Git WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
         path: Some(worktree.to_string()),
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
         worktree_path: Some(worktree.to_string()),
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -147,7 +107,7 @@ async fn uds_git_write_ops_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -441,7 +401,7 @@ async fn uds_git_write_ops_wave_b_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -623,7 +583,7 @@ async fn uds_git_read_ops_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -790,7 +750,7 @@ async fn uds_git_agent_commit_rejects_submodule_internal_file() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -891,7 +851,7 @@ async fn uds_git_discard_rejects_submodule_internal_path() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -995,7 +955,7 @@ async fn uds_git_commit_details_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -1123,7 +1083,7 @@ async fn uds_git_branch_status_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -1287,7 +1247,7 @@ async fn uds_git_get_branches_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -1432,7 +1392,7 @@ async fn uds_git_pull_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {
@@ -1560,7 +1520,7 @@ async fn uds_git_read_ops_extensions_round_trip() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {

@@ -1,0 +1,39 @@
+[package]
+name = "intent-svc-remote"
+version = "0.11.141"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Remote agent runtime for intentd: the backend connector to exposed machines and journal ingestion"
+
+[dependencies]
+intent-services = { path = "../intent-services", version = "0.11.141" }
+intent-core = { path = "../intent-core", version = "0.11.141" }
+intent-store = { path = "../intent-store", version = "0.11.141" }
+intent-transport = { path = "../intent-transport", version = "0.11.141" }
+intent-acp = { path = "../intent-acp", version = "0.11.141" }
+intent-git = { path = "../intent-git", version = "0.11.141" }
+intent-providers = { path = "../intent-providers", version = "0.11.141" }
+git2 = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+sha2 = "0.11"
+intent-services = { path = "../intent-services", version = "0.11.141", features = ["test-hooks"] }
+intentd-test-support = { path = "../intentd-test-support" }
+socket2 = "0.6"
+sqlx = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

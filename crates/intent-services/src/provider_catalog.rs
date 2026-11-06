@@ -44,17 +44,6 @@ fn provider_visible(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str)
 fn provider_row(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> bool) -> Value {
     let mut row = serde_json::Map::new();
     row.insert("id".into(), json!(p.id));
-    if let Some(token) = p.access_token() {
-        row.insert(
-            "accessToken".into(),
-            json!({
-                "kind": token.kind.wire_name(),
-                "settingPath": token.setting_path,
-                "label": token.label,
-                "guidance": token.guidance,
-            }),
-        );
-    }
     row.insert(
         "supportsFastMode".into(),
         json!(p.fast_mode_config_id().is_some()),
@@ -68,6 +57,10 @@ fn provider_row(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> 
     row.insert("command".into(), json!(p.command));
     row.insert("canBeDisabled".into(), json!(p.can_be_disabled));
     row.insert("supportsTestPrompt".into(), json!(p.supports_test_prompt));
+    row.insert(
+        "supportsProfiles".into(),
+        json!(intent_providers::PROFILE_BASE_PROVIDERS.contains(&p.id)),
+    );
     if let Some(hint) = p.login_command_hint {
         row.insert("loginCommandHint".into(), json!(hint));
     }
@@ -96,48 +89,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_access_token_capabilities_match_sensitive_settings() {
-        let v = catalog(&|_| false);
-        for provider in intent_providers::ACP_PROVIDERS {
-            let advertised = &row(&v, provider.id)["accessToken"];
-            match provider.id {
-                "claude-code" | "codex" => {
-                    let token = provider.access_token().unwrap();
-                    assert_eq!(
-                        advertised["kind"],
-                        if provider.id == "codex" {
-                            "codexAccessToken"
-                        } else {
-                            "claudeSetupToken"
-                        }
-                    );
-                    assert_eq!(
-                        advertised["settingPath"],
-                        format!("providers.{}.accessToken", provider.id)
-                    );
-                    assert!(!advertised["label"].as_str().unwrap().is_empty());
-                    assert_eq!(advertised["guidance"], token.guidance);
-                    let definition = crate::settings::definitions()
-                        .into_iter()
-                        .find(|d| d.path == token.setting_path)
-                        .unwrap();
-                    assert!(definition.sensitive);
-                    assert!(!definition.read_only);
-                }
-                _ => assert!(row(&v, provider.id).get("accessToken").is_none()),
-            }
-        }
-        let codex = row(&v, "codex")["accessToken"]["guidance"]
-            .as_str()
-            .unwrap();
-        assert!(codex.contains("Business") && codex.contains("Enterprise"));
-        assert!(row(&v, "claude-code")["accessToken"]["guidance"]
-            .as_str()
-            .unwrap()
-            .contains("claude setup-token"));
-    }
-
-    #[test]
     fn serves_all_providers_in_registry_order_without_default_id() {
         let v = catalog(&|_| false);
         let ids: Vec<&str> = v["providers"]
@@ -153,6 +104,48 @@ mod tests {
             v.get("defaultProviderId").is_none(),
             "catalog must not carry defaultProviderId"
         );
+    }
+
+    /// Only the profile bases advertise `supportsProfiles: true`; every row
+    /// carries the boolean, and rows stay one per provider type, so
+    /// onboarding (which reads `providers`) never sees a profile row.
+    #[test]
+    fn supports_profiles_only_on_codex_and_claude_code() {
+        let v = catalog(&|_| false);
+        for provider in intent_providers::ACP_PROVIDERS {
+            assert_eq!(
+                row(&v, provider.id)["supportsProfiles"],
+                matches!(provider.id, "codex" | "claude-code"),
+                "{}",
+                provider.id
+            );
+        }
+        assert!(
+            v.get("profiles").is_none(),
+            "the static builder adds no profiles"
+        );
+    }
+
+    /// The FE (cloudlands-fe feat/cursor-provider) keys off this
+    /// row: id `cursor`, display name `Cursor`, test prompt supported, and
+    /// visible without any env var or feature code.
+    #[test]
+    fn cursor_row_matches_the_frontend_contract() {
+        let v = catalog(&|_| false);
+        let cursor = row(&v, "cursor");
+        assert_eq!(cursor["displayName"], "Cursor");
+        assert_eq!(cursor["shortName"], "Cursor");
+        assert_eq!(cursor["command"], "cursor-agent");
+        assert_eq!(cursor["canBeDisabled"], true);
+        assert_eq!(cursor["supportsTestPrompt"], true);
+        assert_eq!(cursor["supportsProfiles"], false);
+        assert_eq!(cursor["visible"], true);
+        assert_eq!(cursor["loginCommandHint"], "cursor-agent login");
+        assert_eq!(
+            cursor["loginDocsUrl"],
+            "https://cursor.com/docs/cli/reference/authentication"
+        );
+        assert!(cursor.get("requiresEnvVar").is_none());
     }
 
     #[test]

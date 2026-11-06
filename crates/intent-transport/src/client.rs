@@ -18,10 +18,11 @@ use serde_json::{json, Value};
 use crate::events::{error_frame, success_frame};
 use crate::host_env::detect_has_display;
 use crate::protocol::PROTOCOL_VERSION;
-use crate::reverse::ReverseClientIdentity;
+use crate::reverse::{ClaimedHello, HelloClaim};
 
 /// A classified `client.hello` request awaiting handling by the connection task.
 pub(crate) struct ClientRequest {
+    pub connection_role: ConnectionRole,
     /// The re-presented `clientId`, when a valid string was supplied.
     pub client_id: Option<String>,
     /// A `clientId` member was present but not a string ⇒ `-32602`.
@@ -34,6 +35,15 @@ pub(crate) struct ClientRequest {
     pub host: ClientHostInfo,
     pub id_present: bool,
     pub id_echo: Value,
+}
+
+/// An attachment is admitted by the original physical connection registry,
+/// never by the ordinary profile-writing handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectionRole {
+    Ordinary,
+    ReviewMonitor,
+    Invalid,
 }
 
 /// Classify a parsed frame as a `client.hello` request, or `None` to fall
@@ -55,6 +65,11 @@ pub(crate) fn classify(value: &Value) -> Option<ClientRequest> {
         }
     }
     let params = obj.get("params").and_then(Value::as_object);
+    let connection_role = match params.and_then(|p| p.get("connectionRole")) {
+        None => ConnectionRole::Ordinary,
+        Some(Value::String(role)) if role == "review-monitor" => ConnectionRole::ReviewMonitor,
+        Some(_) => ConnectionRole::Invalid,
+    };
     let client_id_member = params.and_then(|p| p.get("clientId"));
     let (client_id, client_id_invalid) = match client_id_member {
         None | Some(Value::Null) => (None, false),
@@ -75,6 +90,7 @@ pub(crate) fn classify(value: &Value) -> Option<ClientRequest> {
         device_kind: string_param("deviceKind"),
     };
     Some(ClientRequest {
+        connection_role,
         client_id,
         client_id_invalid,
         name,
@@ -99,13 +115,17 @@ pub(crate) fn server_json(
     build_commit: Option<&str>,
     is_local: bool,
 ) -> Value {
+    let capabilities = json!({ "desktopControl": 1, "discussionConversations": 1, "discussionMessageActions": 1, "discussionReactions": 1, "discussionAgentMessaging": 1, "discussionAgentActivity": 1, "discussionPrincipalMentions": 1, "discussionManagement": 1, "liveState": true, "eventStreamRecovery": 1, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "workspaceMembershipEvents": 1, "workspaceGuestRoles": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "repositoryResourcePages": 1, "gitlabChildGitPolicy": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1, "prWorkspaceLookup": 1, "agentWorkers": 1, "noteTruncatedRead": 1, "workspaceLabels": 1, "secretRequests": 1, "workspaceAutoArchiveOptOut": 1, "messageBlockPages": 1, "boundedReads": 1 });
+    let mut capabilities = capabilities;
+    capabilities["remoteAgentSkills"] = json!(1);
+    capabilities["agentPlugins"] = json!(1);
     let mut server = json!({
         "locality": if is_local { "local" } else { "remote" },
         "hasDisplay": has_display,
         "osArch": format!("{os}/{arch}"),
         "version": version,
         "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": { "liveState": true, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "workspaceMembershipEvents": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1 },
+        "capabilities": capabilities,
     });
     if let Some(build_commit) = build_commit {
         server
@@ -116,12 +136,109 @@ pub(crate) fn server_json(
     server
 }
 
+/// Add the capabilities that depend on the running daemon to a successful
+/// hello `frame`: `startupStatus: 1` when the full composition tracks
+/// startup, `remoteMachines: 1` when this backend places agents on exposed
+/// machines (the remote feature, not node mode), together with
+/// `remoteInitialAgent: 1`: `workspace.create` accepts
+/// `initialAgent.placement`.
+pub(crate) fn with_runtime_capabilities(
+    frame: Option<String>,
+    startup_status: bool,
+    remote_machines: bool,
+) -> Option<String> {
+    if !startup_status && !remote_machines {
+        return frame;
+    }
+    frame.map(|frame| {
+        let mut value: Value = serde_json::from_str(&frame).expect("encoded hello");
+        if value.get("result").is_some() {
+            let capabilities = &mut value["result"]["server"]["capabilities"];
+            if startup_status {
+                capabilities["startupStatus"] = json!(1);
+            }
+            if remote_machines {
+                capabilities["remoteMachines"] = json!(1);
+                capabilities["remoteInitialAgent"] = json!(1);
+                // Link traffic capture is served wherever exposed machines
+                // are: never in node mode.
+                capabilities["remoteLinkTraffic"] = json!(1);
+                // Remote agents' saved scripts run on their machines
+                // (nodeProtocol 8): advertised only with `remoteMachines`.
+                capabilities["remoteScripts"] = json!(1);
+            }
+        }
+        value.to_string()
+    })
+}
+
+/// A deliberately compiled test host can exercise the real negotiation path.
+/// This signal supplies compatibility only, never source or recipient authority.
+fn connection_server_json(is_local: bool, version: &str) -> Value {
+    let server = server_json(
+        detect_has_display(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        version,
+        crate::BUILD_COMMIT,
+        is_local,
+    );
+    #[cfg(feature = "repository-test-fixtures")]
+    let server = {
+        let mut server = server;
+        apply_monitor_test_support(
+            &mut server,
+            std::env::var("INTENTD_REVIEW_MONITOR_TEST_SUPPORT").as_deref() == Ok("1"),
+        );
+        server
+    };
+    server
+}
+
+#[cfg(feature = "repository-test-fixtures")]
+fn apply_monitor_test_support(server: &mut Value, enabled: bool) {
+    if enabled {
+        server["capabilities"]["reviewMonitoring"] = json!(1);
+    }
+}
+
 /// Result of [`handle`]: the response frame (`None` for a notification) and,
 /// on success, the identity the connection now carries — what the connection
-/// task binds onto its reverse-registry entry (REV-2).
+/// task binds onto its reverse-registry entry (REV-2). It comes from the
+/// hello's [`HelloClaim`], so it names the claimed id: reserved, and so
+/// bindable, only as [`ClaimedHello::Reserved`] — a detached guard's claim
+/// reserves nothing.
 pub(crate) struct HelloOutcome {
     pub frame: Option<String>,
-    pub bound: Option<ReverseClientIdentity>,
+    pub bound: Option<ClaimedHello>,
+}
+
+pub(crate) fn reject_role(req: &ClientRequest) -> Option<String> {
+    frame(
+        req.id_present,
+        &req.id_echo,
+        Err((
+            -32602,
+            "monitor attachment requires a current acknowledged source connection".into(),
+        )),
+    )
+}
+
+pub(crate) fn attachment_result(
+    req: &ClientRequest,
+    client_id: &ClientId,
+    is_local: bool,
+    version: &str,
+) -> String {
+    success_frame(
+        &req.id_echo,
+        &json!({
+            "clientId":client_id.as_str(),
+            "connectionRole":"review-monitor",
+            "protocolVersion":PROTOCOL_VERSION,
+            "server":connection_server_json(is_local, version)
+        }),
+    )
 }
 
 /// Namespace a `clientId` by the caller's principal when the request is bound
@@ -159,13 +276,36 @@ pub(crate) fn scope_to_caller(raw: ClientId) -> ClientId {
 /// into the `server` block. A non-string `clientId` is `-32602`; a persistence
 /// failure is `-32603`. Idempotent: re-sending updates name / capabilities /
 /// host identification and re-returns the same `server` block (PROTOCOL
-/// §5.17).
+/// §5.17). `version` is the daemon binary's version
+/// ([`crate::SystemControl::daemon_version`]), never this crate's own.
+///
+/// `claim` claims the resolved id for the connection
+/// ([`crate::reverse::PrimaryReverseGuard::claim_hello`]) before the client
+/// row is persisted, so the id is active for the superseded-id rehome
+/// throughout (intent-hq/intent#8045) — a server-generated id too, before the
+/// response reveals it. The claim alone supplies the id this hello persists,
+/// replies with and binds; a failed hello drops it, releasing any reservation.
 pub(crate) async fn handle(
     req: ClientRequest,
     api: &dyn WorkspaceApi,
     client_id: &mut Option<ClientId>,
     is_local: bool,
+    version: &str,
+    claim: impl FnOnce(ClientId) -> HelloClaim,
 ) -> HelloOutcome {
+    if req.connection_role != ConnectionRole::Ordinary {
+        return HelloOutcome {
+            frame: frame(
+                req.id_present,
+                &req.id_echo,
+                Err((
+                    -32602,
+                    "connectionRole requires an admitted monitor attachment".into(),
+                )),
+            ),
+            bound: None,
+        };
+    }
     if req.client_id_invalid {
         return HelloOutcome {
             frame: frame(
@@ -176,7 +316,10 @@ pub(crate) async fn handle(
             bound: None,
         };
     }
-    let resolved = scope_to_caller(req.client_id.map(ClientId::from_string).unwrap_or_default());
+    let claim = claim(scope_to_caller(
+        req.client_id.map(ClientId::from_string).unwrap_or_default(),
+    ));
+    let resolved = claim.client_id().clone();
     if let Err(e) = api
         .upsert_client(
             resolved.clone(),
@@ -191,23 +334,24 @@ pub(crate) async fn handle(
             bound: None,
         };
     }
+    let superseded = superseded_client_ids(&resolved);
+    // Rehoming tabs is browser management: it needs the same current host
+    // execution authority as the browser RPCs, not just namespace ownership
+    // (a member demoted to guest keeps its namespace but loses the browser).
+    if !superseded.is_empty() && crate::context::may_manage_workspaces(api).await {
+        if let Err(e) = api
+            .rehome_superseded_browser_tabs(resolved.clone(), superseded)
+            .await
+        {
+            tracing::warn!(
+                client_id = %resolved.as_str(),
+                error = %e,
+                "client.hello: rehoming browser tabs from superseded client ids failed"
+            );
+        }
+    }
     *client_id = Some(resolved.clone());
-    let mut server = server_json(
-        detect_has_display(),
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        env!("CARGO_PKG_VERSION"),
-        crate::BUILD_COMMIT,
-        is_local,
-    );
-    if api.supports_note_delete_grace() {
-        server["capabilities"]["noteDeleteGrace"] = json!(1);
-    }
-    if let Some(backend_id) = api.note_paging_backend_id() {
-        server["capabilities"]["notePagingRead"] = json!(1);
-        server["capabilities"]["notePagingBackendId"] = json!(backend_id);
-        server["capabilities"]["noteAnnotations"] = json!(1);
-    }
+    let server = connection_server_json(is_local, version);
     HelloOutcome {
         frame: frame(
             req.id_present,
@@ -218,13 +362,30 @@ pub(crate) async fn handle(
                 "server": server,
             })),
         ),
-        bound: Some(ReverseClientIdentity {
-            client_id: resolved,
-            name: req.name,
-            capabilities: req.capabilities.unwrap_or_else(|| json!({})),
-            host: req.host,
-        }),
+        bound: Some(claim.complete(
+            req.name,
+            req.capabilities.unwrap_or_else(|| json!({})),
+            req.host,
+        )),
     }
+}
+
+/// Earlier ids of the device that hello'd as `resolved` (intent-hq/intent#8045):
+/// every proper `:`-suffix of `resolved` (for `a:b:c`, `b:c` then `c`) — the
+/// ids it presented before a backend namespaced it ([`scope_to_caller`]) —
+/// kept only when the caller may already act as that id
+/// (`scope_to_caller(id) == id`). The administrator may act as any id; a
+/// collaborator only inside its own `{principalId}:` namespace, so presenting
+/// another member's raw id (resolved to `{principalId}:{raw}`) never reaches
+/// that member's tabs.
+pub(crate) fn superseded_client_ids(resolved: &ClientId) -> Vec<ClientId> {
+    let raw = resolved.as_str();
+    raw.match_indices(':')
+        .map(|(i, _)| &raw[i + 1..])
+        .filter(|tail| !tail.is_empty())
+        .map(|tail| ClientId::from_string(tail.to_string()))
+        .filter(|id| scope_to_caller(id.clone()) == *id)
+        .collect()
 }
 
 /// Build the response frame for a `client.hello` result, or `None` for a

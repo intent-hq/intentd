@@ -92,6 +92,16 @@ impl GitLabSourceControl {
                 },
             ));
         }
+        // A pipeline attached to the MR can still belong to an older head or a
+        // synthetic merged-result commit. Its association with the MR does not
+        // prove that its checks cover the current head. Keep that unknown until
+        // the provider supplies matching, nonempty commit identities.
+        let pipeline_head = optional(pipeline, "sha").filter(|sha| !sha.is_empty());
+        if pipeline_head.is_none()
+            || pipeline_head != optional(head, "sha").filter(|sha| !sha.is_empty())
+        {
+            return Ok((vec![], ProviderAvailability::Unknown));
+        }
         let Some(id) = pipeline["id"].as_u64().filter(|id| *id > 0) else {
             return Ok((vec![], ProviderAvailability::Unknown));
         };
@@ -203,7 +213,11 @@ impl GitLabSourceControl {
                 && policy
                     .as_ref()
                     .is_some_and(|p| p["only_allow_merge_if_pipeline_succeeds"].is_boolean()),
-            checks_head_sha: optional(&head, "sha"),
+            checks_head_sha: if head["head_pipeline"].is_null() {
+                optional(&head, "sha")
+            } else {
+                optional(&head["head_pipeline"], "sha").filter(|sha| !sha.is_empty())
+            },
             branch_rules: rules,
             // Train state is optional; absence never means the MR is known unqueued.
             is_in_merge_queue: head["merge_train"].as_object().map(|_| true),

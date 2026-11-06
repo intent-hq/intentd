@@ -20,19 +20,31 @@ use crate::model::{
     LineAttributionData, MessageOrigin, Note, NoteAddInput, NoteAddResult, NoteCreate,
     NoteCreateResult, NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult,
     NoteEditResult, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
-    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, ReadAssetResult,
-    RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
+    NoteUpdateMetadataResult, NoteVersion, NoteVersionSummary, ProjectType, PullRequestWorkspace,
+    ReadAssetResult, RepoConfig, SaveAssetResult, ScriptCreateParams, SetupScript, TaskAgentLink,
     TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
-    TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
-    TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
-    TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
-    WorkspaceSetupStatus, WorkspaceTask, WorkspaceUpdate,
+    TaskGetMyTaskResult, TaskListPage, TaskListResult, TaskMarkAsTaskResult,
+    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskUpdateNoteStatusResult,
+    TaskUpdateResult, TaskUpdateStatusResult, TokenUsage, Workspace, WorkspaceCreate,
+    WorkspaceCreateResult, WorkspaceEventSummary, WorkspaceListFilter, WorkspaceSetupStatus,
+    WorkspaceTask, WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
 /// Boxed, `Send` future — keeps [`WorkspaceApi`] object-safe so it can be held
 /// as `Arc<dyn WorkspaceApi>` (the agent→BE callback handle, §6.8).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Paging request of one `git.diffs` / `git.branchDiff` read (PROTOCOL §5.6
+/// "Response budget").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitDiffPage {
+    /// Result budget; clamped into [64 KiB, 480,000], 480,000 when `None`.
+    pub max_bytes: Option<usize>,
+    /// Resumes after the file list a previous page cut (that page's trailing
+    /// `{ "nextToken" }` entry).
+    pub next_token: Option<String>,
+}
 
 /// The single shared service surface (§6.8, "one impl, two front doors"): the
 /// transport JSON-RPC router and the agent→BE MCP callback both dispatch to the
@@ -43,6 +55,49 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `intent-services` (§3.2 rule 3). The default bodies return an internal error
 /// so downstream stubs compile until they override these methods.
 pub trait WorkspaceApi: Send + Sync {
+    /// Whether this daemon runs in node mode (`intentd serve --node` or
+    /// `daemon.mode = "node"`): the transport then serves only
+    /// `NODE_MODE_METHODS` and refuses everything else with `node-mode`.
+    /// Fixed for the process lifetime; `false` by default.
+    fn node_mode(&self) -> bool {
+        false
+    }
+
+    /// Whether `client.hello` advertises `remoteMachines: 1`: this daemon
+    /// is a backend that can place agents on exposed machines, which needs
+    /// the remote feature and node mode off.
+    /// `false` by default.
+    fn remote_machines_capability(&self) -> bool {
+        false
+    }
+
+    fn desktop_agent_call(
+        &self,
+        _workspace: WorkspaceId,
+        _method: String,
+        _args: serde_json::Value,
+    ) -> BoxFuture<'_, crate::desktop::DesktopResult<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::desktop::DesktopError::new(
+                "desktop-unsupported",
+                "Desktop control unavailable",
+            ))
+        })
+    }
+    fn desktop_client_call(
+        &self,
+        _method: String,
+        _args: serde_json::Value,
+        _connection: crate::desktop::DesktopConnection,
+    ) -> BoxFuture<'_, crate::desktop::DesktopResult<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::desktop::DesktopError::new(
+                "desktop-unsupported",
+                "Desktop control unavailable",
+            ))
+        })
+    }
+
     fn repository_checkout_capture(
         &self,
         _query: crate::repository_checkout::CheckoutCaptureQuery,
@@ -134,6 +189,28 @@ pub trait WorkspaceApi: Send + Sync {
         None
     }
 
+    /// Owner-only policy on the original native application connection.
+    fn gitlab_child_git_policy_get(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitPolicyQuery,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitPolicy>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git policy unavailable".into())) })
+    }
+    fn gitlab_child_git_policy_set(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitPolicySet,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitPolicy>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git policy unavailable".into())) })
+    }
+    /// Transport-private helper branch. Implementations require actual local
+    /// owner admission and retain credential proof through final socket output.
+    fn gitlab_child_git_credential(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitCredentialQuery,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitCredentialResult>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git credential unavailable".into())) })
+    }
+
     /// Acquire read-only repository context under the original native connection.
     /// Explicit original-socket resource reads; older implementations refuse.
     fn repository_resource_capture(
@@ -162,6 +239,68 @@ pub trait WorkspaceApi: Send + Sync {
     ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
         Box::pin(async {
             Err(crate::Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+
+    fn repository_resource_resolve_known(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryKnownQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryKnownSelection>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource read unavailable".into(),
+            ))
+        })
+    }
+
+    fn repository_resource_capture_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedCaptureQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryScopedCapture>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_detail_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedDetailQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryScopedDetail>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_release_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_list(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryResourceListQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryResourceList>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_discussions(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryDiscussionsQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryDiscussions>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
                 "Repository resource reads unavailable".into(),
             ))
         })
@@ -271,12 +410,66 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
     }
 
-    /// List workspaces, optionally including archived ones (PROTOCOL §5.1).
-    fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
-        let _ = include_archived;
+    /// List workspaces admitted by `filter` (PROTOCOL §5.1). Retired
+    /// workspaces are returned only when `filter.include_retired` is set —
+    /// `include_archived` alone never includes them.
+    fn list_workspaces(
+        &self,
+        filter: WorkspaceListFilter,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+        let _ = filter;
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::list_workspaces not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// One page of [`Self::list_workspaces`] (`lite: false`) or
+    /// [`Self::list_workspaces_lite`] (`lite: true`) rows in `(createdAt,
+    /// id)` order (PROTOCOL §5.1 "Paged workspace lists"): at most `limit`
+    /// rows (default [`crate::WORKSPACE_LIST_DEFAULT_LIMIT`], maximum
+    /// [`crate::WORKSPACE_LIST_MAX_LIMIT`]), stopping early at
+    /// [`crate::WORKSPACE_LIST_BUDGET_BYTES`], starting after `next_token`.
+    /// `InvalidParams` for a malformed token. The default serves every row
+    /// as one page, for test doubles.
+    fn list_workspaces_page(
+        &self,
+        filter: WorkspaceListFilter,
+        lite: bool,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<crate::WorkspacePage>> {
+        let _ = (limit, next_token);
+        Box::pin(async move {
+            let workspaces = if lite {
+                self.list_workspaces_lite(filter).await?
+            } else {
+                self.list_workspaces(filter).await?
+            };
+            Ok(crate::WorkspacePage {
+                workspaces,
+                next_token: None,
+            })
+        })
+    }
+
+    /// Workspaces linked to the pull request at `url`
+    /// (`workspace.findByPullRequest`, PROTOCOL §5.1 "Pull request workspace
+    /// lookup"): most recently linked first, archived included, narrowed to the
+    /// caller's visible workspaces. `Error::InvalidParams` when `url` is not a
+    /// pull-request URL.
+    ///
+    /// Retired workspaces are included only with `include_retired`.
+    fn find_workspaces_by_pull_request(
+        &self,
+        url: String,
+        include_retired: bool,
+    ) -> BoxFuture<'_, Result<Vec<PullRequestWorkspace>>> {
+        let _ = (url, include_retired);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::find_workspaces_by_pull_request not implemented".to_string(),
             ))
         })
     }
@@ -293,9 +486,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// full `list_workspaces`.
     fn list_workspaces_lite(
         &self,
-        include_archived: bool,
+        filter: WorkspaceListFilter,
     ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
-        self.list_workspaces(include_archived)
+        self.list_workspaces(filter)
     }
 
     /// Fetch one workspace by id; `NotFound` if absent (PROTOCOL §5.1).
@@ -603,6 +796,53 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// The retired workspace a call is scoped to, if any (PROTOCOL §5.1
+    /// "Retired workspaces" read-only gate): `workspace_id` when that
+    /// workspace is `Retired`, else the workspace of `agent_id` when it is
+    /// `Retired`, else `None`. One cheap store read; the default (non-store
+    /// impls) reports nothing retired.
+    fn retired_workspace_for(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Option<WorkspaceId>>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Whether `workspace_id` is a plain-folder workspace (PROTOCOL §5.1
+    /// "Plain-folder workspaces"), read from the persisted `plainFolder`
+    /// flag only. Gates the git and forge surfaces (the `ws.git.*`,
+    /// `ws.pr.*`, `ws.mr.*` and `ws.workspace.proposeSibling` bindings and
+    /// the git/accept-changes RPCs). One cheap store read; the default
+    /// (non-store impls) and a failed read report `false`.
+    fn is_plain_folder_workspace(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, bool> {
+        let _ = workspace_id;
+        Box::pin(async { false })
+    }
+
+    /// Retire a workspace (PROTOCOL §5.1 `workspace.retire`): allowed from
+    /// Active or Archived. An Active workspace gets the archive teardown
+    /// first (interrupt turns, cancel hooks / PR monitors, detach guests);
+    /// then the status flips to `Retired` with `retiredAt`, and the checkout
+    /// folder and git worktree registration are removed in the background.
+    /// The git branch and every DB row (agents, conversations, notes,
+    /// assets, tasks) are kept. Idempotent on an already-retired workspace.
+    /// `caller_agent_id` has the same meaning as on
+    /// [`Self::archive_workspace`].
+    fn retire_workspace(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        let _ = (id, caller_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::retire_workspace not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Unarchive a workspace (status→active) (PROTOCOL §5.1).
     fn unarchive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let _ = id;
@@ -716,6 +956,28 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::get_workspace_browser_client not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.browser.clients()` (agent binding only, no wire method): every
+    /// connected client with its live connections, plus where an unpinned
+    /// `browser.exec` and this workspace's `browser.exec` would go right
+    /// now — `{ clients: [{ clientId, name?, canHostBrowser, connections:
+    /// [{ connectionId, transport, connectedAt, canHostBrowser }] }],
+    /// unpinned: Route, workspace: Route & { source } }` where a route is
+    /// `{ clientId, name?, connectionId, error? }` (see
+    /// [`ReverseConnectionSnapshot`]). Read-only. `agent_id` is the calling
+    /// agent, whose workspace membership is checked as for `browser_exec`.
+    fn browser_clients(
+        &self,
+        id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_clients not implemented".to_string(),
             ))
         })
     }
@@ -1051,46 +1313,6 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// Fetch one note by id, scoped to the workspace (PROTOCOL §5.2).
-    /// Persistent backend identity only when bounded note reads and annotations are available.
-    fn note_paging_backend_id(&self) -> Option<String> {
-        None
-    }
-
-    /// Read bounded indexed source/context/metadata at one live revision.
-    fn get_note_page(
-        &self,
-        workspace_id: WorkspaceId,
-        note_id: NoteId,
-        request: crate::note_page::NotePageRequest,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, note_id, request, rpc_id);
-        Box::pin(async { Err(crate::Error::Unsupported("note pages".into())) })
-    }
-
-    /// Read an opt-in annotation page under current scope and authorization.
-    fn get_note_annotation_page(
-        &self,
-        method: crate::note_annotation::AnnotationMethod,
-        request: crate::note_annotation::AnnotationReadRequest,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (method, request, rpc_id);
-        Box::pin(async { Err(crate::Error::Unsupported("annotation pages".into())) })
-    }
-
-    /// Read one bounded persisted subscription tuple under current authorization.
-    /// An incarnation pins a running subscription to its deletion tombstone.
-    fn get_note_page_state(
-        &self,
-        workspace_id: WorkspaceId,
-        note_id: NoteId,
-        incarnation: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, note_id, incarnation);
-        Box::pin(async { Err(crate::Error::Unsupported("note page state".into())) })
-    }
-
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let _ = (workspace_id, note_id);
         Box::pin(async {
@@ -1256,6 +1478,46 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// [`WorkspaceApi::set_note_content`] with the truncated-read write guard:
+    /// `base_content_bytes` is the UTF-8 size of the writer's base text.
+    /// When `Some`, the write is refused with `Error::ContentBaseMismatch`
+    /// (no write) unless it equals the size of the base the daemon resolves
+    /// — the stored content when `expected_version` is absent or current,
+    /// the merge snapshot when it is stale; an unrecoverable snapshot is an
+    /// unknown base and always refuses (never last-writer-wins). The check
+    /// runs on every read-merge-persist attempt, after the above-current
+    /// `expected_version` `Conflict` and before the merge result is
+    /// persisted; without `expected_version`, losing the rev gate to a
+    /// concurrent writer is a refusal, not a retry. `None` behaves exactly
+    /// like `set_note_content`.
+    #[expect(clippy::too_many_arguments)]
+    fn set_note_content_guarded(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        content: String,
+        confirm_replacement: bool,
+        expected_version: Option<i64>,
+        base_content_bytes: Option<u64>,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
+        if base_content_bytes.is_none() {
+            return self.set_note_content(
+                workspace_id,
+                note_id,
+                content,
+                confirm_replacement,
+                expected_version,
+                caller_agent_id,
+            );
+        }
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::set_note_content_guarded not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `note.updateMetadata`: title/tags (spec title is skipped) (PROTOCOL §5.2).
     /// `expected_version` gates the write on the current `rev` when `Some` (§5.6).
     ///
@@ -1284,38 +1546,6 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::update_note_metadata not implemented".to_string(),
             ))
         })
-    }
-
-    /// Whether this implementation provides the complete grace deletion contract.
-    fn supports_note_delete_grace(&self) -> bool {
-        false
-    }
-
-    /// Bounded grace deletion control; legacy immediate deletion is unchanged.
-    fn schedule_note_delete(
-        &self,
-        request: crate::note_delete::NoteDeleteSchedule,
-    ) -> BoxFuture<'_, Result<crate::note_delete::NoteDeleteOperationResponse>> {
-        let _ = request;
-        Box::pin(async { Err(Error::Unsupported("note deletion grace".into())) })
-    }
-
-    /// Bounded grace deletion control; legacy immediate deletion is unchanged.
-    fn cancel_note_delete(
-        &self,
-        request: crate::note_delete::NoteDeleteCancel,
-    ) -> BoxFuture<'_, Result<crate::note_delete::NoteDeleteOperationResponse>> {
-        let _ = request;
-        Box::pin(async { Err(Error::Unsupported("note deletion grace".into())) })
-    }
-
-    /// Bounded grace deletion control; legacy immediate deletion is unchanged.
-    fn note_delete_status(
-        &self,
-        request: crate::note_delete::NoteDeleteStatus,
-    ) -> BoxFuture<'_, Result<crate::note_delete::NoteDeleteStatusResponse>> {
-        let _ = request;
-        Box::pin(async { Err(Error::Unsupported("note deletion grace".into())) })
     }
 
     /// `note.delete`: remove a note (PROTOCOL §5.2). `expected_version` gates the
@@ -1359,6 +1589,26 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::read_asset not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `note.readAssetChunk`: one offset window of an asset's raw bytes as
+    /// `{ assetId, mimeType, content (base64), bytesRead, size }` (`size` =
+    /// whole asset byte length). Same asset resolution as
+    /// [`Self::read_asset`]. `length` is capped at the transfer chunk size;
+    /// over-cap or zero → `Error::InvalidParams`.
+    fn read_asset_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        asset: String,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, asset, offset, length);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::read_asset_chunk not implemented".to_string(),
             ))
         })
     }
@@ -1575,6 +1825,24 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::task_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Paged `task.list` (`limit` / `nextToken`, bounded reads): one page of
+    /// the [`Self::task_list`] rows in `(createdAt, id)` order under the
+    /// read budget, plus the same `stats` and the `nextToken` for the rest.
+    /// The `task.subscribe` seq-0 snapshot's token pages on through it.
+    fn task_list_page(
+        &self,
+        workspace_id: WorkspaceId,
+        status: Option<String>,
+        page: crate::note_read_bounds::PageRequest,
+    ) -> BoxFuture<'_, Result<TaskListPage>> {
+        let _ = (workspace_id, status, page);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::task_list_page not implemented".to_string(),
             ))
         })
     }
@@ -1813,6 +2081,41 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// One page of an `agent.list` read (PROTOCOL §5.5 "Paged agent lists"):
+    /// the `selection` rows in `(createdAt, id)` order, at most `limit`
+    /// (default [`crate::AGENT_LIST_DEFAULT_LIMIT`], maximum
+    /// [`crate::AGENT_LIST_MAX_LIMIT`]), stopping early at
+    /// [`crate::AGENT_LIST_PAGE_BUDGET_BYTES`], starting after `next_token`.
+    /// `InvalidParams` for a malformed token. The default serves the whole
+    /// selection as one page, for test doubles.
+    fn agent_list_page(
+        &self,
+        workspace_id: WorkspaceId,
+        selection: crate::AgentListSelection,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<crate::AgentListPage>> {
+        let _ = (limit, next_token);
+        Box::pin(async move {
+            let agents = match selection {
+                crate::AgentListSelection::Active => self.agent_list(workspace_id).await?,
+                crate::AgentListSelection::All => {
+                    self.agent_list_including_retired(workspace_id).await?
+                }
+                crate::AgentListSelection::RetiredOnly => {
+                    self.agent_list_retired_only(workspace_id).await?
+                }
+                crate::AgentListSelection::Scoped(scope) => {
+                    self.agent_list_scoped(workspace_id, scope).await?
+                }
+            };
+            Ok(crate::AgentListPage {
+                agents,
+                next_token: None,
+            })
+        })
+    }
+
     /// `agent.list { scope }` (PROTOCOL §5.5): ONLY the non-retired sessions
     /// in one [`AgentListRowScope`] bin (`topLevel` / `delegated` /
     /// `background`), filtered SQL-side so cost stays O(rows returned).
@@ -1938,7 +2241,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `agent.getMessageBlock`: one full content block of one persisted
-    /// message, by block id — `{ block }` (PROTOCOL §5.5). The on-demand
+    /// message, by block id — `{ block, truncated, field, encoding,
+    /// totalBytes, nextOffset }` (PROTOCOL §5.5). `page` caps the served
+    /// block and pages its body ([`crate::page_message_block`]). The on-demand
     /// counterpart of the `projection: "slim"` conversation read: a client
     /// holding a truncated block fetches the full body here. Block ids are
     /// the served identity — persisted assistant ids and the serve-time
@@ -1952,8 +2257,9 @@ pub trait WorkspaceApi: Send + Sync {
         message_id: String,
         block_id: String,
         workspace_id: Option<WorkspaceId>,
+        page: crate::MessageBlockPage,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, message_id, block_id, workspace_id);
+        let _ = (agent_id, message_id, block_id, workspace_id, page);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_get_message_block not implemented".to_string(),
@@ -1961,24 +2267,30 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `agent.listUserMessages`: all user-role messages of an agent as
+    /// `agent.listUserMessages`: user-role messages of an agent as
     /// lightweight index items, oldest→newest —
-    /// `{ agentId, items: [{ id, preview, createdAt, metadata? }], total }`
-    /// (PROTOCOL §5.5). `preview` is the extracted plain text bounded to
-    /// `preview_chars` characters (`None` → server default, server-clamped);
-    /// `metadata` is the persisted row metadata verbatim when present.
-    /// Non-user rows are never included. Bounded cost: one role-filtered
-    /// SQL read whose previews are extracted and truncated inside SQL —
-    /// full content blobs never leave the database and the transcript is
-    /// never hydrated. `NotFound` on an unknown agent or a workspace
-    /// mismatch.
+    /// `{ agentId, items: [{ id, preview, createdAt, metadata? }], total,
+    /// nextToken }` (PROTOCOL §5.5). `preview` is the extracted plain text
+    /// bounded to `preview_chars` characters (`None` → server default,
+    /// server-clamped); `metadata` is the row metadata projected to its
+    /// classification fields when any survive. Every read is paged
+    /// newest-first (`limit` default 100, max 500, plus a 480,000-byte
+    /// items budget) and carries `nextToken` (`null` once no older rows
+    /// remain). Non-user rows are never included.
+    /// Bounded cost: one role-filtered SQL read whose previews and metadata
+    /// are trimmed inside SQL — full content and metadata blobs never leave
+    /// the database and the transcript is never hydrated. `NotFound` on an
+    /// unknown agent or a workspace mismatch; `InvalidParams` on a malformed
+    /// `next_token`.
     fn agent_list_user_messages(
         &self,
         agent_id: AgentId,
         workspace_id: Option<WorkspaceId>,
         preview_chars: Option<i64>,
+        limit: Option<i64>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (agent_id, workspace_id, preview_chars);
+        let _ = (agent_id, workspace_id, preview_chars, limit, next_token);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_list_user_messages not implemented".to_string(),
@@ -2006,11 +2318,31 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// The wire `agent.getSession` read (PROTOCOL §5.5): the
+    /// [`Self::agent_get_session`] projection serialized, with `messages`
+    /// bounded to the newest slim transcript page that keeps the session
+    /// under the read payload budget, plus `messagesTotal`,
+    /// `messagesTruncated` and `messagesNextToken` (continue with
+    /// `agent.getConversation`). The default serves the whole session, for
+    /// test doubles that only implement [`Self::agent_get_session`].
+    fn agent_get_session_bounded(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let session = self.agent_get_session(agent_id, workspace_id).await?;
+            serde_json::to_value(session).map_err(|e| Error::Internal(e.to_string()))
+        })
+    }
+
     /// `agent.update`: partial update of the persisted [`AgentSession`] from
     /// a `changes` object (PROTOCOL §5.5). Only the listed fields are touched;
     /// omitted fields are preserved. Write-once (`acpSessionId`) and immutable
     /// (`provider`) invariants are enforced by the store. Emits `agent:updated`
-    /// (or `agent:renamed` when `name` is the only mutated field). Returns
+    /// (or `agent:renamed` with `{ agentId, name, nameExplicitlySet }` when
+    /// `name` is the only mutated field); any event payload carrying `name`
+    /// also carries the persisted `nameExplicitlySet`. Returns
     /// `{ success: true, agent: AgentLite }` on success. `NotFound` when the
     /// session is unknown; `InvalidParams` when `changes` carries an unknown
     /// field or a malformed value.
@@ -2161,6 +2493,15 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::agent_create not implemented".to_string(),
             ))
         })
+    }
+
+    /// Remote-placement discovery for agents in `workspace_id` (the
+    /// `ws.help("agent")` and tool-description text): the configured
+    /// execution node, its platforms and how to place an agent on it.
+    /// `None` when the daemon has no execution node.
+    fn agent_placement_help(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Option<String>> {
+        let _ = workspace_id;
+        Box::pin(async { None })
     }
 
     /// Read the workspace's last explicitly remembered manual specialist.
@@ -2326,7 +2667,10 @@ pub trait WorkspaceApi: Send + Sync {
     /// a system-origin notice to the agent naming the proposal and outcome
     /// (PROTOCOL §5.5). Idempotent: re-resolving an already-resolved id
     /// succeeds without a duplicate notice. Unknown `proposalId` (never
-    /// pending, never resolved) → `NotFound`.
+    /// pending, never resolved) → `NotFound`. `created_workspace_id` (an
+    /// in-process caller that just created the workspace for an applied
+    /// `workspace-create` card; never taken from the wire) is recorded under
+    /// `metadata.proposalCreatedWorkspaces` so clients can open it.
     fn agent_resolve_proposal(
         &self,
         workspace_id: WorkspaceId,
@@ -2334,8 +2678,16 @@ pub trait WorkspaceApi: Send + Sync {
         proposal_id: String,
         outcome: String,
         detail: Option<String>,
+        created_workspace_id: Option<WorkspaceId>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, agent_id, proposal_id, outcome, detail);
+        let _ = (
+            workspace_id,
+            agent_id,
+            proposal_id,
+            outcome,
+            detail,
+            created_workspace_id,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::agent_resolve_proposal not implemented".to_string(),
@@ -2514,6 +2866,30 @@ pub trait WorkspaceApi: Send + Sync {
     /// [{ id, content, queuedAt, position, imageBlocks?, fileBlocks? }] }` (PROTOCOL §5.5).
     /// When `workspace_id` is supplied the callee verifies the session belongs
     /// to that workspace (defense-in-depth against a bare `agentId` probe).
+    /// One page of [`Self::agent_get_queue`] (PROTOCOL §5.5 "Paged queue
+    /// reads"): at most `limit` entries in drain order (default
+    /// [`crate::AGENT_QUEUE_DEFAULT_LIMIT`], maximum
+    /// [`crate::AGENT_QUEUE_MAX_LIMIT`]) from `next_token`, stopping early at
+    /// [`crate::AGENT_QUEUE_PAGE_BUDGET_BYTES`], plus `queueLength` (the whole
+    /// queue) and `nextToken`. The default serves the whole queue as one page,
+    /// for test doubles.
+    fn agent_get_queue_page(
+        &self,
+        agent_id: AgentId,
+        workspace_id: Option<WorkspaceId>,
+        limit: Option<i64>,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (limit, next_token);
+        Box::pin(async move {
+            let mut reply = self.agent_get_queue(agent_id, workspace_id).await?;
+            if let Some(obj) = reply.as_object_mut() {
+                obj.insert("nextToken".into(), serde_json::Value::Null);
+            }
+            Ok(reply)
+        })
+    }
+
     fn agent_get_queue(
         &self,
         agent_id: AgentId,
@@ -2525,6 +2901,30 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::agent_get_queue not implemented".to_string(),
             ))
         })
+    }
+
+    /// `agent.workers.list` (PROTOCOL §5.5b): the agent's complete
+    /// `WorkerSnapshot` — a memory-only read, never a provider call.
+    fn agent_workers_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async { Err(Error::Unsupported("agent.workers.list".into())) })
+    }
+
+    /// `agent.workers.stop` (PROTOCOL §5.5b): ask the provider to stop one
+    /// worker of `connection_generation`; `{ asyncTaskId, stopped }`.
+    fn agent_workers_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        connection_generation: String,
+        async_task_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, connection_generation, async_task_id);
+        Box::pin(async { Err(Error::Unsupported("agent.workers.stop".into())) })
     }
 
     /// `agent.stop`: cancel an in-flight stream; `{ success: true }` (PROTOCOL §5.5).
@@ -2928,19 +3328,23 @@ pub trait WorkspaceApi: Send + Sync {
     /// subscriptions, delegation groups, and stuck-risk signals as
     /// `{ ok, diagnostics, text }` (PROTOCOL §5.5). Optional `agent_id` /
     /// `task_note_id` focus the snapshot; `stale_responding_after_ms` tunes the
-    /// stale-responding threshold (default 600000).
+    /// stale-responding threshold (default 600000). `row_limit` caps every
+    /// row list of the snapshot (default 100, maximum 200; the reply is also
+    /// held under the read payload budget).
     fn agent_diagnostics(
         &self,
         workspace_id: WorkspaceId,
         agent_id: Option<AgentId>,
         task_note_id: Option<NoteId>,
         stale_responding_after_ms: Option<i64>,
+        row_limit: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
             agent_id,
             task_note_id,
             stale_responding_after_ms,
+            row_limit,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -3907,6 +4311,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.diffs` with a byte budget (PROTOCOL §5.6 "Response budget"):
+    /// see [`GitDiffPage`] ([`Self::git_diffs`] uses the default page). The
+    /// default implementation ignores the page.
+    fn git_diffs_budgeted(
+        &self,
+        workspace_id: WorkspaceId,
+        paths: Option<Vec<String>>,
+        staged: bool,
+        commit_hash: Option<String>,
+        git_root_id: Option<WorkspaceGitRootId>,
+        page: GitDiffPage,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = page;
+        self.git_diffs(workspace_id, paths, staged, commit_hash, git_root_id)
+    }
+
     /// `git.commitDetails`: metadata + per-file `(additions, deletions)` for a
     /// single commit, addressed by `commit_hash` (full SHA or short ref).
     /// Returns the wire shape `{ commitHash, author, authorEmail, date, message,
@@ -3973,6 +4393,36 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `git.showFileChunk`: one offset window of the raw blob bytes that
+    /// [`Self::git_show_file`] would serve, as `{ content (base64),
+    /// bytesRead, size }` (`size` = whole blob byte length). Same path, ref,
+    /// root and fallback rules (a missing path or an unknown/remote/non-repo
+    /// workspace is an empty blob). `length` is capped at the transfer chunk
+    /// size; over-cap or zero → `Error::InvalidParams`.
+    fn git_show_file_chunk(
+        &self,
+        workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+        git_root_id: Option<WorkspaceGitRootId>,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            file_path,
+            git_ref,
+            git_root_id,
+            offset,
+            length,
+        );
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::git_show_file_chunk not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `git.numstat`: per-file additions/deletions for a workspace's tracked
     /// changes (mirrors `git diff --numstat`). When `base_ref`/`base_sha` are
     /// set, resolves the branch boundary (merge-base of `target_ref` and
@@ -4023,6 +4473,21 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::git_branch_diff not implemented".to_string(),
             ))
         })
+    }
+
+    /// `git.branchDiff` with a byte budget (see [`Self::git_diffs_budgeted`]).
+    /// The default implementation ignores the budget.
+    fn git_branch_diff_budgeted(
+        &self,
+        workspace_id: WorkspaceId,
+        base_ref: Option<String>,
+        base_sha: Option<String>,
+        target_ref: Option<String>,
+        paths: Option<Vec<String>>,
+        page: GitDiffPage,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = page;
+        self.git_branch_diff(workspace_id, base_ref, base_sha, target_ref, paths)
     }
 
     /// `git.getRemoteUrl`: the configured URL of the named remote for the git
@@ -5241,6 +5706,123 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Human-only conversation history with participant authorization.
+    fn discussion_list(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            conversation_id,
+            before_sequence,
+            after_sequence,
+            limit,
+        );
+        Box::pin(async { Err(Error::Internal("discussion.list not implemented".into())) })
+    }
+    /// Atomic first send or participant-authorized append with exact retry semantics.
+    fn discussion_send(
+        &self,
+        workspace_id: WorkspaceId,
+        message_id: String,
+        body: String,
+        target: crate::discussion::DiscussionTarget,
+    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionSendResult>> {
+        let _ = (workspace_id, message_id, body, target);
+        Box::pin(async { Err(Error::Internal("discussion.send not implemented".into())) })
+    }
+    /// Human-only compare-and-swap control of an explicitly addressed invocation.
+    fn discussion_control_agent(
+        &self,
+        request: crate::discussion::DiscussionAgentControl,
+        retry: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (request, retry);
+        Box::pin(async { Err(Error::Internal("discussion control not implemented".into())) })
+    }
+    /// Set one human's desired reaction state; retries are no-ops.
+    fn discussion_react(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        message_id: String,
+        reaction: String,
+        active: bool,
+    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionReactionState>> {
+        let _ = (workspace_id, conversation_id, message_id, reaction, active);
+        Box::pin(async { Err(Error::Internal("discussion.react not implemented".into())) })
+    }
+    /// Rename a workspace-wide discussion as its owner or manager.
+    fn discussion_rename(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, conversation_id, name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "discussion management not implemented".into(),
+            ))
+        })
+    }
+
+    /// Delete a workspace-wide discussion as its owner.
+    fn discussion_delete(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, conversation_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "discussion management not implemented".into(),
+            ))
+        })
+    }
+
+    /// Bounded discovery, with legacy private history filtered by original participation.
+    fn discussion_conversations(
+        &self,
+        workspace_id: WorkspaceId,
+        before_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, before_id, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "discussion.conversations not implemented".into(),
+            ))
+        })
+    }
+    /// Bounded offline-capable effective member picker.
+    fn discussion_recipients(
+        &self,
+        workspace_id: WorkspaceId,
+        query: String,
+        after_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, query, after_id, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "discussion.recipients not implemented".into(),
+            ))
+        })
+    }
+    /// Delivery-time participant projection, including owners. Fail closed by default.
+    fn discussion_project_event(
+        &self,
+        event: crate::Event,
+    ) -> BoxFuture<'_, Result<Option<crate::Event>>> {
+        let _ = event;
+        Box::pin(async { Ok(None) })
+    }
+
     /// `workspace.members.list` (multiplayer w3): the members of a workspace
     /// → `{ members: [{ principalId, login?, displayName?, avatarUrl?, role,
     /// addedAt }], guestCount, guestLimit }`, owners first. `guestCount` is
@@ -5276,6 +5858,22 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::workspace_members_add not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Owner-only direct guest role change. Owner and inherited host roles
+    /// are immutable here. Emits workspace:updated only when changed.
+    fn workspace_members_set_role(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+        role: crate::WorkspaceRole,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, principal_id, role);
+        Box::pin(async {
+            Err(Error::Internal(
+                "workspace_members_set_role not implemented".into(),
             ))
         })
     }
@@ -5358,8 +5956,8 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `presence.update({ focus: [{ workspaceId, agentId?, noteId? }],
-    /// typing?: { agentId } })`: replace the connection's focus set (sent
-    /// whole) and typing target → `{ ok: true, typingSource }`, where
+    /// typing?: { agentId } | null, discussionTyping?: { workspaceId } | null })`:
+    /// replace the connection's focus set (sent whole) and typing targets → `{ ok: true, typingSource }`, where
     /// `typingSource` is the connection's own opaque, daemon-minted typing
     /// source handle (the `source` its typing entry carries in
     /// `presence:changed`, so the client can suppress only itself). Every
@@ -5370,7 +5968,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// unchanged. Requires
     /// a hello'd connection; every focused workspace and the typing agent's
     /// workspace must be a member workspace (`NotFound` otherwise). Publishes
-    /// `presence:changed` to each workspace whose aggregate changed.
+    /// `presence:changed` to each workspace whose aggregate changed. Discussion
+    /// typing requires a human member in its target workspace, shares the
+    /// connection source with a separate counter, and clears when omitted or null.
     fn presence_update(
         &self,
         connection_id: String,
@@ -5389,7 +5989,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// with the same member rows the event carries — for a client that
     /// attached its event subscription after its hello (or a second
     /// connection of an already-online principal, whose hello publishes
-    /// nothing). Member+; a non-member sees `NotFound`.
+    /// nothing). Member+; a non-member sees `NotFound`. Human rows include
+    /// `discussionTyping: [{ source, since, pulse }]` (empty when idle);
+    /// agent/daemon snapshots omit that field.
     fn presence_snapshot(
         &self,
         workspace_id: WorkspaceId,
@@ -5663,6 +6265,75 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `executor.mint` (daemon-to-daemon remote agents, owner-only): params
+    /// `{ backendId, backendName, backendFingerprint? }` → `{ credentialId,
+    /// token, machine }`. The token is returned once and never logged.
+    fn executor_mint(&self, params: serde_json::Value) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::executor_mint not implemented".into(),
+            ))
+        })
+    }
+
+    /// `executor.list` (owner-only): `{ backends }`, the unrevoked
+    /// credentials with live status, never tokens.
+    fn executor_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::executor_list not implemented".into(),
+            ))
+        })
+    }
+
+    /// `executor.revoke` (owner-only): `{ ok: true }`; an already revoked id
+    /// is a no-op, an unknown id is `Error::NotFound`.
+    fn executor_revoke(&self, credential_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = credential_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::executor_revoke not implemented".into(),
+            ))
+        })
+    }
+
+    /// `remoteLinkTraffic.*` (owner-only capture of executor-link traffic):
+    /// `method` is the part after `remoteLinkTraffic.` (`start`, `stop`,
+    /// `snapshot`) and `params` the request's params object. Results and
+    /// errors as documented in monorepo `docs/protocol/methods/nodes.md`,
+    /// "Link traffic capture".
+    fn remote_link_traffic(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async move {
+            Err(Error::Internal(format!(
+                "WorkspaceApi::remote_link_traffic({method}) not implemented"
+            )))
+        })
+    }
+
+    /// `remoteMachines.*` (daemon-to-daemon remote agents, backend side,
+    /// owner-only): `method` is the part after `remoteMachines.`
+    /// (`backendInfo`, `add`, `list`, `remove`, `refresh`) and `params` the
+    /// request's params object. Results and errors as documented in monorepo
+    /// `docs/protocol/methods/nodes.md`; never returns the executor token.
+    fn remote_machines(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async move {
+            Err(Error::Internal(format!(
+                "WorkspaceApi::remote_machines({method}) not implemented"
+            )))
+        })
+    }
+
     /// `invite.inspect` (multiplayer w4, unauthenticated `/invite`
     /// endpoint): validate `(invite_id, secret, scope)` — the
     /// [`crate::InviteErrorKind`] refusals for an unknown / expired /
@@ -5804,6 +6475,44 @@ pub trait WorkspaceApi: Send + Sync {
     ) -> BoxFuture<'_, Result<Option<PrincipalId>>> {
         let _ = token_hash;
         Box::pin(async { Ok(None) })
+    }
+
+    /// Transport seam (daemon-to-daemon executor link): resolve a presented
+    /// `/node/*` bearer token, already hashed (hex SHA-256), to its **active**
+    /// executor credential, touching its last use. Only the `/node/*` gate
+    /// calls this; executor credentials are never looked up on `/ws`,
+    /// `/tunnel` or `/invite`. `None` for an unknown or revoked hash.
+    /// Default: no executor credentials exist.
+    fn resolve_executor_credential(
+        &self,
+        token_hash: String,
+    ) -> BoxFuture<'_, Result<Option<crate::machines::ExecutorCredential>>> {
+        let _ = token_hash;
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Transport seam (executor link): decide a backend's bind offer on this
+    /// machine (`node_id`) for one executor credential and, when accepted,
+    /// durably store it as that credential's binding before returning.
+    /// `NotFound` when the credential is unknown or revoked. Default: refuse.
+    fn bind_executor(
+        &self,
+        credential_id: crate::ids::ExecutorCredentialId,
+        node_id: String,
+        offered: crate::node_link::LeaseBinding,
+    ) -> BoxFuture<'_, Result<crate::node_link::BindDecision>> {
+        let _ = (credential_id, node_id, offered);
+        Box::pin(async { Err(Error::NotFound("executor credential".into())) })
+    }
+
+    /// Transport seam (executor link): a live feed of executor credentials
+    /// just revoked, so the listener closes their `/node/*` connections with
+    /// `1008`. A lagged or closed feed must fail closed. `None` when the
+    /// implementation has no executor store (test stubs).
+    fn subscribe_executor_revocations(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::ids::ExecutorCredentialId>> {
+        None
     }
 
     /// Transport seam: resolve a credential-bound principal's current host
@@ -6398,6 +7107,149 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `providers.profiles.list` (PROTOCOL §5.54): `{ profiles, revision }`,
+    /// optionally filtered by `baseProviderId`. Env values are masked.
+    /// Administrator-only.
+    fn provider_profiles_list(
+        &self,
+        base_provider_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = base_provider_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.create` (PROTOCOL §5.54): `params` carries
+    /// `baseProviderId`, `name` and optional `env` / `backup`; returns
+    /// `{ profile, revision }` and emits `providers:profiles-changed`.
+    fn provider_profiles_create(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_create not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.update` (PROTOCOL §5.54): optional `name`,
+    /// `backup` and complete `env` list; returns `{ profile, revision, activation }`.
+    fn provider_profiles_update(
+        &self,
+        profile_id: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (profile_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.delete` (PROTOCOL §5.54): `{ profileId, revision }`;
+    /// refused with `provider-profile-in-use` while saved settings select it.
+    fn provider_profiles_delete(
+        &self,
+        profile_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = profile_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.reorder` (PROTOCOL §5.54): `params` carries
+    /// `baseProviderId` and `profileIds` (every saved profile of that base,
+    /// once); returns `{ profiles, revision }` and emits
+    /// `providers:profiles-changed` (`change: "reordered"`).
+    fn provider_profiles_reorder(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_reorder not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.updateDefault` (PROTOCOL §5.54 "Default
+    /// configuration overrides"): `baseProviderId`, optional `name` and
+    /// `env`; returns `{ defaultConfig, revision, activation }` and emits
+    /// `providers:profiles-changed` (`change: "default-updated"`).
+    fn provider_profiles_update_default(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_update_default not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `host.providerAuthStatus` entries for Default configurations with
+    /// saved environment overrides (PROTOCOL §5.54): one
+    /// `{ id: baseProviderId, authenticated, identity? }` per such Default,
+    /// probed with its saved overlay; they replace the base sweep's rows.
+    /// `Some(id)` limits it to one base provider. Returns a JSON array
+    /// (empty when no Default has overrides).
+    fn provider_default_auth_status(
+        &self,
+        provider_id: Option<String>,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider_id, force);
+        Box::pin(async { Ok(serde_json::Value::Array(Vec::new())) })
+    }
+
+    /// `host.providerAuthStatus` entries for named profiles (PROTOCOL §5.54):
+    /// one `{ id: providerRef, authenticated, identity? }` per profile, probed
+    /// with that profile's saved environment. `Some(ref)` checks one profile
+    /// (a missing one fails with `provider-profile-replacement-required`);
+    /// `None` sweeps every saved profile (`includeProfiles: true`). Returns a
+    /// JSON array.
+    fn provider_profiles_auth_status(
+        &self,
+        provider_ref: Option<String>,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider_ref, force);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_auth_status not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `host.providerTestPrompt` for a named profile reference (PROTOCOL
+    /// §5.54): the live probe runs with that profile's saved environment and
+    /// promotes or demotes only its verdict. A missing profile fails with
+    /// `provider-profile-replacement-required`.
+    fn provider_profiles_test_prompt(
+        &self,
+        provider_ref: String,
+        model: Option<String>,
+        node_max_old_space_mb: Option<u32>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider_ref, model, node_max_old_space_mb);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_test_prompt not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `unsloth.status`: observe the daemon-managed singleton Unsloth server
     /// (monorepo#878) — `{ running: boolean, repoId?, port?, pid?, uptimeSecs?,
     /// phase?, cpuPercent?, memoryBytes?, attachedAgentCount? }`. `running:
@@ -6596,6 +7448,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `skill.list` with `agentId` → `{ skills, stale?, unavailable? }`,
+    /// name-sorted, before paging: a remote agent's machine skills
+    /// (agent-aux.md § Skills of a remote agent), else the workspace's.
+    /// `-32602` when the agent is not in `workspace_id`.
+    fn skill_list_for_agent(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::skill_list_for_agent not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `specialist.edit` → overwrite an existing user/project file; returns
     /// `{ specialist: SpecialistDef }`; missing file → `-32602` (PROTOCOL §5.11).
     fn specialist_edit(
@@ -6707,6 +7576,65 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::mcp_servers_toggle not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `plugin.list` → `{ plugins: PluginInfo[] }`: installed user-scope Agent
+    /// Plugins, valid or not, sorted by name.
+    fn plugin_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::plugin_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `plugin.install { source }` → `{ plugin }`: copy a local folder or clone a
+    /// git URL into the user plugins folder after validation.
+    fn plugin_install(&self, source: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = source;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::plugin_install not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `plugin.update { name }` → `{ plugin }`: re-fetch from the recorded source.
+    fn plugin_update(&self, name: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = name;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::plugin_update not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `plugin.uninstall { name, keepData? }` → `{ name, removed }`.
+    fn plugin_uninstall(
+        &self,
+        name: String,
+        keep_data: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (name, keep_data);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::plugin_uninstall not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `plugin.toggle { name, enabled }` → `{ plugin }`.
+    fn plugin_toggle(
+        &self,
+        name: String,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (name, enabled);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::plugin_toggle not implemented".to_string(),
             ))
         })
     }
@@ -7065,7 +7993,10 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `search.notes`: ranked full-text search across visible workspaces, with
     /// optional hard scope and soft preference. Always returns inline
-    /// `{ requestId, matches: NoteMatch[], indexed: true }` (PROTOCOL §5.15).
+    /// `{ requestId, matches: NoteMatch[], indexed: true, nextToken }`, one
+    /// page of at most `limit` hits (default 50, max 200) within 480,000
+    /// bytes; `nextToken` continues the ranked list (PROTOCOL §5.15).
+    #[expect(clippy::too_many_arguments)]
     fn search_notes(
         &self,
         query: String,
@@ -7074,6 +8005,7 @@ pub trait WorkspaceApi: Send + Sync {
         limit: Option<i64>,
         include_archived: bool,
         request_id: Option<String>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             query,
@@ -7082,6 +8014,7 @@ pub trait WorkspaceApi: Send + Sync {
             limit,
             include_archived,
             request_id,
+            next_token,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -7415,6 +8348,22 @@ pub trait WorkspaceApi: Send + Sync {
     /// `script.start`: spawn the script on the PTY host (service mode auto-
     /// restarts per policy); returns `{ ok, scriptId }` (PROTOCOL §5.8).
     /// Workspace-scoped.
+    /// `script.<method>` with `remoteAgentId` (`remoteScripts: 1`): that
+    /// remote agent's machine run of the script (`params` are the request's).
+    fn script_machine_run(
+        &self,
+        workspace_id: WorkspaceId,
+        method: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, params);
+        Box::pin(async move {
+            Err(Error::InvalidParams(format!(
+                "script.{method}: remoteAgentId is not supported"
+            )))
+        })
+    }
+
     fn script_start(
         &self,
         workspace_id: WorkspaceId,
@@ -7426,6 +8375,25 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::script_start not implemented".to_string(),
             ))
         })
+    }
+
+    /// Default-on completion wake for an agent-started run: after
+    /// `ws.script.start` / `ws.script.restart` by `agent_id` accepts run
+    /// `run_id`, register the same monitor `ws.script.monitor` would (owned by
+    /// the agent) so the agent is woken when a command-mode run finishes even
+    /// if it ends its turn without arming anything. Returns the
+    /// `script.monitor` reply (`{ ok, monitor }` or a refusal), or `null` when
+    /// the script is not command-mode (services keep running by design). The
+    /// default implementation arms nothing.
+    fn script_start_monitor(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        run_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, script_id, run_id);
+        Box::pin(async { Ok(serde_json::Value::Null) })
     }
 
     /// `script.stop`: stop a running script (cancels pending auto-restart);
@@ -7537,6 +8505,22 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::upsert_client not implemented".to_string(),
             ))
         })
+    }
+
+    /// `client.hello` follow-up (intent-hq/intent#8045): move the open
+    /// browser tabs still hosted by `superseded` — earlier ids of the same
+    /// device that a backend later prefixed into `client_id`, already limited
+    /// by the transport to ids the caller may act as — onto `client_id`,
+    /// skipping any superseded id with a live connection, and publish
+    /// `browser:tab-updated` per moved tab. Returns how many tabs moved. The
+    /// default moves nothing.
+    fn rehome_superseded_browser_tabs(
+        &self,
+        client_id: ClientId,
+        superseded: Vec<ClientId>,
+    ) -> BoxFuture<'_, Result<usize>> {
+        let _ = (client_id, superseded);
+        Box::pin(async { Ok(0) })
     }
 
     /// Anonymous-connection draft placeholder: ensure a `client` row exists for
@@ -8215,14 +9199,54 @@ pub trait WorkspaceApi: Send + Sync {
     /// `repositoryPath`, excluding self. Bare array of
     /// `{ id, title, branch, status, createdAt, updatedAt }` (`title` defaults
     /// to `"Untitled"`; `status` is the `PascalCase` `WorkspaceStatus`).
+    ///
+    /// Retired siblings are included only with `include_retired`.
     fn cross_workspace_list_siblings(
         &self,
         workspace_id: WorkspaceId,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = workspace_id;
+        let _ = (workspace_id, include_retired);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::cross_workspace_list_siblings not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.crossWorkspace.search` (agent binding only; no wire method): the
+    /// caller's sibling workspaces matching `search`, best first, as
+    /// `{ matches: [{ id, title, branch, status, archived, updatedAt,
+    /// matchedOn, pullRequests?, notes? }], truncated }`. Same sibling scope
+    /// and errors as [`Self::cross_workspace_list_siblings`].
+    fn cross_workspace_search(
+        &self,
+        workspace_id: WorkspaceId,
+        search: crate::CrossWorkspaceSearch,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, search);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::cross_workspace_search not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `ws.app.workspaces.search` (Assistant workspace only): the
+    /// [`Self::cross_workspace_search`] ranking over every workspace the
+    /// caller can see, across repositories (the Assistant workspace itself
+    /// excluded). `repository` narrows to one GitHub `owner/name`
+    /// (case-insensitive). Rows also carry `repository` / `repositoryPath`.
+    fn app_workspaces_search(
+        &self,
+        workspace_id: WorkspaceId,
+        search: crate::CrossWorkspaceSearch,
+        repository: Option<crate::RepoRef>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, search, repository);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::app_workspaces_search not implemented".to_string(),
             ))
         })
     }
@@ -8244,14 +9268,26 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `crossWorkspace.readNote`: one note in a sibling workspace as
     /// `{ id, title, content, numberedContent, sourceWorkspaceId,
-    /// sourceWorkspaceTitle, branch, lineCount }`.
+    /// sourceWorkspaceTitle, branch, lineCount }`. With a line `window`, or
+    /// with `bounded_default` set, the read is bounded to the window and the
+    /// [`crate::note_read_bounds::NOTE_READ_BUDGET_BYTES`] budget and a
+    /// partial page adds `startLine` / `endLine` / `truncated` /
+    /// `nextStartLine`; otherwise the whole note is served.
     fn cross_workspace_read_note(
         &self,
         workspace_id: WorkspaceId,
         target_workspace_id: WorkspaceId,
         note_id: NoteId,
+        window: crate::note_read_bounds::LineWindow,
+        bounded_default: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, target_workspace_id, note_id);
+        let _ = (
+            workspace_id,
+            target_workspace_id,
+            note_id,
+            window,
+            bounded_default,
+        );
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::cross_workspace_read_note not implemented".to_string(),
@@ -8303,6 +9339,103 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `ws.host.exec` from an agent or one of its hooks (PROTOCOL §5.56):
+    /// like [`WorkspaceApi::host_exec`], plus the agent-only `secretEnv`
+    /// option, resolved from `agent_id`'s own memory-held secrets and
+    /// redacted from the output. A missing secret fails before spawning with
+    /// `secret-unavailable`.
+    fn agent_host_exec(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = agent_id;
+        self.host_exec(workspace_id, params)
+    }
+
+    /// `ws.secret.request` (MCP-only, PROTOCOL §5.56): record a pending
+    /// secret request for the calling top-level agent. Returns
+    /// `{ requestId, agentId, name, reason, created }`; `created` is false
+    /// when a pending request for the same name was reused.
+    fn secret_request(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        name: String,
+        reason: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, name, reason);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "secret requests are not supported by this daemon".to_string(),
+            ))
+        })
+    }
+
+    /// `secret.list` / `ws.secret.list` (PROTOCOL §5.56): names only —
+    /// `{ secrets, pendingRequests, answeredRequests }` for one agent.
+    fn secret_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "secret requests are not supported by this daemon".to_string(),
+            ))
+        })
+    }
+
+    /// `secret.forget` / `ws.secret.forget` (PROTOCOL §5.56): drop one of an
+    /// agent's held secrets → `{ ok, forgotten }`.
+    fn secret_forget(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, name);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "secret requests are not supported by this daemon".to_string(),
+            ))
+        })
+    }
+
+    /// `secret.provide` (PROTOCOL §5.56): answer a pending request with its
+    /// value, held in memory for the requesting agent only, and deliver the
+    /// provided notice. The value is never logged, echoed or persisted.
+    fn secret_provide(
+        &self,
+        workspace_id: WorkspaceId,
+        request_id: String,
+        value: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, request_id, value);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "secret requests are not supported by this daemon".to_string(),
+            ))
+        })
+    }
+
+    /// `secret.dismiss` (PROTOCOL §5.56): decline a pending request and
+    /// deliver the declined notice.
+    fn secret_dismiss(
+        &self,
+        workspace_id: WorkspaceId,
+        request_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, request_id);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "secret requests are not supported by this daemon".to_string(),
+            ))
+        })
+    }
+
     /// `ws.hook.schedule` / wire `hook.schedule`: register a background hook
     /// (an agent-owned scheduled script) after one immediate real run.
     /// `params` carries `{ name, code }` plus exactly one schedule kind —
@@ -8337,6 +9470,22 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::hook_list not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Wire `hook.list`: one page of [`Self::hook_list`]'s workspace rows.
+    /// `params` carries `includeRetired?`, `limit?` (1–200, default 100) and
+    /// `cursor?`; the reply is `{ hooks, nextCursor? }`.
+    fn hook_list_page(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, params);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::hook_list_page not implemented".to_string(),
             ))
         })
     }
@@ -8390,6 +9539,52 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::hook_run_now not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Planned addressed observation seam. No binding dispatches here until
+    /// reviewMonitoring capability version 1 is implemented. Original private
+    /// request admission must be captured synchronously before the first await.
+    /// Defaults refuse; they must never reinterpret a target as legacy GitHub.
+    fn pr_state_addressed(
+        &self,
+        _workspace_id: WorkspaceId,
+        _request: crate::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "Addressed review monitoring unavailable".into(),
+            ))
+        })
+    }
+
+    /// Planned agent-owned registration seam, sharing the existing registry,
+    /// caller ownership, limits and adoption rules across both aliases.
+    fn pr_monitor_start_addressed(
+        &self,
+        _workspace_id: WorkspaceId,
+        _agent_id: AgentId,
+        _request: crate::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "Addressed review monitoring unavailable".into(),
+            ))
+        })
+    }
+
+    /// Planned addressed cancellation of the original caller's own monitor.
+    /// No provider read is needed to cancel; never cancel by a colliding number.
+    fn pr_monitor_stop_addressed(
+        &self,
+        _workspace_id: WorkspaceId,
+        _agent_id: AgentId,
+        _request: crate::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "Addressed review monitoring unavailable".into(),
             ))
         })
     }
@@ -8590,8 +9785,9 @@ pub trait ContextEngine: Send + Sync {
 ///   [`ReverseDispatchError::ClientOffline`] (with `pinned` set for `Pinned`).
 ///   `Client` is what tab-host routing uses, `Pinned` what the per-workspace
 ///   browser-client pin uses — same lookup, distinct error wording.
-/// - [`Default`](Self::Default): the **first-connected** eligible connection;
-///   none ⇒ [`ReverseDispatchError::NoClient`].
+/// - [`Default`](Self::Default): the **first-connected** eligible client,
+///   via its **newest** eligible connection (the same per-client rule as
+///   `Client` / `Pinned`); none ⇒ [`ReverseDispatchError::NoClient`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReverseTarget {
     /// A specific logical client (e.g. the host of a browser tab).
@@ -8710,6 +9906,84 @@ pub struct ReverseLiveClient {
     pub connected_at: String,
 }
 
+/// One live hello'd connection in a [`ReverseConnectionSnapshot`].
+/// `connection_id` is the registry's arrival sequence (the number a
+/// `browser.exec` timeout error names); `transport` is the wire spelling
+/// (`"uds"` / `"wss"`); `can_host_browser` is whether a `browser.exec` of
+/// the snapshot's workspace may be routed to it (`browserExec` advertised,
+/// browser-hosting authority, and administrator-only for Chief) — the same
+/// predicate `dispatch` selects on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReverseConnectionInfo {
+    pub connection_id: u64,
+    pub transport: String,
+    pub connected_at: String,
+    pub can_host_browser: bool,
+}
+
+/// One logical client in a [`ReverseConnectionSnapshot`]: its live hello'd
+/// connections, oldest first. `name` comes from the newest hello (as for
+/// [`ReverseLiveClient`]); `can_host_browser` is true when any connection
+/// can.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReverseClientConnections {
+    pub client_id: ClientId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub can_host_browser: bool,
+    pub connections: Vec<ReverseConnectionInfo>,
+}
+
+/// Where one [`ReverseTarget`] would be delivered right now. On success
+/// `connection_id` names the receiving connection and `name` is the
+/// client's listed (newest-hello) name; otherwise `connection_id` is `None`
+/// and `error` carries the [`ReverseDispatchError`] text (`client_id` /
+/// `name` still name a pinned or tab-host client that is offline; the
+/// service layer rewords it as `browser.exec` would).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReverseRoute {
+    pub client_id: Option<ClientId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub connection_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ReverseRoute {
+    /// The route of a target that resolved to no connection.
+    #[must_use]
+    pub fn failed(error: &ReverseDispatchError) -> Self {
+        let (client_id, name) = match error {
+            ReverseDispatchError::ClientOffline {
+                client_id, name, ..
+            } => (Some(client_id.clone()), name.clone()),
+            _ => (None, None),
+        };
+        Self {
+            client_id,
+            name,
+            connection_id: None,
+            error: Some(error.to_string()),
+        }
+    }
+}
+
+/// Read-only view of the live connections behind each client plus the
+/// route of each requested target, taken under one registry lock so the
+/// two agree ([`AgentReverseDispatch::connection_snapshot`], the source of
+/// `ws.browser.clients()`). Clients are in first-connection order; `routes`
+/// follows the order of the requested targets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReverseConnectionSnapshot {
+    pub clients: Vec<ReverseClientConnections>,
+    pub routes: Vec<ReverseRoute>,
+}
+
 /// Agent-initiated daemon→client reverse-RPC seam (REV-1/REV-2, PROTOCOL
 /// §5.14/§12.4).
 ///
@@ -8727,6 +10001,51 @@ pub struct ReverseLiveClient {
 /// delivered. `is_connected` is a cheap synchronous probe that lets the
 /// service surface a friendlier error before it composes the forward params.
 pub trait AgentReverseDispatch: Send + Sync {
+    /// Eligible authenticated desktop connections for an unassigned workspace.
+    /// Each candidate remains bound to its execution incarnation.
+    fn desktop_candidates(
+        &self,
+        principal: &crate::PrincipalId,
+    ) -> Vec<crate::desktop::DesktopConnection> {
+        self.desktop_resolve(&ReverseTarget::Default, principal)
+            .into_iter()
+            .collect()
+    }
+    /// Changes to admitted execution connections; consumers re-resolve authority.
+    fn desktop_changes(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
+
+    /// Resolve the browser primary first, then require desktop capability and
+    /// the exact authenticated principal. Never fall back to another device.
+    ///
+    /// # Errors
+    /// Returns offline, unsupported or forbidden for an ineligible primary.
+    fn desktop_resolve(
+        &self,
+        _target: &ReverseTarget,
+        _principal: &crate::PrincipalId,
+    ) -> crate::desktop::DesktopResult<crate::desktop::DesktopConnection> {
+        Err(crate::desktop::DesktopError::new(
+            "desktop-unsupported",
+            "Desktop control is unavailable",
+        ))
+    }
+
+    /// Dispatch only to this exact incarnation; reconnect never replays work.
+    fn desktop_dispatch(
+        &self,
+        _connection: crate::desktop::DesktopConnection,
+        _params: serde_json::Value,
+    ) -> BoxFuture<'_, crate::desktop::DesktopResult<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::desktop::DesktopError::new(
+                "desktop-offline",
+                "Desktop connection is unavailable",
+            ))
+        })
+    }
+
     /// Whether at least one eligible client is currently connected (i.e. a
     /// [`ReverseTarget::Default`] dispatch would find a target).
     fn is_connected(&self) -> bool;
@@ -8759,6 +10078,45 @@ pub trait AgentReverseDispatch: Send + Sync {
     /// projection). The default reports no clients.
     fn live_clients(&self) -> Vec<ReverseLiveClient> {
         Vec::new()
+    }
+
+    /// Whether `client_id` is live or about to be: a hello'd connection, or a
+    /// `client.hello` in flight that has not bound yet. The superseded-id tab
+    /// rehome (intent-hq/intent#8045) never moves such a host. The default
+    /// consults [`Self::live_clients`] only.
+    fn client_active(&self, client_id: &ClientId) -> bool {
+        self.live_clients()
+            .iter()
+            .any(|client| &client.client_id == client_id)
+    }
+
+    /// Every live hello'd connection grouped by client, plus where each of
+    /// `targets` would be delivered for a `browser.exec` scoped to
+    /// `workspace_id` (Chief selects administrator connections only, as in
+    /// `dispatch`). Read-only: nothing is sent to any client. The default
+    /// lists no clients and reports each target through [`Self::resolve`]
+    /// (no connection id).
+    fn connection_snapshot(
+        &self,
+        workspace_id: &crate::ids::WorkspaceId,
+        targets: &[ReverseTarget],
+    ) -> ReverseConnectionSnapshot {
+        let _ = workspace_id;
+        ReverseConnectionSnapshot {
+            clients: Vec::new(),
+            routes: targets
+                .iter()
+                .map(|target| match self.resolve(target) {
+                    Ok(resolved) => ReverseRoute {
+                        client_id: Some(resolved.client_id),
+                        name: resolved.name,
+                        connection_id: None,
+                        error: None,
+                    },
+                    Err(error) => ReverseRoute::failed(&error),
+                })
+                .collect(),
+        }
     }
 
     /// All hello'd devices, including guests that cannot host a browser.

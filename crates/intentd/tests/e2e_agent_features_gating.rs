@@ -18,10 +18,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,14 +61,13 @@ const FEATURE_PATHS: [(&str, bool); 12] = [
 ];
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             if !log.is_empty() {
@@ -92,7 +92,7 @@ fn received_prompts(path: &Path) -> Vec<String> {
         .collect()
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -107,7 +107,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -207,11 +207,14 @@ async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
         .await
         .expect("send");
     loop {
-        let msg = timeout(Duration::from_secs(10), ws.next())
-            .await
-            .expect("ws rpc timeout")
-            .expect("ws closed")
-            .expect("ws error");
+        let msg = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            ws.next(),
+        )
+        .await
+        .expect("ws rpc timeout")
+        .expect("ws closed")
+        .expect("ws error");
         if let Message::Text(text) = msg {
             let v: Value = serde_json::from_str(&text).expect("invalid json");
             if v["id"] == id {
@@ -223,9 +226,12 @@ async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
 
 async fn wss_event(ws: &mut Ws, secs: u64) -> Value {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -291,7 +297,7 @@ fn mcp_config_files(data_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Extract the bridge `--connect <addr>` from a generated MCP config file.
-fn bridge_addr_from_config(path: &Path) -> String {
+fn bridge_addr_from_config(path: &Path) -> (String, String) {
     let cfg: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("read mcp config"))
         .expect("parse mcp config");
     let args = cfg["mcpServers"]["workspace-mcp"]["args"]
@@ -301,7 +307,14 @@ fn bridge_addr_from_config(path: &Path) -> String {
         .iter()
         .position(|a| a == "--connect")
         .expect("--connect flag in bridge args");
-    args[idx + 1].as_str().expect("bridge addr").to_string()
+    let token = cfg["mcpServers"]["workspace-mcp"]["env"]["INTENTD_MCP_BRIDGE_TOKEN"]
+        .as_str()
+        .expect("bridge secret in workspace-mcp env")
+        .to_string();
+    (
+        args[idx + 1].as_str().expect("bridge addr").to_string(),
+        token,
+    )
 }
 
 struct BridgeClient {
@@ -311,11 +324,20 @@ struct BridgeClient {
 }
 
 impl BridgeClient {
-    async fn connect(addr: &str) -> Self {
-        let stream = timeout(Duration::from_secs(10), TcpStream::connect(addr))
-            .await
-            .expect("bridge connect timeout")
-            .expect("bridge connect");
+    async fn connect((addr, token): &(String, String)) -> Self {
+        let mut stream = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            TcpStream::connect(addr),
+        )
+        .await
+        .expect("bridge connect timeout")
+        .expect("bridge connect");
+        tokio::io::AsyncWriteExt::write_all(
+            &mut stream,
+            format!("intentd-mcp-bridge-auth {token}\n").as_bytes(),
+        )
+        .await
+        .expect("bridge auth");
         let (r, w) = stream.into_split();
         let mut c = BridgeClient {
             reader: BufReader::new(r),
@@ -341,10 +363,13 @@ impl BridgeClient {
         let mut buf = String::new();
         loop {
             buf.clear();
-            let n = timeout(Duration::from_secs(30), self.reader.read_line(&mut buf))
-                .await
-                .expect("bridge read timeout")
-                .expect("bridge read");
+            let n = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(30)),
+                self.reader.read_line(&mut buf),
+            )
+            .await
+            .expect("bridge read timeout")
+            .expect("bridge read");
             assert!(n > 0, "bridge closed while waiting for response");
             let v: Value = match serde_json::from_str(buf.trim()) {
                 Ok(v) => v,
@@ -1410,16 +1435,19 @@ async fn peer_agents_default_creation_retirement_and_opt_out_over_wss() {
     assert_eq!(retired["retired"], true);
     assert_eq!(retired["agentId"], peer_id);
     assert!(retired["retiredAt"].is_string());
-    let retired_event = timeout(Duration::from_secs(30), async {
-        loop {
-            let frame = wss_event(&mut sub, 30).await;
-            let event = &frame["params"]["event"];
-            if event["type"] == "agent:retired" && event["data"]["agentId"] == peer_id {
-                assert_eq!(frame["jsonrpc"], "2.0");
-                return event.clone();
+    let retired_event = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let frame = wss_event(&mut sub, 30).await;
+                let event = &frame["params"]["event"];
+                if event["type"] == "agent:retired" && event["data"]["agentId"] == peer_id {
+                    assert_eq!(frame["jsonrpc"], "2.0");
+                    return event.clone();
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("peer retirement event");
     assert_eq!(retired_event["data"]["agentName"], "PeerAgent");

@@ -54,3 +54,19 @@ export function assertNoUnexpectedStreamErrors(record) {
     'Inconsistent stream-error summary');
   assert.equal(summary.unexpected, 0, 'Unexpected MCP stream error');
 }
+
+// Keep the Windows tree-kill outcome separate from descendant witness checks.
+export async function assertWindowsTaskkillComplete(killed, child, waitForClose) {
+  assert.ifError(killed.error);
+  assert.ok(!killed.signal, `taskkill interrupted: ${killed.signal}`);
+  if (killed.status === 128) {
+    // The process can exit while spawnSync blocks delivery of Node's close
+    // event. A missing PID alone is insufficient: observe this child's close
+    // under the caller's deadline before accepting the race. Descendant
+    // witnesses are still checked independently by the caller.
+    await waitForClose();
+    assert.ok(child.exitCode !== null || child.signalCode !== null, 'adapter exit not observed');
+    return;
+  }
+  assert.equal(killed.status, 0, `taskkill: ${killed.stderr}`);
+}

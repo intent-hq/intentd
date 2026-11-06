@@ -3,7 +3,7 @@
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-mod common;
+use crate::common;
 
 use std::fmt::Write;
 use std::fs;
@@ -123,6 +123,7 @@ impl Fixture {
         fs::copy(&runtime, bin.join("codex")).unwrap();
         #[cfg(target_os = "macos")]
         executable(&bin.join("codex"), &format!(
+            // cli-fixture-version: allow — doctor reports this exact measured version
             "#!/bin/sh\n[ \"$1\" = --version ] || exit 91\nprintf '%s\\n' '{{\"role\":\"raw\",\"version\":true}}' >> '{}'\nprintf 'codex-cli 0.333.4\\n'\n",
             root.path().join("events.jsonl").display()
         ));
@@ -260,12 +261,17 @@ impl Fixture {
         (status.success(), stdout)
     }
 
+    #[track_caller]
     fn doctor_command(&self, live: bool) -> Command {
         // Check production discovery before any adapter could execute. If a host
         // install outranks a fixture, fail rather than touching that installation.
         let mut preflight = self.command(&std::env::current_exe().unwrap());
         preflight
-            .args(["--exact", "fixture_launch_is_selected", "--nocapture"])
+            .args([
+                "--exact",
+                &common::exact_test_name(module_path!(), "fixture_launch_is_selected"),
+                "--nocapture",
+            ])
             .env(SELECTION, self.selection);
         assert!(
             self.run_command(preflight).0,
@@ -279,6 +285,7 @@ impl Fixture {
         command
     }
 
+    #[track_caller]
     fn run(&self, live: bool) -> String {
         let (success, stdout) = self.run_command(self.doctor_command(live));
         assert!(
@@ -298,6 +305,7 @@ impl Fixture {
             .collect()
     }
 
+    #[track_caller]
     fn assert_version_only(&self) {
         let events = self.events();
         assert!(!events.is_empty(), "installed CLI version must be measured");
@@ -398,6 +406,7 @@ fn ordinary_warning_fixture() -> Fixture {
     fixture
 }
 
+#[track_caller]
 fn assert_ordinary_warning(stderr: &str) {
     assert!(stderr.contains("WARN"));
     assert!(stderr.contains("must be absolute and executable"));
@@ -564,6 +573,7 @@ fn live_ignores_runtime_override_and_uses_the_installed_cli() {
     let selected = fixture.root.path().join("override/bin/codex.js");
     executable(
         &selected,
+        // cli-fixture-version: allow — doctor must not report the unselected runtime version
         "#!/usr/bin/env node\nconsole.log('codex-cli 0.444.5');\n",
     );
     fs::write(

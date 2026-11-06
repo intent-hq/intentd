@@ -1,8 +1,9 @@
 //! Egress registry + contract test for
 //! [`intent_core::model::AGENT_HIDDEN_FIELDS`].
 //!
-//! [`EGRESS_REGISTRY`] enumerates every agent-facing egress that carries
-//! session / event data — one `(name, producer)` entry per surface — and
+//! [`crate::egress_registry::AGENT_EGRESS_CALLS`] enumerates every
+//! agent-facing egress that carries session / event data (shared with the
+//! secret-value egress contract in intent-services), and
 //! [`no_agent_hidden_field_survives_any_egress`] drives each producer through
 //! the REAL production code path (the `workspace_api` MCP tool → JS engine →
 //! `bindings::try_dispatch`, or the services wake-metadata builder) against a
@@ -14,23 +15,22 @@
 //! The fixture is key-agnostic: the injected keys are read from
 //! `AGENT_HIDDEN_FIELDS` at runtime, so adding a key to the const needs no
 //! edit here. Adding a NEW agent-facing egress that serves session or event
-//! data DOES: append a registry entry (and stub whatever trait method it
-//! reads, poisoned via [`poison`] / [`poison_typed`]).
+//! data DOES: append an `AGENT_EGRESS_CALLS` entry (and stub whatever trait
+//! method it reads, poisoned via [`poison`] / [`poison_typed`]).
 
 #![cfg(test)]
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use intent_core::model::AGENT_HIDDEN_FIELDS;
 use intent_core::{
     ActorType, AgentActivity, AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error,
-    Event, EventActor, EventQueryParams, Result, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceEventSummary, WorkspaceId, WorkspaceStatus,
+    Event, EventActor, EventQueryParams, Result, Workspace, WorkspaceApi, WorkspaceEventSummary,
+    WorkspaceId,
 };
 use serde_json::{json, Map, Value};
 
+use crate::egress_registry::{EgressIds, EgressServer, AGENT_EGRESS_CALLS};
 use crate::WorkspaceMcpServer;
 
 /// Marker value injected under every hidden key; the assertion looks for the
@@ -135,8 +135,19 @@ const TARGET: &str = "a-2";
 
 fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
     poison_typed(AgentLite {
+        digest_truncated: false,
+        last_agent_response_truncated: false,
+        last_user_message_truncated: false,
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
         harness_features: None,
+        node_id: None,
+        lease_id: None,
+        node_name: None,
+        placement: None,
+        effective_isolation: None,
+        placement_error: None,
+        submodules: None,
+        setup: None,
         id: AgentId::from(id),
         workspace_id: ws.clone(),
         parent_agent_id: None,
@@ -179,9 +190,14 @@ fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
         stop_reason_timestamp: None,
         session_corrupted: false,
         pending_delete_at: None,
+        using_earlier_profile_settings: false,
+        provider_replacement_required: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
         metadata: AgentMetadata {
+            attention_request_reason_truncated: false,
+            completion_report_truncated: false,
             is_background: false,
             specialist: None,
             created_by_agent_id: None,
@@ -199,6 +215,7 @@ fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
             pending_questions_message_id: None,
             pending_proposals: Vec::new(),
             proposal_resolutions: Map::new(),
+            proposal_created_workspaces: serde_json::Map::new(),
             last_seen_message_id: None,
             is_initial_agent: None,
             sponsor_agent_id: None,
@@ -212,49 +229,9 @@ fn stub_workspace(id: &str) -> Workspace {
         id: WorkspaceId::from_string(id),
         title: format!("Workspace {id}"),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        pull_requests_total: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -380,7 +357,10 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn list_workspaces(&self, _include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+    fn list_workspaces(
+        &self,
+        _filter: intent_core::WorkspaceListFilter,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         Box::pin(async move { Ok(vec![stub_workspace(WS)]) })
     }
 
@@ -424,6 +404,7 @@ impl WorkspaceApi for FakeApi {
         _agent_id: Option<AgentId>,
         _task_note_id: Option<intent_core::NoteId>,
         _stale_responding_after_ms: Option<i64>,
+        _row_limit: Option<i64>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let agents: Vec<Value> = [CALLER, TARGET]
@@ -483,6 +464,7 @@ impl WorkspaceApi for FakeApi {
         message_id: String,
         block_id: String,
         _workspace_id: Option<WorkspaceId>,
+        _page: intent_core::MessageBlockPage,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let mut block = json!({ "id": block_id, "type": "text", "text": "full body" });
@@ -622,145 +604,32 @@ impl Harness {
     }
 }
 
-type Producer = for<'a> fn(&'a Harness) -> Pin<Box<dyn Future<Output = Value> + 'a>>;
+/// The registered egresses from
+/// [`crate::egress_registry::AGENT_EGRESS_CALLS`]: each `workspace_api` call
+/// read as `a-1` against target `a-2`, and the wake-metadata builder.
+const IDS: EgressIds<'static> = EgressIds {
+    target: TARGET,
+    workspace: WS,
+    message: "m-1",
+    block: "b-1",
+};
 
-/// Every agent-facing egress that serves session or event data. A new such
-/// egress MUST be appended here (see the module docs).
-const EGRESS_REGISTRY: &[(&str, Producer)] = &[
-    ("ws.agent.status", |h| {
-        Box::pin(Harness::mcp(
-            &h.srv,
-            "ws.agent.status",
-            "return await ws.agent.status('a-2');",
-        ))
-    }),
-    ("ws.agent.list", |h| {
-        Box::pin(Harness::mcp(
-            &h.srv,
-            "ws.agent.list",
-            "return await ws.agent.list();",
-        ))
-    }),
-    ("ws.agent.getQueue", |h| {
-        Box::pin(Harness::mcp(
-            &h.srv,
-            "ws.agent.getQueue",
-            "return await ws.agent.getQueue('a-2');",
-        ))
-    }),
-    ("ws.agent.diagnostics", |h| {
-        Box::pin(Harness::mcp(
-            &h.srv,
-            "ws.agent.diagnostics",
-            "return await ws.agent.diagnostics();",
-        ))
-    }),
-    ("ws.agent.snapshot", |h| {
-        Box::pin(Harness::mcp(
-            &h.srv,
-            "ws.agent.snapshot",
-            "return await ws.agent.snapshot();",
-        ))
-    }),
-    ("ws.agent.readConversation", |h| {
-        Box::pin(Harness::mcp(
-            &h.srv,
-            "ws.agent.readConversation",
-            "return await ws.agent.readConversation('a-2', { lastN: 10 });",
-        ))
-    }),
-    ("ws.agent.summary", |h| {
-        Box::pin(Harness::mcp(
-            &h.srv,
-            "ws.agent.summary",
-            "return await ws.agent.summary('a-2');",
-        ))
-    }),
-    ("ws.event.query", |h| {
-        Box::pin(Harness::mcp(
-            &h.srv,
-            "ws.event.query",
-            "return await ws.event.query({ eventType: 'agent:*' });",
-        ))
-    }),
-    ("ws.event.query (paginated)", |h| {
-        Box::pin(Harness::mcp(
-            &h.srv,
-            "ws.event.query (paginated)",
-            "return await ws.event.query({ eventType: 'agent:*', paginate: true });",
-        ))
-    }),
-    ("ws.event.agentActivity (agentId)", |h| {
-        Box::pin(Harness::mcp(
-            &h.srv,
-            "ws.event.agentActivity (agentId)",
-            "return await ws.event.agentActivity('a-2');",
-        ))
-    }),
-    ("ws.event.agentActivity (workspace)", |h| {
-        Box::pin(Harness::mcp(
-            &h.srv,
-            "ws.event.agentActivity (workspace)",
-            "return await ws.event.agentActivity();",
-        ))
-    }),
-    ("ws.event.workspaceSummary", |h| {
-        Box::pin(Harness::mcp(
-            &h.srv,
-            "ws.event.workspaceSummary",
-            "return await ws.event.workspaceSummary();",
-        ))
-    }),
-    ("wake metadata (build_event_notification_metadata)", |_h| {
-        Box::pin(async {
-            let events = typed_events();
-            let refs: Vec<&Event> = events.iter().collect();
-            intent_services::build_event_notification_metadata(&refs)
-        })
-    }),
-    ("ws.app.agents.list", |h| {
-        Box::pin(Harness::mcp(
-            &h.chief,
-            "ws.app.agents.list",
-            "return await ws.app.agents.list();",
-        ))
-    }),
-    ("ws.app.agents.readConversation", |h| {
-        Box::pin(Harness::mcp(
-            &h.chief,
-            "ws.app.agents.readConversation",
-            "return await ws.app.agents.readConversation('amber-forest', 'a-2', { lastN: 10 });",
-        ))
-    }),
-    ("ws.app.chats.list", |h| {
-        Box::pin(Harness::mcp(
-            &h.chief,
-            "ws.app.chats.list",
-            "return await ws.app.chats.list();",
-        ))
-    }),
-    ("ws.app.chats.readConversation", |h| {
-        Box::pin(Harness::mcp(
-            &h.chief,
-            "ws.app.chats.readConversation",
-            "return await ws.app.chats.readConversation('a-2', { lastN: 10 });",
-        ))
-    }),
-    ("ws.app.chats.getMessageBlock", |h| {
-        Box::pin(Harness::mcp(
-            &h.chief,
-            "ws.app.chats.getMessageBlock",
-            "return await ws.app.chats.getMessageBlock('a-2', 'm-1', 'b-1');",
-        ))
-    }),
-    ("ws.app.chats.rename", |h| {
-        Box::pin(Harness::mcp(
-            &h.chief,
-            "ws.app.chats.rename",
-            "return await ws.app.chats.rename('a-2', 'Renamed chat');",
-        ))
-    }),
-];
+async fn run_registry(h: &Harness) -> Vec<(String, Value)> {
+    let mut outputs = Vec::new();
+    for call in AGENT_EGRESS_CALLS {
+        let out = match call.server {
+            EgressServer::Workspace => Harness::mcp(&h.srv, call.name, &call.render(&IDS)).await,
+            EgressServer::Chief => Harness::mcp(&h.chief, call.name, &call.render(&IDS)).await,
+            EgressServer::WakeMetadata => {
+                let events = typed_events();
+                let refs: Vec<&Event> = events.iter().collect();
+                intent_services::build_event_notification_metadata(&refs)
+            }
+        };
+        outputs.push((call.name.to_string(), out));
+    }
+    outputs
+}
 
 /// The contract: no `AGENT_HIDDEN_FIELDS` key survives on any registered
 /// egress. Every producer runs (failures are collected, not short-circuited)
@@ -773,8 +642,7 @@ async fn no_agent_hidden_field_survives_any_egress() {
     );
     let h = Harness::new();
     let mut leaks: Vec<String> = Vec::new();
-    for (name, producer) in EGRESS_REGISTRY {
-        let out = producer(&h).await;
+    for (name, out) in run_registry(&h).await {
         assert!(
             !out.is_null(),
             "{name}: egress produced null — the fixture did not reach it"

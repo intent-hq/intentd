@@ -13,7 +13,7 @@ use intent_core::{
 };
 use serde_json::{json, Value};
 
-use crate::mcp_server::bindings::{map_err, opt_bool, opt_str, opt_vec_str};
+use crate::mcp_server::bindings::{map_err, opt_bool, opt_str, opt_strict_bool, opt_vec_str};
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
@@ -21,6 +21,10 @@ pub(crate) const PRELUDE: &str = r"
     ws.app.workspaces = {
         list: (options) => host({ method: 'app.workspaces.list', args: options || {} }),
         get: (id) => host({ method: 'app.workspaces.get', args: { id } }),
+        search: (options) => host({
+            method: 'app.workspaces.search',
+            args: typeof options === 'string' ? { query: options } : (options || {}),
+        }),
         transfer: (id, options) => {
             if (options !== undefined && (options === null || typeof options !== 'object' || Array.isArray(options))) throw new Error('transfer options must be an object');
             return host({ method: 'app.workspaces.transfer', args: { ...(options || {}), id } });
@@ -50,6 +54,7 @@ pub(crate) async fn dispatch(
     match method {
         "list" => list(api, args).await,
         "get" => get(api, args).await,
+        "search" => search(api, workspace_id, args).await,
         "transfer" => transfer(api, args).await,
         "create" => create(api, args).await,
         "archive" => archive(api, args).await,
@@ -86,9 +91,20 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
     let include_deleted = filter_obj
         .and_then(|f| opt_bool(f, "includeDeleted"))
         .unwrap_or(false);
+    // Retired workspaces are opt-in only (PROTOCOL §5.1): listed only with
+    // an explicit `filter.includeRetired: true`, never via a status filter
+    // alone.
+    let include_retired = match filter_obj {
+        Some(f) => opt_strict_bool(f, "includeRetired")?,
+        None => None,
+    }
+    .unwrap_or(false);
 
     // Fetch all workspaces (include archived so we can apply status filter)
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::new(true, include_retired))
+        .await
+        .map_err(map_err)?;
 
     // Filter and summarize
     let mut results = Vec::new();
@@ -289,6 +305,47 @@ async fn transfer(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, St
 /// identity, so forge-slug casing (`Intent-HQ` vs `intent-hq`) never excludes a
 /// match. A half that is not filtered on is taken from the workspace row so the
 /// comparison stays a plain `RepoRef` equality.
+/// `ws.app.workspaces.search({ query?, pr?, repository?, includeRetired?,
+/// limit? })` (a bare string is shorthand for `{ query }`): the
+/// `ws.crossWorkspace.search` ranking over every visible workspace in any
+/// repository. `repository` (`"owner/name"`) narrows to one GitHub
+/// repository. Each row gains `link` / `markdownLink`.
+async fn search(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let search = crate::mcp_server::bindings::cross_workspace::parse_search(args)?;
+    let repository = parse_repository(args)?;
+    let mut result = api
+        .app_workspaces_search(workspace_id.clone(), search, repository)
+        .await
+        .map_err(map_err)?;
+    if let Some(rows) = result.get_mut("matches").and_then(Value::as_array_mut) {
+        rows.iter_mut()
+            .for_each(crate::mcp_server::bindings::insert_workspace_links);
+    }
+    Ok(result)
+}
+
+/// `repository: "owner/name"` (surrounding whitespace and a `.git` suffix
+/// tolerated).
+fn parse_repository(args: &Value) -> Result<Option<RepoRef>, String> {
+    let raw = match args.get("repository") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => s.trim(),
+        Some(_) => return Err("repository must be an \"owner/name\" string".to_string()),
+    };
+    let parsed = raw.split_once('/').and_then(|(owner, name)| {
+        let name = name.strip_suffix(".git").unwrap_or(name);
+        let valid = |part: &str| !part.is_empty() && !part.contains(['/', ' ', '#']);
+        (valid(owner) && valid(name)).then(|| RepoRef::new(owner, name))
+    });
+    parsed
+        .map(Some)
+        .ok_or_else(|| format!("repository `{raw}` must be \"owner/name\""))
+}
+
 fn repo_filter_matches(ws: &Workspace, owner: Option<&str>, name: Option<&str>) -> bool {
     match (owner, name) {
         (None, None) => true,
@@ -760,7 +817,10 @@ async fn lookup_known_repo_local_path(
     github_url: &str,
 ) -> Option<String> {
     let wanted = GitRemoteUrl::parse(github_url)?.github_repo()?;
-    let workspaces = api.list_workspaces(true).await.ok()?;
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .ok()?;
 
     let mut strict = Vec::new();
     let mut name_only = Vec::new();
@@ -961,8 +1021,12 @@ async fn create(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
         preview.insert("warnings".to_string(), json!(warnings));
     }
 
+    // A per-card identity (as for workspace-transfer): without it the card is
+    // keyed by its title, so a later card with the same title or content
+    // inherited an earlier card's pending/resolution and local apply state.
     let proposal = json!({
         "kind": "workspace-create",
+        "applyToolCallId": format!("workspace-create-{}", uuid::Uuid::new_v4()),
         "payload": {
             "operation": "workspace.create",
             "params": payload_params
@@ -981,8 +1045,11 @@ async fn archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
 
     assert_mutable_workspace_id(id)?;
 
-    // Validate workspace exists
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    // Validate workspace exists (id validation, not a listing: retired ids stay deletable)
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::ALL)
+        .await
+        .map_err(map_err)?;
     let workspace = workspaces
         .iter()
         .find(|w| w.id.as_str() == id)
@@ -995,8 +1062,12 @@ async fn archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
         .or(workspace.repository_path.as_deref())
         .map_or_else(|| format!("{:?}", workspace.status), String::from);
 
+    // A per-card identity (as for workspace-create): without it the card is
+    // keyed by its title, so a later card with the same title inherited an
+    // earlier card's pending/resolution and applied state (intent-hq/intent#8560).
     let proposal = json!({
         "kind": "bulk-op",
+        "applyToolCallId": format!("bulk-op-{}", uuid::Uuid::new_v4()),
         "payload": {
             "operation": "workspace.bulkArchive",
             "ids": [id]
@@ -1026,8 +1097,11 @@ async fn delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
 
     assert_mutable_workspace_id(id)?;
 
-    // Validate workspace exists
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    // Validate workspace exists (id validation, not a listing: retired ids stay deletable)
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::ALL)
+        .await
+        .map_err(map_err)?;
     let workspace = workspaces
         .iter()
         .find(|w| w.id.as_str() == id)
@@ -1040,8 +1114,12 @@ async fn delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
         .or(workspace.repository_path.as_deref())
         .map_or_else(|| format!("{:?}", workspace.status), String::from);
 
+    // A per-card identity (as for workspace-create): without it the card is
+    // keyed by its title, so a later card with the same title inherited an
+    // earlier card's pending/resolution and applied state (intent-hq/intent#8560).
     let proposal = json!({
         "kind": "bulk-op",
+        "applyToolCallId": format!("bulk-op-{}", uuid::Uuid::new_v4()),
         "payload": {
             "operation": "workspace.bulkDelete",
             "ids": [id]
@@ -1083,8 +1161,11 @@ async fn bulk_archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value
         }
     }
 
-    // Validate all workspaces exist
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    // Validate all workspaces exist (id validation, not a listing: retired ids stay deletable)
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::ALL)
+        .await
+        .map_err(map_err)?;
     let mut bulk_items = Vec::new();
 
     for id_val in ids {
@@ -1110,8 +1191,12 @@ async fn bulk_archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value
     }
 
     let count = ids.len();
+    // A per-card identity (as for workspace-create): without it the card is
+    // keyed by its title, so a later card with the same title inherited an
+    // earlier card's pending/resolution and applied state (intent-hq/intent#8560).
     let proposal = json!({
         "kind": "bulk-op",
+        "applyToolCallId": format!("bulk-op-{}", uuid::Uuid::new_v4()),
         "payload": {
             "operation": "workspace.bulkArchive",
             "ids": ids
@@ -1146,8 +1231,11 @@ async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value,
         }
     }
 
-    // Validate all workspaces exist
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    // Validate all workspaces exist (id validation, not a listing: retired ids stay deletable)
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::ALL)
+        .await
+        .map_err(map_err)?;
     let mut bulk_items = Vec::new();
 
     for id_val in ids {
@@ -1173,8 +1261,12 @@ async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value,
     }
 
     let count = ids.len();
+    // A per-card identity (as for workspace-create): without it the card is
+    // keyed by its title, so a later card with the same title inherited an
+    // earlier card's pending/resolution and applied state (intent-hq/intent#8560).
     let proposal = json!({
         "kind": "bulk-op",
+        "applyToolCallId": format!("bulk-op-{}", uuid::Uuid::new_v4()),
         "payload": {
             "operation": "workspace.bulkDelete",
             "ids": ids
@@ -1194,9 +1286,7 @@ async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intent_core::{
-        BoxFuture, Error, Result, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-    };
+    use intent_core::{BoxFuture, Error, Result, Workspace, WorkspaceStatus};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -1206,7 +1296,14 @@ mod tests {
         events: Arc<Mutex<Vec<PublishEvent>>>,
         plan_calls: Arc<Mutex<Vec<WorkspaceId>>>,
         plan_error: bool,
+        search_calls: Arc<Mutex<Vec<SearchCall>>>,
     }
+
+    type SearchCall = (
+        WorkspaceId,
+        intent_core::CrossWorkspaceSearch,
+        Option<RepoRef>,
+    );
 
     impl FakeApi {
         fn published_events(&self) -> Vec<PublishEvent> {
@@ -1217,9 +1314,16 @@ mod tests {
     impl WorkspaceApi for FakeApi {
         fn list_workspaces(
             &self,
-            _include_archived: bool,
+            filter: intent_core::WorkspaceListFilter,
         ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
-            let workspaces = self.workspaces.lock().unwrap().clone();
+            let workspaces: Vec<Workspace> = self
+                .workspaces
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|w| filter.admits(w))
+                .cloned()
+                .collect();
             Box::pin(async move { Ok(workspaces) })
         }
 
@@ -1238,6 +1342,24 @@ mod tests {
             Box::pin(async move {
                 events.lock().unwrap().push(event);
                 Ok(())
+            })
+        }
+
+        fn app_workspaces_search(
+            &self,
+            workspace_id: WorkspaceId,
+            search: intent_core::CrossWorkspaceSearch,
+            repository: Option<RepoRef>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.search_calls
+                .lock()
+                .unwrap()
+                .push((workspace_id, search, repository));
+            Box::pin(async {
+                Ok(json!({
+                    "matches": [{ "id": "ws-fe", "title": "Login polish", "repository": "intent-hq/cloudlands-fe" }],
+                    "truncated": false,
+                }))
             })
         }
 
@@ -1270,50 +1392,199 @@ mod tests {
             id: WorkspaceId::from_string(id),
             title: title.to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
             repository_path: Some("/repo".to_string()),
             repository_owner: Some("owner".to_string()),
             repository_name: Some("repo".to_string()),
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
+    }
+
+    /// `app.workspaces.delete` / `bulkDelete` validate ids against every
+    /// row, retired included: a retired workspace stays deletable (its id is
+    /// not reported as not found just because lists hide it).
+    #[tokio::test]
+    async fn delete_accepts_retired_workspace_ids() {
+        let fake = Arc::new(FakeApi::default());
+        let mut retired = make_workspace("ws-retired", "Retired");
+        retired.status = WorkspaceStatus::Retired;
+        retired.archived = true;
+        fake.workspaces.lock().unwrap().push(retired);
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief = WorkspaceId::chief();
+        let one = dispatch(&api, &chief, None, "delete", &json!({ "id": "ws-retired" })).await;
+        assert!(
+            one.as_ref().err().is_none_or(|e| !e.contains("not found")),
+            "{one:?}"
+        );
+        let bulk = dispatch(
+            &api,
+            &chief,
+            None,
+            "bulkDelete",
+            &json!({ "ids": ["ws-retired"] }),
+        )
+        .await;
+        assert!(
+            bulk.as_ref().err().is_none_or(|e| !e.contains("not found")),
+            "{bulk:?}"
+        );
+    }
+
+    /// `app.workspaces.list` (the ws.app.* MCP binding) hides retired
+    /// workspaces unless `filter.includeRetired: true` — even a
+    /// `status: "retired"` filter alone does not surface them.
+    #[tokio::test]
+    async fn list_hides_retired_unless_include_retired() {
+        let fake = Arc::new(FakeApi::default());
+        let live = make_workspace("ws-live", "Live");
+        let mut retired = make_workspace("ws-retired", "Retired");
+        retired.status = WorkspaceStatus::Retired;
+        retired.archived = true;
+        retired.retired_at = Some("2026-10-22T00:00:00Z".to_string());
+        fake.workspaces.lock().unwrap().extend([live, retired]);
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief = WorkspaceId::chief();
+        let ids = |v: Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let default = dispatch(&api, &chief, None, "list", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(ids(default), vec!["ws-live"]);
+        let by_status = dispatch(
+            &api,
+            &chief,
+            None,
+            "list",
+            &json!({ "filter": { "status": "retired" } }),
+        )
+        .await
+        .unwrap();
+        assert!(ids(by_status).is_empty());
+        let opted_in = dispatch(
+            &api,
+            &chief,
+            None,
+            "list",
+            &json!({ "filter": { "includeRetired": true } }),
+        )
+        .await
+        .unwrap();
+        let mut got = ids(opted_in);
+        got.sort();
+        assert_eq!(got, vec!["ws-live", "ws-retired"]);
+    }
+
+    /// `filter.includeRetired` is strictly boolean: explicit `false` behaves
+    /// like omission, and a non-boolean value is an invalid-params error
+    /// instead of silently meaning `false`.
+    #[tokio::test]
+    async fn list_rejects_a_non_boolean_include_retired() {
+        let fake = Arc::new(FakeApi::default());
+        let mut retired = make_workspace("ws-retired", "Retired");
+        retired.status = WorkspaceStatus::Retired;
+        retired.archived = true;
+        fake.workspaces
+            .lock()
+            .unwrap()
+            .extend([make_workspace("ws-live", "Live"), retired]);
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief = WorkspaceId::chief();
+        let list = |filter: Value| {
+            let api = api.clone();
+            let chief = chief.clone();
+            async move { dispatch(&api, &chief, None, "list", &json!({ "filter": filter })).await }
+        };
+        let count = |v: Value| v.as_array().unwrap().len();
+
+        assert_eq!(
+            count(list(json!({ "includeRetired": false })).await.unwrap()),
+            1
+        );
+        assert_eq!(
+            count(list(json!({ "includeRetired": true })).await.unwrap()),
+            2
+        );
+        for bad in [json!("true"), Value::Null, json!(1), json!({})] {
+            let err = list(json!({ "includeRetired": bad.clone() }))
+                .await
+                .expect_err("non-boolean includeRetired must be rejected");
+            assert!(
+                err.contains("invalid params") && err.contains("includeRetired"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// `app.workspaces.search` peels `repository` beside the shared
+    /// crossWorkspace search arguments and adds workspace links to rows.
+    #[tokio::test]
+    async fn search_parses_arguments_and_links_rows() {
+        let fake = Arc::new(FakeApi::default());
+        let api: Arc<dyn WorkspaceApi> = fake.clone();
+        let chief = WorkspaceId::from_string(intent_core::CHIEF_WORKSPACE_ID);
+        let v = dispatch(
+            &api,
+            &chief,
+            None,
+            "search",
+            &json!({ "query": " login ", "pr": "#7", "repository": " Intent-HQ/cloudlands-fe.git ", "limit": 5 }),
+        )
+        .await
+        .unwrap();
+        assert!(v["matches"][0]["link"].as_str().unwrap().contains("ws-fe"));
+        assert!(v["matches"][0]["markdownLink"].is_string());
+        let calls = fake.search_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        let (caller, search, repository) = &calls[0];
+        assert!(caller.is_chief());
+        assert_eq!(search.query.as_deref(), Some("login"));
+        assert!(search.pr.is_some());
+        assert_eq!(search.limit, 5);
+        assert_eq!(
+            repository.as_ref(),
+            Some(&RepoRef::new("intent-hq", "cloudlands-fe"))
+        );
+
+        dispatch(&api, &chief, None, "search", &json!({ "pr": 12 }))
+            .await
+            .unwrap();
+        assert_eq!(fake.search_calls.lock().unwrap()[1].2, None);
+
+        for (args, needle) in [
+            (
+                json!({ "query": "x", "repository": "cloudlands-fe" }),
+                "owner/name",
+            ),
+            (json!({ "query": "x", "repository": "a/b/c" }), "owner/name"),
+            (json!({ "query": "x", "repository": "/b" }), "owner/name"),
+            (json!({ "query": "x", "repository": 7 }), "owner/name"),
+            (json!({ "repository": "a/b" }), "non-empty query"),
+        ] {
+            let err = dispatch(&api, &chief, None, "search", &args)
+                .await
+                .unwrap_err();
+            assert!(err.contains(needle), "{args}: {err}");
+        }
+        assert_eq!(fake.search_calls.lock().unwrap().len(), 2);
+
+        let err = dispatch(
+            &api,
+            &WorkspaceId::from_string("amber-forest"),
+            None,
+            "search",
+            &json!({ "query": "x" }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "ws.app.* is only available in the Assistant workspace");
     }
 
     #[tokio::test]
@@ -1859,6 +2130,23 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].get("type").unwrap().as_str().unwrap(), "text");
         assert_eq!(items[1].get("type").unwrap().as_str().unwrap(), "resource");
+    }
+
+    /// Two identical `create` calls must yield two distinct cards: the
+    /// per-card `applyToolCallId` is the identity clients key pending state,
+    /// resolutions and local apply state by, so a title- or content-derived
+    /// identity would let a new card inherit an earlier card's outcome.
+    #[tokio::test]
+    async fn test_create_stamps_unique_apply_tool_call_id() {
+        let args = json!({ "title": "Same WS" });
+        let first = create_proposal(args.clone()).await;
+        let second = create_proposal(args).await;
+        let first_id = first["applyToolCallId"].as_str().expect("first id");
+        let second_id = second["applyToolCallId"].as_str().expect("second id");
+        assert!(first_id.starts_with("workspace-create-"));
+        assert_ne!(first_id, second_id);
+        assert_eq!(first["payload"], second["payload"]);
+        assert!(super::super::proposal::is_valid_proposal(&first));
     }
 
     /// Helper: run `create` against a fresh `FakeApi` and return the proposal.
@@ -2684,6 +2972,42 @@ mod tests {
             preview.get("title").unwrap().as_str().unwrap(),
             "Archive 1 workspace"
         );
+    }
+
+    /// Every bulk-op card gets its own identity: single-workspace archive and
+    /// delete cards all share a title ("Archive 1 workspace"), so a later card
+    /// for another workspace inherited the earlier card's applied state
+    /// (intent-hq/intent#8560).
+    #[tokio::test]
+    async fn test_bulk_op_proposals_stamp_unique_apply_tool_call_ids() {
+        let fake = Arc::new(FakeApi::default());
+        {
+            let mut workspaces = fake.workspaces.lock().unwrap();
+            workspaces.push(make_workspace("ws-1", "One"));
+            workspaces.push(make_workspace("ws-2", "Two"));
+        }
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief_id = WorkspaceId::chief();
+        let calls = [
+            ("archive", json!({ "id": "ws-1" })),
+            ("archive", json!({ "id": "ws-2" })),
+            ("delete", json!({ "id": "ws-1" })),
+            ("bulkArchive", json!({ "ids": ["ws-1"] })),
+            ("bulkDelete", json!({ "ids": ["ws-1"] })),
+        ];
+        let mut ids = std::collections::HashSet::new();
+        for (method, args) in calls {
+            let result = dispatch(&api, &chief_id, None, method, &args)
+                .await
+                .unwrap_or_else(|e| panic!("{method}: {e}"));
+            let proposal = &result["proposal"];
+            let id = proposal["applyToolCallId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{method}: missing applyToolCallId"));
+            assert!(id.starts_with("bulk-op-"), "{method}: {id}");
+            assert!(ids.insert(id.to_string()), "{method}: duplicate id {id}");
+            assert!(super::super::proposal::is_valid_proposal(proposal));
+        }
     }
 
     #[tokio::test]

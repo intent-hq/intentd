@@ -393,6 +393,47 @@ pub fn daemon_helper_env(
     )]
 }
 
+/// Offer the on-demand GitLab helper for one full HTTPS instance. An unset or
+/// disabled daemon policy answers silently. Existing helpers keep their order;
+/// no credentials are placed in environment, config, URLs or arguments.
+#[must_use]
+pub fn daemon_gitlab_helper_env(
+    intentd_path: &str,
+    instance_base_url: &str,
+    inherited_config_parameters: Option<&str>,
+) -> Vec<(String, String)> {
+    let Ok(url) = reqwest::Url::parse(instance_base_url) else {
+        return Vec::new();
+    };
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || instance_base_url.contains(['\\', '%'])
+        || instance_base_url.chars().any(char::is_control)
+        || url.as_str().trim_end_matches('/') != instance_base_url.trim_end_matches('/')
+    {
+        return Vec::new();
+    }
+    let root = instance_base_url.trim_end_matches('/');
+    let entries = [
+        format!(
+            "credential.{root}.helper=!{} git-credential",
+            sh_quote(intentd_path)
+        ),
+        format!("credential.{root}.useHttpPath=true"),
+        // A child Git request must not forward a released credential to a
+        // redirect destination outside the admitted origin/installation prefix.
+        format!("http.{root}.followRedirects=false"),
+    ];
+    vec![(
+        GIT_CONFIG_PARAMETERS_ENV.into(),
+        config_parameters(inherited_config_parameters, &entries),
+    )]
+}
+
 /// Single-quote `src` for the POSIX shell git hands a `!`-prefixed helper
 /// value to: wrap in `'…'` and escape embedded `'` as `'\''`. Distinct from
 /// [`sq_quote`], which targets git's own `sq_dequote` parser (that layer is
@@ -1528,6 +1569,196 @@ mod tests {
         String::from_utf8_lossy(&out.stdout)
             .lines()
             .find_map(|l| l.strip_prefix("password=").map(str::to_string))
+    }
+
+    #[cfg(unix)]
+    fn fill_gitlab_url(dir: &Scratch, global: &Path, params: &str, url: &str) -> Option<String> {
+        use std::io::Write;
+        let mut child = Command::new("git")
+            .args(["credential", "fill"])
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env(GIT_CONFIG_PARAMETERS_ENV, params)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("url={url}\n\n").as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix("password=").map(str::to_owned))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitlab_daemon_helper_receives_full_path_and_matches_only_original_https_root() {
+        let dir = Scratch::new("gitlab-root");
+        let received = dir.path().join("received");
+        let helper = dir.stub(
+            "intent daemon'helper",
+            &format!(
+                "cat > {}\nprintf 'username=oauth2\\npassword=fixture-only\\n'\n",
+                sh_quote(&received.to_string_lossy())
+            ),
+        );
+        let global = dir.path().join("empty-config");
+        std::fs::write(&global, "").unwrap();
+        let env = daemon_gitlab_helper_env(
+            &helper.to_string_lossy(),
+            "https://gitlab.test:8443/Forge",
+            None,
+        );
+        let params = &env[0].1;
+        assert!(!params.contains("fixture-only"));
+        assert_eq!(
+            fill_gitlab_url(
+                &dir,
+                &global,
+                params,
+                "https://gitlab.test:8443/Forge/group/project.git"
+            ),
+            Some("fixture-only".into())
+        );
+        let input = std::fs::read_to_string(&received).unwrap();
+        assert!(input.contains("host=gitlab.test:8443\n"));
+        assert!(input.contains("path=Forge/group/project.git\n"));
+        std::fs::remove_file(&received).unwrap();
+        for url in [
+            "https://gitlab.test/Forge/group/project.git",
+            "https://gitlab.test:8443/forge/group/project.git",
+            "https://gitlab.test:8443/Forge-other/group/project.git",
+            "https://other.test:8443/Forge/group/project.git",
+            "http://gitlab.test:8443/Forge/group/project.git",
+            "ssh://gitlab.test:8443/Forge/group/project.git",
+        ] {
+            assert_eq!(fill_gitlab_url(&dir, &global, params, url), None, "{url}");
+            assert!(
+                !received.exists(),
+                "out-of-root lookup must not invoke daemon"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitlab_daemon_helper_preserves_caller_helper_priority_and_dynamic_silent_fallback() {
+        let dir = Scratch::new("gitlab-fallback");
+        let configured = dir.stub(
+            "configured",
+            "printf 'username=alice\\npassword=caller-choice\\n'\n",
+        );
+        let invoked = dir.path().join("invoked");
+        let helper = dir.stub(
+            "intentd",
+            &format!(
+                "touch {}\nprintf 'username=oauth2\\npassword=daemon-choice\\n'\n",
+                sh_quote(&invoked.to_string_lossy())
+            ),
+        );
+        let global = dir.global_config(&configured);
+        let original = "'color.ui=false'";
+        let env = daemon_gitlab_helper_env(
+            &helper.to_string_lossy(),
+            "https://gitlab.test/forge",
+            Some(original),
+        );
+        assert!(env[0].1.starts_with(original));
+        assert_eq!(
+            fill_gitlab_url(
+                &dir,
+                &global,
+                &env[0].1,
+                "https://gitlab.test/forge/group/project.git"
+            ),
+            Some("caller-choice".into())
+        );
+        assert!(
+            !invoked.exists(),
+            "existing explicit helper keeps precedence"
+        );
+        std::fs::write(&global, "").unwrap();
+        let disabled = dir.stub("disabled", "exit 0\n");
+        let params = daemon_gitlab_helper_env(
+            &disabled.to_string_lossy(),
+            "https://gitlab.test/forge",
+            None,
+        )[0]
+        .1
+        .clone();
+        assert_eq!(
+            fill_gitlab_url(
+                &dir,
+                &global,
+                &params,
+                "https://gitlab.test/forge/group/project.git"
+            ),
+            None
+        );
+        // The same already-created environment consults the helper again. A
+        // real daemon changes policy, not this script; this tests Git caching.
+        dir.stub(
+            "disabled",
+            "printf 'username=oauth2\\npassword=enabled-now\\n'\n",
+        );
+        assert_eq!(
+            fill_gitlab_url(
+                &dir,
+                &global,
+                &params,
+                "https://gitlab.test/forge/group/project.git"
+            ),
+            Some("enabled-now".into())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gitlab_daemon_helper_disables_redirects_only_for_the_selected_full_root() {
+        let dir = Scratch::new("gitlab-redirect");
+        let global = dir.path().join("empty");
+        std::fs::write(&global, "").unwrap();
+        let env =
+            daemon_gitlab_helper_env("/owned/intentd", "https://gitlab.test:8443/Forge", None);
+        for (url, expected) in [
+            (
+                "https://gitlab.test:8443/Forge/group/repo.git",
+                Some("false"),
+            ),
+            ("https://gitlab.test:8443/Other/group/repo.git", None),
+            ("https://github.com/group/repo.git", None),
+        ] {
+            let out = Command::new("git")
+                .args(["config", "--get-urlmatch", "http.followRedirects", url])
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", &global)
+                .envs(env.clone())
+                .output()
+                .unwrap();
+            assert_eq!(out.status.success(), expected.is_some());
+            assert_eq!(
+                String::from_utf8(out.stdout).unwrap().trim(),
+                expected.unwrap_or("")
+            );
+        }
+        for root in [
+            "http://gitlab.test",
+            "https://user@gitlab.test",
+            "https://gitlab.test/prefix?query",
+            "https://gitlab.test/a/../b",
+            "https://gitlab.test/%2e",
+        ] {
+            assert!(daemon_gitlab_helper_env("/owned/intentd", root, None).is_empty());
+        }
     }
 
     /// RAII scratch dir under the system temp root, unique per test so the

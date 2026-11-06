@@ -16,7 +16,7 @@ if (fs.readSync(0, input, 0, 1, null) !== 1 || input[0] !== 0x78) {
 writeOutput('OUTPUT_FLOW\n'.repeat(16384));
 
 let lines = 0;
-while (lines < 128) {
+while (lines < 256) {
   const count = fs.readSync(0, input, 0, input.length, null);
   if (count === 0) throw new Error('Terminal input ended early');
   for (let index = 0; index < count; index += 1) {

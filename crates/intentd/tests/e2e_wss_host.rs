@@ -12,10 +12,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,15 +37,14 @@ const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     _data_dir_guard: tempfile::TempDir,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -52,7 +52,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-host-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -69,7 +69,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -282,11 +282,14 @@ async fn host_detection_services_over_wss() {
             .await
             .unwrap();
         let err = loop {
-            let next = timeout(Duration::from_secs(15), ws.next())
-                .await
-                .expect("timed out")
-                .unwrap()
-                .unwrap();
+            let next = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(15)),
+                ws.next(),
+            )
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
             if let Message::Text(t) = next {
                 let v: Value = serde_json::from_str(&t).unwrap();
                 if v["id"] == json!(2) {
@@ -500,11 +503,14 @@ async fn host_app_detection_services_over_wss() {
             .await
             .unwrap();
         let err = loop {
-            let next = timeout(Duration::from_secs(15), ws.next())
-                .await
-                .expect("timed out")
-                .unwrap()
-                .unwrap();
+            let next = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(15)),
+                ws.next(),
+            )
+            .await
+            .expect("timed out")
+            .unwrap()
+            .unwrap();
             if let Message::Text(t) = next {
                 let v: Value = serde_json::from_str(&t).unwrap();
                 if v["id"] == json!(100) {
@@ -602,6 +608,7 @@ async fn host_provider_auth_status_over_wss() {
         "grok",
         "pi",
         "antigravity",
+        "cursor",
     ];
     assert_eq!(
         providers.len(),
@@ -776,6 +783,124 @@ exit "$code"
     }
 }
 
+/// A service-launched daemon must check Claude with the same shell credentials
+/// as its agent launches. Explicit daemon values, including empty ones, win.
+#[tokio::test]
+async fn host_claude_auth_status_recovers_shell_credentials_over_wss() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    for inherited in [
+        None,
+        Some(OsString::from("synthetic-daemon-token")),
+        Some(OsString::new()),
+        Some(OsString::from_vec(b"synthetic-opaque-\xff".to_vec())),
+    ] {
+        let data_dir_guard = temp_data_dir();
+        let data_dir = data_dir_guard.path().to_path_buf();
+        let bin_dir = data_dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let shell = bin_dir.join("fixture-shell");
+        let cli = bin_dir.join("claude");
+        for (path, body) in [
+            (
+                &shell,
+                r#"#!/bin/sh
+export CLAUDE_CODE_OAUTH_TOKEN=synthetic-shell-token
+export CLAUDE_CONFIG_DIR="$HOME/claude-config"
+export CODEX_TEST_AUTH_SECRET=synthetic-other-provider-secret
+export UNRELATED_AUTH_SECRET=synthetic-unrelated-secret
+exec /bin/sh -c "$2"
+"#,
+            ),
+            (
+                &cli,
+                r#"#!/bin/sh
+[ "$*" = 'auth status' ] || exit 127
+if [ "${CLAUDE_CODE_OAUTH_TOKEN-unset}" = "$EXPECTED_CLAUDE_TOKEN" ] &&
+   [ "$CLAUDE_CONFIG_DIR" = "$HOME/claude-config" ] &&
+   [ "${CODEX_TEST_AUTH_SECRET-unset}" = unset ] &&
+   [ "${UNRELATED_AUTH_SECRET-unset}" = unset ]; then
+    if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+        printf '{"loggedIn":true}\n'
+    else
+        printf '{"loggedIn":false}\n'
+    fi
+else
+    printf '{}\n'
+fi
+"#,
+            ),
+        ] {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        common::enable_ws_api(&data_dir);
+        let log = std::fs::File::create(data_dir.join("daemon.log")).unwrap();
+        let mut command = common::hermetic_serve_command(&data_dir);
+        command
+            .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env("INTENTD_AUTH_TOKEN", TOKEN)
+            .env("INTENTD_TCP_PORT", "0")
+            .env("HOME", &data_dir)
+            .env("USERPROFILE", &data_dir)
+            .env("SHELL", &shell)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+            .env(
+                "EXPECTED_CLAUDE_TOKEN",
+                inherited
+                    .as_deref()
+                    .unwrap_or(std::ffi::OsStr::new("synthetic-shell-token")),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log));
+        if let Some(token) = &inherited {
+            command.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+        }
+        common::hermetic_fixture_identity(&mut command, &data_dir);
+        let _daemon = Daemon {
+            child: GuardedChild::spawn(&mut command).unwrap(),
+            _data_dir_guard: data_dir_guard,
+            data_dir: data_dir.clone(),
+        };
+        let socket = data_dir.join("intentd.sock");
+        assert!(await_uds(&socket).await, "daemon did not start");
+        let status = common::await_wss_status(&socket).await;
+        let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
+        let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
+        let mut ws = connect_ws(port, cfg).await;
+        let result = wss_rpc(
+            &mut ws,
+            1,
+            "host.providerAuthStatus",
+            json!({ "providerId": "claude-code", "force": true }),
+        )
+        .await;
+        assert_eq!(
+            result,
+            json!({ "providers": [{ "id": "claude-code", "authenticated": !inherited.as_ref().is_some_and(|v| v.is_empty()) }] }),
+            "shell credentials must fill gaps without overriding daemon values"
+        );
+        let log = std::fs::read_to_string(data_dir.join("daemon.log")).unwrap();
+        for secret in [
+            "synthetic-shell-token",
+            "synthetic-daemon-token",
+            "synthetic-other-provider-secret",
+            "synthetic-unrelated-secret",
+        ] {
+            assert!(
+                !log.contains(secret),
+                "credentials must not appear in daemon logs"
+            );
+        }
+    }
+}
+
 /// host.checkAuggie over the real WSS wire: resolution-only `{ available,
 /// path? }`. Pinning `context.auggiePath` at a plain (non-executable) file
 /// proves both halves of the contract — the settings-precedence path still
@@ -817,9 +942,7 @@ async fn host_check_auggie_is_resolution_only_over_wss() {
 /// Seed one workspace with a filesystem root so `host.exec` can enforce the
 /// within-workspace containment guard on `cwd`. Returns `(workspace_id, root)`.
 async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
-    use intent_core::{
-        now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    };
+    use intent_core::{now_iso, Workspace, WorkspaceId};
     use intent_store::Store;
     let db_path = data_dir.join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
@@ -829,49 +952,11 @@ async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
         id: ws_id.clone(),
         title: "WSS-HOST-EXEC".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
         path: Some(root.to_string_lossy().into_owned()),
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
         worktree_path: Some(root.to_string_lossy().into_owned()),
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     store.insert_workspace(&ws).await.expect("insert ws");
     ws_id.0
@@ -886,11 +971,14 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("timed out")
-            .unwrap()
-            .unwrap();
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("timed out")
+        .unwrap()
+        .unwrap();
         match next {
             Message::Text(t) => {
                 let v: Value = serde_json::from_str(&t).unwrap();
@@ -1104,9 +1192,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss stream event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss stream event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -1827,6 +1918,15 @@ async fn host_provider_discovery_over_wss() {
         "{pi}"
     );
     for p in providers.iter().filter(|p| p["id"] != "pi") {
+        // Cursor reports its CLI identity (cliCommand/cliVersion) without a
+        // version requirement.
+        if p["id"] == "cursor" {
+            assert!(p.get("cliRequirement").is_none(), "{p}");
+            if p.get("cliCommand").is_some() {
+                assert_eq!(p["cliCommand"], "cursor-agent", "{p}");
+            }
+            continue;
+        }
         if let Some(requirement) =
             intent_providers::adapter_cli::requirement(p["id"].as_str().unwrap())
         {
@@ -2595,9 +2695,12 @@ exit 1
         (5, json!({"providerIds":["codex","codex"]}), None),
     ] {
         ws.send(Message::Text(json!({"jsonrpc":"2.0","id":id,"method":"host.prepareProviderAdapters","params":params}).to_string().into())).await.unwrap();
-        let reply = timeout(Duration::from_secs(5), wss_expect_error(&mut ws, id))
-            .await
-            .expect("ack must not wait for npm");
+        let reply = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            wss_expect_error(&mut ws, id),
+        )
+        .await
+        .expect("ack must not wait for npm");
         if let Some(code) = code {
             assert_eq!(reply["error"]["code"], code);
         } else {
@@ -2611,21 +2714,27 @@ exit 1
         !probe_release.exists(),
         "acknowledgement must precede version probe completion"
     );
-    timeout(Duration::from_secs(10), async {
-        while !probe_started.exists() {
-            // timing-guard: poll the explicitly held version probe
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !probe_started.exists() {
+                // timing-guard: poll the explicitly held version probe
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .expect("version probe started");
     std::fs::write(&probe_release, "go").unwrap();
-    timeout(Duration::from_secs(10), async {
-        while !started.exists() {
-            // timing-guard: poll fake npm's observable start marker
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !started.exists() {
+                // timing-guard: poll fake npm's observable start marker
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .expect("background download started");
     let args = std::fs::read_to_string(&report).unwrap();

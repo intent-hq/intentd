@@ -40,22 +40,28 @@ exit "$status"
         .unwrap();
     let mut stdout = BufReader::new(probe.stdout.take().unwrap());
     let mut stderr = probe.stderr.take().unwrap();
-    let pids = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut pids = Vec::new();
-        for _ in 0..2 {
-            let mut line = String::new();
-            stdout.read_line(&mut line).await.unwrap();
-            pids.push(line.trim().parse::<u32>().unwrap());
-        }
-        pids
-    })
+    let pids = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            let mut pids = Vec::new();
+            for _ in 0..2 {
+                let mut line = String::new();
+                stdout.read_line(&mut line).await.unwrap();
+                pids.push(line.trim().parse::<u32>().unwrap());
+            }
+            pids
+        },
+    )
     .await
     .unwrap();
     let owner = probe.ownership.as_mut().unwrap();
-    let control_pid = tokio::time::timeout(Duration::from_secs(5), owner.control_pid())
-        .await
-        .unwrap()
-        .unwrap();
+    let control_pid = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        owner.control_pid(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let channels = [
         std::fs::read_link(format!(
             "/proc/self/fd/{}",
@@ -71,19 +77,22 @@ exit "$status"
 
     // Complete ordinary IO and cleanup before asserting the regression so
     // even the expected pre-fix failure leaves no test processes or home.
-    let (out, err, status) = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut stdin = probe.stdin.take().unwrap();
-        stdin.write_all(b"provider input\n").await.unwrap();
-        drop(stdin);
-        let mut out = String::new();
-        let mut err = String::new();
-        tokio::try_join!(
-            stdout.read_to_string(&mut out),
-            stderr.read_to_string(&mut err)
-        )
-        .unwrap();
-        (out, err, probe.wait().await.unwrap())
-    })
+    let (out, err, status) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            let mut stdin = probe.stdin.take().unwrap();
+            stdin.write_all(b"provider input\n").await.unwrap();
+            drop(stdin);
+            let mut out = String::new();
+            let mut err = String::new();
+            tokio::try_join!(
+                stdout.read_to_string(&mut out),
+                stderr.read_to_string(&mut err)
+            )
+            .unwrap();
+            (out, err, probe.wait().await.unwrap())
+        },
+    )
     .await
     .unwrap();
     assert!(home_path.is_dir());
@@ -166,10 +175,13 @@ exit 7
         let mut stdin = child.stdin.take().unwrap();
         stdin.write_all(b"provider input\n").await.unwrap();
         drop(stdin);
-        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
-            .await
-            .unwrap()
-            .unwrap();
+        let output = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            child.wait_with_output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(output.status.success(), "{control}/{status}: {output:?}");
         assert_eq!(output.stderr, b"provider stderr\n");
         let stdout = String::from_utf8(output.stdout).unwrap();
@@ -211,11 +223,14 @@ async fn proc_stat_reaped_after_open_counts_as_terminated() {
         .write_all(b"exit\n")
         .await
         .unwrap();
-    assert!(tokio::time::timeout(Duration::from_secs(5), child.wait())
-        .await
-        .unwrap()
-        .unwrap()
-        .success());
+    assert!(tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        child.wait()
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .success());
     assert!(terminated(pid.cast_signed()).unwrap());
 
     // Reaping between open and read yields ESRCH, not a missing-path ENOENT.
@@ -284,10 +299,13 @@ socket.once('data', () => {
     let mut probe = super::super::ProbeProcess::spawn(command, home)
         .await
         .unwrap();
-    let (socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
+    let (socket, _) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        listener.accept(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let mut socket = BufReader::new(socket);
     let leader = receive_pid(&mut socket, "leader").await;
     let (snapshot_tx, snapshot_rx) = tokio::sync::oneshot::channel();
@@ -295,10 +313,13 @@ socket.once('data', () => {
     probe.ownership.as_mut().unwrap().snapshot_barrier = Some((snapshot_tx, resume_rx));
     let task = tokio::spawn(async move { probe.cleanup().await });
     cleanup.task = Some(task.abort_handle());
-    let snapshot = tokio::time::timeout(Duration::from_secs(5), snapshot_rx)
-        .await
-        .unwrap()
-        .unwrap();
+    let snapshot = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        snapshot_rx,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(snapshot.contains(&leader));
     socket.get_mut().write_all(b"fork and exit").await.unwrap();
     let child = receive_pid(&mut socket, "child").await;
@@ -309,19 +330,25 @@ socket.once('data', () => {
         "fixture must escape the supervisor group"
     );
     // Observe the real leader exit before resuming cleanup's stale snapshot.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !terminated(leader).unwrap() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !terminated(leader).unwrap() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     assert!(home_path.is_dir());
     resume_tx.send(()).unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(8), task)
-        .await
-        .unwrap()
-        .unwrap();
+    let result = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(8)),
+        task,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(result, Ok(()));
     assert_eq!(
         kill(Pid::from_raw(child), None),
@@ -334,10 +361,13 @@ socket.once('data', () => {
 
 async fn receive_pid(socket: &mut BufReader<tokio::net::TcpStream>, field: &str) -> i32 {
     let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(5), socket.read_line(&mut line))
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        socket.read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let message: serde_json::Value = serde_json::from_str(&line).unwrap();
     i32::try_from(message[field].as_i64().unwrap()).unwrap()
 }
@@ -362,11 +392,14 @@ async fn cleanup_retains_home_when_control_child_is_lost() {
     let children = owned_children(owner_pid).unwrap();
     kill(Pid::from_raw(control), Signal::SIGKILL).unwrap();
     // Wait for actual removal, not just delivery of the terminating signal.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while owned_children(owner_pid).unwrap().contains(&control) {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while owned_children(owner_pid).unwrap().contains(&control) {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -376,11 +409,14 @@ async fn cleanup_retains_home_when_control_child_is_lost() {
     assert!(home_path.is_dir(), "unconfirmed cleanup must retain HOME");
     // The failed owner's drop kills its group. Confirm the fixture is gone
     // before explicitly removing the intentionally retained test directory.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while children.iter().any(|pid| !terminated(*pid).unwrap()) {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while children.iter().any(|pid| !terminated(*pid).unwrap()) {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     std::fs::remove_dir_all(home_path).unwrap();

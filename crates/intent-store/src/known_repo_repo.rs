@@ -19,11 +19,24 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_known_repos(&self) -> Result<Vec<KnownRepo>> {
         let sql = format!("SELECT {KNOWN_REPO_COLUMNS} FROM known_repo ORDER BY last_used_at DESC");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list known repos failed: {e}")))?;
         rows.iter().map(map_known_repo_row).collect()
+    }
+
+    /// Check one explicitly supplied registry path without loading every row.
+    ///
+    /// This is local input validation, not filesystem or repository authority.
+    /// # Errors
+    /// Returns an error if the registry query fails.
+    pub async fn known_repo_exists(&self, path: &str) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM known_repo WHERE path = ?)")
+            .bind(path)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("known repo lookup failed: {e}")))
     }
 
     /// Insert or update a known repo, keyed on `path` (TS `addRepo`). A new row

@@ -51,7 +51,7 @@ async fn task_list_large_bodies_preserve_response() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.unwrap();
     let ws = seed(&store, 4, 8).await;
-    let svc = Services::new(store.clone());
+    let svc = Services::new_isolated(store.clone());
     let before = serde_json::to_value(svc.task_list(ws.clone(), None).await.unwrap()).unwrap();
     bodies(&store, &ws, 128 * 1024, 256 * 1024).await;
     let (after, statements) =
@@ -73,7 +73,7 @@ async fn task_list_does_not_read_non_spec_bodies() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.unwrap();
     let ws = seed(&store, 4, 8).await;
-    let svc = Services::new(store.clone());
+    let svc = Services::new_isolated(store.clone());
     let expected = serde_json::to_value(svc.task_list(ws.clone(), None).await.unwrap()).unwrap();
     sqlx::query("ALTER TABLE note RENAME TO task_list_body_probe")
         .execute(store.write_pool())
@@ -97,7 +97,7 @@ async fn task_list_latency_baseline() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.unwrap();
     let ws = seed(&store, 64, 192).await;
-    let svc = Services::new(store.clone());
+    let svc = Services::new_isolated(store.clone());
     let mut expected = None;
     for (label, task_bytes, plain_bytes) in [
         ("empty", 0, 0),
@@ -205,13 +205,13 @@ async fn task_list_projection_preserves_semantics() {
         ..Default::default()
     });
     store.insert_note(&elsewhere).await.unwrap();
-    let svc = Services::new(store.clone());
+    let svc = Services::new_isolated(store.clone());
     for content in [None, Some(""), Some("No links"), Some("[z](intent://local/task/z) [a](intent://local/task/a) [nested](intent://local/task/nested) [cancelled](intent://local/task/cancelled)")] {
         if let Some(content) = content {
             let mut spec = note(&ws, "spec", content);
             spec.metadata.task = Some(TaskMetadata { status: TaskStatus::Complete, ..Default::default() });
             if store.note_exists(&ws, &NoteId::from("spec")).await.unwrap() {
-                store.update_note(&spec).await.unwrap();
+                store.update_note(&store.lock_note_content(&spec.workspace_id, &spec.id).await, &spec).await.unwrap();
             } else {
                 store.insert_note(&spec).await.unwrap();
             }

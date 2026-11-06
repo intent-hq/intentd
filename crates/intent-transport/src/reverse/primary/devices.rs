@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use super::{ClientTransition, PrimaryReverseGuard, ReverseClientIdentity, State};
 
 pub(super) struct DeviceBinding {
-    identity: ReverseClientIdentity,
+    pub(super) identity: ReverseClientIdentity,
     pub(super) principal_id: PrincipalId,
     hello_seq: u64,
 }
@@ -116,6 +116,7 @@ impl PrimaryReverseGuard {
         let Some(entry) = state.entries.iter_mut().find(|e| e.id == self.id) else {
             return;
         };
+        entry.desktop_epoch = intent_core::desktop::new_connection_epoch();
         entry.device_managed = true;
         entry.device = Some(DeviceBinding {
             identity,

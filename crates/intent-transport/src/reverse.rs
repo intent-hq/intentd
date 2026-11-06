@@ -28,7 +28,7 @@ pub(crate) const DEFAULT_REVERSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Screenshot reverse requests must settle before the agent JavaScript tool's
 /// 30-second outer deadline so the caller receives the transport error.
-const SCREENSHOT_REVERSE_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const SCREENSHOT_REVERSE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Select the reverse deadline without changing the global default. A mixed
 /// `browser.exec` batch uses the screenshot deadline when any action captures
@@ -55,6 +55,10 @@ pub(crate) fn request_timeout(method: &str, params: &Value) -> Duration {
 pub struct ReverseError {
     pub code: i64,
     pub message: String,
+    pub data: Option<Value>,
+    /// Set only when the daemon gave up waiting (no reply within the
+    /// deadline), never for an error the client itself returned.
+    pub timed_out: bool,
 }
 
 type PendingSender = oneshot::Sender<Result<Value, ReverseError>>;
@@ -90,7 +94,7 @@ impl Drop for PendingRequest<'_> {
 /// durable authority on each request. Hello metadata never grants that role.
 #[derive(Clone)]
 pub struct ReverseChannel {
-    out_tx: mpsc::Sender<String>,
+    out_tx: mpsc::Sender<crate::OutboundFrame>,
     pending: Pending,
     next_id: Arc<AtomicU64>,
     administrator: bool,
@@ -104,7 +108,7 @@ impl ReverseChannel {
     /// administrator's (the legacy single-user default); see
     /// [`ReverseChannel::with_administrator`].
     #[must_use]
-    pub fn new(out_tx: mpsc::Sender<String>) -> Self {
+    pub fn new(out_tx: mpsc::Sender<crate::OutboundFrame>) -> Self {
         Self {
             out_tx,
             pending: Arc::new(Mutex::new(ReverseState {
@@ -164,7 +168,7 @@ impl ReverseChannel {
         let Some((api, principal_id)) = &self.member_authority else {
             return false;
         };
-        if method != "browser.exec"
+        if !matches!(method, "browser.exec" | "desktop.control")
             || !api
                 .principal_host_role(principal_id.clone())
                 .await
@@ -216,6 +220,8 @@ impl ReverseChannel {
     ) -> Result<Value, ReverseError> {
         if !self.administrator && !self.member_may_receive(method, &params).await {
             return Err(ReverseError {
+                timed_out: false,
+                data: None,
                 code: i64::from(crate::catalog::FORBIDDEN_ERROR_CODE),
                 message: format!(
                     "{}: reverse RPC {method} is outside this connection's authority",
@@ -229,6 +235,8 @@ impl ReverseChannel {
             let mut state = self.pending.lock().expect("reverse pending poisoned");
             if state.closed {
                 return Err(ReverseError {
+                    timed_out: false,
+                    data: None,
                     code: 0,
                     message: "client connection closed".to_string(),
                 });
@@ -247,15 +255,21 @@ impl ReverseChannel {
         match tokio::time::timeout(timeout, async {
             tokio::select! {
                 result = &mut rx => return result.unwrap_or_else(|_| Err(ReverseError {
+                timed_out: false,
+                data: None,
                     code: 0,
                     message: "client connection closed".to_string(),
                 })),
-                result = self.out_tx.send(frame) => result.map_err(|_| ReverseError {
+                result = self.out_tx.send(frame.into()) => result.map_err(|_| ReverseError {
+                timed_out: false,
+                data: None,
                     code: 0,
                     message: "client connection closed".to_string(),
                 })?,
             }
             rx.await.map_err(|_| ReverseError {
+                timed_out: false,
+                data: None,
                 code: 0,
                 message: "reverse response channel dropped".to_string(),
             })?
@@ -264,6 +278,8 @@ impl ReverseChannel {
         {
             Ok(result) => result,
             Err(_) => Err(ReverseError {
+                timed_out: true,
+                data: None,
                 code: 0,
                 message: format!("reverse request timed out: {method}"),
             }),
@@ -295,6 +311,8 @@ impl ReverseChannel {
         };
         if let Some(err) = obj.get("error") {
             let _ = sender.send(Err(ReverseError {
+                timed_out: false,
+                data: err.get("data").cloned(),
                 code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
                 message: err
                     .get("message")
@@ -318,6 +336,8 @@ impl ReverseChannel {
         };
         for (_, sender) in pending {
             let _ = sender.send(Err(ReverseError {
+                timed_out: false,
+                data: None,
                 code: 0,
                 message: "client connection closed".to_string(),
             }));
@@ -327,8 +347,9 @@ impl ReverseChannel {
 
 pub mod primary;
 pub use primary::{
-    ClientPresence, ClientTransition, LiveClient, PrimaryReverseGuard, PrimaryReverseRegistry,
-    ResolvedClient, ReverseClientIdentity, ReverseTransport, CLIENT_CONNECTED, CLIENT_DISCONNECTED,
+    BindingReservation, ClaimedHello, ClientPresence, ClientTransition, HelloBinding, HelloClaim,
+    LiveClient, PrimaryReverseGuard, PrimaryReverseRegistry, ResolvedClient, ReverseClientIdentity,
+    ReverseTransport, CLIENT_CONNECTED, CLIENT_DISCONNECTED,
 };
 
 #[cfg(test)]

@@ -19,6 +19,11 @@ struct FakeRuntime {
     cancels: AtomicUsize,
     stops: AtomicUsize,
     responses: AtomicUsize,
+    /// Prompts still to reject with a provider quota error, before output.
+    quota_failures: AtomicUsize,
+    /// When set, the node reported the agent exited before it started:
+    /// every prompt fails before output, as the production runtime does.
+    exited: Mutex<Option<String>>,
 }
 
 impl FakeRuntime {
@@ -34,15 +39,20 @@ impl FakeRuntime {
             cancels: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
             responses: AtomicUsize::new(0),
+            quota_failures: AtomicUsize::new(0),
+            exited: Mutex::new(None),
         })
     }
 
     async fn wait_prompts(&self, count: usize) {
-        timeout(Duration::from_secs(5), async {
-            while self.prompts.lock().unwrap().len() < count {
-                self.entered.notified().await;
-            }
-        })
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while self.prompts.lock().unwrap().len() < count {
+                    self.entered.notified().await;
+                }
+            },
+        )
         .await
         .expect("manager dispatches the expected prompt");
     }
@@ -66,6 +76,26 @@ impl AgentRuntime for FakeRuntime {
                 .lock()
                 .unwrap()
                 .push((session_id.to_owned(), prompt));
+            if let Some(error) = self.exited.lock().unwrap().clone() {
+                self.entered.notify_one();
+                return Err(AcpError::Transport(format!(
+                    "node-agent-not-running: {error}"
+                )));
+            }
+            if self
+                .quota_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                self.entered.notify_one();
+                return Err(AcpError::Rpc(intent_acp::JsonRpcError {
+                    code: -32603,
+                    message: "Internal error".into(),
+                    data: Some(json!(
+                        "{\"type\":\"rate_limit_error\",\"message\":\"usage limit reached\"}"
+                    )),
+                }));
+            }
             self.updates
                 .send(IncomingNotification {
                     method: "session/update".into(),
@@ -126,7 +156,12 @@ impl AgentRuntime for FakeRuntime {
 
 async fn install_fake(mgr: &Arc<AgentManager>, id: &AgentId, ws: &WorkspaceId) -> Arc<FakeRuntime> {
     seed_agent(mgr, ws, id).await;
-    let mut session = mgr.services.store.get_agent_session(id).await.unwrap();
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(id)
+        .await
+        .unwrap();
     // Resolve the existing mock provider config but never launch its script.
     session.provider = Some("mock".into());
     mgr.services
@@ -148,7 +183,10 @@ async fn install_fake(mgr: &Arc<AgentManager>, id: &AgentId, ws: &WorkspaceId) -
             antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
+            session_open_filled_model: None,
             spawned_provider: "node".into(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("node"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -162,11 +200,14 @@ async fn install_fake(mgr: &Arc<AgentManager>, id: &AgentId, ws: &WorkspaceId) -
 }
 
 async fn wait_idle(mgr: &AgentManager, id: &AgentId) {
-    timeout(Duration::from_secs(5), async {
-        while mgr.is_busy(id) || !mgr.workers.lock().unwrap().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while mgr.is_busy(id) || !mgr.workers.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("turn worker settles");
 }
@@ -258,7 +299,7 @@ async fn fake_runtime_drives_queued_delivery_streaming_and_idle_reap() {
     assert_eq!(
         mgr.services
             .store
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .unwrap()
             .acp_session_id
@@ -315,4 +356,511 @@ async fn fake_runtime_map_drop_stops_even_with_a_borrowed_runtime() {
     mgr.handles.lock().unwrap().clear();
     assert_eq!(fake.stops.load(Ordering::SeqCst), 1);
     assert!(!fake.is_alive());
+}
+
+/// A remote-launch port whose agents all run on `runtime`.
+struct RemoteRuntimes {
+    runtime: Option<Arc<FakeRuntime>>,
+    asked: AtomicUsize,
+}
+
+impl crate::feature_ports::RemoteLaunchPort for RemoteRuntimes {
+    fn placements<'a>(
+        &'a self,
+        _svc: &'a Services,
+    ) -> BoxFuture<'a, intent_core::Result<intent_core::placement::PlatformAvailability>> {
+        Box::pin(async { Ok(intent_core::placement::PlatformAvailability::none(now_iso())) })
+    }
+    fn placement_help<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async { None })
+    }
+    fn admit<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _placement: &'a intent_core::placement::AgentPlacement,
+        _needs: &'a intent_core::remote_launch::RemoteLaunchNeeds,
+    ) -> BoxFuture<'a, intent_core::Result<intent_core::remote_launch::RemotePlacementView>> {
+        Box::pin(async { Ok(remote_view()) })
+    }
+    fn launch<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _request: intent_core::remote_launch::RemoteLaunchRequest,
+    ) -> BoxFuture<'a, intent_core::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn runtime<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, intent_core::Result<Arc<crate::feature_ports::RemoteRuntime>>> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime
+                .map(|r| r as Arc<crate::feature_ports::RemoteRuntime>)
+                .ok_or_else(|| Error::InvalidParams("node-unavailable: no node".into()))
+        })
+    }
+}
+
+/// A manager whose services use `port` for remote launch, with agent `id`
+/// placed on a node.
+async fn remote_manager(
+    port: Arc<RemoteRuntimes>,
+    id: &AgentId,
+    ws: &WorkspaceId,
+) -> (TempDb, Arc<AgentManager>) {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let services = Services::new_with_file_secrets(
+        store,
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
+    )
+    .with_event_bus(bus.clone())
+    .with_remote_launch_port(port);
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+    let mgr = Arc::new(AgentManager::new(services, sink, 8));
+    seed_agent(&mgr, ws, id).await;
+    let view = intent_core::remote_launch::RemotePlacementView {
+        node_id: "node-1".into(),
+        lease_id: "lease-1".into(),
+        node_name: "Mac".into(),
+        placement: intent_core::placement::AgentPlacement::default(),
+        effective_isolation: intent_core::remote_launch::EffectiveIsolation::Pending,
+        placement_error: None,
+        base_commit: "base".into(),
+        submodules: None,
+        setup: None,
+        setup_script: None,
+        skills: None,
+        shared_checkout_of: None,
+        parent_work: None,
+    };
+    mgr.services
+        .store
+        .set_agent_session_metadata_key_json(
+            ws,
+            id,
+            intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+            &serde_json::to_string(&view).unwrap(),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.services.attach_agent_manager(&mgr);
+    (tmp, mgr)
+}
+
+fn remote_view() -> intent_core::remote_launch::RemotePlacementView {
+    intent_core::remote_launch::RemotePlacementView {
+        node_id: "node-1".into(),
+        lease_id: "lease-1".into(),
+        node_name: "Mac".into(),
+        placement: intent_core::placement::AgentPlacement::default(),
+        effective_isolation: intent_core::remote_launch::EffectiveIsolation::Pending,
+        placement_error: None,
+        base_commit: "base".into(),
+        submodules: None,
+        setup: None,
+        setup_script: None,
+        skills: None,
+        shared_checkout_of: None,
+        parent_work: None,
+    }
+}
+
+/// A placed agent's turns run on the runtime the remote-launch port hands
+/// out (asked once, then reused), never on a local process; transcripts
+/// are written as for a local agent.
+#[tokio::test]
+async fn a_placed_agent_runs_its_turns_on_the_remote_runtime() {
+    let ws = WorkspaceId::from("ws-remote-turns");
+    let id = AgentId::from("agent-remote-turns");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
+
+    for (turn, text) in [(1, "first"), (2, "second")] {
+        mgr.send_message(
+            id.clone(),
+            ws.clone(),
+            text.into(),
+            None,
+            super::super::TurnOptions::default(),
+        )
+        .await
+        .unwrap();
+        fake.wait_prompts(turn).await;
+        fake.finish.add_permits(1);
+        wait_idle(&mgr, &id).await;
+    }
+    assert_eq!(
+        port.asked.load(Ordering::SeqCst),
+        1,
+        "the live runtime is reused"
+    );
+    assert!(fake
+        .prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(session, _)| *session == format!("remote:{id}")));
+    assert!(mgr.agent_root_pids().is_empty(), "no local process");
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.iter().filter(|m| m.role == "assistant").count(),
+        2,
+        "the remote runtime's output reaches the transcript"
+    );
+
+    // Stopping the agent stops its remote runtime.
+    assert!(mgr.stop(&id).await);
+    assert_eq!(fake.stops.load(Ordering::SeqCst), 1);
+}
+
+/// With no node to run it, a placed agent's turn fails; it never falls
+/// back to a local process.
+#[tokio::test]
+async fn a_placed_agent_never_starts_locally() {
+    let ws = WorkspaceId::from("ws-remote-none");
+    let id = AgentId::from("agent-remote-none");
+    let port = Arc::new(RemoteRuntimes {
+        runtime: None,
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
+    let result = mgr.ensure_started(&id, &ws).await;
+    assert!(
+        matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("node-unavailable")),
+        "{result:?}"
+    );
+    assert_eq!(port.asked.load(Ordering::SeqCst), 1);
+    assert!(!mgr.contains(&id));
+    assert!(mgr.agent_root_pids().is_empty());
+}
+
+/// Review of intentd#2779: a live remote run is not reused once the
+/// session's identity changed; it is stopped and the turn is refused.
+#[tokio::test]
+async fn a_live_remote_run_is_not_reused_after_an_identity_change() {
+    let ws = WorkspaceId::from("ws-remote-identity");
+    let id = AgentId::from("agent-remote-identity");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
+    mgr.ensure_started(&id, &ws).await.unwrap();
+    assert!(mgr.contains(&id));
+    let mut session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    session.model = Some("another-model".into());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .unwrap();
+    let result = mgr.ensure_started(&id, &ws).await;
+    assert!(
+        matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("remote-model-change-unsupported")),
+        "{result:?}"
+    );
+    assert!(!mgr.contains(&id), "the old run is not kept");
+    assert_eq!(fake.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(port.asked.load(Ordering::SeqCst), 1);
+}
+
+/// Review of intentd#2779: a remote agent's instructions (an explicit
+/// `behaviorPrompt`, or a specialist's frozen body and role) reach the node
+/// with its first prompt, as a `<system>` prepend, and only once.
+#[tokio::test]
+async fn a_remote_agents_instructions_ride_its_first_prompt() {
+    for specialist in [false, true] {
+        let ws = WorkspaceId::from(format!("ws-remote-prompt-{specialist}").as_str());
+        let id = AgentId::from(format!("agent-remote-prompt-{specialist}").as_str());
+        let fake = FakeRuntime::new();
+        let port = Arc::new(RemoteRuntimes {
+            runtime: Some(fake.clone()),
+            asked: AtomicUsize::new(0),
+        });
+        let (_tmp, mgr) = remote_manager(port, &id, &ws).await;
+        let marker = if specialist {
+            "SPECIALIST-BODY-MARKER"
+        } else {
+            "BEHAVIOR-PROMPT-MARKER"
+        };
+        let store = &mgr.services.store;
+        store
+            .set_agent_session_metadata_key(&ws, &id, "behaviorPrompt", marker, None, None)
+            .await
+            .unwrap();
+        if specialist {
+            let mut session = store.get_agent_session_with_transcript(&id).await.unwrap();
+            session.specialist = Some("implementor".into());
+            store.update_agent_session(&ws, &session).await.unwrap();
+            store
+                .set_agent_session_metadata_key(
+                    &ws,
+                    &id,
+                    "specialistName",
+                    "Implementor",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        for (turn, text) in [(1, "first"), (2, "second")] {
+            mgr.send_message(
+                id.clone(),
+                ws.clone(),
+                text.into(),
+                None,
+                super::super::TurnOptions::default(),
+            )
+            .await
+            .unwrap();
+            fake.wait_prompts(turn).await;
+            fake.finish.add_permits(1);
+            wait_idle(&mgr, &id).await;
+        }
+        let prompts = fake.prompts.lock().unwrap().clone();
+        let first = serde_json::to_string(&prompts[0].1).unwrap();
+        let second = serde_json::to_string(&prompts[1].1).unwrap();
+        assert!(first.contains("<system>"), "{first}");
+        assert!(first.contains(marker), "{first}");
+        if specialist {
+            assert!(first.contains("Implementor"), "{first}");
+        }
+        assert!(
+            !second.contains(marker),
+            "the instructions are sent once: {second}"
+        );
+        let persisted = store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap()
+            .system_prompt;
+        assert!(persisted.is_some_and(|p| p.contains(marker)));
+    }
+}
+
+/// Review of intentd#2779: an explicit `behaviorPrompt` on a remote
+/// delegation reaches the child's first prompt through the real delegate
+/// path.
+#[tokio::test]
+async fn a_remote_delegations_behavior_prompt_rides_its_first_prompt() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", &script)]);
+    let ws = WorkspaceId::from("ws-remote-delegate");
+    let parent = AgentId::from("agent-remote-delegate-parent");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &parent, &ws).await;
+    let delegated = mgr
+        .services
+        .agent_delegate_op(
+            ws.clone(),
+            intent_core::AgentDelegateInput {
+                task_text: Some("Do the remote thing".into()),
+                provider: Some("mock".into()),
+                behavior_prompt: Some("CUSTOM-INSTRUCTION".into()),
+                placement: Some(serde_json::from_value(json!({"target": "remote"})).unwrap()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let child = AgentId::from(delegated["agentId"].as_str().unwrap());
+    fake.wait_prompts(1).await;
+    fake.finish.add_permits(1);
+    wait_idle(&mgr, &child).await;
+    let first = serde_json::to_string(&fake.prompts.lock().unwrap()[0].1).unwrap();
+    assert!(first.contains("<system>"), "{first}");
+    assert!(first.contains("CUSTOM-INSTRUCTION"), "{first}");
+}
+
+/// Review of intentd#2779: when the instructions cannot be stored, the turn
+/// fails before the node starts anything, and the next turn prepares again.
+#[tokio::test]
+async fn a_remote_run_never_starts_without_its_instructions() {
+    let ws = WorkspaceId::from("ws-remote-prepare");
+    let id = AgentId::from("agent-remote-prepare");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
+    let pool = mgr.services.store.write_pool();
+    sqlx::query("CREATE TRIGGER fail_system_prompt BEFORE UPDATE OF system_prompt ON agent_session BEGIN SELECT RAISE(FAIL, 'injected'); END")
+        .execute(pool)
+        .await
+        .unwrap();
+    let failed = mgr.ensure_started(&id, &ws).await;
+    assert!(
+        matches!(&failed, Err(Error::Internal(m)) if m.contains("could not store its instructions")),
+        "{failed:?}"
+    );
+    assert_eq!(
+        port.asked.load(Ordering::SeqCst),
+        0,
+        "nothing started on the node"
+    );
+    assert!(!mgr.contains(&id));
+
+    sqlx::query("DROP TRIGGER fail_system_prompt")
+        .execute(pool)
+        .await
+        .unwrap();
+    mgr.ensure_started(&id, &ws).await.unwrap();
+    assert_eq!(port.asked.load(Ordering::SeqCst), 1);
+    assert!(mgr.prepend_pending.lock().unwrap().contains(&id));
+}
+
+/// Remote parity S6: a message with an image and a file reaches the remote
+/// agent's runtime: the image inline in the prompt, the file as the notice
+/// that points at `ws.file.getAttachment` (which runs on the machine).
+#[tokio::test]
+async fn a_remote_agent_receives_a_message_with_attachments() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", &script)]);
+    let ws = WorkspaceId::from("ws-remote-attachments");
+    let id = AgentId::from("agent-remote-attachments");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
+    fake.finish.add_permits(1);
+    mgr.send_message(
+        id.clone(),
+        ws.clone(),
+        "look".into(),
+        None,
+        super::super::TurnOptions {
+            image_blocks: Some(serde_json::json!([
+                { "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "mimeType": "image/png" }
+            ])),
+            file_blocks: Some(serde_json::json!([
+                { "attachmentId": "att-1", "fileName": "notes.txt" }
+            ])),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    fake.wait_prompts(1).await;
+    let prompt = serde_json::to_value(&fake.prompts.lock().unwrap()[0].1).unwrap();
+    let blocks = prompt.as_array().unwrap();
+    assert!(
+        blocks
+            .iter()
+            .any(|b| b["type"] == "image" && b["data"].as_str().is_some_and(|d| !d.is_empty())),
+        "{prompt}"
+    );
+    assert!(
+        blocks.iter().any(|b| b["type"] == "text"
+            && b["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("ws.file.getAttachment(\"att-1\")"))),
+        "{prompt}"
+    );
+}
+
+#[path = "remote_quota_failover_tests.rs"]
+mod remote_quota_failover_tests;
+
+/// Remote parity S1: a remote agent's instructions match what its machine
+/// can serve. A truncating provider gets the condensed `ws.*` reference
+/// (its machine serves the compact tool description that points at it);
+/// the backend's skills catalog stays out (its paths are on the backend);
+/// and the prompt keeps the private `$TMPDIR` promise, which the machine
+/// keeps (remote parity S6).
+#[tokio::test]
+async fn a_remote_agents_prompt_matches_what_its_machine_serves() {
+    let ws = WorkspaceId::from("ws-remote-prompt");
+    let id = AgentId::from("agent-remote-prompt");
+    let port = Arc::new(RemoteRuntimes {
+        runtime: None,
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port, &id, &ws).await;
+    let store = &mgr.services.store;
+    let worktree = tempfile::TempDir::new().unwrap();
+    let skill = worktree.path().join(".agents/skills/backend-only-skill");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: backend-only-skill\ndescription: Lives on the backend\n---\n\nBody.\n",
+    )
+    .unwrap();
+    let mut workspace = store.get_workspace(&ws).await.unwrap();
+    workspace.worktree_path = Some(worktree.path().to_string_lossy().into_owned());
+    store.update_workspace(&workspace).await.unwrap();
+
+    let prompt_for = |provider: &'static str| {
+        let mgr = mgr.clone();
+        let (ws, id) = (ws.clone(), id.clone());
+        async move {
+            let mut session = mgr
+                .services
+                .store
+                .get_agent_session_with_transcript(&id)
+                .await
+                .unwrap();
+            session.provider = Some(provider.to_owned());
+            mgr.prepare_remote_system_prompt(&id, &ws, &session)
+                .await
+                .unwrap();
+            mgr.services
+                .store
+                .get_agent_session_with_transcript(&id)
+                .await
+                .unwrap()
+                .system_prompt
+                .unwrap_or_default()
+        }
+    };
+
+    let truncating = prompt_for("claude-code").await;
+    assert!(
+        truncating.contains(intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING),
+        "{truncating}"
+    );
+    assert!(truncating.contains("ws.note.read("), "{truncating}");
+    assert!(!truncating.contains("<available_skills>"), "{truncating}");
+    assert!(!truncating.contains("backend-only-skill"), "{truncating}");
+    assert!(
+        truncating.contains("is a private temp folder for this agent"),
+        "{truncating}"
+    );
+
+    let full = prompt_for("codex").await;
+    assert!(
+        !full.contains(intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING),
+        "a provider that reads the full tool description gets no copy: {full}"
+    );
+    assert!(!full.contains("<available_skills>"), "{full}");
 }

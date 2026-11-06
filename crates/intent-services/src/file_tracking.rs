@@ -96,6 +96,32 @@ pub(crate) fn normalize_path(path: &str) -> String {
     trimmed.strip_prefix("./").unwrap_or(trimmed).to_string()
 }
 
+/// Whether an agent write to `rel_path` (worktree-relative) must not be
+/// recorded because git ignores it: an untracked path matching the owning
+/// repository's ignore rules can never be staged or committed, so its
+/// `unstaged` row would never leave the working stage and would lock the path
+/// forever (intent-hq/intent#7266). Runs the libgit2 check on the blocking
+/// pool; any failure answers `false` so recording proceeds as before.
+pub(crate) async fn is_ignored_write(worktree: &std::path::Path, rel_path: &str) -> bool {
+    let worktree = worktree.to_path_buf();
+    let rel = normalize_path(rel_path);
+    if rel.is_empty() {
+        return false;
+    }
+    let ignored = tokio::task::spawn_blocking(move || {
+        intent_git::attribution::is_ignored_untracked(&worktree, &rel)
+    })
+    .await
+    .unwrap_or(false);
+    if ignored {
+        tracing::debug!(
+            path = rel_path,
+            "file-tracking: skipping attribution for a git-ignored path"
+        );
+    }
+    ignored
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

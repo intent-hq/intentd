@@ -188,11 +188,18 @@ pub(crate) fn no_caller() -> Error {
     Error::Internal("forbidden: request is not bound to a principal".to_string())
 }
 
+/// The refusal for an executor credential reaching a principal-scoped
+/// operation: it may only send executor link frames.
+pub(crate) fn executor_forbidden() -> Error {
+    Error::Forbidden("executor credentials may only run remote agents".into())
+}
+
 /// Resolve the current request's caller to a principal id. `None` when no
-/// caller is bound.
+/// caller is bound, or for an executor credential.
 pub(crate) async fn caller_principal_id(store: &Store) -> Result<Option<PrincipalId>> {
     match current_caller() {
-        None => Ok(None),
+        // An executor credential is not a person and acts for no principal.
+        None | Some(Caller::Executor { .. }) => Ok(None),
         Some(Caller::Wire { principal_id, .. }) => Ok(Some(principal_id)),
         Some(Caller::Agent { .. } | Caller::Daemon) => {
             Ok(Some(store.get_primary_principal().await?.id))
@@ -206,7 +213,7 @@ pub(crate) async fn caller_principal_id(store: &Store) -> Result<Option<Principa
 fn stamping_principal_id() -> Option<PrincipalId> {
     match current_caller() {
         Some(Caller::Wire { principal_id, .. }) => Some(principal_id),
-        Some(Caller::Agent { .. } | Caller::Daemon) | None => None,
+        Some(Caller::Agent { .. } | Caller::Daemon | Caller::Executor { .. }) | None => None,
     }
 }
 
@@ -409,7 +416,13 @@ impl Services {
                     .store
                     .get_workspace_member_role(workspace_id, &principal_id)
                     .await?;
-                if role != Some(intent_core::WorkspaceRole::Collaborator) {
+                if !matches!(
+                    role,
+                    Some(
+                        intent_core::WorkspaceRole::Collaborator
+                            | intent_core::WorkspaceRole::Manager
+                    )
+                ) {
                     return Ok(None);
                 }
                 false
@@ -832,6 +845,7 @@ impl Services {
         let principal = match &caller {
             Caller::Wire { principal_id, .. } => self.store.get_principal(principal_id).await?,
             Caller::Agent { .. } | Caller::Daemon => self.store.get_primary_principal().await?,
+            Caller::Executor { .. } => return Err(executor_forbidden()),
         };
         if principal.is_primary {
             self.spawn_primary_identity_refresh(principal.clone()).await;
@@ -904,7 +918,7 @@ impl Services {
         let caller_is_primary = match current_caller() {
             Some(Caller::Wire { principal_id, .. }) => principal_id == primary.id,
             Some(Caller::Agent { .. } | Caller::Daemon) => true,
-            None => false,
+            Some(Caller::Executor { .. }) | None => false,
         };
         if caller_is_primary {
             self.spawn_primary_identity_refresh(primary.clone()).await;
@@ -1058,7 +1072,11 @@ impl Services {
 
     /// The bound GitLab instance (`sourceControl.gitlab.host`) when it
     /// parses.
-    pub(crate) fn bound_gitlab_host(&self) -> Option<GitlabHost> {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn bound_gitlab_host(&self) -> Option<GitlabHost> {
         self.resolve_source_control_target("gitlab", None)
             .ok()
             .and_then(|t| match t {
@@ -1635,7 +1653,7 @@ mod tests {
             .revoke_all_principal_credentials(&revoked.id)
             .await
             .expect("revoke");
-        let services = Services::new(store);
+        let services = Services::new_isolated(store);
 
         let listed = services.principal_list_op().await.expect("daemon lists");
         assert_eq!(
@@ -1689,7 +1707,7 @@ mod tests {
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let primary = store.get_primary_principal().await.expect("primary");
         assert!(primary.login.is_none(), "fixture precondition: {primary:?}");
-        let services = Services::new(store).with_source_control(sc);
+        let services = Services::new_isolated(store).with_source_control(sc);
         (tmp, services, ws)
     }
 
@@ -1703,26 +1721,32 @@ mod tests {
     /// Poll the primary row until the background refresh linked it (bounded;
     /// no fixed sleep — the poll yields to the spawned task each round).
     async fn wait_until_linked(store: &Store) -> Principal {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let primary = store.get_primary_principal().await.expect("primary");
-                if primary.login.is_some() {
-                    return primary;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let primary = store.get_primary_principal().await.expect("primary");
+                    if primary.login.is_some() {
+                        return primary;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+            },
+        )
         .await
         .expect("primary identity refresh linked the row within the bound")
     }
 
     /// Poll until `probe` is true (bounded; yields to spawned tasks).
     async fn wait_until(probe: impl Fn() -> bool) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !probe() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                while !probe() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("observable outcome within the bound");
     }
@@ -2163,7 +2187,7 @@ mod tests {
         let primary = store.get_primary_principal().await.expect("primary");
         let guest = principal("guest");
         store.upsert_principal(&guest).await.expect("guest");
-        let services = Services::new(store);
+        let services = Services::new_isolated(store);
 
         let stamped = json!({ "fromPrincipalId": guest.id.0 });
         let mut resolver = MessageAuthorResolver::new(&services, &ws);
@@ -2248,7 +2272,7 @@ mod tests {
         for g in &guests {
             store.upsert_principal(g).await.expect("guest");
         }
-        let services = Services::new(store);
+        let services = Services::new_isolated(store);
 
         let row = |role: &str, metadata: Option<Value>| intent_core::AgentMessage {
             id: "m".to_string(),
@@ -2329,7 +2353,7 @@ mod tests {
         let primary = store.get_primary_principal().await.expect("primary");
         let guest = principal("guest");
         store.upsert_principal(&guest).await.expect("guest");
-        let services = Services::new(store);
+        let services = Services::new_isolated(store);
 
         let mut queue = vec![
             json!({ "id": "q1", "content": "hi", "queuedAt": now_iso(), "position": 0,

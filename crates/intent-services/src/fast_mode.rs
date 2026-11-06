@@ -15,6 +15,14 @@ pub(crate) fn refresh_options(options: &mut Option<Value>, response: Option<&Val
     }
 }
 
+/// The saved preference for `selection` (a provider id or a named-profile
+/// reference): only that selection's own `providers.fastMode` entry counts.
+/// A profile never falls back to its base provider's (Default) entry; an
+/// absent entry is off.
+pub(crate) fn preference(map: &std::collections::BTreeMap<String, bool>, selection: &str) -> bool {
+    map.get(selection).copied().unwrap_or(false)
+}
+
 pub(crate) async fn apply(
     conn: &Connection,
     session_id: &str,

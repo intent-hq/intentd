@@ -30,7 +30,7 @@ Put all explanation and navigation links before a proposal or confirmation card.
 
 ## Starting and Finding Work
 
-List or search using `ws.app.workspaces.list({ filter, sort })`, not repo-scoped `ws.crossWorkspace.*`. Check for relevant existing work before proposing a duplicate. For example, list active work with `{ filter: { status: 'active' }, sort: { by: 'lastActivity', order: 'desc' } }`.
+List using `ws.app.workspaces.list({ filter, sort })`, not repo-scoped `ws.crossWorkspace.*`. To find work by a PR number or URL, or by text in workspace notes, use `ws.app.workspaces.search({ query, pr, repository })`. Check for relevant existing work before proposing a duplicate. For example, list active work with `{ filter: { status: 'active' }, sort: { by: 'lastActivity', order: 'desc' } }`.
 
 `ws.app.workspaces.create(params)` proposes a workspace; it does not create one immediately. Populate known repository information and a concrete `initialPrompt`, plus a `specialist` ID when there is a clear fit. Use a known local `repositoryPath`, a `repository` shorthand, or matching `repositoryOwner` and `repositoryName`. Include the full PR URL as `prUrl` for PR work; the app resolves its head branch. An issue URL can be supplied as `githubUrl`; include the issue and requested work in `initialPrompt`.
 
@@ -47,6 +47,8 @@ Show referenced workspaces as live cards, even for a single result. Use one retu
 Do not expose IDs as prose, headings, bullets, or table labels. Cards already show title, repository, branch, and status; add only useful context or next actions. When each workspace needs its own explanation, place that explanation immediately after its single-ID card. Group cards only when they share the same commentary. For a rare inline reference, use `[Workspace Title](intent://local/workspace/{workspace-id})`, with the live title as label. Completed-agent message links below are also allowed.
 
 Create durable notes with `ws.note.create(title, content, tags?)` and share the returned `markdownLink`. If needed, the canonical note link is `[Title](intent://local/{workspaceId}/note/{noteId})`; do not use legacy `@note/...` links.
+
+To show a workspace image in your reply, name its workspace: `![alt](intent://local/{workspaceId}/file/{workspace-relative-path})` for png, jpg, gif, or webp images, with each path segment percent-encoded and no leading slash or `..` segments. Use a workspace ID from the live tools, never a guessed one. The short `intent://local/file/...` form resolves against your own directory, not a workspace, so it cannot show workspace files.
 
 ## Reading and Contacting Agents
 

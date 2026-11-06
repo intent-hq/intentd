@@ -1,0 +1,112 @@
+# Opt-in macOS compile and Clippy for a PR head, before it reaches the merge
+# queue. ci.yml's `build (aarch64-apple-darwin)` job is the first native macOS
+# signal and runs only on merge_group and main pushes, so a long-lived branch
+# could reach the queue never having been compiled for macOS: intentd#2910 was
+# ejected for a macOS-only `clippy::unused_async` (fixed by intentd#2934).
+# ci.yml's PR-time `macos-cross-lint` now catches that class on every PR from
+# Linux (stub C compiler); this native run remains the way to check a PR head
+# against the real SDK, e.g. for a change to C dependencies or build scripts.
+#
+# Never automatic, so ordinary PRs spend no paid macOS minutes:
+# - add the `ci:macos` label to a same-repo PR: it runs now and again on each
+#   push while the label stays (remove it to stop);
+# - or dispatch it for any branch or SHA, using main's copy of this file:
+#   gh workflow run macos-preflight.yml --repo intent-hq/intentd --ref main -f ref=<branch-or-sha>
+#
+# Advisory: the job name is distinct from ci.yml's checks and CI Gate does not
+# read it, so a red run never blocks a PR and a green run never satisfies the
+# queue. The check and Clippy commands are ci.yml's queue commands
+# (scripts/test-macos-ci-workflows.py keeps them in sync); the queue's macOS
+# runtime proofs stay queue-only.
+name: macOS preflight
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit SHA to check (empty = the ref this run was dispatched on)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # Routing runs only when the preflight will: unlabeled PRs skip the whole
+  # workflow at once, and fork PRs get no CI (see ci.yml's `pull_request`).
+  runner-route:
+    # A `labeled` event runs only for this label, so tagging a PR otherwise
+    # never reruns it.
+    if: github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo.full_name == github.repository && ((github.event.action == 'labeled' && github.event.label.name == 'ci:macos') || (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'ci:macos'))))
+    uses: ./.github/workflows/runner-route.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+
+  preflight:
+    name: macOS preflight (aarch64-apple-darwin)
+    needs: [runner-route]
+    # Runs whenever routing ran (only after an opt-in), even if routing failed:
+    # runs-on then falls back to WarpBuild, as ci.yml's `build` does.
+    if: ${{ !cancelled() && needs.runner-route.result != 'skipped' }}
+    # Job-level, not workflow-level: GitHub enters a workflow's group when the
+    # run is created, so adding an unrelated label would start a run that
+    # cancels the preflight in progress and then skips itself. A skipped job
+    # never joins this group; a new push to the PR does supersede the run.
+    concurrency:
+      group: macos-preflight-${{ github.event.pull_request.number || inputs.ref || github.ref }}
+      cancel-in-progress: true
+    # The idle self-hosted Apple Silicon runner (m1mac) when routing finds one,
+    # else WarpBuild's macOS runner, as ci.yml's `build` job.
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['macos-26-xlarge'] || fromJSON('["warp-macos-26-arm64-6x"]') }}
+    timeout-minutes: 60
+    env:
+      # WarpBuild runners also report runner.environment == 'self-hosted', so
+      # only the routed labels tell the persistent m1mac apart (as in ci.yml).
+      PERSISTENT: ${{ contains(fromJSON(needs.runner-route.outputs.runners || '{}')['macos-26-xlarge'], 'self-hosted') }}
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - name: Configure the self-hosted compiler cache
+        env:
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
+      # Shares ci.yml `build`'s persistent target dir on the single-slot m1mac,
+      # so a preflight warms the queue's compile and the cleanup below covers it.
+      - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
+        if: env.PERSISTENT == 'true'
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/build-aarch64-apple-darwin" >> "$GITHUB_ENV"
+      - name: Ensure macOS CI disk headroom
+        if: env.PERSISTENT == 'true'
+        run: python3 -I -B scripts/macos-ci-cleanup.py --apply
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: aarch64-apple-darwin
+          components: clippy
+      - name: Check (native production configuration)
+        run: cargo check --workspace --target aarch64-apple-darwin
+      - name: Clippy (target-gated code)
+        run: cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings

@@ -40,9 +40,9 @@ class ProbeTests(unittest.TestCase):
     def test_accepted_installer_is_used_without_a_manifest_override(self):
         module = probe.load_installer()
         self.assertEqual(module.configuration().identity,
-                         "a08355be6f7f7aafd77977b0cdf030dc32f3fdce9178ec1883e0b04d71629597")
+                         "7380cac4fc2afa570b234326bbfd7a1a416c9c72c6c788b4ea2d1a9e314354d1")
         self.assertEqual(module.DESCRIPTOR_SHA256,
-                         "592a378105c930444b42ecd2e52bf5c6a017a5539dfe69ef7a94fb570ac9588d")
+                         "0f3d23023f1f7be72fcf42a56eda39ee1c0ae50a0deb3579939579bed2d332f6")
 
     def test_modified_installer_is_rejected_before_import(self):
         fake_probe = self.root / "probe-claude-callback-native.py"
@@ -109,10 +109,14 @@ class ProbeTests(unittest.TestCase):
             probe.execute(missing)
         launch.assert_not_called()
         bad = self.root / "bad-bundle"; bad.write_bytes(b"not the sealed artifact")
-        with patch.object(probe, "run_bounded") as launch, redirect_stderr(io.StringIO()):
+        # check_os pins host library bytes that drift with distro updates;
+        # stub it so the refusal comes from the bad bundle, as asserted below.
+        with patch.object(probe, "check_os"), patch.object(probe, "run_bounded") as launch, \
+                redirect_stderr(io.StringIO()) as stderr:
             result = probe.main(["--case", "native", "--output", str(self.root / "out"),
                                  "--bundle", str(bad), "--intentd", str(self.root / "no-bridge")])
         self.assertEqual(result, 1)
+        self.assertIn(str(bad), stderr.getvalue())
         launch.assert_not_called()
         self.assertFalse((self.root / "out").exists())
 
@@ -137,7 +141,10 @@ class ProbeTests(unittest.TestCase):
     def test_failed_inert_proof_has_no_payload_fallback(self):
         refusal = {"stdout": "", "stderr": "fixture namespace denied", "returncode": 1,
                    "live_original_processes_after_cleanup": [], "reason": "exited"}
-        with patch.object(probe, "run_bounded", return_value=refusal) as launch:
+        # check_os pins the host's system library bytes, which change with
+        # every distro update; this case is about the fallback, not the pins.
+        with patch.object(probe, "check_os"), \
+                patch.object(probe, "run_bounded", return_value=refusal) as launch:
             result = probe.execute(self.args())
         self.assertEqual(result, 1)
         receipt = json.loads((self.root / "result/receipt.json").read_text())
@@ -422,7 +429,7 @@ class ServicesStartupRunnerTests(unittest.TestCase):
         facts = {
             "runner-verified": {"case": case, "testElf": probe.SERVICES_SHA,
                                 "bridge": probe.BRIDGE_SHA,
-                                "runtimeIdentity": "a08355be6f7f7aafd77977b0cdf030dc32f3fdce9178ec1883e0b04d71629597"},
+                                "runtimeIdentity": "7380cac4fc2afa570b234326bbfd7a1a416c9c72c6c788b4ea2d1a9e314354d1"},
             "ordinary-started": {"legacy": case == "legacy", "sessionId": "inert-session",
                                  "agent": "inert-agent", "workspace": "inert-workspace",
                                  "adapterPid": 10, "pendingEndpoint": "127.0.0.1:1"},

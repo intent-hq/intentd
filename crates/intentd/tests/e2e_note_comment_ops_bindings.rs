@@ -6,13 +6,13 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 
 use intent_core::{
-    now_iso, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, Workspace,
-    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, Workspace, WorkspaceApi,
+    WorkspaceId,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -23,49 +23,11 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         id: id.clone(),
         title: "E2E Note Comment Ops".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
         path: path.as_ref().map(|p| p.to_string_lossy().to_string()),
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
         worktree_path: path.map(|p| p.to_string_lossy().to_string()),
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -79,7 +41,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, tempfile::TempDir) {
 
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(tmp.path().to_path_buf())
         .with_event_bus(bus.clone());
 
@@ -403,6 +365,90 @@ async fn comment_respond_adds_reply_to_thread() {
     assert_eq!(result.comment.content, "Reply to comment");
     assert!(!result.thread.thread_id.is_empty());
     assert!(!result.message.is_empty());
+
+    drop(services);
+}
+
+/// intent-hq/intent#7186: once `comment.add` embeds anchor markers, `note.edit`
+/// must still match the visible text and keep the comment anchored.
+#[intent_test_macros::daemon_test]
+async fn note_edit_matches_visible_text_around_comment_anchor() {
+    let (services, ws, _tmp) = setup().await;
+
+    let note = services
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "t".to_string(),
+                content: Some("Alpha line here.\nBeta line here.\n".to_string()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create note")
+        .note;
+
+    let added = services
+        .comment_add(
+            ws.clone(),
+            note.id.clone(),
+            "Beta line here.".to_string(),
+            "Beta".to_string(),
+            "c".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("add comment");
+    assert!(added.anchored);
+
+    let result = services
+        .edit_note(
+            ws.clone(),
+            note.id.clone(),
+            NoteEditInput {
+                old: "Beta line here.".to_string(),
+                new: "Beta line edited.".to_string(),
+            },
+            None,
+        )
+        .await
+        .expect("edit matches visible text despite anchor markers");
+    assert!(result.ok);
+
+    let id = &added.comment_id;
+    let expected = format!(
+        "Alpha line here.\n<!--anchor:{id}:start-->Beta<!--anchor:{id}:end--> line edited.\n"
+    );
+    assert_eq!(result.new_content, expected);
+    let stored = services
+        .get_note(ws.clone(), note.id.clone())
+        .await
+        .expect("get note");
+    assert_eq!(stored.content, expected);
+
+    let listed = services
+        .comment_list(ws.clone(), note.id.clone(), None, None, None, true)
+        .await
+        .expect("list comments");
+    let thread = listed
+        .threads
+        .iter()
+        .find(|t| t.comments.iter().flatten().any(|c| c.id == *id))
+        .expect("thread for comment");
+    assert_eq!(thread.targeted_text.as_deref(), Some("Beta"));
+    let root = thread
+        .comments
+        .as_ref()
+        .and_then(|c| c.iter().find(|c| c.id == *id))
+        .expect("root comment");
+    assert_ne!(root.is_orphaned, Some(true));
 
     drop(services);
 }

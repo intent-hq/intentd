@@ -363,7 +363,9 @@ mod tests {
                 .stderr(log);
             let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
             let status = child
-                .wait_with_timeout(std::time::Duration::from_secs(60))
+                .wait_with_timeout(intentd_test_support::test_timeout(
+                    std::time::Duration::from_secs(60),
+                ))
                 .unwrap();
             // Reap even a timed-out worker before inspecting its directory.
             drop(child);

@@ -19,7 +19,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -154,6 +154,7 @@ fn gate() -> bool {
     }
 }
 
+#[track_caller]
 fn run_git(args: &[&str], cwd: &Path) {
     let out = Command::new("git")
         .args(args)
@@ -206,7 +207,7 @@ async fn boot() -> Fixture {
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
 
     let services = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(workspaces_root.clone())
             .with_branches_ls_remote_base(file_url(&dir.join("remotes")))
             .with_event_bus(bus.clone()),

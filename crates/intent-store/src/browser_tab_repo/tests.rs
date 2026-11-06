@@ -2,8 +2,7 @@
 
 use intent_core::{
     now_iso, AgentId, BrowserTabInput, BrowserTabSize, BrowserTabUpsertOutcome,
-    BrowserTabVisibility, ClientHostInfo, ClientId, Error, Workspace, WorkspaceActivity,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    BrowserTabVisibility, ClientHostInfo, ClientId, Error, Workspace, WorkspaceId,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -37,49 +36,9 @@ fn test_workspace(ws_id: &WorkspaceId, ts: &str) -> Workspace {
         id: ws_id.clone(),
         title: "Test".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.to_string(),
         updated_at: ts.to_string(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
-        browser_client_id: None,
-        pull_requests_total: None,
+        ..Default::default()
     }
 }
 
@@ -713,9 +672,12 @@ async fn concurrent_first_reports_admit_exactly_one_host() {
     };
     tokio::pin!(race);
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(200), &mut race)
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_millis(200)),
+            &mut race
+        )
+        .await
+        .is_err(),
         "both reports wait on the write connection"
     );
     drop(writer);
@@ -782,11 +744,11 @@ async fn failed_sync_persists_nothing() {
 #[tokio::test]
 async fn list_by_workspace_is_one_ordered_partial_index_scan() {
     let f = fixture().await;
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "EXPLAIN QUERY PLAN SELECT {} FROM browser_tab \
          WHERE workspace_id = ? AND closed_at IS NULL ORDER BY created_at, tab_id",
         super::COLUMNS
-    ))
+    )))
     .bind(&f.ws.0)
     .fetch_all(f.store.read_pool())
     .await
@@ -880,4 +842,150 @@ async fn workspace_delete_evicts_displayed_overlay() {
         .unwrap();
     assert!(matches!(reopened, BrowserTabUpsertOutcome::Opened(_)));
     assert_eq!(reopened.tab().displayed, None);
+}
+
+/// Superseded-host rehome (intent-hq/intent#8045): every **open** row
+/// hosted by one of `old_hosts` moves to `new_host` (claimed or not), with
+/// `changes: { hostClientId }` plus `displayed: null` when the fact was set;
+/// rows of other hosts and tombstones of an old host stay put.
+#[tokio::test]
+async fn reassign_browser_tabs_from_hosts_moves_only_open_rows_of_old_hosts() {
+    let f = fixture().await;
+    let new_host = ClientId("scope:client-a".to_string());
+    f.store
+        .upsert_client(
+            &new_host,
+            Some("Desktop A"),
+            None,
+            &ClientHostInfo::default(),
+        )
+        .await
+        .unwrap();
+    let agent = AgentId("agent-1".to_string());
+    let mut claimed = input(&f.ws, "stranded-claimed", "https://a.test/");
+    claimed.owner_agent_id = Some(agent.clone());
+    claimed.visibility = BrowserTabVisibility::Hidden;
+    claimed.displayed = Some(true);
+    f.store
+        .upsert_browser_tab(&f.host_a, claimed)
+        .await
+        .unwrap();
+    f.store
+        .upsert_browser_tab(&f.host_a, input(&f.ws, "stranded-user", "https://b.test/"))
+        .await
+        .unwrap();
+    f.store
+        .upsert_browser_tab(
+            &f.host_a,
+            input(&f.ws, "stranded-closed", "https://c.test/"),
+        )
+        .await
+        .unwrap();
+    f.store.close_browser_tab("stranded-closed").await.unwrap();
+    f.store
+        .upsert_browser_tab(&f.host_b, input(&f.ws, "other-host", "https://d.test/"))
+        .await
+        .unwrap();
+
+    let moved = f
+        .store
+        .reassign_browser_tabs_from_hosts(&new_host, std::slice::from_ref(&f.host_a), &|_| true)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = moved.iter().map(|(t, _)| t.tab_id.as_str()).collect();
+    assert_eq!(ids, ["stranded-claimed", "stranded-user"]);
+    assert_eq!(
+        moved[0].1,
+        json!({ "hostClientId": "scope:client-a", "displayed": null })
+    );
+    assert_eq!(moved[1].1, json!({ "hostClientId": "scope:client-a" }));
+    assert_eq!(moved[0].0.owner_agent_id.as_ref(), Some(&agent));
+
+    let rows = f.store.list_browser_tabs(&f.ws).await.unwrap();
+    let host_of = |id: &str| {
+        rows.iter()
+            .find(|t| t.tab_id == id)
+            .map(|t| t.host_client_id.0.clone())
+    };
+    assert_eq!(
+        host_of("stranded-claimed").as_deref(),
+        Some("scope:client-a")
+    );
+    assert_eq!(host_of("stranded-user").as_deref(), Some("scope:client-a"));
+    assert_eq!(host_of("other-host").as_deref(), Some("client-b"));
+    let tomb = f
+        .store
+        .get_stored_tab("stranded-closed")
+        .await
+        .unwrap()
+        .expect("tombstone kept");
+    assert!(tomb.closed);
+    assert_eq!(
+        tomb.tab.host_client_id, f.host_a,
+        "tombstones stay with the old host"
+    );
+
+    let again = f
+        .store
+        .reassign_browser_tabs_from_hosts(&new_host, std::slice::from_ref(&f.host_a), &|_| true)
+        .await
+        .unwrap();
+    assert!(again.is_empty(), "idempotent");
+    let none = f
+        .store
+        .reassign_browser_tabs_from_hosts(&new_host, &[], &|_| true)
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+}
+
+/// The rehome's final per-host decision runs while the transaction holds the
+/// store's only write connection (intent-hq/intent#8045): a concurrent
+/// `client.hello` cannot persist its client row — and so cannot bind — until
+/// the move commits. Hosts the predicate rejects are never written.
+#[tokio::test]
+async fn reassign_browser_tabs_from_hosts_decides_while_holding_the_write_connection() {
+    let f = fixture().await;
+    let new_host = ClientId("scope:client-a".to_string());
+    f.store
+        .upsert_client(
+            &new_host,
+            Some("Desktop A"),
+            None,
+            &ClientHostInfo::default(),
+        )
+        .await
+        .unwrap();
+    f.store
+        .upsert_browser_tab(&f.host_a, input(&f.ws, "a-tab", "https://a.test/"))
+        .await
+        .unwrap();
+    f.store
+        .upsert_browser_tab(&f.host_b, input(&f.ws, "b-tab", "https://b.test/"))
+        .await
+        .unwrap();
+    let pool = f.store.write_pool().clone();
+    let held = std::sync::atomic::AtomicBool::new(true);
+    let decide = |host: &ClientId| {
+        if pool.try_acquire().is_some() {
+            held.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        *host == f.host_a
+    };
+    let moved = f
+        .store
+        .reassign_browser_tabs_from_hosts(&new_host, &[f.host_a.clone(), f.host_b.clone()], &decide)
+        .await
+        .unwrap();
+    assert!(
+        held.load(std::sync::atomic::Ordering::SeqCst),
+        "the write connection is held while deciding"
+    );
+    let ids: Vec<&str> = moved.iter().map(|(t, _)| t.tab_id.as_str()).collect();
+    assert_eq!(ids, ["a-tab"]);
+    let b = f.store.get_browser_tab("b-tab").await.unwrap().unwrap();
+    assert_eq!(
+        b.host_client_id, f.host_b,
+        "a rejected host is never written"
+    );
 }

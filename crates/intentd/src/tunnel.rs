@@ -548,7 +548,8 @@ esac
         // Kill the child; the supervisor must stop advertising the address
         // while the restart/backoff loop has nothing serving it.
         std::fs::write(dir.path().join("exit-now"), b"").unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         loop {
             if sup.address().await.is_none() {
                 break;

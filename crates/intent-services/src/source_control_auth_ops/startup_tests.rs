@@ -32,9 +32,12 @@ async fn gitlab_poll_retains_late_commit_result_and_binding() {
         release: std::sync::Mutex::new(held),
     }));
     svc.gitlab_connect_device(host).await.unwrap();
-    timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         svc.gitlab_secret_store
             .load(GITLAB_SECRET_ACCOUNT)
@@ -50,7 +53,12 @@ async fn gitlab_poll_retains_late_commit_result_and_binding() {
     let pending = poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx).is_pending())).await;
     release.send(()).unwrap();
     if pending {
-        timeout(Duration::from_secs(5), drain).await.unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            drain,
+        )
+        .await
+        .unwrap();
     }
     server.await.unwrap();
     assert!(
@@ -301,18 +309,24 @@ impl DeferredStart {
         let svc = svc.clone();
         let host = self.host.clone();
         let task = tokio::spawn(async move { svc.gitlab_connect_device(host).await });
-        timeout(Duration::from_secs(5), self.entered.notified())
-            .await
-            .expect("startup reached private upstream");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            self.entered.notified(),
+        )
+        .await
+        .expect("startup reached private upstream");
         task
     }
 
     async fn finish(&self, task: JoinHandle<Result<Value>>) -> Result<Value> {
         self.release.notify_one();
-        timeout(Duration::from_secs(5), task)
-            .await
-            .unwrap()
-            .unwrap()
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap()
     }
 }
 
@@ -396,9 +410,12 @@ async fn gitlab_shutdown_joins_admitted_idle_poll_without_waiting_for_interval()
     assert!(svc.gitlab_auth.lock().await.flow.is_some());
     // The upstream cadence is 3600 seconds, with 900 seconds until expiry.
     // Shutdown wakes the idle poll; it does not wait for either deadline.
-    timeout(Duration::from_secs(5), svc.shutdown_store_writers())
-        .await
-        .expect("idle GitLab poll must observe shutdown before its next interval");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        svc.shutdown_store_writers(),
+    )
+    .await
+    .expect("idle GitLab poll must observe shutdown before its next interval");
     assert!(svc.store_tasks.is_closed());
     let state = svc.gitlab_auth.lock().await;
     assert!(state.flow.is_none());

@@ -23,15 +23,18 @@ use crate::reverse::{
 /// convention) so a bug that never forwards the frame surfaces as a clear
 /// test failure instead of hanging the runtime.
 fn mock_fe_replies_with(
-    mut out_rx: mpsc::Receiver<String>,
+    mut out_rx: mpsc::Receiver<crate::OutboundFrame>,
     reverse: ReverseChannel,
     reply: Value,
 ) -> tokio::task::JoinHandle<Value> {
     tokio::spawn(async move {
-        let frame = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
-            .await
-            .expect("daemon did not forward a reverse RPC within 2s")
-            .expect("daemon forwarded a reverse RPC");
+        let frame = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            out_rx.recv(),
+        )
+        .await
+        .expect("daemon did not forward a reverse RPC within 2s")
+        .expect("daemon forwarded a reverse RPC");
         let req: Value = serde_json::from_str(&frame).expect("valid JSON frame");
         let id = req["id"]
             .as_str()
@@ -127,7 +130,11 @@ async fn exec_rejects_missing_actions_before_forwarding() {
     assert!(err.to_string().contains("actions"));
     // Nothing was written to the outbound queue — validation short-circuits.
     assert!(matches!(
-        tokio::time::timeout(Duration::from_millis(20), out_rx.recv()).await,
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(20)),
+            out_rx.recv()
+        )
+        .await,
         Err(_) | Ok(None)
     ));
 }
@@ -144,9 +151,59 @@ async fn exec_rejects_empty_actions_before_forwarding() {
     assert_eq!(err.code(), browser_ops::INVALID_PARAMS);
     assert!(err.to_string().contains("empty"));
     assert!(matches!(
-        tokio::time::timeout(Duration::from_millis(20), out_rx.recv()).await,
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(20)),
+            out_rx.recv()
+        )
+        .await,
         Err(_) | Ok(None)
     ));
+}
+
+/// Client-triggered `browser.exec` must arm the 20s screenshot deadline at
+/// its own call site, not the 30s default, so an unanswered screenshot fails
+/// inside the agent JavaScript tool's 30s outer budget. The paused clock
+/// makes this exact: the screenshot settles by the screenshot deadline, while
+/// a request without a screenshot is still waiting then. No wall time passes.
+#[tokio::test(start_paused = true)]
+async fn exec_arms_the_screenshot_deadline_for_an_unanswered_screenshot() {
+    let just_past = crate::reverse::SCREENSHOT_REVERSE_TIMEOUT + Duration::from_millis(1);
+    assert!(just_past < crate::reverse::DEFAULT_REVERSE_TIMEOUT);
+    let (out_tx, mut out_rx) = mpsc::channel(8);
+    let reverse = ReverseChannel::new(out_tx);
+    let actions = |action: &str| {
+        serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+            "actions": [{ "action": action }]
+        }))
+        .unwrap()
+    };
+
+    let screenshot = actions("screenshot");
+    let err = tokio::time::timeout(just_past, exec(&screenshot, &reverse))
+        .await
+        .expect("an unanswered screenshot must settle on the screenshot deadline")
+        .expect_err("an unanswered screenshot must fail");
+    assert!(
+        err.to_string()
+            .contains("reverse request timed out: browser.exec"),
+        "unexpected error: {err}"
+    );
+
+    let list_tabs = actions("listTabs");
+    assert!(
+        tokio::time::timeout(just_past, exec(&list_tabs, &reverse))
+            .await
+            .is_err(),
+        "a request without a screenshot keeps the longer default deadline"
+    );
+
+    // Both requests really went out and sat unanswered; neither failed early
+    // on a closed channel.
+    for action in ["screenshot", "listTabs"] {
+        let frame: Value = serde_json::from_str(&out_rx.try_recv().expect("forwarded frame"))
+            .expect("valid JSON frame");
+        assert_eq!(frame["params"]["actions"][0]["action"], action);
+    }
 }
 
 #[tokio::test]
@@ -375,7 +432,7 @@ fn registry_with_live(
     let registry = PrimaryReverseRegistry::new();
     let (out_tx, _out_rx) = mpsc::channel(8);
     let guard = registry.register(ReverseChannel::new(out_tx), ReverseTransport::Wss);
-    guard.bind(ReverseClientIdentity {
+    guard.bind_hello(ReverseClientIdentity {
         client_id: client(client_id),
         name: Some(name.to_string()),
         capabilities: json!({ "browserExec": true }),

@@ -3,7 +3,7 @@
 // CI reads the shipping pin from intent-providers/src/config.rs and requires
 // every native Windows and Unix matrix case, including the cleanup audit.
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import {
@@ -17,6 +17,7 @@ import { createInterface } from 'node:readline';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { assertCleanupComplete, finishCleanup } from './pi-session-cleanup.mjs';
+import { stopWindowsProcessTree } from './pi-windows-shutdown.mjs';
 import diagnostics from './pi-diagnostics.cjs';
 const { Capture, safeValue, failureReport, publishEvidence } = diagnostics;
 
@@ -105,10 +106,7 @@ class AcpClient {
     // Kill the whole tree: on Windows the adapter's child is CMD, whose Pi child
     // is otherwise orphaned by child.kill(). Await closure before removing files.
     if (windows) {
-      if (this.child.exitCode === null) {
-        const killed = spawnSync('taskkill.exe', ['/PID', String(this.child.pid), '/T', '/F'], { timeout: timeoutMs });
-        assert.equal(killed.status, 0, `taskkill: ${killed.stderr}`);
-      }
+      await stopWindowsProcessTree(this.child, this.exited, { timeoutMs });
     } else {
       try { process.kill(-this.child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
     }

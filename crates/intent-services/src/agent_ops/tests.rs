@@ -6,13 +6,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod pending_completion;
+mod user_message_pages;
 
 use intent_acp::WorkspaceMcpServer;
 use intent_core::{
     now_iso, AgentDelegateInput, AgentId, AgentStatus, Error, MessageOrigin, NoteCreate,
-    NoteUpdateInput, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity,
-    WorkspaceApi, WorkspaceAttention, WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource,
-    WorkspaceId, WorkspaceStatus,
+    NoteUpdateInput, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceApi, WorkspaceGitRoot,
+    WorkspaceGitRootId, WorkspaceGitRootSource, WorkspaceId,
 };
 use std::time::Duration;
 
@@ -30,12 +30,16 @@ use intent_core::{ActorType, Event, EventActor, SessionStats};
 use crate::{EventBus, SubscriptionFilter};
 
 use crate::agent_ops::{
-    ensure_effort_supported_by_model, fetch_auggie_models, fetch_auggie_models_rich,
-    fetch_session_stats, finalize_model_rows, last_response_and_digest_from_blocks,
-    live_response_and_digest_from_blocks, parse_model_list_json, parse_model_list_output,
-    parse_session_stats_output, resolve_auggie_bin_with,
+    clamp_diagnostics_row_limit, ensure_effort_supported_by_model, fetch_auggie_models,
+    fetch_auggie_models_rich, fetch_session_stats, finalize_model_rows, fit_diagnostics,
+    last_response_and_digest_from_blocks, live_response_and_digest_from_blocks,
+    parse_model_list_json, parse_model_list_output, parse_session_stats_output,
+    resolve_auggie_bin_with, DiagnosticsSections, DIAGNOSTICS_BUDGET_BYTES,
+    DIAGNOSTICS_DEFAULT_ROW_LIMIT, DIAGNOSTICS_MAX_ROW_LIMIT, SESSION_BUDGET_BYTES,
+    SESSION_MESSAGES_PAGE_LIMIT,
 };
 use crate::agent_subscriptions::GroupPersistOp;
+use crate::test_support::fake_runtime::FakeRuntime;
 use crate::Services;
 use intent_core::MAX_DELEGATION_DEPTH;
 
@@ -82,8 +86,16 @@ pub(super) fn test_registry_with_default_provider(tmp: &TempDb) -> Arc<crate::Se
 /// `agent.setModel`'s cross-provider gate) pass without the real binary on the
 /// test host. Merges into the `providers.paths` map seeded by
 /// [`test_registry_with_default_provider`] rather than replacing it, so
-/// auggie's override survives.
+/// auggie's override survives. npx-only providers (Codex, Claude Code, pi)
+/// ignore path overrides: mark those with
+/// `test_support::provider_installed::mark_on` instead.
 pub(super) fn seed_provider_path(svc: &Services, provider_id: &str) {
+    assert!(
+        intent_providers::provider_config(provider_id)
+            .npx_only_package
+            .is_none(),
+        "{provider_id} ignores providers.paths; use test_support::provider_installed"
+    );
     let mut paths = svc.effective_settings().providers.paths;
     paths.insert(provider_id.to_string(), "/bin/sh".to_string());
     svc.settings_registry()
@@ -98,49 +110,9 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         id: id.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -150,7 +122,7 @@ pub(super) async fn setup() -> (TempDb, Services, WorkspaceId) {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let registry = test_registry_with_default_provider(&tmp);
-    let services = Services::new(store).with_settings_registry(registry);
+    let services = Services::new_isolated(store).with_settings_registry(registry);
     (tmp, services, ws)
 }
 
@@ -175,17 +147,17 @@ async fn setup_with_task_graph(
     registry
         .apply(&[("agentFeatures.taskGraph".into(), json!(enabled))])
         .expect("set taskGraph");
-    let services = Services::new(store).with_settings_registry(Arc::clone(&registry));
+    let services = Services::new_isolated(store).with_settings_registry(Arc::clone(&registry));
     (tmp, services, ws, registry, config_dir)
 }
 
-async fn setup_with_bus() -> (TempDb, Services, WorkspaceId, EventBus) {
+pub(super) async fn setup_with_bus() -> (TempDb, Services, WorkspaceId, EventBus) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let registry = test_registry_with_default_provider(&tmp);
-    let services = Services::new(store).with_settings_registry(registry);
+    let services = Services::new_isolated(store).with_settings_registry(registry);
     let bus = EventBus::new(services.store().clone());
     let services = services.with_event_bus(bus.clone());
     (tmp, services, ws, bus)
@@ -229,10 +201,13 @@ async fn delete_emits_agent_deleted_scoped_to_workspace() {
     let r = svc.agent_delete_op(id.clone(), None).await.expect("delete");
     assert_eq!(r["success"], json!(true));
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_DELETED);
     assert_eq!(batch[0].workspace_id, ws);
@@ -258,7 +233,11 @@ async fn delete_skips_emit_when_session_already_gone() {
     assert_eq!(r["success"], json!(true));
 
     // Nothing was emitted: the subscription stays empty within the window.
-    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    let res = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await;
     assert!(
         res.is_err(),
         "expected no agent:deleted emit for a missing session"
@@ -285,10 +264,13 @@ async fn retire_sets_mark_emits_event_and_preserves_the_row() {
     assert_eq!(r["success"], json!(true));
     let retired_at = r["retiredAt"].as_str().expect("retiredAt").to_string();
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_RETIRED);
     assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
@@ -296,7 +278,11 @@ async fn retire_sets_mark_emits_event_and_preserves_the_row() {
     assert_eq!(batch[0].data["reason"].as_str(), Some("handing off"));
 
     // The row survives with the mark set and the conversation intact.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.retired_at.as_deref(), Some(retired_at.as_str()));
 
     // Idempotent: a second retire preserves the original timestamp.
@@ -367,10 +353,13 @@ async fn retired_agents_are_inert_until_restored() {
         .await
         .expect("restore");
     assert_eq!(r["restored"], json!(true));
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch[0].event_type, AGENT_RESTORED);
     assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
 
@@ -818,7 +807,11 @@ async fn retire_and_restore_reject_cross_workspace_targets() {
         .await
         .expect_err("cross-workspace restore must fail");
     // The mark was never set.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.retired_at.is_none());
 }
 
@@ -833,7 +826,7 @@ async fn link_child(
 ) {
     let mut s = svc
         .store()
-        .get_agent_session(child)
+        .get_agent_session_with_transcript(child)
         .await
         .expect("child session");
     s.parent_agent_id = Some(parent.clone());
@@ -863,7 +856,11 @@ async fn retire_rejects_while_a_descendant_is_running_a_turn() {
     assert!(msg.contains("running a turn"), "got: {msg}");
     // Nothing mutated: neither the parent nor the child is retired.
     for id in [&parent, &child] {
-        let s = svc.store().get_agent_session(id).await.expect("session");
+        let s = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
         assert!(s.retired_at.is_none(), "no partial retire for {id}");
     }
 
@@ -896,7 +893,11 @@ async fn retire_rejects_while_a_descendant_is_running_a_turn() {
         "error names the grandchild: {msg}"
     );
     for id in [&parent, &child, &grandchild] {
-        let s = svc.store().get_agent_session(id).await.expect("session");
+        let s = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
         assert!(s.retired_at.is_none(), "no partial retire for {id}");
     }
 
@@ -912,6 +913,247 @@ async fn retire_rejects_while_a_descendant_is_running_a_turn() {
     svc.agent_retire_op(parent.clone(), Some(ws.clone()), None)
         .await
         .expect_err("retire with a pending descendant must fail");
+}
+
+/// Run `agent_retire_op` as the agent itself (`ws.agent.retire` scopes the
+/// call with `Caller::Agent`).
+async fn self_retire(
+    svc: &Services,
+    ws: &WorkspaceId,
+    id: &AgentId,
+) -> intent_core::Result<serde_json::Value> {
+    intent_core::with_caller(
+        intent_core::Caller::Agent {
+            agent_id: id.clone(),
+        },
+        svc.agent_retire_op(id.clone(), Some(ws.clone()), None),
+    )
+    .await
+}
+
+fn assert_last_top_level_refusal(err: &Error) {
+    assert!(
+        matches!(err, Error::InvalidParams(_)),
+        "expected InvalidParams, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("last active top-level agent"),
+        "got: {err}"
+    );
+}
+
+/// Guard: an agent may not self-retire when it is the workspace's last
+/// active top-level agent. Children, background agents, and retired
+/// top-level agents do not count as another top-level agent; nothing is
+/// mutated on refusal.
+#[tokio::test]
+async fn agent_self_retire_rejects_the_last_top_level_agent() {
+    let (_t, svc, ws) = setup().await;
+    let solo = create_agent(&svc, &ws, "Solo").await;
+
+    let err = self_retire(&svc, &ws, &solo)
+        .await
+        .expect_err("the only top-level agent must not self-retire");
+    assert_last_top_level_refusal(&err);
+
+    // A settled child is not top-level: still refused, and the child is not
+    // cascade-retired.
+    let child = create_agent(&svc, &ws, "Child").await;
+    link_child(&svc, &ws, &child, &solo, AgentStatus::RuntimeIdle).await;
+    // A background agent is not visible top-level either.
+    let bg = create_agent(&svc, &ws, "Background").await;
+    let mut bg_session = svc
+        .store()
+        .get_agent_session_with_transcript(&bg)
+        .await
+        .expect("bg");
+    bg_session.is_background = true;
+    svc.store()
+        .update_agent_session(&ws, &bg_session)
+        .await
+        .expect("mark background");
+    // An already-retired top-level agent does not count.
+    let gone = create_agent(&svc, &ws, "Gone").await;
+    svc.agent_retire_op(gone.clone(), Some(ws.clone()), None)
+        .await
+        .expect("retire bystander");
+
+    let err = self_retire(&svc, &ws, &solo)
+        .await
+        .expect_err("children/background/retired agents do not count");
+    assert_last_top_level_refusal(&err);
+    for id in [&solo, &child, &bg] {
+        let s = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
+        assert!(s.retired_at.is_none(), "{id} must not be retired");
+    }
+
+    // With a second active top-level agent the self-retire succeeds…
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    let r = self_retire(&svc, &ws, &solo)
+        .await
+        .expect("retire with a peer");
+    assert_eq!(r["success"], json!(true));
+    // …and the peer, now the last one, is refused in turn.
+    let err = self_retire(&svc, &ws, &peer)
+        .await
+        .expect_err("the remaining top-level agent must not self-retire");
+    assert_last_top_level_refusal(&err);
+}
+
+/// Run `agent_retire_op` as a user over the wire (`agent.retire`).
+async fn user_retire(
+    svc: &Services,
+    ws: &WorkspaceId,
+    id: &AgentId,
+) -> intent_core::Result<serde_json::Value> {
+    intent_core::with_caller(
+        intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Owner,
+        },
+        svc.agent_retire_op(id.clone(), Some(ws.clone()), None),
+    )
+    .await
+}
+
+/// The guard only covers top-level sessions: a child agent may still
+/// self-retire under the last top-level agent, and a user may retire it too.
+/// Daemon-internal (unbound) retires are not guarded.
+#[tokio::test]
+async fn last_top_level_guard_skips_children_and_daemon_callers() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Child").await;
+    let other_child = create_agent(&svc, &ws, "OtherChild").await;
+    link_child(&svc, &ws, &child, &parent, AgentStatus::RuntimeIdle).await;
+    link_child(&svc, &ws, &other_child, &parent, AgentStatus::RuntimeIdle).await;
+
+    self_retire(&svc, &ws, &child)
+        .await
+        .expect("a child agent may self-retire");
+    user_retire(&svc, &ws, &other_child)
+        .await
+        .expect("a user may retire a child agent");
+    svc.agent_retire_op(parent.clone(), Some(ws.clone()), None)
+        .await
+        .expect("a daemon-internal caller may retire the last top-level agent");
+}
+
+/// Guard: a user (wire `agent.retire`) may not retire the workspace's last
+/// active top-level agent either. The refusal speaks to the user, mutates
+/// nothing, and lifts once another top-level agent exists.
+#[tokio::test]
+async fn user_retire_rejects_the_last_top_level_agent() {
+    let (_t, svc, ws) = setup().await;
+    let solo = create_agent(&svc, &ws, "Solo").await;
+
+    let err = user_retire(&svc, &ws, &solo)
+        .await
+        .expect_err("a user must not retire the only top-level agent");
+    assert_last_top_level_refusal(&err);
+    assert!(
+        err.to_string().contains("Start another agent"),
+        "user-facing guidance: {err}"
+    );
+    let s = svc
+        .store()
+        .get_agent_session_with_transcript(&solo)
+        .await
+        .expect("session");
+    assert!(s.retired_at.is_none(), "nothing mutated on refusal");
+
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    user_retire(&svc, &ws, &solo)
+        .await
+        .expect("retire succeeds once a peer exists");
+    let err = user_retire(&svc, &ws, &peer)
+        .await
+        .expect_err("the remaining top-level agent is now protected");
+    assert_last_top_level_refusal(&err);
+}
+
+/// Two top-level agents self-retiring at the same time on separate worker
+/// threads: exactly one wins and the workspace keeps one active top-level
+/// agent. Repeated so a missing workspace gate shows up as a flake-free
+/// failure rather than a lucky interleaving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_self_retires_leave_one_top_level_agent() {
+    let (_t, svc, ws) = setup().await;
+    let mut survivor = create_agent(&svc, &ws, "A0").await;
+    for round in 1..=8 {
+        let rival = create_agent(&svc, &ws, &format!("B{round}")).await;
+        let spawn_retire = |id: AgentId| {
+            let (svc, ws) = (svc.clone(), ws.clone());
+            tokio::spawn(async move { self_retire(&svc, &ws, &id).await })
+        };
+        let (ra, rb) = tokio::join!(spawn_retire(survivor.clone()), spawn_retire(rival.clone()));
+        let (ra, rb) = (ra.expect("join a"), rb.expect("join b"));
+        assert_eq!(
+            usize::from(ra.is_ok()) + usize::from(rb.is_ok()),
+            1,
+            "round {round}: exactly one self-retire may win: {ra:?} / {rb:?}"
+        );
+        if ra.is_ok() {
+            survivor = rival;
+        }
+        let loser = ra.err().or(rb.err()).expect("one refusal");
+        assert_last_top_level_refusal(&loser);
+        let active = svc
+            .store()
+            .list_active_agent_session_summaries(&ws)
+            .await
+            .expect("list");
+        assert_eq!(
+            active.len(),
+            1,
+            "round {round}: one top-level agent survives"
+        );
+        assert_eq!(active[0].id, survivor);
+    }
+}
+
+/// A guarded retire that read its target before waiting on the workspace
+/// gate must not turn into a last-agent refusal when, meanwhile, a rival
+/// retire of the same target won and the last peer retired too: the late
+/// call reports the documented idempotent `alreadyRetired` result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guarded_retire_reports_already_retired_after_waiting_on_the_gate() {
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let peer = create_agent(&svc, &ws, "Peer").await;
+    let gate = svc.agent_retirement_gates.for_workspace(&ws);
+    let held = gate.lock().await;
+    let late = {
+        let (svc, ws, target) = (svc.clone(), ws.clone(), target.clone());
+        tokio::spawn(async move { user_retire(&svc, &ws, &target).await })
+    };
+    // The late call holds its own handle on the gate once it has read the
+    // (still unretired) target and is about to wait on the lock.
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while Arc::strong_count(&gate) < 2 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("late retire reaches the workspace gate");
+    for id in [&target, &peer] {
+        svc.agent_retire_op(id.clone(), Some(ws.clone()), None)
+            .await
+            .expect("daemon-internal retire");
+    }
+    drop(held);
+    let res = late
+        .await
+        .expect("join")
+        .expect("late retire is an idempotent retry");
+    assert_eq!(res["alreadyRetired"], json!(true), "{res}");
 }
 
 /// Cascade: retiring the parent retires every settled/idle descendant with
@@ -982,10 +1224,13 @@ async fn retire_cascades_to_settled_descendants() {
     // descendants (cascade reason naming the parent).
     let mut events = Vec::new();
     while events.len() < 3 {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription closed");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
         events.extend(batch);
     }
     let reason_of = |id: &AgentId| {
@@ -1007,16 +1252,24 @@ async fn retire_cascades_to_settled_descendants() {
     // Rows: parent + cascaded descendants retired; terminal child and
     // bystander untouched; the veteran keeps its original timestamp.
     for id in [&parent, &child, &grandchild] {
-        let s = svc.store().get_agent_session(id).await.expect("session");
+        let s = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
         assert!(s.retired_at.is_some(), "{id} retired by the cascade");
     }
     for id in [&done, &bystander] {
-        let s = svc.store().get_agent_session(id).await.expect("session");
+        let s = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
         assert!(s.retired_at.is_none(), "{id} must not be cascade-retired");
     }
     let s = svc
         .store()
-        .get_agent_session(&veteran)
+        .get_agent_session_with_transcript(&veteran)
         .await
         .expect("veteran");
     assert_eq!(
@@ -1033,9 +1286,12 @@ async fn retire_cascades_to_settled_descendants() {
         .expect("re-retire");
     assert_eq!(r2["alreadyRetired"], json!(true));
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no re-emit on the idempotent retire"
     );
 }
@@ -1059,7 +1315,11 @@ async fn restoring_the_parent_does_not_restore_cascaded_children() {
     svc.agent_retire_op(parent.clone(), Some(ws.clone()), None)
         .await
         .expect("retire parent");
-    let s = svc.store().get_agent_session(&child).await.expect("child");
+    let s = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert!(s.retired_at.is_some(), "child cascade-retired");
 
     let r = svc
@@ -1069,11 +1329,15 @@ async fn restoring_the_parent_does_not_restore_cascaded_children() {
     assert_eq!(r["restored"], json!(true));
     let s = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent");
     assert!(s.retired_at.is_none(), "parent restored");
-    let s = svc.store().get_agent_session(&child).await.expect("child");
+    let s = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert!(
         s.retired_at.is_some(),
         "cascaded child stays retired after the parent's restore"
@@ -1085,7 +1349,11 @@ async fn restoring_the_parent_does_not_restore_cascaded_children() {
         .await
         .expect("restore child");
     assert_eq!(r["restored"], json!(true));
-    let s = svc.store().get_agent_session(&child).await.expect("child");
+    let s = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert!(s.retired_at.is_none());
 }
 
@@ -1366,7 +1634,7 @@ async fn startup_heal_prunes_watches_for_retired_or_missing_parent() {
     let (live, target) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let retired = create_agent(&svc, &ws, "Retired").await;
         let deleted = create_agent(&svc, &ws, "Deleted").await;
         let live = create_agent(&svc, &ws, "Live").await;
@@ -1396,7 +1664,7 @@ async fn startup_heal_prunes_watches_for_retired_or_missing_parent() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -1420,7 +1688,7 @@ async fn group_rehydration_prunes_groups_for_retired_or_missing_parent() {
     {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let retired = create_agent(&svc, &ws, "Retired").await;
         let deleted = create_agent(&svc, &ws, "Deleted").await;
         let child = create_agent(&svc, &ws, "Child").await;
@@ -1429,7 +1697,8 @@ async fn group_rehydration_prunes_groups_for_retired_or_missing_parent() {
             svc.enroll_child_in_group(&gid, &child);
         }
         // Wait for both group rows to persist (the upsert is spawned).
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -1454,7 +1723,7 @@ async fn group_rehydration_prunes_groups_for_retired_or_missing_parent() {
     } // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .rehydrate_delegation_groups(&ws)
         .await
@@ -1496,7 +1765,7 @@ async fn completion_delivery_wakes_watching_parent_and_removes_watch() {
     // The parent received exactly one wake message via agent_send_message_op.
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(parent_session.messages.len(), 1);
@@ -1533,7 +1802,7 @@ async fn completion_delivery_leaves_group_watch_for_as4() {
     // No wake delivered and the group watch is left in place for AS-4.
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert!(parent_session.messages.is_empty());
@@ -2416,7 +2685,7 @@ async fn completion_delivery_attaches_event_notification_metadata() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -2481,7 +2750,7 @@ async fn cross_workspace_chief_watch_delivers_wake_in_parent_home_workspace() {
     // The chief parent received exactly one wake and the watch is consumed.
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(parent_session.messages.len(), 1);
@@ -2490,10 +2759,13 @@ async fn cross_workspace_chief_watch_delivers_wake_in_parent_home_workspace() {
 
     // `agent:subscriptions-changed` is published in the PARENT's home
     // workspace (`__chief__`), not the child's.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].workspace_id, chief_ws);
     assert_eq!(batch[0].data["agentId"].as_str(), Some(parent.0.as_str()));
@@ -2572,7 +2844,7 @@ async fn delegate_after_all_scope_gate_rejection_leaves_no_group() {
     assert!(svc.list_watches_for_parent(&parent).is_empty());
     let sessions = svc
         .store()
-        .list_agent_sessions(&ws_b)
+        .list_agent_sessions_with_transcripts(&ws_b)
         .await
         .expect("list ws-b sessions");
     assert!(
@@ -2609,7 +2881,8 @@ async fn chief_anchored_group_fires_aggregated_wake_to_chief_parent() {
 
     // The group persists under its anchor workspace (`__chief__`), so a
     // restart rehydrates it from the chief workspace, not the children's.
-    let seal_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let seal_deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let rows = svc
             .store()
@@ -2653,7 +2926,7 @@ async fn chief_anchored_group_fires_aggregated_wake_to_chief_parent() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("chief parent session");
     assert_eq!(
@@ -2699,7 +2972,7 @@ async fn group_fire_attaches_event_notification_metadata() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -2780,7 +3053,7 @@ async fn app_agents_wait_immediate_wakes_from_two_workspaces() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 2, "one wake per completed target");
@@ -2845,7 +3118,7 @@ async fn app_agents_wait_immediate_reconciles_already_settled_target() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::Completed;
@@ -2863,7 +3136,7 @@ async fn app_agents_wait_immediate_reconciles_already_settled_target() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "immediate synthetic wake");
@@ -2886,7 +3159,7 @@ async fn app_agents_wait_after_all_reconciles_already_settled_targets() {
     for (target, report) in [(&t1, "one done"), (&t2, "two done")] {
         let mut s = svc
             .store()
-            .get_agent_session(target)
+            .get_agent_session_with_transcript(target)
             .await
             .expect("target session");
         s.status = intent_core::AgentStatus::Completed;
@@ -2920,7 +3193,7 @@ async fn app_agents_wait_after_all_reconciles_already_settled_targets() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "exactly one aggregated wake");
@@ -2992,7 +3265,7 @@ async fn app_agents_wait_after_all_across_two_workspaces_single_aggregated_wake(
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "exactly one aggregated wake");
@@ -3012,7 +3285,7 @@ async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
     let (caller, t1, t2) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let caller = create_agent(&svc, &chief_ws, "Chief").await;
         let t1 = create_agent(&svc, &ws, "Target1").await;
         let t2 = create_agent(&svc, &ws, "Target2").await;
@@ -3028,7 +3301,8 @@ async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
 
         // Wait for the group row to persist under the chief anchor (the
         // upsert is spawned; completion recording below awaits persistence).
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -3059,11 +3333,14 @@ async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
     let store = Store::open(&tmp.path).await.expect("reopen store");
     // The second target finished while the daemon was down: its session is
     // Completed with a report and no interrupted row (the STAB-108 predicate).
-    let mut s2 = store.get_agent_session(&t2).await.expect("t2 session");
+    let mut s2 = store
+        .get_agent_session_with_transcript(&t2)
+        .await
+        .expect("t2 session");
     s2.status = intent_core::AgentStatus::Completed;
     s2.completion_report = Some("two".into());
     store.update_agent_session(&ws, &s2).await.expect("mark t2");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .rehydrate_delegation_groups(&chief_ws)
@@ -3075,7 +3352,7 @@ async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
     // wake to the caller covering both targets.
     let session = restarted
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(
@@ -3092,7 +3369,8 @@ async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
 /// Poll until the persisted `completion_watch` table reaches `expected` rows
 /// (registration/removal persistence is spawned, not awaited).
 async fn wait_for_persisted_watches(svc: &Services, expected: usize) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let rows = svc
             .store()
@@ -3115,7 +3393,8 @@ async fn wait_for_persisted_watches(svc: &Services, expected: usize) {
 /// reach `expected` (group persistence and sweeps are spawned, not awaited —
 /// intent#4460).
 async fn wait_for_persisted_groups(svc: &Services, ws: &WorkspaceId, expected: usize) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let rows = svc
             .store()
@@ -3280,7 +3559,7 @@ async fn completion_watch_survives_restart_and_fires_post_restart() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         svc.register_completion_watch(
@@ -3297,7 +3576,7 @@ async fn completion_watch_survives_restart_and_fires_post_restart() {
     }; // old Services dropped — simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -3315,7 +3594,7 @@ async fn completion_watch_survives_restart_and_fires_post_restart() {
         .await;
     let session = restarted
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "exactly one wake post-restart");
@@ -3333,7 +3612,7 @@ async fn completion_watch_rehydration_wakes_parent_for_downtime_completion() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         svc.register_completion_watch(
@@ -3353,7 +3632,7 @@ async fn completion_watch_rehydration_wakes_parent_for_downtime_completion() {
     // The child finished during the downtime (STAB-108 predicate: Completed
     // with a completion report).
     let mut s = store
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::Completed;
@@ -3362,7 +3641,7 @@ async fn completion_watch_rehydration_wakes_parent_for_downtime_completion() {
         .update_agent_session(&ws, &s)
         .await
         .expect("mark child");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .heal_completion_watches_on_startup()
@@ -3372,7 +3651,7 @@ async fn completion_watch_rehydration_wakes_parent_for_downtime_completion() {
 
     let session = restarted
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(
@@ -3408,7 +3687,7 @@ async fn completion_watch_rehydration_prunes_dead_rows() {
     let (gone_parent, live_parent) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let gone_parent = create_agent(&svc, &ws, "GoneParent").await;
         let live_parent = create_agent(&svc, &ws, "LiveParent").await;
         let child = create_agent(&svc, &ws, "Child").await;
@@ -3439,7 +3718,7 @@ async fn completion_watch_rehydration_prunes_dead_rows() {
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
     let mut s = store
-        .get_agent_session(&gone_parent)
+        .get_agent_session_with_transcript(&gone_parent)
         .await
         .expect("gone parent session");
     s.status = intent_core::AgentStatus::Deleted;
@@ -3447,7 +3726,7 @@ async fn completion_watch_rehydration_prunes_dead_rows() {
         .update_agent_session(&ws, &s)
         .await
         .expect("mark parent deleted");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .heal_completion_watches_on_startup()
@@ -3475,7 +3754,7 @@ async fn fired_completion_watch_does_not_rehydrate() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         svc.register_completion_watch(
@@ -3501,7 +3780,7 @@ async fn fired_completion_watch_does_not_rehydrate() {
     };
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -3510,7 +3789,7 @@ async fn fired_completion_watch_does_not_rehydrate() {
     assert!(restarted.find_watches_for_child(&child).is_empty());
     let session = restarted
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "only the pre-restart wake");
@@ -3531,7 +3810,7 @@ async fn restart_reconcile_skips_already_delivered_completion() {
     let (parent, child, baseline) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store).with_settings_registry(Arc::clone(&registry));
+        let svc = Services::new_isolated(store).with_settings_registry(Arc::clone(&registry));
         let parent = create_agent(&svc, &ws, "Parent").await;
         let resp = svc
             .agent_delegate_op(
@@ -3582,7 +3861,7 @@ async fn restart_reconcile_skips_already_delivered_completion() {
     {
         let store = Store::open(&tmp.path).await.expect("reopen to mark");
         let mut s = store
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         s.status = intent_core::AgentStatus::Completed;
@@ -3596,7 +3875,7 @@ async fn restart_reconcile_skips_already_delivered_completion() {
     // historical completion on either, and the re-armed watch stays armed.
     for restart in 1..=2 {
         let store = Store::open(&tmp.path).await.expect("reopen store");
-        let restarted = Services::new(store);
+        let restarted = Services::new_isolated(store);
         restarted
             .heal_completion_watches_on_startup()
             .await
@@ -3651,7 +3930,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
     // the registration-time reconcile must NOT fire the historical completion.
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::Completed;
@@ -3677,7 +3956,7 @@ async fn rearmed_watch_on_completed_child_waits_for_future_completion() {
     // exactly once — the normal single-delivery path is unchanged.
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.completion_report = Some("second".into());
@@ -3769,7 +4048,7 @@ async fn rearmed_watch_dedups_empty_report_completion() {
     // `completionReport: ""` — the marker must match and suppress it.
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::Completed;
@@ -3800,6 +4079,7 @@ async fn rearmed_watch_dedups_empty_report_completion() {
 #[tokio::test]
 async fn gap_b_settlement_records_marker_so_rearm_skips_stale_report() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -3807,7 +4087,7 @@ async fn gap_b_settlement_records_marker_so_rearm_skips_stale_report() {
     // with the hook still active.
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -3893,7 +4173,7 @@ async fn stale_reported_idle_does_not_suppress_newer_completion() {
     // report's idle event is finally processed.
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -4246,7 +4526,7 @@ async fn group_adoption_mid_window_retracts_held_report_into_aggregate_wake() {
     );
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("aggregate wake");
@@ -4310,7 +4590,7 @@ async fn restart_reconcile_delivers_terminal_after_progress_once() {
     let (parent, child, baseline) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store).with_settings_registry(Arc::clone(&registry));
+        let svc = Services::new_isolated(store).with_settings_registry(Arc::clone(&registry));
         let parent = create_agent(&svc, &ws, "Parent").await;
         let resp = svc
             .agent_delegate_op(
@@ -4334,7 +4614,8 @@ async fn restart_reconcile_delivers_terminal_after_progress_once() {
             .await
             .expect("re-arm");
         wait_for_persisted_watches(&svc, 1).await;
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -4358,7 +4639,7 @@ async fn restart_reconcile_delivers_terminal_after_progress_once() {
     {
         let store = Store::open(&tmp.path).await.expect("reopen to mark");
         let mut s = store
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         s.status = intent_core::AgentStatus::Completed;
@@ -4372,7 +4653,7 @@ async fn restart_reconcile_delivers_terminal_after_progress_once() {
     // stable durable delivery and atomic watch retirement are idempotent.
     for restart in 1..=2 {
         let store = Store::open(&tmp.path).await.expect("reopen store");
-        let restarted = Services::new(store);
+        let restarted = Services::new_isolated(store);
         restarted
             .heal_completion_watches_on_startup()
             .await
@@ -4404,7 +4685,7 @@ async fn restart_reconcile_skips_already_delivered_failure() {
     let (parent, child, baseline) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         let baseline = parent_message_count(&svc, &parent).await;
@@ -4461,7 +4742,7 @@ async fn restart_reconcile_skips_already_delivered_failure() {
     // not re-deliver on either, and the re-armed watch stays armed.
     for restart in 1..=2 {
         let store = Store::open(&tmp.path).await.expect("reopen store");
-        let restarted = Services::new(store);
+        let restarted = Services::new_isolated(store);
         restarted
             .heal_completion_watches_on_startup()
             .await
@@ -4608,7 +4889,7 @@ async fn fresh_watch_on_failed_child_delivers_historical_failure_once() {
     );
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("wake message");
@@ -4809,7 +5090,7 @@ async fn app_agents_send_persists_chief_attribution_and_source_link() {
 
     let target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     let delivered = target_session.messages.last().expect("delivered message");
@@ -4891,7 +5172,7 @@ async fn app_agents_send_delivers_despite_target_pending_questions() {
     });
     let target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     assert_eq!(
@@ -5002,7 +5283,7 @@ async fn app_agents_ask_ignores_same_target_progress_and_wakes_once_on_completio
 
     let mut target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     target_session.status = AgentStatus::RuntimeIdle;
@@ -5081,7 +5362,7 @@ async fn app_agents_ask_ignores_same_target_progress_and_wakes_once_on_completio
     svc.set_test_busy(&target, false);
     let mut target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     target_session.status = AgentStatus::RuntimeIdle;
@@ -5106,7 +5387,7 @@ async fn app_agents_ask_ignores_same_target_progress_and_wakes_once_on_completio
     assert!(svc.list_watches_for_parent(&chief).is_empty());
     let chief_session = svc
         .store()
-        .get_agent_session(&chief)
+        .get_agent_session_with_transcript(&chief)
         .await
         .expect("Chief session");
     // The ask target is not the Chief's delegation child, so the wake
@@ -5272,7 +5553,7 @@ async fn app_agents_ask_ignores_attention_and_stays_armed_for_completion() {
     assert!(watch.completion_only, "ask watch is completion-only");
     let chief_before = svc
         .store()
-        .get_agent_session(&chief)
+        .get_agent_session_with_transcript(&chief)
         .await
         .expect("Chief session")
         .messages
@@ -5288,7 +5569,7 @@ async fn app_agents_ask_ignores_attention_and_stays_armed_for_completion() {
     .expect("attention request");
     assert_eq!(
         svc.store()
-            .get_agent_session(&chief)
+            .get_agent_session_with_transcript(&chief)
             .await
             .expect("Chief after attention")
             .messages
@@ -5299,7 +5580,7 @@ async fn app_agents_ask_ignores_attention_and_stays_armed_for_completion() {
 
     let mut target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     target_session.status = AgentStatus::RuntimeIdle;
@@ -5318,7 +5599,7 @@ async fn app_agents_ask_ignores_attention_and_stays_armed_for_completion() {
     .await;
     assert_eq!(
         svc.store()
-            .get_agent_session(&chief)
+            .get_agent_session_with_transcript(&chief)
             .await
             .expect("Chief after completion")
             .messages
@@ -5377,14 +5658,14 @@ async fn app_agents_ask_does_not_adopt_an_unrelated_after_all_group() {
 
     let chief_before = svc
         .store()
-        .get_agent_session(&chief)
+        .get_agent_session_with_transcript(&chief)
         .await
         .expect("Chief session")
         .messages
         .len();
     let mut target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     target_session.status = AgentStatus::RuntimeIdle;
@@ -5404,7 +5685,7 @@ async fn app_agents_ask_does_not_adopt_an_unrelated_after_all_group() {
 
     assert_eq!(
         svc.store()
-            .get_agent_session(&chief)
+            .get_agent_session_with_transcript(&chief)
             .await
             .expect("Chief after completion")
             .messages
@@ -5430,7 +5711,7 @@ async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
             .insert_workspace(&workspace(&target_ws))
             .await
             .expect("workspace");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let chief = create_agent(&svc, &WorkspaceId::chief(), "Chief thread").await;
         let target = create_agent(&svc, &target_ws, "Remote target").await;
         svc.agent_send_message_op(chief.clone(), "source".into(), None, None, None, None)
@@ -5438,7 +5719,7 @@ async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
             .expect("persist source");
         let mut session = svc
             .store()
-            .get_agent_session(&target)
+            .get_agent_session_with_transcript(&target)
             .await
             .expect("target session");
         session.status = AgentStatus::Active;
@@ -5470,7 +5751,7 @@ async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
     };
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     assert_eq!(
         restarted
             .heal_completion_watches_on_startup()
@@ -5480,14 +5761,14 @@ async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
     );
     let before = restarted
         .store()
-        .get_agent_session(&chief)
+        .get_agent_session_with_transcript(&chief)
         .await
         .expect("Chief session")
         .messages
         .len();
     let mut target_session = restarted
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     target_session.status = AgentStatus::RuntimeIdle;
@@ -5512,7 +5793,7 @@ async fn app_agents_ask_watch_survives_restart_after_durable_registration() {
 
     let after = restarted
         .store()
-        .get_agent_session(&chief)
+        .get_agent_session_with_transcript(&chief)
         .await
         .expect("Chief session")
         .messages
@@ -5571,7 +5852,7 @@ async fn app_agents_ask_fails_closed_when_completion_watch_persistence_fails() {
     );
     let target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     assert!(
@@ -5632,11 +5913,14 @@ async fn strict_ask_registration_is_durable_before_in_memory_visibility() {
         .await
         .expect("release writer lock");
     drop(blocker);
-    timeout(Duration::from_secs(10), registration)
-        .await
-        .expect("registration unblocked")
-        .expect("registration task")
-        .expect("registration succeeds");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        registration,
+    )
+    .await
+    .expect("registration unblocked")
+    .expect("registration task")
+    .expect("registration succeeds");
     assert_eq!(svc.list_watches_for_parent(&chief).len(), 1);
     assert_eq!(
         svc.store()
@@ -5649,7 +5933,7 @@ async fn strict_ask_registration_is_durable_before_in_memory_visibility() {
 
     let mut target_session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     target_session.status = AgentStatus::RuntimeIdle;
@@ -5824,7 +6108,7 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
             ws.clone(),
             Some("Spec".into()),
             None,
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -5838,7 +6122,7 @@ async fn agent_lite_carries_metadata_and_activity_fields() {
     let v = serde_json::to_value(&lite).unwrap();
     // Nested metadata object (iOS `parseAgent` reads metadata.specialist /
     // isBackground / createdByAgentId).
-    assert_eq!(v["metadata"]["specialist"], "implementor");
+    assert_eq!(v["metadata"]["specialist"], "developer");
     assert_eq!(v["metadata"]["isBackground"], false);
     assert!(v["metadata"].get("createdByAgentId").is_none());
     // Activity flags are present; an idle agent (no worker, no watches) reports
@@ -6150,9 +6434,12 @@ async fn report_to_parent_keeps_waiting_projection_and_subscription_quiet() {
         .expect("report");
 
     assert!(
-        timeout(Duration::from_millis(100), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "progress report must not publish a subscription-state change"
     );
     let snapshot = serde_json::to_value(
@@ -6441,6 +6728,20 @@ fn live_preview_derivation_clips_trailing_partial_line() {
         last_response_and_digest_from_blocks(&blocks(&["First done\nfinal line no newline"]));
     assert_eq!(resp.as_deref(), Some("final line no newline"));
     assert_eq!(digest, None);
+}
+
+/// A reply that copied the HTML-escaped prompts block from an XML-escaped
+/// history replay must not surface `--&gt;` (or a prompt line) as the
+/// agent's last response; the literal block is stripped as before.
+#[test]
+fn last_response_strips_escaped_suggested_prompts_block() {
+    for text in [
+        "Report back when ready.\n\n&lt;!-- suggested-prompts\nRaise Type Check &amp; Lint's timeout.\n--&gt;",
+        "Report back when ready.\n\n<!-- suggested-prompts\nRaise the timeout.\n-->",
+    ] {
+        let (resp, _) = last_response_and_digest_from_blocks(&[text.to_owned()]);
+        assert_eq!(resp.as_deref(), Some("Report back when ready."), "{text}");
+    }
 }
 
 /// Live-turn overlay fallback: a slot whose blocks carry no text yet (early
@@ -6746,8 +7047,8 @@ async fn get_conversation_in_progress_tail_rebudgets_slim_page() {
     assert_eq!(tail["inProgress"], true, "live row always serves (anchor)");
     let page_bytes = serde_json::to_string(&res["messages"]).unwrap().len();
     assert!(
-        page_bytes <= SLIM_PAGE_BUDGET_BYTES + 110 * 1024,
-        "merged page bounded by budget + one message: {page_bytes}"
+        page_bytes <= SLIM_PAGE_BUDGET_BYTES + 1024,
+        "merged page bounded by the budget (plus separators): {page_bytes}"
     );
     // Rows evicted by the re-budget stay reachable: the re-minted token
     // resumes at the first evicted row and a token walk reconstructs all 6
@@ -6798,7 +7099,11 @@ async fn agent_lite_last_activity_overlays_live_stream_stamp() {
     let id = create_agent(&svc, &ws, "Streamer").await;
 
     // Freeze the persisted stamp in the past — a long turn's updated_at.
-    let mut s = svc.store().get_agent_session(&id).await.expect("session");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     s.updated_at = "2000-01-01T00:00:00Z".to_string();
     svc.store()
         .update_agent_session(&ws, &s)
@@ -6840,7 +7145,11 @@ async fn diagnostics_stale_responding_respects_live_stream_activity() {
     let id = create_agent(&svc, &ws, "LongTurn").await;
 
     // Responding status with a long-stale persisted stamp.
-    let mut s = svc.store().get_agent_session(&id).await.expect("session");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     s.status = intent_core::AgentStatus::Active;
     s.updated_at = "2000-01-01T00:00:00Z".to_string();
     svc.store()
@@ -6860,7 +7169,7 @@ async fn diagnostics_stale_responding_respects_live_stream_activity() {
 
     // No live turn: persisted staleness stands.
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let row = find_row(&result);
@@ -6876,7 +7185,7 @@ async fn diagnostics_stale_responding_respects_live_stream_activity() {
         vec![json!({ "type": "text", "id": "msg-1:0", "text": "still working…" })],
     );
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics live");
     let row = find_row(&result);
@@ -8010,8 +8319,8 @@ async fn get_conversation_slim_pages_are_byte_budgeted() {
         assert!(!msgs.is_empty(), "budgeted pages are never empty");
         let page_bytes = serde_json::to_string(&page["messages"]).unwrap().len();
         assert!(
-            page_bytes <= SLIM_PAGE_BUDGET_BYTES + 110 * 1024,
-            "page bounded by budget + one message: {page_bytes}"
+            page_bytes <= SLIM_PAGE_BUDGET_BYTES + 1024,
+            "page bounded by the budget (plus separators): {page_bytes}"
         );
         // Transcript-wide semantics are untouched by the trim: totals count
         // the whole transcript and `truncated` still means "older history
@@ -8128,12 +8437,17 @@ async fn get_conversation_slim_budget_counts_attached_author_bytes() {
     assert_eq!(dedup.len(), 12, "token walk has no duplicates");
 }
 
-/// Slim page budget edge: a single message over the whole page budget still
-/// serves alone (never an empty page, no infinite token loop), and the walk
-/// continues past it into older history.
+/// Slim page budget edge (§5.5 single-row bound): a message whose text alone
+/// is over the whole page budget is served cut down to fit — a preview with
+/// `textTruncated` / `textBytes` — instead of over budget, so it shares the
+/// page with older rows, and `agent.getMessageBlock` still rebuilds the full
+/// text byte for byte.
 #[tokio::test]
-async fn get_conversation_slim_single_overbudget_message_still_serves() {
-    use intent_core::{ConversationProjection, SLIM_PAGE_BUDGET_BYTES};
+async fn get_conversation_slim_single_overbudget_message_is_cut_to_fit() {
+    use intent_core::{
+        ConversationProjection, MessageBlockPage, SLIM_PAGE_BUDGET_BYTES,
+        SLIM_PROJECTION_BUDGET_BYTES,
+    };
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "BigOne").await;
     let small = svc
@@ -8171,27 +8485,46 @@ async fn get_conversation_slim_single_overbudget_message_still_serves() {
         )
         .await
         .expect("page 1");
+    assert!(
+        serde_json::to_string(&p1).unwrap().len() <= SLIM_PAGE_BUDGET_BYTES,
+        "the page fits the budget"
+    );
     let m1 = p1["messages"].as_array().unwrap();
-    assert_eq!(m1.len(), 1, "over-budget message serves alone");
-    assert_eq!(m1[0]["id"], huge.id.as_str());
-    let t = p1["nextToken"].as_str().expect("older rows remain");
-    let p2 = svc
-        .agent_get_conversation_op(
-            id,
-            None,
-            None,
-            Some(t.to_string()),
-            None,
-            None,
-            Some(ConversationProjection::Slim),
-            false,
-        )
-        .await
-        .expect("page 2");
-    let m2 = p2["messages"].as_array().unwrap();
-    assert_eq!(m2.len(), 1);
-    assert_eq!(m2[0]["id"], small.id.as_str());
-    assert!(p2["nextToken"].is_null());
+    assert_eq!(m1.len(), 2, "the cut row no longer crowds out older rows");
+    assert_eq!(m1[0]["id"], small.id.as_str());
+    assert_eq!(m1[1]["id"], huge.id.as_str());
+    let block = &m1[1]["contentBlocks"][0];
+    assert_eq!(block["textTruncated"], true);
+    assert_eq!(block["textBytes"], json!(huge_text.len()));
+    assert_eq!(
+        block["text"].as_str().unwrap(),
+        &huge_text[..SLIM_PROJECTION_BUDGET_BYTES]
+    );
+    assert!(p1["nextToken"].is_null());
+
+    let mut joined = String::new();
+    let mut offset = None;
+    loop {
+        let r = svc
+            .agent_get_message_block_page_op(
+                id.clone(),
+                huge.id.clone(),
+                "h".to_string(),
+                Some(ws.clone()),
+                MessageBlockPage {
+                    offset,
+                    max_bytes: None,
+                },
+            )
+            .await
+            .expect("block page");
+        joined.push_str(r["block"]["text"].as_str().expect("text slice"));
+        match r["nextOffset"].as_u64() {
+            Some(n) => offset = Some(n),
+            None => break,
+        }
+    }
+    assert_eq!(joined, huge_text, "getMessageBlock rebuilds the full text");
 }
 
 /// Slim page budget on the seek path (§5.5): an `aroundMessageId` page keeps
@@ -9636,11 +9969,14 @@ async fn set_model_normalizes_legacy_provider_aliases() {
 async fn set_model_bare_model_with_explicit_provider_id() {
     let (tmp, svc, ws) = setup().await;
     // The cross-provider switch below runs the availability gate against the
-    // target, so pin claude-code to a deterministic executable rather than
-    // depending on whether the test host happens to have it installed.
-    seed_provider_path(&svc, "claude-code");
+    // target, so mark claude-code installed rather than depending on whether
+    // the test host happens to have npx and the claude CLI.
+    crate::test_support::provider_installed::mark_on(&svc, &["claude-code"]);
     #[cfg(unix)]
-    let _cli_env = crate::test_support::installed_cli_env(tmp.path.parent().unwrap(), "claude");
+    let _cli_env = crate::test_support::installed_cli_env(
+        tmp.path.parent().unwrap(),
+        intent_providers::installed_cli::InstalledCli::Claude,
+    );
     #[cfg(not(unix))]
     let _fixture_owner = tmp;
     // Warm caches: claude-code claims `haiku`, auggie's catalog lacks it.
@@ -10068,7 +10404,11 @@ const DETAIL_ONLY_ROW_KEYS: &[&str] = &[
     "fileBlocks",
     "stats",
 ];
-const DETAIL_ONLY_METADATA_KEYS: &[&str] = &["pendingProposals", "proposalResolutions"];
+const DETAIL_ONLY_METADATA_KEYS: &[&str] = &[
+    "pendingProposals",
+    "proposalResolutions",
+    "proposalCreatedWorkspaces",
+];
 
 /// Build the worst-case-realistic `agent.list` row for the budget /
 /// allowlist goldens: one session with every optional field populated (ids,
@@ -10149,7 +10489,11 @@ async fn worst_case_agent_list_row(
         .expect("append assistant");
 
     let ts = now_iso();
-    let mut s = svc.store().get_agent_session(&id).await.expect("session");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     s.parent_agent_id = Some(parent.clone());
     s.backend_session_id = Some(AgentId::from("agent-11111111-2222-3333-4444-555555555555"));
     s.acp_session_id = Some("acp-01HZY8Q6W1V2K3M4N5P6R7S8T9".into());
@@ -10160,7 +10504,7 @@ async fn worst_case_agent_list_row(
         "m".repeat(NAME_CAP)
     ));
     s.reasoning_effort = Some("medium".into());
-    s.specialist = Some("implementor".into());
+    s.specialist = Some("developer".into());
     s.task_note_id = Some(intent_core::NoteId::from(
         "1d8c1e09-41fb-4b83-834a-781d012e2707",
     ));
@@ -10191,6 +10535,9 @@ async fn worst_case_agent_list_row(
         intent_core::PROPOSAL_RESOLUTIONS_KEY: {
             "prop-00": intent_core::PROPOSAL_OUTCOME_APPLIED,
             "prop-03": intent_core::PROPOSAL_OUTCOME_DISMISSED,
+        },
+        intent_core::PROPOSAL_CREATED_WORKSPACES_KEY: {
+            "prop-00": "ws-01HZY8Q6W1V2K3M4N5P6R7S8U4",
         },
         "isInitialAgent": true,
         "sponsorAgentId": parent.0,
@@ -10226,6 +10573,49 @@ async fn worst_case_agent_list_row(
         .set_agent_notifications_muted(ws, &id, true)
         .await
         .expect("mute");
+    // A remote agent at its caps: 128-byte node id and name, the longest
+    // placement error detail.
+    let node = "n".repeat(128);
+    let view = intent_core::remote_launch::RemotePlacementView {
+        node_id: node.clone(),
+        lease_id: uuid::Uuid::new_v4().to_string(),
+        node_name: "N".repeat(128),
+        placement: serde_json::from_value(json!({
+            "target": "remote", "checkout": "isolated", "os": "macos", "arch": "aarch64", "nodeId": node,
+        }))
+        .unwrap(),
+        effective_isolation: intent_core::remote_launch::EffectiveIsolation::Pending,
+        placement_error: Some(intent_core::remote_launch::PlacementError::from_node_error(
+            &format!("node-checkout-failed: {}", "e".repeat(4096)),
+        )),
+        base_commit: "0".repeat(40),
+        submodules: None,
+        // The longest setup status a row carries: every member, the error
+        // at its cap.
+        setup: Some(intent_core::remote_launch::RemoteSetupStatus {
+            state: intent_core::remote_launch::RemoteSetupState::Failed,
+            exit_code: Some(i32::MIN),
+            error: Some("e".repeat(intent_core::remote_launch::SETUP_ERROR_CAP_BYTES)),
+            started_at: Some("2026-11-05T12:00:00.000000000Z".into()),
+            finished_at: Some("2026-11-05T12:00:00.000000000Z".into()),
+            output: None,
+            output_truncated: None,
+        }),
+        setup_script: None,
+        skills: None,
+        shared_checkout_of: None,
+        parent_work: None,
+    };
+    svc.store()
+        .set_agent_session_metadata_key_json(
+            ws,
+            &id,
+            intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+            &serde_json::to_string(&view).unwrap(),
+            &ts,
+        )
+        .await
+        .expect("remote placement");
 
     seed_active_hook(svc, ws, &id, "Wait for CI on intentd PR").await;
     seed_active_hook(svc, ws, &id, "Wait for shipped alpha").await;
@@ -10338,6 +10728,10 @@ async fn agent_list_strips_detail_only_fields_get_keeps_them() {
             "prop-03": intent_core::PROPOSAL_OUTCOME_DISMISSED,
         })
     );
+    assert_eq!(
+        got["metadata"]["proposalCreatedWorkspaces"],
+        json!({ "prop-00": "ws-01HZY8Q6W1V2K3M4N5P6R7S8U4" })
+    );
     // And agent.get never applies the list caps either.
     assert!(
         got["metadata"]["attentionRequestReason"]
@@ -10373,6 +10767,7 @@ async fn agent_list_row_stays_within_row_budget() {
         AGENT_LIST_PATH_CAP_BYTES, AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
     };
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let (_id, row) = worst_case_agent_list_row(&svc, &ws).await;
 
     assert_eq!(
@@ -10415,6 +10810,13 @@ async fn agent_list_row_stays_within_row_budget() {
         row.last_tool_use.as_ref().unwrap()["inputTruncated"],
         json!(true)
     );
+    // Every shortened preview string carries its truncation flag, and the
+    // flags are measured inside the row budget below.
+    assert!(row.last_agent_response_truncated);
+    assert!(row.last_user_message_truncated);
+    assert!(row.digest_truncated);
+    assert!(row.metadata.completion_report_truncated);
+    assert!(row.metadata.attention_request_reason_truncated);
     assert_eq!(row.waiting_on_hooks.len(), 2);
     assert_eq!(row.waiting_on_pr_monitors.len(), 2);
     assert_eq!(row.waiting_for_agent_ids.len(), 1);
@@ -10452,6 +10854,7 @@ async fn agent_list_row_keys_match_allowlist_golden() {
         AGENT_LIST_ROW_METADATA_KEYS,
     };
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let (_id, row) = worst_case_agent_list_row(&svc, &ws).await;
     let wire = serde_json::to_value(&row).unwrap();
 
@@ -10559,30 +10962,40 @@ async fn create_rename_set_model_emit_agent_events() {
     });
 
     let id = create_agent(&svc, &ws, "Evented").await;
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("created recv")
-        .expect("sub closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("created recv")
+    .expect("sub closed");
     assert_eq!(batch[0].event_type, AGENT_CREATED);
     assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
 
     svc.agent_rename_op(id.clone(), "Renamed".into(), false)
         .await
         .expect("rename");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("renamed recv")
-        .expect("sub closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("renamed recv")
+    .expect("sub closed");
     assert_eq!(batch[0].event_type, AGENT_RENAMED);
     assert_eq!(batch[0].data["name"], "Renamed");
+    assert_eq!(batch[0].data["nameExplicitlySet"], json!(true));
 
     svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into(), None)
         .await
         .expect("setModel");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("updated recv")
-        .expect("sub closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("updated recv")
+    .expect("sub closed");
     assert_eq!(batch[0].event_type, AGENT_UPDATED);
     assert_eq!(batch[0].data["modelId"], "auggie:opus4.7");
 }
@@ -10602,9 +11015,12 @@ async fn skipped_rename_emits_no_event() {
         .expect("skip");
     assert_eq!(r["skipped"], json!(true));
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no agent:renamed expected for a skipped rename"
     );
 }
@@ -10678,7 +11094,11 @@ async fn legacy_checkbox_delegate_can_report_and_request_attention() {
         .await
         .expect("delegate checkbox task");
     let child = AgentId::from(delegated["agentId"].as_str().expect("agentId"));
-    let session = svc.store().get_agent_session(&child).await.expect("child");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert_eq!(session.task_note_id.as_ref(), Some(&note.id));
 
     let report = svc
@@ -10699,7 +11119,11 @@ async fn legacy_checkbox_delegate_can_report_and_request_attention() {
         .expect("legacy attention request");
     assert_eq!(attention["ok"], json!(true));
     assert!(attention.get("quarantined").is_none());
-    let session = svc.store().get_agent_session(&child).await.expect("child");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert_eq!(session.completion_report.as_deref(), Some("done"));
     assert_eq!(
         session.attention_request_kind.as_deref(),
@@ -10797,7 +11221,11 @@ async fn delegated_task_note_edits_do_not_suppress_report_to_parent() {
     assert_eq!(result["ok"], json!(true));
     assert!(result.get("quarantined").is_none());
 
-    let session = svc.store().get_agent_session(&child).await.expect("child");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert_eq!(
         session.completion_report.as_deref(),
         Some("incident regression covered")
@@ -10837,7 +11265,11 @@ async fn delegated_task_note_edits_do_not_suppress_attention_requests() {
         assert_eq!(result["ok"], json!(true));
         assert!(result.get("quarantined").is_none());
 
-        let session = svc.store().get_agent_session(&child).await.expect("child");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&child)
+            .await
+            .expect("child");
         assert_eq!(session.attention_request_kind.as_deref(), Some(kind));
         let note = svc
             .store()
@@ -11136,7 +11568,7 @@ async fn report_to_parent_without_linked_task_is_status_noop() {
     assert_eq!(r["ok"], json!(true));
     let session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     assert!(session.task_note_id.is_none());
@@ -11145,10 +11577,10 @@ async fn report_to_parent_without_linked_task_is_status_noop() {
 
 /// Workspace-scoping (Copilot review `PRRT_kwDOS9Wxuc6QIaRJ` on PR #104):
 /// `agent.delegate` loads the linked task note via `crate::fetch_note`, which
-/// is workspace-scoped. Passing a `taskNoteId` that belongs to another
-/// workspace must NOT leak the foreign note's title/content into the TASK-C
-/// preamble injected as the child's first message; the preamble is skipped and
-/// the message falls back to the caller-supplied `agentInstructions`.
+/// is workspace-scoped. A `taskNoteId` that belongs to another workspace is
+/// "not found" from this workspace's point of view, so the delegation is
+/// rejected (intent-hq/intent#7120) before any child is created — and the
+/// rejection must not leak the foreign note's title/content.
 #[intent_test_macros::daemon_test]
 async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
     let (_t, svc, ws_a) = setup().await;
@@ -11179,28 +11611,82 @@ async fn delegate_out_of_workspace_task_note_id_does_not_leak_into_preamble() {
         agent_instructions: Some("do the work".into()),
         ..Default::default()
     };
-    let resp = svc
+    let err = svc
         .agent_delegate_op(ws_a.clone(), input, None)
         .await
-        .expect("delegate");
-    let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
+        .expect_err("a task note from another workspace must be rejected");
+    assert!(
+        matches!(err, Error::InvalidParams(_)),
+        "out-of-workspace taskNoteId rejects with -32602: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("CROSS-WORKSPACE-SECRET"),
+        "the rejection must not leak the foreign note: {msg}"
+    );
+    let sessions = svc
+        .store()
+        .list_agent_sessions_with_transcripts(&ws_a)
+        .await
+        .expect("list ws_a sessions");
+    assert!(
+        sessions.is_empty(),
+        "a rejected delegation leaves no agent behind: {sessions:?}"
+    );
+}
 
-    let body = child_session_messages_json(&svc, &child).await;
+/// intent-hq/intent#7120: `agent.delegate` with a `taskNoteId` (or `noteId`)
+/// that does not exist must fail with `-32602` and create no agent, instead
+/// of returning `ok` and spawning an idle child bound to the missing id.
+#[intent_test_macros::daemon_test]
+async fn delegate_nonexistent_task_note_id_is_rejected_without_spawning() {
+    let (_t, svc, ws) = setup().await;
+
+    for input in [
+        AgentDelegateInput {
+            task_note_id: Some(intent_core::NoteId::from("no-such-task-123")),
+            ..Default::default()
+        },
+        AgentDelegateInput {
+            task_note_id: Some(intent_core::NoteId::from("no-such-task-123")),
+            agent_instructions: Some("do the work".into()),
+            ..Default::default()
+        },
+        AgentDelegateInput {
+            note_id: Some(intent_core::NoteId::from("no-such-note-456")),
+            task_text: Some("tick the box".into()),
+            ..Default::default()
+        },
+    ] {
+        let err = svc
+            .agent_delegate_op(ws.clone(), input.clone(), None)
+            .await
+            .expect_err("a nonexistent task note must be rejected");
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "nonexistent note id rejects with -32602: {err:?}"
+        );
+        let missing = input
+            .task_note_id
+            .as_ref()
+            .or(input.note_id.as_ref())
+            .expect("id")
+            .0
+            .clone();
+        assert!(
+            err.to_string().contains(&missing),
+            "the rejection names the missing id: {err}"
+        );
+    }
+
+    let sessions = svc
+        .store()
+        .list_agent_sessions_with_transcripts(&ws)
+        .await
+        .expect("list sessions");
     assert!(
-        body.contains("do the work"),
-        "explicit instructions must still reach the child: {body}"
-    );
-    assert!(
-        !body.contains("CROSS-WORKSPACE-SECRET-TITLE"),
-        "foreign note title must not leak into preamble: {body}"
-    );
-    assert!(
-        !body.contains("CROSS-WORKSPACE-SECRET-BODY"),
-        "foreign note body must not leak into preamble: {body}"
-    );
-    assert!(
-        !body.contains("**Your Task Note:**"),
-        "preamble must be skipped when the linked note is out of workspace: {body}"
+        sessions.is_empty(),
+        "a rejected delegation leaves no agent behind: {sessions:?}"
     );
 }
 
@@ -11333,7 +11819,7 @@ async fn report_to_parent_cross_workspace_rejected_and_has_no_side_effects() {
 
     let before = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("load child before");
     assert!(before.completion_report.is_none());
@@ -11357,7 +11843,7 @@ async fn report_to_parent_cross_workspace_rejected_and_has_no_side_effects() {
     // No side effects: the persisted session is byte-identical to `before`.
     let after = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("load child after");
     assert!(
@@ -11523,7 +12009,7 @@ async fn terminal_wake_suppresses_already_delivered_report() {
     assert_eq!(parent_message_count(&svc, &parent).await, baseline + 2);
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -11575,7 +12061,7 @@ async fn terminal_wake_renders_full_report_when_identity_stale() {
     .await;
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -11705,7 +12191,7 @@ async fn report_to_parent_debounce_settlement_retracts_and_combines() {
     // report event first (it happened first), then the terminal idle.
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -11769,7 +12255,8 @@ async fn report_to_parent_debounce_expiry_flushes_wake() {
 
     // The 1s hold expires; the release timer clears the hold marker so the
     // entry becomes a normal ready-to-send wake.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
     loop {
         let snapshot = svc.queue_snapshot(&parent);
         assert_eq!(snapshot.len(), 1, "parked wake stays queued: {snapshot:?}");
@@ -11859,16 +12346,19 @@ async fn report_to_parent_debounce_send_failure_restores_held_entry_for_retry() 
         .execute(svc.store().write_pool())
         .await
         .expect("remove failure trigger");
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if parent_message_count(&svc, &parent).await == baseline + 1
-                && svc.find_watches_for_child(&child).is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if parent_message_count(&svc, &parent).await == baseline + 1
+                    && svc.find_watches_for_child(&child).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry delivers the combined wake");
     assert!(
@@ -11877,7 +12367,7 @@ async fn report_to_parent_debounce_send_failure_restores_held_entry_for_retry() 
     );
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -11899,7 +12389,8 @@ async fn report_to_parent_debounce_send_failure_restores_held_entry_for_retry() 
 /// of its debounce hold (hold marker cleared, entry still undelivered).
 /// Returns the flushed entry's id.
 async fn wait_for_report_hold_flush(svc: &Services, parent: &AgentId) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
     loop {
         let snapshot = svc.queue_snapshot(parent);
         assert_eq!(snapshot.len(), 1, "parked wake stays queued: {snapshot:?}");
@@ -11965,7 +12456,7 @@ async fn report_to_parent_flushed_wake_retracted_at_settlement() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -12076,16 +12567,19 @@ async fn flushed_report_send_failure_restores_entry_for_retry() {
         .execute(svc.store().write_pool())
         .await
         .expect("remove failure trigger");
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if parent_message_count(&svc, &parent).await == baseline + 1
-                && svc.find_watches_for_child(&child).is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if parent_message_count(&svc, &parent).await == baseline + 1
+                    && svc.find_watches_for_child(&child).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry delivers the combined wake");
     let remaining = svc.queue_snapshot(&parent);
@@ -12101,7 +12595,7 @@ async fn flushed_report_send_failure_restores_entry_for_retry() {
     );
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -12172,7 +12666,7 @@ async fn debounce_zero_report_wake_retracted_at_settlement() {
     // (the busy-parent fallback shape).
     let immediate = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session")
         .messages
@@ -12221,7 +12715,7 @@ async fn debounce_zero_report_wake_retracted_at_settlement() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("terminal wake");
@@ -12323,7 +12817,7 @@ async fn group_settlement_retracts_flushed_report_into_aggregate_wake() {
     );
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let wake = session.messages.last().expect("aggregate wake");
@@ -12362,7 +12856,7 @@ async fn durable_completion_wake_retry_reuses_transcript_message_id() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), baseline + 1);
@@ -12452,22 +12946,25 @@ async fn failed_terminal_wake_retries_without_another_event() {
         .execute(svc.store().write_pool())
         .await
         .expect("remove failure trigger");
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if parent_message_count(&svc, &parent).await == 1
-                && svc.find_watches_for_child(&child).is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if parent_message_count(&svc, &parent).await == 1
+                    && svc.find_watches_for_child(&child).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry delivers and retires without another event");
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -12538,23 +13035,26 @@ async fn failed_aggregated_wake_retries_without_another_event() {
         .execute(svc.store().write_pool())
         .await
         .expect("remove failure trigger");
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if parent_message_count(&svc, &parent).await == 1
-                && svc.delegation_group_for_parent(&parent).is_none()
-                && svc.list_watches_for_parent(&parent).is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if parent_message_count(&svc, &parent).await == 1
+                    && svc.delegation_group_for_parent(&parent).is_none()
+                    && svc.list_watches_for_parent(&parent).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("group retry delivers and settles without another event");
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -12638,29 +13138,32 @@ async fn multi_watch_wake_failure_coalesces_one_retry_per_child() {
         .execute(svc.store().write_pool())
         .await
         .expect("remove failure trigger");
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if parent_message_count(&svc, &parent_a).await == 1
-                && parent_message_count(&svc, &parent_b).await == 1
-                && svc.find_watches_for_child(&child).is_empty()
-                && svc
-                    .completion_delivery_retries
-                    .lock()
-                    .expect("retries registry")
-                    .is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if parent_message_count(&svc, &parent_a).await == 1
+                    && parent_message_count(&svc, &parent_b).await == 1
+                    && svc.find_watches_for_child(&child).is_empty()
+                    && svc
+                        .completion_delivery_retries
+                        .lock()
+                        .expect("retries registry")
+                        .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("coalesced retry delivers every watch and clears its registry entry");
 
     for (parent, watch_id) in [(&parent_a, &watch_a), (&parent_b, &watch_b)] {
         let session = svc
             .store()
-            .get_agent_session(parent)
+            .get_agent_session_with_transcript(parent)
             .await
             .expect("parent session");
         assert_eq!(session.messages.len(), 1);
@@ -12743,19 +13246,22 @@ async fn clean_interim_retry_pass_stops_polling() {
         .await
         .expect("remove failure trigger");
 
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if svc
-                .completion_delivery_retries
-                .lock()
-                .expect("retries registry")
-                .is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if svc
+                    .completion_delivery_retries
+                    .lock()
+                    .expect("retries registry")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("clean interim pass retires the retry task instead of polling until retirement");
     assert_eq!(
@@ -12809,7 +13315,7 @@ async fn report_wake_says_reported_and_discloses_watch_is_still_armed() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let msg = session.messages.last().expect("report wake delivered");
@@ -12858,7 +13364,7 @@ async fn report_wake_without_watch_flip_has_no_disarm_disclosure() {
         .expect("report without watch");
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let msg = session.messages.last().expect("report wake delivered");
@@ -12898,7 +13404,7 @@ async fn report_wake_without_watch_flip_has_no_disarm_disclosure() {
         .expect("second report");
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let msg = session.messages.last().expect("second report wake");
@@ -13645,10 +14151,13 @@ async fn queue_message_emits_queue_updated_with_snapshot() {
         .expect("queue");
     let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert!(!batch.is_empty(), "expected at least one event");
     let evt = batch
         .iter()
@@ -13758,7 +14267,12 @@ async fn queue_reads_and_queue_updated_carry_resolved_author() {
     // The last `agent:queue:updated` (post agent-sent enqueue) lists both
     // entries with the same projection.
     let mut last_queue = None;
-    while let Ok(Some(batch)) = timeout(Duration::from_secs(2), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    {
         for evt in batch
             .iter()
             .filter(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -14181,7 +14695,7 @@ async fn queue_mutations_enforce_entry_ownership() {
     // Send-now — same visibility rule; the administrator force-sends anything.
     let rows_before = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("session")
         .messages
@@ -14200,7 +14714,7 @@ async fn queue_mutations_enforce_entry_ownership() {
     );
     assert_eq!(
         svc.store()
-            .get_agent_session(&id)
+            .get_agent_session_with_transcript(&id)
             .await
             .expect("session")
             .messages
@@ -14304,8 +14818,8 @@ async fn queue_mutations_recheck_ownership_against_the_entry_at_mutation_time() 
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let park = Arc::new(crate::script_ops::SupervisePark::default());
-    let svc = Services::new(store)
+    let park = Arc::new(crate::runtime_config::SupervisePark::default());
+    let svc = Services::new_isolated(store)
         .with_settings_registry(test_registry_with_default_provider(&tmp))
         .with_queue_mutation_gate_park(Arc::clone(&park));
     let id = create_agent(&svc, &ws, "Shared").await;
@@ -14361,9 +14875,12 @@ async fn queue_mutations_recheck_ownership_against_the_entry_at_mutation_time() 
                 }
             }))
         };
-        timeout(Duration::from_secs(10), park.entered.notified())
-            .await
-            .unwrap_or_else(|_| panic!("{op}: the guest op never reached the mutation window"));
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            park.entered.notified(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{op}: the guest op never reached the mutation window"));
 
         // The owner's send loses its slot (or its persist fails): the entry
         // is restored at the front of the live queue and leaves the overlay.
@@ -14371,10 +14888,13 @@ async fn queue_mutations_recheck_ownership_against_the_entry_at_mutation_time() 
         drop(draining);
         park.release.notify_one();
 
-        let result = timeout(Duration::from_secs(10), guest_op)
-            .await
-            .unwrap_or_else(|_| panic!("{op}: the guest op never completed"))
-            .expect("guest op task");
+        let result = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            guest_op,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{op}: the guest op never completed"))
+        .expect("guest op task");
         let err = match result {
             Ok(v) => panic!(
                 "{op}: a guest mutation of the restored foreign entry must be refused, got {v}"
@@ -14401,7 +14921,7 @@ async fn queue_mutations_recheck_ownership_against_the_entry_at_mutation_time() 
         );
         assert_eq!(
             svc.store()
-                .get_agent_session(&id)
+                .get_agent_session_with_transcript(&id)
                 .await
                 .expect("session")
                 .messages
@@ -14555,7 +15075,12 @@ async fn stamped_entries_stay_shared_when_the_principal_lookup_fails() {
     .await
     .expect("agent-sent queueMessage");
     let mut event_queue = None;
-    while let Ok(Some(batch)) = timeout(Duration::from_secs(5), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        sub.recv(),
+    )
+    .await
+    {
         for evt in batch
             .iter()
             .filter(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -14763,7 +15288,12 @@ async fn unstamped_human_entries_fail_closed_when_the_fallback_lookup_fails() {
     .await
     .expect("agent-sent queueMessage");
     let mut event_queue = None;
-    while let Ok(Some(batch)) = timeout(Duration::from_secs(5), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        sub.recv(),
+    )
+    .await
+    {
         for evt in batch
             .iter()
             .filter(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -14806,7 +15336,12 @@ async fn unstamped_human_entries_fail_closed_when_the_fallback_lookup_fails() {
     svc.publish_queue_processing(&id, &ws, std::slice::from_ref(&legacy))
         .await;
     let mut processing_event = None;
-    while let Ok(Some(batch)) = timeout(Duration::from_secs(5), processing.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        processing.recv(),
+    )
+    .await
+    {
         for evt in batch
             .iter()
             .filter(|e| e.event_type == intent_core::events::AGENT_QUEUE_PROCESSING)
@@ -15041,17 +15576,24 @@ async fn remove_queued_message_emits_queue_updated_only_when_present() {
         .await
         .expect("idempotent remove");
     assert_eq!(r["success"], true);
-    let none = timeout(Duration::from_millis(200), sub.recv()).await;
+    let none = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        sub.recv(),
+    )
+    .await;
     assert!(none.is_err(), "no event when nothing was removed");
 
     // Real remove emits with the empty snapshot.
     svc.agent_remove_queued_message_op(id.clone(), mid)
         .await
         .expect("remove");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let evt = batch
         .iter()
         .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -15137,10 +15679,13 @@ async fn clearing_editing_flag_emits_queue_updated() {
     svc.agent_edit_queued_message_op(id.clone(), mid.clone(), "draft".into(), Some(true))
         .await
         .expect("mark editing");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let evt = batch
         .iter()
         .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -15151,10 +15696,13 @@ async fn clearing_editing_flag_emits_queue_updated() {
     svc.agent_edit_queued_message_op(id.clone(), mid.clone(), "saved".into(), Some(false))
         .await
         .expect("save edit");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let evt = batch
         .iter()
         .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -15216,7 +15764,11 @@ async fn send_message_op_persists_message_metadata() {
         .await
         .expect("send");
     assert_eq!(r["queued"], false);
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.messages.len(), 1);
     metadata["submissionIds"] = json!([session.messages[0].id]);
     assert_eq!(
@@ -15255,7 +15807,7 @@ async fn send_to_task_store_only_fallback_persists_message_metadata() {
     assert_eq!(r["ok"], true);
     let session = svc
         .store()
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("session");
     assert_eq!(session.messages.len(), 1);
@@ -15319,7 +15871,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
         let id = id.to_string();
         async move {
             svc.store()
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .expect("session")
                 .messages
@@ -15334,7 +15886,7 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
         let text = text.to_string();
         async move {
             svc.store()
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .expect("session")
                 .messages
@@ -15660,6 +16212,12 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     // agent.create: the wire stores `initialMessage` on the session and
     // appends NO transcript row — the kickoff arrives through
     // `agent.sendMessage` (stamped above), so no unstamped row can exist.
+    // Only the creation arm needs Manager access; the messaging arms above
+    // deliberately exercise the ordinary Participant role.
+    svc.store()
+        .set_workspace_member_role(&ws, &alice, intent_core::WorkspaceRole::Manager)
+        .await
+        .expect("promote creator to Manager");
     let created = with_caller(wire(&alice), async {
         svc.agent_create(
             ws.clone(),
@@ -15680,7 +16238,9 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     .expect("agent.create");
     let kickoff = svc
         .store()
-        .get_agent_session(&AgentId::from(created["agent"]["id"].as_str().expect("id")))
+        .get_agent_session_with_transcript(&AgentId::from(
+            created["agent"]["id"].as_str().expect("id"),
+        ))
         .await
         .expect("kickoff session");
     assert_eq!(kickoff.initial_message.as_deref(), Some("first"));
@@ -15854,7 +16414,7 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
         async move {
             let row = svc
                 .store()
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .expect("session")
                 .messages
@@ -15871,7 +16431,7 @@ async fn collaborator_sender_preamble_on_every_human_authored_entry_point() {
         async move {
             let row = svc
                 .store()
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .expect("session")
                 .messages
@@ -16226,7 +16786,7 @@ async fn collaborator_sender_preamble_on_delegate_free_text() {
         async move {
             let row = svc
                 .store()
-                .get_agent_session(&child)
+                .get_agent_session_with_transcript(&child)
                 .await
                 .expect("child session")
                 .messages
@@ -16730,7 +17290,7 @@ async fn non_object_message_metadata_is_rejected_on_every_user_origin_entry_poin
     }
     let session = svc
         .store()
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .expect("session");
     assert!(
@@ -16816,9 +17376,12 @@ async fn edit_queued_message_restamp_rejection_leaves_entry_untouched() {
         .expect("entry still queued");
     assert_eq!(after, before, "rejected edit mutated the entry: {after}");
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "a rejected edit publishes no queue update"
     );
 
@@ -16900,7 +17463,7 @@ async fn assert_self_send_rejected(
     }
     let session = svc
         .store()
-        .get_agent_session(agent_id)
+        .get_agent_session_with_transcript(agent_id)
         .await
         .expect("session");
     assert!(
@@ -16912,9 +17475,12 @@ async fn assert_self_send_rejected(
         "no queue entry may be created for a self-targeted send"
     );
     assert!(
-        timeout(Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no event may be published for a self-targeted send"
     );
 }
@@ -17035,7 +17601,7 @@ async fn send_message_op_allows_other_sender_and_unattributed_sends() {
     .expect("unattributed send must succeed");
     let session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("session");
     assert_eq!(session.messages.len(), 2);
@@ -17093,9 +17659,12 @@ async fn queue_message_op_rejects_unknown_agent() {
         "no phantom queue entry may be created for an unknown agent"
     );
     assert!(
-        timeout(Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no agent:queue:updated event may be published for an unknown agent"
     );
 }
@@ -17266,7 +17835,11 @@ async fn send_message_op_preserves_answer_metadata_on_auto_queue() {
         .await
         .expect("drain queued answer");
     assert_ne!(drained["messageId"], "dup-id");
-    let session = svc.store().get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let answer = session.messages.last().unwrap();
     assert_eq!(json!(answer.id), drained["messageId"]);
     let answer_metadata = answer.metadata.as_ref().unwrap();
@@ -17414,7 +17987,11 @@ async fn file_blocks_inline_data_rejected_on_every_seam() {
     // spec note and no `workspace:created` event is left behind (both the
     // top-level `initialAgent.fileBlocks` and its `metadata.fileBlocks`
     // mirror).
-    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let workspaces_before = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     let notes_before = svc.store().list_all_notes().await.expect("notes").len();
     let created_events = || async {
         svc.store()
@@ -17454,7 +18031,10 @@ async fn file_blocks_inline_data_rejected_on_every_seam() {
         expect_rejected("workspace.create", err);
     }
     assert_eq!(
-        svc.list_workspaces(true).await.expect("list").len(),
+        svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .len(),
         workspaces_before,
         "workspace.create rejection must precede the workspace row"
     );
@@ -17718,7 +18298,11 @@ async fn workspace_create_rejects_every_invalid_input_before_side_effects() {
         ),
     ];
 
-    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let workspaces_before = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     let notes_before = svc.store().list_all_notes().await.expect("notes").len();
     let created_events = || async {
         svc.store()
@@ -17756,7 +18340,10 @@ async fn workspace_create_rejects_every_invalid_input_before_side_effects() {
             "{name}: rejection must come from this arm's validator; got: {msg}"
         );
         assert_eq!(
-            svc.list_workspaces(true).await.expect("list").len(),
+            svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .expect("list")
+                .len(),
             workspaces_before,
             "{name}: workspace.create rejection must precede the workspace row"
         );
@@ -17836,11 +18423,12 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
             false,
             extra(),
             None,
+            super::CreateModelSource::Caller,
         )
         .await
         .expect("plan while auggie is enabled and authenticated");
     assert_eq!(plan.model.as_deref(), Some("sonnet4.5"));
-    assert_eq!(plan.provider.as_deref(), Some("auggie"));
+    assert_eq!(plan.provider, "auggie");
     assert_eq!(plan.reasoning_effort.as_deref(), Some("high"));
 
     // Demote the planned provider on both create-seam gates between plan and
@@ -17861,6 +18449,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
             false,
             extra(),
             None,
+            super::CreateModelSource::Caller,
         )
         .await
         .expect_err("the demotion must reject a fresh plan");
@@ -17882,7 +18471,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
     let id = AgentId::from(created["agent"]["id"].as_str().expect("agent id"));
     let session = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("session row");
     assert_eq!(session.name, "Planned");
@@ -18044,7 +18633,7 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
     let id = AgentId::from(created["agent"]["id"].as_str().expect("agent id"));
     let session = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("session row");
     assert_eq!(
@@ -18055,7 +18644,11 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
 
     // `workspace.create` adopting root A: root A decides.
     let sessions_before = sessions().await;
-    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let workspaces_before = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     let notes_before = svc.store().list_all_notes().await.expect("notes").len();
     let created_events = || async {
         svc.store()
@@ -18086,7 +18679,10 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
         "rejection must persist no session"
     );
     assert_eq!(
-        svc.list_workspaces(true).await.expect("list").len(),
+        svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .len(),
         workspaces_before,
         "rejection must precede the workspace row"
     );
@@ -18117,7 +18713,7 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
     let id = AgentId::from(initial["id"].as_str().expect("agent id"));
     let session = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("session row");
     assert_eq!(session.workspace_id, result.workspace.id);
@@ -18741,8 +19337,8 @@ async fn summary_reports_counts_and_last_response() {
 async fn get_models_returns_empty_list_when_cli_unavailable() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let svc =
-        Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+    let svc = Services::new_isolated(store)
+        .with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
     let res = svc.agent_get_models_op().await.expect("models");
     let models = res["models"].as_array().unwrap();
     assert!(models.is_empty(), "no static fallback: {models:?}");
@@ -19616,11 +20212,12 @@ async fn event_subscription_delivers_batched_wake_to_subscriber() {
 
     // Wait for the batch window + delivery to land on the subscriber session
     // (generous deadline: the 2s batch window plus load-tolerant slack).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let session = svc
             .store()
-            .get_agent_session(&subscriber)
+            .get_agent_session_with_transcript(&subscriber)
             .await
             .expect("subscriber session");
         if !session.messages.is_empty() {
@@ -19690,7 +20287,7 @@ async fn event_subscription_excludes_self_and_unsubscribe_stops_delivery() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let session = svc
         .store()
-        .get_agent_session(&subscriber)
+        .get_agent_session_with_transcript(&subscriber)
         .await
         .expect("session");
     assert!(
@@ -19708,13 +20305,90 @@ async fn event_subscription_excludes_self_and_unsubscribe_stops_delivery() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let session = svc
         .store()
-        .get_agent_session(&subscriber)
+        .get_agent_session_with_transcript(&subscriber)
         .await
         .expect("session");
     assert!(
         session.messages.is_empty(),
         "unsubscribed subscriptions must not deliver"
     );
+}
+
+#[intent_test_macros::daemon_test]
+async fn discussion_rehydrated_agent_subscription_excludes_human_events() {
+    let (_tmp, svc, ws, bus) = setup_with_bus().await;
+    let subscriber = create_agent(&svc, &ws, "Watcher").await;
+    // An old row can name human discussions even though new admissions reject
+    // them. Exercise the actual startup rehydration and wake-delivery path.
+    let id = "legacy-discussion-subscription";
+    svc.store
+        .upsert_event_subscription(&intent_store::PersistedEventSubscription {
+            id: id.into(),
+            workspace_id: ws.clone(),
+            subscriber_agent_id: subscriber.clone(),
+            event_types: vec!["discussion:*".into(), "file:*".into()],
+            exclude_self: true,
+            batch_window_ms: 1,
+            created_at: now_iso(),
+        })
+        .await
+        .unwrap();
+    let subscribers = bus.subscriber_count();
+    assert_eq!(svc.heal_event_subscriptions_on_startup().await.unwrap(), 1);
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while bus.subscriber_count() <= subscribers {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("rehydrated subscription attached");
+    for (kind, data) in [
+        ("discussion:message", json!({"body":"human-secret"})),
+        ("file:changed", json!({"path":"sentinel.rs"})),
+    ] {
+        let _ = bus.publish_transient(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: now_iso(),
+            event_type: kind.into(),
+            actor: EventActor {
+                actor_type: ActorType::User,
+                id: Some("human".into()),
+                ..Default::default()
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data,
+        });
+    }
+    let messages = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let session = svc
+                    .store
+                    .get_agent_session_with_transcript(&subscriber)
+                    .await
+                    .unwrap();
+                if !session.messages.is_empty() {
+                    break session.messages;
+                }
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("allowed sentinel delivered");
+    let text = serde_json::to_string(&messages).unwrap();
+    assert!(text.contains("file:changed"));
+    assert!(!text.contains("human-secret"));
+    assert!(!text.contains("discussion:message"));
+    assert_eq!(messages.len(), 1);
+    svc.remove_event_subscription(id).await;
 }
 
 /// monorepo#937: agent-owned subscriptions persist and rehydrate on startup;
@@ -19727,7 +20401,7 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store).with_event_bus(bus);
+        let svc = Services::new_isolated(store).with_event_bus(bus);
         let subscriber = create_agent(&svc, &ws, "Watcher").await;
         let other = create_agent(&svc, &ws, "Worker").await;
         // `file:*` — agent event types are rejected for agent subscribers
@@ -19743,7 +20417,8 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
             .await
             .expect("subscribe");
         // The write-through persist is async; wait for the row to appear.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(3));
         loop {
             let rows = svc
                 .store()
@@ -19773,7 +20448,7 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
     // "Restart": fresh Services over the same database.
     let store = Store::open(&tmp.path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
-    let svc = Services::new(store).with_event_bus(bus.clone());
+    let svc = Services::new_isolated(store).with_event_bus(bus.clone());
     let loaded = svc
         .heal_event_subscriptions_on_startup()
         .await
@@ -19798,11 +20473,12 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
     })
     .await
     .expect("publish");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3));
     loop {
         let session = svc
             .store()
-            .get_agent_session(&subscriber)
+            .get_agent_session_with_transcript(&subscriber)
             .await
             .expect("session");
         if !session.messages.is_empty() {
@@ -19844,7 +20520,7 @@ async fn event_subscriptions_reject_and_prune_retired_subscribers() {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store).with_event_bus(bus);
+        let svc = Services::new_isolated(store).with_event_bus(bus);
         let subscriber = create_agent(&svc, &ws, "Watcher").await;
         svc.agent_subscribe(
             ws.clone(),
@@ -19856,7 +20532,8 @@ async fn event_subscriptions_reject_and_prune_retired_subscribers() {
         .await
         .expect("subscribe while live");
         // The write-through persist is async; wait for the row.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(3));
         loop {
             let rows = svc
                 .store()
@@ -19884,7 +20561,7 @@ async fn event_subscriptions_reject_and_prune_retired_subscribers() {
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
-    let svc = Services::new(store).with_event_bus(bus);
+    let svc = Services::new_isolated(store).with_event_bus(bus);
     let loaded = svc
         .heal_event_subscriptions_on_startup()
         .await
@@ -20008,7 +20685,7 @@ async fn diagnostics_reports_event_subscriptions() {
     .expect("subscribe");
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -20031,7 +20708,7 @@ async fn diagnostics_reports_event_subscriptions() {
     // The agentId filter scopes the event-subscription list too.
     let other = create_agent(&svc, &ws, "Other").await;
     let filtered = svc
-        .agent_diagnostics_op(ws.clone(), Some(other), None, None)
+        .agent_diagnostics_op(ws.clone(), Some(other), None, None, None)
         .await
         .expect("diagnostics filtered");
     assert_eq!(
@@ -20053,7 +20730,7 @@ async fn diagnostics_reports_event_subscriptions() {
     .await
     .expect("chief subscribe");
     let result = svc
-        .agent_diagnostics_op(ws, None, None, None)
+        .agent_diagnostics_op(ws, None, None, None, None)
         .await
         .expect("diagnostics with chief sub");
     let chief_entry = result["diagnostics"]["eventSubscriptions"]
@@ -20111,7 +20788,7 @@ async fn diagnostics_reports_queue_snapshots() {
     );
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -20151,7 +20828,7 @@ async fn diagnostics_reports_queue_snapshots() {
 
     // The agentId filter scopes the queue list too.
     let filtered = svc
-        .agent_diagnostics_op(ws.clone(), Some(sender.clone()), None, None)
+        .agent_diagnostics_op(ws.clone(), Some(sender.clone()), None, None, None)
         .await
         .expect("diagnostics filtered");
     assert_eq!(filtered["diagnostics"]["queues"], json!([]));
@@ -20161,7 +20838,7 @@ async fn diagnostics_reports_queue_snapshots() {
     svc.dequeue_message(&target).expect("drain interrupt");
     svc.dequeue_message(&target).expect("drain normal");
     let drained = svc
-        .agent_diagnostics_op(ws, None, None, None)
+        .agent_diagnostics_op(ws, None, None, None, None)
         .await
         .expect("diagnostics after drain");
     assert_eq!(drained["diagnostics"]["queues"], json!([]));
@@ -20169,6 +20846,125 @@ async fn diagnostics_reports_queue_snapshots() {
     let text = drained["text"].as_str().expect("text");
     assert!(text.contains("Queued agents: 0"), "text: {text}");
     assert!(!text.contains("Pending message queues:"), "text: {text}");
+}
+
+/// Agents this machine runs for another backend (the executor) have no
+/// session row here: `agent.memoryUsage` still lists them, from the launch
+/// the probe reports, tagged with `remoteOwner` and counted in `totalBytes`.
+/// They carry no `agentName` (the launch has none) and omit `model` when the
+/// launch gave none; a local row beside them is unchanged and has no
+/// `remoteOwner`. Rows of both kinds sort together by `memoryBytes`.
+#[tokio::test]
+async fn agent_memory_usage_lists_executor_run_agents_with_their_owner() {
+    use crate::agent_manager::{
+        AgentMemorySnapshot, ProcessSample, RemoteAgentMemory, RemoteAgentRoot, RemoteOwner,
+        TreeMemoryProbe, TreeSample,
+    };
+    use std::collections::HashMap;
+
+    struct Probe(AgentMemorySnapshot);
+    impl TreeMemoryProbe for Probe {
+        fn sample(&self) -> Option<TreeSample> {
+            Some(TreeSample {
+                memory_bytes: 0,
+                seq: 1,
+                available_memory: None,
+            })
+        }
+        fn agent_memory_snapshot(&self) -> Option<AgentMemorySnapshot> {
+            Some(self.0.clone())
+        }
+    }
+    let proc = |pid: u32, parent_pid: u32, name: &str, memory_bytes: u64| ProcessSample {
+        pid,
+        parent_pid,
+        name: name.to_string(),
+        cmdline: format!("/bin/{name}"),
+        memory_bytes,
+    };
+
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let local = create_agent(&svc, &ws, "Local").await;
+    let sink: Arc<dyn intent_acp::EventSink> = Arc::new(crate::BusEventSink::new(bus));
+    let manager = Arc::new(crate::agent_manager::AgentManager::new(
+        svc.clone(),
+        sink,
+        4,
+    ));
+    svc.attach_agent_manager(&manager);
+    let owner = RemoteOwner {
+        backend_id: "head-1".to_string(),
+        backend_name: "Studio".to_string(),
+    };
+    manager.set_tree_probe(Arc::new(Probe(AgentMemorySnapshot {
+        sampled_at: Some("2026-11-03T07:00:00Z".to_string()),
+        processes: HashMap::from([(local.clone(), vec![proc(100, 1, "node", 3_000)])]),
+        remote: vec![
+            RemoteAgentMemory {
+                agent: RemoteAgentRoot {
+                    agent_id: AgentId("agent-remote-big".to_string()),
+                    workspace_id: WorkspaceId("ws-on-head".to_string()),
+                    provider: "claude-code".to_string(),
+                    model: Some("opus".to_string()),
+                    owner: owner.clone(),
+                    root_pid: 500,
+                },
+                processes: vec![proc(500, 1, "claude", 4_000), proc(501, 500, "rg", 1_000)],
+            },
+            RemoteAgentMemory {
+                agent: RemoteAgentRoot {
+                    agent_id: AgentId("agent-remote-small".to_string()),
+                    workspace_id: WorkspaceId("ws-on-head".to_string()),
+                    provider: "codex".to_string(),
+                    model: None,
+                    owner,
+                    root_pid: 600,
+                },
+                processes: vec![proc(600, 1, "codex", 1_000)],
+            },
+        ],
+    })));
+
+    let result = svc.agent_memory_usage().await.expect("memory usage");
+    assert_eq!(result["totalBytes"], json!(9_000), "{result}");
+    let agents = result["agents"].as_array().expect("agents");
+    assert_eq!(
+        agents
+            .iter()
+            .map(|a| a["agentId"].as_str().expect("id"))
+            .collect::<Vec<_>>(),
+        vec!["agent-remote-big", local.0.as_str(), "agent-remote-small"],
+        "local and remote rows sort together: {result}"
+    );
+    assert_eq!(
+        agents[0],
+        json!({
+            "agentId": "agent-remote-big",
+            "workspaceId": "ws-on-head",
+            "provider": "claude-code",
+            "model": "opus",
+            "remoteOwner": { "backendId": "head-1", "backendName": "Studio" },
+            "rootPid": 500,
+            "processCount": 2,
+            "memoryBytes": 5_000,
+            "processes": [
+                { "pid": 500, "parentPid": 1, "name": "claude", "cmdline": "/bin/claude", "memoryBytes": 4_000 },
+                { "pid": 501, "parentPid": 500, "name": "rg", "cmdline": "/bin/rg", "memoryBytes": 1_000 },
+            ],
+        })
+    );
+    assert!(
+        agents[2].get("model").is_none(),
+        "no model: omitted, never null"
+    );
+    assert!(agents[2].get("agentName").is_none());
+    let local_row = &agents[1];
+    assert_eq!(local_row["agentName"], json!("Local"));
+    assert_eq!(local_row["workspaceId"], json!(ws.0));
+    assert!(
+        local_row.get("remoteOwner").is_none(),
+        "local rows carry no owner tag: {local_row}"
+    );
 }
 
 /// intent-hq/monorepo#2669: `agent.diagnostics` agent rows carry
@@ -20207,7 +21003,7 @@ async fn diagnostics_reports_conversation_bytes_and_large_conversation_risk() {
     }
 
     let result = svc
-        .agent_diagnostics_op(ws, None, None, None)
+        .agent_diagnostics_op(ws, None, None, None, None)
         .await
         .expect("diagnostics");
     let rows = result["diagnostics"]["agents"].as_array().expect("agents");
@@ -20285,7 +21081,7 @@ async fn diagnostics_reports_subtree_memory_bytes() {
 
     // No manager attached: the field is absent everywhere.
     let before = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics without manager");
     for row in before["diagnostics"]["agents"].as_array().expect("agents") {
@@ -20308,7 +21104,7 @@ async fn diagnostics_reports_subtree_memory_bytes() {
     )]))));
 
     let result = svc
-        .agent_diagnostics_op(ws, None, None, None)
+        .agent_diagnostics_op(ws, None, None, None, None)
         .await
         .expect("diagnostics");
     let rows = result["diagnostics"]["agents"].as_array().expect("agents");
@@ -20378,6 +21174,7 @@ async fn agent_memory_usage_reports_per_agent_process_rows() {
                 .then(|| AgentMemorySnapshot {
                     sampled_at: Some("2026-09-20T07:00:00Z".to_string()),
                     processes: self.rows.clone(),
+                    remote: Vec::new(),
                 })
         }
     }
@@ -20523,7 +21320,7 @@ async fn diagnostics_reports_last_turn_silent_tail_and_long_tail_risk() {
     svc.record_turn_silent_tail(&stalled, threshold + 60_000);
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let rows = result["diagnostics"]["agents"].as_array().expect("agents");
@@ -20567,7 +21364,7 @@ async fn diagnostics_reports_last_turn_silent_tail_and_long_tail_risk() {
     // turn clears the risk.
     svc.record_turn_silent_tail(&stalled, 800);
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics after healthy turn");
     let rows = result["diagnostics"]["agents"].as_array().expect("agents");
@@ -20627,7 +21424,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         MessageOrigin::Automatic,
     );
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics fresh");
     assert!(
@@ -20658,7 +21455,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         MessageOrigin::Automatic,
     );
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics stale");
     let risk = result["diagnostics"]["stuckRisks"]
@@ -20686,7 +21483,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
             intent_core::Caller::Agent {
                 agent_id: target.clone(),
             },
-            svc.agent_diagnostics_op(ws.clone(), filter, None, None),
+            svc.agent_diagnostics_op(ws.clone(), filter, None, None, None),
         )
         .await
         .expect("recipient diagnostics");
@@ -20715,7 +21512,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
     // until the turn ends: no risk even with the old entry.
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("session");
     s.status = intent_core::AgentStatus::Active;
@@ -20725,7 +21522,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         .await
         .expect("mark responding");
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics responding");
     assert!(
@@ -20740,7 +21537,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
     // A stale-responding agent is NOT actively draining — the risk returns.
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("session");
     s.status = intent_core::AgentStatus::Active;
@@ -20750,7 +21547,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         .await
         .expect("mark stale responding");
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics stale responding");
     assert!(
@@ -20769,7 +21566,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         guard.get_mut(&target).expect("queue")[0].editing = true;
     }
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics editing");
     assert!(
@@ -20790,7 +21587,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         q[0].queued_at = "not-a-timestamp".into();
     }
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics unparseable");
     assert!(
@@ -20824,7 +21621,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
     // actively-responding skip.
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("session");
     s.status = intent_core::AgentStatus::Idle;
@@ -20833,7 +21630,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         .await
         .expect("mark idle");
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics pending questions");
     let risk = result["diagnostics"]["stuckRisks"]
@@ -20868,7 +21665,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         m.id.clone()
     };
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics user-origin under pending questions");
     let risk = result["diagnostics"]["stuckRisks"]
@@ -20888,7 +21685,7 @@ async fn diagnostics_flags_stale_undelivered_queue_entry() {
         .await
         .expect("archive");
     let result = svc
-        .agent_diagnostics_op(ws, None, None, None)
+        .agent_diagnostics_op(ws, None, None, None, None)
         .await
         .expect("diagnostics archived");
     assert!(
@@ -20911,7 +21708,7 @@ async fn workspace_delete_cleans_up_event_subscriptions() {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let bus = EventBus::new(store.clone());
-    let svc = Services::new(store)
+    let svc = Services::new_isolated(store)
         .with_event_bus(bus)
         .with_workspaces_root(tmp.path.with_extension("workspaces"));
     let other_ws = WorkspaceId::new();
@@ -20989,7 +21786,7 @@ async fn heal_prunes_orphan_workspace_rows_but_keeps_chief() {
             .await
             .expect("ws");
         let bus = EventBus::new(store.clone());
-        let svc = Services::new(store).with_event_bus(bus);
+        let svc = Services::new_isolated(store).with_event_bus(bus);
         let chief_sub = create_agent(&svc, &chief, "Chief").await;
         svc.agent_subscribe(
             gone_ws.clone(),
@@ -21020,7 +21817,7 @@ async fn heal_prunes_orphan_workspace_rows_but_keeps_chief() {
     // "Restart": fresh Services over the same database.
     let store = Store::open(&tmp.path).await.expect("reopen store");
     let bus = EventBus::new(store.clone());
-    let svc = Services::new(store).with_event_bus(bus);
+    let svc = Services::new_isolated(store).with_event_bus(bus);
     let loaded = svc
         .heal_event_subscriptions_on_startup()
         .await
@@ -21075,7 +21872,7 @@ async fn report_to_parent_delivers_for_delegated_caller() {
     // Report-time wake: reportToParent now delivers an immediate wake to the parent.
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(parent_session.messages.len(), 1);
@@ -21099,7 +21896,7 @@ async fn report_to_parent_delivers_for_delegated_caller() {
     assert_eq!(events[0]["data"]["report"], json!(report));
     let child_session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     assert_eq!(child_session.completion_report.as_deref(), Some(report));
@@ -21251,7 +22048,7 @@ async fn get_subscriptions_bundles_slim_participants() {
 
 #[intent_test_macros::daemon_test]
 async fn get_subscriptions_preserves_chief_identity_and_runtime_overlays() {
-    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let (_t, svc, manager, _bus, ws) = setup_with_manager_fake_runtime().await;
     let chief = WorkspaceId::chief();
     let parent = create_agent(&svc, &chief, "Chief").await;
     let child = create_agent(&svc, &ws, "Remote participant").await;
@@ -21297,6 +22094,96 @@ async fn get_subscriptions_preserves_chief_identity_and_runtime_overlays() {
     assert_eq!(row["waitingOnPrMonitors"][0]["prNumber"], 42);
 }
 
+#[intent_test_macros::daemon_test]
+async fn get_subscriptions_withholds_nonlegacy_monitor_provenance() {
+    let (_t, svc, ws) = setup().await;
+    let parent = create_agent(&svc, &ws, "Parent").await;
+    let child = create_agent(&svc, &ws, "Private monitor owner").await;
+    svc.register_completion_watch(
+        &ws,
+        &ws,
+        parent.clone(),
+        "Parent".into(),
+        child.clone(),
+        None,
+    )
+    .unwrap();
+    let monitor = seed_active_pr_monitor(&svc, &ws, &child, 42).await;
+    for (provider, instance, project, kind, provenance, reason) in [
+        (
+            None,
+            None,
+            None,
+            None,
+            "unresolved",
+            Some("missing-provenance"),
+        ),
+        (
+            Some("gitlab"),
+            Some("https://gitlab.com"),
+            Some("acme/widgets"),
+            Some("merge-request"),
+            "captured-request",
+            None,
+        ),
+        (
+            Some("github"),
+            Some("https://github.com"),
+            Some("acme/widgets"),
+            Some("pull-request"),
+            "captured-request",
+            None,
+        ),
+        (
+            Some("github"),
+            Some("https://github.com"),
+            Some("acme/widgets"),
+            Some("pull-request"),
+            "validated-transfer",
+            None,
+        ),
+        (
+            Some("github"),
+            Some("https://github.com"),
+            Some("different/project"),
+            Some("pull-request"),
+            "legacy-github-writer",
+            None,
+        ),
+    ] {
+        sqlx::query("UPDATE pr_monitor SET target_provider=?,target_instance_base_url=?,target_project_path=?,target_kind=?,target_provenance=?,target_unresolved_reason=? WHERE monitor_id=?")
+            .bind(provider).bind(instance).bind(project).bind(kind).bind(provenance).bind(reason)
+            .bind(&monitor.monitor_id.0).execute(svc.store().write_pool()).await.unwrap();
+        let before = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let subscriptions = svc
+            .agent_get_subscriptions_op(ws.clone(), parent.clone())
+            .await
+            .unwrap();
+        let row = subscriptions["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == child.0)
+            .unwrap();
+        assert!(
+            row.get("waitingOnPrMonitors").is_none(),
+            "{provenance}/{project:?}: {row}"
+        );
+        assert_eq!(svc.active_pr_monitors_for_agent(&child).await.len(), 1);
+        assert_eq!(
+            svc.store()
+                .get_pr_monitor(&monitor.monitor_id)
+                .await
+                .unwrap(),
+            before
+        );
+    }
+}
+
 /// SQL events are attributed to this read's span (the production profiler's
 /// signal). Transcript bodies are deliberately malformed so hydration fails;
 /// both small and large reads must still use the persisted previews only.
@@ -21305,7 +22192,11 @@ async fn get_subscriptions_projection_cost_is_batched_and_preview_only() {
     let (_t, svc, ws) = setup().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let first = create_agent(&svc, &ws, "Participant").await;
-    let mut template = svc.store().get_agent_session_summary(&first).await.unwrap();
+    let mut template = svc
+        .store()
+        .get_agent_session_without_messages(&first)
+        .await
+        .unwrap();
     template.completion_report = Some("r".repeat(8192));
     template.initial_message = Some("initial".repeat(10000));
     template.system_prompt = Some("prompt".repeat(10000));
@@ -21347,6 +22238,17 @@ async fn get_subscriptions_projection_cost_is_batched_and_preview_only() {
     assert_eq!(
         one_count, 4,
         "status + session/preview + hook + PR projections"
+    );
+    let (with_extra_query, extra_count) = crate::test_tracing::count_sqlx_statements(async {
+        sqlx::query("SELECT 1").execute(pool).await.unwrap();
+        svc.agent_get_subscriptions_op(ws.clone(), parent.clone())
+            .await
+    })
+    .await;
+    assert_eq!(with_extra_query.unwrap(), one);
+    assert_eq!(
+        extra_count, 5,
+        "an extra application query must remain visible"
     );
     drop(reserved);
     // An unrelated corrupt row must never be decoded by this targeted read.
@@ -21490,7 +22392,8 @@ async fn cancel_subscriptions_clears_watches_and_groups_idempotently() {
         .expect("delegate");
     // Wait for the group's spawned write-through persist so the delete sweep
     // below provably removes the row (no upsert/delete race).
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     while svc
         .store()
         .list_undelivered_groups(&ws)
@@ -21520,7 +22423,8 @@ async fn cancel_subscriptions_clears_watches_and_groups_idempotently() {
 
     // The persisted delegation_group row is swept too (the delete is spawned
     // — poll) so the cancelled group can't rehydrate on restart.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     while !svc
         .store()
         .list_undelivered_groups(&ws)
@@ -21578,10 +22482,13 @@ async fn scoped_cancel_by_subscription_id_leaves_group_intact() {
         .expect("scoped cancel");
     assert_eq!(cancel, json!({ "success": true }));
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after scoped cancel")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after scoped cancel")
+    .expect("batch");
     let ev = batch.last().expect("event");
     assert_eq!(ev.data["agentId"], json!(parent.0));
     assert_eq!(ev.data["isWaitingForOtherAgents"], json!(true));
@@ -21618,7 +22525,8 @@ async fn scoped_cancel_by_group_id_leaves_ungrouped_intact() {
     wait_for_persisted_watches(&svc, 2).await;
     // The group's write-through persist is spawned; wait for the row so the
     // awaited scoped delete provably removes it (no upsert/delete race).
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     while svc
         .store()
         .list_undelivered_groups(&ws)
@@ -21919,7 +22827,7 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
     let child_id = AgentId::from(parsed["agentId"].as_str().expect("agentId"));
     let child = svc
         .store()
-        .get_agent_session(&child_id)
+        .get_agent_session_with_transcript(&child_id)
         .await
         .expect("child session");
     assert_eq!(child.parent_agent_id, Some(caller));
@@ -21932,7 +22840,7 @@ async fn mcp_delegate_stamps_parent_but_rpc_path_does_not() {
     let rpc_child_id = AgentId::from(rpc_resp["agentId"].as_str().expect("rpc agentId"));
     let rpc_child = svc
         .store()
-        .get_agent_session(&rpc_child_id)
+        .get_agent_session_with_transcript(&rpc_child_id)
         .await
         .expect("rpc child session");
     assert_eq!(rpc_child.parent_agent_id, None);
@@ -21989,7 +22897,7 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
     // The child carries the parent linkage stamped from the caller identity.
     let child_session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     assert_eq!(child_session.parent_agent_id, Some(parent.clone()));
@@ -22030,7 +22938,7 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
     // report. The report is persisted on the child session.
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(parent_session.messages.len(), 1);
@@ -22041,7 +22949,7 @@ async fn mcp_parent_tracking_loop_delegate_then_report_reaches_parent() {
     );
     let child_session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     assert_eq!(child_session.completion_report.as_deref(), Some(report));
@@ -22278,7 +23186,7 @@ async fn rehydration_prunes_duplicate_pair_rows() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         (parent, child)
@@ -22308,7 +23216,7 @@ async fn rehydration_prunes_duplicate_pair_rows() {
             .await
             .expect("seed row");
     }
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .heal_completion_watches_on_startup()
@@ -22402,7 +23310,7 @@ async fn delegate_skips_watch_when_parent_deleted() {
     let parent = create_agent(&svc, &ws, "Parent").await;
     let mut session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     session.status = intent_core::AgentStatus::Deleted;
@@ -22455,7 +23363,7 @@ async fn watch_completion_skips_when_parent_deleted() {
     let child = create_agent(&svc, &ws, "Child").await;
     let mut session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     session.status = intent_core::AgentStatus::Deleted;
@@ -22488,7 +23396,7 @@ async fn sender_watch_registers_ungrouped_for_foreground_caller() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     session.is_background = true;
@@ -22523,7 +23431,7 @@ async fn sender_watch_silently_adopts_existing_watch_for_pair() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     session.is_background = true;
@@ -22564,7 +23472,7 @@ async fn sender_watch_skips_delegated_background_caller() {
     let target = create_agent(&svc, &ws, "Sibling").await;
     let mut session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     session.is_background = true;
@@ -22629,7 +23537,7 @@ async fn sender_watch_skips_child_via_created_by_metadata() {
     let child = create_agent(&svc, &ws, "Child").await;
     let mut session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     assert!(session.parent_agent_id.is_none());
@@ -22741,7 +23649,7 @@ async fn sender_watch_skips_independent_top_level_foreground_target() {
     let peer = create_agent(&svc, &ws, "Peer").await;
     let session = svc
         .store()
-        .get_agent_session(&peer)
+        .get_agent_session_with_transcript(&peer)
         .await
         .expect("peer session");
     assert!(session.parent_agent_id.is_none());
@@ -22894,7 +23802,7 @@ async fn wake_or_create_scope_gate_rejection_create_branch_is_side_effect_free()
 
     let sessions = svc
         .store()
-        .list_agent_sessions(&ws_b)
+        .list_agent_sessions_with_transcripts(&ws_b)
         .await
         .expect("list ws-b sessions");
     assert!(
@@ -23018,7 +23926,7 @@ async fn wake_or_create_unknown_caller_still_proceeds() {
 async fn flag_agent_deleted(svc: &Services, agent: &AgentId) {
     let mut session = svc
         .store()
-        .get_agent_session(agent)
+        .get_agent_session_with_transcript(agent)
         .await
         .expect("caller session");
     session.status = intent_core::AgentStatus::Deleted;
@@ -23110,7 +24018,7 @@ async fn wake_or_create_created_new_sets_parent_to_live_caller() {
 
     let session = svc
         .store()
-        .get_agent_session(&created)
+        .get_agent_session_with_transcript(&created)
         .await
         .expect("created session");
     assert_eq!(
@@ -23128,7 +24036,7 @@ async fn wake_or_create_created_new_sets_parent_to_live_caller() {
     assert_eq!(parent_message_count(&svc, &caller).await, baseline + 1);
     let session = svc
         .store()
-        .get_agent_session(&created)
+        .get_agent_session_with_transcript(&created)
         .await
         .expect("created session");
     assert_eq!(session.completion_report.as_deref(), Some("shipped it"));
@@ -23154,7 +24062,7 @@ async fn wake_or_create_created_new_without_caller_leaves_parent_unset() {
     let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let session = svc
         .store()
-        .get_agent_session(&created)
+        .get_agent_session_with_transcript(&created)
         .await
         .expect("created session");
     assert!(session.parent_agent_id.is_none());
@@ -23182,7 +24090,7 @@ async fn wake_or_create_created_new_deleted_caller_leaves_parent_unset() {
     let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let session = svc
         .store()
-        .get_agent_session(&created)
+        .get_agent_session_with_transcript(&created)
         .await
         .expect("created session");
     assert!(
@@ -23213,7 +24121,7 @@ async fn wake_or_create_created_new_unknown_caller_leaves_parent_unset() {
     let created = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let session = svc
         .store()
-        .get_agent_session(&created)
+        .get_agent_session_with_transcript(&created)
         .await
         .expect("created session");
     assert!(
@@ -23235,7 +24143,7 @@ async fn wake_or_create_created_new_rejects_caller_column_at_depth_cap() {
     let note_id = seed_task(&svc, &ws, "Depth cap fail-closed").await;
     let mut session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     session.delegation_depth = Some(MAX_DELEGATION_DEPTH);
@@ -23447,7 +24355,7 @@ async fn wake_or_create_queued_adopts_existing_watch() {
 
 /// SUB-2 (Copilot #104 follow-up, thread `PRRT_kwDOS9Wxuc6QKWuU`):
 /// when the caller's display name cannot be resolved
-/// (`store.get_agent_session` failed), the reuse path must still return
+/// (`store.get_agent_session_with_transcript` failed), the reuse path must still return
 /// the live subscription id — but must NOT overwrite the watch's stored
 /// `parent_agent_name` with an empty placeholder. Callers pass `None`
 /// through `find_and_refresh_ungrouped_watch` to signal the missing name.
@@ -23585,7 +24493,7 @@ async fn mcp_delegate_immediate_registers_ungrouped_watch() {
 async fn child_session_messages_json(svc: &Services, child: &AgentId) -> String {
     let session = svc
         .store()
-        .get_agent_session(child)
+        .get_agent_session_with_transcript(child)
         .await
         .expect("child session");
     serde_json::to_string(&session.messages).expect("serialize child messages")
@@ -23597,7 +24505,7 @@ async fn child_session_messages_json(svc: &Services, child: &AgentId) -> String 
 async fn child_session_first_message_text(svc: &Services, child: &AgentId) -> String {
     let session = svc
         .store()
-        .get_agent_session(child)
+        .get_agent_session_with_transcript(child)
         .await
         .expect("child session");
     let first = session.messages.first().expect("first message");
@@ -23945,7 +24853,7 @@ async fn delegate_derives_skip_auto_commit_from_workspace_auto_commit_off() {
     );
     let session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("session");
     assert!(
@@ -23977,7 +24885,11 @@ async fn agent_create_derives_skip_auto_commit_from_workspace_auto_commit_off() 
     .await
     .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().expect("id"));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(
         session.skip_auto_commit,
         "agent.create must opt the session out when auto-commit is off"
@@ -24288,7 +25200,7 @@ async fn delegate_after_all(svc: &Services, ws: &WorkspaceId, parent: &AgentId) 
 
 async fn parent_message_count(svc: &Services, parent: &AgentId) -> usize {
     svc.store()
-        .get_agent_session(parent)
+        .get_agent_session_with_transcript(parent)
         .await
         .expect("parent session")
         .messages
@@ -24298,7 +25210,7 @@ async fn parent_message_count(svc: &Services, parent: &AgentId) -> usize {
 async fn parent_messages_text(svc: &Services, parent: &AgentId) -> String {
     let session = svc
         .store()
-        .get_agent_session(parent)
+        .get_agent_session_with_transcript(parent)
         .await
         .expect("parent session");
     let blocks: Vec<_> = session.messages.iter().map(|m| &m.content).collect();
@@ -24339,7 +25251,7 @@ async fn seed_active_hook(
     hook
 }
 
-/// Seed one ACTIVE PR-monitor row owned by `agent` directly in the store —
+/// Seed one ACTIVE legacy GitHub producer row owned by `agent` —
 /// the idle-visibility lookups read persisted monitor rows, so no poll loop
 /// is needed. Mirrors [`seed_active_hook`] for the pr-monitor-waiting
 /// classification.
@@ -24369,7 +25281,19 @@ async fn seed_active_pr_monitor(
         updated_at: now,
     };
     svc.store()
-        .insert_pr_monitor(&monitor)
+        .insert_qualified_pr_monitor(
+            &monitor,
+            &intent_core::ReviewTarget {
+                repository: intent_core::RepositoryTarget {
+                    provider: intent_core::RepositoryProvider::Github,
+                    instance_base_url: "https://github.com".into(),
+                    project_path: format!("{}/{}", monitor.repo_owner, monitor.repo_name),
+                },
+                kind: intent_core::RepositoryResourceKind::PullRequest,
+                number: u64::try_from(pr_number).unwrap(),
+            },
+            intent_store::MonitorTargetProvenance::LegacyGithubWriter,
+        )
         .await
         .expect("insert pr monitor");
     monitor
@@ -24385,6 +25309,7 @@ async fn seed_active_pr_monitor(
 #[tokio::test]
 async fn hook_waiting_idle_delivers_advisory_then_armed_watch_completes() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -24505,7 +25430,7 @@ async fn hook_waiting_idle_delivers_advisory_then_armed_watch_completes() {
 /// is unchanged: a second idle before any turn stays silent.
 #[tokio::test]
 async fn turn_start_opens_new_waiting_period_for_armed_watch() {
-    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let (_t, svc, manager, _bus, ws) = setup_with_manager_fake_runtime().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -24612,7 +25537,7 @@ async fn turn_start_opens_new_waiting_period_for_armed_watch() {
 /// the first even though the marker cleared.
 #[tokio::test]
 async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
-    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let (_t, svc, manager, _bus, ws) = setup_with_manager_fake_runtime().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -24685,7 +25610,7 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
     );
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(
@@ -24706,6 +25631,7 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
 #[tokio::test]
 async fn monitoring_idle_advisory_metadata_flags() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "ci-poll").await;
@@ -24730,7 +25656,7 @@ async fn monitoring_idle_advisory_metadata_flags() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -24937,10 +25863,13 @@ async fn deletion_wake_keeps_child_agent_label_after_session_purge() {
         .expect("delete child");
     let mut handled = 0;
     while handled < 2 {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription closed");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
         for event in batch {
             svc.handle_completion_event(&event).await;
             handled += 1;
@@ -25020,6 +25949,7 @@ async fn queue_interim_monitoring_idle_gets_no_advisory() {
 #[tokio::test]
 async fn busy_suppressed_monitoring_idle_advisory_heals_on_worker_exit() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -25099,6 +26029,7 @@ async fn busy_suppressed_monitoring_idle_advisory_heals_on_worker_exit() {
 #[tokio::test]
 async fn failed_advisory_wake_retries_without_another_event() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -25134,26 +26065,29 @@ async fn failed_advisory_wake_retries_without_another_event() {
         .execute(svc.store().write_pool())
         .await
         .expect("remove failure trigger");
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if parent_message_count(&svc, &parent).await == 1
-                && svc
-                    .store()
-                    .has_advisory_wake_delivery(&parent, &child)
-                    .await
-                    .expect("marker read")
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if parent_message_count(&svc, &parent).await == 1
+                    && svc
+                        .store()
+                        .has_advisory_wake_delivery(&parent, &child)
+                        .await
+                        .expect("marker read")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry delivers the advisory and persists the marker without another event");
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -25194,6 +26128,7 @@ async fn failed_advisory_wake_retries_without_another_event() {
 #[tokio::test]
 async fn sustained_marker_write_failure_advises_once_per_period() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -25317,6 +26252,7 @@ async fn sustained_marker_write_failure_advises_once_per_period() {
 #[tokio::test]
 async fn ask_then_watch_adoption_receives_monitoring_idle_advisory() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -25391,6 +26327,7 @@ async fn ask_then_watch_adoption_receives_monitoring_idle_advisory() {
 #[tokio::test]
 async fn completion_only_watch_skips_monitoring_idle_advisory() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -25462,6 +26399,7 @@ async fn completion_only_watch_skips_monitoring_idle_advisory() {
 #[tokio::test]
 async fn advisory_marker_clears_at_settlement_without_armed_watch() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "first-watch").await;
@@ -25652,6 +26590,7 @@ async fn agent_waiting_monitoring_idle_gets_no_advisory() {
 #[tokio::test]
 async fn grouped_monitoring_idle_delivers_one_advisory_and_group_settles_later() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -25679,7 +26618,7 @@ async fn grouped_monitoring_idle_delivers_one_advisory_and_group_settles_later()
     .await;
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(
@@ -25832,6 +26771,7 @@ async fn completion_wake_without_hooks_stays_plain() {
 #[tokio::test]
 async fn after_all_group_waits_for_hook_waiting_child() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "ci-poll").await;
@@ -25850,7 +26790,10 @@ async fn after_all_group_waits_for_hook_waiting_child() {
 
     // Child idles while its hook is active: NOT recorded as settled.
     let mut data = json!({ "agentId": child.0 });
-    svc.annotate_waiting_on_hooks(&child, &mut data).await;
+    svc.ports
+        .runtime()
+        .annotate_waiting_on_hooks(&svc, &child, &mut data)
+        .await;
     assert!(data.get("waitingOnHooks").is_some(), "stamped: {data}");
     svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data))
         .await;
@@ -26194,6 +27137,7 @@ async fn after_all_group_waits_for_pr_monitor_waiting_child() {
 #[tokio::test]
 async fn external_hook_cancel_settles_deferred_watch() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -26228,9 +27172,9 @@ async fn external_hook_cancel_settles_deferred_watch() {
     // owner wake persists directly (no runtime turn), so the terminal-
     // transition backstop synthesizes the child's completion and the
     // deferred watch fires.
-    svc.hook_cancel_op(&ws, &hook.hook_id, None)
-        .await
-        .expect("cancel hook");
+    FakeRuntime::of(&svc)
+        .cancel_hook(&svc, &hook.hook_id, None)
+        .await;
     assert!(
         svc.find_watches_for_child(&child).is_empty(),
         "deferred watch fires when the last active hook is cancelled"
@@ -26252,7 +27196,7 @@ async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = FakeRuntime::install(Services::new_isolated(store));
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -26272,7 +27216,7 @@ async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
         // its active hook defers the refire.
         let mut s = svc
             .store()
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         s.status = intent_core::AgentStatus::Completed;
@@ -26284,7 +27228,7 @@ async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = FakeRuntime::install(Services::new_isolated(store));
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -26368,7 +27312,7 @@ async fn rehydrated_watch_on_pr_monitor_waiting_idle_child_does_not_refire() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         seed_active_pr_monitor(&svc, &ws, &child, 99).await;
@@ -26388,7 +27332,7 @@ async fn rehydrated_watch_on_pr_monitor_waiting_idle_child_does_not_refire() {
         // its active PR monitor defers the refire.
         let mut s = svc
             .store()
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         s.status = intent_core::AgentStatus::Completed;
@@ -26400,7 +27344,7 @@ async fn rehydrated_watch_on_pr_monitor_waiting_idle_child_does_not_refire() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -26578,7 +27522,7 @@ async fn unwatch_in_classify_mark_window_still_settles_watcher() {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let park = Arc::new(crate::CompletionClassifyPark::default());
-    let svc = Services::new(store).with_completion_classify_park(park.clone());
+    let svc = Services::new_isolated(store).with_completion_classify_park(park.clone());
     let a = create_agent(&svc, &ws, "A").await;
     let b = create_agent(&svc, &ws, "B").await;
     let c = create_agent(&svc, &ws, "C").await;
@@ -26595,9 +27539,12 @@ async fn unwatch_in_classify_mark_window_still_settles_watcher() {
         let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
         async move { svc.handle_completion_event(&event).await }
     });
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("delivery parked in the classify→mark window");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("delivery parked in the classify→mark window");
 
     // Concurrent unwatch inside the window: removes B's last outgoing watch;
     // its backstop redelivery no-ops (no marker exists yet).
@@ -26614,14 +27561,20 @@ async fn unwatch_in_classify_mark_window_still_settles_watcher() {
     // snapshot, then the tail re-probe observes the emptied watch set and
     // hands off to the redelivery — whose synthetic pass parks once more.
     park.release.notify_one();
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("synthetic redelivery pass parked");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("synthetic redelivery pass parked");
     park.release.notify_one();
-    timeout(Duration::from_secs(5), delivery)
-        .await
-        .expect("delivery completes")
-        .expect("delivery task");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        delivery,
+    )
+    .await
+    .expect("delivery completes")
+    .expect("delivery task");
 
     assert_eq!(
         parent_message_count(&svc, &a).await,
@@ -26648,7 +27601,7 @@ async fn concurrent_completion_passes_deliver_one_terminal_wake() {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let park = Arc::new(crate::CompletionClassifyPark::default());
-    let svc = Services::new(store).with_completion_claim_park(park.clone());
+    let svc = Services::new_isolated(store).with_completion_claim_park(park.clone());
     let a = create_agent(&svc, &ws, "A").await;
     let b = create_agent(&svc, &ws, "B").await;
 
@@ -26661,9 +27614,12 @@ async fn concurrent_completion_passes_deliver_one_terminal_wake() {
         let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
         async move { svc.handle_completion_event(&event).await }
     });
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("first pass parked in the claim→send window");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("first pass parked in the claim→send window");
 
     // Second pass for the same completion inside the window: the watch is
     // claimed, so it must neither wake A nor retire the watch.
@@ -26686,10 +27642,13 @@ async fn concurrent_completion_passes_deliver_one_terminal_wake() {
     );
 
     park.release.notify_one();
-    timeout(Duration::from_secs(5), first)
-        .await
-        .expect("first pass completes")
-        .expect("first pass task");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        first,
+    )
+    .await
+    .expect("first pass completes")
+    .expect("first pass task");
     assert_eq!(
         parent_message_count(&svc, &a).await,
         1,
@@ -26709,14 +27668,20 @@ async fn concurrent_completion_passes_deliver_one_terminal_wake() {
         let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
         async move { svc.handle_completion_event(&event).await }
     });
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("re-armed delivery claims the new watch");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("re-armed delivery claims the new watch");
     park.release.notify_one();
-    timeout(Duration::from_secs(5), second)
-        .await
-        .expect("re-armed delivery completes")
-        .expect("re-armed delivery task");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        second,
+    )
+    .await
+    .expect("re-armed delivery completes")
+    .expect("re-armed delivery task");
     assert_eq!(parent_message_count(&svc, &a).await, 2);
 }
 
@@ -26739,7 +27704,7 @@ async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let park = Arc::new(crate::CompletionClassifyPark::default());
     let flip_park = Arc::new(crate::CompletionClassifyPark::default());
-    let svc = Services::new(store)
+    let svc = Services::new_isolated(store)
         .with_completion_claim_park(park.clone())
         .with_completion_flip_take_park(flip_park.clone());
     let a = create_agent(&svc, &ws, "A").await;
@@ -26767,9 +27732,12 @@ async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
         let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
         async move { svc.handle_completion_event(&event).await }
     });
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("first pass parked on its claimed watch");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("first pass parked on its claimed watch");
     // Pass 2 skips the claimed watch, claims the other one, and parks too:
     // the snapshot is now split between the two passes.
     let second = tokio::spawn({
@@ -26777,16 +27745,22 @@ async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
         let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
         async move { svc.handle_completion_event(&event).await }
     });
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("second pass parked on the other claimed watch");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("second pass parked on the other claimed watch");
 
     // Release pass 1 alone: it consumes the child's flips from the store and
     // parks before publishing them.
     park.release.notify_one();
-    timeout(Duration::from_secs(2), flip_park.entered.notified())
-        .await
-        .expect("first pass parked between its flip take and the publish");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        flip_park.entered.notified(),
+    )
+    .await
+    .expect("first pass parked between its flip take and the publish");
     // Release pass 2 while pass 1 holds that window: it reaches the flip
     // take with the store already drained and must await pass 1's result
     // rather than take (and stamp) an empty set.
@@ -26797,19 +27771,25 @@ async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
         "second pass must not settle its wake before the flips are published"
     );
     flip_park.release.notify_one();
-    timeout(Duration::from_secs(5), first)
-        .await
-        .expect("first pass completes")
-        .expect("first pass task");
-    timeout(Duration::from_secs(5), second)
-        .await
-        .expect("second pass completes")
-        .expect("second pass task");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        first,
+    )
+    .await
+    .expect("first pass completes")
+    .expect("first pass task");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        second,
+    )
+    .await
+    .expect("second pass completes")
+    .expect("second pass task");
 
     for parent in [&a, &c] {
         let session = svc
             .store()
-            .get_agent_session(parent)
+            .get_agent_session_with_transcript(parent)
             .await
             .expect("parent session");
         assert_eq!(
@@ -26869,6 +27849,138 @@ async fn mutual_idle_two_cycle_does_not_defer() {
         "mutual-idle 2-cycle delivers as before (no deadlock)"
     );
     assert!(svc.find_watches_for_child(&b).is_empty());
+}
+
+/// N-cycle deadlock guard (issue intent-hq/intent#7205): A→B→C→A watch each
+/// other and all three are idle. Before the fix only direct 2-cycles were
+/// declassified, so every member counted its outgoing edge as a waiting
+/// reason, every idle deferred, and the closed cycle stayed unsettled
+/// forever. The last idle in the cycle must deliver, and the cycle must then
+/// unwind with each watch firing exactly once.
+#[tokio::test]
+async fn idle_three_cycle_does_not_defer() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    svc.register_completion_watch(&ws, &ws, c.clone(), "C".into(), a.clone(), None)
+        .expect("C watches A");
+    // Wait for the three watch rows to persist (the upsert is spawned); the
+    // durable classification below reads them (intent#8148).
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
+    loop {
+        let rows = svc
+            .store()
+            .list_completion_watches()
+            .await
+            .expect("list persisted watches");
+        if rows.len() == 3 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "watch rows persisted");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    for id in [&a, &b, &c] {
+        assert!(
+            !svc.agent_is_waiting_on_agents(id),
+            "an all-idle 3-cycle is not a waiting reason for {}",
+            id.0
+        );
+        assert!(
+            !svc.agent_is_waiting_on_agents_durable(id).await,
+            "durable (rehydration) classification agrees for {}",
+            id.0
+        );
+    }
+
+    // C idles last: not deferred — B's watch on C fires.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &b).await, 1, "B woken by C");
+    assert!(svc.find_watches_for_child(&c).is_empty());
+
+    // B (now watchless) idles: A's watch on B fires; then A idles: C's
+    // watch on A fires. The cycle unwinds with exactly one wake per edge.
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &b,
+        json!({ "agentId": b.0 }),
+    ))
+    .await;
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &a,
+        json!({ "agentId": a.0 }),
+    ))
+    .await;
+    assert_eq!(parent_message_count(&svc, &a).await, 1, "A woken once");
+    assert_eq!(parent_message_count(&svc, &c).await, 1, "C woken once");
+    assert_eq!(parent_message_count(&svc, &b).await, 1, "B not re-woken");
+    for id in [&a, &b, &c] {
+        assert!(svc.find_watches_for_child(id).is_empty());
+        assert!(svc.waiting_watches_for_parent(id).is_empty());
+    }
+}
+
+/// Control for the N-cycle guard (issue intent-hq/intent#7205): a cycle
+/// with one BUSY member is a genuine wait — the busy agent will complete and
+/// wake its watcher — so every member still defers. An acyclic idle chain
+/// ending in a busy agent defers too.
+#[tokio::test]
+async fn three_cycle_with_busy_member_still_defers() {
+    let (_t, svc, ws) = setup().await;
+    let a = create_agent(&svc, &ws, "A").await;
+    let b = create_agent(&svc, &ws, "B").await;
+    let c = create_agent(&svc, &ws, "C").await;
+    let d = create_agent(&svc, &ws, "D").await;
+
+    svc.register_completion_watch(&ws, &ws, a.clone(), "A".into(), b.clone(), None)
+        .expect("A watches B");
+    svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
+        .expect("B watches C");
+    svc.register_completion_watch(&ws, &ws, c.clone(), "C".into(), a.clone(), None)
+        .expect("C watches A");
+    svc.register_completion_watch(&ws, &ws, d.clone(), "D".into(), a.clone(), None)
+        .expect("D watches A (acyclic tail)");
+
+    svc.set_test_busy(&b, true);
+    assert!(
+        svc.agent_is_waiting_on_agents(&c),
+        "C's cycle passes through busy B: genuine wait"
+    );
+    assert!(
+        svc.agent_is_waiting_on_agents(&d),
+        "D waits on A, which waits on busy B"
+    );
+
+    svc.handle_completion_event(&completion_event(
+        &ws,
+        AGENT_IDLE,
+        &c,
+        json!({ "agentId": c.0 }),
+    ))
+    .await;
+    assert_eq!(
+        parent_message_count(&svc, &b).await,
+        0,
+        "C's idle deferred while the cycle has a busy member"
+    );
+    assert_eq!(svc.find_watches_for_child(&c).len(), 1);
+    svc.set_test_busy(&b, false);
 }
 
 /// Agent-waiting deferral (grouped): a parent P delegates child B in an
@@ -27166,7 +28278,7 @@ async fn report_delivered_watch_is_not_an_agent_waiting_reason() {
     let ws = WorkspaceId::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let b = create_agent(&svc, &ws, "B").await;
     let c = create_agent(&svc, &ws, "C").await;
 
@@ -27196,7 +28308,7 @@ async fn report_delivered_watch_is_not_an_agent_waiting_reason() {
         .await
         .expect("open durable-phase store");
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let row = |report_delivered: bool| intent_store::PersistedCompletionWatch {
         id: "watch-1643".to_string(),
         parent_workspace_id: ws.clone(),
@@ -27275,7 +28387,11 @@ async fn rearm_watch_on_agent_waiting_idle_child_stays_armed() {
         .expect("B watches C");
     // B looks genuinely complete by the STAB-108 predicate (RuntimeIdle +
     // report, no interrupted row) — only its outgoing watch on C defers.
-    let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&b)
+        .await
+        .expect("B session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
     s.completion_report = Some("waiting on my reviewer".into());
     svc.store()
@@ -27322,7 +28438,11 @@ async fn rearm_watch_on_failed_child_with_outgoing_watch_fires_immediately() {
 
     svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
         .expect("B watches C");
-    let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&b)
+        .await
+        .expect("B session");
     s.status = intent_core::AgentStatus::Error;
     svc.store()
         .update_agent_session(&ws, &s)
@@ -27353,7 +28473,7 @@ async fn rehydrated_watch_on_agent_waiting_idle_child_does_not_refire() {
     let (a, b, c) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let a = create_agent(&svc, &ws, "A").await;
         let b = create_agent(&svc, &ws, "B").await;
         let c = create_agent(&svc, &ws, "C").await;
@@ -27362,7 +28482,11 @@ async fn rehydrated_watch_on_agent_waiting_idle_child_does_not_refire() {
         svc.register_completion_watch(&ws, &ws, b.clone(), "B".into(), c.clone(), None)
             .expect("B watches C");
         wait_for_persisted_watches(&svc, 2).await;
-        let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+        let mut s = svc
+            .store()
+            .get_agent_session_with_transcript(&b)
+            .await
+            .expect("B session");
         s.status = intent_core::AgentStatus::RuntimeIdle;
         s.completion_report = Some("waiting on my reviewer".into());
         svc.store()
@@ -27373,7 +28497,7 @@ async fn rehydrated_watch_on_agent_waiting_idle_child_does_not_refire() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -27409,7 +28533,7 @@ async fn group_rehydration_skips_agent_waiting_idle_child() {
     let (p, b, c) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let p = create_agent(&svc, &ws, "P").await;
         let b = create_agent(&svc, &ws, "B").await;
         let c = create_agent(&svc, &ws, "C").await;
@@ -27425,7 +28549,8 @@ async fn group_rehydration_skips_agent_waiting_idle_child() {
             .expect("B watches C");
         wait_for_persisted_watches(&svc, 2).await;
         // Wait for the group row to persist (the upsert is spawned).
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -27438,7 +28563,11 @@ async fn group_rehydration_skips_agent_waiting_idle_child() {
             assert!(std::time::Instant::now() < deadline, "group row persisted");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+        let mut s = svc
+            .store()
+            .get_agent_session_with_transcript(&b)
+            .await
+            .expect("B session");
         s.status = intent_core::AgentStatus::RuntimeIdle;
         s.completion_report = Some("waiting on my reviewer".into());
         svc.store()
@@ -27449,7 +28578,7 @@ async fn group_rehydration_skips_agent_waiting_idle_child() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     // Startup order: groups rehydrate FIRST (watch registry still empty —
     // the durable classification reads the persisted watch rows).
     let loaded = restarted
@@ -27560,6 +28689,7 @@ async fn pre_publish_group_record_skips_agent_waiting_child() {
 #[tokio::test]
 async fn status_list_and_diagnostics_surface_waiting_on_hooks() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let hooked = create_agent(&svc, &ws, "Hooked").await;
     let bare = create_agent(&svc, &ws, "Bare").await;
     let hook = seed_active_hook(&svc, &ws, &hooked, "inbox-poll").await;
@@ -27608,7 +28738,7 @@ async fn status_list_and_diagnostics_surface_waiting_on_hooks() {
 
     // agent.diagnostics agent rows.
     let diag = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .unwrap();
     let rows = diag["diagnostics"]["agents"].as_array().expect("agents");
@@ -27634,6 +28764,7 @@ async fn assert_waiting_hooks_read_cost(batched: bool) {
     use intent_core::{HookId, HookState};
 
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let owner = create_agent(&svc, &ws, "Owner").await;
     let peer = create_agent(&svc, &ws, "Peer").await;
     let bare = create_agent(&svc, &ws, "Bare").await;
@@ -27730,8 +28861,18 @@ async fn assert_waiting_hooks_read_cost(batched: bool) {
     assert!(cost_failures.is_empty(), "{}", cost_failures.join("\n"));
     // Visibility remains best-effort if the store read fails.
     svc.store().read_pool().close().await;
-    assert!(svc.active_hooks_for_agent(&owner).await.is_empty());
-    assert!(svc.active_hooks_by_agent(&ws).await.is_empty());
+    assert!(svc
+        .ports
+        .runtime()
+        .active_hooks_for_agent(&svc, &owner)
+        .await
+        .is_empty());
+    assert!(svc
+        .ports
+        .runtime()
+        .active_hooks_by_agent(&svc, &ws)
+        .await
+        .is_empty());
 }
 
 #[tokio::test]
@@ -27799,7 +28940,7 @@ async fn status_list_and_diagnostics_surface_waiting_on_pr_monitors() {
 
     // agent.diagnostics agent rows.
     let diag = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .unwrap();
     let rows = diag["diagnostics"]["agents"].as_array().expect("agents");
@@ -28074,7 +29215,7 @@ async fn interim_parent_idle_does_not_seal_group_and_late_delegate_joins() {
     }
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "exactly one aggregated wake");
@@ -28157,7 +29298,7 @@ async fn busy_interim_parent_idle_does_not_seal_group_and_late_delegate_joins() 
     }
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "exactly one aggregated wake");
@@ -28377,6 +29518,7 @@ async fn hook_owning_parent_idle_seals_group_and_wake_delivers() {
 #[intent_test_macros::daemon_test]
 async fn hook_waiting_child_settlement_still_deferred_after_seal() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = delegate_after_all(&svc, &ws, &parent).await;
     let hook = seed_active_hook(&svc, &ws, &child, "ci-poll").await;
@@ -28636,6 +29778,7 @@ async fn completion_report_idle_settles_group_despite_active_pr_monitor() {
 #[intent_test_macros::daemon_test]
 async fn completion_report_idle_settles_group_despite_active_hook() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = delegate_after_all(&svc, &ws, &parent).await;
     seed_active_hook(&svc, &ws, &child, "late-comment-watch").await;
@@ -28658,7 +29801,10 @@ async fn completion_report_idle_settles_group_despite_active_hook() {
         "completionReport": report,
         "report": report,
     });
-    svc.annotate_waiting_on_hooks(&child, &mut data).await;
+    svc.ports
+        .runtime()
+        .annotate_waiting_on_hooks(&svc, &child, &mut data)
+        .await;
     assert!(data.get("waitingOnHooks").is_some(), "stamped: {data}");
     svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data))
         .await;
@@ -28672,7 +29818,11 @@ async fn completion_report_idle_settles_group_despite_active_hook() {
     assert!(text.contains("task done"), "{text}");
     assert!(svc.delegation_group_for_parent(&parent).is_none());
     assert_eq!(
-        svc.active_hooks_for_agent(&child).await.len(),
+        svc.ports
+            .runtime()
+            .active_hooks_for_agent(&svc, &child)
+            .await
+            .len(),
         1,
         "settlement leaves the hook armed"
     );
@@ -28735,6 +29885,7 @@ async fn completion_report_idle_fires_ungrouped_watch_despite_active_monitor() {
 #[tokio::test]
 async fn pre_publish_group_record_bypasses_external_wait_deferrals_with_report() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let p = create_agent(&svc, &ws, "P").await;
     let b = create_agent(&svc, &ws, "B").await;
     let gid = svc.get_or_create_delegation_group(&ws, &p);
@@ -28750,7 +29901,11 @@ async fn pre_publish_group_record_bypasses_external_wait_deferrals_with_report()
     .expect("grouped watch");
     seed_active_pr_monitor(&svc, &ws, &b, 7).await;
     seed_active_hook(&svc, &ws, &b, "late-comment-watch").await;
-    let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&b)
+        .await
+        .expect("B session");
     s.completion_report = Some("done".into());
     svc.store()
         .update_agent_session(&ws, &s)
@@ -28758,7 +29913,10 @@ async fn pre_publish_group_record_bypasses_external_wait_deferrals_with_report()
         .expect("persist report");
 
     let mut data = json!({ "agentId": b.0, "completionReport": "done", "report": "done" });
-    svc.annotate_waiting_on_hooks(&b, &mut data).await;
+    svc.ports
+        .runtime()
+        .annotate_waiting_on_hooks(&svc, &b, &mut data)
+        .await;
     svc.annotate_waiting_on_pr_monitors(&b, &mut data).await;
     svc.record_group_completion_pre_publish(&ws, &b, &data)
         .await;
@@ -28768,7 +29926,14 @@ async fn pre_publish_group_record_bypasses_external_wait_deferrals_with_report()
         group.completed_agent_ids.contains(&b),
         "report-carrying idle records despite hook + monitor deferrals"
     );
-    assert_eq!(svc.active_hooks_for_agent(&b).await.len(), 1);
+    assert_eq!(
+        svc.ports
+            .runtime()
+            .active_hooks_for_agent(&svc, &b)
+            .await
+            .len(),
+        1
+    );
     assert_eq!(svc.active_pr_monitors_for_agent(&b).await.len(), 1);
 }
 
@@ -28783,7 +29948,7 @@ async fn group_rehydration_records_report_idle_child_despite_active_monitor() {
     let (p, b) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let p = create_agent(&svc, &ws, "P").await;
         let b = create_agent(&svc, &ws, "B").await;
         svc.app_agents_wait_op(
@@ -28796,7 +29961,8 @@ async fn group_rehydration_records_report_idle_child_despite_active_monitor() {
         .expect("waitFor after_all");
         wait_for_persisted_watches(&svc, 1).await;
         // Wait for the group row to persist (the upsert is spawned).
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -28810,7 +29976,11 @@ async fn group_rehydration_records_report_idle_child_despite_active_monitor() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         seed_active_pr_monitor(&svc, &ws, &b, 1009).await;
-        let mut s = svc.store().get_agent_session(&b).await.expect("B session");
+        let mut s = svc
+            .store()
+            .get_agent_session_with_transcript(&b)
+            .await
+            .expect("B session");
         s.status = intent_core::AgentStatus::RuntimeIdle;
         s.completion_report = Some("PR #1009 ready to merge".into());
         svc.store()
@@ -28821,7 +29991,7 @@ async fn group_rehydration_records_report_idle_child_despite_active_monitor() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .rehydrate_delegation_groups(&ws)
         .await
@@ -28853,7 +30023,7 @@ async fn rehydrated_watch_on_report_idle_child_refires_despite_active_monitor() 
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         seed_active_pr_monitor(&svc, &ws, &child, 77).await;
@@ -28869,7 +30039,7 @@ async fn rehydrated_watch_on_report_idle_child_refires_despite_active_monitor() 
         wait_for_persisted_watches(&svc, 1).await;
         let mut s = svc
             .store()
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -28882,7 +30052,7 @@ async fn rehydrated_watch_on_report_idle_child_refires_despite_active_monitor() 
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -28944,7 +30114,8 @@ async fn watch_after_progress_adopts_armed_watch_and_fires_terminal_idle() {
         !watches[0].report_delivered,
         "adopted watch remains terminal-ready"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let rows = svc
             .store()
@@ -28964,7 +30135,7 @@ async fn watch_after_progress_adopts_armed_watch_and_fires_terminal_idle() {
     // The child's next genuine completion fires the adopted watch.
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.completion_report = Some("second cycle".into());
@@ -28999,12 +30170,13 @@ async fn watch_after_progress_adopts_armed_watch_and_fires_terminal_idle() {
 #[tokio::test]
 async fn registration_reconcile_defers_on_reported_idle_child_with_active_hook() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let watcher = create_agent(&svc, &ws, "Watcher").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29057,7 +30229,7 @@ async fn wait_for_reconcile_defers_on_reported_idle_child_with_active_monitor() 
     let monitor = seed_active_pr_monitor(&svc, &ws, &child, 88).await;
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29113,7 +30285,7 @@ async fn agent_watch_rejects_settled_idle_target_with_no_waiting_reasons() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29161,7 +30333,7 @@ async fn agent_watch_rejects_unreported_idle_target_with_no_waiting_reasons() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29195,7 +30367,7 @@ async fn app_agents_wait_rejects_idle_target_with_no_waiting_reasons() {
     let idle = create_agent(&svc, &ws, "Idle").await;
     let mut s = svc
         .store()
-        .get_agent_session(&idle)
+        .get_agent_session_with_transcript(&idle)
         .await
         .expect("idle session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29401,7 +30573,7 @@ async fn agent_watch_accepts_idle_target_with_queued_message() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29447,7 +30619,7 @@ async fn agent_watch_accepts_idle_target_with_pending_attention() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29482,7 +30654,7 @@ async fn agent_watch_accepts_idle_target_with_interrupted_row() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29518,7 +30690,7 @@ async fn agent_watch_accepts_idle_target_with_event_subscription() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29572,7 +30744,7 @@ async fn agent_watch_accepts_idle_target_with_pending_question() {
         .await;
     let mut s = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29607,7 +30779,7 @@ async fn watch_scope_gate_precedes_idle_target_guard() {
     let remote = create_agent(&svc, &ws_b, "Remote").await;
     let mut s = svc
         .store()
-        .get_agent_session(&remote)
+        .get_agent_session_with_transcript(&remote)
         .await
         .expect("remote session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29655,7 +30827,7 @@ async fn rehydrated_watch_on_settled_idle_target_still_fires_at_boot() {
     let (watcher, target) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let watcher = create_agent(&svc, &ws, "Watcher").await;
         let target = create_agent(&svc, &ws, "Target").await;
         // Registered while the target is still un-run (guard passes), then
@@ -29666,7 +30838,7 @@ async fn rehydrated_watch_on_settled_idle_target_still_fires_at_boot() {
         wait_for_persisted_watches(&svc, 1).await;
         let mut s = svc
             .store()
-            .get_agent_session(&target)
+            .get_agent_session_with_transcript(&target)
             .await
             .expect("target session");
         s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29680,7 +30852,7 @@ async fn rehydrated_watch_on_settled_idle_target_still_fires_at_boot() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -29745,7 +30917,8 @@ async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
         !watches[0].report_delivered,
         "sender reuse keeps the watch terminal-ready"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let rows = svc
             .store()
@@ -29793,13 +30966,14 @@ async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
 #[tokio::test]
 async fn registration_deferral_survives_non_last_hook_terminal_transition() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let watcher = create_agent(&svc, &ws, "Watcher").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook_a = seed_active_hook(&svc, &ws, &child, "ci-poll").await;
     let hook_b = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::RuntimeIdle;
@@ -29873,10 +31047,13 @@ async fn watch_set_changes_emit_subscriptions_changed() {
     });
 
     let c1 = delegate_after_all(&svc, &ws, &parent).await;
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after delegate")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after delegate")
+    .expect("batch");
     assert_eq!(batch[0].event_type, AGENT_SUBSCRIPTIONS_CHANGED);
     assert_eq!(batch[0].data["agentId"], json!(parent.0));
     assert_eq!(batch[0].data["isWaitingForOtherAgents"], json!(true));
@@ -29898,10 +31075,13 @@ async fn watch_set_changes_emit_subscriptions_changed() {
         json!({ "agentId": parent.0 }),
     ))
     .await;
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after group clear")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after group clear")
+    .expect("batch");
     let last = batch.last().expect("event");
     assert_eq!(last.data["agentId"], json!(parent.0));
     assert_eq!(last.data["isWaitingForOtherAgents"], json!(false));
@@ -29918,6 +31098,7 @@ fn subscribe_display_status(bus: &EventBus, ws: &WorkspaceId) -> crate::Subscrip
 }
 
 async fn assert_display_status_silent(sub: &mut crate::Subscription) {
+    // fixed-deadline: allow — stays under the 3s WORKSPACE_IDLE_DEBOUNCE_MS idle demotion, which legitimately changes displayStatus
     let res = timeout(Duration::from_millis(300), sub.recv()).await;
     assert!(res.is_err(), "expected no displayStatus event: {res:?}");
 }
@@ -30029,7 +31210,11 @@ async fn report_to_parent_suppressed_for_after_all_group_child() {
 
     // The reports are still persisted on the child sessions.
     for (c, expected) in [(&c1, "report one"), (&c2, "report two")] {
-        let session = svc.store().get_agent_session(c).await.expect("child");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(c)
+            .await
+            .expect("child");
         assert_eq!(session.completion_report.as_deref(), Some(expected));
     }
 
@@ -30099,7 +31284,7 @@ async fn report_to_parent_immediate_after_group_delivery() {
     assert_eq!(parent_message_count(&svc, &parent).await, 2);
     let child_session = svc
         .store()
-        .get_agent_session(&c1)
+        .get_agent_session_with_transcript(&c1)
         .await
         .expect("child session");
     assert_eq!(
@@ -30147,7 +31332,11 @@ async fn request_attention_persists_fields_and_notice_for_non_delegated_agent() 
     assert_eq!(v["metadata"]["attentionRequestTimestamp"], r["savedAt"]);
 
     // Transcript notice: system role + meta.kind = "discussion-request".
-    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .expect("sess");
     let notice = session
         .messages
         .iter()
@@ -30165,6 +31354,65 @@ async fn request_attention_persists_fields_and_notice_for_non_delegated_agent() 
     // and `stop_reason` stays unset.
     assert_ne!(session.status, intent_core::AgentStatus::Error);
     assert_eq!(session.stop_reason, None);
+}
+
+/// List-row truncation flag (intent-hq/intent#7250 follow-up): a reason over
+/// the 400-byte list cap is served shortened on `agent.list` with
+/// `metadata.attentionRequestReasonTruncated: true`; a short reason carries
+/// no flag; `agent.get` serves the full reason and never the flag.
+#[tokio::test]
+async fn agent_list_flags_shortened_attention_reason() {
+    use intent_core::AGENT_LIST_PREVIEW_BUDGET_BYTES as BUDGET;
+    let (_t, svc, ws) = setup().await;
+    let long = create_agent(&svc, &ws, "Long").await;
+    let short = create_agent(&svc, &ws, "Short").await;
+    let reason = format!("blocked: {}", "r".repeat(BUDGET * 2));
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "blocker".into(),
+        reason.clone(),
+        Some(long.clone()),
+    )
+    .await
+    .expect("long request");
+    svc.agent_request_attention_op(
+        ws.clone(),
+        "discussion".into(),
+        "short reason".into(),
+        Some(short.clone()),
+    )
+    .await
+    .expect("short request");
+
+    let rows = svc.agent_list_op(ws.clone()).await.expect("list");
+    let wire = |id: &AgentId| {
+        serde_json::to_value(rows.iter().find(|a| a.id == *id).expect("listed")).unwrap()
+    };
+    let long_row = wire(&long);
+    assert_eq!(
+        long_row["metadata"]["attentionRequestReasonTruncated"],
+        json!(true)
+    );
+    let served = long_row["metadata"]["attentionRequestReason"]
+        .as_str()
+        .unwrap();
+    assert_eq!(served.len(), BUDGET);
+    assert!(reason.starts_with(served));
+    let short_row = wire(&short);
+    assert_eq!(
+        short_row["metadata"]["attentionRequestReason"],
+        "short reason"
+    );
+    assert!(short_row["metadata"]
+        .get("attentionRequestReasonTruncated")
+        .is_none());
+
+    let got =
+        serde_json::to_value(svc.agent_get_op(long.clone(), None).await.expect("get")).unwrap();
+    assert_eq!(got["metadata"]["attentionRequestReason"], json!(reason));
+    assert!(got["metadata"]
+        .get("attentionRequestReasonTruncated")
+        .is_none());
 }
 
 /// `kind: "blocker"` writes the `blocker-report` meta.kind and moves the
@@ -30231,7 +31479,11 @@ async fn request_attention_transitions_linked_task_per_kind() {
             expected_status,
             "kind {kind} must set the matching task status"
         );
-        let session = svc.store().get_agent_session(&child).await.expect("sess");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&child)
+            .await
+            .expect("sess");
         assert_eq!(session.attention_request_kind.as_deref(), Some(kind));
         let notice = session
             .messages
@@ -30393,7 +31645,11 @@ async fn request_attention_validates_inputs() {
         .await,
         Err(Error::NotFound(_))
     ));
-    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .expect("sess");
     assert_eq!(session.attention_request_kind, None);
     assert!(session.messages.iter().all(|m| m.role != "system"));
 }
@@ -30552,10 +31808,13 @@ async fn attention_requested_event_carries_parent_agent_id_for_delegated_child()
     .await
     .expect("request attention");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     let data = &batch[0].data;
     assert_eq!(data["agentId"].as_str(), Some(child.0.as_str()));
@@ -30586,10 +31845,13 @@ async fn attention_requested_event_omits_parent_agent_id_for_non_delegated() {
     .await
     .expect("request attention");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     let data = &batch[0].data;
     assert_eq!(data["agentId"].as_str(), Some(agent.0.as_str()));
@@ -30633,13 +31895,20 @@ async fn request_attention_mid_turn_defers_surfacing_until_flush() {
         assert_eq!(r["ok"], json!(true), "op reports success ({kind})");
 
         // Store persistence is immediate…
-        let session = svc.store().get_agent_session(&agent).await.expect("sess");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("sess");
         assert_eq!(session.attention_request_kind.as_deref(), Some(kind));
         // …but nothing user-facing surfaces mid-turn: no events, no notice.
         assert!(
-            timeout(Duration::from_millis(300), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(300)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no surfacing events while the turn is in flight ({kind})"
         );
         assert!(
@@ -30651,7 +31920,12 @@ async fn request_attention_mid_turn_defers_surfacing_until_flush() {
         svc.set_test_busy(&agent, false);
         svc.flush_deferred_attention(&agent, &ws).await;
         let mut events = Vec::new();
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await
+        {
             events.extend(batch);
         }
         let attention = events
@@ -30672,7 +31946,11 @@ async fn request_attention_mid_turn_defers_surfacing_until_flush() {
                     && e.data["attentionRequestKind"] == json!(kind)),
             "agent:updated attention fields emit at flush: {events:?}"
         );
-        let session = svc.store().get_agent_session(&agent).await.expect("sess");
+        let session = svc
+            .store()
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("sess");
         let notice = session
             .messages
             .iter()
@@ -30687,9 +31965,12 @@ async fn request_attention_mid_turn_defers_surfacing_until_flush() {
         // The flush consumed the marker — a second flush is a no-op.
         svc.flush_deferred_attention(&agent, &ws).await;
         assert!(
-            timeout(Duration::from_millis(200), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(200)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "second flush surfaces nothing ({kind})"
         );
     }
@@ -30734,12 +32015,19 @@ async fn request_attention_cleared_before_idle_flushes_nothing() {
     svc.set_test_busy(&agent, false);
     svc.flush_deferred_attention(&agent, &ws).await;
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "cleared-before-idle raise surfaces nothing"
     );
-    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .expect("sess");
     assert!(
         !session.messages.iter().any(|m| m.role == "system"),
         "no transcript notice for a dismissed raise"
@@ -30759,9 +32047,12 @@ async fn request_attention_cleared_before_idle_flushes_nothing() {
     );
     svc.flush_deferred_attention(&agent, &ws).await;
     assert!(
-        timeout(Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "stale marker over cleared fields retires silently"
     );
 }
@@ -30786,10 +32077,13 @@ async fn request_attention_idle_agent_surfaces_immediately() {
     )
     .await
     .expect("request attention");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("immediate surfacing for an idle raise")
-        .expect("open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("immediate surfacing for an idle raise")
+    .expect("open");
     assert_eq!(batch[0].data["kind"], json!("blocker"));
     assert!(
         svc.take_deferred_attention(&agent).is_empty(),
@@ -30832,10 +32126,13 @@ async fn deferred_attention_flush_carries_parent_agent_id() {
     });
     svc.set_test_busy(&child, false);
     svc.flush_deferred_attention(&child, &ws).await;
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("flush surfaces")
-        .expect("open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("flush surfaces")
+    .expect("open");
     assert_eq!(
         batch[0].data["parentAgentId"].as_str(),
         Some(parent.0.as_str()),
@@ -30872,7 +32169,11 @@ async fn multiple_mid_turn_raises_each_surface_at_flush() {
     .expect("second raise");
 
     // The store keeps latest-wins pending fields…
-    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .expect("sess");
     assert_eq!(session.attention_request_kind.as_deref(), Some("blocker"));
 
     let mut sub = bus.subscribe(SubscriptionFilter {
@@ -30886,7 +32187,12 @@ async fn multiple_mid_turn_raises_each_surface_at_flush() {
     svc.set_test_busy(&agent, false);
     svc.flush_deferred_attention(&agent, &ws).await;
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let attention: Vec<_> = events
@@ -30903,7 +32209,11 @@ async fn multiple_mid_turn_raises_each_surface_at_flush() {
     assert_eq!(attention[1].data["kind"], json!("blocker"));
     assert_eq!(attention[1].data["reason"], json!("second: sandbox broke"));
 
-    let session = svc.store().get_agent_session(&agent).await.expect("sess");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .expect("sess");
     let notices: Vec<_> = session
         .messages
         .iter()
@@ -30922,9 +32232,12 @@ async fn multiple_mid_turn_raises_each_surface_at_flush() {
     // The flush consumed the queue — a second flush is a no-op.
     svc.flush_deferred_attention(&agent, &ws).await;
     assert!(
-        timeout(Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "second flush surfaces nothing"
     );
 }
@@ -31004,10 +32317,13 @@ async fn agent_failed_event_carries_parent_agent_id_for_delegated_child() {
     )
     .await;
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     let data = &batch[0].data;
     assert_eq!(data["error"].as_str(), Some("boom"));
@@ -31020,7 +32336,7 @@ async fn agent_failed_event_carries_parent_agent_id_for_delegated_child() {
     // exactly the child's session name from the store.
     let child_session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     assert_eq!(
@@ -31049,10 +32365,13 @@ async fn agent_failed_event_omits_parent_agent_id_for_parentless_agent() {
     )
     .await;
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     let data = &batch[0].data;
     assert!(
@@ -31068,11 +32387,14 @@ async fn agent_failed_event_omits_parent_agent_id_for_parentless_agent() {
 /// Poll until the completion-delivery worker's broadcast receiver is live so a
 /// published event never races ahead of the subscription.
 async fn wait_for_subscriber(bus: &EventBus) {
-    timeout(Duration::from_secs(2), async {
-        while bus.subscriber_count() == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            while bus.subscriber_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        },
+    )
     .await
     .expect("delivery worker subscribed");
 }
@@ -31107,14 +32429,17 @@ async fn publish_completion(
 /// Poll until the parent transcript reaches expected messages (the worker wakes
 /// the parent asynchronously through the spawned delivery task).
 async fn wait_for_message_count(svc: &Services, parent: &AgentId, expected: usize) {
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if parent_message_count(svc, parent).await >= expected {
-                return;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if parent_message_count(svc, parent).await >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap_or_else(|_| panic!("parent did not reach {expected} messages in time"));
 }
@@ -31128,38 +32453,47 @@ async fn wait_for_group_children(
     parent: &AgentId,
     n: usize,
 ) {
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if let Some(g) = svc.delegation_group_for_parent(parent) {
-                if g.completed_agent_ids.len() + g.deleted_agent_ids.len() >= n {
-                    return;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if let Some(g) = svc.delegation_group_for_parent(parent) {
+                    if g.completed_agent_ids.len() + g.deleted_agent_ids.len() >= n {
+                        return;
+                    }
                 }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("delegation group recorded child completions");
 }
 
 async fn wait_for_child_watch_cleanup(svc: &Services, child: &AgentId) {
-    timeout(Duration::from_secs(2), async {
-        while !svc.find_watches_for_child(child).is_empty() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            while !svc.find_watches_for_child(child).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        },
+    )
     .await
     .expect("terminal child completion retired its watches");
 }
 
 async fn wait_for_group_cleanup(svc: &Services, parent: &AgentId) {
-    timeout(Duration::from_secs(2), async {
-        while svc.delegation_group_for_parent(parent).is_some()
-            || !svc.list_watches_for_parent(parent).is_empty()
-        {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            while svc.delegation_group_for_parent(parent).is_some()
+                || !svc.list_watches_for_parent(parent).is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        },
+    )
     .await
     .expect("terminal group settlement retired the group and watches");
 }
@@ -31369,7 +32703,7 @@ async fn diagnostics_snapshot_shape_and_subscriptions() {
     .expect("register watch");
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
 
@@ -31415,7 +32749,7 @@ async fn diagnostics_agent_filter_narrows_scope() {
     let _b = create_agent(&svc, &ws, "B").await;
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), Some(a.clone()), None, None)
+        .agent_diagnostics_op(ws.clone(), Some(a.clone()), None, None, None)
         .await
         .expect("diagnostics");
 
@@ -31450,7 +32784,7 @@ async fn diagnostics_task_filter_matches_task_agents() {
     let _unrelated = create_agent(&svc, &ws, "Unrelated").await;
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None)
+        .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -31474,7 +32808,7 @@ async fn diagnostics_task_filter_includes_note_side_assignees() {
     let _unrelated = create_agent(&svc, &ws, "Unrelated").await;
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, Some(note_id), None)
+        .agent_diagnostics_op(ws.clone(), None, Some(note_id), None, None)
         .await
         .expect("diagnostics");
     let agents = result["diagnostics"]["agents"].as_array().expect("agents");
@@ -31521,10 +32855,18 @@ async fn diagnostics_task_filter_matches_session_side_only() {
     );
     task.assigned_agent_ids.clear();
     note.metadata.task = Some(task);
-    svc.store.update_note(&note).await.expect("update note");
+    svc.store
+        .update_note(
+            &svc.store
+                .lock_note_content(&note.workspace_id, &note.id)
+                .await,
+            &note,
+        )
+        .await
+        .expect("update note");
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None)
+        .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -31545,7 +32887,13 @@ async fn diagnostics_task_filter_unknown_note_yields_empty_snapshot() {
     let _agent = create_agent(&svc, &ws, "Someone").await;
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, Some(NoteId::from("note-missing")), None)
+        .agent_diagnostics_op(
+            ws.clone(),
+            None,
+            Some(NoteId::from("note-missing")),
+            None,
+            None,
+        )
         .await
         .expect("diagnostics must not error on an unknown note");
     let diag = &result["diagnostics"];
@@ -31564,7 +32912,7 @@ async fn diagnostics_flags_orphaned_subscription() {
         .expect("register watch");
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
 
@@ -31606,7 +32954,7 @@ async fn diagnostics_healthy_after_all_group_reports_subscription_linkage() {
     }
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -31659,7 +33007,7 @@ async fn diagnostics_after_all_group_with_responding_children_is_info() {
     .expect("grouped watch");
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::Active;
@@ -31669,7 +33017,7 @@ async fn diagnostics_after_all_group_with_responding_children_is_info() {
         .expect("mark child responding");
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -31705,7 +33053,7 @@ async fn diagnostics_after_all_group_with_stale_responding_child_is_warning() {
     .expect("grouped watch");
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.status = intent_core::AgentStatus::Active;
@@ -31717,7 +33065,7 @@ async fn diagnostics_after_all_group_with_stale_responding_child_is_warning() {
         .expect("mark child responding but stale");
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -31744,7 +33092,7 @@ async fn diagnostics_after_all_group_without_watch_is_critical() {
     svc.enroll_child_in_group(&gid, &child);
 
     let result = svc
-        .agent_diagnostics_op(ws.clone(), None, None, None)
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
         .await
         .expect("diagnostics");
     let diag = &result["diagnostics"];
@@ -31793,7 +33141,11 @@ fn parse_session_stats_output_maps_cli_shape() {
 async fn session_stats_emits_only_on_change() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let id = create_agent(&svc, &ws, "Stats").await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
 
     let mut sub = bus.subscribe(SubscriptionFilter {
         event_types: vec![AGENT_SESSION_STATS_CHANGED.to_string()],
@@ -31807,10 +33159,13 @@ async fn session_stats_emits_only_on_change() {
     };
     svc.cache_and_emit_session_stats(&session, &stats).await;
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_SESSION_STATS_CHANGED);
     assert_eq!(batch[0].workspace_id, ws);
@@ -31822,7 +33177,11 @@ async fn session_stats_emits_only_on_change() {
 
     // Identical snapshot -> no second emit within the window.
     svc.cache_and_emit_session_stats(&session, &stats).await;
-    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    let res = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await;
     assert!(res.is_err(), "identical stats must not re-emit");
 
     // A moved rollup -> a fresh emit.
@@ -31832,10 +33191,13 @@ async fn session_stats_emits_only_on_change() {
         tool_count: 2,
     };
     svc.cache_and_emit_session_stats(&session, &moved).await;
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].data["stats"]["messageCount"], json!(6));
 }
@@ -31871,7 +33233,7 @@ async fn agent_get_session_projects_full_session_shape() {
             ws.clone(),
             Some("Full".into()),
             Some("auggie:sonnet4.5".into()),
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -31894,7 +33256,7 @@ async fn agent_get_session_projects_full_session_shape() {
         .expect("getSession");
     assert_eq!(session.id, id);
     assert_eq!(session.name, "Full");
-    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+    assert_eq!(session.specialist.as_deref(), Some("developer"));
     assert_eq!(
         session.system_prompt.as_deref(),
         Some("you are a helpful agent")
@@ -31910,6 +33272,173 @@ async fn agent_get_session_unknown_agent_is_not_found() {
         .await
         .expect_err("unknown agent");
     assert!(matches!(err, Error::NotFound(_)));
+}
+
+/// Bounded `agent.getSession` (§5.5): the wire read serves only the newest
+/// slim transcript page, trimmed to the session byte budget, and its
+/// `messagesNextToken` continues through `agent.getConversation` to the
+/// message right before the first one served.
+#[tokio::test]
+async fn agent_get_session_bounded_serves_newest_page_within_budget() {
+    use intent_core::ConversationProjection;
+    use serde_json::Value;
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Long").await;
+    let body = "x".repeat(12 * 1024);
+    for i in 0..120 {
+        let content = json!([{ "type": "text", "text": format!("m{i:03} {body}") }]);
+        svc.store()
+            .append_agent_message(&id, "user", &content, &now_iso())
+            .await
+            .expect("append");
+    }
+    let session = svc
+        .agent_get_session_bounded_op(id.clone())
+        .await
+        .expect("bounded getSession");
+    let bytes = serde_json::to_vec(&session).expect("json").len();
+    assert!(
+        bytes <= SESSION_BUDGET_BYTES,
+        "session {bytes} B over {SESSION_BUDGET_BYTES}"
+    );
+    let messages = session["messages"].as_array().expect("messages");
+    assert!(
+        !messages.is_empty() && messages.len() < SESSION_MESSAGES_PAGE_LIMIT,
+        "byte budget trims the page: {}",
+        messages.len()
+    );
+    assert_eq!(session["messagesTotal"], 120);
+    assert_eq!(session["messagesTruncated"], true);
+    let text = |m: &Value| m["contentBlocks"][0]["text"].as_str().unwrap_or("")[..4].to_string();
+    assert_eq!(
+        text(messages.last().unwrap()),
+        "m119",
+        "newest message kept"
+    );
+    let first = 120 - messages.len();
+    assert_eq!(text(&messages[0]), format!("m{first:03}"));
+
+    let token = session["messagesNextToken"]
+        .as_str()
+        .expect("token")
+        .to_string();
+    let older = svc
+        .agent_get_conversation_op(
+            id.clone(),
+            Some(5),
+            None,
+            Some(token),
+            None,
+            None,
+            Some(ConversationProjection::Slim),
+            false,
+        )
+        .await
+        .expect("older page");
+    let older = older["messages"].as_array().expect("older messages");
+    assert_eq!(
+        text(older.last().expect("older row")),
+        format!("m{:03}", first - 1),
+        "the token continues right before the first served message"
+    );
+}
+
+/// A short transcript is served whole with no continuation.
+#[tokio::test]
+async fn agent_get_session_bounded_serves_short_transcript_whole() {
+    use serde_json::Value;
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "Short").await;
+    for i in 0..3 {
+        let content = json!([{ "type": "text", "text": format!("hello {i}") }]);
+        svc.store()
+            .append_agent_message(&id, "user", &content, &now_iso())
+            .await
+            .expect("append");
+    }
+    let session = svc
+        .agent_get_session_bounded_op(id.clone())
+        .await
+        .expect("bounded getSession");
+    assert_eq!(session["messages"].as_array().expect("messages").len(), 3);
+    assert_eq!(session["messagesTotal"], 3);
+    assert_eq!(session["messagesTruncated"], false);
+    assert_eq!(session["messagesNextToken"], Value::Null);
+    assert_eq!(session["id"], id.0.as_str());
+}
+
+/// `agent.diagnostics` row limit (§5.5): every row list is cut to the
+/// limit, `summary` still counts every row, `truncated` names the cuts,
+/// and `limit` clamps into `[1, 200]` (default 100).
+#[tokio::test]
+async fn diagnostics_row_limit_caps_lists_and_keeps_summary_counts() {
+    let (_t, svc, ws) = setup().await;
+    for i in 0..5 {
+        create_agent(&svc, &ws, &format!("Row{i}")).await;
+    }
+    let result = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None, Some(2))
+        .await
+        .expect("diagnostics");
+    let d = &result["diagnostics"];
+    assert_eq!(d["rowLimit"], 2);
+    assert_eq!(d["agents"].as_array().expect("agents").len(), 2);
+    assert_eq!(d["summary"]["agents"], 5, "summary counts every row");
+    assert_eq!(d["truncated"]["agents"], 3);
+
+    let all = svc
+        .agent_diagnostics_op(ws.clone(), None, None, None, None)
+        .await
+        .expect("diagnostics default");
+    assert_eq!(
+        all["diagnostics"]["rowLimit"],
+        DIAGNOSTICS_DEFAULT_ROW_LIMIT
+    );
+    assert_eq!(
+        all["diagnostics"]["agents"]
+            .as_array()
+            .expect("agents")
+            .len(),
+        5
+    );
+    assert_eq!(all["diagnostics"]["truncated"], json!({}));
+
+    assert_eq!(clamp_diagnostics_row_limit(None), 100);
+    assert_eq!(clamp_diagnostics_row_limit(Some(0)), 1);
+    assert_eq!(clamp_diagnostics_row_limit(Some(-4)), 1);
+    assert_eq!(
+        clamp_diagnostics_row_limit(Some(10_000)),
+        DIAGNOSTICS_MAX_ROW_LIMIT
+    );
+}
+
+/// The diagnostics byte backstop halves the row limit until the snapshot
+/// fits, and cuts each queue's entries to the limit with a flag.
+#[test]
+fn fit_diagnostics_halves_limit_until_within_budget() {
+    use serde_json::Value;
+    let row = json!({ "id": "a", "pad": "p".repeat(4 * 1024) });
+    let entries: Vec<Value> = (0..300).map(|i| json!({ "id": i })).collect();
+    let sections = DiagnosticsSections {
+        agents: vec![row; 200],
+        subscriptions: Vec::new(),
+        event_subscriptions: Vec::new(),
+        queues: vec![json!({ "agentId": "a", "queueLength": 300, "entries": entries })],
+        delegation_groups: Vec::new(),
+        stuck_risks: Vec::new(),
+    };
+    let d = fit_diagnostics(&json!({ "summary": {} }), &sections, 200);
+    let bytes = serde_json::to_vec(&d).expect("json").len();
+    assert!(bytes <= DIAGNOSTICS_BUDGET_BYTES, "{bytes}");
+    assert_eq!(d["rowLimit"], 100, "200 rows of 4 KiB halve once");
+    assert_eq!(d["agents"].as_array().expect("agents").len(), 100);
+    assert_eq!(d["truncated"]["agents"], 100);
+    assert_eq!(
+        d["queues"][0]["entries"].as_array().expect("entries").len(),
+        100
+    );
+    assert_eq!(d["queues"][0]["entriesTruncated"], true);
+    assert_eq!(d["queues"][0]["queueLength"], 300);
 }
 
 /// `agent.update` patches only listed fields; omitted fields survive the write.
@@ -31946,10 +33475,13 @@ async fn agent_update_patches_listed_fields_and_emits_updated() {
     // Name (unmutated) survives.
     assert_eq!(session.name, "Patch");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv")
-        .expect("open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv")
+    .expect("open");
     assert!(batch.iter().any(
         |e| e.event_type == AGENT_UPDATED && e.data["agentId"].as_str() == Some(id.0.as_str())
     ));
@@ -31962,7 +33494,11 @@ async fn agent_update_notifications_muted_preserves_activity_timestamp() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
     let id = create_agent(&svc, &ws, "Mute timestamp").await;
     let old = "2020-01-01T00:00:00.000Z";
-    let mut session = svc.store.get_agent_session(&id).await.unwrap();
+    let mut session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     session.updated_at = old.to_string();
     svc.store.update_agent_session(&ws, &session).await.unwrap();
     let mut sub = bus.subscribe(SubscriptionFilter {
@@ -31977,10 +33513,13 @@ async fn agent_update_notifications_muted_preserves_activity_timestamp() {
             .expect("toggle notifications");
         assert_eq!(response["agent"]["notificationsMuted"], muted);
         assert_eq!(response["agent"]["updatedAt"], old);
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event arrives")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event arrives")
+        .expect("subscription open");
         let event = batch
             .iter()
             .find(|e| e.event_type == AGENT_UPDATED)
@@ -32015,7 +33554,11 @@ async fn agent_update_notifications_muted_mixed_edits_advance_activity_timestamp
         json!({ "notificationsMuted": false, "isBackground": true }),
         json!({ "name": "Real edit" }),
     ] {
-        let mut session = svc.store.get_agent_session(&id).await.unwrap();
+        let mut session = svc
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         session.updated_at = old.to_string();
         svc.store.update_agent_session(&ws, &session).await.unwrap();
         let response = svc
@@ -32025,10 +33568,13 @@ async fn agent_update_notifications_muted_mixed_edits_advance_activity_timestamp
         let stored = svc.agent_get_session_op(id.clone()).await.unwrap();
         assert!(stored.updated_at.as_str() > old, "{changes}");
         assert_eq!(response["agent"]["updatedAt"], stored.updated_at);
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let event = batch.iter().find(|e| e.data["agentId"] == id.0).unwrap();
         for (key, value) in changes.as_object().unwrap() {
             assert_eq!(&event.data[key], value);
@@ -32043,6 +33589,107 @@ async fn agent_update_notifications_muted_mixed_edits_advance_activity_timestamp
     assert_eq!(stored.system_prompt.as_deref(), Some("New prompt"));
     assert!(stored.is_background);
     assert!(!stored.notifications_muted);
+}
+
+/// `pinned` is a sidebar preference: pin / unpin (alone or together with the
+/// mute) is echoed on the response, persisted, and announced through
+/// `agent:updated` without advancing the activity timestamp the sidebar sorts by.
+#[tokio::test]
+async fn agent_update_pinned_preserves_activity_timestamp() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Pin timestamp").await;
+    let old = "2020-01-01T00:00:00.000Z";
+    let mut session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    session.updated_at = old.to_string();
+    svc.store.update_agent_session(&ws, &session).await.unwrap();
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![AGENT_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    for changes in [
+        json!({ "pinned": true }),
+        json!({ "pinned": true }),
+        json!({ "pinned": false, "notificationsMuted": true }),
+        json!({ "pinned": true }),
+    ] {
+        let pinned = changes["pinned"].as_bool().unwrap();
+        let response = svc
+            .agent_update_op(id.clone(), changes.clone())
+            .await
+            .expect("toggle pin");
+        assert_eq!(response["agent"]["pinned"], pinned);
+        assert_eq!(response["agent"]["updatedAt"], old);
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event arrives")
+        .expect("subscription open");
+        let event = batch
+            .iter()
+            .find(|e| e.event_type == AGENT_UPDATED)
+            .unwrap();
+        let mut expected = changes.clone();
+        expected["agentId"] = json!(id.0);
+        assert_eq!(event.data, expected);
+        let stored = svc.agent_get_session_op(id.clone()).await.unwrap();
+        assert_eq!(stored.updated_at, old);
+        assert_eq!(stored.pinned, pinned);
+    }
+    let stored = svc.agent_get_session_op(id.clone()).await.unwrap();
+    assert!(
+        stored.notifications_muted,
+        "mixed preference write kept the mute"
+    );
+
+    let listed = svc
+        .agent_get_op(id.clone(), Some(ws.clone()))
+        .await
+        .expect("agent.get projection");
+    assert!(listed.pinned);
+    assert_eq!(serde_json::to_value(&listed).unwrap()["pinned"], true);
+}
+
+/// A pin accompanying a substantive edit does not suppress its activity
+/// timestamp, and a non-boolean `pinned` is rejected with the session untouched.
+#[tokio::test]
+async fn agent_update_pinned_mixed_edit_and_validation() {
+    let (_t, svc, ws, _bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Before").await;
+    let old = "2020-01-01T00:00:00.000Z";
+    let mut session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    session.updated_at = old.to_string();
+    svc.store.update_agent_session(&ws, &session).await.unwrap();
+
+    svc.agent_update_op(id.clone(), json!({ "pinned": true, "name": "After" }))
+        .await
+        .expect("mixed update");
+    let stored = svc.agent_get_session_op(id.clone()).await.unwrap();
+    assert!(stored.updated_at.as_str() > old);
+    assert!(stored.pinned);
+    assert_eq!(stored.name, "After");
+
+    for bad in [json!(null), json!("yes"), json!(1)] {
+        let err = svc
+            .agent_update_op(id.clone(), json!({ "pinned": bad }))
+            .await
+            .expect_err("non-boolean pinned");
+        assert!(
+            matches!(&err, Error::InvalidParams(msg) if msg.contains("`pinned` must be a boolean")),
+            "{err:?}"
+        );
+    }
+    assert!(svc.agent_get_session_op(id).await.unwrap().pinned);
 }
 
 /// Name-only updates fold into `agent:renamed` (not `agent:updated`), matching
@@ -32064,11 +33711,77 @@ async fn agent_update_name_only_emits_agent_renamed() {
     assert_eq!(session.name, "NewName");
     assert!(session.name_explicitly_set);
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv")
+    .expect("open");
+    let renamed = batch
+        .iter()
+        .find(|e| e.event_type == AGENT_RENAMED)
+        .expect("agent:renamed in batch");
+    assert_eq!(renamed.data["name"], "NewName");
+    assert_eq!(renamed.data["nameExplicitlySet"], json!(true));
+}
+
+/// An `agent:updated` carrying `name` also carries the session's persisted
+/// `nameExplicitlySet` after the write (§6.5), overriding any request-echoed
+/// value: a mixed update reports `true`, and `{ name, nameExplicitlySet }`
+/// reports the stored flag in either key order.
+#[tokio::test]
+async fn agent_update_with_name_reports_persisted_name_explicitly_set() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let cases = [
+        json!({ "name": "Mixed", "systemPrompt": "be brief" }),
+        serde_json::from_str::<serde_json::Value>(
+            r#"{ "nameExplicitlySet": false, "name": "FlagFirst" }"#,
+        )
+        .unwrap(),
+        serde_json::from_str::<serde_json::Value>(
+            r#"{ "name": "NameFirst", "nameExplicitlySet": false }"#,
+        )
+        .unwrap(),
+    ];
+    for (changes, stored) in cases.into_iter().zip([true, true, false]) {
+        let id = create_agent(&svc, &ws, "Before").await;
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![AGENT_UPDATED.to_string()],
+            ..Default::default()
+        });
+        svc.agent_update_op(id.clone(), changes.clone())
+            .await
+            .expect("update");
+        let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+        // Pins today's store semantics: the last of `name` (sets `true`) and
+        // `nameExplicitlySet` in request order wins.
+        assert_eq!(
+            session.name_explicitly_set, stored,
+            "stored flag for {changes}"
+        );
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
         .await
         .expect("recv")
         .expect("open");
-    assert!(batch.iter().any(|e| e.event_type == AGENT_RENAMED));
+        let updated = batch
+            .iter()
+            .find(|e| {
+                e.event_type == AGENT_UPDATED
+                    && e.data["agentId"] == json!(id.0)
+                    && e.data.get("name").is_some()
+            })
+            .expect("agent:updated in batch");
+        assert_eq!(updated.data["name"], json!(session.name), "{changes}");
+        assert_eq!(
+            updated.data["nameExplicitlySet"],
+            json!(session.name_explicitly_set),
+            "event flag must equal the persisted flag for {changes}"
+        );
+    }
 }
 
 /// `agent.update` runs the same registry validation on the `imageBlocks`
@@ -32260,10 +33973,13 @@ async fn agent_append_message_persists_and_emits() {
     let session = svc.agent_get_session_op(id.clone()).await.expect("get");
     assert_eq!(session.messages.len(), 1);
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv")
-        .expect("open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv")
+    .expect("open");
     assert!(batch.iter().any(|e| e.event_type == AGENT_MESSAGE));
 }
 
@@ -32422,18 +34138,21 @@ async fn agent_edit_truncate_drops_edited_message_and_tail() {
     // truncate summary. An unbatched subscription delivers those as separate
     // batches, so wait for the event this assertion owns instead of assuming
     // it is in the first batch.
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let batch = sub.recv().await.expect("open");
-            if batch.iter().any(|e| {
-                e.event_type == AGENT_UPDATED
-                    && e.data["truncatedCount"] == json!(2)
-                    && e.data["remainingCount"] == json!(2)
-            }) {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                let batch = sub.recv().await.expect("open");
+                if batch.iter().any(|e| {
+                    e.event_type == AGENT_UPDATED
+                        && e.data["truncatedCount"] == json!(2)
+                        && e.data["remainingCount"] == json!(2)
+                }) {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("truncate summary event");
 }
@@ -32536,7 +34255,7 @@ async fn agent_edit_and_regenerate_fallback_applies_model_and_truncates() {
 
 use intent_core::{AgentCreateExtra, AgentWakeCreateOptions, AgentWakeOrCreateInput, NoteId};
 
-async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
+pub(super) async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> NoteId {
     let note = svc
         .create_note(
             ws.clone(),
@@ -32782,7 +34501,7 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
             ws.clone(),
             Some("prev".into()),
             Some("gpt-4".into()),
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -32799,7 +34518,7 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
     // inheritance source can still read specialist/model from the row.
     let mut prev_session = svc
         .store()
-        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .get_agent_session_with_transcript(&AgentId::from(prev_id.as_str()))
         .await
         .expect("load prev");
     prev_session.status = intent_core::AgentStatus::Deleted;
@@ -32831,7 +34550,7 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
     let new_id = resp["agentId"].as_str().unwrap();
     let session = svc
         .store()
-        .get_agent_session(&AgentId::from(new_id))
+        .get_agent_session_with_transcript(&AgentId::from(new_id))
         .await
         .expect("load new session");
     assert_eq!(session.name, "Explicit Name");
@@ -32843,7 +34562,7 @@ async fn wake_or_create_inherits_specialist_and_persists_rich_payload() {
     assert_eq!(md["contextReferences"][0]["id"], "note-1");
     assert_eq!(md["skipAutoCommit"], true);
     // Specialist was inherited from the previous (now-deleted) session.
-    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+    assert_eq!(session.specialist.as_deref(), Some("developer"));
     // Depth defaults to `0` when neither caller nor explicit depth was given.
     assert_eq!(md["delegationDepth"], 0);
     assert!(!md["taskNoteId"].as_str().unwrap().is_empty());
@@ -32862,7 +34581,7 @@ async fn wake_or_create_drops_stale_inherited_specialist() {
             ws.clone(),
             Some("prev".into()),
             None,
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -32880,10 +34599,10 @@ async fn wake_or_create_drops_stale_inherited_specialist() {
     // inheritance source.
     let mut prev_session = svc
         .store()
-        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .get_agent_session_with_transcript(&AgentId::from(prev_id.as_str()))
         .await
         .expect("load prev");
-    prev_session.specialist = Some("retired-specialist".into());
+    prev_session.specialist = Some("implementor".into());
     prev_session.status = intent_core::AgentStatus::Deleted;
     prev_session.updated_at = intent_core::now_iso();
     svc.store()
@@ -32904,7 +34623,7 @@ async fn wake_or_create_drops_stale_inherited_specialist() {
     let new_id = resp["agentId"].as_str().unwrap();
     let session = svc
         .store()
-        .get_agent_session(&AgentId::from(new_id))
+        .get_agent_session_with_transcript(&AgentId::from(new_id))
         .await
         .expect("load new session");
     assert_eq!(
@@ -32926,7 +34645,7 @@ async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
             ws.clone(),
             Some("prev".into()),
             None,
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -32940,7 +34659,7 @@ async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
         .expect("assign prev");
     let mut prev_session = svc
         .store()
-        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .get_agent_session_with_transcript(&AgentId::from(prev_id.as_str()))
         .await
         .expect("load prev");
     prev_session.specialist = Some("retired-specialist".into());
@@ -32953,7 +34672,7 @@ async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
 
     let input = AgentWakeOrCreateInput {
         create: Some(intent_core::AgentWakeCreateOptions {
-            specialist: Some("verifier".into()),
+            specialist: Some("developer".into()),
             ..Default::default()
         }),
         ..Default::default()
@@ -32966,12 +34685,12 @@ async fn wake_or_create_stale_inherited_falls_back_to_create_specialist() {
     let new_id = resp["agentId"].as_str().unwrap();
     let session = svc
         .store()
-        .get_agent_session(&AgentId::from(new_id))
+        .get_agent_session_with_transcript(&AgentId::from(new_id))
         .await
         .expect("load new session");
     assert_eq!(
         session.specialist.as_deref(),
-        Some("verifier"),
+        Some("developer"),
         "stale inherited id falls back to the validated create.specialist"
     );
 }
@@ -32991,7 +34710,7 @@ async fn wake_or_create_rejects_unknown_create_specialist_side_effect_free() {
             ws.clone(),
             Some("prev".into()),
             None,
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -33008,7 +34727,7 @@ async fn wake_or_create_rejects_unknown_create_specialist_side_effect_free() {
     // the purge would remove.
     let mut prev_session = svc
         .store()
-        .get_agent_session(&AgentId::from(prev_id.as_str()))
+        .get_agent_session_with_transcript(&AgentId::from(prev_id.as_str()))
         .await
         .expect("load prev");
     prev_session.status = intent_core::AgentStatus::Deleted;
@@ -33019,7 +34738,7 @@ async fn wake_or_create_rejects_unknown_create_specialist_side_effect_free() {
         .expect("mark prev deleted");
     let sessions_before = svc
         .store()
-        .list_agent_sessions(&ws)
+        .list_agent_sessions_with_transcripts(&ws)
         .await
         .expect("list before")
         .len();
@@ -33044,7 +34763,7 @@ async fn wake_or_create_rejects_unknown_create_specialist_side_effect_free() {
 
     let sessions_after = svc
         .store()
-        .list_agent_sessions(&ws)
+        .list_agent_sessions_with_transcripts(&ws)
         .await
         .expect("list after")
         .len();
@@ -33122,7 +34841,7 @@ async fn wake_or_create_store_only_persists_row_level_metadata() {
     );
     let session = svc
         .store()
-        .get_agent_session(&new_id)
+        .get_agent_session_with_transcript(&new_id)
         .await
         .expect("session");
     assert_eq!(
@@ -33153,15 +34872,41 @@ async fn setup_with_manager() -> (
     EventBus,
     WorkspaceId,
 ) {
+    setup_with_manager_on(|services| services).await
+}
+
+/// [`setup_with_manager`] with the runtime test double installed before the
+/// manager takes its `Services` clone.
+async fn setup_with_manager_fake_runtime() -> (
+    TempDb,
+    Services,
+    Arc<crate::agent_manager::AgentManager>,
+    EventBus,
+    WorkspaceId,
+) {
+    setup_with_manager_on(FakeRuntime::install).await
+}
+
+async fn setup_with_manager_on(
+    configure: impl FnOnce(Services) -> Services,
+) -> (
+    TempDb,
+    Services,
+    Arc<crate::agent_manager::AgentManager>,
+    EventBus,
+    WorkspaceId,
+) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let bus = EventBus::new(store.clone());
     let registry = test_registry_with_default_provider(&tmp);
-    let services = Services::new(store)
-        .with_settings_registry(registry)
-        .with_event_bus(bus.clone());
+    let services = configure(
+        Services::new_isolated(store)
+            .with_settings_registry(registry)
+            .with_event_bus(bus.clone()),
+    );
     let sink: Arc<dyn intent_acp::EventSink> = Arc::new(crate::BusEventSink::new(bus.clone()));
     let manager = Arc::new(crate::agent_manager::AgentManager::new(
         services.clone(),
@@ -33662,7 +35407,7 @@ async fn agent_store_mutations_reject_cross_workspace_writes() {
     let id = create_agent(&svc, &ws_a, "Owned").await;
     let mut session = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("owner session");
     session.name = "Renamed".to_string();
@@ -33677,7 +35422,7 @@ async fn agent_store_mutations_reject_cross_workspace_writes() {
     assert!(matches!(err, Error::NotFound(_)), "update: {err:?}");
     let reread = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("still there");
     assert_ne!(reread.name, "Renamed");
@@ -33710,7 +35455,7 @@ async fn agent_store_mutations_reject_cross_workspace_writes() {
         .expect("delete returns bool");
     assert!(!removed, "cross-ws delete must remove zero rows");
     svc.store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("row still present after cross-ws delete");
 }
@@ -33778,12 +35523,17 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
 
     // Store rows are gone — the cascade ran after the live-state sweep.
     for id in [&a, &b, &c] {
-        let err = svc.store().get_agent_session(id).await.expect_err("gone");
+        let err = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect_err("gone");
         assert!(matches!(err, Error::NotFound(_)), "{id}: {err:?}");
     }
 
     // Collect one full event window (batch may fan out across recvs).
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     let mut deleted_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut saw_workspace_deleted = false;
     while std::time::Instant::now() < deadline && (deleted_ids.len() < 3 || !saw_workspace_deleted)
@@ -33856,13 +35606,14 @@ async fn delete_workspace_consumes_chief_ungrouped_watch_without_bus() {
     // Exactly one deleted-completion wake reached the chief parent.
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session survives the delete");
     assert_eq!(parent_session.messages.len(), 1);
 
     // The persisted completion_watch row is swept (delete is spawned; poll).
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let rows = svc
             .store()
@@ -33885,7 +35636,7 @@ async fn delete_workspace_consumes_chief_ungrouped_watch_without_bus() {
     svc.handle_completion_event(&event).await;
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(parent_session.messages.len(), 1, "duplicate wake delivered");
@@ -33968,10 +35719,13 @@ async fn delete_workspace_backstop_sweep_emits_subscriptions_changed() {
     // The grouped watch survived the direct delivery (group settlement owns
     // its lifecycle) and was removed by the backstop sweep, which publishes
     // the parent's refreshed (now empty) waiting flags.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after backstop sweep")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after backstop sweep")
+    .expect("batch");
     let last = batch.last().expect("event");
     assert_eq!(last.event_type, AGENT_SUBSCRIPTIONS_CHANGED);
     assert_eq!(last.data["agentId"], json!(parent.0));
@@ -34185,10 +35939,13 @@ async fn agent_send_message_emits_agent_message_event() {
     let response_message_id = r["messageId"].as_str().unwrap();
 
     // Verify the event was published with the correct messageId.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv")
-        .expect("open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv")
+    .expect("open");
     let event = batch
         .iter()
         .find(|e| e.event_type == AGENT_MESSAGE)
@@ -34230,10 +35987,13 @@ async fn agent_send_queued_message_now_emits_agent_message_event() {
     assert_eq!(response_message_id, queued_id, "entry id is the row id");
 
     // Verify the event was published with the correct messageId.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv")
-        .expect("open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv")
+    .expect("open");
     let event = batch
         .iter()
         .find(|e| e.event_type == AGENT_MESSAGE)
@@ -34278,7 +36038,12 @@ async fn agent_send_queued_message_now_publishes_shrunk_queue_after_row_persist(
     assert_eq!(r["success"], json!(true));
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let row_echo_at = events
@@ -34349,6 +36114,7 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
     // persisted=true (matching persist_error_and_requeue's behavior).
     let message_id = new_message_id();
     let queued = QueuedMessage {
+        monitor_turn: None,
         delivery_groups: None,
         prepend_delivery_groups: None,
         turn_id: message_id.clone(),
@@ -34393,10 +36159,13 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
     );
 
     // Verify agent:queue:updated event carries the marker
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let evt = batch
         .iter()
         .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -34444,10 +36213,13 @@ async fn queued_message_metadata_surfaces_in_queue_snapshot() {
     assert_eq!(snapshot[0]["messageMetadata"], metadata);
 
     // agent:queue:updated event carries the same shape.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let evt = batch
         .iter()
         .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -34573,17 +36345,20 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
     // try_fire_group swaps the watches before the wake-delivery await, but the
     // transcript write we synchronized on above is a separate async step, so
     // poll until the registry reaches its settled state.
-    let watches = timeout(Duration::from_secs(2), async {
-        loop {
-            let watches = svc.list_watches_for_parent(&parent);
-            let settled = watches.iter().all(|w| w.group_id.is_none())
-                && watches.iter().any(|w| w.child_agent_id == child_b);
-            if settled {
-                return watches;
+    let watches = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                let watches = svc.list_watches_for_parent(&parent);
+                let settled = watches.iter().all(|w| w.group_id.is_none())
+                    && watches.iter().any(|w| w.child_agent_id == child_b);
+                if settled {
+                    return watches;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("failed-child watch re-established after group settlement");
     assert!(
@@ -34682,7 +36457,7 @@ async fn grouped_child_failure_wakes_parent_immediately() {
     // immediate wake's metadata (`watchStillArmed: true`).
     let parent_session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let failure_meta = parent_session
@@ -34938,6 +36713,7 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
     svc.requeue_front(
         &id,
         crate::agent_ops::QueuedMessage {
+            monitor_turn: None,
             delivery_groups: None,
             prepend_delivery_groups: None,
             id: requeue_id.clone(),
@@ -34973,7 +36749,7 @@ async fn turn_id_fresh_enqueue_identity_and_restart_round_trip() {
 
     // Restart: both entries rehydrate with their turn ids intact.
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let rehydrated = restarted.rehydrate_agent_queues().await.expect("rehydrate");
     assert_eq!(rehydrated, 2);
     let front = restarted.dequeue_message(&id).expect("dequeue requeued");
@@ -35050,7 +36826,7 @@ async fn rehydrate_restores_queue_resets_editing_and_keeps_flags() {
 
     // Fresh Services over the same store = a daemon restart (empty in-memory map).
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let rehydrated = restarted.rehydrate_agent_queues().await.expect("rehydrate");
     assert_eq!(rehydrated, 2);
 
@@ -35095,7 +36871,7 @@ async fn rehydrate_preserves_live_map() {
     // Rehydrating over a Services that already holds a live queue for the
     // agent keeps the live (newer) queue rather than clobbering it.
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     restarted
         .agent_queue_message_op(id.clone(), "live".into(), None, None, None)
         .await
@@ -35222,7 +36998,8 @@ async fn hold_timer_flush_makes_entry_ready() {
 
     // Wait for the spawned timer to flush the hold: the marker clears in
     // the queue snapshot. The deadline is a liveness bound only.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3));
     loop {
         let snapshot = svc.queue_snapshot(&id);
         let entry = snapshot
@@ -35358,12 +37135,13 @@ async fn rehydrate_flushes_expired_and_rearms_unexpired_holds() {
 
     // Fresh Services over the same store = a daemon restart.
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let rehydrated = restarted.rehydrate_agent_queues().await.expect("rehydrate");
     assert_eq!(rehydrated, 2);
 
     // The expired hold's re-armed timer fires immediately and flushes it.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3));
     while !restarted.has_ready_to_send(&id) {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -35399,6 +37177,7 @@ async fn rehydrate_flushes_expired_and_rearms_unexpired_holds() {
 /// resets and preservations are both observable.
 fn parked_entry(id: &str, content: &str) -> crate::agent_ops::QueuedMessage {
     crate::agent_ops::QueuedMessage {
+        monitor_turn: None,
         delivery_groups: None,
         prepend_delivery_groups: None,
         id: id.to_string(),
@@ -35493,7 +37272,9 @@ async fn migrate_queue_preserves_order_resets_flags_and_gcs_poisoned() {
     // was written through with the reset flags — nothing rehydrates for the
     // dead agent at the next startup.
     assert!(matches!(
-        svc.store().get_agent_session(&poisoned).await,
+        svc.store()
+            .get_agent_session_with_transcript(&poisoned)
+            .await,
         Err(Error::NotFound(_))
     ));
     assert_eq!(svc.record_terminal_failure(&poisoned, "boom"), 1);
@@ -35509,16 +37290,22 @@ async fn migrate_queue_preserves_order_resets_flags_and_gcs_poisoned() {
 
     // agent:queue:updated names the TARGET with the migrated snapshot;
     // agent:deleted names the poisoned session.
-    let batch = timeout(Duration::from_secs(2), queue_sub.recv())
-        .await
-        .expect("queue event timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        queue_sub.recv(),
+    )
+    .await
+    .expect("queue event timed out")
+    .expect("subscription closed");
     assert_eq!(batch[0].data["agentId"].as_str(), Some(target.0.as_str()));
     assert_eq!(batch[0].data["queue"].as_array().unwrap().len(), 3);
-    let batch = timeout(Duration::from_secs(2), deleted_sub.recv())
-        .await
-        .expect("deleted event timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        deleted_sub.recv(),
+    )
+    .await
+    .expect("deleted event timed out")
+    .expect("subscription closed");
     assert_eq!(batch[0].data["agentId"].as_str(), Some(poisoned.0.as_str()));
 }
 
@@ -35538,14 +37325,19 @@ async fn migrate_queue_empty_queue_still_gcs_poisoned_session() {
         .expect("migrate empty");
     assert_eq!(migrated, 0);
     assert!(matches!(
-        svc.store().get_agent_session(&poisoned).await,
+        svc.store()
+            .get_agent_session_with_transcript(&poisoned)
+            .await,
         Err(Error::NotFound(_))
     ));
     // No entries moved → no agent:queue:updated noise for the target.
     assert!(
-        timeout(Duration::from_millis(300), queue_sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            queue_sub.recv()
+        )
+        .await
+        .is_err(),
         "expected no queue event for an empty migration"
     );
 }
@@ -35586,7 +37378,11 @@ async fn migrate_queue_rejects_unknown_target_without_draining() {
         .expect_err("unknown target must fail closed");
     assert!(matches!(err, Error::InvalidParams(_)));
     // Nothing was drained or deleted: the parked message and session survive.
-    assert!(svc.store().get_agent_session(&poisoned).await.is_ok());
+    assert!(svc
+        .store()
+        .get_agent_session_with_transcript(&poisoned)
+        .await
+        .is_ok());
     assert!(svc.dequeue_message(&poisoned).is_some());
 }
 
@@ -35625,7 +37421,11 @@ async fn migrate_queue_failed_store_move_rolls_back_and_skips_gc() {
 
     // GC skipped: the poisoned session survives with its durable rows, and
     // the in-memory drain was rolled back — nothing leaked onto the target.
-    assert!(svc.store().get_agent_session(&poisoned).await.is_ok());
+    assert!(svc
+        .store()
+        .get_agent_session_with_transcript(&poisoned)
+        .await
+        .is_ok());
     let rows = persisted_queue(&svc, &poisoned).await;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["id"], "m-0");
@@ -35649,7 +37449,9 @@ async fn migrate_queue_failed_store_move_rolls_back_and_skips_gc() {
         .expect("retry succeeds");
     assert_eq!(migrated, 2);
     assert!(matches!(
-        svc.store().get_agent_session(&poisoned).await,
+        svc.store()
+            .get_agent_session_with_transcript(&poisoned)
+            .await,
         Err(Error::NotFound(_))
     ));
     assert_eq!(persisted_queue(&svc, &target).await.len(), 2);
@@ -35659,25 +37461,50 @@ async fn migrate_queue_failed_store_move_rolls_back_and_skips_gc() {
 /// the boot-rehydration re-arm): a held entry migrated off a poisoned
 /// session still flushes at its deadline on the replacement's queue instead
 /// of sitting parked until an unrelated queue event.
+///
+/// Neither half depends on how long setup and the migration's store writes
+/// take (intent-hq/intent#8181: a 300 ms wall-clock deadline expired before
+/// the marker check on a loaded host). The `kept` entry's deadline is far
+/// away, so its marker must arrive intact. The `due` entry is armed far away
+/// on the poisoned agent and its deadline is then moved into the past in
+/// memory without re-arming, so only the migration's re-arm can flush it
+/// before the liveness bound; the poisoned agent's own timer would sleep
+/// for a minute.
 #[tokio::test]
 async fn migrate_queue_rearms_hold_timers_for_target() {
     let (_t, svc, ws) = setup().await;
     let poisoned = create_agent(&svc, &ws, "PoisonedHeld").await;
     let target = create_agent(&svc, &ws, "FreshHeld").await;
 
-    // Park one short-deadline held entry on the poisoned session (armed
-    // against the poisoned agent id) alongside a normal entry.
-    let soon = intent_core::iso_ms_from_now(300);
-    let (held, _) = svc
+    let far = intent_core::iso_ms_from_now(60_000);
+    let (kept, _) = svc
         .enqueue_held_message(
             &poisoned,
-            "held wake".into(),
+            "kept wake".into(),
             None,
             "debounce",
-            &soon,
+            &far,
             "child-1",
         )
         .await;
+    let (due, _) = svc
+        .enqueue_held_message(
+            &poisoned,
+            "due wake".into(),
+            None,
+            "debounce",
+            &far,
+            "child-2",
+        )
+        .await;
+    {
+        let mut guard = svc.agent_queues.lock().unwrap();
+        let entry = guard
+            .get_mut(&poisoned)
+            .and_then(|queue| queue.iter_mut().find(|m| m.id == due.id))
+            .expect("due entry queued on the poisoned agent");
+        entry.hold_until = Some(intent_core::iso_ms_from_now(0));
+    }
     svc.enqueue_message(
         &poisoned,
         "plain".into(),
@@ -35693,25 +37520,26 @@ async fn migrate_queue_rearms_hold_timers_for_target() {
         .migrate_queue_and_gc_poisoned_session(&poisoned, &target, &ws)
         .await
         .expect("migrate");
-    assert_eq!(migrated, 2);
+    assert_eq!(migrated, 3);
 
     // The held entry moved with its marker intact...
     let snapshot = svc.queue_snapshot(&target);
     let moved = snapshot
         .iter()
-        .find(|e| e["id"] == json!(held.id))
+        .find(|e| e["id"] == json!(kept.id))
         .expect("held entry migrated");
     assert_eq!(moved["holdKind"], "debounce");
 
-    // ...and the re-armed timer flushes it on the TARGET at the deadline —
-    // no manual release, no unrelated queue event.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    // ...and the re-armed timer flushes the due entry on the TARGET — no
+    // manual release, no unrelated queue event.
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3));
     loop {
         let snapshot = svc.queue_snapshot(&target);
         let entry = snapshot
             .iter()
-            .find(|e| e["id"] == json!(held.id))
-            .expect("held entry stays queued");
+            .find(|e| e["id"] == json!(due.id))
+            .expect("due entry stays queued");
         if entry["holdKind"].is_null() {
             break;
         }
@@ -35721,6 +37549,15 @@ async fn migrate_queue_rearms_hold_timers_for_target() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    let snapshot = svc.queue_snapshot(&target);
+    let kept_entry = snapshot
+        .iter()
+        .find(|e| e["id"] == json!(kept.id))
+        .expect("kept entry stays queued");
+    assert_eq!(
+        kept_entry["holdKind"], "debounce",
+        "the far-deadline hold stays held"
+    );
     assert!(svc.has_ready_to_send(&target));
 }
 
@@ -35906,9 +37743,12 @@ async fn suspend_self_heal_refuses_late_schedule() {
 async fn suspend_idle_self_heal_stops_without_claiming() {
     let (_tmp, svc, _, aid, bus) = suspend_shutdown_fixture().await;
     assert!(svc.schedule_suspend_self_heal(Duration::from_secs(3600)));
-    timeout(Duration::from_secs(5), svc.shutdown_store_writers())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        svc.shutdown_store_writers(),
+    )
+    .await
+    .unwrap();
     assert!(svc
         .store
         .get_interrupted_agent(&aid)
@@ -35936,9 +37776,12 @@ async fn assert_suspend_claim_shutdown(reset: bool) {
     let owner = svc.clone();
     let caller =
         intent_core::spawn_daemon(async move { owner.resume_suspend_interrupted_agents().await });
-    timeout(Duration::from_secs(5), park.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        park.entered.notified(),
+    )
+    .await
+    .unwrap();
     assert!(
         svc.store
             .get_interrupted_agent(&aid)
@@ -35956,20 +37799,26 @@ async fn assert_suspend_claim_shutdown(reset: bool) {
     *svc.secrets.writer_drain_pending.lock().unwrap() = Some(entered);
     let owner = svc.clone();
     let mut drain = intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
-    let pending = timeout(Duration::from_secs(5), async {
-        tokio::select! {
-            point = entering => { assert_eq!(point.unwrap(), "settings-tasks"); true }
-            result = &mut drain => { result.unwrap(); false }
-        }
-    })
+    let pending = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            tokio::select! {
+                point = entering => { assert_eq!(point.unwrap(), "settings-tasks"); true }
+                result = &mut drain => { result.unwrap(); false }
+            }
+        },
+    )
     .await
     .unwrap();
     park.release.notify_one();
     if pending {
-        timeout(Duration::from_secs(5), drain)
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            drain,
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
     assert!(pending, "shutdown discarded a claimed suspend resume");
     if let Some(manager) = &manager {
@@ -36195,10 +38044,13 @@ async fn resume_watch_reregistration_publishes_subscriptions_changed() {
 
     svc.resume_interrupted_agent(&child).await.expect("resume");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after resume re-registration")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after resume re-registration")
+    .expect("batch");
     assert_eq!(batch.len(), 1, "exactly one event: {batch:?}");
     assert_eq!(batch[0].event_type, AGENT_SUBSCRIPTIONS_CHANGED);
     assert_eq!(
@@ -36209,9 +38061,12 @@ async fn resume_watch_reregistration_publishes_subscriptions_changed() {
     assert_eq!(batch[0].data["isWaitingForOtherAgents"], json!(true));
     assert_eq!(batch[0].data["waitingForAgentIds"], json!([child.0]));
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "resume must publish subscriptions-changed exactly once"
     );
 
@@ -36246,10 +38101,13 @@ async fn resume_grouped_watch_reregistration_publishes_subscriptions_changed() {
 
     svc.resume_interrupted_agent(&child).await.expect("resume");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after grouped re-registration")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after grouped re-registration")
+    .expect("batch");
     assert_eq!(batch.len(), 1, "exactly one event: {batch:?}");
     assert_eq!(batch[0].data["agentId"], json!(parent.0));
     assert_eq!(batch[0].data["isWaitingForOtherAgents"], json!(true));
@@ -36283,10 +38141,13 @@ async fn resume_existing_watch_refresh_publishes_snapshot_without_display_status
 
     svc.resume_interrupted_agent(&child).await.expect("resume");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after watch refresh")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after watch refresh")
+    .expect("batch");
     assert_eq!(batch.len(), 1, "exactly one event: {batch:?}");
     assert_eq!(batch[0].data["agentId"], json!(parent.0));
     assert_eq!(batch[0].data["isWaitingForOtherAgents"], json!(true));
@@ -36335,9 +38196,12 @@ async fn resume_watch_rejection_publishes_no_subscriptions_changed() {
         .expect("resume succeeds despite the rejected watch");
 
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "rejected re-registration must not publish subscriptions-changed"
     );
     assert!(svc.list_watches_for_parent(&parent).is_empty());
@@ -36509,7 +38373,11 @@ fn context_size_error_classifier() {
 async fn deterministic_prompt_rejection_poisons_session_and_streak() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Rejected").await;
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
 
     // Error + the #940 rejection → poisoned without any streak.
     session.status = intent_core::AgentStatus::Error;
@@ -36595,7 +38463,11 @@ fn normalize_failure_text_strips_volatile_tokens() {
 async fn session_poisoned_requires_error_status_and_fatal_reason_or_streak() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Poisoned").await;
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
 
     // Fatal reason but non-Error status → not poisoned (status gate).
     session.status = intent_core::AgentStatus::Active;
@@ -36642,7 +38514,7 @@ async fn wake_or_create_skips_poisoned_session_and_creates_fresh() {
             ws.clone(),
             Some("prev".into()),
             Some("gpt-4".into()),
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -36687,10 +38559,10 @@ async fn wake_or_create_skips_poisoned_session_and_creates_fresh() {
     // The fresh session inherits specialist from the poisoned source.
     let session = svc
         .store()
-        .get_agent_session(&AgentId::from(new_id.as_str()))
+        .get_agent_session_with_transcript(&AgentId::from(new_id.as_str()))
         .await
         .expect("new session");
-    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+    assert_eq!(session.specialist.as_deref(), Some("developer"));
     // The poisoned id is stripped from the task's assigned_agent_ids.
     let note = svc.get_note(ws, note_id).await.expect("note");
     let task = note.metadata.task.expect("task");
@@ -36805,7 +38677,7 @@ async fn wake_or_create_migrates_poisoned_queue_to_created_agent() {
 
     // GC: hard-deleted, nothing left to rehydrate at the next startup.
     assert!(matches!(
-        svc.store().get_agent_session(&prev).await,
+        svc.store().get_agent_session_with_transcript(&prev).await,
         Err(Error::NotFound(_))
     ));
     assert!(persisted_queue(&svc, &prev).await.is_empty());
@@ -36849,7 +38721,7 @@ async fn wake_or_create_migrates_poisoned_sibling_queue_to_woken_agent() {
     assert_eq!(moved.content, "parked");
     assert!(svc.dequeue_message(&live).is_none());
     assert!(matches!(
-        svc.store().get_agent_session(&bad).await,
+        svc.store().get_agent_session_with_transcript(&bad).await,
         Err(Error::NotFound(_))
     ));
 }
@@ -36906,7 +38778,7 @@ async fn wake_or_create_migrates_cross_workspace_poisoned_sibling_queue_to_woken
     assert_eq!(moved.id, "m-0");
     assert!(svc.dequeue_message(&live).is_none());
     assert!(matches!(
-        svc.store().get_agent_session(&bad).await,
+        svc.store().get_agent_session_with_transcript(&bad).await,
         Err(Error::NotFound(_))
     ));
     let task = svc
@@ -36937,7 +38809,11 @@ async fn wake_or_create_cleanup_only_for_not_found_and_soft_deleted() {
     }
     // Soft-delete: the row survives with status Deleted; park a queue on it
     // that must NOT be migrated.
-    let mut soft_session = svc.store().get_agent_session(&soft).await.expect("soft");
+    let mut soft_session = svc
+        .store()
+        .get_agent_session_with_transcript(&soft)
+        .await
+        .expect("soft");
     soft_session.status = intent_core::AgentStatus::Deleted;
     soft_session.updated_at = intent_core::now_iso();
     svc.store()
@@ -36971,7 +38847,7 @@ async fn wake_or_create_cleanup_only_for_not_found_and_soft_deleted() {
     assert!(svc.dequeue_message(&live).is_none());
     let soft_row = svc
         .store()
-        .get_agent_session(&soft)
+        .get_agent_session_with_transcript(&soft)
         .await
         .expect("soft row survives cleanup");
     assert_eq!(soft_row.status, intent_core::AgentStatus::Deleted);
@@ -37024,7 +38900,11 @@ async fn wake_or_create_survives_failed_queue_migration() {
     // in memory) on the poisoned queue; nothing leaked onto the new agent.
     let new_id = AgentId::from(resp["agentId"].as_str().unwrap());
     assert!(svc.dequeue_message(&new_id).is_none());
-    assert!(svc.store().get_agent_session(&prev).await.is_ok());
+    assert!(svc
+        .store()
+        .get_agent_session_with_transcript(&prev)
+        .await
+        .is_ok());
     assert_eq!(persisted_queue(&svc, &prev).await.len(), 1);
     {
         let guard = svc.agent_queues.lock().unwrap();
@@ -37056,7 +38936,7 @@ async fn wake_or_create_survives_failed_queue_migration() {
     assert_eq!(resp2["created"], false);
     assert_eq!(resp2["cleanedUpAgentIds"], json!([prev.clone()]));
     assert!(matches!(
-        svc.store().get_agent_session(&prev).await,
+        svc.store().get_agent_session_with_transcript(&prev).await,
         Err(Error::NotFound(_))
     ));
     let guard = svc.agent_queues.lock().unwrap();
@@ -37092,7 +38972,7 @@ async fn repeated_identical_failure_wake_is_deduped_per_parent() {
         let parent = parent.clone();
         async move {
             svc.store()
-                .get_agent_session(&parent)
+                .get_agent_session_with_transcript(&parent)
                 .await
                 .expect("parent session")
                 .messages
@@ -37340,7 +39220,7 @@ async fn assert_cow_provision_shutdown(target: u8) {
     let aid = create_agent(&svc, &ws, "Provisioning").await;
     let (_directory, path) = fake_provisioned_sandbox(&svc, &ws, &aid).await;
     if target == 1 {
-        let mut session = store.get_agent_session(&aid).await.unwrap();
+        let mut session = store.get_agent_session_with_transcript(&aid).await.unwrap();
         session.status = AgentStatus::Deleted;
         store.update_agent_session(&ws, &session).await.unwrap();
     } else if target == 2 {
@@ -37376,33 +39256,45 @@ async fn assert_cow_provision_shutdown(target: u8) {
         .await;
         let _ = done.send(());
     }));
-    timeout(Duration::from_secs(5), entering)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        entering,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(svc.sandbox_provisioning.lock().unwrap().contains_key(&aid));
     let (entered, entering) = tokio::sync::oneshot::channel();
     *svc.secrets.writer_drain_pending.lock().unwrap() = Some(entered);
     let owner = svc.clone();
     let mut drain = intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
-    let pending = timeout(Duration::from_secs(5), async {
-        tokio::select! {
-            point = entering => { assert_eq!(point.unwrap(), "store-tasks"); true }
-            result = &mut drain => { result.unwrap(); false }
-        }
-    })
+    let pending = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            tokio::select! {
+                point = entering => { assert_eq!(point.unwrap(), "store-tasks"); true }
+                result = &mut drain => { result.unwrap(); false }
+            }
+        },
+    )
     .await
     .unwrap();
     drop(connection);
-    timeout(Duration::from_secs(5), finished)
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        finished,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    if pending {
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            drain,
+        )
         .await
         .unwrap()
         .unwrap();
-    if pending {
-        timeout(Duration::from_secs(5), drain)
-            .await
-            .unwrap()
-            .unwrap();
     }
     assert!(pending, "shutdown discarded admitted CoW settlement");
     assert!(!svc.sandbox_provisioning.lock().unwrap().contains_key(&aid));
@@ -37426,7 +39318,7 @@ async fn assert_cow_provision_shutdown(target: u8) {
     if target == 0 {
         assert_eq!(
             reopened
-                .get_agent_session(&aid)
+                .get_agent_session_with_transcript(&aid)
                 .await
                 .unwrap()
                 .sandbox_path
@@ -37435,7 +39327,7 @@ async fn assert_cow_provision_shutdown(target: u8) {
         );
     } else if target == 1 {
         assert!(reopened
-            .get_agent_session(&aid)
+            .get_agent_session_with_transcript(&aid)
             .await
             .unwrap()
             .sandbox_path
@@ -37477,9 +39369,12 @@ async fn cow_provision_refusal_leaves_no_wait_gate() {
     );
     assert!(observed.await.is_err());
     assert!(!svc.sandbox_provisioning.lock().unwrap().contains_key(&aid));
-    timeout(Duration::from_secs(1), svc.await_sandbox_provisioning(&aid))
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(1)),
+        svc.await_sandbox_provisioning(&aid),
+    )
+    .await
+    .unwrap();
     store.close().await;
 }
 
@@ -37552,7 +39447,11 @@ async fn settle_provisioned_sandbox_discards_when_session_missing() {
             .is_none(),
         "sandbox record must be removed"
     );
-    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    let res = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await;
     assert!(
         res.is_err(),
         "expected no sandbox:cow:created emit for a deleted agent"
@@ -37568,7 +39467,7 @@ async fn settle_provisioned_sandbox_discards_when_session_soft_deleted() {
     let aid = create_agent(&svc, &ws, "Doomed").await;
     let mut session = svc
         .store()
-        .get_agent_session(&aid)
+        .get_agent_session_with_transcript(&aid)
         .await
         .expect("agent session");
     session.status = intent_core::AgentStatus::Deleted;
@@ -37599,7 +39498,7 @@ async fn settle_provisioned_sandbox_discards_when_session_soft_deleted() {
     );
     let session = svc
         .store()
-        .get_agent_session(&aid)
+        .get_agent_session_with_transcript(&aid)
         .await
         .expect("agent session");
     assert!(
@@ -37636,7 +39535,7 @@ async fn settle_provisioned_sandbox_attaches_fields_for_live_session() {
     );
     let session = svc
         .store()
-        .get_agent_session(&aid)
+        .get_agent_session_with_transcript(&aid)
         .await
         .expect("agent session");
     assert_eq!(
@@ -37687,7 +39586,11 @@ async fn agent_lite_projection_identical_between_full_and_bounded_paths() {
     }
 
     // Old (full-transcript) projection, still used by the event-emit paths.
-    let full = svc.store().get_agent_session(&id).await.expect("session");
+    let full = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let old_lite = svc.project_lite_with_flags(full);
     let old = serde_json::to_value(&old_lite).unwrap();
     assert!(
@@ -37888,7 +39791,11 @@ async fn agent_lite_last_message_id_follows_newest_message() {
     )
     .await
     .expect("replace");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let newest = session.messages.last().expect("replaced rows");
     assert_eq!(newest.role, "assistant");
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
@@ -37974,7 +39881,7 @@ async fn agent_lite_last_message_role_live_turn_overlay_flip() {
 /// transcripts, and their per-session message work is bounded (the newest
 /// user/assistant rows only) regardless of per-agent message count — proven
 /// by corrupting the content JSON of every OTHER message row, which errors
-/// any path that fetches/decodes it (as `get_agent_session` demonstrates).
+/// any path that fetches/decodes it (as `get_agent_session_with_transcript` demonstrates).
 /// Query count stays fixed by construction: `agent_list_op` issues one
 /// summaries read plus one bounded projections read for the whole workspace,
 /// never a per-agent (or per-message) transcript query.
@@ -38019,7 +39926,10 @@ async fn agent_list_and_get_do_not_hydrate_transcripts_regression() {
     // fails on the corrupted rows — so the assertions below prove the new
     // paths never touch them.
     assert!(
-        svc.store().get_agent_session(&ids[0]).await.is_err(),
+        svc.store()
+            .get_agent_session_with_transcript(&ids[0])
+            .await
+            .is_err(),
         "full transcript hydration must fail on the corrupted rows"
     );
 
@@ -38183,7 +40093,7 @@ async fn link_task_note(
     .expect("mark as task");
     let mut s = svc
         .store()
-        .get_agent_session(child)
+        .get_agent_session_with_transcript(child)
         .await
         .expect("child session");
     s.task_note_id = Some(note.id.clone());
@@ -38227,7 +40137,7 @@ async fn stall_suspected_wake_annotated_when_no_report_and_task_incomplete() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "exactly one wake");
@@ -38269,7 +40179,7 @@ async fn stall_annotation_skipped_when_completion_report_present() {
     link_task_note(&svc, &ws, &child, "Port frobnicator", "in_progress").await;
     let mut s = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     s.completion_report = Some("all done".into());
@@ -38297,7 +40207,7 @@ async fn stall_annotation_skipped_when_completion_report_present() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -38328,7 +40238,7 @@ async fn stall_annotation_skipped_for_no_task_completed_task_and_missing_note() 
     let dangling = create_agent(&svc, &ws, "Dangling").await;
     let mut s = svc
         .store()
-        .get_agent_session(&dangling)
+        .get_agent_session_with_transcript(&dangling)
         .await
         .expect("session");
     s.task_note_id = Some(intent_core::NoteId::from("note-gone"));
@@ -38358,7 +40268,7 @@ async fn stall_annotation_skipped_for_no_task_completed_task_and_missing_note() 
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 3, "three clean wakes");
@@ -38402,7 +40312,7 @@ async fn stall_annotation_skipped_for_agent_failed() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -38455,7 +40365,7 @@ async fn stall_annotation_applies_to_grouped_after_all_child_line() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "one aggregated wake");
@@ -38498,7 +40408,7 @@ async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
     let (caller, target) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let caller = create_agent(&svc, &ws, "Caller").await;
         let target = create_agent(&svc, &ws, "Target").await;
         link_task_note(&svc, &ws, &target, "Stalled task", "in_progress").await;
@@ -38512,7 +40422,8 @@ async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
         .await
         .expect("waitFor after_all");
         // Wait for the group row to persist (the upsert is spawned).
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -38532,12 +40443,12 @@ async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
     // The target settled while the daemon was down: Completed but with NO
     // completion report, and its task note is still in_progress.
     let mut s = store
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     s.status = intent_core::AgentStatus::Completed;
     store.update_agent_session(&ws, &s).await.expect("mark");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .rehydrate_delegation_groups(&ws)
@@ -38547,7 +40458,7 @@ async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
 
     let session = restarted
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "one aggregated wake");
@@ -38589,7 +40500,7 @@ async fn stall_annotation_skipped_when_task_review_required() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -38634,7 +40545,7 @@ async fn stall_tail_never_contradicts_rendered_report() {
     .await;
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1);
@@ -38681,7 +40592,7 @@ async fn stall_tail_never_contradicts_rendered_report() {
     .await;
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "one aggregated wake");
@@ -38723,7 +40634,11 @@ async fn truncation_redrive_eligibility_gates() {
     // Fully eligible: parent + in_progress task + no report.
     let child = create_agent(&svc, &ws, "Child").await;
     link_task_note(&svc, &ws, &child, "In-flight work", "in_progress").await;
-    let mut s = svc.store().get_agent_session(&child).await.expect("child");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     s.parent_agent_id = Some(parent.clone());
     svc.store()
         .update_agent_session(&ws, &s)
@@ -38744,7 +40659,11 @@ async fn truncation_redrive_eligibility_gates() {
 
     // Delegated but taskless → ineligible.
     let taskless = create_agent(&svc, &ws, "Taskless").await;
-    let mut s = svc.store().get_agent_session(&taskless).await.expect("s");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&taskless)
+        .await
+        .expect("s");
     s.parent_agent_id = Some(parent.clone());
     svc.store()
         .update_agent_session(&ws, &s)
@@ -38758,7 +40677,11 @@ async fn truncation_redrive_eligibility_gates() {
     // Delegated + task, but the task is not in_progress → ineligible.
     let waiting = create_agent(&svc, &ws, "Waiting").await;
     link_task_note(&svc, &ws, &waiting, "Parked task", "waiting").await;
-    let mut s = svc.store().get_agent_session(&waiting).await.expect("s");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&waiting)
+        .await
+        .expect("s");
     s.parent_agent_id = Some(parent.clone());
     svc.store()
         .update_agent_session(&ws, &s)
@@ -38773,7 +40696,11 @@ async fn truncation_redrive_eligibility_gates() {
     // wake, not a redrive).
     let reported = create_agent(&svc, &ws, "Reported").await;
     link_task_note(&svc, &ws, &reported, "Reported task", "in_progress").await;
-    let mut s = svc.store().get_agent_session(&reported).await.expect("s");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&reported)
+        .await
+        .expect("s");
     s.parent_agent_id = Some(parent.clone());
     s.completion_report = Some("all done".into());
     svc.store()
@@ -38787,7 +40714,11 @@ async fn truncation_redrive_eligibility_gates() {
 
     // Dangling task_note_id (note gone) → fail closed.
     let dangling = create_agent(&svc, &ws, "Dangling").await;
-    let mut s = svc.store().get_agent_session(&dangling).await.expect("s");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&dangling)
+        .await
+        .expect("s");
     s.parent_agent_id = Some(parent.clone());
     s.task_note_id = Some(intent_core::NoteId::from("gone-note"));
     svc.store()
@@ -38881,7 +40812,11 @@ async fn empty_wake_recovery_raises_attention_for_root_agent() {
     let nudged = svc.recover_empty_harness_wake(&root, &ws).await;
     assert!(!nudged, "root agents are not redrive-eligible — no nudge");
 
-    let session = svc.store().get_agent_session(&root).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&root)
+        .await
+        .expect("session");
     assert_eq!(
         session.attention_request_kind.as_deref(),
         Some("blocker"),
@@ -38913,7 +40848,11 @@ async fn empty_wake_recovery_enqueues_nudge_for_delegated_agent_until_cap() {
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     link_task_note(&svc, &ws, &child, "In-flight work", "in_progress").await;
-    let mut s = svc.store().get_agent_session(&child).await.expect("child");
+    let mut s = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     s.parent_agent_id = Some(parent.clone());
     svc.store()
         .update_agent_session(&ws, &s)
@@ -38941,7 +40880,11 @@ async fn empty_wake_recovery_enqueues_nudge_for_delegated_agent_until_cap() {
         Some(json!({ "type": "empty_wake_redrive" })),
         "nudge row is attributable"
     );
-    let session = svc.store().get_agent_session(&child).await.expect("child");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert!(
         session.attention_request_kind.is_none(),
         "redrive arm raises no attention"
@@ -38966,7 +40909,11 @@ async fn empty_wake_recovery_enqueues_nudge_for_delegated_agent_until_cap() {
         !svc.has_ready_to_send(&child),
         "no nudge enqueued past the cap"
     );
-    let session = svc.store().get_agent_session(&child).await.expect("child");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     assert_eq!(
         session.attention_request_kind.as_deref(),
         Some("blocker"),
@@ -38994,7 +40941,11 @@ async fn empty_wake_recovery_skips_on_ready_queue_and_pending_attention() {
         MessageOrigin::Automatic,
     );
     assert!(!svc.recover_empty_harness_wake(&queued, &ws).await);
-    let session = svc.store().get_agent_session(&queued).await.expect("s");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&queued)
+        .await
+        .expect("s");
     assert!(
         session.attention_request_kind.is_none(),
         "imminent drain suppresses the recovery"
@@ -39007,7 +40958,11 @@ async fn empty_wake_recovery_skips_on_ready_queue_and_pending_attention() {
         .await
         .expect("seed attention");
     assert!(!svc.recover_empty_harness_wake(&raised, &ws).await);
-    let session = svc.store().get_agent_session(&raised).await.expect("s");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&raised)
+        .await
+        .expect("s");
     assert_eq!(
         session.attention_request_kind.as_deref(),
         Some("discussion"),
@@ -39042,7 +40997,7 @@ fn question_blocks() -> serde_json::Value {
 /// proposal-resource block whose embedded proposal identifies as
 /// `proposal_id` (the shape the §7.1 turn-end drain appends for
 /// `ws.app.proposal.show` / `proposeSibling`).
-fn proposal_blocks(proposal_id: &str) -> serde_json::Value {
+pub(super) fn proposal_blocks(proposal_id: &str) -> serde_json::Value {
     let proposal = json!({
         "kind": "settings-change",
         "applyToolCallId": proposal_id,
@@ -39086,7 +41041,11 @@ async fn record_pending_proposals_persists_and_emits_agent_updated() {
     assert!(svc.record_pending_proposals(&ws, &id, &msg.id, &ids).await);
 
     // Persisted on the session row and lifted into the AgentLite projection.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let pending = session.pending_proposals();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].proposal_id, "tc-1");
@@ -39095,10 +41054,13 @@ async fn record_pending_proposals_persists_and_emits_agent_updated() {
     assert_eq!(lite.metadata.pending_proposals, pending);
 
     // `agent:updated` emitted, scoped to the workspace, carrying the list.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_UPDATED);
     assert_eq!(batch[0].workspace_id, ws);
@@ -39138,7 +41100,11 @@ async fn record_pending_proposals_accumulates_and_dedupes_newest_wins() {
         svc.record_pending_proposals(&ws, &id, &m2.id, &["tc-b".to_string()])
             .await
     );
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let pending = session.pending_proposals();
     assert_eq!(
         pending
@@ -39159,7 +41125,11 @@ async fn record_pending_proposals_accumulates_and_dedupes_newest_wins() {
         svc.record_pending_proposals(&ws, &id, &m3.id, &["tc-a".to_string()])
             .await
     );
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let pending = session.pending_proposals();
     assert_eq!(
         pending
@@ -39179,7 +41149,11 @@ async fn record_pending_proposals_accumulates_and_dedupes_newest_wins() {
         svc.record_pending_questions_marker(&ws, &id, &asked.id)
             .await
     );
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(asked.id.as_str())
@@ -39203,7 +41177,11 @@ async fn record_pending_proposals_error_paths_leave_metadata_intact() {
 
     // Empty ids: no write, no marker key.
     assert!(!svc.record_pending_proposals(&ws, &id, &msg.id, &[]).await);
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.pending_proposals().is_empty());
     assert!(session
         .metadata
@@ -39230,13 +41208,21 @@ async fn record_pending_proposals_error_paths_leave_metadata_intact() {
         )
         .await
         .expect("corrupt marker");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.pending_proposals().is_empty());
     assert!(
         svc.record_pending_proposals(&ws, &id, &msg.id, &["tc-1".to_string()])
             .await
     );
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.pending_proposals().len(), 1);
     assert_eq!(session.pending_proposals()[0].proposal_id, "tc-1");
 }
@@ -39274,7 +41260,11 @@ async fn agent_replace_messages_reconciles_pending_proposals() {
         .await
         .expect("replace");
     let new_carrier = r["messages"][1]["id"].as_str().expect("new id").to_string();
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let pending = session.pending_proposals();
     assert_eq!(pending.len(), 1, "tc-2 was not pending and is not re-added");
     assert_eq!(pending[0].proposal_id, "tc-1");
@@ -39293,7 +41283,11 @@ async fn agent_replace_messages_reconciles_pending_proposals() {
     )
     .await
     .expect("replace again");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.pending_proposals().is_empty());
 }
 
@@ -39358,7 +41352,11 @@ async fn agent_edit_truncate_reconciles_pending_proposals() {
     assert_eq!(messages.len(), 2);
     let new_carrier = &messages[1].id;
     assert_eq!(new_carrier, &a1.id, "kept rows keep their ids");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let pending = session.pending_proposals();
     assert_eq!(
         pending
@@ -39651,6 +41649,7 @@ async fn resolve_proposal_applied_persists_notifies_and_emits() {
             "tc-1".to_string(),
             "applied".to_string(),
             Some("Created workspace ws-123.".to_string()),
+            None,
         )
         .await
         .expect("resolve");
@@ -39659,7 +41658,11 @@ async fn resolve_proposal_applied_persists_notifies_and_emits() {
     assert_eq!(r["outcome"], json!("applied"));
 
     // Pending list emptied, resolution persisted, both in the projection.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.pending_proposals().is_empty());
     assert_eq!(
         session.proposal_resolutions().get("tc-1"),
@@ -39673,10 +41676,13 @@ async fn resolve_proposal_applied_persists_notifies_and_emits() {
     );
 
     // `agent:updated` carries the emptied list and the resolutions map.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_UPDATED);
     assert_eq!(batch[0].workspace_id, ws);
@@ -39739,12 +41745,17 @@ async fn resolve_proposal_dismissed_delivers_dismissed_notice() {
             "tc-1".to_string(),
             "dismissed".to_string(),
             None,
+            None,
         )
         .await
         .expect("resolve");
     assert_eq!(r["outcome"], json!("dismissed"));
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.pending_proposals().is_empty());
     assert_eq!(
         session.proposal_resolutions().get("tc-1"),
@@ -39805,6 +41816,7 @@ async fn resolve_proposal_repeat_resolution_is_idempotent() {
         "tc-1".to_string(),
         "applied".to_string(),
         None,
+        None,
     )
     .await
     .expect("resolve");
@@ -39824,12 +41836,17 @@ async fn resolve_proposal_repeat_resolution_is_idempotent() {
             "tc-1".to_string(),
             "dismissed".to_string(),
             None,
+            None,
         )
         .await
         .expect("re-resolve");
     assert_eq!(again["success"], json!(true));
     assert_eq!(again["outcome"], json!("applied"), "persisted outcome wins");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.proposal_resolutions().get("tc-1"),
         Some(&json!("applied"))
@@ -39879,10 +41896,13 @@ async fn resolve_proposal_repeat_resolution_is_idempotent() {
         resolution_events[0].data["proposalResolutions"],
         json!({"tc-1": "applied"})
     );
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("live resolution event timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("live resolution event timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].id, resolution_events[0].id);
 }
@@ -39912,6 +41932,7 @@ async fn resolve_proposal_error_paths() {
             "tc-unknown".to_string(),
             "applied".to_string(),
             None,
+            None,
         )
         .await
         .expect_err("unknown proposal must fail");
@@ -39926,6 +41947,7 @@ async fn resolve_proposal_error_paths() {
             "tc-1".to_string(),
             "applied".to_string(),
             None,
+            None,
         )
         .await
         .expect_err("workspace mismatch must fail");
@@ -39939,6 +41961,7 @@ async fn resolve_proposal_error_paths() {
             "tc-1".to_string(),
             "ignored".to_string(),
             None,
+            None,
         )
         .await
         .expect_err("bad outcome must fail");
@@ -39951,6 +41974,7 @@ async fn resolve_proposal_error_paths() {
             id.clone(),
             "  ".to_string(),
             "applied".to_string(),
+            None,
             None,
         )
         .await
@@ -39966,13 +41990,18 @@ async fn resolve_proposal_error_paths() {
             "tc-1".to_string(),
             "applied".to_string(),
             None,
+            None,
         )
         .await
         .expect_err("nonexistent agent must fail");
     assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
 
     // All failures left the pending entry intact.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.pending_proposals().len(), 1);
     assert!(session.proposal_resolutions().is_empty());
 }
@@ -40004,6 +42033,7 @@ async fn resolve_proposal_title_falls_back_to_id_when_carrier_gone() {
         id.clone(),
         "tc-dangling".to_string(),
         "dismissed".to_string(),
+        None,
         None,
     )
     .await
@@ -40055,11 +42085,16 @@ async fn resolve_proposal_removes_only_named_entry() {
         "tc-a".to_string(),
         "dismissed".to_string(),
         None,
+        None,
     )
     .await
     .expect("resolve");
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let pending = session.pending_proposals();
     assert_eq!(
         pending
@@ -40096,7 +42131,11 @@ async fn resolve_proposal_ignores_seeded_invalid_outcome() {
         .await
         .expect("seed invalid resolution");
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(
         session.proposal_resolutions().is_empty(),
         "reader must filter non-contract outcomes"
@@ -40107,6 +42146,7 @@ async fn resolve_proposal_ignores_seeded_invalid_outcome() {
             id.clone(),
             "tc-seeded".to_string(),
             "applied".to_string(),
+            None,
             None,
         )
         .await
@@ -40140,12 +42180,17 @@ async fn resolve_proposal_matches_whitespace_id_verbatim() {
             ws_id.to_string(),
             "dismissed".to_string(),
             None,
+            None,
         )
         .await
         .expect("whitespace-padded id must resolve");
     assert_eq!(r["proposalId"], json!(ws_id));
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(session.pending_proposals().is_empty());
     assert_eq!(
         session.proposal_resolutions().get(ws_id),
@@ -40192,11 +42237,16 @@ async fn resolve_proposal_resolutions_map_evicts_oldest_past_cap() {
         "tc-new".to_string(),
         "applied".to_string(),
         None,
+        None,
     )
     .await
     .expect("resolve");
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let resolutions = session.proposal_resolutions();
     assert_eq!(resolutions.len(), 100, "capped at the retention limit");
     assert!(
@@ -40221,7 +42271,11 @@ async fn pending_questions_tail_fallback_materializes_marker_and_survives_user_r
 
     // Empty transcript → no hold, and nothing materialized.
     assert!(!svc.questions_pending(&id).await);
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(!session.pending_questions_marker_written());
 
     // Plain assistant message (no question blocks) → no hold.
@@ -40244,7 +42298,11 @@ async fn pending_questions_tail_fallback_materializes_marker_and_survives_user_r
         .await
         .expect("append question");
     assert!(svc.questions_pending(&id).await);
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(asked.id.as_str()),
@@ -40285,7 +42343,11 @@ async fn materialize_legacy_pending_questions_marker_writes_marker_from_tail() {
     let id = create_agent(&svc, &ws, "Asker").await;
 
     svc.materialize_legacy_pending_questions_marker(&id).await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert!(
         !session.pending_questions_marker_written(),
         "empty transcript: nothing to materialize"
@@ -40297,7 +42359,11 @@ async fn materialize_legacy_pending_questions_marker_writes_marker_from_tail() {
         .await
         .expect("append question");
     svc.materialize_legacy_pending_questions_marker(&id).await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(asked.id.as_str()),
@@ -40369,7 +42435,7 @@ async fn pending_questions_survive_trailing_system_row() {
     // An explicit dismissal past the system row still releases it.
     let asked = svc
         .store()
-        .get_agent_session(&id)
+        .get_agent_session_with_transcript(&id)
         .await
         .expect("session")
         .pending_questions_message_id()
@@ -40464,7 +42530,11 @@ async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
 
     // Marker persisted on the session row (survives reload) and lifted into
     // the AgentLite metadata projection.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.dismissed_questions_message_id(),
         Some(asked.id.as_str())
@@ -40476,10 +42546,13 @@ async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
     );
 
     // `agent:updated` emitted, scoped to the workspace, carrying the marker.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_UPDATED);
     assert_eq!(batch[0].workspace_id, ws);
@@ -40527,10 +42600,13 @@ async fn dismiss_questions_event_omits_pending_marker_when_never_written() {
         .await
         .expect("dismiss");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(
         batch[0].data["dismissedQuestionsMessageId"].as_str(),
@@ -40584,7 +42660,8 @@ async fn dismiss_questions_event_reflects_concurrent_marker_clear() {
     };
     // The dismissal marker persists BEFORE the lock acquisition: poll for it
     // to know the op is parked at the gate.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let session = svc
             .store()
@@ -40620,10 +42697,13 @@ async fn dismiss_questions_event_reflects_concurrent_marker_clear() {
     drop(guard);
     dismissing.await.expect("join").expect("dismiss");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(
         batch[0].data["dismissedQuestionsMessageId"].as_str(),
@@ -40743,7 +42823,11 @@ async fn dismiss_questions_preserves_non_object_metadata() {
     // Force the session's metadata column into a non-object shape — not
     // reachable through the normal `agent.*` API, but defensively possible
     // if the column is ever written to by another code path.
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     session.metadata = Some(json!("legacy-string-metadata"));
     svc.store()
         .update_agent_session(&ws, &session)
@@ -40756,7 +42840,11 @@ async fn dismiss_questions_preserves_non_object_metadata() {
         .expect("dismiss");
     assert_eq!(r["success"], json!(true));
 
-    let after = svc.store().get_agent_session(&id).await.expect("session");
+    let after = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         after.dismissed_questions_message_id(),
         Some(asked.id.as_str()),
@@ -40776,7 +42864,11 @@ async fn dismiss_questions_preserves_non_object_metadata() {
 async fn dismiss_questions_preserves_existing_session_metadata() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Asker").await;
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     session.metadata = Some(json!({ "source": "test-suite" }));
     svc.store()
         .update_agent_session(&ws, &session)
@@ -40787,7 +42879,11 @@ async fn dismiss_questions_preserves_existing_session_metadata() {
         .await
         .expect("dismiss");
 
-    let session = svc.store().get_agent_session(&id).await.expect("reload");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("reload");
     let metadata = session.metadata.as_ref().expect("metadata");
     assert_eq!(metadata["source"], json!("test-suite"));
     assert_eq!(metadata["dismissedQuestionsMessageId"], json!("msg-1"));
@@ -40801,7 +42897,11 @@ async fn dismiss_questions_preserves_existing_session_metadata() {
 async fn dismiss_questions_preserves_system_prompt() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Asker").await;
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     session.system_prompt = Some("You are a careful reviewer.".to_string());
     svc.store()
         .update_agent_session(&ws, &session)
@@ -40812,7 +42912,11 @@ async fn dismiss_questions_preserves_system_prompt() {
         .await
         .expect("dismiss");
 
-    let after = svc.store().get_agent_session(&id).await.expect("reload");
+    let after = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("reload");
     assert_eq!(
         after.dismissed_questions_message_id(),
         Some("msg-1"),
@@ -40849,7 +42953,11 @@ async fn dismiss_questions_fails_closed() {
             .await,
         Err(Error::NotFound(_))
     ));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.dismissed_questions_message_id(), None);
 
     // Blank messageId → InvalidParams.
@@ -40901,10 +43009,13 @@ async fn pending_marker_projects_on_list_get_and_update_events() {
         .await
         .expect("append question");
     let asked_id = asked["message"]["id"].as_str().expect("id").to_string();
-    let set_event = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("set event timed out")
-        .expect("subscription closed");
+    let set_event = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("set event timed out")
+    .expect("subscription closed");
     assert_eq!(set_event[0].data["pendingQuestionsMessageId"], asked_id);
 
     let set_get = svc.agent_get_op(id.clone(), None).await.expect("set get");
@@ -40926,10 +43037,13 @@ async fn pending_marker_projects_on_list_get_and_update_events() {
     )
     .await
     .expect("append answer");
-    let clear_event = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("clear event timed out")
-        .expect("subscription closed");
+    let clear_event = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("clear event timed out")
+    .expect("subscription closed");
     assert_eq!(clear_event[0].data["pendingQuestionsMessageId"], "");
 
     let cleared_get = svc
@@ -40964,7 +43078,11 @@ async fn pending_marker_written_overwritten_and_survives_later_rows() {
         .await
         .expect("append question");
     let asked_id = asked["message"]["id"].as_str().expect("id").to_string();
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(asked_id.as_str())
@@ -40994,7 +43112,11 @@ async fn pending_marker_written_overwritten_and_survives_later_rows() {
     )
     .await
     .expect("append plain assistant");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(asked_id.as_str()),
@@ -41007,7 +43129,11 @@ async fn pending_marker_written_overwritten_and_survives_later_rows() {
         .await
         .expect("append re-ask");
     let reask_id = reask["message"]["id"].as_str().expect("id").to_string();
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(reask_id.as_str()),
@@ -41053,7 +43179,11 @@ async fn pending_marker_cleared_by_matching_answer_only() {
     )
     .await
     .expect("append answer");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.pending_questions_message_id(), None);
     assert!(session.pending_questions_marker_written());
     assert!(!svc.questions_pending(&id).await);
@@ -41076,7 +43206,11 @@ async fn dismissal_neutralizes_pending_marker() {
     svc.agent_dismiss_questions_op(ws.clone(), id.clone(), asked_id.clone())
         .await
         .expect("dismiss");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(asked_id.as_str()),
@@ -41132,7 +43266,11 @@ async fn edit_truncate_reconciles_pending_marker() {
         .await
         .expect("messages");
     let question_id = messages.last().expect("question row").id.clone();
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(question_id.as_str()),
@@ -41146,7 +43284,11 @@ async fn edit_truncate_reconciles_pending_marker() {
     svc.agent_edit_truncate_op(&id, &first_id)
         .await
         .expect("truncate to empty");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.pending_questions_message_id(), None);
     assert!(!svc.questions_pending(&id).await);
 }
@@ -41183,7 +43325,11 @@ async fn reconcile_answer_resolves_only_dangling_or_matching_tag() {
     rows[2].metadata = Some(answer_metadata(&q0));
     svc.reconcile_pending_questions_marker(&ws, &id, &rows)
         .await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.pending_questions_message_id(),
         Some(q1.as_str()),
@@ -41195,7 +43341,11 @@ async fn reconcile_answer_resolves_only_dangling_or_matching_tag() {
     rows[2].metadata = Some(answer_metadata("dropped-by-the-swap"));
     svc.reconcile_pending_questions_marker(&ws, &id, &rows)
         .await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.pending_questions_message_id(), None);
     assert!(!svc.questions_pending(&id).await);
 
@@ -41203,7 +43353,11 @@ async fn reconcile_answer_resolves_only_dangling_or_matching_tag() {
     rows[2].metadata = Some(answer_metadata(&q1));
     svc.reconcile_pending_questions_marker(&ws, &id, &rows)
         .await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.pending_questions_message_id(), None);
 }
 
@@ -41240,7 +43394,11 @@ async fn mark_seen_persists_marker_and_emits_agent_updated() {
 
     // Marker persisted on the session row (survives reload) and lifted into
     // the AgentLite metadata projection.
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.last_seen_message_id(), Some(seen.id.as_str()));
     let lite = intent_core::AgentLite::from_session(session, 0, None, None, None, None, None);
     assert_eq!(
@@ -41249,10 +43407,13 @@ async fn mark_seen_persists_marker_and_emits_agent_updated() {
     );
 
     // `agent:updated` emitted, scoped to the workspace, carrying the marker.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_UPDATED);
     assert_eq!(batch[0].workspace_id, ws);
@@ -41302,10 +43463,13 @@ async fn mark_seen_is_monotonic_and_idempotent() {
         .await
         .expect("mark second");
     assert_eq!(r["lastSeenMessageId"], json!(second.id));
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
 
     // Older message: no-op returning the CURRENT marker, no write, no event.
@@ -41315,7 +43479,11 @@ async fn mark_seen_is_monotonic_and_idempotent() {
         .expect("mark older");
     assert_eq!(r["success"], json!(true));
     assert_eq!(r["lastSeenMessageId"], json!(second.id));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.last_seen_message_id(), Some(second.id.as_str()));
 
     // Same message again: idempotent success, still no event.
@@ -41325,9 +43493,12 @@ async fn mark_seen_is_monotonic_and_idempotent() {
         .expect("re-mark");
     assert_eq!(r["lastSeenMessageId"], json!(second.id));
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no agent:updated for the older-message no-op or the idempotent re-mark"
     );
 
@@ -41347,10 +43518,13 @@ async fn mark_seen_is_monotonic_and_idempotent() {
         .await
         .expect("mark third");
     assert_eq!(r["lastSeenMessageId"], json!(third.id));
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(
         batch[0].data["lastSeenMessageId"].as_str(),
         Some(third.id.as_str())
@@ -41381,7 +43555,11 @@ async fn mark_seen_tolerates_dangling_ids() {
         .await
         .expect("mark unknown");
     assert_eq!(r["lastSeenMessageId"], json!("msg-unknown"));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.last_seen_message_id(), Some("msg-unknown"));
 
     // Dangling current marker: a real message still advances it — the
@@ -41391,7 +43569,11 @@ async fn mark_seen_tolerates_dangling_ids() {
         .await
         .expect("mark real");
     assert_eq!(r["lastSeenMessageId"], json!(real.id));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.last_seen_message_id(), Some(real.id.as_str()));
 
     // Unknown NEW id over a resolvable current marker: the write-through is
@@ -41401,7 +43583,11 @@ async fn mark_seen_tolerates_dangling_ids() {
         .await
         .expect("mark unknown over real");
     assert_eq!(r["lastSeenMessageId"], json!("msg-unknown-2"));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.last_seen_message_id(), Some("msg-unknown-2"));
 }
 
@@ -41415,7 +43601,11 @@ async fn mark_seen_preserves_non_object_metadata() {
     // Force the session's metadata column into a non-object shape — not
     // reachable through the normal `agent.*` API, but defensively possible
     // if the column is ever written to by another code path.
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     session.metadata = Some(json!("legacy-string-metadata"));
     svc.store()
         .update_agent_session(&ws, &session)
@@ -41426,7 +43616,11 @@ async fn mark_seen_preserves_non_object_metadata() {
         .await
         .expect("mark seen");
 
-    let after = svc.store().get_agent_session(&id).await.expect("session");
+    let after = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(after.last_seen_message_id(), Some("msg-1"));
     assert_eq!(
         after
@@ -41445,7 +43639,11 @@ async fn mark_seen_preserves_non_object_metadata() {
 async fn mark_seen_preserves_existing_metadata_and_system_prompt() {
     let (_t, svc, ws) = setup().await;
     let id = create_agent(&svc, &ws, "Reader").await;
-    let mut session = svc.store().get_agent_session(&id).await.expect("session");
+    let mut session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     session.metadata = Some(json!({ "source": "test-suite" }));
     session.system_prompt = Some("You are a careful reviewer.".to_string());
     svc.store()
@@ -41460,7 +43658,11 @@ async fn mark_seen_preserves_existing_metadata_and_system_prompt() {
         .await
         .expect("mark seen");
 
-    let after = svc.store().get_agent_session(&id).await.expect("reload");
+    let after = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("reload");
     let metadata = after.metadata.as_ref().expect("metadata");
     assert_eq!(metadata["source"], json!("test-suite"));
     assert_eq!(metadata["dismissedQuestionsMessageId"], json!("msg-q1"));
@@ -41496,7 +43698,11 @@ async fn mark_seen_fails_closed() {
             .await,
         Err(Error::NotFound(_))
     ));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.last_seen_message_id(), None);
 
     // Blank messageId → InvalidParams.
@@ -41846,7 +44052,11 @@ async fn pending_questions_do_not_gate_store_only_automatic_send() {
         .expect("automatic send succeeds");
     assert_eq!(r["queued"], json!(false), "{r}");
     assert!(r.get("heldForQuestions").is_none(), "{r}");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.messages.len(),
         2,
@@ -41903,7 +44113,7 @@ async fn pending_questions_do_not_gate_store_only_send_to_task() {
     assert!(r["result"].get("heldForQuestions").is_none(), "{r}");
     let session = svc
         .store()
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("session");
     assert_eq!(session.messages.len(), 2, "user row appended");
@@ -41927,7 +44137,7 @@ async fn pending_questions_do_not_gate_store_only_parent_wake() {
     assert!(r.get("heldForQuestions").is_none(), "{r}");
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("session");
     assert_eq!(session.messages.len(), 2, "wake row appended");
@@ -42007,7 +44217,7 @@ async fn interrupt_enqueue_orders_ahead_of_normal_and_persists() {
     // Ordering + marker survive restart.
     svc.publish_queue_updated(&id).await;
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     restarted.rehydrate_agent_queues().await.expect("rehydrate");
     let front = restarted.dequeue_message(&id).expect("dequeue");
     assert_eq!(front.content, "int-1");
@@ -42263,7 +44473,7 @@ async fn agent_watch_delivers_once_and_is_retired() {
     // metadata (`watchStillArmed: false`), mirroring `hookStillActive`.
     let session = svc
         .store()
-        .get_agent_session(&watcher)
+        .get_agent_session_with_transcript(&watcher)
         .await
         .expect("watcher session");
     let metadata = session.messages[0].metadata.as_ref().expect("metadata");
@@ -42328,7 +44538,7 @@ async fn agent_watch_removed_after_target_deleted() {
     // monorepo#2060: the deleted-kind retirement is machine-readable too.
     let session = svc
         .store()
-        .get_agent_session(&watcher)
+        .get_agent_session_with_transcript(&watcher)
         .await
         .expect("watcher session");
     let metadata = session.messages[0].metadata.as_ref().expect("metadata");
@@ -42385,7 +44595,7 @@ async fn agent_watch_resolved_when_target_retires() {
     );
     let session = svc
         .store()
-        .get_agent_session(&watcher)
+        .get_agent_session_with_transcript(&watcher)
         .await
         .expect("watcher session");
     let metadata = session.messages[0].metadata.as_ref().expect("metadata");
@@ -42483,6 +44693,7 @@ async fn agent_watch_resolved_when_target_is_cascade_retired() {
 #[tokio::test]
 async fn retire_settles_hook_deferred_watch_with_retired_notice() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
+    let svc = FakeRuntime::install(svc);
     let _worker = svc.spawn_completion_delivery_loop();
     wait_for_subscriber(&bus).await;
     let watcher = create_agent(&svc, &ws, "Watcher").await;
@@ -42536,6 +44747,12 @@ async fn retire_settles_hook_deferred_watch_with_retired_notice() {
         1,
         "exactly one wake for the retire"
     );
+    assert!(
+        FakeRuntime::of(&svc)
+            .calls()
+            .contains(&"cancel_agent_hooks"),
+        "retire asks the runtime to cancel the retired agent's hooks"
+    );
 }
 
 /// Which archive-swept watches the monitoring-idle child owns in
@@ -42561,7 +44778,7 @@ enum ArchivedWatches {
 async fn archive_keeps_deferred_watch_armed_until_the_childs_real_turn_ends(
     watches: ArchivedWatches,
 ) {
-    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let (_t, svc, manager, _bus, ws) = setup_with_manager_fake_runtime().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = match watches {
@@ -42734,6 +44951,7 @@ async fn archive_keeps_mixed_deferred_watch_armed_until_real_turn_ends() {
 #[tokio::test]
 async fn retire_cascade_reaches_cross_workspace_descendants() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
+    let svc = FakeRuntime::install(svc);
     let _worker = svc.spawn_completion_delivery_loop();
     wait_for_subscriber(&bus).await;
     let other_ws = WorkspaceId::new();
@@ -42780,10 +44998,13 @@ async fn retire_cascade_reaches_cross_workspace_descendants() {
     // CHILD's own workspace.
     let mut events = Vec::new();
     while events.len() < 2 {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription closed");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
         events.extend(batch);
     }
     let child_event = events
@@ -42801,7 +45022,11 @@ async fn retire_cascade_reaches_cross_workspace_descendants() {
 
     // Rows retired on both sides of the workspace boundary.
     for id in [&parent, &child] {
-        let s = svc.store().get_agent_session(id).await.expect("session");
+        let s = svc
+            .store()
+            .get_agent_session_with_transcript(id)
+            .await
+            .expect("session");
         assert!(s.retired_at.is_some(), "{id} retired by the cascade");
     }
     // The remote child's hook and PR monitor are cancelled by its cleanup.
@@ -42895,7 +45120,7 @@ async fn completion_watch_rehydration_resolves_retired_child() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         svc.register_completion_watch(
@@ -42918,7 +45143,7 @@ async fn completion_watch_rehydration_resolves_retired_child() {
         .set_agent_session_retired_at(&ws, &child, Some(&now), &now)
         .await
         .expect("mark child retired");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .heal_completion_watches_on_startup()
@@ -42928,7 +45153,7 @@ async fn completion_watch_rehydration_resolves_retired_child() {
 
     let session = restarted
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(
@@ -42955,7 +45180,7 @@ async fn group_rehydration_settles_retired_child() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         let gid = svc.get_or_create_delegation_group(&ws, &parent);
@@ -42974,7 +45199,8 @@ async fn group_rehydration_settles_retired_child() {
         // exists after the first (no members yet), so wait for the second —
         // the row carrying the enrolled child — or the restarted instance
         // rehydrates a memberless group that can never be complete.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -43003,7 +45229,7 @@ async fn group_rehydration_settles_retired_child() {
         .set_agent_session_retired_at(&ws, &child, Some(&now), &now)
         .await
         .expect("mark child retired");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
 
     let loaded = restarted
         .rehydrate_delegation_groups(&ws)
@@ -43014,7 +45240,7 @@ async fn group_rehydration_settles_retired_child() {
     // The retired member reconciled as settled and the sealed group fired.
     let session = restarted
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(
@@ -43099,7 +45325,7 @@ async fn agent_watch_wakes_watcher_on_attention_request() {
     // fan-out wake metadata (`watchStillArmed: true`).
     let watcher_session = svc
         .store()
-        .get_agent_session(&watcher)
+        .get_agent_session_with_transcript(&watcher)
         .await
         .expect("watcher session");
     let attention_meta = watcher_session
@@ -43474,7 +45700,7 @@ async fn agent_watch_reconciles_already_settled_target() {
     let target = create_agent(&svc, &ws, "Target").await;
     let mut session = svc
         .store()
-        .get_agent_session(&target)
+        .get_agent_session_with_transcript(&target)
         .await
         .expect("target session");
     session.status = intent_core::AgentStatus::Completed;
@@ -43566,7 +45792,7 @@ async fn agent_watch_rehydrates_with_flags_after_restart() {
     let (watcher, target) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let watcher = create_agent(&svc, &ws, "Watcher").await;
         let target = create_agent(&svc, &ws, "Target").await;
         svc.agent_watch_op(ws.clone(), watcher.clone(), target.clone())
@@ -43576,7 +45802,7 @@ async fn agent_watch_rehydrates_with_flags_after_restart() {
     };
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = Services::new_isolated(store);
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -43848,7 +46074,12 @@ async fn agent_snapshot_trivial_omits_fields_and_skips_injection() {
         .await
         .expect("snapshot");
     let obj = v.as_object().expect("object");
-    assert_eq!(obj.len(), 1, "trivial snapshot carries only time: {v}");
+    assert_eq!(
+        obj.len(),
+        2,
+        "trivial snapshot carries time and desktop state: {v}"
+    );
+    assert_eq!(v["desktopControl"], json!({"status":"inactive"}));
     let time = v["time"].as_str().expect("time string");
     assert!(
         time.ends_with('Z') && !time.contains('.'),
@@ -43875,7 +46106,7 @@ async fn agent_snapshot_populated_counts_and_injection_line() {
     // Parent linkage: `child` is an actively executing delegate of `parent`.
     let mut child_session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     child_session.parent_agent_id = Some(parent.clone());
@@ -44047,7 +46278,7 @@ async fn agent_snapshot_excludes_settled_children() {
         let child = create_agent(&svc, &ws, &format!("Child {status:?}")).await;
         let mut child_session = svc
             .store()
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         child_session.parent_agent_id = Some(parent.clone());
@@ -44082,7 +46313,7 @@ async fn agent_snapshot_counts_idle_and_hook_waiting_children_as_unsettled_only(
         let child = create_agent(&svc, &ws, name).await;
         let mut child_session = svc
             .store()
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("child session");
         child_session.parent_agent_id = Some(parent.clone());
@@ -44120,7 +46351,7 @@ async fn agent_snapshot_excludes_idle_children() {
     let created_idle = create_agent(&svc, &ws, "Created Idle").await;
     let mut created_session = svc
         .store()
-        .get_agent_session(&created_idle)
+        .get_agent_session_with_transcript(&created_idle)
         .await
         .expect("created-idle session");
     assert_eq!(created_session.status, intent_core::AgentStatus::Idle);
@@ -44133,7 +46364,7 @@ async fn agent_snapshot_excludes_idle_children() {
     let turn_idle = create_agent(&svc, &ws, "Turn Idle").await;
     let mut turn_session = svc
         .store()
-        .get_agent_session(&turn_idle)
+        .get_agent_session_with_transcript(&turn_idle)
         .await
         .expect("turn-idle session");
     turn_session.parent_agent_id = Some(parent.clone());
@@ -44184,7 +46415,7 @@ async fn agent_snapshot_counts_cross_workspace_children() {
     let child = create_agent(&svc, &other_ws, "Remote Child").await;
     let mut child_session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("child session");
     child_session.parent_agent_id = Some(parent.clone());
@@ -44947,6 +47178,7 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
                     provider: None,
                     reasoning_effort: None,
                     agent_instructions: Some("do it my way".into()),
+                    placement: None,
                 })]),
                 ..Default::default()
             },
@@ -44994,7 +47226,7 @@ async fn batch_delegate_rejects_unknown_specialist_default_fast() {
     }
     let agents = svc
         .store()
-        .list_agent_sessions(&ws)
+        .list_agent_sessions_with_transcripts(&ws)
         .await
         .expect("list sessions");
     assert!(agents.is_empty(), "no child persisted: {agents:?}");
@@ -45012,6 +47244,7 @@ async fn batch_delegate_rejects_unknown_specialist_default_fast() {
                         provider: None,
                         reasoning_effort: None,
                         agent_instructions: None,
+                        placement: None,
                     }),
                     BatchTaskEntry::Id(t2.clone()),
                 ]),
@@ -45459,14 +47692,15 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
                     BatchTaskEntry::Id(plain.clone()),
                     BatchTaskEntry::Options(BatchTaskOptions {
                         task_note_id: custom.clone(),
-                        specialist: Some("verifier".into()),
+                        specialist: Some("developer".into()),
                         model: Some("mock:override".into()),
                         provider: None,
                         reasoning_effort: Some("high".into()),
                         agent_instructions: None,
+                        placement: None,
                     }),
                 ]),
-                specialist: Some("implementor".into()),
+                specialist: Some("developer".into()),
                 model: Some("mock:default".into()),
                 ..Default::default()
             },
@@ -45488,10 +47722,10 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
     // The bare entry inherited the top-level defaults…
     let plain_session = svc
         .store()
-        .get_agent_session(&AgentId::from(rp["agentId"].as_str().unwrap()))
+        .get_agent_session_with_transcript(&AgentId::from(rp["agentId"].as_str().unwrap()))
         .await
         .expect("plain session");
-    assert_eq!(plain_session.specialist.as_deref(), Some("implementor"));
+    assert_eq!(plain_session.specialist.as_deref(), Some("developer"));
     // Compound input ids are split on read: bare model + provider column.
     assert_eq!(plain_session.model.as_deref(), Some("default"));
     assert_eq!(plain_session.provider.as_deref(), Some("mock"));
@@ -45500,10 +47734,10 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
     // …and the object entry's overrides won, field by field.
     let custom_session = svc
         .store()
-        .get_agent_session(&AgentId::from(rc["agentId"].as_str().unwrap()))
+        .get_agent_session_with_transcript(&AgentId::from(rc["agentId"].as_str().unwrap()))
         .await
         .expect("custom session");
-    assert_eq!(custom_session.specialist.as_deref(), Some("verifier"));
+    assert_eq!(custom_session.specialist.as_deref(), Some("developer"));
     assert_eq!(custom_session.model.as_deref(), Some("override"));
     assert_eq!(custom_session.provider.as_deref(), Some("mock"));
     assert_eq!(custom_session.reasoning_effort.as_deref(), Some("high"));
@@ -45593,7 +47827,7 @@ async fn task_graph_on_then_off_completion_wake_keeps_unblocked_section() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "exactly one wake");
@@ -45655,7 +47889,7 @@ async fn task_graph_off_then_on_completion_wake_omits_unblocked_section() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let text = session.messages[0].content.to_string();
@@ -45706,7 +47940,7 @@ async fn taskless_and_no_delta_wakes_are_unannotated() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 2, "two wakes");
@@ -45848,7 +48082,7 @@ async fn group_wake_stamps_all_settled_member_trigger_tasks() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "one aggregated wake");
@@ -45923,7 +48157,7 @@ async fn group_wake_keeps_trigger_of_child_deleted_before_settlement() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "one aggregated wake");
@@ -45980,7 +48214,7 @@ async fn completion_wake_joins_flipped_triggers_and_consumes_them() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "one wake");
@@ -46022,7 +48256,7 @@ async fn completion_wake_joins_flipped_triggers_and_consumes_them() {
     .await;
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 2, "second wake");
@@ -46072,7 +48306,7 @@ async fn unlinked_child_completion_wake_stamps_flips_only() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     let metadata = session.messages[0].metadata.as_ref().expect("metadata");
@@ -46128,7 +48362,7 @@ async fn report_to_parent_progress_preserves_flips_for_terminal_wake() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), baseline + 1, "one report wake");
@@ -46156,7 +48390,7 @@ async fn report_to_parent_progress_preserves_flips_for_terminal_wake() {
     .await;
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session after terminal wake");
     let metadata = session.messages[baseline + 1]
@@ -46242,7 +48476,7 @@ async fn group_wake_includes_flipped_completion_triggers() {
 
     let session = svc
         .store()
-        .get_agent_session(&caller)
+        .get_agent_session_with_transcript(&caller)
         .await
         .expect("caller session");
     assert_eq!(session.messages.len(), 1, "one aggregated wake");
@@ -46304,7 +48538,7 @@ async fn no_manager_send_now_resolves_unblocked_section() {
 
     let session = svc
         .store()
-        .get_agent_session(&parent)
+        .get_agent_session_with_transcript(&parent)
         .await
         .expect("parent session");
     assert_eq!(session.messages.len(), 1, "one persisted message");
@@ -46385,6 +48619,30 @@ mod resume_tail_recap {
         }
     }
 
+    #[test]
+    fn qualified_monitor_recap_withholds_whole_private_envelope() {
+        for embedded in [false, true] {
+            let metadata = json!({"type":"pr_monitor_wake","resource":{"provider":"gitlab"}});
+            let mut private = user("private monitor update");
+            if embedded {
+                private.content[0]["messageMetadata"] = metadata;
+            } else {
+                private.metadata = Some(metadata);
+            }
+            assert!(build_resume_tail_recap(&[private.clone()]).is_none());
+            let recap = build_resume_tail_recap(&[user("ordinary request"), private])
+                .expect("ordinary recap remains available");
+            assert!(recap.text.contains("ordinary request"));
+            assert!(!recap.text.contains("private monitor update"));
+        }
+        let mut github = user("GitHub monitor update");
+        github.metadata = Some(json!({"type":"pr_monitor_wake","prNumber":4}));
+        assert!(build_resume_tail_recap(&[github])
+            .unwrap()
+            .text
+            .contains("GitHub monitor update"));
+    }
+
     fn user(text: &str) -> AgentMessage {
         message("user", json!([{ "type": "text", "text": text }]), None)
     }
@@ -46432,7 +48690,7 @@ mod resume_tail_recap {
             user("what board formats exist?"),
             assistant("Here are the formats..."),
             user("build a simple local webapp that surfaces the board"),
-            interrupted_assistant("Delegating board webapp — Plan: an implementor builds..."),
+            interrupted_assistant("Delegating board webapp — Plan: an developer builds..."),
         ];
         let recap = build_resume_tail_recap(&messages).expect("recap");
         assert!(recap
@@ -46570,6 +48828,11 @@ mod resume_tail_recap {
              responding, and your restored session may predate the exchange below \
              — it is repeated here (parts of it may or may not already be in your \
              context).\n\n\
+             Note on escaping: text quoted inside the XML tags of this message is XML-escaped \
+             only so it can be quoted (&lt; &gt; &amp; &quot; stand for < > & \"). The \
+             original messages used the literal characters. Write your own replies with \
+             literal characters too: for example <!-- and -->, never &lt;!-- and \
+             --&gt;.\n\n\
              The user's message, delivered before the interruption:\n\
              <interrupted_user_message>\nbuild a simple local webapp\n</interrupted_user_message>\n\n\
              Your partial response before the cut-off (it did NOT complete; anything \
@@ -46577,6 +48840,26 @@ mod resume_tail_recap {
              <interrupted_partial_response>\nDelegating board webapp...\n</interrupted_partial_response>\n\n\
              </supervisor>"
         );
+    }
+
+    /// The recapped text is XML-escaped, so the recap carries the note that
+    /// the escaping is transport-only and replies use literal characters.
+    #[test]
+    fn recap_says_escaping_is_transport_only() {
+        let messages = vec![
+            user("fix <b> & ship"),
+            interrupted_assistant("Done.\n\n<!-- suggested-prompts\nShip it.\n-->"),
+        ];
+        let recap = build_resume_tail_recap(&messages).expect("recap");
+        assert!(
+            recap
+                .text
+                .contains(crate::history_xml::REPLAY_ESCAPING_NOTE),
+            "{}",
+            recap.text
+        );
+        assert!(recap.text.contains("fix &lt;b&gt; &amp; ship"));
+        assert!(recap.text.contains("&lt;!-- suggested-prompts"));
     }
 
     /// A SECOND restart mid-continuation: the tail now holds the original
@@ -46858,8 +49141,12 @@ mod resume_tail_recap {
 /// and the never-fail fallback (`resume_continuation_text`).
 mod resume_continuation {
     use crate::agent_ops::{
-        humanize_outage_duration, resume_continuation_text, RESUME_CONTINUATION_FALLBACK_TEXT,
+        humanize_outage_duration, resume_continuation_text, InterruptedCapture,
+        ABANDON_NOTICE_TEXT, ABANDON_WORKERS_MID_TURN_NOTICE_TEXT, ABANDON_WORKERS_NOTICE_TEXT,
+        RESUME_CONTINUATION_FALLBACK_TEXT, RESUME_MARKER_TEXT, RESUME_WORKERS_LOST_NOTE,
+        RESUME_WORKERS_MARKER_TEXT, RESUME_WORKERS_MID_TURN_MARKER_TEXT,
     };
+    use crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON;
     use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
 
@@ -46882,6 +49169,100 @@ mod resume_continuation {
         assert_eq!(humanize_outage_duration(2 * 86_400 - 1), "47 hours");
         assert_eq!(humanize_outage_duration(2 * 86_400), "2 days");
         assert_eq!(humanize_outage_duration(3 * 86_400 + 5), "3 days");
+    }
+
+    /// intent-hq/intent#7658: rows are classified by their reason tag and
+    /// recorded status. Untagged rows (and other reasons) are mid-turn
+    /// whatever their status; a tagged row is mid-turn only when its status
+    /// is an in-flight one.
+    #[test]
+    fn interrupted_capture_classifies_by_reason_and_status() {
+        let tag = Some(INTERRUPTED_WITH_WORKERS_REASON);
+        for status in ["active", "idle", "Idle", "error"] {
+            assert_eq!(
+                InterruptedCapture::of(None, status),
+                InterruptedCapture::MidTurn
+            );
+            assert_eq!(
+                InterruptedCapture::of(Some("system_suspend"), status),
+                InterruptedCapture::MidTurn
+            );
+        }
+        for status in ["active", "Processing", "Waiting"] {
+            assert_eq!(
+                InterruptedCapture::of(tag, status),
+                InterruptedCapture::MidTurnWithWorkers,
+                "{status}"
+            );
+        }
+        for status in ["idle", "Idle", "error", "not-a-status"] {
+            assert_eq!(
+                InterruptedCapture::of(tag, status),
+                InterruptedCapture::IdleWithWorkers,
+                "{status}"
+            );
+        }
+    }
+
+    /// Each capture's marker, continuation, abandon notice and tail replay:
+    /// tagged rows get the lost-task note after the duration wording, an idle
+    /// capture replays no tail (a turn the user stopped stays stopped), and
+    /// untagged rows keep today's wording.
+    #[test]
+    fn interrupted_capture_wording_and_tail_replay() {
+        let now = parse("2026-08-15T12:00:15Z");
+        let at = "2026-08-15T12:00:00Z";
+        let base = resume_continuation_text(at, now);
+        assert!(base.starts_with("You were interrupted for about 15 seconds"));
+        let noted = format!("{base} {RESUME_WORKERS_LOST_NOTE}");
+        let cases = [
+            (
+                InterruptedCapture::MidTurn,
+                RESUME_MARKER_TEXT,
+                base.clone(),
+                ABANDON_NOTICE_TEXT,
+                true,
+            ),
+            (
+                InterruptedCapture::MidTurnWithWorkers,
+                RESUME_WORKERS_MID_TURN_MARKER_TEXT,
+                noted.clone(),
+                ABANDON_WORKERS_MID_TURN_NOTICE_TEXT,
+                true,
+            ),
+            (
+                InterruptedCapture::IdleWithWorkers,
+                RESUME_WORKERS_MARKER_TEXT,
+                noted,
+                ABANDON_WORKERS_NOTICE_TEXT,
+                false,
+            ),
+        ];
+        for (capture, marker, continuation, abandon, replays) in cases {
+            assert_eq!(
+                capture.resume_marker_and_continuation(at, now),
+                (marker, continuation),
+                "{capture:?}"
+            );
+            assert_eq!(capture.abandon_notice(), abandon, "{capture:?}");
+            assert_eq!(capture.replays_tail(), replays, "{capture:?}");
+        }
+        assert!(RESUME_WORKERS_LOST_NOTE.contains("will not report back"));
+        assert_eq!(
+            RESUME_MARKER_TEXT,
+            "The previous turn was interrupted because the harness shut down. Continuing below."
+        );
+        assert_eq!(
+            ABANDON_NOTICE_TEXT,
+            "This conversation was interrupted because intentd restarted. The agent's \
+             in-flight work was terminated."
+        );
+        assert_eq!(
+            InterruptedCapture::IdleWithWorkers
+                .resume_marker_and_continuation("not-a-timestamp", now)
+                .1,
+            format!("{RESUME_CONTINUATION_FALLBACK_TEXT} {RESUME_WORKERS_LOST_NOTE}")
+        );
     }
 
     /// The delivered wording embeds the duration.
@@ -47152,6 +49533,7 @@ async fn wire_agent_delegate_rejects_compound_model_in_batch_tasks() {
                 provider: None,
                 reasoning_effort: None,
                 agent_instructions: None,
+                placement: None,
             })]),
             ..Default::default()
         },
@@ -47224,7 +49606,11 @@ async fn wire_agent_wake_or_create_rejects_compound_model() {
 #[intent_test_macros::daemon_test]
 async fn wire_create_workspace_rejects_compound_initial_agent_model() {
     let (_t, svc, _ws) = setup().await;
-    let before = svc.list_workspaces(true).await.expect("list").len();
+    let before = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     for bad in ["mock:default", ":default"] {
         let err = WorkspaceApi::create_workspace(
             &svc,
@@ -47242,7 +49628,11 @@ async fn wire_create_workspace_rejects_compound_initial_agent_model() {
         .expect_err("compound initialAgent.model must reject");
         assert_compound_model_rejection(err, "initialAgent.model");
     }
-    let after = svc.list_workspaces(true).await.expect("list").len();
+    let after = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     assert_eq!(after, before, "rejection must precede any side effect");
 }
 
@@ -47398,7 +49788,11 @@ async fn startup_resume_and_manual_resolution_have_one_winner() {
         automatic.is_ok() ^ manual_won,
         "exactly one resume must win"
     );
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         session.messages.iter().filter(|m| m.role == "user").count(),
         1
@@ -47433,7 +49827,11 @@ async fn startup_resume_and_manual_abandon_have_no_losing_side_effects() {
         svc.abandon_interrupted_agent(&id)
     );
     assert!(automatic.is_ok() ^ abandon.is_ok(), "one resolver wins");
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let abandonment_notices = session
         .messages
         .iter()
@@ -47487,7 +49885,11 @@ async fn startup_resume_abandon_persist_failure_remains_retryable() {
         .await
         .unwrap()
         .is_none());
-    let session = svc.store.get_agent_session(&id).await.unwrap();
+    let session = svc
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     assert_eq!(
         session
             .messages
@@ -47507,13 +49909,16 @@ async fn startup_resume_listing_never_exposes_a_stale_successful_candidate() {
         .await
         .unwrap();
     let reservations = svc.prepare_startup_resume().await.unwrap();
-    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let park = Arc::new(crate::runtime_config::SupervisePark::default());
     let mut listing = svc.clone();
     listing.interrupted_list_park = Some(park.clone());
     let (result, ()) = tokio::join!(listing.agent_list_interrupted(), async {
-        timeout(Duration::from_secs(5), park.entered.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            park.entered.notified(),
+        )
+        .await
+        .unwrap();
         svc.resume_startup_candidate(&reservations, &id)
             .await
             .unwrap();
@@ -47535,7 +49940,7 @@ async fn completion_startup_checks_do_not_read_transcripts() {
     let store = Store::open(&tmp.path).await.unwrap();
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     svc.register_completion_watch(
@@ -47552,7 +49957,11 @@ async fn completion_startup_checks_do_not_read_transcripts() {
         .bind(&child.0).execute(svc.store().write_pool()).await.unwrap();
     sqlx::query("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('poison', ?, 0, 'assistant', 'invalid JSON', '2026-09-30T00:00:00Z')")
         .bind(&child.0).execute(svc.store().write_pool()).await.unwrap();
-    assert!(svc.store().get_agent_session(&child).await.is_err());
+    assert!(svc
+        .store()
+        .get_agent_session_with_transcript(&child)
+        .await
+        .is_err());
     assert_eq!(
         svc.store()
             .get_agent_session_summary(&child)
@@ -47573,7 +49982,7 @@ async fn completion_startup_checks_do_not_read_transcripts() {
     );
     assert_eq!(
         svc.store()
-            .get_agent_session(&parent)
+            .get_agent_session_with_transcript(&parent)
             .await
             .unwrap()
             .messages
@@ -47591,6 +50000,156 @@ async fn completion_startup_checks_do_not_read_transcripts() {
     );
 }
 
+/// Make `agent_id`'s stored transcript undecodable so any full transcript
+/// read (`get_agent_messages(.., None)` / `get_agent_session_with_transcript`) fails, while
+/// the metadata lookups keep working.
+async fn poison_transcript(svc: &Services, agent_id: &AgentId) {
+    svc.store()
+        .append_agent_message(
+            agent_id,
+            "user",
+            &json!([{ "type": "text", "text": "first" }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_message SET content = 'not json' WHERE agent_id = ?")
+        .bind(&agent_id.0)
+        .execute(svc.store().write_pool())
+        .await
+        .unwrap();
+    assert!(
+        svc.store()
+            .get_agent_session_with_transcript(agent_id)
+            .await
+            .is_err(),
+        "fixture: a full session read must fail on the undecodable row"
+    );
+}
+
+/// Every queue mutation publishes `agent:queue:updated` through
+/// `publish_queue_updated`, which needs only the session's workspace: it must
+/// not read the transcript (a failed full read silently dropped the event).
+#[tokio::test]
+async fn queue_updated_publish_does_not_read_the_transcript() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let id = create_agent(&svc, &ws, "Q").await;
+    poison_transcript(&svc, &id).await;
+    let mut sub = bus.subscribe(SubscriptionFilter {
+        event_types: vec![intent_core::events::AGENT_QUEUE_UPDATED.to_string()],
+        ..Default::default()
+    });
+
+    svc.agent_queue_message_op(id.clone(), "first".into(), None, None, None)
+        .await
+        .expect("queue");
+
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("queue:updated must still be published")
+    .expect("subscription closed");
+    let evt = batch
+        .iter()
+        .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
+        .expect("queue:updated emitted");
+    assert_eq!(evt.workspace_id, ws);
+    assert_eq!(evt.data["agentId"].as_str(), Some(id.0.as_str()));
+}
+
+/// `agent.wakeOrCreate` resolves the caller's delegation depth and scans the
+/// task's assigned agents on every call; both read only session metadata. A
+/// full read failed on an undecodable transcript and failed the whole wake,
+/// so the assigned agent must still be reused.
+#[intent_test_macros::daemon_test]
+async fn wake_or_create_does_not_read_the_transcript() {
+    let (_t, svc, ws) = setup().await;
+    let caller = create_agent(&svc, &ws, "Coordinator").await;
+    let target = create_agent(&svc, &ws, "Assignee").await;
+    let note_id = seed_task(&svc, &ws, "Transcript-free wake").await;
+    svc.assign_agent(ws.clone(), note_id.clone(), target.0.clone(), None)
+        .await
+        .expect("assign");
+    poison_transcript(&svc, &caller).await;
+    poison_transcript(&svc, &target).await;
+
+    let resp = svc
+        .agent_wake_or_create_op(
+            ws.clone(),
+            note_id,
+            "resume".into(),
+            AgentWakeOrCreateInput {
+                caller_agent_id: Some(caller.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("wake succeeds without reading either transcript");
+    assert_eq!(resp["agentId"].as_str(), Some(target.0.as_str()), "{resp}");
+}
+
+/// The delegation depth guards (`agent.create` and `agent.delegate`) read the
+/// parent's persisted depth. A failed full read fell back to depth 0, so a
+/// parent already at the maximum depth could spawn a child whenever its
+/// transcript could not be decoded.
+#[tokio::test]
+async fn delegation_depth_guards_do_not_read_the_transcript() {
+    let (_t, svc, ws) = setup().await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("MaxDepth".into()),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                metadata: Some(json!({ "delegationDepth": MAX_DELEGATION_DEPTH })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create parent at max depth");
+    let parent = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    poison_transcript(&svc, &parent).await;
+
+    let err = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            None,
+            None,
+            Some(parent.clone()),
+            None,
+            false,
+            intent_core::AgentCreateExtra::default(),
+        )
+        .await
+        .expect_err("create must be refused when parent at max depth");
+    assert!(
+        err.to_string().contains("maximum delegation depth"),
+        "unexpected err: {err}"
+    );
+    let err = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                agent_instructions: Some("still trying".into()),
+                ..Default::default()
+            },
+            Some(parent),
+        )
+        .await
+        .expect_err("delegate must be refused at max depth");
+    assert!(
+        err.to_string().contains("maximum delegation depth"),
+        "unexpected err: {err}"
+    );
+}
+
 #[tokio::test]
 async fn completion_startup_restores_repeated_parent_without_delivery_and_survives_stop() {
     for grouped in [false, true] {
@@ -47598,7 +50157,7 @@ async fn completion_startup_restores_repeated_parent_without_delivery_and_surviv
         let store = Store::open(&tmp.path).await.unwrap();
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let children = vec![
             create_agent(&svc, &ws, "One").await,
@@ -47630,7 +50189,11 @@ async fn completion_startup_restores_repeated_parent_without_delivery_and_surviv
         sqlx::query("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('history', ?, 0, 'assistant', ?, ?)")
             .bind(&parent.0).bind("x".repeat(1024 * 1024)).bind(now_iso()).execute(svc.store().write_pool()).await.unwrap();
         for child in &children {
-            let mut session = svc.store().get_agent_session_summary(child).await.unwrap();
+            let mut session = svc
+                .store()
+                .get_agent_session_without_messages(child)
+                .await
+                .unwrap();
             session.status = intent_core::AgentStatus::Completed;
             session.completion_report = Some("done".into());
             svc.store()
@@ -47669,11 +50232,11 @@ async fn completion_startup_restores_repeated_parent_without_delivery_and_surviv
             .execute(svc.store().write_pool())
             .await
             .unwrap();
-        let restarted = Services::new(Store::open(&tmp.path).await.unwrap());
+        let restarted = Services::new_isolated(Store::open(&tmp.path).await.unwrap());
         let recovery = restarted.prepare_startup_completion_recovery().await;
         assert!(restarted
             .store()
-            .get_agent_session(&parent)
+            .get_agent_session_with_transcript(&parent)
             .await
             .unwrap()
             .messages
@@ -47685,7 +50248,7 @@ async fn completion_startup_restores_repeated_parent_without_delivery_and_surviv
         assert_eq!(
             restarted
                 .store()
-                .get_agent_session(&parent)
+                .get_agent_session_with_transcript(&parent)
                 .await
                 .unwrap()
                 .messages
@@ -47703,7 +50266,7 @@ async fn completion_startup_reconciliation_does_not_consume_new_watches() {
         let store = Store::open(&tmp.path).await.unwrap();
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.unwrap();
-        let svc = Services::new(store);
+        let svc = FakeRuntime::install(Services::new_isolated(store));
         let original = create_agent(&svc, &ws, "Original").await;
         let newcomer = create_agent(&svc, &ws, "Newcomer").await;
         let child = create_agent(&svc, &ws, "Child").await;
@@ -47719,7 +50282,11 @@ async fn completion_startup_reconciliation_does_not_consume_new_watches() {
         wait_for_persisted_watches(&svc, 1).await;
         let hook_a = seed_active_hook(&svc, &ws, &child, "first hook").await;
         let hook_b = seed_active_hook(&svc, &ws, &child, "last hook").await;
-        let mut session = svc.store().get_agent_session_summary(&child).await.unwrap();
+        let mut session = svc
+            .store()
+            .get_agent_session_without_messages(&child)
+            .await
+            .unwrap();
         session.status = intent_core::AgentStatus::RuntimeIdle;
         session.completion_report = Some("historical completion".into());
         session.completion_report_timestamp = Some(now_iso());
@@ -47727,7 +50294,9 @@ async fn completion_startup_reconciliation_does_not_consume_new_watches() {
             .update_agent_session(&ws, &session)
             .await
             .unwrap();
-        let restarted = Services::new(Store::open(&tmp.path).await.unwrap());
+        let restarted = FakeRuntime::install(Services::new_isolated(
+            Store::open(&tmp.path).await.unwrap(),
+        ));
         let recovery = restarted.prepare_startup_completion_recovery().await;
         restarted
             .agent_watch_op(ws.clone(), newcomer.clone(), child.clone())
@@ -47757,20 +50326,23 @@ async fn completion_startup_reconciliation_does_not_consume_new_watches() {
                 .execute(restarted.store().write_pool())
                 .await
                 .unwrap();
-            timeout(Duration::from_secs(5), async {
-                loop {
-                    if restarted
-                        .completion_delivery_retries
-                        .lock()
-                        .unwrap()
-                        .is_empty()
-                    {
-                        break;
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                async {
+                    loop {
+                        if restarted
+                            .completion_delivery_retries
+                            .lock()
+                            .unwrap()
+                            .is_empty()
+                        {
+                            break;
+                        }
+                        // timing-guard: observe completion of scoped startup retries
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    // timing-guard: observe completion of scoped startup retries
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
+                },
+            )
             .await
             .expect("startup retry settles");
         }
@@ -47823,7 +50395,7 @@ async fn completion_startup_stop_drains_claimed_wake_and_skips_next_child() {
     let store = Store::open(&tmp.path).await.unwrap();
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let mut children = vec![
         create_agent(&svc, &ws, "One").await,
@@ -47840,7 +50412,11 @@ async fn completion_startup_stop_drains_claimed_wake_and_skips_next_child() {
             None,
         )
         .unwrap();
-        let mut session = svc.store().get_agent_session_summary(child).await.unwrap();
+        let mut session = svc
+            .store()
+            .get_agent_session_without_messages(child)
+            .await
+            .unwrap();
         session.status = intent_core::AgentStatus::Completed;
         session.completion_report = Some("done".into());
         svc.store()
@@ -47850,7 +50426,7 @@ async fn completion_startup_stop_drains_claimed_wake_and_skips_next_child() {
     }
     wait_for_persisted_watches(&svc, 2).await;
     let park = Arc::new(crate::CompletionClassifyPark::default());
-    let restarted = Services::new(Store::open(&tmp.path).await.unwrap())
+    let restarted = Services::new_isolated(Store::open(&tmp.path).await.unwrap())
         .with_completion_claim_park(park.clone());
     let recovery = restarted.prepare_startup_completion_recovery().await;
     let (stop, stopping) = tokio::sync::watch::channel(false);
@@ -47862,9 +50438,12 @@ async fn completion_startup_stop_drains_claimed_wake_and_skips_next_child() {
                 .await;
         }
     });
-    timeout(Duration::from_secs(5), park.entered.notified())
-        .await
-        .expect("recovery claimed first wake");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("recovery claimed first wake");
     // Live completion racing deferred boot delivery yields to its existing claim.
     restarted
         .handle_completion_event(&completion_event(
@@ -47877,10 +50456,13 @@ async fn completion_startup_stop_drains_claimed_wake_and_skips_next_child() {
     stop.send(true).unwrap();
     assert!(!worker.is_finished(), "an admitted wake must drain");
     park.release.notify_one();
-    timeout(Duration::from_secs(5), worker)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        worker,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(parent_message_count(&restarted, &parent).await, 1);
     assert!(restarted.find_watches_for_child(&children[0]).is_empty());
     assert_eq!(restarted.find_watches_for_child(&children[1]).len(), 1);
@@ -47894,11 +50476,15 @@ async fn completion_startup_unreported_child_keeps_stall_annotation_without_hist
         let store = Store::open(&tmp.path).await.unwrap();
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.unwrap();
-        let svc = Services::new(store);
+        let svc = Services::new_isolated(store);
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         link_task_note(&svc, &ws, &child, "Unfinished task", "in_progress").await;
-        let mut session = svc.store().get_agent_session_summary(&child).await.unwrap();
+        let mut session = svc
+            .store()
+            .get_agent_session_without_messages(&child)
+            .await
+            .unwrap();
         session.status = intent_core::AgentStatus::Completed;
         session.completion_report = report;
         svc.store()
@@ -47917,7 +50503,11 @@ async fn completion_startup_unreported_child_keeps_stall_annotation_without_hist
         wait_for_persisted_watches(&svc, 1).await;
         sqlx::query("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at) VALUES ('poison', ?, 0, 'assistant', 'invalid JSON', ?)")
             .bind(&child.0).bind(now_iso()).execute(svc.store().write_pool()).await.unwrap();
-        assert!(svc.store().get_agent_session(&child).await.is_err());
+        assert!(svc
+            .store()
+            .get_agent_session_with_transcript(&child)
+            .await
+            .is_err());
         assert_eq!(
             svc.store()
                 .get_agent_session_summary(&child)
@@ -47926,7 +50516,7 @@ async fn completion_startup_unreported_child_keeps_stall_annotation_without_hist
                 .status,
             intent_core::AgentStatus::Completed
         );
-        let restarted = Services::new(Store::open(&tmp.path).await.unwrap());
+        let restarted = Services::new_isolated(Store::open(&tmp.path).await.unwrap());
         let recovery = restarted.prepare_startup_completion_recovery().await;
         let (_stop, stopping) = tokio::sync::watch::channel(false);
         restarted
@@ -47934,7 +50524,7 @@ async fn completion_startup_unreported_child_keeps_stall_annotation_without_hist
             .await;
         let messages = restarted
             .store()
-            .get_agent_session(&parent)
+            .get_agent_session_with_transcript(&parent)
             .await
             .unwrap()
             .messages;
@@ -47996,15 +50586,18 @@ async fn completion_startup_and_live_retries_keep_distinct_payloads_and_scopes()
             svc.schedule_completion_delivery_retry(child.clone(), boot, Some(&scope));
         }
         assert_eq!(svc.completion_delivery_retries.lock().unwrap().len(), 1);
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if svc.completion_delivery_retries.lock().unwrap().is_empty() {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                loop {
+                    if svc.completion_delivery_retries.lock().unwrap().is_empty() {
+                        break;
+                    }
+                    // timing-guard: observe both coalesced retry attempts settling
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                // timing-guard: observe both coalesced retry attempts settling
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("coalesced retry worker completes");
         assert_eq!(parent_message_count(&svc, &original).await, 1);
@@ -48064,7 +50657,7 @@ async fn shutdown_admission_stops_retry_and_preserves_durable_watch() {
     assert_eq!(parent_message_count(&svc, &parent).await, 0);
 
     // Restart wiring can still recover the watch and deliver its stable wake.
-    let restarted = Services::new(svc.store().clone());
+    let restarted = Services::new_isolated(svc.store().clone());
     restarted
         .heal_completion_watches_on_startup()
         .await
@@ -48140,9 +50733,12 @@ async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
     let resume = intent_core::spawn_daemon(async move {
         resuming.resume_startup_candidate(&candidates, &id).await
     });
-    timeout(Duration::from_secs(5), park.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        park.entered.notified(),
+    )
+    .await
+    .unwrap();
     assert!(
         svc.store
             .get_interrupted_agent(&agent)
@@ -48159,10 +50755,13 @@ async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
     manager.checkpoint_shutdown().await;
     svc.shutdown_agent_deliveries().await;
     park.release.notify_one();
-    let outcome = timeout(Duration::from_secs(5), resume)
-        .await
-        .unwrap()
-        .unwrap();
+    let outcome = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        resume,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     manager.shutdown().await;
     assert!(
         outcome.is_err(),
@@ -48176,7 +50775,7 @@ async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
             .is_some(),
         "unadmitted recovery stays pending for the next boot"
     );
-    let restarted = Services::new(svc.store.clone());
+    let restarted = Services::new_isolated(svc.store.clone());
     restarted.rehydrate_agent_queues().await.unwrap();
     assert!(
         restarted.queue_snapshot(&agent).is_empty(),
@@ -48197,7 +50796,7 @@ async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
     assert!(restarted.resume_interrupted_agent(&agent).await.is_err());
     let messages = restarted
         .store
-        .get_agent_session(&agent)
+        .get_agent_session_with_transcript(&agent)
         .await
         .unwrap()
         .messages;
@@ -48262,7 +50861,11 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
         assert_eq!(result.is_ok(), outcome != "failure");
         if outcome == "collision" {
             assert_ne!(result.as_ref().unwrap()["messageId"], entry_id);
-            let session = svc.store.get_agent_session(&agent).await.unwrap();
+            let session = svc
+                .store
+                .get_agent_session_with_transcript(&agent)
+                .await
+                .unwrap();
             assert_eq!(session.messages.len(), 2);
             assert_eq!(
                 session.messages[1].metadata.as_ref().unwrap()["submissionIds"],
@@ -48299,6 +50902,7 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
 async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel() {
     for grouped in [false, true] {
         let (_t, svc, ws) = setup().await;
+        let svc = FakeRuntime::install(svc);
         let park = Arc::new(crate::CompletionClassifyPark::default());
         let svc = if grouped {
             svc
@@ -48307,27 +50911,11 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
         };
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
-        let script = svc
-            .script_create(
-                ws.clone(),
-                intent_core::ScriptCreateParams {
-                    name: "Monitor check".into(),
-                    command: "true".into(),
-                    mode: intent_core::ScriptMode::Command,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let sid = script["id"].as_str().unwrap().to_owned();
-        svc.store
-            .admit_script_run(&ws, &sid, "accepted-reservation")
-            .await
-            .unwrap();
-        let monitor = svc
-            .script_monitor(ws.clone(), child.clone(), sid, json!({"ttlMs":60000}))
-            .await
-            .unwrap();
+        // Fake runtime: seed the active monitor row the runtime's
+        // `script.monitor` would have written; its lookups read it back.
+        let monitor =
+            crate::test_support::fake_runtime::active_script_monitor(&ws, &child, "Monitor check");
+        svc.store.insert_script_monitor(&monitor).await.unwrap();
         let gid = grouped.then(|| {
             let gid = svc.get_or_create_delegation_group(&ws, &parent);
             svc.enroll_child_in_group(&gid, &child);
@@ -48346,7 +50934,7 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
         svc.annotate_waiting_on_pr_monitors(&child, &mut data).await;
         assert_eq!(
             data["waitingOnScriptMonitors"][0]["monitorId"],
-            monitor["monitor"]["monitorId"]
+            json!(monitor.monitor_id)
         );
         svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data.clone()))
             .await;
@@ -48372,15 +50960,20 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
             let ws = ws.clone();
             let child = child.clone();
             async move {
-                svc.cancel_script_monitors(&ws, Some(&child), "owner-retired")
+                svc.ports
+                    .runtime()
+                    .cancel_script_monitors(&svc, &ws, Some(&child), "owner-retired")
                     .await
                     .unwrap();
             }
         });
         if !grouped {
-            timeout(Duration::from_secs(5), park.entered.notified())
-                .await
-                .expect("cancellation redelivery claims the watch");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                park.entered.notified(),
+            )
+            .await
+            .expect("cancellation redelivery claims the watch");
             // The competing idle pass must yield to the existing delivery;
             // its return does not promise that the winner has retired yet.
             svc.handle_completion_event(&completion_event(
@@ -48394,19 +50987,459 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
             assert_eq!(parent_message_count(&svc, &parent).await, 1);
             park.release.notify_one();
         }
-        timeout(Duration::from_secs(5), cancellation)
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            cancellation,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         // Cancellation and commit_monitor's spawned redelivery race for the
-        // same claim. Await durable retirement by the winner, preserving the
-        // exact final assertions for both individual and after_all watches.
+        // same claim. The winner commits durable retirement before removing
+        // the in-memory watch, so observing the database alone is not a fence
+        // for both states. Await memory cleanup and then durable retirement.
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while !svc.find_watches_for_child(&child).is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .expect("cancellation redelivery retires the in-memory watch");
         wait_for_persisted_watches(&svc, 0).await;
         assert!(svc.find_watches_for_child(&child).is_empty());
         assert_eq!(parent_message_count(&svc, &parent).await, 2);
         assert!(svc
-            .active_script_monitors_for_agent(&child)
+            .ports
+            .runtime()
+            .active_script_monitors_for_agent(&svc, &child)
             .await
             .is_empty());
     }
+}
+
+#[intent_test_macros::daemon_test]
+async fn task_push_assignment_cleanup_publishes_complete_metadata() {
+    let (_tmp, svc, ws) = setup().await;
+    let note_id = seed_task(&svc, &ws, "Cleanup").await;
+    let stale = AgentId::from("stale-assignment");
+    let mut note = svc.store().get_note(&ws, &note_id).await.unwrap();
+    note.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![stale.clone()];
+    svc.store()
+        .update_note_metadata(
+            &svc.store()
+                .lock_note_content(&note.workspace_id, &note.id)
+                .await,
+            &note,
+        )
+        .await
+        .unwrap();
+    let bus = EventBus::new(svc.store().clone());
+    let svc = svc.with_event_bus(bus.clone());
+    svc.remove_agent_ids_from_workspace_tasks(&ws, &[stale])
+        .await
+        .unwrap();
+    let events = svc
+        .store()
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws),
+            event_types: vec![intent_core::events::NOTE_UPDATED.into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data["note"]["id"], note_id.as_str());
+    assert!(events[0].data["note"]["metadata"]["task"]
+        .get("assignedAgentIds")
+        .is_none());
+    assert!(events[0].data["note"].get("content").is_none());
+    bus.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn models_list_codex_reports_warning_kind_only_for_known_causes() {
+    use crate::model_catalog::ModelWarningKind;
+    for (kind, wire) in [
+        (Some(ModelWarningKind::CliMissing), Some("cli-missing")),
+        (
+            Some(ModelWarningKind::PrerequisiteMissing),
+            Some("prerequisite-missing"),
+        ),
+        (None, None),
+    ] {
+        let (_t, svc, _ws) = setup().await;
+        svc.models_catalog.test_install_selection_error(
+            "codex",
+            crate::provider_models::CatalogUnavailable {
+                reason: "codex catalog unavailable".into(),
+                kind,
+            },
+        );
+        let res = svc
+            .models_list_op(Some("codex".to_string()), false)
+            .await
+            .expect("models.list codex");
+        assert_eq!(res["providerId"], "codex");
+        assert_eq!(res["source"], "static");
+        assert_eq!(res["warning"], "codex catalog unavailable", "{res}");
+        assert_eq!(
+            res.get("warningKind").and_then(serde_json::Value::as_str),
+            wire,
+            "{res}"
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Capped and paged `agent.getMessageBlock` + `agent.editAndRegenerate` stored
+// image block references (PROTOCOL §5.5, `messageBlockPages: 1`).
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Serialized size of a JSON value, as the transport writes it.
+fn json_len(v: &serde_json::Value) -> usize {
+    serde_json::to_vec(v).expect("serialize").len()
+}
+
+/// A persisted multi-MB text block, tool output and image are each served
+/// under the cap through the default page; paging the text and the tool
+/// output with `offset` / `nextOffset` reassembles the exact stored bodies.
+#[tokio::test]
+async fn get_message_block_caps_and_pages_large_bodies() {
+    use intent_core::{MessageBlockPage, MESSAGE_BLOCK_MAX_BYTES};
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "BlockCap").await;
+    let text = "line ✓ \"quoted\"\n".repeat(250_000);
+    let output = "out\t".repeat(600_000);
+    let image = "QUJD".repeat(500_000);
+    let content = json!([
+        { "type": "text", "id": "t", "text": text },
+        { "type": "tool_result", "id": "r", "tool_use_id": "tc", "output": output, "is_error": false },
+        { "type": "image", "id": "i", "data": image, "mimeType": "image/png" },
+    ]);
+    let row = svc
+        .store()
+        .append_agent_message(&id, "assistant", &content, &now_iso())
+        .await
+        .expect("append");
+
+    for (block_id, body) in [("t", &text), ("r", &output)] {
+        let mut joined = String::new();
+        let mut offset = None;
+        loop {
+            let page = MessageBlockPage {
+                offset,
+                max_bytes: None,
+            };
+            let r = svc
+                .agent_get_message_block_page_op(
+                    id.clone(),
+                    row.id.clone(),
+                    block_id.to_string(),
+                    Some(ws.clone()),
+                    page,
+                )
+                .await
+                .expect("page");
+            assert!(json_len(&r) < 500 * 1024, "result under budget");
+            assert!(json_len(&r["block"]) <= MESSAGE_BLOCK_MAX_BYTES);
+            assert_eq!(r["truncated"], true);
+            assert_eq!(r["encoding"], "text");
+            assert_eq!(r["totalBytes"], json!(body.len()));
+            let field = r["field"].as_str().expect("field");
+            joined.push_str(r["block"][field].as_str().expect("slice"));
+            match r["nextOffset"].as_u64() {
+                Some(n) => offset = Some(n),
+                None => break,
+            }
+        }
+        assert_eq!(&joined, body, "pages reassemble block {block_id}");
+    }
+
+    let r = svc
+        .agent_get_message_block_op(id.clone(), row.id.clone(), "i".into(), None)
+        .await
+        .expect("image");
+    assert!(json_len(&r) < 500 * 1024);
+    assert!(
+        r["block"].get("data").is_none(),
+        "over-cap image has no data"
+    );
+    assert_eq!(r["block"]["dataTruncated"], true);
+    assert_eq!(r["block"]["dataBytes"], json!(image.len()));
+    assert_eq!(r["truncated"], true);
+    assert_eq!(r["nextOffset"], serde_json::Value::Null);
+
+    let err = svc
+        .agent_get_message_block_page_op(
+            id,
+            row.id,
+            "i".into(),
+            None,
+            MessageBlockPage {
+                offset: Some(4),
+                max_bytes: None,
+            },
+        )
+        .await
+        .expect_err("offset on an image");
+    assert!(
+        matches!(&err, Error::InvalidParams(m) if m == "offset is not supported for this block"),
+        "{err:?}"
+    );
+}
+
+/// `agent.editAndRegenerate` with a `{ type: "image", messageId, blockId }`
+/// reference regenerates with the ORIGINAL full image bytes of the edited
+/// message (which the truncation drops), although `agent.getMessageBlock`
+/// serves that image without `data`.
+#[intent_test_macros::daemon_test]
+async fn edit_and_regenerate_resolves_stored_image_block_reference() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "EditRef").await;
+    let image = "QUJD".repeat(300_000);
+    let first = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([
+                { "type": "text", "text": "look" },
+                { "type": "image", "data": image, "mimeType": "image/png" },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .expect("append");
+    let block_id = format!("{}:1", first.id);
+    let capped = svc
+        .agent_get_message_block_op(id.clone(), first.id.clone(), block_id.clone(), None)
+        .await
+        .expect("capped read");
+    assert!(
+        capped["block"].get("data").is_none(),
+        "client never gets the bytes"
+    );
+
+    svc.agent_edit_and_regenerate(
+        ws.clone(),
+        id.clone(),
+        first.id.clone(),
+        "look again".into(),
+        Some(json!([{ "type": "image", "messageId": first.id, "blockId": block_id }])),
+        None,
+        None,
+    )
+    .await
+    .expect("edit by reference");
+
+    let session = svc.agent_get_session_op(id).await.expect("get");
+    assert_eq!(session.messages.len(), 1, "edited message replaced");
+    let blocks = session.messages[0].content.as_array().expect("blocks");
+    let img = blocks
+        .iter()
+        .find(|b| b["type"] == "image")
+        .expect("image block persisted");
+    assert_eq!(
+        img["data"].as_str(),
+        Some(image.as_str()),
+        "full original bytes"
+    );
+    assert_eq!(img["mimeType"], "image/png");
+    assert!(img.get("messageId").is_none() && img.get("blockId").is_none());
+}
+
+/// Malformed, unknown and non-image block references are `-32602` before
+/// any state change; the transcript is untouched.
+#[intent_test_macros::daemon_test]
+async fn edit_and_regenerate_rejects_bad_block_references() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "EditRefErr").await;
+    let row = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": "hi" }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append");
+    let text_block = format!("{}:0", row.id);
+    let cases = [
+        (
+            json!({ "type": "image", "messageId": row.id }),
+            "agent.editAndRegenerate: imageBlocks[0] block reference needs a non-empty `messageId` and `blockId` and no `data` or `attachmentId`".to_string(),
+        ),
+        (
+            json!({ "type": "image", "messageId": row.id, "blockId": text_block, "data": "QQ==" }),
+            "agent.editAndRegenerate: imageBlocks[0] block reference needs a non-empty `messageId` and `blockId` and no `data` or `attachmentId`".to_string(),
+        ),
+        (
+            json!({ "type": "image", "messageId": "m-missing", "blockId": "b" }),
+            "unknown message id: m-missing".to_string(),
+        ),
+        (
+            json!({ "type": "image", "messageId": row.id, "blockId": format!("{}:7", row.id) }),
+            format!("unknown block id: {}:7", row.id),
+        ),
+        (
+            json!({ "type": "image", "messageId": row.id, "blockId": text_block }),
+            format!("agent.editAndRegenerate: imageBlocks[0] references block {text_block}, which is not an image with stored bytes"),
+        ),
+    ];
+    for (entry, want) in cases {
+        let err = svc
+            .agent_edit_and_regenerate(
+                ws.clone(),
+                id.clone(),
+                row.id.clone(),
+                "x".into(),
+                Some(json!([entry])),
+                None,
+                None,
+            )
+            .await
+            .expect_err("bad reference");
+        assert!(
+            matches!(&err, Error::InvalidParams(m) if *m == want),
+            "{entry}: {err:?}"
+        );
+    }
+    let session = svc.agent_get_session_op(id).await.expect("get");
+    assert_eq!(session.messages.len(), 1, "transcript unchanged");
+    assert_eq!(session.messages[0].id, row.id);
+}
+
+/// Other `imageBlocks` seams do not accept references: an entry with
+/// neither `data` nor `attachmentId` stays `-32602`.
+#[test]
+fn block_reference_entries_fail_ordinary_image_validation() {
+    let err = crate::agent_ops::validate_image_blocks(
+        "agent.sendMessage",
+        Some(&json!([{ "type": "image", "messageId": "m", "blockId": "b" }])),
+    )
+    .expect_err("reference rejected");
+    assert!(matches!(err, Error::InvalidParams(_)));
+}
+
+/// The `ws.agent.getMessageBlock` MCP binding pages a large block in
+/// 100 KiB pieces (a larger `maxBytes` is clamped down): the agent loops on `{ offset: nextOffset }` until `nextOffset` is null and
+/// reassembles the exact stored text (`WorkspaceMcpServer` dispatch ->
+/// `Services` -> `Store`).
+#[intent_test_macros::daemon_test]
+async fn mcp_get_message_block_binding_pages_with_next_offset() {
+    let (_t, svc, ws) = setup().await;
+    svc.settings_update(json!([{ "path": "workspaceApi.toonOutput", "value": false }]))
+        .await
+        .expect("disable toonOutput");
+    let id = create_agent(&svc, &ws, "BindingPages").await;
+    let text = (0..120_000).fold(String::new(), |mut out, i| {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "{i}");
+        out
+    });
+    let row = svc
+        .store()
+        .append_agent_message(
+            &id,
+            "assistant",
+            &json!([{ "type": "text", "id": "big", "text": text }]),
+            &now_iso(),
+        )
+        .await
+        .expect("append");
+    let api: Arc<dyn WorkspaceApi> = Arc::new(svc.clone());
+    let caller = AgentId::from("agent-00000000-0000-0000-0000-00000000pager");
+    let server = WorkspaceMcpServer::new(api, ws.clone()).with_caller_agent_id(Some(caller));
+    let code = format!(
+        "let joined = ''; let offset = null; let pages = 0; let maxPage = 0;
+         for (;;) {{
+           const r = await ws.agent.getMessageBlock('{id}', '{mid}', 'big', {{ offset, maxBytes: 480000 }});
+           joined += r.block[r.field]; pages += 1;
+           maxPage = Math.max(maxPage, JSON.stringify(r.block).length);
+           if (r.nextOffset === null) break;
+           offset = r.nextOffset;
+         }}
+         const lines = joined.split('\\n');
+         return {{ pages, maxPage, length: joined.length, lines: lines.length, last: lines[lines.length - 2] }};",
+        mid = row.id,
+    );
+    let resp = server
+        .handle_message(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_api",
+                "arguments": { "code": code, "summary": "page a block" }
+            }
+        }))
+        .await
+        .expect("mcp response");
+    let out = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool text");
+    let parsed: serde_json::Value =
+        serde_json::from_str(out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert!(parsed["pages"].as_u64().unwrap() > 1, "{parsed}");
+    let max_page = parsed["maxPage"].as_u64().unwrap();
+    assert!(
+        max_page <= intent_core::AGENT_MESSAGE_BLOCK_MAX_BYTES && max_page > 90_000,
+        "agent pages are clamped to 100 KiB even when 480,000 is asked: {parsed}"
+    );
+    assert_eq!(parsed["length"], json!(text.len()), "{parsed}");
+    assert_eq!(parsed["lines"], json!(120_001), "{parsed}");
+    assert_eq!(parsed["last"], "119999", "{parsed}");
+}
+
+/// Paged `agent.list` (§5.5 "Paged agent lists and queues"): following
+/// `nextToken` walks every session of the selection exactly once, in
+/// `(createdAt, id)` order, and a malformed token is rejected.
+#[tokio::test]
+async fn agent_list_pages_walk_every_row_once() {
+    let (_t, svc, ws) = setup().await;
+    for i in 0..5 {
+        create_agent(&svc, &ws, &format!("Paged{i}")).await;
+    }
+    let mut expected: Vec<(String, String)> = svc
+        .agent_list_op(ws.clone())
+        .await
+        .expect("whole list")
+        .into_iter()
+        .map(|a| (a.created_at, a.id.0))
+        .collect();
+    expected.sort();
+    let mut seen = Vec::new();
+    let mut token = None;
+    loop {
+        let page = svc
+            .agent_list_page_op(
+                ws.clone(),
+                intent_core::AgentListSelection::Active,
+                Some(2),
+                token.clone(),
+            )
+            .await
+            .expect("page");
+        assert!(page.agents.len() <= 2);
+        seen.extend(page.agents.into_iter().map(|a| (a.created_at, a.id.0)));
+        match page.next_token {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen, expected, "every row once, in order");
+    let err = svc
+        .agent_list_page_op(
+            ws,
+            intent_core::AgentListSelection::Active,
+            None,
+            Some("garbage".into()),
+        )
+        .await
+        .expect_err("bad token");
+    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
 }

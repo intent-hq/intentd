@@ -488,7 +488,9 @@ mod tests {
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     };
 
-    const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+    fn wait_budget() -> Duration {
+        intentd_test_support::test_timeout(Duration::from_secs(15))
+    }
     const FIXTURE_MODE: &str = "INTENTD_WINDOWS_PROBE_FIXTURE_MODE";
     const FIXTURE_ADDRESS: &str = "INTENTD_WINDOWS_PROBE_FIXTURE_ADDRESS";
     const ARGUMENT: &str = r#"spaces \"quoted\" λ & | < > trailing\"#;
@@ -640,7 +642,7 @@ mod tests {
         }
 
         async fn wait_stopped(&self) {
-            timeout(TEST_TIMEOUT, async {
+            timeout(wait_budget(), async {
                 while !self.stopped() {
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
@@ -668,13 +670,13 @@ mod tests {
 
     impl Control {
         async fn accept(listener: &TcpListener) -> Self {
-            let (socket, _) = timeout(TEST_TIMEOUT, listener.accept())
+            let (socket, _) = timeout(wait_budget(), listener.accept())
                 .await
                 .unwrap()
                 .unwrap();
             let mut stream = BufReader::new(socket);
             let mut pid = String::new();
-            timeout(TEST_TIMEOUT, stream.read_line(&mut pid))
+            timeout(wait_budget(), stream.read_line(&mut pid))
                 .await
                 .unwrap()
                 .unwrap();
@@ -701,7 +703,7 @@ mod tests {
         omitted_pid: Option<u32>,
     ) -> JOBOBJECT_BASIC_ACCOUNTING_INFORMATION {
         let mut omitted_seen = false;
-        let result = timeout(TEST_TIMEOUT, async {
+        let result = timeout(wait_budget(), async {
             loop {
                 if let Some(omitted) = omitted_pid {
                     for _ in 0..MESSAGE_BATCH {
@@ -794,7 +796,7 @@ mod tests {
             leader = Control::accept(&listener) => leader,
             status = started.ownership.wait() => {
                 let mut stderr = String::new();
-                timeout(TEST_TIMEOUT, started.stderr.as_mut().unwrap().read_to_string(&mut stderr))
+                timeout(wait_budget(), started.stderr.as_mut().unwrap().read_to_string(&mut stderr))
                     .await.unwrap().unwrap();
                 panic!("conversation fixture exited before readiness: {status:?}; {stderr}");
             }
@@ -806,7 +808,7 @@ mod tests {
             .unwrap();
         input.flush().await.unwrap();
         drop(input);
-        let status = timeout(TEST_TIMEOUT, started.ownership.wait())
+        let status = timeout(wait_budget(), started.ownership.wait())
             .await
             .unwrap()
             .unwrap();
@@ -815,14 +817,14 @@ mod tests {
         let mut out = String::new();
         let mut err = String::new();
         timeout(
-            TEST_TIMEOUT,
+            wait_budget(),
             started.stdout.as_mut().unwrap().read_to_string(&mut out),
         )
         .await
         .unwrap()
         .unwrap();
         timeout(
-            TEST_TIMEOUT,
+            wait_budget(),
             started.stderr.as_mut().unwrap().read_to_string(&mut err),
         )
         .await
@@ -883,7 +885,7 @@ mod tests {
         let (mut started, mut leader, descendant) = tree(mode).await;
         leader.exit(17).await;
         assert_eq!(
-            timeout(TEST_TIMEOUT, started.ownership.wait())
+            timeout(wait_budget(), started.ownership.wait())
                 .await
                 .unwrap()
                 .unwrap()
@@ -901,30 +903,33 @@ mod tests {
         let mut output = Vec::new();
         let mut error_output = Vec::new();
         if mode == "tree_closed" {
-            timeout(TEST_TIMEOUT, stdout.read_to_end(&mut output))
+            timeout(wait_budget(), stdout.read_to_end(&mut output))
                 .await
                 .unwrap()
                 .unwrap();
-            timeout(TEST_TIMEOUT, stderr.read_to_end(&mut error_output))
+            timeout(wait_budget(), stderr.read_to_end(&mut error_output))
                 .await
                 .unwrap()
                 .unwrap();
         } else {
             assert!(
-                timeout(Duration::from_millis(50), stdout.read_to_end(&mut output))
-                    .await
-                    .is_err(),
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_millis(50)),
+                    stdout.read_to_end(&mut output)
+                )
+                .await
+                .is_err(),
                 "live descendant holds inherited stdout after leader exit"
             );
         }
         started.ownership.cleanup().await.unwrap();
         // No grace period after cleanup: success itself promises termination.
         assert!(descendant.process.stopped());
-        timeout(TEST_TIMEOUT, stdout.read_to_end(&mut output))
+        timeout(wait_budget(), stdout.read_to_end(&mut output))
             .await
             .unwrap()
             .unwrap();
-        timeout(TEST_TIMEOUT, stderr.read_to_end(&mut error_output))
+        timeout(wait_budget(), stderr.read_to_end(&mut error_output))
             .await
             .unwrap()
             .unwrap();
@@ -949,7 +954,7 @@ mod tests {
     async fn dropping_ownership_after_leader_exit_kills_orphaned_descendant() {
         let (mut started, mut leader, descendant) = tree("tree_closed").await;
         leader.exit(0).await;
-        assert!(timeout(TEST_TIMEOUT, started.ownership.wait())
+        assert!(timeout(wait_budget(), started.ownership.wait())
             .await
             .unwrap()
             .unwrap()
@@ -967,13 +972,13 @@ mod tests {
             .unwrap();
         let mut leader = Control::accept(&listener).await;
         let mut reply = String::new();
-        timeout(TEST_TIMEOUT, leader.stream.read_line(&mut reply))
+        timeout(wait_budget(), leader.stream.read_line(&mut reply))
             .await
             .unwrap()
             .unwrap();
         assert_eq!(reply.trim(), "breakaway-denied");
         leader.exit(0).await;
-        assert!(timeout(TEST_TIMEOUT, started.ownership.wait())
+        assert!(timeout(wait_budget(), started.ownership.wait())
             .await
             .unwrap()
             .unwrap()
@@ -984,9 +989,12 @@ mod tests {
     #[tokio::test]
     async fn leader_deadline_preserves_ownership_until_confirmed_cleanup() {
         let (mut started, leader, descendant) = tree("tree_inherit").await;
-        assert!(timeout(Duration::from_millis(25), started.ownership.wait())
-            .await
-            .is_err());
+        assert!(timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(25)),
+            started.ownership.wait()
+        )
+        .await
+        .is_err());
         assert!(!leader.process.stopped());
         assert!(!descendant.process.stopped());
         started.ownership.cleanup().await.unwrap();
@@ -1039,7 +1047,7 @@ mod tests {
         let mut leader = Control::accept(&listener).await;
         let descendant = Control::accept(&listener).await;
         leader.exit(0).await;
-        assert!(timeout(TEST_TIMEOUT, process.wait())
+        assert!(timeout(wait_budget(), process.wait())
             .await
             .unwrap()
             .unwrap()

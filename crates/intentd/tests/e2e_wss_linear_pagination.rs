@@ -9,7 +9,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -297,7 +297,7 @@ async fn boot() -> Fixture {
 
     let engine = Arc::new(RecordingEngine::default());
     let services = Arc::new(
-        Services::new(store)
+        Services::new_isolated(store)
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone())
             .with_linear_engine(engine.clone()),
@@ -441,10 +441,15 @@ async fn search_issues_next_token_round_trips() {
 
         let calls = fx.engine.search_calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], ("login bug".to_string(), None, None));
+        // No wire `limit`: the daemon sends its default page size (50).
+        assert_eq!(calls[0], ("login bug".to_string(), Some(50), None));
         assert_eq!(
             calls[1],
-            ("login bug".to_string(), None, Some("cursor-2".to_string()))
+            (
+                "login bug".to_string(),
+                Some(50),
+                Some("cursor-2".to_string())
+            )
         );
     }
 }

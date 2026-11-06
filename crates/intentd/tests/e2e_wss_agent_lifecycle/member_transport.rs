@@ -237,30 +237,36 @@ async fn collect_tool_output(events: &mut common::TlsWs, kind: &str, id: &str, m
     use base64::Engine as _;
     let mut output = Vec::new();
     let mut exited = false;
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while !exited || !String::from_utf8_lossy(&output).contains(marker) {
-            match events.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let frame: Value = serde_json::from_str(&text).unwrap();
-                    let event = &frame["params"]["event"];
-                    if event["data"][format!("{kind}Id")] != id {
-                        continue;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while !exited || !String::from_utf8_lossy(&output).contains(marker) {
+                match events.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        let event = &frame["params"]["event"];
+                        if event["data"][format!("{kind}Id")] != id {
+                            continue;
+                        }
+                        if let Some(chunk) = event["data"]["chunk"].as_str() {
+                            output.extend(
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(chunk)
+                                    .unwrap(),
+                            );
+                        }
+                        exited |= event["type"] == "terminal:exit"
+                            || (event["type"] == "script:state"
+                                && event["data"]["status"] == "exited");
                     }
-                    if let Some(chunk) = event["data"]["chunk"].as_str() {
-                        output.extend(
-                            base64::engine::general_purpose::STANDARD
-                                .decode(chunk)
-                                .unwrap(),
-                        );
+                    Some(Ok(Message::Ping(bytes))) => {
+                        events.send(Message::Pong(bytes)).await.unwrap();
                     }
-                    exited |= event["type"] == "terminal:exit"
-                        || (event["type"] == "script:state" && event["data"]["status"] == "exited");
+                    other => panic!("live {kind} output: {other:?}"),
                 }
-                Some(Ok(Message::Ping(bytes))) => events.send(Message::Pong(bytes)).await.unwrap(),
-                other => panic!("live {kind} output: {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap_or_else(|_| {
         panic!(

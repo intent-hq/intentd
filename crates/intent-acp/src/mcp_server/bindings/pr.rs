@@ -4,13 +4,17 @@
 //! PR state) plus the centralized PR-monitor surface — `pr.monitor` /
 //! `pr.unmonitor` / `pr.monitors`, gated by `agentFeatures.prMonitor`. Every
 //! other PR operation (create, view, comment, review threads, branch update,
-//! merge) is intentionally unbound — agents use the `gh` CLI instead. The
+//! merge) is intentionally unbound — agents use the forge-appropriate CLI. The
 //! bindings only peel arguments and forward the trait's `serde_json::Value`
 //! result unchanged.
 //!
 //! `ws.mr` aliases the same object, arguments and results as `ws.pr`; the
 //! spelling never selects a provider. Both exist independently of remotes,
-//! and both currently use the same GitHub observation backend.
+//! and both resolve the same selected project or explicit address.
+//!
+//! Addressed arguments use the dedicated service seam and original-caller
+//! admission. Qualified recipient activation remains disabled in ordinary product wiring; help describes the support requirement without
+//! enabling it.
 //!
 //! Monitors are agent-owned, so `pr.monitor` / `pr.unmonitor` / `pr.monitors`
 //! require an agent caller context (mirroring `ws.hook.schedule`): the FE
@@ -18,6 +22,7 @@
 
 use std::sync::Arc;
 
+use intent_core::review_monitor::ReviewMonitorRequest;
 use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
 use serde_json::Value;
 
@@ -91,11 +96,29 @@ fn opt_repo(args: &Value) -> Result<Option<String>, String> {
     }
 }
 
+/// New selectors must reach the addressed seam, never the legacy fallback.
+/// Keep legacy validation and ignored extension arguments unchanged when neither
+/// selector is present. The service still owns recipient support and admission.
+fn addressed(args: &Value) -> Result<Option<ReviewMonitorRequest>, String> {
+    if args.get("gitRootId").is_none() && args.get("target").is_none() {
+        return Ok(None);
+    }
+    serde_json::from_value(args.clone())
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 async fn snapshot(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
+    if let Some(request) = addressed(args)? {
+        return api
+            .pr_state_addressed(ws.clone(), request)
+            .await
+            .map_err(map_err);
+    }
     let pr_number = req_pr_number(args)?;
     let repo = opt_repo(args)?;
     api.pr_state(ws.clone(), pr_number, repo)
@@ -114,6 +137,12 @@ async fn monitor(
             "pr.monitor requires an agent caller context to attribute ownership".to_string(),
         );
     };
+    if let Some(request) = addressed(args)? {
+        return api
+            .pr_monitor_start_addressed(ws.clone(), owner.clone(), request)
+            .await
+            .map_err(map_err);
+    }
     let pr_number = req_pr_number(args)?;
     let repo = opt_repo(args)?;
     api.pr_monitor_start(ws.clone(), owner.clone(), pr_number, repo)
@@ -132,6 +161,12 @@ async fn unmonitor(
             "pr.unmonitor requires an agent caller context to verify monitor ownership".to_string(),
         );
     };
+    if let Some(request) = addressed(args)? {
+        return api
+            .pr_monitor_stop_addressed(ws.clone(), owner.clone(), request)
+            .await
+            .map_err(map_err);
+    }
     let pr_number = req_pr_number(args)?;
     let repo = opt_repo(args)?;
     api.pr_monitor_stop(ws.clone(), owner.clone(), pr_number, repo)
@@ -292,6 +327,28 @@ mod tests {
             error: None,
             retired: false,
         })
+    }
+
+    #[tokio::test]
+    async fn addressed_aliases_never_silently_call_a_legacy_backend() {
+        let api = recording_api(json!({"legacy":true}));
+        let server = bridge(api.clone(), true, true);
+        for namespace in ["pr", "mr"] {
+            for method in ["snapshot", "monitor", "unmonitor"] {
+                let result = call(
+                    &server,
+                    &format!(
+                        "return await ws.{namespace}.{method}(7,{{gitRootId:'registered-root'}});"
+                    ),
+                )
+                .await;
+                assert_eq!(result["isError"], true, "{result}");
+                assert!(result
+                    .to_string()
+                    .contains("Addressed review monitoring unavailable"));
+            }
+        }
+        assert!(api.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

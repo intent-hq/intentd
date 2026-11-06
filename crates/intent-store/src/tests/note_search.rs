@@ -76,7 +76,15 @@ async fn note_fts_lifecycle_and_composite_identity() {
     first.title = "Newtitle".into();
     first.content = "shared freshbody".into();
     first.tags = vec!["unicorn".into(), "café".into()];
-    store.update_note(&first).await.unwrap();
+    store
+        .update_note(
+            &store
+                .lock_note_content(&first.workspace_id, &first.id)
+                .await,
+            &first,
+        )
+        .await
+        .unwrap();
     assert!(hits(&store, "oldtitle").await.is_empty());
     assert_eq!(hits(&store, "oldbody").await[0].workspace_id, "b");
     for query in ["newtitle", "freshbody", "unicorn", "cafe"] {
@@ -89,7 +97,15 @@ async fn note_fts_lifecycle_and_composite_identity() {
     first.tags = vec!["narwhal".into()];
     // Metadata-only writes must not reindex an old caller's body.
     first.content = "stale caller body".into();
-    store.update_note_metadata(&first).await.unwrap();
+    store
+        .update_note_metadata(
+            &store
+                .lock_note_content(&first.workspace_id, &first.id)
+                .await,
+            &first,
+        )
+        .await
+        .unwrap();
     assert!(hits(&store, "unicorn").await.is_empty());
     assert_eq!(hits(&store, "narwhal").await.len(), 1);
     assert_eq!(hits(&store, "freshbody").await.len(), 1);
@@ -99,10 +115,11 @@ async fn note_fts_lifecycle_and_composite_identity() {
     store.delete_workspace(&b).await.unwrap();
     assert!(hits(&store, "shared").await.is_empty());
     for table in ["note_fts", "note_search_ctx"] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(store.read_pool())
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap();
         assert_eq!(count, 0);
     }
 }
@@ -117,7 +134,10 @@ async fn note_fts_migration_backfills_and_rolls_back_atomically() {
     let mut n = note(&store, &a, "spec", "Backfilltitle", "backfillbody").await;
     n.tags = vec!["backfilltag".into()];
     n.is_archived = true;
-    store.update_note(&n).await.unwrap();
+    store
+        .update_note(&store.lock_note_content(&n.workspace_id, &n.id).await, &n)
+        .await
+        .unwrap();
     note(&store, &b, "spec", "Other", "backfillbody").await;
     let sql = include_str!("../../migrations/0141_note_fts.sql");
     // A failed migration transaction must leave original notes intact and no
@@ -159,7 +179,15 @@ async fn note_fts_permissions_scope_and_archive_filter_before_top_n() {
     }
     let mut archived = note(&store, &allowed, "archived", "needle", "needle").await;
     archived.is_archived = true;
-    store.update_note_metadata(&archived).await.unwrap();
+    store
+        .update_note_metadata(
+            &store
+                .lock_note_content(&archived.workspace_id, &archived.id)
+                .await,
+            &archived,
+        )
+        .await
+        .unwrap();
     note(&store, &allowed, "visible", "Other", "needle").await;
     let permit = [allowed.clone()];
     let mut options = NoteFtsOptions {
@@ -193,7 +221,15 @@ async fn note_fts_permissions_scope_and_archive_filter_before_top_n() {
     options.workspace_id = Some(&allowed);
     options.include_archived = false;
     archived.is_archived = false;
-    store.update_note_metadata(&archived).await.unwrap();
+    store
+        .update_note_metadata(
+            &store
+                .lock_note_content(&archived.workspace_id, &archived.id)
+                .await,
+            &archived,
+        )
+        .await
+        .unwrap();
     assert_eq!(
         store
             .search_notes_fts("needle", &options)
@@ -239,7 +275,13 @@ async fn note_fts_ranking_weights_and_stable_ties() {
     note(&store, &a, "body", "padding", "needle").await;
     let mut tag = note(&store, &a, "tag", "padding", "").await;
     tag.tags = vec!["needle".into()];
-    store.update_note_metadata(&tag).await.unwrap();
+    store
+        .update_note_metadata(
+            &store.lock_note_content(&tag.workspace_id, &tag.id).await,
+            &tag,
+        )
+        .await
+        .unwrap();
     let ranked = hits(&store, "needle").await;
     assert_eq!(
         ranked
@@ -255,7 +297,15 @@ async fn note_fts_ranking_weights_and_stable_ties() {
     note(&store, &a, "a", "same", "tie").await;
     let mut newest = note(&store, &b, "new", "same", "tie").await;
     newest.updated_at = "2026-02-01T00:00:00Z".into();
-    store.update_note_metadata(&newest).await.unwrap();
+    store
+        .update_note_metadata(
+            &store
+                .lock_note_content(&newest.workspace_id, &newest.id)
+                .await,
+            &newest,
+        )
+        .await
+        .unwrap();
     let options = NoteFtsOptions {
         limit: Some(2),
         ..Default::default()
@@ -414,7 +464,15 @@ async fn note_fts_survives_compaction_and_note_rowid_reassignment() {
     assert_eq!(hits(&store, "survivorword").await[0].note_id, "spec");
     assert!(hits(&store, "deletedword").await.is_empty());
     survivor.content = "aftercompaction".into();
-    store.update_note(&survivor).await.unwrap();
+    store
+        .update_note(
+            &store
+                .lock_note_content(&survivor.workspace_id, &survivor.id)
+                .await,
+            &survivor,
+        )
+        .await
+        .unwrap();
     assert!(hits(&store, "survivorword").await.is_empty());
     assert_eq!(hits(&store, "aftercompaction").await.len(), 1);
     note(&store, &ws, "later", "Later", "laterword").await;
@@ -429,21 +487,40 @@ async fn note_fts_query_plan_hydrates_only_winners() {
     let store = Store::open(&tmp.path).await.unwrap();
     let ws = workspace(&store, "plan", false).await;
     let allowed = [ws.clone()];
-    for filtered in [false, true] {
+    let cursor = crate::NoteFtsCursor {
+        rank: -1.0,
+        updated_at: "2026-01-01T00:00:00Z".into(),
+        workspace_id: "plan".into(),
+        note_id: "n".into(),
+    };
+    for (filtered, keyset) in [(false, false), (true, false), (false, true), (true, true)] {
         let options = NoteFtsOptions {
             workspace_id: filtered.then_some(&ws),
             allowed_workspace_ids: filtered.then_some(&allowed[..]),
             include_archived: !filtered,
             limit: Some(10),
+            after: keyset.then_some(&cursor),
             ..Default::default()
         };
         let sql = format!(
             "EXPLAIN QUERY PLAN {}",
             crate::note_search_repo::search_notes_fts_sql(&options)
         );
-        let mut query = sqlx::query(&sql).bind("plan").bind("needle");
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind("plan")
+            .bind("needle");
         if filtered {
             query = query.bind("plan").bind("[\"plan\"]");
+        }
+        if keyset {
+            query = query
+                .bind(-1.0_f64)
+                .bind(-1.0_f64)
+                .bind("2026-01-01T00:00:00Z")
+                .bind("2026-01-01T00:00:00Z")
+                .bind("plan")
+                .bind("plan")
+                .bind("n");
         }
         let rows = query
             .bind(10_i64)
@@ -452,7 +529,7 @@ async fn note_fts_query_plan_hydrates_only_winners() {
             .unwrap();
         let plan: Vec<String> = rows.iter().map(|row| row.get("detail")).collect();
         let joined = plan.join("\n");
-        println!("filtered={filtered}\n{joined}");
+        println!("filtered={filtered} keyset={keyset}\n{joined}");
         assert!(
             plan.iter()
                 .any(|d| d.contains("note_fts VIRTUAL TABLE INDEX") && d.contains('M')),
@@ -553,4 +630,119 @@ async fn bench_note_fts() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn note_fts_per_workspace_limit_applies_before_the_global_limit() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let strong = workspace(&store, "strong", false).await;
+    let weak = workspace(&store, "weak", false).await;
+    for i in 0..5 {
+        note(&store, &strong, &format!("s{i}"), "Needle", "needle needle").await;
+    }
+    note(
+        &store,
+        &weak,
+        "w0",
+        "Other",
+        "a long body that mentions the needle once among many words",
+    )
+    .await;
+
+    // Without the cap, the strong workspace fills a small global limit.
+    let mut options = NoteFtsOptions {
+        limit: Some(3),
+        ..Default::default()
+    };
+    let got = store.search_notes_fts("needle", &options).await.unwrap();
+    assert!(got.iter().all(|h| h.workspace_id == "strong"));
+
+    options.per_workspace_limit = Some(2);
+    let got = store.search_notes_fts("needle", &options).await.unwrap();
+    let pairs: Vec<(&str, &str)> = got
+        .iter()
+        .map(|h| (h.workspace_id.as_str(), h.note_id.as_str()))
+        .collect();
+    assert_eq!(pairs.len(), 3, "{pairs:?}");
+    assert_eq!(pairs.iter().filter(|(w, _)| *w == "strong").count(), 2);
+    assert!(pairs.contains(&("weak", "w0")), "{pairs:?}");
+    assert!(got.windows(2).all(|p| p[0].rank <= p[1].rank));
+
+    options.limit = None;
+    assert_eq!(
+        store
+            .search_notes_fts("needle", &options)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    options.per_workspace_limit = Some(0);
+    assert!(store
+        .search_notes_fts("needle", &options)
+        .await
+        .unwrap()
+        .is_empty());
+    options.per_workspace_limit = Some(-1);
+    assert!(store.search_notes_fts("needle", &options).await.is_err());
+}
+
+#[tokio::test]
+async fn note_fts_keyset_pages_the_ranked_order_without_gaps() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let a = workspace(&store, "a", false).await;
+    let b = workspace(&store, "b", false).await;
+    for i in 0..7 {
+        note(&store, &a, &format!("a{i}"), "Needle", "needle").await;
+        note(&store, &b, &format!("b{i}"), "Other", "needle body").await;
+    }
+    let key = |h: &NoteFtsMatch| (h.workspace_id.clone(), h.note_id.clone());
+    for per_workspace_limit in [None, Some(5)] {
+        let all: Vec<_> = store
+            .search_notes_fts(
+                "needle",
+                &NoteFtsOptions {
+                    per_workspace_limit,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(key)
+            .collect();
+        let mut paged = Vec::new();
+        let mut after: Option<crate::NoteFtsCursor> = None;
+        loop {
+            let options = NoteFtsOptions {
+                per_workspace_limit,
+                limit: Some(3),
+                after: after.as_ref(),
+                ..Default::default()
+            };
+            let page = store.search_notes_fts("needle", &options).await.unwrap();
+            let Some(last) = page.last() else { break };
+            after = Some(crate::NoteFtsCursor {
+                rank: last.rank,
+                updated_at: last.updated_at.clone(),
+                workspace_id: last.workspace_id.clone(),
+                note_id: last.note_id.clone(),
+            });
+            paged.extend(page.iter().map(key));
+        }
+        assert_eq!(paged, all, "per_workspace_limit={per_workspace_limit:?}");
+    }
+    let positions = store
+        .note_fts_positions(
+            "needle",
+            &NoteFtsOptions::default(),
+            &[("a".into(), "a3".into()), ("b".into(), "gone".into())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].note_id, "a3");
+    assert!(positions[0].rank < 0.0);
 }

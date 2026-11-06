@@ -72,6 +72,9 @@ const CREDENTIAL_ENV_EXACT: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "XAI_API_KEY",
+    // Cursor CLI API key. Exact name only: `CURSOR_CONFIG_DIR` /
+    // `CURSOR_DATA_DIR` select config and state folders, not credentials.
+    "CURSOR_API_KEY",
     "AWS_PROFILE",
     "AWS_REGION",
     "AWS_ACCESS_KEY_ID",
@@ -188,6 +191,33 @@ fn resolve_login_shell(
 /// non-UTF-8 `pw_shell`.
 #[cfg(unix)]
 fn user_db_shell() -> Option<String> {
+    user_db_field(|pwd| pwd.pw_shell)
+}
+
+#[cfg(not(unix))]
+fn user_db_shell() -> Option<String> {
+    None
+}
+
+/// The current user's home directory from the user database (`pw_dir` via
+/// `getpwuid_r`), independent of `$HOME`. `None` on lookup failure, a null,
+/// empty or non-UTF-8 entry, and on non-unix targets.
+#[cfg(unix)]
+#[must_use]
+pub fn user_db_home() -> Option<std::path::PathBuf> {
+    user_db_field(|pwd| pwd.pw_dir).map(std::path::PathBuf::from)
+}
+
+#[cfg(not(unix))]
+#[must_use]
+pub fn user_db_home() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Read one string field of the current user's `getpwuid_r` entry. Returns
+/// `None` on lookup failure or a null, empty, or non-UTF-8 field.
+#[cfg(unix)]
+fn user_db_field(field: fn(&libc::passwd) -> *mut libc::c_char) -> Option<String> {
     use std::ffi::CStr;
 
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
@@ -213,21 +243,17 @@ fn user_db_shell() -> Option<String> {
         }
         // On success `result` points at `pwd`, which getpwuid_r filled in, so
         // read the field from `pwd` rather than dereferencing the raw pointer.
-        if pwd.pw_shell.is_null() {
+        let value = field(&pwd);
+        if value.is_null() {
             return None;
         }
-        let shell = unsafe { CStr::from_ptr(pwd.pw_shell) };
-        return shell
+        let value = unsafe { CStr::from_ptr(value) };
+        return value
             .to_str()
             .ok()
-            .filter(|shell| !shell.is_empty())
+            .filter(|value| !value.is_empty())
             .map(str::to_string);
     }
-}
-
-#[cfg(not(unix))]
-fn user_db_shell() -> Option<String> {
-    None
 }
 
 /// Helper to attempt the login-shell capture with specific shell flags.
@@ -1209,9 +1235,10 @@ mod tests {
         let script = format!(
             "#!/bin/sh\nif [ \"$1\" = \"-ilc\" ]; then\n  printf '{noise}'\n  printf '__INTENT_PATH_S__/large/bin__INTENT_PATH_E__'\nfi\n"
         );
-        let start = std::time::Instant::now();
+        // The sentinel pair follows the noise, so it is read only if the
+        // pipe is drained while the shell runs: a deadlocked capture is cut
+        // off by its timeout before the sentinels and extracts nothing.
         let dirs = write_and_capture(&fake_shell, &script).dirs;
-        let elapsed = start.elapsed();
         fs::remove_file(&fake_shell).ok();
 
         assert_eq!(
@@ -1220,10 +1247,6 @@ mod tests {
             "Should extract PATH even with >64KB of noise"
         );
         assert_eq!(dirs[0], PathBuf::from("/large/bin"));
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "Should complete well within timeout (no deadlock), took {elapsed:?}"
-        );
     }
 
     #[test]
@@ -1242,6 +1265,9 @@ mod tests {
         assert!(!is_credential_env_allow_listed("AUGGIE"));
         assert!(!is_credential_env_allow_listed("PIN"));
         assert!(!is_credential_env_allow_listed("HOME"));
+        assert!(is_credential_env_allow_listed("CURSOR_API_KEY"));
+        assert!(!is_credential_env_allow_listed("CURSOR_CONFIG_DIR"));
+        assert!(!is_credential_env_allow_listed("CURSOR_DATA_DIR"));
         assert!(!is_credential_env_allow_listed("PATH"));
     }
 

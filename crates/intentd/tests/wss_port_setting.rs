@@ -3,7 +3,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 // Port setting tests don't need actual TCP listeners
 use std::path::PathBuf;
@@ -160,10 +160,13 @@ async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
 
 async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     let mut line = String::new();
-    let n = timeout(Duration::from_secs(2), reader.read_line(&mut line))
-        .await
-        .expect("timed out waiting for a frame")
-        .expect("read failed");
+    let n = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("timed out waiting for a frame")
+    .expect("read failed");
     assert!(n > 0, "connection closed unexpectedly");
     serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
 }
@@ -203,7 +206,7 @@ async fn port_setting_crud() {
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());
@@ -284,7 +287,7 @@ async fn port_change_restarts_listener() {
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());
@@ -349,7 +352,7 @@ async fn port_bind_failure_friendly_error() {
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());
@@ -439,7 +442,7 @@ async fn setup_uds(
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());

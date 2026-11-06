@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+use futures_util::FutureExt;
+
 use intent_core::{
     HistoricalTargetSource, RepositoryRootId, RepositoryRootKind, SavedReviewSelection, WorkspaceId,
 };
@@ -357,14 +359,12 @@ fn classify(
     }
     SelectionComparison::Write(current)
 }
-fn settled(
+async fn settled(
     lifecycle: LifecycleWrite,
     result: RepositorySelectionWriteResult,
     persistence: RepositorySelectionPersistence,
 ) -> RepositorySelectionWriteOutcome {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lifecycle.settle()))
-        .map(|()| result)
-        .map_err(|_| Error::Internal("repository selection settlement failed".into()));
+    let result = settle_selection(lifecycle).await.map(|()| result);
     RepositorySelectionWriteOutcome {
         result,
         persistence,
@@ -395,10 +395,17 @@ impl SelectionAdmission<'_> {
             == *self.authority)
     }
 }
-fn settled_denial(lifecycle: LifecycleWrite, error: Error) -> RepositorySelectionWriteOutcome {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lifecycle.settle()))
-        .map_err(|_| Error::Internal("repository selection settlement failed".into()))
-        .and(Err(error));
+async fn settle_selection(lifecycle: LifecycleWrite) -> Result<()> {
+    std::panic::AssertUnwindSafe(lifecycle.settle_after_retirement())
+        .catch_unwind()
+        .await
+        .map_err(|_| Error::Internal("repository selection settlement failed".into()))?
+}
+async fn settled_denial(
+    lifecycle: LifecycleWrite,
+    error: Error,
+) -> RepositorySelectionWriteOutcome {
+    let result = settle_selection(lifecycle).await.and(Err(error));
     RepositorySelectionWriteOutcome {
         result,
         persistence: RepositorySelectionPersistence::NoEffect,
@@ -514,14 +521,10 @@ impl Store {
         };
         read.commit().await.map_err(sql_error)?;
         if !authority_current {
-            return Ok(settled_denial(lifecycle, admission_denied()));
+            return Ok(settled_denial(lifecycle, admission_denied()).await);
         }
         if let SelectionComparison::Finished(result) = classify(current, original, change) {
-            return Ok(settled(
-                lifecycle,
-                result,
-                RepositorySelectionPersistence::NoEffect,
-            ));
+            return Ok(settled(lifecycle, result, RepositorySelectionPersistence::NoEffect).await);
         }
         lifecycle.begin_selection_change(&original.root)?;
         *persistence = RepositorySelectionPersistence::Unknown;
@@ -532,18 +535,16 @@ impl Store {
             if !admission.current(original, &mut tx).await? {
                 tx.rollback().await.map_err(sql_error)?;
                 *persistence = RepositorySelectionPersistence::NoEffect;
-                return Ok(settled_denial(lifecycle, admission_denied()));
+                return Ok(settled_denial(lifecycle, admission_denied()).await);
             }
         }
         let current = match classify(current, original, change) {
             SelectionComparison::Write(current) => current,
             SelectionComparison::Finished(result) => {
                 tx.rollback().await.map_err(sql_error)?;
-                return Ok(settled(
-                    lifecycle,
-                    result,
-                    RepositorySelectionPersistence::NoEffect,
-                ));
+                return Ok(
+                    settled(lifecycle, result, RepositorySelectionPersistence::NoEffect).await,
+                );
             }
         };
         let state = current.state.as_ref().ok_or_else(error)?;
@@ -558,7 +559,7 @@ impl Store {
             if let Err(denied) = admission.admit.take().ok_or_else(error)?() {
                 tx.rollback().await.map_err(sql_error)?;
                 *persistence = RepositorySelectionPersistence::NoEffect;
-                return Ok(settled_denial(lifecycle, denied));
+                return Ok(settled_denial(lifecycle, denied).await);
             }
         }
         let changed=sqlx::query("UPDATE repository_selection_state SET selection_revision=?,choice_incarnation=root_incarnation,choice_mode=?,remote_name=?,historical_source=NULL,historical_record_id=NULL WHERE workspace_id=? AND root_kind=? AND root_id=? AND root_incarnation=? AND selection_revision=?")
@@ -578,7 +579,8 @@ impl Store {
             lifecycle,
             RepositorySelectionWriteResult::Applied(applied),
             committed,
-        ))
+        )
+        .await)
     }
 }
 

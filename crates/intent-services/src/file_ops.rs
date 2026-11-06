@@ -1,7 +1,8 @@
 //! Wire-policy + filesystem glue for the `file.*` methods (PROTOCOL §5.10).
 //!
 //! Ports the TS `buildFileApi` / `LocalFileSystemAdapter` semantics: the
-//! workspace root is `worktreePath || repositoryPath`; an unset/unknown root
+//! workspace root is `worktreePath || repositoryPath` (the Assistant
+//! `__chief__` workspace uses the daemon's chief-cwd dir); an unset/unknown root
 //! (empty string) is rejected rather than falling back to the process CWD, so a
 //! bogus `workspaceId` cannot escape workspace containment
 //! (intent-hq/intent#3839). Every path is
@@ -35,30 +36,56 @@ pub(crate) const ATTACHMENTS_DIR: &str = ".intent/attachments";
 /// `worktreePath || repositoryPath`, else empty — which [`is_within`] then
 /// fails closed instead of falling back to CWD-relative resolution
 /// (intent-hq/intent#3839).
-pub(crate) fn workspace_root(ws: &Workspace) -> String {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn workspace_root(ws: &Workspace) -> String {
     git_ops::worktree_path(ws)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
+/// The Assistant (`__chief__`) workspace's file root: the configured
+/// chief-cwd directory, created owner-only (0700) on demand. Chief has no
+/// worktree or repository, so without this its `file.*` calls had no root
+/// (intent-hq/intent#8644). An unconfigured root or a failed create yields
+/// an empty root, which [`is_within`] fails closed — never the process CWD
+/// or the temp dir.
+fn chief_root(chief_cwd_root: Option<&Path>) -> String {
+    let Some(root) = chief_cwd_root else {
+        return String::new();
+    };
+    if let Err(e) = intent_core::create_chief_cwd_dir(root) {
+        tracing::warn!(error = %e, path = %root.display(), "failed to create chief file root");
+        return String::new();
+    }
+    root.to_string_lossy().into_owned()
+}
+
 /// Load the workspace and resolve its filesystem root, preferring the calling
-/// agent's sandbox path when available (`CoW` containment). A missing workspace
-/// (or any load error) yields an empty root; the guard in [`is_within`] then
-/// fails such a request closed rather than resolving it CWD-relative, so a
-/// bogus `workspaceId` cannot escape workspace containment
+/// agent's sandbox path when available (`CoW` containment). The Assistant
+/// (`__chief__`) workspace resolves to `chief_cwd_root` (see [`chief_root`]).
+/// A missing workspace (or any load error) yields an empty root; the guard in
+/// [`is_within`] then fails such a request closed rather than resolving it
+/// CWD-relative, so a bogus `workspaceId` cannot escape workspace containment
 /// (intent-hq/intent#3839).
 pub(crate) async fn resolve_root(
     store: &Store,
     workspace_id: &WorkspaceId,
     caller_agent_id: Option<&intent_core::AgentId>,
+    chief_cwd_root: Option<&Path>,
 ) -> String {
     // CoW containment: prefer the calling agent's sandbox path when present.
     if let Some(agent_id) = caller_agent_id {
-        if let Ok(session) = store.get_agent_session(agent_id).await {
-            if let Some(sandbox_path) = session.sandbox_path {
+        if let Ok(session) = store.get_agent_session_summary(agent_id).await {
+            if let Some(sandbox_path) = session.sandbox_path.clone() {
                 return sandbox_path;
             }
         }
+    }
+    if workspace_id.is_chief() {
+        return chief_root(chief_cwd_root);
     }
     match store.get_workspace(workspace_id).await {
         Ok(ws) => workspace_root(&ws),
@@ -232,25 +259,30 @@ fn io_err(e: &std::io::Error) -> Error {
 /// with the within-workspace guard — shared by the `getAttachment` copy path
 /// and the `getAttachmentInfo` exists-probe so a tampered row can never read
 /// or probe outside the store.
-pub(crate) fn resolve_attachment_source(
-    canonical_root: &str,
-    stored_path: &str,
-) -> Result<PathBuf> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn resolve_attachment_source(canonical_root: &str, stored_path: &str) -> Result<PathBuf> {
     resolve_within(canonical_root, stored_path)
 }
 
 /// `file.read` → bare UTF-8 string.
-pub(crate) fn read(root: &str, path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn read(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     let content = std::fs::read_to_string(&full).map_err(|e: std::io::Error| io_err(&e))?;
     Ok(Value::String(content))
 }
 
 /// Maximum bytes served per `file.readChunk` call BEFORE base64 encoding.
-/// Matches the transfer chunk cap ([`crate::transfer_import::IMPORT_MAX_CHUNK_BYTES`])
+/// Matches the transfer chunk cap ([`crate::feature_ports::IMPORT_MAX_CHUNK_BYTES`])
 /// so the ~21.4 MiB encoded frame stays comfortably under the 40 MiB
 /// outbound cap (PROTOCOL §1.3).
-pub(crate) const READ_CHUNK_MAX_BYTES: usize = crate::transfer_import::IMPORT_MAX_CHUNK_BYTES;
+pub(crate) const READ_CHUNK_MAX_BYTES: usize = crate::feature_ports::IMPORT_MAX_CHUNK_BYTES;
 
 /// `file.readChunk` → `{ content (base64), bytesRead, size }` — one
 /// offset-windowed slice of a workspace file's raw bytes, the FE-ward
@@ -273,14 +305,7 @@ pub(crate) fn read_chunk(root: &str, path: &str, offset: u64, length: u64) -> Re
     if root.is_empty() {
         return Err(Error::Internal(ACCESS_DENIED.to_string()));
     }
-    if length == 0 {
-        return Err(Error::InvalidParams("length must be positive".to_string()));
-    }
-    if length > READ_CHUNK_MAX_BYTES as u64 {
-        return Err(Error::InvalidParams(format!(
-            "length of {length} bytes exceeds the {READ_CHUNK_MAX_BYTES} byte cap"
-        )));
-    }
+    validate_chunk_length(length)?;
     let full = resolve_within(root, path)?;
     let md = std::fs::metadata(&full).map_err(|e: std::io::Error| io_err(&e))?;
     if md.is_dir() {
@@ -306,9 +331,45 @@ pub(crate) fn read_chunk(root: &str, path: &str, offset: u64, length: u64) -> Re
     Ok(json!({ "content": content, "bytesRead": len, "size": size }))
 }
 
+/// Reject a zero or over-cap chunk `length` (-32602), shared by every
+/// windowed read (`file.readChunk`, `git.showFileChunk`,
+/// `note.readAssetChunk`).
+pub(crate) fn validate_chunk_length(length: u64) -> Result<()> {
+    if length == 0 {
+        return Err(Error::InvalidParams("length must be positive".to_string()));
+    }
+    if length > READ_CHUNK_MAX_BYTES as u64 {
+        return Err(Error::InvalidParams(format!(
+            "length of {length} bytes exceeds the {READ_CHUNK_MAX_BYTES} byte cap"
+        )));
+    }
+    Ok(())
+}
+
+/// One offset window of an in-memory object as `{ content (base64),
+/// bytesRead, size }`, with the `file.readChunk` rules: a window at/past the
+/// end is empty, one crossing the end is shortened.
+pub(crate) fn window_bytes(bytes: &[u8], offset: u64, length: u64) -> Result<Value> {
+    use base64::Engine as _;
+
+    validate_chunk_length(length)?;
+    let size = bytes.len();
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(size);
+    let len = usize::try_from(length)
+        .unwrap_or(usize::MAX)
+        .min(size - start);
+    let slice = &bytes[start..start + len];
+    let content = base64::engine::general_purpose::STANDARD.encode(slice);
+    Ok(json!({ "content": content, "bytesRead": len, "size": size }))
+}
+
 /// `file.write` → `{ ok, path, size }` (size = UTF-16 code-unit length, matching
 /// JS `content.length`). Parent directories are created.
-pub(crate) fn write(root: &str, path: &str, content: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn write(root: &str, path: &str, content: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent).map_err(|e: std::io::Error| io_err(&e))?;
@@ -512,24 +573,9 @@ pub(crate) fn get_attachment(
     // a tampered registry row must never read outside it.
     let src = resolve_attachment_source(canonical_root, &record.stored_path)?;
     if !src.is_file() {
-        return Err(Error::Internal(format!(
-            "attachment file was deleted from the workspace store: \"{}\" (uploaded {}) no \
-             longer exists on disk. Continue without this file — do not retry the download.",
-            record.file_name, record.uploaded_at
-        )));
+        return Err(deleted_attachment(record));
     }
-    let dir = dest_dir.unwrap_or(ATTACHMENTS_DIR);
-    let dest_dir_full = resolve_within(dest_root, dir)?;
-    std::fs::create_dir_all(&dest_dir_full).map_err(|e: std::io::Error| io_err(&e))?;
-    // Keep retrieved copies out of git tracking (same ignore-all marker
-    // `place_attachment` drops), whatever directory the caller picked.
-    let marker = dest_dir_full.join(".gitignore");
-    if !marker.exists() {
-        std::fs::write(&marker, "*\n").map_err(|e: std::io::Error| io_err(&e))?;
-    }
-    // resolve_within on the joined relative path guards a crafted fileName.
-    let rel = format!("{}/{}", dir.trim_end_matches('/'), record.file_name);
-    let dest = resolve_within(dest_root, &rel)?;
+    let (rel, dest) = attachment_destination(dest_root, dest_dir, &record.file_name)?;
     let identical = match (std::fs::metadata(&src), std::fs::metadata(&dest)) {
         (Ok(s), Ok(d)) if s.len() == d.len() => {
             // Same size — confirm contents before skipping the copy.
@@ -552,20 +598,350 @@ pub(crate) fn get_attachment(
     let size = std::fs::metadata(&dest)
         .map(|m| m.len())
         .unwrap_or_default();
+    Ok(attachment_copy_result(
+        &rel,
+        &record.file_name,
+        size,
+        &record.uploaded_at,
+        record.mime_type.as_deref(),
+    ))
+}
+
+/// The error for a registry row whose stored file is gone from disk.
+fn deleted_attachment(record: &intent_store::AttachmentRecord) -> Error {
+    Error::Internal(format!(
+        "attachment file was deleted from the workspace store: \"{}\" (uploaded {}) no \
+         longer exists on disk. Continue without this file — do not retry the download.",
+        record.file_name, record.uploaded_at
+    ))
+}
+
+/// Where a copy of `file_name` goes under `dest_root`: `dest_dir` (default
+/// [`ATTACHMENTS_DIR`]) is created and kept out of git tracking (same
+/// ignore-all marker `place_attachment` drops), whatever directory the
+/// caller picked. Returns the copy's relative and full paths.
+fn attachment_destination(
+    dest_root: &str,
+    dest_dir: Option<&str>,
+    file_name: &str,
+) -> Result<(String, PathBuf)> {
+    let dir = dest_dir.unwrap_or(ATTACHMENTS_DIR);
+    let dest_dir_full = resolve_within(dest_root, dir)?;
+    std::fs::create_dir_all(&dest_dir_full).map_err(|e: std::io::Error| io_err(&e))?;
+    let marker = dest_dir_full.join(".gitignore");
+    if !marker.exists() {
+        std::fs::write(&marker, "*\n").map_err(|e: std::io::Error| io_err(&e))?;
+    }
+    // resolve_within on the joined relative path guards a crafted fileName.
+    let rel = format!("{}/{}", dir.trim_end_matches('/'), file_name);
+    let dest = resolve_within(dest_root, &rel)?;
+    Ok((rel, dest))
+}
+
+/// Refuse a `ws.file.getAttachment` `dest_dir` outside `dest_root` before
+/// anything is fetched; [`write_attachment_copy`] checks again.
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn check_attachment_dest(dest_root: &str, dest_dir: Option<&str>) -> Result<()> {
+    resolve_within(dest_root, dest_dir.unwrap_or(ATTACHMENTS_DIR)).map(drop)
+}
+
+/// `{ path, fileName, mimeType?, size, uploadedAt }`, the
+/// `ws.file.getAttachment` result.
+fn attachment_copy_result(
+    rel: &str,
+    file_name: &str,
+    size: u64,
+    uploaded_at: &str,
+    mime_type: Option<&str>,
+) -> Value {
     let mut result = json!({
         "path": rel,
-        "fileName": record.file_name,
+        "fileName": file_name,
         "size": size,
-        "uploadedAt": record.uploaded_at,
+        "uploadedAt": uploaded_at,
     });
+    if let Some(mime) = mime_type {
+        result["mimeType"] = json!(mime);
+    }
+    result
+}
+
+/// `ws.file.getAttachment` on a remote agent's machine: write `bytes` (the
+/// attachment head sent) into the agent's checkout `dest_root`, as
+/// [`get_attachment`] copies a local one: under `dest_dir` (default
+/// [`ATTACHMENTS_DIR`]), git-ignored, skipped when an identical file is
+/// already there, with the same result.
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn write_attachment_copy(
+    dest_root: &str,
+    dest_dir: Option<&str>,
+    file_name: &str,
+    mime_type: Option<&str>,
+    uploaded_at: &str,
+    bytes: &[u8],
+) -> Result<Value> {
+    if dest_root.is_empty() {
+        return Err(Error::Internal(ACCESS_DENIED.to_string()));
+    }
+    let (rel, dest) = attachment_destination(dest_root, dest_dir, file_name)?;
+    let identical = std::fs::read(&dest).is_ok_and(|existing| existing == bytes);
+    if !identical {
+        std::fs::write(&dest, bytes).map_err(|e| {
+            let _ = std::fs::remove_file(&dest);
+            Error::Internal(format!("failed to copy attachment \"{file_name}\": {e}"))
+        })?;
+    }
+    Ok(attachment_copy_result(
+        &rel,
+        file_name,
+        bytes.len() as u64,
+        uploaded_at,
+        mime_type,
+    ))
+}
+
+/// A `ws.file.getAttachment` copy on a remote agent's machine that head
+/// sends in pieces: written to a hidden part file beside its destination
+/// and kept, by [`Self::finish`], only when its size and sha256 match
+/// head's. A copy that is dropped unfinished leaves nothing behind.
+pub struct AttachmentPieces {
+    rel: String,
+    dest: PathBuf,
+    part: PathBuf,
+    file: Option<std::fs::File>,
+    hasher: sha2::Sha256,
+    written: u64,
+}
+
+impl AttachmentPieces {
+    /// Start the copy of `file_name` under `dest_dir` (default
+    /// [`ATTACHMENTS_DIR`]) in `dest_root`, as [`write_attachment_copy`]
+    /// places it.
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn begin(dest_root: &str, dest_dir: Option<&str>, file_name: &str) -> Result<Self> {
+        use sha2::Digest as _;
+        if dest_root.is_empty() {
+            return Err(Error::Internal(ACCESS_DENIED.to_string()));
+        }
+        let (rel, dest) = attachment_destination(dest_root, dest_dir, file_name)?;
+        // Not derived from the name, so a name near the file system's limit
+        // still fits.
+        let part = dest.with_file_name(format!(".{}.part", uuid::Uuid::new_v4().simple()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+            .map_err(|e| {
+                Error::Internal(format!("failed to copy attachment \"{file_name}\": {e}"))
+            })?;
+        Ok(Self {
+            rel,
+            dest,
+            part,
+            file: Some(file),
+            hasher: sha2::Sha256::new(),
+            written: 0,
+        })
+    }
+
+    /// The bytes written so far: the offset of the next piece.
+    #[must_use]
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Write the next piece.
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        use sha2::Digest as _;
+        use std::io::Write as _;
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| Error::Internal("attachment copy already finished".into()))?;
+        file.write_all(bytes)
+            .map_err(|e| Error::Internal(format!("failed to copy attachment: {e}")))?;
+        self.hasher.update(bytes);
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Keep the copy when it is `size` bytes with `sha256` (lowercase hex);
+    /// otherwise remove it and fail with `-32602` `attachment-copy-mismatch`.
+    /// An identical file already at the destination is left as it is. The
+    /// result is [`write_attachment_copy`]'s.
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn finish(
+        mut self,
+        size: u64,
+        sha256: &str,
+        file_name: &str,
+        mime_type: Option<&str>,
+        uploaded_at: &str,
+    ) -> Result<Value> {
+        use sha2::Digest as _;
+        let file = self.file.take();
+        if let Some(file) = file {
+            file.sync_all().map_err(|e| {
+                Error::Internal(format!("failed to copy attachment \"{file_name}\": {e}"))
+            })?;
+        }
+        let digest = lower_hex(&self.hasher.clone().finalize());
+        if self.written != size || !digest.eq_ignore_ascii_case(sha256) {
+            return Err(Error::InvalidParams(format!(
+                "attachment-copy-mismatch: \"{file_name}\" arrived as {} bytes with sha256 {digest}, but the backend has {size} bytes with sha256 {sha256}. Try again, or continue without this file.",
+                self.written
+            )));
+        }
+        let identical = std::fs::metadata(&self.dest)
+            .is_ok_and(|md| md.is_file() && md.len() == size)
+            && std::fs::File::open(&self.dest)
+                .and_then(|mut existing| sha256_hex(&mut existing))
+                .is_ok_and(|existing| existing == digest);
+        if !identical {
+            std::fs::rename(&self.part, &self.dest).map_err(|e| {
+                Error::Internal(format!("failed to copy attachment \"{file_name}\": {e}"))
+            })?;
+        }
+        Ok(attachment_copy_result(
+            &self.rel,
+            file_name,
+            size,
+            uploaded_at,
+            mime_type,
+        ))
+    }
+}
+
+impl Drop for AttachmentPieces {
+    fn drop(&mut self) {
+        self.file.take();
+        let _ = std::fs::remove_file(&self.part);
+    }
+}
+
+/// The bytes of a registered attachment for a remote agent's machine:
+/// `{ fileName, mimeType?, size, uploadedAt, data }` with `data` base64,
+/// read from the canonical store like [`get_attachment`]'s source. Without
+/// `range` a file larger than `max_bytes` is `-32602`
+/// `attachment-too-large-for-link`. With `range` (`offset`, `length`) the
+/// answer is one piece of a file of any size: at most `length` bytes from
+/// `offset`, with `offset` and, at offset 0, the whole file's `sha256`; an
+/// offset past the end is `-32602`.
+pub(crate) fn attachment_data(
+    canonical_root: &str,
+    record: &intent_store::AttachmentRecord,
+    max_bytes: u64,
+    range: Option<(u64, u64)>,
+) -> Result<Value> {
+    use base64::Engine as _;
+    use std::io::{Read as _, Seek as _};
+    if canonical_root.is_empty() {
+        return Err(Error::Internal(
+            "workspace has no resolved filesystem root".to_string(),
+        ));
+    }
+    let src = resolve_attachment_source(canonical_root, &record.stored_path)?;
+    let size = match std::fs::metadata(&src) {
+        Ok(md) if md.is_file() => md.len(),
+        _ => return Err(deleted_attachment(record)),
+    };
+    let (bytes, piece) = if let Some((offset, length)) = range {
+        if offset > size {
+            return Err(Error::InvalidParams(format!(
+                "attachment-range-invalid: offset {offset} is past the end of \"{}\" ({size} bytes)",
+                record.file_name
+            )));
+        }
+        let mut file = std::fs::File::open(&src).map_err(|_| deleted_attachment(record))?;
+        let sha256 = if offset == 0 {
+            Some(sha256_hex(&mut file).map_err(|_| deleted_attachment(record))?)
+        } else {
+            None
+        };
+        file.seek(std::io::SeekFrom::Start(offset))
+            .map_err(|_| deleted_attachment(record))?;
+        let mut bytes = Vec::new();
+        file.take(length.min(max_bytes))
+            .read_to_end(&mut bytes)
+            .map_err(|_| deleted_attachment(record))?;
+        (bytes, Some((offset, size, sha256)))
+    } else {
+        if size > max_bytes {
+            return Err(Error::InvalidParams(format!(
+                "attachment-too-large-for-link: \"{}\" is {size} bytes; a remote agent can copy attachments of at most {max_bytes} bytes. Continue without this file, or ask the user to share it another way.",
+                record.file_name
+            )));
+        }
+        (
+            std::fs::read(&src).map_err(|_| deleted_attachment(record))?,
+            None,
+        )
+    };
+    let mut result = json!({
+        "fileName": record.file_name,
+        "size": bytes.len(),
+        "uploadedAt": record.uploaded_at,
+        "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+    });
+    if let Some((offset, size, sha256)) = piece {
+        result["size"] = json!(size);
+        result["offset"] = json!(offset);
+        if let Some(sha256) = sha256 {
+            result["sha256"] = json!(sha256);
+        }
+    }
     if let Some(mime) = &record.mime_type {
         result["mimeType"] = json!(mime);
     }
     Ok(result)
 }
 
+/// `bytes` as lowercase hex.
+fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
+}
+
+/// Lowercase hex SHA-256 of everything `reader` yields.
+fn sha256_hex(reader: &mut impl std::io::Read) -> std::io::Result<String> {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(lower_hex(&hasher.finalize()))
+}
+
 /// `file.list` → bare array of `{ name, type }`.
-pub(crate) fn list(root: &str, path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn list(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(&full).map_err(|e: std::io::Error| io_err(&e))? {
@@ -619,7 +995,11 @@ pub(crate) fn tree(root: &str, path: &str) -> Result<Value> {
 }
 
 /// `file.delete` → `{ ok, path, deleted: true }` (rejects directories).
-pub(crate) fn delete(root: &str, path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn delete(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     if !full.exists() {
         return Err(Error::Internal(format!("File not found: {path}")));
@@ -634,7 +1014,11 @@ pub(crate) fn delete(root: &str, path: &str) -> Result<Value> {
 }
 
 /// `file.mkdir` → `{ ok, path, created: true }` or `{ ok, path, existed: true }`.
-pub(crate) fn mkdir(root: &str, path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn mkdir(root: &str, path: &str) -> Result<Value> {
     let full = resolve_within(root, path)?;
     if full.exists() {
         if full.is_dir() {
@@ -738,7 +1122,11 @@ fn permissions_octal(_md: &std::fs::Metadata) -> String {
 /// Both endpoints go through [`resolve_within`], so the symlink-aware gate
 /// covers the source and the destination (a rename through an out-of-root
 /// symlinked directory is denied on either side).
-pub(crate) fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn rename(root: &str, old_path: &str, new_path: &str) -> Result<Value> {
     let old_full = resolve_within(root, old_path)?;
     let new_full = resolve_within(root, new_path)?;
     if !old_full.exists() {
@@ -830,6 +1218,34 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn chief_root_creates_configured_dir_owner_only() {
+        let t = TempRoot::new();
+        let dir = intent_core::chief_cwd_root(&t.path);
+        assert_eq!(chief_root(Some(&dir)), dir.to_string_lossy());
+        assert!(dir.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        // Idempotent on an existing dir.
+        assert_eq!(chief_root(Some(&dir)), dir.to_string_lossy());
+    }
+
+    #[test]
+    fn chief_root_fails_closed_when_unconfigured_or_uncreatable() {
+        assert_eq!(chief_root(None), "");
+        let t = TempRoot::new();
+        let file = t.path.join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        // A path under a regular file cannot be created.
+        assert_eq!(chief_root(Some(&file.join("chief-cwd"))), "");
+        // An empty root is denied, never resolved against the process CWD.
+        assert!(read("", "notes.md").is_err());
     }
 
     #[test]

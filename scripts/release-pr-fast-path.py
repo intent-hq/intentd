@@ -36,13 +36,19 @@ def dependency_tables(doc):
             yield section.get(key, {})
 
 
-def matches(base, head):
+def matches(base, head, exact_parent=False):
     base = git('rev-parse', '--verify', f'{base}^{{commit}}').strip()
     head = git('rev-parse', '--verify', f'{head}^{{commit}}').strip()
-    try:
-        base = git('merge-base', base, head).strip()
-    except subprocess.CalledProcessError:
-        pass  # Keep the existing shallow-checkout fallback to the supplied base.
+    if exact_parent:
+        # Main pushes: head must be one non-merge commit directly on base. A
+        # shallow head without its parent lists none and fails closed.
+        parents = git('rev-list', '--parents', '-n', '1', head).split()[1:]
+        require(parents == [base], f'head is not a single commit on {base[:12]} (parents: {parents})')
+    else:
+        try:
+            base = git('merge-base', base, head).strip()
+        except subprocess.CalledProcessError:
+            pass  # Keep the existing shallow-checkout fallback to the supplied base.
     changes = git('diff', '--raw', '--no-abbrev', '--no-renames', base, head).splitlines()
     require(changes, 'empty diff')
     paths = []
@@ -89,8 +95,19 @@ def matches(base, head):
                     dep['version'] = a
         require(norm == old, f'non-release manifest change: {path}')
 
+    # Every bumped workspace package recorded in the base lockfile must carry
+    # its new version in the head lockfile, whether or not Cargo.lock is in
+    # the diff: a stale lockfile breaks every `--locked` build, and release
+    # PRs on the fast path skip the CI jobs that would catch it.
+    head_lock = manifest(head, 'Cargo.lock')
+    locked = {p['name']: p['version'] for p in head_lock.get('package', []) if 'source' not in p}
+    for package in manifest(base, 'Cargo.lock').get('package', []):
+        name = package['name']
+        if name in bumps and 'source' not in package:
+            require(locked.get(name) == bumps[name][1], f'lockfile not updated for bumped package: {name}')
+
     if 'Cargo.lock' in paths:
-        old, norm = manifest(base, 'Cargo.lock'), manifest(head, 'Cargo.lock')
+        old, norm = manifest(base, 'Cargo.lock'), head_lock
         for package in norm.get('package', []):
             name = package['name']
             if name in bumps and 'source' not in package:
@@ -109,11 +126,15 @@ def matches(base, head):
 
 
 def main():
-    if not 2 <= len(sys.argv) <= 3:
-        print(f'usage: {sys.argv[0]} <base> [<head>]', file=sys.stderr)
+    args = sys.argv[1:]
+    exact_parent = bool(args) and args[0] == '--exact-parent'
+    if exact_parent:
+        args = args[1:]
+    if not 1 <= len(args) <= 2:
+        print(f'usage: {sys.argv[0]} [--exact-parent] <base> [<head>]', file=sys.stderr)
         return 2
     try:
-        matches(sys.argv[1], sys.argv[2] if len(sys.argv) == 3 else 'HEAD')
+        matches(args[0], args[1] if len(args) == 2 else 'HEAD', exact_parent)
     except (NoMatch, subprocess.CalledProcessError, ValueError, KeyError, TypeError) as error:
         print(f'release-pr-fast-path: no match: {error}', file=sys.stderr)
         print('fast_path=false')

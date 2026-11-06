@@ -96,7 +96,10 @@ pub(crate) fn repo_from_html_url(html_url: &str) -> Option<RepoRef> {
 }
 
 /// Clamp an optional `limit` / `perPage` into the §5.5 `[1, 200]` window
-/// (default 50) and cast to the engine's `u8` query width.
+/// (default 50) and cast to the engine's `u8` query width. The engine itself
+/// sends at most 100 per page to GitHub. The byte-budgeted list reads use
+/// [`crate::proxy_page::clamp_page_limit`] (`[1, 100]`) instead; this wider
+/// window also bounds the pages the PR-monitor summary cache accepts.
 pub(crate) fn clamp_limit(limit: Option<i64>) -> u8 {
     u8::try_from(limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)).expect("clamped to [1, 200]")
 }
@@ -244,14 +247,21 @@ pub(crate) fn pull_to_json(pr: &PullRequest) -> Value {
 /// — the `github.pulls.get` shape served from the shared PR cache: the key
 /// is present exactly when the cached read reported the host's merge-queue
 /// state (`true` / `false`), and absent (never `null`) when it did not
-/// (REST-only fallback, older GHES).
+/// (REST-only fallback, older GHES). The additive `mergeQueue` entry
+/// (position, queue size, state, enqueue time, time-to-merge estimate)
+/// rides along as served: the checklist only carries one while the PR is
+/// reported queued (`pr_ops::queued_merge_queue_entry`).
 pub(crate) fn pull_to_json_with_merge_queue(
     pr: &PullRequest,
     is_in_merge_queue: Option<bool>,
+    merge_queue: Option<&intent_sourcecontrol::MergeQueueEntry>,
 ) -> Value {
     let mut v = pull_to_json(pr);
     if let (Value::Object(map), Some(queued)) = (&mut v, is_in_merge_queue) {
         map.insert("isInMergeQueue".into(), json!(queued));
+        if let Some(entry) = merge_queue {
+            map.insert("mergeQueue".into(), json!(entry));
+        }
     }
     v
 }

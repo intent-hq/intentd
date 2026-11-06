@@ -102,17 +102,19 @@ pub enum HostAdmissionOutcome {
     Refused,
 }
 
-/// Encoded bytes bound to one engine-owned completion. Fields are private;
+/// A prebuilt reply frame bound to one engine-owned completion. The frame is
+/// the already-constructed `{ok, value|error}` JSON value, so delivering it
+/// needs no re-encoding or re-parsing. Fields are private;
 /// there is no constructor, clone, payload accessor, or replacement-slot API.
 #[must_use = "dropping a prepared transfer withholds its private reply"]
 pub struct PreparedHostTransfer {
     receipt: HostTransferReceipt,
-    sender: tokio::sync::oneshot::Sender<String>,
-    encoded: String,
+    sender: tokio::sync::oneshot::Sender<serde_json::Value>,
+    frame: serde_json::Value,
 }
 
 impl PreparedHostTransfer {
-    /// Move the prebuilt bytes into their original slot, exactly once.
+    /// Move the prebuilt frame into its original slot, exactly once.
     ///
     /// This synchronous action performs no JS execution, JSON construction,
     /// await, I/O, or spawn. The receiver remains unread until `admit` returns.
@@ -131,7 +133,7 @@ impl PreparedHostTransfer {
         if !Arc::ptr_eq(&self.receipt.0, &original.0) {
             return HostAdmissionOutcome::ForeignCall;
         }
-        match self.sender.send(self.encoded) {
+        match self.sender.send(self.frame) {
             Ok(()) => HostAdmissionOutcome::Transferred(self.receipt),
             Err(_) => HostAdmissionOutcome::ConsumerClosed,
         }

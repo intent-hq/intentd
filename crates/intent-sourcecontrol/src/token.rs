@@ -503,7 +503,12 @@ esac
             command.env(DISABLE_GH_CREDENTIALS_ENV, "1");
         }
         let mut child = command.spawn().unwrap();
-        let status = match timeout(Duration::from_secs(20), child.wait()).await {
+        let status = match timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(20)),
+            child.wait(),
+        )
+        .await
+        {
             Ok(result) => result.unwrap(),
             Err(error) => {
                 child.kill().await.unwrap();

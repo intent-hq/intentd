@@ -234,14 +234,20 @@ mod tests {
             () = std::future::ready(()) => {}
         }
         drop(admitted);
-        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(1)),
+            drain,
+        )
+        .await
+        .unwrap();
         // An idle connection's limiter clone does not keep shutdown alive.
         let idle_connection = limiter.clone();
-        tokio::time::timeout(std::time::Duration::from_secs(1), idle_connection.drain())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(1)),
+            idle_connection.drain(),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]

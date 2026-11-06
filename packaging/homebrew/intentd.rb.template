@@ -2,7 +2,7 @@
 # scripts/render-sitter-homebrew-formula.sh and pushed to
 # intent-hq/homebrew-tap by .github/workflows/release-sitter.yml (replacing
 # the cargo-dist generated daemon formula). Placeholders: {{VERSION}} and the
-# four {{SHA256_*}} values, computed from the built release archives.
+# required {{SHA256_*}} values and optional macOS Intel stanza from release archives.
 #
 # The archives ship the sitter — a self-updating supervisor shim renamed to
 # `intentd` — which downloads, verifies, and runs the real daemon, forwarding
@@ -23,10 +23,7 @@ class Intentd < Formula
       url "https://github.com/intent-hq/intentd-releases/releases/download/sitter-v{{VERSION}}/intentd-aarch64-apple-darwin.tar.xz"
       sha256 "{{SHA256_AARCH64_APPLE_DARWIN}}"
     end
-    on_intel do
-      url "https://github.com/intent-hq/intentd-releases/releases/download/sitter-v{{VERSION}}/intentd-x86_64-apple-darwin.tar.xz"
-      sha256 "{{SHA256_X86_64_APPLE_DARWIN}}"
-    end
+{{MACOS_INTEL}}
   end
 
   # The musl archives are fully static, so they run on any Homebrew-on-Linux

@@ -24,11 +24,12 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,21 +56,14 @@ type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kill the whole process group (daemon + Node.js ACP children) BEFORE
-        // removing the data dir, so an orphaned child cannot re-create files
-        // under it after cleanup. Spawned with process_group(0).
-        {
-            use nix::sys::signal::{self, Signal};
-            use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id().cast_signed());
-            let _ = signal::killpg(pid, Signal::SIGKILL);
-        }
-        let _ = self.child.wait();
+        // Kill the daemon's process group (GuardedChild gives it its own) BEFORE
+        // the data dir is removed, so nothing in it can re-create files there.
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -77,7 +71,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-chatids-")
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -93,16 +87,11 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    // Group leader so Daemon::drop can killpg the daemon + ACP children.
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
     for (k, v) in env {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 /// Wait for the daemon's UDS to accept connections, up to the shared
@@ -208,9 +197,12 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(30), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -278,9 +270,7 @@ fn gate(test: &str) -> Option<String> {
 /// the turn is pure daemon + mock provider). The store handle is dropped before
 /// the daemon opens the same data dir.
 async fn seed_workspace(data_dir: &Path) -> String {
-    use intent_core::{
-        now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    };
+    use intent_core::{now_iso, Workspace, WorkspaceId};
     use intent_store::Store;
     let store = Store::open(&data_dir.join("intentd.db"))
         .await
@@ -291,49 +281,9 @@ async fn seed_workspace(data_dir: &Path) -> String {
         id: id.clone(),
         title: "WSS chat block ids".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     store.insert_workspace(&ws).await.expect("insert ws");
     id.0
@@ -543,7 +493,7 @@ async fn drive_turn(
     );
     let snap = wss_push_until(
         &mut chat,
-        tokio::time::Instant::now() + Duration::from_secs(30),
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30)),
     )
     .await;
     assert_eq!(snap["params"]["kind"], "snapshot", "push: {snap}");
@@ -568,7 +518,8 @@ async fn drive_turn(
 
     // One hard deadline across the whole turn (per-frame windows would reset on
     // heartbeats and hide a missing terminal reconcile).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     let mut live: Vec<Value> = Vec::new();
     loop {
         let frame = wss_push_until(&mut chat, deadline).await;
@@ -631,6 +582,7 @@ fn durable_use_id(blocks: &[Value], tool_call_id: &str) -> String {
 /// owns with a different type. A mispredicted `tool_result` id lands on the
 /// interleaved text block (shape a) or the sibling call's `tool_use` (shape b),
 /// and every id-keyed client replaces it for the rest of the turn.
+#[track_caller]
 fn assert_live_ids_never_retype_durable_blocks(turn: &Turn) {
     let durable: HashMap<String, String> = turn
         .durable_blocks()

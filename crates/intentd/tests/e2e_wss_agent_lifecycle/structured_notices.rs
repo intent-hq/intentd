@@ -79,29 +79,32 @@ async fn exercise_notices(fail: bool) {
     )
     .await;
     assert_eq!(sent["success"], true);
-    let events = timeout(Duration::from_secs(40), async {
-        let mut events = Vec::new();
-        loop {
-            let frame = wss_event(&mut sub, 40).await;
-            assert_eq!(frame["jsonrpc"], "2.0");
-            let event = frame["params"]["event"].clone();
-            if event["data"]["agentId"] != agent_id {
-                continue;
+    let events = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(40)),
+        async {
+            let mut events = Vec::new();
+            loop {
+                let frame = wss_event(&mut sub, 40).await;
+                assert_eq!(frame["jsonrpc"], "2.0");
+                let event = frame["params"]["event"].clone();
+                if event["data"]["agentId"] != agent_id {
+                    continue;
+                }
+                let terminal = if fail { "agent:failed" } else { "agent:idle" };
+                let done = event["type"] == terminal;
+                if !fail {
+                    assert_ne!(
+                        event["type"], "agent:failed",
+                        "advisory error cannot fail a turn: {event}"
+                    );
+                }
+                events.push(event);
+                if done {
+                    return events;
+                }
             }
-            let terminal = if fail { "agent:failed" } else { "agent:idle" };
-            let done = event["type"] == terminal;
-            if !fail {
-                assert_ne!(
-                    event["type"], "agent:failed",
-                    "advisory error cannot fail a turn: {event}"
-                );
-            }
-            events.push(event);
-            if done {
-                return events;
-            }
-        }
-    })
+        },
+    )
     .await
     .expect("turn terminated");
     let deltas: String = events

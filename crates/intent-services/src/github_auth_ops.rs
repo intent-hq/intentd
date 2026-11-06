@@ -424,9 +424,12 @@ async fn run_poll_algorithm(
     if outcome.is_none() && sync_gh {
         // Best-effort gh CLI sync: loads the token back from the secret store
         // (it never leaves the engine) and pipes it to `gh` via stdin only.
-        intent_core::spawn_daemon(intent_sourcecontrol::gh_sync::sync_token_to_gh(
-            intent_core::FileSecretStore::new(),
-        ));
+        // Reads the file this Services instance persists into (production:
+        // the daemon default; tests: their isolated store), never a fresh
+        // home-default store; an injected non-file store has nothing to sync.
+        if let Ok(store) = secrets.paired_gitlab_source() {
+            intent_core::spawn_daemon(intent_sourcecontrol::gh_sync::sync_token_to_gh(store));
+        }
     }
 }
 

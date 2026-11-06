@@ -26,6 +26,8 @@ fn an_evicted_receipt_does_not_retain_history_receipt_lifetime_regression() {
     let request = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
     let cache = PrCache::default();
     let result = reviews(&cache, &request, &begin(&request).unwrap(), &[7]);
+    // Delivery has finished; only the renderer's retained row receipt remains.
+    drop(result.delivery);
     cache.lock().unwrap().clear();
     assert!(!can_serve(
         &cache,
@@ -698,6 +700,113 @@ fn original_admission_is_checked_at_start_application_and_summary_hit() {
 }
 
 #[test]
+fn observed_summary_failure_survives_caller_refusal_without_invalidating_retained_rows() {
+    let connection = connection("alice");
+    let repo = repository("team/app");
+    let authorized = AtomicBool::new(true);
+    let check = || {
+        if authorized.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(intent_core::Error::Forbidden("caller retired".into()))
+        }
+    };
+    let request = SummaryRequest {
+        revalidate: &check,
+        ..req(&connection, &repo, RepositoryResourceKind::MergeRequest)
+    };
+    let cache = PrCache::default();
+    let retained = reviews(&cache, &request, &begin(&request).unwrap(), &[7]);
+    let pending = begin(&request).unwrap();
+    authorized.store(false, Ordering::SeqCst);
+    let result: Result<SummaryPage<PullRequest>, _> = finish(
+        &cache,
+        &request,
+        &pending,
+        (Err(denied(ProviderFailureKind::ProjectDenied)), quota()),
+        |p| (target(&request, p.number), true),
+        keep,
+    );
+    let failure = result.unwrap_err();
+    assert!(matches!(
+        failure.cause,
+        CacheError::Provider(Error::Provider(ProviderFailure {
+            kind: ProviderFailureKind::ProjectDenied,
+            status: Some(403),
+        }))
+    ));
+    assert_eq!(failure.quota, quota());
+    // Inspect the metadata separately from the refused caller. The refused
+    // operation neither grants a hit nor applies a denial to these rows.
+    let inspected = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
+    assert!(can_serve(
+        &cache,
+        &inspected,
+        retained.receipts[0].as_ref().unwrap(),
+        FRESH
+    )
+    .unwrap());
+}
+
+#[test]
+fn observed_summary_failure_survives_wrong_list_without_denying_replacement() {
+    let original = connection("alice");
+    let replacement = connection("alice");
+    let repo = repository("team/app");
+    let old = req(&original, &repo, RepositoryResourceKind::MergeRequest);
+    let current = req(&replacement, &repo, RepositoryResourceKind::MergeRequest);
+    let pending = begin(&old).unwrap();
+    let cache = PrCache::default();
+    let retained = reviews(&cache, &current, &begin(&current).unwrap(), &[7]);
+    let failure = failure(
+        &current,
+        &pending,
+        Error::Provider(ProviderFailure {
+            kind: ProviderFailureKind::CredentialRejected,
+            status: Some(401),
+        }),
+        quota(),
+    );
+    assert!(matches!(
+        failure.cause,
+        CacheError::Provider(Error::Provider(ProviderFailure {
+            kind: ProviderFailureKind::CredentialRejected,
+            status: Some(401),
+        }))
+    ));
+    assert_eq!(failure.quota, quota());
+    assert!(can_serve(
+        &cache,
+        &current,
+        retained.receipts[0].as_ref().unwrap(),
+        FRESH
+    )
+    .unwrap());
+}
+
+#[test]
+fn observed_summary_failure_preserves_rate_limit_after_scope_retirement() {
+    let connection = connection("alice");
+    let repo = repository("team/app");
+    let request = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
+    let pending = begin(&request).unwrap();
+    connection.retire();
+    let result: Result<SummaryPage<PullRequest>, _> = finish(
+        &PrCache::default(),
+        &request,
+        &pending,
+        (Err(Error::RateLimited("Retry-After: 90".into())), quota()),
+        |p| (target(&request, p.number), true),
+        keep,
+    );
+    let failure = result.unwrap_err();
+    assert!(
+        matches!(failure.cause, CacheError::Provider(Error::RateLimited(ref message)) if message == "Retry-After: 90")
+    );
+    assert_eq!(failure.quota, quota());
+}
+
+#[test]
 fn retired_or_same_ids_replacement_cannot_apply_old_success_or_denial() {
     let connection = connection("alice");
     let replacement = self::connection("alice");
@@ -728,7 +837,10 @@ fn retired_or_same_ids_replacement_cannot_apply_old_success_or_denial() {
             quota()
         )
         .cause,
-        CacheError::Ineligible(Ineligible::DifferentSlot)
+        CacheError::Provider(Error::Provider(ProviderFailure {
+            kind: ProviderFailureKind::CredentialRejected,
+            ..
+        }))
     ));
     connection.retire();
     assert!(matches!(
@@ -739,7 +851,10 @@ fn retired_or_same_ids_replacement_cannot_apply_old_success_or_denial() {
             quota()
         )
         .cause,
-        CacheError::Ineligible(Ineligible::RetiredScope)
+        CacheError::Provider(Error::Provider(ProviderFailure {
+            kind: ProviderFailureKind::CredentialRejected,
+            ..
+        }))
     ));
     assert!(can_serve(&cache, &new, fresh.receipts[0].as_ref().unwrap(), FRESH).unwrap());
 }
@@ -1109,4 +1224,161 @@ async fn empty_pages_also_expire_when_pending_history_is_lost() {
     .unwrap();
     assert!(fresh.page.items.is_empty());
     assert_eq!(fresh.page.next_cursor.as_deref(), Some("opaque cursor"));
+}
+
+#[test]
+fn summary_delivery_guards_empty_cursor_and_preserves_unrelated_projects() {
+    let connection = connection("alice");
+    let repo = repository("team/app");
+    let other_repo = repository("team/other");
+    let request = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
+    let other = req(
+        &connection,
+        &other_repo,
+        RepositoryResourceKind::MergeRequest,
+    );
+    let cache = PrCache::default();
+    let empty = reviews(&cache, &request, &begin(&request).unwrap(), &[]);
+    let unrelated = reviews(&cache, &other, &begin(&other).unwrap(), &[]);
+    assert_eq!(empty.page.next_cursor.as_deref(), Some("opaque cursor"));
+    let mut calls = 0;
+    empty
+        .delivery
+        .with_current(&mut || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    let _ = failure(
+        &request,
+        &begin(&request).unwrap(),
+        denied(ProviderFailureKind::ProjectDenied),
+        quota(),
+    );
+    assert!(empty
+        .delivery
+        .with_current(&mut || {
+            calls += 1;
+            Ok(())
+        })
+        .is_err());
+    unrelated
+        .delivery
+        .with_current(&mut || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(calls, 2);
+    let fresh = reviews(&cache, &request, &begin(&request).unwrap(), &[]);
+    fresh.delivery.with_current(&mut || Ok(())).unwrap();
+    assert!(empty.delivery.with_current(&mut || Ok(())).is_err());
+    connection.retire();
+    assert!(fresh.delivery.with_current(&mut || Ok(())).is_err());
+    assert!(unrelated.delivery.with_current(&mut || Ok(())).is_err());
+}
+
+#[tokio::test]
+async fn summary_delivery_combines_with_detail_and_rejects_denied_or_reinserted_rows() {
+    let connection = connection("alice");
+    let repo = repository("team/app");
+    let request = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
+    let cache = PrCache::default();
+    let detail = read_detail(&cache, &request, 7, Duration::ZERO, Ok(detail(7)))
+        .await
+        .unwrap();
+    let page = reviews(&cache, &request, &begin(&request).unwrap(), &[7, 8]);
+    let mut calls = 0;
+    super::super::CacheDelivery::with_all_current(
+        &[&page.delivery, &detail.delivery, &page.delivery],
+        &mut || {
+            assert!(cache.try_lock().is_err());
+            calls += 1;
+            Ok(())
+        },
+    )
+    .unwrap();
+    deny(&cache, &request, 8, ProviderFailureKind::ResourceDenied).await;
+    assert!(page
+        .delivery
+        .with_current(&mut || {
+            calls += 1;
+            Ok(())
+        })
+        .is_err());
+    detail
+        .delivery
+        .with_current(&mut || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    let recovered = reviews(&cache, &request, &begin(&request).unwrap(), &[7, 8]);
+    recovered.delivery.with_current(&mut || Ok(())).unwrap();
+    assert!(page.delivery.with_current(&mut || Ok(())).is_err());
+    cache.lock().unwrap().clear();
+    let reinserted = reviews(&cache, &request, &begin(&request).unwrap(), &[7, 8]);
+    assert!(recovered.delivery.with_current(&mut || Ok(())).is_err());
+    reinserted.delivery.with_current(&mut || Ok(())).unwrap();
+    assert_eq!(calls, 2);
+}
+
+#[tokio::test]
+async fn summary_delivery_validates_partial_rows_without_refreshing_detail() {
+    let connection = connection("alice");
+    let repo = repository("team/app");
+    let request = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
+    let cache = PrCache::default();
+    warm(&cache, &request, 7).await;
+    let key = CacheKey::Qualified(Box::new(connection.key(target(&request, 7))));
+    let before = match cache.lock().unwrap().get(&key).unwrap() {
+        CacheSlot::Qualified(slot) => slot.payload.as_ref().unwrap().freshness.fetched_at,
+        CacheSlot::Legacy(_) => panic!("qualified detail"),
+    };
+    let partial = finish(
+        &cache,
+        &request,
+        &begin(&request).unwrap(),
+        page(vec![pull(7)]),
+        |p| (target(&request, p.number), false),
+        keep,
+    )
+    .unwrap();
+    assert!(partial.receipts[0].is_none());
+    partial.delivery.with_current(&mut || Ok(())).unwrap();
+    if let CacheSlot::Qualified(slot) = cache.lock().unwrap().get(&key).unwrap() {
+        assert_eq!(slot.payload.as_ref().unwrap().freshness.fetched_at, before);
+    }
+    let _ = failure(
+        &request,
+        &begin(&request).unwrap(),
+        denied(ProviderFailureKind::ResourceDenied),
+        quota(),
+    );
+    assert!(partial.delivery.with_current(&mut || Ok(())).is_err());
+    assert!(
+        !read_detail(
+            &cache,
+            &request,
+            7,
+            FRESH,
+            Err(Error::Api("detail must remain a hit".into()))
+        )
+        .await
+        .unwrap()
+        .fetched
+    );
+}
+
+#[test]
+fn summary_delivery_does_not_retain_project_history_after_transfer() {
+    let connection = connection("alice");
+    let repo = repository("team/app");
+    let request = req(&connection, &repo, RepositoryResourceKind::MergeRequest);
+    let cache = PrCache::default();
+    let empty = reviews(&cache, &request, &begin(&request).unwrap(), &[]);
+    assert_eq!(connection.retained_project_count(), 1);
+    empty.delivery.with_current(&mut || Ok(())).unwrap();
+    drop(empty);
+    assert_eq!(connection.retained_project_count(), 0);
 }

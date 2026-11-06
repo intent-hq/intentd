@@ -171,6 +171,14 @@ pub const AGENT_SESSION_STATS_CHANGED: &str = "agent:session-stats-changed";
 // `publish_agent_event`).
 pub const AGENT_ATTENTION_REQUESTED: &str = "agent:attention-requested";
 
+// Provider worker observations (PROTOCOL §5.5b). Transient (broadcast, never
+// persisted — `event.query` has no rows) complete `WorkerSnapshot` replacement
+// `{ workspaceId, agentId, provider, acpSessionId, connectionGeneration,
+// support, continuity, asOf, truncated, workers }` emitted when the bounded
+// projection of an agent's provider-reported background workers changes. It
+// never opens a turn, triggers completion watches or changes agent status.
+pub const AGENT_WORKERS_CHANGED: &str = "agent:workers-changed";
+
 // Pull-request events (new in intentd; §7.6). The TS reference broadcasts PR
 // refresh deltas over Electron IPC (`workspace:background-enrichment-complete`,
 // renderer-only); a wire backend instead emits `pr:*` WorkspaceEvents so the
@@ -203,12 +211,23 @@ pub const GIT_ROOT_REGISTERED: &str = "gitRoot:registered";
 pub const GIT_ROOT_UPDATED: &str = "gitRoot:updated";
 pub const GIT_ROOT_UNREGISTERED: &str = "gitRoot:unregistered";
 
+/// Workspace-wide discussion metadata lifecycle.
+pub const DISCUSSION_CREATED: &str = "discussion:created";
+/// Workspace-wide discussion metadata lifecycle.
+pub const DISCUSSION_UPDATED: &str = "discussion:updated";
+/// Workspace-wide discussion metadata lifecycle.
+pub const DISCUSSION_DELETED: &str = "discussion:deleted";
+/// Versioned activity of an explicitly addressed discussion invocation.
+pub const DISCUSSION_ACTIVITY: &str = "discussion:activity";
+/// A newly persisted discussion message.
+pub const DISCUSSION_MESSAGE: &str = "discussion:message";
+/// Transient committed reaction metadata; never a new message.
+pub const DISCUSSION_REACTION: &str = "discussion:reaction";
+
 // Note events.
 pub const NOTE_CREATED: &str = "note:created";
 pub const NOTE_UPDATED: &str = "note:updated";
 pub const NOTE_DELETED: &str = "note:deleted";
-/// Bounded grace deletion registry invalidation, scoped to its workspace.
-pub const NOTE_DELETE_OPERATION: &str = "note:delete-operation";
 
 // Line-attribution events (new in intentd; PROTOCOL §5.2.1). Emitted after the
 // daemon recomputes per-line attributions for a note (post-mutation,
@@ -225,6 +244,7 @@ pub const LINE_ATTRIBUTION_UPDATED: &str = "line-attribution:updated";
 // parallels `task:status-changed` so a feed renders the new task without a
 // follow-up read.
 pub const TASK_CREATED: &str = "task:created";
+pub const TASK_UPDATED: &str = "task:updated";
 pub const TASK_STATUS_CHANGED: &str = "task:status-changed";
 pub const TASK_READY_TASKS_CHANGED: &str = "task:ready-tasks-changed";
 // Task↔agent linkage events (new in intentd; PROTOCOL §5.4 / §6.5). Migrate
@@ -241,10 +261,12 @@ pub(crate) const TERMINAL_COMMAND: &str = "terminal:command";
 // Interactive PTY streaming family (new in intentd; PROTOCOL §5.13/§6.5). The
 // daemon fans live PTY output to subscribers as `terminal:data` (base64 `chunk`)
 // and signals process exit with `terminal:exit`; `terminal:title`/`terminal:cwd`
-// carry detected title / working-directory changes. All payloads are
-// self-sufficient and carry the `terminalId`.
+// carry detected title / working-directory changes, and `terminal:process`
+// carries foreground program changes (`{ terminalId, foregroundProcess,
+// lastProcess }`). All payloads are self-sufficient and carry the `terminalId`.
 pub const TERMINAL_DATA: &str = "terminal:data";
 pub const TERMINAL_EXIT: &str = "terminal:exit";
+pub const TERMINAL_PROCESS: &str = "terminal:process";
 pub(crate) const TERMINAL_TITLE: &str = "terminal:title";
 pub(crate) const TERMINAL_CWD: &str = "terminal:cwd";
 
@@ -286,6 +308,10 @@ pub const HOOK_EXPIRED: &str = "hook:expired";
 pub const PR_MONITOR_REGISTERED: &str = "prMonitor:registered";
 pub const PR_MONITOR_CHANGED: &str = "prMonitor:changed";
 pub const PR_MONITOR_EMITTED: &str = "prMonitor:emitted";
+/// UI-only: a poll changed only the informational merge-queue entry of the
+/// monitor's `lastSnapshot` (pending set unchanged), so UI clients re-read
+/// `prMonitor.list`. Never a wake; off-limits to agent-owned subscriptions.
+pub const PR_MONITOR_REFRESHED: &str = "prMonitor:refreshed";
 pub const PR_MONITOR_COMPLETED: &str = "prMonitor:completed";
 pub const PR_MONITOR_CANCELLED: &str = "prMonitor:cancelled";
 
@@ -342,6 +368,18 @@ pub const WORKSPACE_DISPLAY_STATUS_CHANGED: &str = "workspace:displayStatus-chan
 // `{ workspaceId, waiting }` (§6.7) flips the workspace wait indicator with
 // no follow-up fetch.
 pub const WORKSPACE_WAITING_CHANGED: &str = "workspace:waiting-changed";
+// Orthogonal `Workspace.scriptsRunning` flag transition (PROTOCOL §5.1 /
+// §6.5): a command-mode script run entered or left flight. Self-sufficient
+// payload `{ workspaceId, scriptsRunning }` (§6.7).
+pub const WORKSPACE_SCRIPTS_RUNNING_CHANGED: &str = "workspace:scriptsRunning-changed";
+// Orthogonal `Workspace.backgroundTasksRunning` flag transition (PROTOCOL
+// §5.1 / §6.5): an agent of the workspace reported its first, or the
+// workspace lost its last, still-running §5.5b provider background task.
+// Self-sufficient payload `{ workspaceId, backgroundTasksRunning }` (§6.7).
+pub const WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED: &str =
+    "workspace:backgroundTasksRunning-changed";
+/// Changed-only authoritative workspace task counts.
+pub const WORKSPACE_TASK_STATS_CHANGED: &str = "workspace:task-stats-changed";
 // Token/credit usage recomputed by the daemon-internal scan job (§5.23 / §19.1).
 // The self-sufficient payload `{ workspaceId, tokenUsage: TokenUsage }` carries
 // the new snapshot so the FE re-renders without a follow-up `getTokenUsage`.
@@ -463,6 +501,13 @@ pub const MCP_SERVERS_STATUS_CHANGED: &str = "mcp.servers:status-changed";
 // in sync without leaking secrets.
 pub const SETTINGS_CHANGED: &str = "settings:changed";
 
+// Provider profile events (PROTOCOL §5.54/§6.5). Emitted once per committed
+// `providers.profiles.*` mutation (exactly one profile each); global like
+// `settings:changed` (empty workspace id) and administrator-only. The payload
+// `{ revision, change, profileId, profile?, envChanged? }` never carries
+// environment keys or values.
+pub const PROVIDERS_PROFILES_CHANGED: &str = "providers:profiles-changed";
+
 // GitHub auth events (new in intentd; PROTOCOL §5.27). Emitted by the
 // daemon-owned device-flow poller on terminal transitions (authorized /
 // expired / denied / error) and by `github.revoke`. Global like
@@ -489,6 +534,17 @@ pub const IDENTITY_AUTH_CHANGED: &str = "identity:auth-changed";
 // change — never on the implicit refresh (the identity lock blocks those).
 // Payload `{ principalId, identity: { provider, host, externalUserId },
 // login? }`; owner-only, like `sourceControl:auth-changed`.
+// Daemon-to-daemon remote agents, backend side: an exposed machine was
+// added, removed, changed state or reported new capabilities. Payload
+// `{ machine: RemoteMachine }` or `{ machineId, removed: true }`; global and
+// owner-only, never the executor token.
+pub const REMOTE_MACHINE_CHANGED: &str = "remoteMachine:changed";
+// Owner-only capture of executor-link traffic: a batch of new records, or
+// (with `records: []`) capture starting or stopping. Payload `{ records:
+// LinkTrafficRecord[], capture: LinkTrafficCapture }`; global, owner-only and
+// never persisted. Records are redacted before they are kept.
+pub const REMOTE_LINK_TRAFFIC_RECORDS: &str = "remoteLinkTraffic:records";
+
 pub const HOST_MEMBERS_CHANGED: &str = "host:members-changed";
 pub const HOST_INVITES_CHANGED: &str = "host:invites-changed";
 pub const HOST_EXECUTION_CONTEXT_CHANGED: &str = "host:execution-context-changed";
@@ -556,7 +612,16 @@ pub fn is_client_event_type(event_type: &str) -> bool {
 
 /// Every canonical event-type string in the taxonomy above. Useful for
 /// validation and the filter/subscription wiring added in later M2 tasks.
+pub const DESKTOP_PERMISSION_REQUESTED: &str = "desktop:permission-requested";
+pub const DESKTOP_PERMISSION_RESOLVED: &str = "desktop:permission-resolved";
+pub const DESKTOP_PERMISSION_CHANGED: &str = "desktop:permission-changed";
+pub const DESKTOP_SESSION_CHANGED: &str = "desktop:session-changed";
+
 pub const ALL_EVENT_TYPES: &[&str] = &[
+    DESKTOP_PERMISSION_REQUESTED,
+    DESKTOP_PERMISSION_RESOLVED,
+    DESKTOP_PERMISSION_CHANGED,
+    DESKTOP_SESSION_CHANGED,
     FILE_CHANGED,
     FILE_CREATED,
     FILE_DELETED,
@@ -605,6 +670,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     AGENT_PERMISSION_RESOLVED,
     AGENT_SESSION_STATS_CHANGED,
     AGENT_ATTENTION_REQUESTED,
+    AGENT_WORKERS_CHANGED,
     PR_LINKED,
     PR_UPDATED,
     PR_UNLINKED,
@@ -616,12 +682,18 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     GIT_ROOT_REGISTERED,
     GIT_ROOT_UPDATED,
     GIT_ROOT_UNREGISTERED,
+    DISCUSSION_MESSAGE,
+    DISCUSSION_CREATED,
+    DISCUSSION_UPDATED,
+    DISCUSSION_DELETED,
+    DISCUSSION_ACTIVITY,
+    DISCUSSION_REACTION,
     NOTE_CREATED,
     NOTE_UPDATED,
     NOTE_DELETED,
-    NOTE_DELETE_OPERATION,
     LINE_ATTRIBUTION_UPDATED,
     TASK_CREATED,
+    TASK_UPDATED,
     TASK_STATUS_CHANGED,
     TASK_READY_TASKS_CHANGED,
     TASK_AGENT_LINKED,
@@ -629,6 +701,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     TERMINAL_COMMAND,
     TERMINAL_DATA,
     TERMINAL_EXIT,
+    TERMINAL_PROCESS,
     TERMINAL_TITLE,
     TERMINAL_CWD,
     SCRIPT_OUTPUT,
@@ -649,6 +722,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     PR_MONITOR_REGISTERED,
     PR_MONITOR_CHANGED,
     PR_MONITOR_EMITTED,
+    PR_MONITOR_REFRESHED,
     PR_MONITOR_COMPLETED,
     PR_MONITOR_CANCELLED,
     TEST_STARTED,
@@ -669,6 +743,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_ATTENTION_CHANGED,
     WORKSPACE_DISPLAY_STATUS_CHANGED,
     WORKSPACE_WAITING_CHANGED,
+    WORKSPACE_SCRIPTS_RUNNING_CHANGED,
+    WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED,
+    WORKSPACE_TASK_STATS_CHANGED,
     WORKSPACE_TOKEN_USAGE_CHANGED,
     WORKSPACE_CONTEXT_CHANGED,
     WORKSPACE_TRANSFER_PROGRESS,
@@ -696,6 +773,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     MCP_NOTIFICATION,
     MCP_SERVERS_STATUS_CHANGED,
     SETTINGS_CHANGED,
+    PROVIDERS_PROFILES_CHANGED,
     GITHUB_AUTH_CHANGED,
     SOURCE_CONTROL_AUTH_CHANGED,
     IDENTITY_AUTH_CHANGED,
@@ -703,6 +781,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     HOST_MEMBERS_CHANGED,
     HOST_INVITES_CHANGED,
     HOST_EXECUTION_CONTEXT_CHANGED,
+    REMOTE_MACHINE_CHANGED,
+    REMOTE_LINK_TRAFFIC_RECORDS,
     APP_UI_NAVIGATE,
     APP_UI_HIGHLIGHT,
     APP_WORKSPACE_OPEN,
@@ -777,6 +857,7 @@ pub const EVENT_DISCRIMINATORS: &[EventDiscriminator] = &[
             "archived",
             "archivedAt",
             "attention",
+            "autoArchiveDisabled",
             "autoCommitEnabled",
             "autoUnarchive",
             "baseCommitSha",
@@ -785,6 +866,7 @@ pub const EVENT_DISCRIMINATORS: &[EventDiscriminator] = &[
             "browserClientId",
             "defaultModel",
             "isRemote",
+            "label",
             "lastActivity",
             "mcpServerToggled",
             "members",
@@ -797,6 +879,8 @@ pub const EVENT_DISCRIMINATORS: &[EventDiscriminator] = &[
             "repositoryName",
             "repositoryOwner",
             "repositoryPath",
+            "retiredAt",
+            "revived",
             "scope",
             "setupScript",
             "skipIsolation",
@@ -875,6 +959,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (AGENT_TOOL_CALL, "Agent stream: a recorded tool call; transcript content the guest reads through the conversation."),
     (AGENT_UPDATED, "Agent lifecycle: agent row fields changed."),
     (AGENT_USER_MESSAGE_SENT, "Agent stream: a human message reached an agent; conversation content."),
+    (AGENT_WORKERS_CHANGED, "Agent lifecycle: provider-reported background worker snapshot (§5.5b); task labels (a shell label may be its command line, already visible in the transcript) and states, no output or output paths. Same projection agent.workers.list serves."),
     (CHANGES_AGENT_LOCKS, "Changes: which agent holds which file lock; workspace-relative paths."),
     (CHANGES_GIT_STATUS, "Changes: working-tree status counters of the workspace repo."),
     (CHANGES_METRICS_CHANGED, "Changes: line-count metrics of tracked changes."),
@@ -886,6 +971,16 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (COMMENT_ADDED, "Comment: a comment landed on a note."),
     (COMMENT_DELETED, "Comment: a comment was deleted from a note."),
     (COMMENT_RESOLVED, "Comment: a thread was resolved."),
+    (DESKTOP_PERMISSION_CHANGED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
+    (DESKTOP_PERMISSION_REQUESTED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
+    (DESKTOP_PERMISSION_RESOLVED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
+    (DESKTOP_SESSION_CHANGED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
+    (DISCUSSION_ACTIVITY, "Discussion: versioned activity for one explicitly addressed invocation."),
+    (DISCUSSION_CREATED, "Workspace-wide discussion created."),
+    (DISCUSSION_DELETED, "Workspace-wide discussion deleted."),
+    (DISCUSSION_MESSAGE, "Human discussion: authenticated member message in the workspace."),
+    (DISCUSSION_REACTION, "Human discussion: participant-visible reaction metadata update."),
+    (DISCUSSION_UPDATED, "Workspace-wide discussion updated."),
     (DRAFT_CHANGED, "Draft: a client's composer draft exists or was cleared; { workspaceId, agentId, clientId, hasDraft } — never the text."),
     (FILE_CHANGED, "File: a watched file changed; payload paths are workspace-relative (`events::watcher::relative_path`), never absolute."),
     (FILE_CREATED, "File: a watched file was created; workspace-relative path."),
@@ -904,7 +999,6 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (HOOK_SCHEDULED, "Hook lifecycle: a hook was registered; hook id, name and schedule."),
     (LINE_ATTRIBUTION_UPDATED, "Note: per-line authorship of a note changed."),
     (NOTE_CREATED, "Note: a note was created."),
-    (NOTE_DELETE_OPERATION, "Note: a cancellable deletion changed state."),
     (NOTE_DELETED, "Note: a note was deleted."),
     (NOTE_PRESENCE, "Presence: a member joined / moved its caret in / left a note the guest is a member of; principal profile fields and a caret position (rev/anchor/head) only. Transient."),
     (NOTE_UPDATED, "Note: note content or metadata changed."),
@@ -915,6 +1009,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (PR_MONITOR_CHANGED, "PR monitor: pending PR changes recorded; PR checklist state."),
     (PR_MONITOR_COMPLETED, "PR monitor: the PR merged/closed; PR identity."),
     (PR_MONITOR_EMITTED, "PR monitor: a debounced report was delivered; PR checklist state."),
+    (PR_MONITOR_REFRESHED, "PR monitor: only the merge-queue position/estimate changed (UI re-read hint); PR identity."),
     (PR_MONITOR_REGISTERED, "PR monitor: a monitor was registered; monitor and PR identity."),
     (PRESENCE_CHANGED, "Presence: the online members of a member workspace with their focus in that workspace and typing targets; principal profile fields already exposed by workspace.members.list. Transient."),
     (SCRIPT_MONITOR_CANCELLED, "Script monitor: cancelled; full workspace-scoped monitor snapshot including opt-in bounded matching line."),
@@ -932,9 +1027,11 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (TASK_CREATED, "Task: a task note was created."),
     (TASK_READY_TASKS_CHANGED, "Task: the startable task set changed; task ids."),
     (TASK_STATUS_CHANGED, "Task: a task's status changed."),
+    (TASK_UPDATED, "Task: complete changed task summaries and removed ids."),
     (WORKSPACE_ACTIVITY, "Workspace: activity heartbeat of a workspace the guest is a member of."),
     (WORKSPACE_ACTIVITY_CHANGED, "Workspace: the aggregated activity marker changed (workspace channel delta)."),
     (WORKSPACE_ATTENTION_CHANGED, "Workspace: the attention marker changed (workspace channel delta)."),
+    (WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED, "Workspace: the agent-background-tasks-running marker changed (workspace channel delta)."),
     (WORKSPACE_CLOSED, "Workspace: a workspace was closed; id only."),
     (WORKSPACE_CONTEXT_CHANGED, "Workspace: context items (note/link references) changed."),
     (WORKSPACE_CREATED, "Workspace: a workspace row was created (workspace channel delta; rows are membership-filtered in the service layer)."),
@@ -943,8 +1040,10 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (WORKSPACE_DELETED, "Workspace: a workspace row was deleted; id only."),
     (WORKSPACE_DISPLAY_STATUS_CHANGED, "Workspace: the display status changed (workspace channel delta)."),
     (WORKSPACE_OPENED, "Workspace: a workspace was opened; id only."),
+    (WORKSPACE_SCRIPTS_RUNNING_CHANGED, "Workspace: the command-scripts-running marker changed (workspace channel delta)."),
     (WORKSPACE_SETUP_COMPLETED, "Workspace: setup finished; id and outcome."),
     (WORKSPACE_SETUP_STARTED, "Workspace: setup started; id only."),
+    (WORKSPACE_TASK_STATS_CHANGED, "Workspace: authoritative task statistics changed."),
     (WORKSPACE_TOKEN_USAGE_CHANGED, "Workspace: token usage counters changed (workspace.getTokenUsage is Collaborator+)."),
     (WORKSPACE_UPDATED, "Workspace: title / tags / status fields changed (workspace channel delta); `changes.members` + `removedPrincipalId` on a membership removal, `addedPrincipalId` on an add (invite join or `workspace.members.add`)."),
     (WORKSPACE_WAITING_CHANGED, "Workspace: the waiting marker changed (workspace channel delta)."),
@@ -993,6 +1092,7 @@ pub const MEMBER_EVENT_TYPES: &[&str] = &[
     TERMINAL_CWD,
     TERMINAL_DATA,
     TERMINAL_EXIT,
+    TERMINAL_PROCESS,
     TERMINAL_TITLE,
     TEST_COMPLETED,
     TEST_STARTED,

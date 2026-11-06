@@ -14,7 +14,7 @@ import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { assertCleanupComplete, finishCleanup } from './pi-session-cleanup.mjs';
+import { assertCleanupComplete, assertWindowsTaskkillComplete, finishCleanup } from './pi-session-cleanup.mjs';
 import diagnostics from './pi-diagnostics.cjs';
 import { assertWitnessesClosed, readWitnesses, stopWitnesses } from './pi-witness-harness.mjs';
 const { Capture, LIMITS, SECRET, safeValue, failureReport, publishEvidence } = diagnostics;
@@ -92,7 +92,8 @@ function startAdapter(cwd, env, records) {
         if (windows) {
           if (child.exitCode === null && child.signalCode === null) {
             const killed = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { timeout: 10_000 });
-            assert.equal(killed.status, 0, `taskkill: ${killed.stderr}`);
+            await assertWindowsTaskkillComplete(killed, child,
+              () => bounded(closed, 'adapter close after taskkill race'));
           }
         } else {
           try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }

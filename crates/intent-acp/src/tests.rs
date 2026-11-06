@@ -187,6 +187,51 @@ async fn structured_notices_are_negotiated_with_and_without_callbacks() {
     }
 }
 
+/// Cursor turns on native subagents when `clientCapabilities.subagents` or
+/// `clientCapabilities._meta.subagents` is present, and switches its model
+/// option to a parameterized picker on `_meta.parameterizedModelPicker`.
+/// Neither may be advertised, under any callback/monitoring offer, and the
+/// handshake must never send `authenticate` (Cursor's `cursor_login` starts
+/// a browser login on a signed-out host).
+#[tokio::test]
+async fn cursor_initialize_advertises_no_subagents_or_model_picker_and_skips_authenticate() {
+    use crate::callback_registration::CallbackOffer;
+    use crate::review_monitoring::ReviewMonitoringOffer;
+    let cursor = intent_providers::find_provider("cursor").unwrap();
+    for (offer, monitoring) in [
+        (CallbackOffer::Disabled, ReviewMonitoringOffer::Disabled),
+        (CallbackOffer::V1, ReviewMonitoringOffer::Disabled),
+        (CallbackOffer::V1, ReviewMonitoringOffer::V1),
+    ] {
+        let (conn, responder, _stderr) = connect_mock(ConnectionHooks::default());
+        let result = crate::handshake::handshake_with_review_monitoring(
+            std::sync::Arc::new(conn),
+            cursor,
+            offer,
+            monitoring,
+        )
+        .await
+        .unwrap();
+        assert!(!result.ordinary.authenticated);
+        drop(result);
+        let seen = responder.await.unwrap();
+        assert!(
+            seen.iter().all(|frame| frame["method"] != "authenticate"),
+            "{seen:?}"
+        );
+        let caps = &seen[0]["params"]["clientCapabilities"];
+        assert!(caps.get("subagents").is_none(), "{caps}");
+        let meta = caps.get("_meta").cloned().unwrap_or_else(|| json!({}));
+        assert!(meta.get("subagents").is_none(), "{meta}");
+        assert!(meta.get("parameterizedModelPicker").is_none(), "{meta}");
+        let text = caps.to_string();
+        assert!(
+            !text.contains("subagents") && !text.contains("parameterizedModelPicker"),
+            "{text}"
+        );
+    }
+}
+
 #[test]
 fn structured_notices_are_consumed_without_becoming_chunks() {
     for severity in ["info", "warning", "error", "_custom"] {
@@ -353,6 +398,7 @@ async fn routes_requests_and_notifications() {
     let hooks = ConnectionHooks {
         requests: Some(req_tx),
         notifications: Some(note_tx),
+        workers: None,
         auth_error_patterns: Vec::new(),
         stderr_log_dir: None,
         auth_required_stdout_marker: None,
@@ -374,17 +420,23 @@ async fn routes_requests_and_notifications() {
         .unwrap();
     a2c_agent.flush().await.unwrap();
 
-    let req = tokio::time::timeout(Duration::from_secs(2), req_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let req = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        req_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(req.method, "fs/read_text_file");
     assert_eq!(req.id, json!("p1"));
 
-    let note = tokio::time::timeout(Duration::from_secs(2), note_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let note = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        note_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(note.method, "session/update");
     let _ = conn;
 }
@@ -1046,10 +1098,13 @@ async fn spawn_provider_real_npx_ignores_matching_ancestor_workspaces_and_siblin
         // The previous launch dir is still alive (`alive`), so npm now sees two
         // same-named sentinels under the matching glob.
         let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn real npx");
-        let status = tokio::time::timeout(Duration::from_secs(120), agent.child_mut().wait())
-            .await
-            .unwrap_or_else(|_| panic!("{label} real npx launch did not exit"))
-            .expect("wait real npx");
+        let status = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(120)),
+            agent.child_mut().wait(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{label} real npx launch did not exit"))
+        .expect("wait real npx");
         assert!(
             status.success(),
             "{label} launch: real npx must start the adapter despite the matching ancestor \
@@ -1168,10 +1223,13 @@ async fn spawn_provider_real_npx_ignores_inherited_npm_workspace_selectors() {
     assert!(opts.via_npx());
 
     let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn real npx");
-    let status = tokio::time::timeout(Duration::from_secs(120), agent.child_mut().wait())
-        .await
-        .expect("real npx launch did not exit")
-        .expect("wait real npx");
+    let status = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(120)),
+        agent.child_mut().wait(),
+    )
+    .await
+    .expect("real npx launch did not exit")
+    .expect("wait real npx");
     assert!(
         status.success(),
         "real npx must start the adapter despite an inherited npm_config_workspace selector \
@@ -3907,18 +3965,24 @@ mod client_served_tests {
             .await
             .unwrap();
         writer.flush().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), req_rx.recv())
-            .await
-            .unwrap()
-            .unwrap()
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            req_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
     }
 
     async fn read_frame(reader: &mut BufReader<DuplexStream>) -> Value {
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            reader.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         serde_json::from_str(line.trim()).unwrap()
     }
 
@@ -4202,6 +4266,139 @@ mod client_served_tests {
         assert!(sink
             .types()
             .contains(&"agent:permission:request".to_string()));
+    }
+
+    /// Cursor's own permission request shape (cursor-agent 2026.11.05-86047df):
+    /// `allow-always` first would persist an allowlist entry in the user's
+    /// Cursor config, so it is deliberately listed ahead of `allow-once` here.
+    fn cursor_permission_params() -> Value {
+        json!({
+            "sessionId": "s1",
+            "toolCall": { "toolCallId": "tc-1", "title": "Run git status", "kind": "execute", "status": "pending" },
+            "options": [
+                { "optionId": "allow-always", "name": "Allow always", "kind": "allow_always" },
+                { "optionId": "allow-once", "name": "Allow once", "kind": "allow_once" },
+                { "optionId": "reject-once", "name": "Reject", "kind": "reject_once" }
+            ]
+        })
+    }
+
+    /// With `auto_allow_once`, an auto-approved prompt answers `allow-once`;
+    /// without it the legacy first-non-destructive pick is unchanged.
+    #[tokio::test]
+    async fn auto_allow_once_selects_the_allow_once_option() {
+        for (allow_once, expected) in [(true, "allow-once"), (false, "allow-always")] {
+            let root = temp_dir();
+            let sink = Arc::new(MockSink::default());
+            let (handler, _reg) = build_handler(
+                root.path(),
+                PermissionPolicy::AllowAll,
+                sink.clone(),
+                PermissionRegistry::new(),
+            );
+            let handler = handler.with_auto_allow_once(allow_once);
+            let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+            let req = send(
+                &mut writer,
+                &mut req_rx,
+                11,
+                "session/request_permission",
+                cursor_permission_params(),
+            )
+            .await;
+            handler.serve(&conn, req).await.unwrap();
+            let resp = read_frame(&mut reader).await;
+            assert_eq!(resp["result"]["outcome"]["outcome"], json!("selected"));
+            assert_eq!(resp["result"]["outcome"]["optionId"], json!(expected));
+        }
+    }
+
+    /// Denials keep picking the reject option even with `auto_allow_once`.
+    #[tokio::test]
+    async fn auto_allow_once_does_not_change_denials() {
+        let root = temp_dir();
+        let (handler, _reg) = build_handler(
+            root.path(),
+            PermissionPolicy::DenyAll,
+            Arc::new(MockSink::default()),
+            PermissionRegistry::new(),
+        );
+        let handler = handler.with_auto_allow_once(true);
+        let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+        let req = send(
+            &mut writer,
+            &mut req_rx,
+            12,
+            "session/request_permission",
+            cursor_permission_params(),
+        )
+        .await;
+        handler.serve(&conn, req).await.unwrap();
+        let resp = read_frame(&mut reader).await;
+        assert_eq!(resp["result"]["outcome"]["optionId"], json!("reject-once"));
+    }
+
+    /// `cursor/ask_question` (params carry no sessionId) is answered with the
+    /// skipped outcome, never `method not found`, under every policy.
+    #[tokio::test]
+    async fn cursor_ask_question_is_answered_skipped() {
+        for policy in [PermissionPolicy::Interactive, PermissionPolicy::AllowAll] {
+            let root = temp_dir();
+            let sink = Arc::new(MockSink::default());
+            let (handler, _reg) =
+                build_handler(root.path(), policy, sink.clone(), PermissionRegistry::new());
+            let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+            let req = send(
+                &mut writer,
+                &mut req_rx,
+                13,
+                crate::CURSOR_ASK_QUESTION_METHOD,
+                json!({
+                    "toolCallId": "ask-1",
+                    "title": "Pick a framework",
+                    "questions": [{
+                        "id": "q1", "prompt": "Which one?", "allowMultiple": false,
+                        "options": [{ "id": "a", "label": "React" }, { "id": "b", "label": "Svelte" }]
+                    }]
+                }),
+            )
+            .await;
+            handler.serve(&conn, req).await.unwrap();
+            let resp = read_frame(&mut reader).await;
+            assert!(resp.get("error").is_none(), "{resp}");
+            assert_eq!(resp["id"], json!(13));
+            assert_eq!(resp["result"]["outcome"]["outcome"], json!("skipped"));
+            assert!(resp["result"]["outcome"]["reason"].is_string());
+            assert!(sink.types().is_empty(), "no permission prompt is raised");
+        }
+    }
+
+    /// `cursor/task` (captured: sent after a native Task tool call) gets an
+    /// empty success result, not `method not found`.
+    #[tokio::test]
+    async fn cursor_task_report_is_acknowledged_with_an_empty_result() {
+        let root = temp_dir();
+        let sink = Arc::new(MockSink::default());
+        let (handler, _reg) = build_handler(
+            root.path(),
+            PermissionPolicy::AllowAll,
+            sink.clone(),
+            PermissionRegistry::new(),
+        );
+        let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+        let req = send(
+            &mut writer,
+            &mut req_rx,
+            14,
+            crate::CURSOR_TASK_METHOD,
+            json!({"toolCallId":"call-27e9fb5d-2f35-4699-83db-5f3c01ce559a-3\nfc_93650954-f819-9d9f-9e36-f87a8cad6bd7_0","description":"Reply with HELLO","prompt":"Your only job is to reply with exactly the word HELLO and nothing else. Do not call any tools. Do not add punctuation or explanation.","subagentType":"unspecified","model":"default","agentId":"29a69723-caee-4eb1-ae48-1b5141dea32b","durationMs":1473}),
+        )
+        .await;
+        handler.serve(&conn, req).await.unwrap();
+        let resp = read_frame(&mut reader).await;
+        assert!(resp.get("error").is_none(), "{resp}");
+        assert_eq!(resp["result"], json!({}));
+        assert!(sink.types().is_empty());
     }
 
     #[tokio::test]
@@ -5342,10 +5539,13 @@ mod mcp_bridge_tests {
 
     async fn read_next_line(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> String {
         let mut buf = String::new();
-        timeout(Duration::from_secs(2), reader.read_line(&mut buf))
-            .await
-            .expect("read_line timed out")
-            .expect("read_line ok");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            reader.read_line(&mut buf),
+        )
+        .await
+        .expect("read_line timed out")
+        .expect("read_line ok");
         buf
     }
 
@@ -5367,7 +5567,7 @@ mod mcp_bridge_tests {
         let bridge = serve_workspace_mcp_tcp(build_bridge_server())
             .await
             .unwrap();
-        let stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+        let stream = bridge.connect().await.unwrap();
         let (read, mut write) = stream.into_split();
         let mut reader = BufReader::new(read);
 
@@ -5378,13 +5578,133 @@ mod mcp_bridge_tests {
         write.flush().await.unwrap();
 
         let mut line = String::new();
-        timeout(Duration::from_secs(2), reader.read_line(&mut line))
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            reader.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(resp["id"], json!(1));
         assert_eq!(resp["result"]["protocolVersion"], json!("2024-11-05"));
+    }
+
+    /// Read until EOF and return everything the listener sent: an
+    /// unauthenticated connection must be closed without any response line.
+    async fn read_to_eof(stream: TcpStream) -> String {
+        let (read, _w) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        let mut all = String::new();
+        // A reset (unread bytes at close) is as much a refusal as a clean EOF.
+        let _closed = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut all),
+        )
+        .await
+        .expect("the listener closes an unauthenticated connection");
+        all
+    }
+
+    async fn try_send_line(stream: &mut TcpStream, line: &str) {
+        let _ = stream.write_all(format!("{line}\n").as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+
+    /// Security regression: any local process (another OS user, or a browser
+    /// cross-protocol POST) could reach the per-agent loopback listener and
+    /// run `workspace_api` with the agent's authority. A connection whose
+    /// first line is a JSON-RPC frame instead of the bridge secret is closed
+    /// without dispatching anything.
+    #[tokio::test]
+    async fn unauthenticated_connection_is_refused() {
+        let bridge = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(bridge.addr()).await.unwrap();
+        try_send_line(
+            &mut stream,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}",
+        )
+        .await;
+        try_send_line(
+            &mut stream,
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}",
+        )
+        .await;
+        assert_eq!(read_to_eof(stream).await, "", "no response may be served");
+    }
+
+    /// A wrong or truncated secret, or an HTTP request head (cross-protocol
+    /// abuse from a web page), is refused the same way.
+    #[tokio::test]
+    async fn wrong_secret_and_http_preamble_are_refused() {
+        let bridge = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        let token = bridge.auth_token().to_owned();
+        let wrong = format!("{}x", &token[..token.len() - 1]);
+        for first in [
+            crate::bridge_auth_line(&wrong),
+            crate::bridge_auth_line(&token[..token.len() - 1]),
+            crate::bridge_auth_line(""),
+            "POST / HTTP/1.1\r\n".to_string(),
+        ] {
+            let mut stream = TcpStream::connect(bridge.addr()).await.unwrap();
+            stream.write_all(first.as_bytes()).await.unwrap();
+            send_line(
+                &mut stream,
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}",
+            )
+            .await;
+            assert_eq!(
+                read_to_eof(stream).await,
+                "",
+                "refused first line: {first:?}"
+            );
+        }
+    }
+
+    /// An unauthenticated peer cannot grow memory with an endless first
+    /// line: the listener reads at most the auth line's length, then closes.
+    #[tokio::test]
+    async fn oversized_first_line_is_refused_without_buffering() {
+        let bridge = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        let mut stream = TcpStream::connect(bridge.addr()).await.unwrap();
+        let flood = vec![b'a'; 1024 * 1024];
+        let _ = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            stream.write_all(&flood),
+        )
+        .await;
+        assert_eq!(read_to_eof(stream).await, "");
+    }
+
+    /// Each listener mints its own secret, so one agent's secret never opens
+    /// another agent's bridge.
+    #[tokio::test]
+    async fn each_listener_has_a_distinct_secret() {
+        let a = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        let b = serve_workspace_mcp_tcp(build_bridge_server())
+            .await
+            .unwrap();
+        assert_eq!(a.auth_token().len(), 64);
+        assert_ne!(a.auth_token(), b.auth_token());
+        let mut stream = TcpStream::connect(b.addr()).await.unwrap();
+        stream
+            .write_all(crate::bridge_auth_line(a.auth_token()).as_bytes())
+            .await
+            .unwrap();
+        try_send_line(
+            &mut stream,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}",
+        )
+        .await;
+        assert_eq!(read_to_eof(stream).await, "");
     }
 
     #[tokio::test]
@@ -5392,7 +5712,7 @@ mod mcp_bridge_tests {
         let bridge = serve_workspace_mcp_tcp(build_bridge_server())
             .await
             .unwrap();
-        let mut stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+        let mut stream = bridge.connect().await.unwrap();
         // A blank line and a non-JSON line both produce no response and must not
         // close the connection; the follow-up request still gets answered.
         send_line(&mut stream, "").await;
@@ -5414,7 +5734,7 @@ mod mcp_bridge_tests {
         let bridge = serve_workspace_mcp_tcp(build_bridge_server())
             .await
             .unwrap();
-        let mut stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+        let mut stream = bridge.connect().await.unwrap();
         // A notification (no `id`) yields no response, then a request still works.
         send_line(
             &mut stream,
@@ -5449,7 +5769,8 @@ mod mcp_bridge_tests {
         // ephemeral port is freed, a concurrent test binding 127.0.0.1:0 can
         // be handed the same port, making connects succeed against an
         // unrelated listener.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
         while !accept_loop.is_finished() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -5474,7 +5795,6 @@ mod mcp_bridge_tests {
         use serde_json::{json, Value};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-        use tokio::net::TcpStream;
         use tokio::sync::Notify;
         use tokio::time::timeout;
 
@@ -5503,7 +5823,8 @@ mod mcp_bridge_tests {
             }
 
             async fn wait_started(&self, id: i64) {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                let deadline = tokio::time::Instant::now()
+                    + intentd_test_support::test_timeout(Duration::from_secs(2));
                 while !self.started.lock().unwrap().contains(&id) {
                     assert!(
                         tokio::time::Instant::now() < deadline,
@@ -5567,7 +5888,7 @@ mod mcp_bridge_tests {
         ) {
             let dispatch = Arc::new(TestDispatch::default());
             let bridge = serve_mcp_tcp(dispatch.clone()).await.unwrap();
-            let stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+            let stream = bridge.connect().await.unwrap();
             let (read, write) = stream.into_split();
             (dispatch, bridge, write, BufReader::new(read))
         }
@@ -5580,10 +5901,13 @@ mod mcp_bridge_tests {
 
         async fn read_response(reader: &mut BufReader<OwnedReadHalf>) -> Value {
             let mut buf = String::new();
-            timeout(Duration::from_secs(2), reader.read_line(&mut buf))
-                .await
-                .expect("read_line timed out")
-                .expect("read_line ok");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
+                reader.read_line(&mut buf),
+            )
+            .await
+            .expect("read_line timed out")
+            .expect("read_line ok");
             serde_json::from_str(buf.trim()).expect("response line must be whole JSON")
         }
 
@@ -5688,7 +6012,8 @@ mod mcp_bridge_tests {
             dispatch.wait_started(1).await;
             drop(write);
             drop(reader);
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let deadline = tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(2));
             while dispatch.cancelled.load(Ordering::SeqCst) == 0 {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -5715,7 +6040,6 @@ mod mcp_bridge_tests {
         use serde_json::{json, Value};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-        use tokio::net::TcpStream;
         use tokio::time::timeout;
 
         use crate::mcp_bridge::{
@@ -5778,7 +6102,7 @@ mod mcp_bridge_tests {
             let bridge = serve_mcp_tcp_with_timeout(dispatch.clone(), TEST_DEADLINE)
                 .await
                 .unwrap();
-            let stream = TcpStream::connect(bridge.connect_addr()).await.unwrap();
+            let stream = bridge.connect().await.unwrap();
             let (read, write) = stream.into_split();
             (dispatch, bridge, write, BufReader::new(read))
         }
@@ -5791,15 +6115,19 @@ mod mcp_bridge_tests {
 
         async fn read_response(reader: &mut BufReader<OwnedReadHalf>) -> Value {
             let mut buf = String::new();
-            timeout(Duration::from_secs(2), reader.read_line(&mut buf))
-                .await
-                .expect("read_line timed out")
-                .expect("read_line ok");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
+                reader.read_line(&mut buf),
+            )
+            .await
+            .expect("read_line timed out")
+            .expect("read_line ok");
             serde_json::from_str(buf.trim()).expect("response line must be whole JSON")
         }
 
         async fn wait_cancelled(dispatch: &WedgeDispatch, n: usize) {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let deadline = tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(2));
             while dispatch.cancelled.load(Ordering::SeqCst) < n {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -5985,7 +6313,7 @@ mod mcp_bridge_tests {
             let (stdin, stdin_remote) = tokio::io::duplex(64 * 1024);
             let (stdout_remote, stdout) = tokio::io::duplex(64 * 1024);
             let handle = tokio::spawn(async move {
-                run_bridge(&addr.to_string(), stdin_remote, stdout_remote, cfg).await
+                run_bridge(&addr.to_string(), stdin_remote, stdout_remote, cfg, None).await
             });
             BridgeHarness {
                 stdin,
@@ -6025,10 +6353,13 @@ mod mcp_bridge_tests {
 
             async fn read_response(&mut self) -> Value {
                 let mut line = String::new();
-                timeout(Duration::from_secs(5), self.stdout.read_line(&mut line))
-                    .await
-                    .expect("bridge stdout read timed out")
-                    .expect("bridge stdout read failed");
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    self.stdout.read_line(&mut line),
+                )
+                .await
+                .expect("bridge stdout read timed out")
+                .expect("bridge stdout read failed");
                 serde_json::from_str(line.trim()).expect("bridge stdout line is JSON")
             }
         }
@@ -6080,10 +6411,13 @@ mod mcp_bridge_tests {
             // Bind only after the bridge has started (and failed) connecting.
             sleep(Duration::from_millis(50)).await;
             let listener = TcpListener::bind(addr).await.unwrap();
-            let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("bridge never retried the connect")
-                .unwrap();
+            let (conn, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .expect("bridge never retried the connect")
+            .unwrap();
             tokio::spawn(answer_requests(conn));
 
             bridge.send_request(1).await;
@@ -6106,10 +6440,13 @@ mod mcp_bridge_tests {
             // Let the bridge burn a couple of backoff cycles first.
             sleep(Duration::from_millis(50)).await;
             let listener = TcpListener::bind(addr).await.unwrap();
-            let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("bridge never retried the connect")
-                .unwrap();
+            let (conn, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .expect("bridge never retried the connect")
+            .unwrap();
             tokio::spawn(answer_requests(conn));
             // The FIRST line on stdout is the real response for id 1; a
             // pre-fix bridge writes the -32001 reject here instead.
@@ -6135,10 +6472,13 @@ mod mcp_bridge_tests {
             let mut bridge = spawn_bridge(addr, cfg);
             bridge.send_request(7).await;
             // The bounded retry gives up with the connect error.
-            let result = timeout(Duration::from_secs(5), bridge.handle)
-                .await
-                .expect("bridge did not give up in time")
-                .unwrap();
+            let result = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                bridge.handle,
+            )
+            .await
+            .expect("bridge did not give up in time")
+            .unwrap();
             assert!(
                 result.is_err(),
                 "initial-connect give-up must surface an error"
@@ -6146,7 +6486,7 @@ mod mcp_bridge_tests {
             // Nothing was written to stdout for the buffered request.
             let mut leftover = String::new();
             timeout(
-                Duration::from_secs(5),
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
                 bridge.stdout.read_to_string(&mut leftover),
             )
             .await
@@ -6209,19 +6549,25 @@ mod mcp_bridge_tests {
             bridge.send_request(9).await;
             sleep(Duration::from_millis(50)).await;
             let listener = TcpListener::bind(addr).await.unwrap();
-            let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("bridge never connected")
-                .unwrap();
+            let (conn, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .expect("bridge never connected")
+            .unwrap();
             // Read the flushed request, then drop the connection without
             // answering it.
             let (read, write) = conn.into_split();
             let mut lines = BufReader::new(read).lines();
-            let line = timeout(Duration::from_secs(5), lines.next_line())
-                .await
-                .expect("buffered request never flushed to the connection")
-                .unwrap()
-                .unwrap();
+            let line = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                lines.next_line(),
+            )
+            .await
+            .expect("buffered request never flushed to the connection")
+            .unwrap()
+            .unwrap();
             let msg: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(msg["id"], json!(9), "buffered line is flushed in order");
             drop(write);
@@ -6237,18 +6583,24 @@ mod mcp_bridge_tests {
             let mut bridge = spawn_bridge(addr, fast_cfg());
 
             // First connection answers one request, then the server drops it.
-            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (conn1, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let (read1, mut write1) = conn1.into_split();
             bridge.send_request(1).await;
             let mut lines1 = BufReader::new(read1).lines();
-            let line = timeout(Duration::from_secs(5), lines1.next_line())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            let line = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                lines1.next_line(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
             let msg: Value = serde_json::from_str(&line).unwrap();
             let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":{"ok":true}});
             write1
@@ -6262,15 +6614,84 @@ mod mcp_bridge_tests {
 
             // The bridge reconnects to the same addr; the second connection
             // serves the follow-up request and stdio never closed in between.
-            let (conn2, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("bridge never reconnected")
-                .unwrap();
+            let (conn2, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .expect("bridge never reconnected")
+            .unwrap();
             tokio::spawn(answer_requests(conn2));
             bridge.send_request(2).await;
             let resp = bridge.read_response().await;
             assert_eq!(resp["id"], json!(2));
             assert_eq!(resp["result"]["ok"], json!(true));
+        }
+
+        /// The bridge authenticates on every connection, including a
+        /// mid-session reconnect: the listener refuses any connection whose
+        /// first line is not the secret, so a reconnect that skipped it would
+        /// silently lose the session.
+        #[tokio::test]
+        async fn every_connect_and_reconnect_presents_the_bridge_secret() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (stdin, stdin_remote) = tokio::io::duplex(64 * 1024);
+            let (stdout_remote, stdout) = tokio::io::duplex(64 * 1024);
+            let handle = tokio::spawn(async move {
+                run_bridge(
+                    &addr.to_string(),
+                    stdin_remote,
+                    stdout_remote,
+                    fast_cfg(),
+                    Some("s3cret".to_string()),
+                )
+                .await
+            });
+            let mut bridge = BridgeHarness {
+                stdin,
+                stdout: BufReader::new(stdout),
+                handle,
+            };
+            let expected = crate::bridge_auth_line("s3cret");
+            for id in [1, 2] {
+                let (conn, _) = timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    listener.accept(),
+                )
+                .await
+                .expect("bridge connected")
+                .unwrap();
+                let (read, mut write) = conn.into_split();
+                let mut lines = BufReader::new(read).lines();
+                bridge.send_request(id).await;
+                let first = timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    lines.next_line(),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+                assert_eq!(format!("{first}\n"), expected, "connection {id}");
+                let line = timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    lines.next_line(),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+                let msg: Value = serde_json::from_str(&line).unwrap();
+                let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":{"ok":true}});
+                write
+                    .write_all(format!("{resp}\n").as_bytes())
+                    .await
+                    .unwrap();
+                assert_eq!(bridge.read_response().await["id"], json!(id));
+                // Drop the connection; the bridge must reconnect and
+                // authenticate again for the next request.
+            }
         }
 
         /// Regression for monorepo#906: a stdin line that races a *pending*
@@ -6303,18 +6724,24 @@ mod mcp_bridge_tests {
             let mut bridge = spawn_bridge_with_connector(addr, fast_cfg(), connect);
 
             // Session 1: answer one request cleanly, then drop the TCP side.
-            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (conn1, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let (read1, mut write1) = conn1.into_split();
             bridge.send_request(1).await;
             let mut lines1 = BufReader::new(read1).lines();
-            let line = timeout(Duration::from_secs(5), lines1.next_line())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            let line = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                lines1.next_line(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
             let msg: Value = serde_json::from_str(&line).unwrap();
             let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":{"ok":true}});
             write1
@@ -6327,11 +6754,14 @@ mod mcp_bridge_tests {
             drop(lines1);
 
             // Wait until reconnect attempt 2 is in flight (parked on the gate).
-            timeout(Duration::from_secs(5), async {
-                while attempts.load(Ordering::SeqCst) < 2 {
-                    sleep(Duration::from_millis(5)).await;
-                }
-            })
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                async {
+                    while attempts.load(Ordering::SeqCst) < 2 {
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                },
+            )
             .await
             .expect("bridge never started the reconnect attempt");
 
@@ -6342,6 +6772,7 @@ mod mcp_bridge_tests {
             // the line before the gate opens, so the race is exercised).
             bridge.send_request(2).await;
             let mut peek = String::new();
+            // fixed-deadline: allow — stays under fast_cfg()'s 2s reconnect_window, after which the bridge may legitimately reject
             let silent = timeout(
                 Duration::from_millis(200),
                 bridge.stdout.read_line(&mut peek),
@@ -6353,10 +6784,13 @@ mod mcp_bridge_tests {
             );
             gate.notify_one();
 
-            let (conn2, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("bridge never completed the reconnect")
-                .unwrap();
+            let (conn2, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .expect("bridge never completed the reconnect")
+            .unwrap();
             tokio::spawn(answer_requests(conn2));
 
             let resp = bridge.read_response().await;
@@ -6400,18 +6834,24 @@ mod mcp_bridge_tests {
             let mut bridge = spawn_bridge_with_connector(addr, fast_cfg(), connect);
 
             // Session 1: answer one request cleanly, then drop the TCP side.
-            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (conn1, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let (read1, mut write1) = conn1.into_split();
             bridge.send_request(1).await;
             let mut lines1 = BufReader::new(read1).lines();
-            let line = timeout(Duration::from_secs(5), lines1.next_line())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            let line = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                lines1.next_line(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
             let msg: Value = serde_json::from_str(&line).unwrap();
             let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":{"ok":true}});
             write1
@@ -6423,11 +6863,14 @@ mod mcp_bridge_tests {
             drop(write1);
             drop(lines1);
 
-            timeout(Duration::from_secs(5), async {
-                while attempts.load(Ordering::SeqCst) < 2 {
-                    sleep(Duration::from_millis(5)).await;
-                }
-            })
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                async {
+                    while attempts.load(Ordering::SeqCst) < 2 {
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                },
+            )
             .await
             .expect("bridge never started the reconnect attempt");
 
@@ -6436,6 +6879,7 @@ mod mcp_bridge_tests {
             // to consume the line before the gate opens).
             bridge.send_request(2).await;
             let mut peek = String::new();
+            // fixed-deadline: allow — stays under fast_cfg()'s 2s reconnect_window, after which the bridge may legitimately reject
             let silent = timeout(
                 Duration::from_millis(200),
                 bridge.stdout.read_line(&mut peek),
@@ -6461,20 +6905,26 @@ mod mcp_bridge_tests {
             let addr = listener.local_addr().unwrap();
             let mut bridge = spawn_bridge(addr, fast_cfg());
 
-            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (conn1, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let (read1, write1) = conn1.into_split();
             // Forwarded but never answered: the server reads the request and
             // then drops the connection.
             bridge.send_request(9).await;
             let mut lines1 = BufReader::new(read1).lines();
-            timeout(Duration::from_secs(5), lines1.next_line())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                lines1.next_line(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
             drop(write1);
             drop(lines1);
 
@@ -6543,7 +6993,7 @@ mod mcp_bridge_tests {
                 json!({"jsonrpc":"2.0","id":2,"method":"tools/call"}).to_string(),
             ];
             let end = timeout(
-                Duration::from_secs(5),
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
                 pump_session(
                     tokio::io::empty(),
                     tcp_write,
@@ -6585,7 +7035,7 @@ mod mcp_bridge_tests {
             // The empty TCP read side yields EOF right after the flush, so
             // the session ends as TcpDropped with both lines delivered.
             let end = timeout(
-                Duration::from_secs(5),
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
                 pump_session(
                     tokio::io::empty(),
                     tcp_write,
@@ -6616,10 +7066,13 @@ mod mcp_bridge_tests {
             };
             let mut bridge = spawn_bridge(addr, cfg);
 
-            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (conn1, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             // Kill the connection and the listener: the daemon is gone for good.
             drop(conn1);
             drop(listener);
@@ -6645,10 +7098,13 @@ mod mcp_bridge_tests {
             }
 
             // Once the reconnect window is exhausted the bridge exits cleanly.
-            let result = timeout(Duration::from_secs(5), bridge.handle)
-                .await
-                .expect("bridge did not exit after reconnect window")
-                .unwrap();
+            let result = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                bridge.handle,
+            )
+            .await
+            .expect("bridge did not exit after reconnect window")
+            .unwrap();
             assert!(
                 result.is_ok(),
                 "reconnect give-up must exit cleanly: {result:?}"
@@ -6660,16 +7116,22 @@ mod mcp_bridge_tests {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let addr = listener.local_addr().unwrap();
             let bridge = spawn_bridge(addr, fast_cfg());
-            let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (conn, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             tokio::spawn(answer_requests(conn));
             drop(bridge.stdin);
-            let result = timeout(Duration::from_secs(5), bridge.handle)
-                .await
-                .expect("bridge did not exit on stdin EOF")
-                .unwrap();
+            let result = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                bridge.handle,
+            )
+            .await
+            .expect("bridge did not exit on stdin EOF")
+            .unwrap();
             assert!(result.is_ok(), "stdin EOF must exit cleanly: {result:?}");
         }
     }
@@ -6729,6 +7191,7 @@ mod _dead_workspace_metadata_tool_tests {
                 scope: None,
                 skip_worktree: false,
                 setup_script: None,
+                skills: None,
                 is_remote: false,
                 default_model: None,
                 pr_number: None,
@@ -6738,6 +7201,7 @@ mod _dead_workspace_metadata_tool_tests {
                 pull_requests: None,
                 archived: false,
                 archived_at: None,
+                retired_at: None,
                 task_stats: None,
                 agent_summary: None,
                 diff_summary: None,
@@ -6982,10 +7446,7 @@ mod workspace_api_tool_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use intent_core::{
-        BoxFuture, Result, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
-        WorkspaceId, WorkspaceStatus,
-    };
+    use intent_core::{BoxFuture, Result, Workspace, WorkspaceApi, WorkspaceId};
     use serde_json::{json, Value};
 
     use crate::WorkspaceMcpServer;
@@ -7007,49 +7468,10 @@ mod workspace_api_tool_tests {
                 id: WorkspaceId::from_string(id),
                 title: id.to_string(),
                 branch: id.to_string(),
-                base_ref: None,
-                base_commit_sha: None,
-                status: WorkspaceStatus::Active,
-                status_message: None,
-                status_image_asset_id: None,
-                activity: WorkspaceActivity::Idle,
-                attention: WorkspaceAttention::None,
                 created_at: now.clone(),
                 updated_at: now,
-                last_activity: None,
-                last_content_activity: None,
-                tags: Vec::new(),
                 path: path.map(str::to_string),
-                repository_path: None,
-                repository_owner: None,
-                repository_name: None,
-                worktree_path: None,
-                scope: None,
-                skip_worktree: false,
-                setup_script: None,
-                is_remote: false,
-                default_model: None,
-                pr_number: None,
-                pr_url: None,
-                pr_status: None,
-                active_pull_request: None,
-                pull_requests: None,
-                context_links: None,
-                archived: false,
-                archived_at: None,
-                task_stats: None,
-                agent_summary: None,
-                diff_summary: None,
-                token_usage: None,
-                cow_supported: None,
-                browser_client_id: None,
-                pull_requests_total: None,
-                display_status: None,
-                waiting: false,
-                checkout_mode: None,
-                disk_usage: None,
-                pending_delete_at: None,
-                membership: None,
+                ..Default::default()
             };
             Arc::new(Self {
                 ws: Mutex::new(ws),
@@ -7170,11 +7592,17 @@ mod workspace_api_tool_tests {
 
         assert_eq!(proposal["kind"], "workspace-create");
         assert_eq!(proposal["payload"]["operation"], "workspace.create");
-        assert_eq!(
-            first["proposalId"], "Create workspace: Follow up",
-            "top-level proposalId is the applyProposal handle (preview.title, no applyToolCallId)"
+        assert_eq!(proposal["preview"]["title"], "Create workspace: Follow up");
+        let first_id = first["proposalId"].as_str().expect("proposalId");
+        assert!(
+            first_id.starts_with("workspace-create-"),
+            "top-level proposalId is the card's unique applyToolCallId: {first_id}"
         );
-        assert_eq!(first["proposalId"], proposal["preview"]["title"]);
+        assert_eq!(first["proposalId"], proposal["applyToolCallId"]);
+        assert_ne!(
+            second["proposalId"], first["proposalId"],
+            "same-titled follow-up cards never share an identity"
+        );
         assert_eq!(create["mode"], "sibling");
         assert_eq!(create["title"], "Follow up");
         assert_eq!(
@@ -7213,6 +7641,199 @@ mod workspace_api_tool_tests {
         let retry_apply = request_for_apply();
         assert_eq!(first_apply, retry_apply);
         assert_eq!(first_apply["idempotencyKey"], params["idempotencyKey"]);
+    }
+
+    /// Give `repo` an `origin` remote at `url` whose fetched `main` tracking
+    /// ref points at the current `main` commit (a pushed default branch).
+    fn add_origin(repo: &std::path::Path, url: &str) {
+        let repo = git2::Repository::open(repo).unwrap();
+        repo.remote("origin", url).unwrap();
+        let main = repo
+            .find_reference("refs/heads/main")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        repo.reference("refs/remotes/origin/main", main, true, "test fetch")
+            .unwrap();
+    }
+
+    async fn propose(srv: &WorkspaceMcpServer, base_ref: Option<&str>) -> Value {
+        let base = base_ref.map_or(String::new(), |r| format!(", baseRef: '{r}'"));
+        let code = format!(
+            "return await ws.workspace.proposeSibling({{ title: 'Follow up', initialPrompt: 'Do it.'{base} }});"
+        );
+        tool_json(&call_workspace_api(srv, &code).await)
+    }
+
+    /// A GitHub `origin` (HTTPS or SSH, with or without `.git`) makes the
+    /// proposal a repo-cache clone: canonical https `githubUrl`, no
+    /// `repositoryPath` / `clonePath` (the FE + daemon cache-hydration
+    /// contract), `repoType: "github"` in the preview.
+    #[tokio::test]
+    async fn propose_sibling_clones_when_origin_is_github() {
+        for origin in [
+            "https://github.com/intent-hq/intentd.git",
+            "https://github.com/intent-hq/intentd",
+            "git@github.com:intent-hq/intentd.git",
+            "ssh://git@github.com/intent-hq/intentd.git",
+        ] {
+            let repo = git_repo();
+            add_origin(repo.path(), origin);
+            let srv = server_with_repo("amber-forest", repo.path());
+            let result = propose(&srv, None).await;
+            let params = &result["proposal"]["payload"]["params"];
+            let create = &result["proposal"]["preview"]["workspaceCreate"];
+            assert_eq!(
+                params["githubUrl"], "https://github.com/intent-hq/intentd",
+                "{origin}"
+            );
+            assert!(params.get("repositoryPath").is_none(), "{origin}: {params}");
+            assert!(params.get("clonePath").is_none(), "{origin}: {params}");
+            assert_eq!(params["repositoryOwner"], "intent-hq");
+            assert_eq!(params["repositoryName"], "intentd");
+            assert_eq!(params["baseRef"], "main");
+            assert!(params["idempotencyKey"]
+                .as_str()
+                .unwrap()
+                .starts_with("sibling-workspace-"));
+            assert_eq!(create["mode"], "sibling");
+            assert_eq!(create["repoType"], "github", "{origin}");
+            assert_eq!(create["githubUrl"], "https://github.com/intent-hq/intentd");
+            assert_eq!(create["repoPath"], repo.path().to_string_lossy().as_ref());
+            assert!(result["proposal"]["preview"].get("warnings").is_none());
+        }
+    }
+
+    fn server_with_identity(
+        repo: &std::path::Path,
+        owner: Option<&str>,
+        name: Option<&str>,
+    ) -> WorkspaceMcpServer {
+        let api = WorkspaceInfoMockApi::new("amber-forest", None);
+        {
+            let mut workspace = api.ws.lock().unwrap();
+            workspace.repository_path = Some(repo.to_string_lossy().into_owned());
+            workspace.repository_owner = owner.map(str::to_string);
+            workspace.repository_name = name.map(str::to_string);
+        }
+        WorkspaceMcpServer::new(api, WorkspaceId::from_string("amber-forest"))
+    }
+
+    /// The clone needs the caller row's own GitHub identity: it no longer
+    /// shares `repositoryPath` with its parent, so owner/name is the only
+    /// `crossWorkspace.*` sibling link, and a fork / renamed `origin` must not
+    /// persist an identity that disagrees with `githubUrl`. Identity compares
+    /// case-insensitively (`RepoRef`).
+    #[tokio::test]
+    async fn propose_sibling_clones_only_when_origin_matches_row_identity() {
+        let repo = git_repo();
+        add_origin(repo.path(), "git@github.com:clement/intentd.git");
+        for (owner, name) in [
+            (None, None),
+            (Some(""), Some("")),
+            (Some("intent-hq"), Some("intentd")),
+        ] {
+            let srv = server_with_identity(repo.path(), owner, name);
+            let params = &propose(&srv, None).await["proposal"]["payload"]["params"];
+            assert_eq!(
+                params["repositoryPath"],
+                repo.path().to_string_lossy().as_ref(),
+                "{owner:?}/{name:?}"
+            );
+            assert!(params.get("githubUrl").is_none(), "{owner:?}/{name:?}");
+        }
+
+        let srv = server_with_identity(repo.path(), Some("Clement"), Some("IntentD"));
+        let params = &propose(&srv, None).await["proposal"]["payload"]["params"];
+        assert_eq!(params["githubUrl"], "https://github.com/Clement/IntentD");
+        assert_eq!(params["repositoryOwner"], "Clement");
+        assert_eq!(params["repositoryName"], "IntentD");
+        assert!(params.get("repositoryPath").is_none());
+    }
+
+    /// The default branch is checked too: with no `origin/HEAD`,
+    /// `repo_default_branch` can fall back to an unpushed local branch the
+    /// clone would lack.
+    #[tokio::test]
+    async fn propose_sibling_keeps_worktree_for_unpushed_default_branch() {
+        let repo = git_repo();
+        git2::Repository::open(repo.path())
+            .unwrap()
+            .remote("origin", "https://github.com/intent-hq/intentd.git")
+            .unwrap();
+        let srv = server_with_repo("amber-forest", repo.path());
+        let result = propose(&srv, None).await;
+        let params = &result["proposal"]["payload"]["params"];
+        assert_eq!(
+            params["repositoryPath"],
+            repo.path().to_string_lossy().as_ref()
+        );
+        assert!(params.get("githubUrl").is_none());
+        let warning = result["proposal"]["preview"]["warnings"][0]
+            .as_str()
+            .unwrap();
+        assert!(
+            warning.contains(params["baseRef"].as_str().unwrap()),
+            "{warning}"
+        );
+        assert!(warning.contains("worktree"), "{warning}");
+    }
+
+    /// A non-GitHub `origin` keeps today's linked-worktree request.
+    #[tokio::test]
+    async fn propose_sibling_keeps_worktree_for_non_github_origin() {
+        let repo = git_repo();
+        add_origin(repo.path(), "git@gitlab.com:intent-hq/intentd.git");
+        let srv = server_with_repo("amber-forest", repo.path());
+        let result = propose(&srv, None).await;
+        let params = &result["proposal"]["payload"]["params"];
+        let create = &result["proposal"]["preview"]["workspaceCreate"];
+        assert_eq!(
+            params["repositoryPath"],
+            repo.path().to_string_lossy().as_ref()
+        );
+        assert!(params.get("githubUrl").is_none());
+        assert_eq!(create["repoType"], "local");
+    }
+
+    /// A named base ref that exists locally but was never pushed would be
+    /// missing from the clone: keep the worktree and say why.
+    #[tokio::test]
+    async fn propose_sibling_keeps_worktree_for_local_only_base_ref() {
+        let repo = git_repo();
+        add_origin(repo.path(), "https://github.com/intent-hq/intentd.git");
+        let srv = server_with_repo("amber-forest", repo.path());
+
+        let local_only = propose(&srv, Some("feature/ready")).await;
+        let params = &local_only["proposal"]["payload"]["params"];
+        assert_eq!(
+            params["repositoryPath"],
+            repo.path().to_string_lossy().as_ref()
+        );
+        assert!(params.get("githubUrl").is_none());
+        assert_eq!(params["baseRef"], "feature/ready");
+        assert_eq!(
+            local_only["proposal"]["preview"]["workspaceCreate"]["repoType"],
+            "local"
+        );
+        let warning = local_only["proposal"]["preview"]["warnings"][0]
+            .as_str()
+            .unwrap();
+        assert!(warning.contains("feature/ready"), "{warning}");
+        assert!(warning.contains("worktree"), "{warning}");
+
+        for pushed in ["main", "origin/main"] {
+            let result = propose(&srv, Some(pushed)).await;
+            let params = &result["proposal"]["payload"]["params"];
+            assert_eq!(
+                params["githubUrl"], "https://github.com/intent-hq/intentd",
+                "{pushed}"
+            );
+            assert!(params.get("repositoryPath").is_none(), "{pushed}");
+            assert_eq!(params["baseRef"], pushed);
+            assert!(result["proposal"]["preview"].get("warnings").is_none());
+        }
     }
 
     #[tokio::test]
@@ -7521,7 +8142,7 @@ mod workspace_api_tool_tests {
         let srv =
             server("amber-forest", None).with_workspace_api_timeout(Duration::from_millis(250));
         let resp = tokio::time::timeout(
-            Duration::from_secs(5),
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
             call_workspace_api(&srv, "while (true) {}"),
         )
         .await
@@ -7661,8 +8282,14 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // Every gate is open by default.
-        let all_on_srv = server("amber-forest", None);
+        // Every gate open: the defaults plus the off-by-default
+        // `secretRequests` toggle (PROTOCOL §5.56).
+        let all_on_srv = server("amber-forest", None).with_agent_features(
+            intent_core::settings_file::AgentFeaturesSettings {
+                secret_requests: true,
+                ..Default::default()
+            },
+        );
         let resp = all_on_srv
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -7792,10 +8419,13 @@ mod workspace_api_tool_tests {
     #[tokio::test]
     async fn assistant_management_discovery_matches_workspace_scope() {
         for (workspace, is_assistant) in [("amber-forest", false), ("__chief__", true)] {
-            for mcp_tools in [false, true] {
+            for (mcp_tools, desktop_control) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
                 let srv = server(workspace, None).with_agent_features(
                     intent_core::settings_file::AgentFeaturesSettings {
                         mcp_tools,
+                        desktop_control,
                         ..Default::default()
                     },
                 );
@@ -7806,6 +8436,7 @@ mod workspace_api_tool_tests {
                 let description = response["result"]["tools"][0]["description"]
                     .as_str()
                     .unwrap();
+                assert_eq!(description.contains("ws.desktop.move("), desktop_control);
                 for (namespace, method) in [("mcp", "createServer"), ("chats", "rename")] {
                     assert_eq!(
                         description.contains(&format!("ws.app.{namespace}.{method}(")),
@@ -7813,14 +8444,14 @@ mod workspace_api_tool_tests {
                     );
                     let response = call_workspace_api(
                         &srv,
-                        &format!("let help; try {{ help = await ws.help('app.{namespace}'); }} catch (_) {{ help = ''; }} return {{ installed: typeof ws.app.{namespace} !== 'undefined', advertised: help.includes('ws.app.{namespace}.{method}(') }};"),
+                        &format!("let help; try {{ help = await ws.help('app.{namespace}'); }} catch (_) {{ help = ''; }} return {{ installed: typeof ws.app.{namespace} !== 'undefined', advertised: help.includes('ws.app.{namespace}.{method}('), desktopMove: typeof ws.desktop?.move === 'function' }};"),
                     )
                     .await;
                     assert_eq!(response["result"]["isError"], false, "{response}");
                     let body: Value = serde_json::from_str(tool_text(&response)).unwrap();
                     assert_eq!(
                         body,
-                        json!({ "installed": is_assistant, "advertised": is_assistant })
+                        json!({ "installed": is_assistant, "advertised": is_assistant, "desktopMove": desktop_control })
                     );
                 }
             }
@@ -8055,8 +8686,14 @@ mod workspace_api_tool_tests {
             "un-gated surface must stay advertised"
         );
 
-        // A default top-level bridge stays byte-identical to the static const.
-        let top = server("amber-forest", None).with_sub_agent(false);
+        // A top-level bridge with every gate open stays byte-identical to
+        // the static const.
+        let top = server("amber-forest", None)
+            .with_sub_agent(false)
+            .with_agent_features(intent_core::settings_file::AgentFeaturesSettings {
+                secret_requests: true,
+                ..Default::default()
+            });
         let resp = top
             .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
             .await
@@ -8373,10 +9010,19 @@ mod wsapi3_bindings_tests {
             asset: String,
         ) -> BoxFuture<'_, Result<ReadAssetResult>> {
             self.read_asset_calls.lock().unwrap().push(asset.clone());
+            let mime_type = if std::path::Path::new(&asset)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("webm"))
+            {
+                "video/webm"
+            } else {
+                "image/png"
+            };
             Box::pin(async move {
                 Ok(ReadAssetResult {
                     asset_id: asset,
-                    mime_type: "image/png".to_string(),
+                    mime_type: mime_type.to_string(),
                     data: "AAAA".to_string(),
                     size_kb: 1,
                 })
@@ -9136,6 +9782,19 @@ mod wsapi3_bindings_tests {
         assert!(text(&resp).contains("Note not found"));
     }
 
+    /// A bracketed title stays one Markdown link (shared escaping with the
+    /// workspace links).
+    #[tokio::test]
+    async fn note_create_markdown_link_escapes_brackets_in_the_title() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.note.create('Fix [beta]', 'x');").await;
+        let v = body(&resp);
+        assert_eq!(
+            v["markdownLink"],
+            json!(r"[Fix \[beta\]](intent://local/amber-forest/note/n-new)")
+        );
+    }
+
     #[tokio::test]
     async fn note_create_returns_link_and_markdown_link() {
         let (srv, api) = server();
@@ -9258,12 +9917,43 @@ mod wsapi3_bindings_tests {
             "return await ws.note.readAsset('workspace-asset://amber-forest/img-1');",
         )
         .await;
+        let content = resp["result"]["content"].as_array().unwrap();
+        let image = content
+            .iter()
+            .find(|item| item["type"] == "image")
+            .expect("image assets must return a native MCP image block");
+        assert_eq!(image["mimeType"], json!("image/png"));
+        assert_eq!(image["data"], json!("AAAA"));
+        assert_eq!(resp["result"]["isError"], json!(false));
+
+        let resp = call(
+            &srv,
+            "const a = await ws.note.readAsset('workspace-asset://amber-forest/img-1'); return { assetId: a.assetId, mimeType: a.mimeType, data: a.data, sizeKb: a.sizeKb };",
+        )
+        .await;
         let v = body(&resp);
+        assert_eq!(v["assetId"], json!("workspace-asset://amber-forest/img-1"));
         assert_eq!(v["mimeType"], json!("image/png"));
+        assert_eq!(v["data"], json!("AAAA"));
         assert_eq!(v["sizeKb"], json!(1));
+
+        let resp = call(
+            &srv,
+            "return await ws.note.readAsset('workspace-asset://amber-forest/clip.webm');",
+        )
+        .await;
+        let v = body(&resp);
+        assert_eq!(v["mimeType"], json!("video/webm"));
+        assert_eq!(v["data"], json!("AAAA"));
+        assert_eq!(v["sizeKb"], json!(1));
+        assert!(v.get("__mcpContentItems").is_none());
         assert_eq!(
-            api.read_asset_calls.lock().unwrap()[0],
-            "workspace-asset://amber-forest/img-1"
+            *api.read_asset_calls.lock().unwrap(),
+            vec![
+                "workspace-asset://amber-forest/img-1".to_string(),
+                "workspace-asset://amber-forest/img-1".to_string(),
+                "workspace-asset://amber-forest/clip.webm".to_string(),
+            ]
         );
     }
 
@@ -9700,7 +10390,9 @@ mod wsapi6_bindings_tests {
     struct FakeApi {
         pr_snapshot_calls: Mutex<Vec<PrSnapshotCall>>,
         cross_list_siblings_calls: Mutex<u32>,
+        cross_list_siblings_include_retired: Mutex<Vec<bool>>,
         cross_read_note_calls: Mutex<Vec<CrossReadCall>>,
+        cross_read_note_windows: Mutex<Vec<intent_core::note_read_bounds::LineWindow>>,
         cross_list_notes_calls: Mutex<Vec<String>>,
         browser_exec_calls: Mutex<Vec<BrowserExecCall>>,
         /// When set, `browser_exec` shapes this raw FE envelope through the
@@ -9708,6 +10400,9 @@ mod wsapi6_bindings_tests {
         /// seam the production `Services::browser_exec` uses — so the JS
         /// dispatch tests exercise real shaping instead of canned replies.
         browser_exec_fe_envelope: Mutex<Option<Value>>,
+        /// When set, `browser_exec` fails with this internal error.
+        browser_exec_error: Mutex<Option<String>>,
+        browser_clients_calls: Mutex<Vec<(String, Option<String>)>>,
     }
 
     impl WorkspaceApi for FakeApi {
@@ -9750,8 +10445,16 @@ mod wsapi6_bindings_tests {
             })
         }
 
-        fn cross_workspace_list_siblings(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        fn cross_workspace_list_siblings(
+            &self,
+            _ws: WorkspaceId,
+            include_retired: bool,
+        ) -> BoxFuture<'_, Result<Value>> {
             *self.cross_list_siblings_calls.lock().unwrap() += 1;
+            self.cross_list_siblings_include_retired
+                .lock()
+                .unwrap()
+                .push(include_retired);
             Box::pin(async {
                 Ok(json!([
                     { "id": "sibling-1", "title": "Sib One", "branch": "b/1", "status": "active" },
@@ -9764,7 +10467,11 @@ mod wsapi6_bindings_tests {
             _ws: WorkspaceId,
             target: WorkspaceId,
             note_id: NoteId,
+            window: intent_core::note_read_bounds::LineWindow,
+            bounded_default: bool,
         ) -> BoxFuture<'_, Result<Value>> {
+            assert!(bounded_default, "agents get bounded defaults");
+            self.cross_read_note_windows.lock().unwrap().push(window);
             self.cross_read_note_calls
                 .lock()
                 .unwrap()
@@ -9812,6 +10519,9 @@ mod wsapi6_bindings_tests {
                 agent_id.map(|a| a.as_str().to_string()),
             ));
             let fe_envelope = self.browser_exec_fe_envelope.lock().unwrap().clone();
+            if let Some(error) = self.browser_exec_error.lock().unwrap().clone() {
+                return Box::pin(async move { Err(intent_core::Error::Internal(error)) });
+            }
             // Reference parity: a single-action batch yields the sole action's
             // envelope; multi-action yields `{ results: [...] }`. The fake
             // stands in for what the reverse channel would have returned.
@@ -9841,6 +10551,37 @@ mod wsapi6_bindings_tests {
                             .collect::<Vec<_>>()
                     }))
                 }
+            })
+        }
+
+        fn browser_clients(
+            &self,
+            ws: WorkspaceId,
+            agent_id: Option<AgentId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.browser_clients_calls.lock().unwrap().push((
+                ws.as_str().to_string(),
+                agent_id.map(|a| a.as_str().to_string()),
+            ));
+            Box::pin(async {
+                Ok(json!({
+                    "clients": [{
+                        "clientId": "desktop-a",
+                        "name": "Desktop A",
+                        "canHostBrowser": true,
+                        "connections": [{
+                            "connectionId": 4,
+                            "transport": "wss",
+                            "connectedAt": "2026-10-27T09:00:00Z",
+                            "canHostBrowser": true,
+                        }],
+                    }],
+                    "unpinned": { "clientId": "desktop-a", "name": "Desktop A", "connectionId": 4 },
+                    "workspace": {
+                        "clientId": "desktop-a", "name": "Desktop A", "connectionId": 4,
+                        "source": "default",
+                    },
+                }))
             })
         }
     }
@@ -9897,6 +10638,70 @@ mod wsapi6_bindings_tests {
         assert_eq!(*api.cross_list_siblings_calls.lock().unwrap(), 1);
     }
 
+    /// Each sibling row carries a ready-made workspace link so agents can
+    /// reference the workspace by a clickable title instead of its bare ID.
+    #[tokio::test]
+    async fn cross_workspace_list_siblings_rows_carry_workspace_links() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.crossWorkspace.listSiblings();").await;
+        let v = body(&resp);
+        assert_eq!(v[0]["link"], json!("intent://local/workspace/sibling-1"));
+        assert_eq!(
+            v[0]["markdownLink"],
+            json!("[Sib One](intent://local/workspace/sibling-1)")
+        );
+    }
+
+    /// `includeRetired` is strictly boolean: omission and explicit `false`
+    /// list live siblings, `true` opts in, and any other value (`"true"`,
+    /// `null`, a number, an object) is an invalid-params error that never
+    /// reaches the service.
+    #[tokio::test]
+    async fn cross_workspace_list_siblings_rejects_a_non_boolean_include_retired() {
+        let (srv, api) = server();
+        for (arg, want) in [
+            ("", false),
+            ("{ includeRetired: false }", false),
+            ("{ includeRetired: true }", true),
+        ] {
+            let resp = call(
+                &srv,
+                &format!("return await ws.crossWorkspace.listSiblings({arg});"),
+            )
+            .await;
+            assert_eq!(resp["result"]["isError"], json!(false), "{arg}: {resp}");
+            assert_eq!(
+                api.cross_list_siblings_include_retired
+                    .lock()
+                    .unwrap()
+                    .last(),
+                Some(&want),
+                "{arg}"
+            );
+        }
+        for bad in ["'true'", "null", "1", "{}"] {
+            let resp = call(
+                &srv,
+                &format!(
+                    "return await ws.crossWorkspace.listSiblings({{ includeRetired: {bad} }});"
+                ),
+            )
+            .await;
+            let text = resp.to_string();
+            assert_eq!(resp["result"]["isError"], json!(true), "{bad}: {text}");
+            assert!(
+                text.contains("includeRetired must be a boolean")
+                    || text.contains("`includeRetired` must be a boolean"),
+                "{bad}: {text}"
+            );
+        }
+        assert_eq!(
+            *api.cross_list_siblings_calls.lock().unwrap(),
+            3,
+            "bad values never reach the api"
+        );
+    }
+
     #[tokio::test]
     async fn cross_workspace_read_note_forwards_target_and_note_ids() {
         let (srv, api) = server();
@@ -9914,6 +10719,42 @@ mod wsapi6_bindings_tests {
             *api.cross_read_note_calls.lock().unwrap(),
             vec![("sibling-1".to_string(), "n-1".to_string())]
         );
+    }
+
+    #[tokio::test]
+    async fn cross_workspace_read_note_forwards_line_window() {
+        let (srv, api) = server();
+        let resp = call(
+            &srv,
+            "return await ws.crossWorkspace.readNote('sibling-1', 'n-1', { startLine: 4, maxLines: 9, startOffset: 12 });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let resp = call(
+            &srv,
+            "return await ws.crossWorkspace.readNote('sibling-1', 'n-1');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let windows = api.cross_read_note_windows.lock().unwrap().clone();
+        assert_eq!(
+            windows,
+            vec![
+                intent_core::note_read_bounds::LineWindow {
+                    start_line: Some(4),
+                    max_lines: Some(9),
+                    start_offset: Some(12),
+                },
+                intent_core::note_read_bounds::LineWindow::default(),
+            ]
+        );
+        let resp = call(
+            &srv,
+            "return await ws.crossWorkspace.readNote('sibling-1', 'n-1', { startLine: 0 });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("startLine must be a positive integer"));
     }
 
     #[tokio::test]
@@ -10323,6 +11164,98 @@ mod wsapi6_bindings_tests {
         }
     }
 
+    // `ws.browser.clients()`: the services snapshot passes through unchanged,
+    // scoped to the server's workspace, with no browser.exec dispatch.
+    #[tokio::test]
+    async fn browser_clients_returns_the_services_snapshot() {
+        let (srv, api) = server_with_caller("agent-77");
+        let resp = call(&srv, "return await ws.browser.clients();").await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let v = body(&resp);
+        assert_eq!(v["clients"][0]["connections"][0]["connectionId"], json!(4));
+        assert_eq!(v["unpinned"]["connectionId"], json!(4));
+        assert_eq!(v["workspace"]["source"], json!("default"));
+        assert_eq!(
+            *api.browser_clients_calls.lock().unwrap(),
+            vec![("amber-forest".to_string(), Some("agent-77".to_string()))]
+        );
+        assert!(api.browser_exec_calls.lock().unwrap().is_empty());
+    }
+
+    // A timed-out `browser.exec` points to `ws.browser.clients()`; other
+    // failures are left as they were.
+    #[tokio::test]
+    async fn browser_exec_timeout_points_to_browser_clients() {
+        let (srv, api) = server();
+        *api.browser_exec_error.lock().unwrap() = Some(
+            "browser.exec: reverse request timed out: browser.exec: browser client \
+             \"Desktop A\" (desktop-a) on connection 4 over wss, connected \
+             2026-10-27T09:00:00Z did not accept or answer the request within 30s"
+                .to_string(),
+        );
+        let resp = call(
+            &srv,
+            "return await ws.browser.exec([{ action: 'screenshot' }]);",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let message = text(&resp);
+        assert!(message.contains("on connection 4 over wss"), "{message}");
+        assert!(
+            message.contains("Call ws.browser.clients() to see this client's live connections"),
+            "{message}"
+        );
+
+        // An error the client itself returned (no daemon deadline suffix)
+        // gets no hint, even though its text says "timed out".
+        *api.browser_exec_error.lock().unwrap() =
+            Some("browser.exec: reverse request timed out: browser.exec".to_string());
+        let resp = call(
+            &srv,
+            "return await ws.browser.exec([{ action: 'screenshot' }]);",
+        )
+        .await;
+        let message = text(&resp);
+        assert!(message.contains("timed out"), "{message}");
+        assert!(!message.contains("ws.browser.clients()"), "{message}");
+
+        *api.browser_exec_error.lock().unwrap() =
+            Some("browser.exec: no client connected".to_string());
+        let resp = call(
+            &srv,
+            "return await ws.browser.exec([{ action: 'screenshot' }]);",
+        )
+        .await;
+        let message = text(&resp);
+        assert!(message.contains("no client connected"), "{message}");
+        assert!(!message.contains("ws.browser.clients()"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn browser_docs_overview_explains_timeouts_and_clients() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.browser.docs('overview');").await;
+        let v = body(&resp);
+        let doc = v.as_str().expect("docs return string");
+        assert!(doc.contains("## Troubleshooting Timeouts"));
+        assert!(doc.contains("ws.browser.clients()"));
+        assert!(doc.contains("reverse request timed out"));
+    }
+
+    #[tokio::test]
+    async fn browser_docs_overview_states_full_frame_rate_during_agent_use() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.browser.docs('overview');").await;
+        let v = body(&resp);
+        let doc = v.as_str().expect("docs return string");
+        assert!(doc.contains("**Frame rate during agent use.**"));
+        assert!(doc.contains("draws at full\nframe rate"));
+        assert!(doc.contains("30 s\nafter your last action"));
+        // The idle rate is uneven (1-57 fps measured), not a fixed 1 fps.
+        assert!(doc.contains("throttled,\nuneven rate"));
+        assert!(!doc.contains("about 1 frame per second"));
+    }
+
     #[tokio::test]
     async fn browser_docs_rejects_unknown_topic() {
         let (srv, _api) = server();
@@ -10391,6 +11324,12 @@ mod wsapi4_bindings_tests {
         agent_delete_calls: Mutex<Vec<(String, Option<String>)>>,
         agent_retire_calls: Mutex<Vec<RetireCall>>,
         agent_create_calls: Mutex<Vec<CreateCall>>,
+        /// `(method, placement)` of every create / delegate / wakeOrCreate.
+        placements: Mutex<Vec<(&'static str, Option<Value>)>>,
+        /// What `agent_placement_help` answers.
+        placement_help: Mutex<Option<String>>,
+        /// What `is_plain_folder_workspace` answers.
+        plain_folder: Mutex<bool>,
         /// Count of `agent_watch_completion` (create-path auto-subscribe)
         /// calls — `create({ topLevel: true })` must never make one.
         agent_watch_completion_calls: Mutex<u32>,
@@ -10461,8 +11400,19 @@ mod wsapi4_bindings_tests {
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
         AgentLite {
+            digest_truncated: false,
+            last_agent_response_truncated: false,
+            last_user_message_truncated: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
+            node_id: None,
+            lease_id: None,
+            node_name: None,
+            placement: None,
+            effective_isolation: None,
+            placement_error: None,
+            submodules: None,
+            setup: None,
             id: AgentId::from(id),
             workspace_id: ws.clone(),
             parent_agent_id: None,
@@ -10505,9 +11455,14 @@ mod wsapi4_bindings_tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            using_earlier_profile_settings: false,
+            provider_replacement_required: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             metadata: AgentMetadata {
+                attention_request_reason_truncated: false,
+                completion_report_truncated: false,
                 is_background: false,
                 specialist: None,
                 created_by_agent_id: None,
@@ -10525,6 +11480,7 @@ mod wsapi4_bindings_tests {
                 pending_questions_message_id: None,
                 pending_proposals: Vec::new(),
                 proposal_resolutions: serde_json::Map::new(),
+                proposal_created_workspaces: serde_json::Map::new(),
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
@@ -10793,6 +11749,14 @@ mod wsapi4_bindings_tests {
             context_message: String,
             input: intent_core::AgentWakeOrCreateInput,
         ) -> BoxFuture<'_, Result<Value>> {
+            self.placements.lock().unwrap().push((
+                "wakeOrCreate",
+                input
+                    .create
+                    .as_ref()
+                    .and_then(|create| create.placement.as_ref())
+                    .map(|p| serde_json::to_value(p).unwrap()),
+            ));
             self.agent_wake_or_create_calls.lock().unwrap().push((
                 task_note_id.as_str().to_string(),
                 context_message,
@@ -10814,6 +11778,14 @@ mod wsapi4_bindings_tests {
             idempotency_key: Option<String>,
             extra: intent_core::AgentCreateExtra,
         ) -> BoxFuture<'_, Result<Value>> {
+            let placed = extra.placement.is_some();
+            self.placements.lock().unwrap().push((
+                "create",
+                extra
+                    .placement
+                    .as_ref()
+                    .map(|p| serde_json::to_value(p).unwrap()),
+            ));
             self.agent_create_calls.lock().unwrap().push((
                 name,
                 specialist_id,
@@ -10822,7 +11794,25 @@ mod wsapi4_bindings_tests {
                 extra.metadata,
                 extra.is_background,
             ));
-            Box::pin(async move { Ok(json!({ "agent": { "id": "child-1", "name": "child" } })) })
+            Box::pin(async move {
+                if placed {
+                    return Ok(json!({
+                        "agent": { "id": "child-1", "name": "child", "nodeId": "node-1", "nodeName": "Mac" },
+                        "notice": "Uncommitted changes in the workspace are not carried",
+                    }));
+                }
+                Ok(json!({ "agent": { "id": "child-1", "name": "child" } }))
+            })
+        }
+
+        fn agent_placement_help(&self, _ws: WorkspaceId) -> BoxFuture<'_, Option<String>> {
+            let help = self.placement_help.lock().unwrap().clone();
+            Box::pin(async move { help })
+        }
+
+        fn is_plain_folder_workspace(&self, _id: WorkspaceId) -> BoxFuture<'_, bool> {
+            let plain = *self.plain_folder.lock().unwrap();
+            Box::pin(async move { plain })
         }
 
         fn agent_watch_completion(
@@ -10841,6 +11831,13 @@ mod wsapi4_bindings_tests {
             input: AgentDelegateInput,
             caller: Option<AgentId>,
         ) -> BoxFuture<'_, Result<Value>> {
+            self.placements.lock().unwrap().push((
+                "delegate",
+                input
+                    .placement
+                    .as_ref()
+                    .map(|p| serde_json::to_value(p).unwrap()),
+            ));
             self.agent_delegate_calls.lock().unwrap().push((
                 input.wait_mode.clone(),
                 caller.as_ref().map(|c| c.as_str().to_string()),
@@ -11887,7 +12884,7 @@ mod wsapi4_bindings_tests {
         let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             call(
                 &srv,
                 "return await ws.agent.send('agent-target', 'hello', 'queue');",
@@ -11939,7 +12936,7 @@ mod wsapi4_bindings_tests {
         let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             call(
                 &srv,
                 "return await ws.agent.sendToTask('tn-1', 'hello', 'queue');",
@@ -11978,7 +12975,7 @@ mod wsapi4_bindings_tests {
         let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             call(
                 &srv,
                 "return await ws.agent.send('agent-target', 'hello', 'queue');",
@@ -11999,7 +12996,7 @@ mod wsapi4_bindings_tests {
 
         drop(guard);
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             api.agent_send_landed.notified(),
         )
         .await
@@ -12030,7 +13027,7 @@ mod wsapi4_bindings_tests {
         let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             call(
                 &srv,
                 "return await ws.agent.send('agent-target', 'hello', 'queue');",
@@ -12051,7 +13048,7 @@ mod wsapi4_bindings_tests {
 
         drop(guard);
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             api.agent_send_landed.notified(),
         )
         .await
@@ -12123,7 +13120,7 @@ mod wsapi4_bindings_tests {
         };
         let (resp, ()) = tokio::join!(
             tokio::time::timeout(
-                std::time::Duration::from_secs(8),
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(8)),
                 call(
                     &srv,
                     "await ws.agent.getQueue('agent-target'); \
@@ -12146,7 +13143,7 @@ mod wsapi4_bindings_tests {
 
         drop(send_guard);
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             api.agent_send_landed.notified(),
         )
         .await
@@ -12175,7 +13172,7 @@ mod wsapi4_bindings_tests {
         let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             call(
                 &srv,
                 "return await ws.agent.send('agent-target', 'hello', 'queue');",
@@ -12199,7 +13196,7 @@ mod wsapi4_bindings_tests {
 
         drop(guard);
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             api.agent_send_landed.notified(),
         )
         .await
@@ -12251,9 +13248,12 @@ mod wsapi4_bindings_tests {
             op,
             |_| "in flight".to_string(),
         ));
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
-            .await
-            .expect("the send op must start behind the hold");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .expect("the send op must start behind the hold");
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         assert!(capture.lines().is_empty(), "nothing to log while held");
@@ -12296,7 +13296,7 @@ mod wsapi4_bindings_tests {
         let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             call(
                 &srv,
                 "return await ws.agent.send('agent-target', 'hello', 'queue');",
@@ -12705,6 +13705,92 @@ mod wsapi4_bindings_tests {
         let calls = api.agent_wake_or_create_calls.lock().unwrap();
         assert_eq!(calls[0].2.as_deref(), Some("opus"));
         assert_eq!(calls[0].3.as_ref().unwrap()["type"], json!("agent_message"));
+    }
+
+    /// `placement` reaches every create seam unchanged; `null` and invalid
+    /// objects are refused before any call; a remote create reports its
+    /// node and launch notice.
+    #[tokio::test]
+    async fn placement_is_threaded_through_create_delegate_and_wake_or_create() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "return await ws.agent.create('n', 'go', { placement: { target: 'remote', os: 'macos' } });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("\"nodeName\": \"Mac\"") || text.contains("\"nodeName\":\"Mac\""),
+            "{text}"
+        );
+        assert!(text.contains("not carried"), "{text}");
+        let resp = call(
+            &srv,
+            "return await ws.agent.delegate({ taskNoteId: 't-1', placement: { arch: 'aarch64' } });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let resp = call(
+            &srv,
+            "return await ws.agent.wakeOrCreate('tn-1', 'ctx', undefined, undefined, undefined, { create: { placement: { target: 'remote' } } });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        let resp = call(&srv, "return await ws.agent.wakeOrCreate('tn-2', 'ctx');").await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        assert_eq!(
+            *api.placements.lock().unwrap(),
+            vec![
+                ("create", Some(json!({"target": "remote", "os": "macos"}))),
+                ("delegate", Some(json!({"arch": "aarch64"}))),
+                ("wakeOrCreate", Some(json!({"target": "remote"}))),
+                ("wakeOrCreate", None),
+            ]
+        );
+
+        for code in [
+            "return await ws.agent.create('n', 'go', { placement: null });",
+            "return await ws.agent.create('n', 'go', { placement: { node: 'x' } });",
+            "return await ws.agent.delegate({ taskNoteId: 't-1', placement: { os: 'windows' } });",
+            "return await ws.agent.wakeOrCreate('tn-1', 'ctx', undefined, undefined, undefined, { placement: {} });",
+        ] {
+            let resp = call(&srv, code).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "{code}: {resp}");
+        }
+        assert_eq!(
+            api.placements.lock().unwrap().len(),
+            4,
+            "refused before any call"
+        );
+    }
+
+    /// `ws.help("agent")` appends the daemon's live placement discovery when
+    /// it has an execution node, and nothing otherwise.
+    #[tokio::test]
+    async fn agent_help_includes_live_placement_discovery() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(&srv, "return await ws.help('agent');").await;
+        let plain = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!plain.contains("Remote placement"), "{plain}");
+        *api.placement_help.lock().unwrap() =
+            Some("Remote placement (experimental): node \"Mac\"".into());
+        let resp = call(&srv, "return await ws.help('agent');").await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Remote placement (experimental)"), "{text}");
+        let resp = call(&srv, "return await ws.help('note');").await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("Remote placement"), "{text}");
+
+        // Remote agents start from a git commit: a plain folder (§5.1)
+        // never lists placement.
+        *api.plain_folder.lock().unwrap() = true;
+        let resp = call(&srv, "return await ws.help('agent');").await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("Remote placement"), "{text}");
     }
 
     #[tokio::test]
@@ -13456,10 +14542,7 @@ mod workspace_api_output_limit_tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
-    use intent_core::{
-        BoxFuture, Result, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
-        WorkspaceId, WorkspaceStatus,
-    };
+    use intent_core::{BoxFuture, Result, Workspace, WorkspaceApi, WorkspaceId};
     use serde_json::{json, Value};
 
     use crate::WorkspaceMcpServer;
@@ -13496,49 +14579,11 @@ mod workspace_api_output_limit_tests {
                     id: id.clone(),
                     title: id.as_str().to_string(),
                     branch: id.as_str().to_string(),
-                    base_ref: None,
-                    base_commit_sha: None,
-                    status: WorkspaceStatus::Active,
-                    status_message: None,
-                    status_image_asset_id: None,
-                    activity: WorkspaceActivity::Idle,
-                    attention: WorkspaceAttention::None,
                     created_at: now.clone(),
                     updated_at: now,
-                    last_activity: None,
-                    last_content_activity: None,
-                    tags: Vec::new(),
-                    path: None,
                     repository_path,
-                    repository_owner: None,
-                    repository_name: None,
                     worktree_path: checkout,
-                    scope: None,
-                    skip_worktree: false,
-                    setup_script: None,
-                    is_remote: false,
-                    default_model: None,
-                    pr_number: None,
-                    pr_url: None,
-                    pr_status: None,
-                    active_pull_request: None,
-                    pull_requests: None,
-                    context_links: None,
-                    archived: false,
-                    archived_at: None,
-                    task_stats: None,
-                    agent_summary: None,
-                    diff_summary: None,
-                    token_usage: None,
-                    cow_supported: None,
-                    browser_client_id: None,
-                    pull_requests_total: None,
-                    display_status: None,
-                    waiting: false,
-                    checkout_mode: None,
-                    disk_usage: None,
-                    pending_delete_at: None,
-                    membership: None,
+                    ..Default::default()
                 })
             })
         }
@@ -13783,8 +14828,8 @@ mod workspace_apply_proposal_tests {
 
     use intent_core::{
         AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, PendingProposal, Result,
-        Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate,
-        WorkspaceCreateResult, WorkspaceId, WorkspaceStatus,
+        Workspace, WorkspaceApi, WorkspaceCreate, WorkspaceCreateOrigin, WorkspaceCreateResult,
+        WorkspaceId,
     };
     use serde_json::{json, Value};
 
@@ -13815,6 +14860,8 @@ mod workspace_apply_proposal_tests {
         /// Outcome the fake resolver echoes back instead of the requested one
         /// (models the real resolver's "already resolved" idempotent path).
         resolve_persisted_outcome: Mutex<Option<String>>,
+        /// `created_workspace_id` of each resolve call, in call order.
+        resolve_created: Mutex<Vec<Option<String>>>,
     }
 
     fn workspace(id: &str, title: &str) -> Workspace {
@@ -13823,49 +14870,10 @@ mod workspace_apply_proposal_tests {
             id: WorkspaceId::from_string(id),
             title: title.to_string(),
             branch: format!("{id}-branch"),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: now.clone(),
             updated_at: now,
-            last_activity: None,
-            last_content_activity: None,
-            tags: Vec::new(),
             path: Some(format!("/checkouts/{id}")),
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            pull_requests_total: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
     }
 
@@ -13874,8 +14882,19 @@ mod workspace_apply_proposal_tests {
         resolutions: serde_json::Map<String, Value>,
     ) -> AgentLite {
         AgentLite {
+            digest_truncated: false,
+            last_agent_response_truncated: false,
+            last_user_message_truncated: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
+            node_id: None,
+            lease_id: None,
+            node_name: None,
+            placement: None,
+            effective_isolation: None,
+            placement_error: None,
+            submodules: None,
+            setup: None,
             id: AgentId::from(CALLER),
             workspace_id: WorkspaceId::from_string(WS),
             parent_agent_id: None,
@@ -13918,9 +14937,14 @@ mod workspace_apply_proposal_tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            using_earlier_profile_settings: false,
+            provider_replacement_required: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             metadata: AgentMetadata {
+                attention_request_reason_truncated: false,
+                completion_report_truncated: false,
                 is_background: false,
                 specialist: None,
                 created_by_agent_id: None,
@@ -13938,6 +14962,7 @@ mod workspace_apply_proposal_tests {
                 pending_questions_message_id: None,
                 pending_proposals: pending,
                 proposal_resolutions: resolutions,
+                proposal_created_workspaces: serde_json::Map::new(),
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,
@@ -14042,6 +15067,9 @@ mod workspace_apply_proposal_tests {
                         "name": "Coordinator",
                         "notificationsMuted": false,
                     })),
+                    proposal_origin: None,
+                    notice: None,
+                    initial_agent_launch_failure: None,
                 })
             })
         }
@@ -14053,7 +15081,12 @@ mod workspace_apply_proposal_tests {
             proposal_id: String,
             outcome: String,
             detail: Option<String>,
+            created_workspace_id: Option<WorkspaceId>,
         ) -> BoxFuture<'_, Result<Value>> {
+            self.resolve_created
+                .lock()
+                .unwrap()
+                .push(created_workspace_id.map(|id| id.as_str().to_string()));
             self.resolve_calls.lock().unwrap().push((
                 workspace_id.as_str().to_string(),
                 agent_id.as_str().to_string(),
@@ -14232,6 +15265,11 @@ mod workspace_apply_proposal_tests {
         assert_eq!(out["workspace"]["title"], "Follow up");
         assert_eq!(out["workspace"]["branch"], "ws-new-branch");
         assert_eq!(out["workspace"]["path"], "/checkouts/ws-new");
+        assert_eq!(out["workspace"]["link"], "intent://local/workspace/ws-new");
+        assert_eq!(
+            out["workspace"]["markdownLink"],
+            "[Follow up](intent://local/workspace/ws-new)"
+        );
         assert_eq!(out["initialAgent"]["id"], "agent-new");
         assert!(
             out["initialAgent"].get("notificationsMuted").is_none(),
@@ -14263,6 +15301,16 @@ mod workspace_apply_proposal_tests {
             Some("Implement the isolated follow-up and test it.")
         );
         assert_eq!(agent.specialist.as_deref(), Some("implementor"));
+        // Provenance rides the `workspace:created` event as `data.origin` so
+        // clients can open the new workspace beside its source (§6.5).
+        assert_eq!(
+            input.origin,
+            Some(WorkspaceCreateOrigin::Proposal {
+                proposal_id: PENDING_ID.to_string(),
+                agent_id: AgentId::from(CALLER),
+                source_workspace_id: WorkspaceId::from(WS),
+            })
+        );
         drop(creates);
 
         let resolves = api.resolve_calls.lock().unwrap();
@@ -14275,6 +15323,12 @@ mod workspace_apply_proposal_tests {
         assert_eq!(
             detail.as_deref(),
             Some("Created workspace ws-new (Follow up) via ws.workspace.applyProposal")
+        );
+        drop(resolves);
+        assert_eq!(
+            *api.resolve_created.lock().unwrap(),
+            vec![Some("ws-new".to_string())],
+            "the applied card records the workspace it created"
         );
     }
 
@@ -14372,6 +15426,57 @@ mod workspace_apply_proposal_tests {
             &resp,
             "has no initialAgent; initialPrompt cannot be overridden",
         );
+        assert!(api.create_calls.lock().unwrap().is_empty());
+    }
+
+    /// A unique-id follow-up card whose pending entry is its `applyToolCallId`.
+    fn api_with_pending_ids(ids: &[&str]) -> Arc<FakeApi> {
+        let api = Arc::new(FakeApi::default());
+        for (index, id) in ids.iter().enumerate() {
+            let message_id = format!("m-{index}");
+            let mut proposal = sibling_proposal();
+            proposal["applyToolCallId"] = json!(id);
+            proposal["payload"]["params"]["idempotencyKey"] = json!(format!("{KEY}-{index}"));
+            api.pending.lock().unwrap().push(PendingProposal {
+                proposal_id: id.to_string(),
+                message_id: message_id.clone(),
+            });
+            api.messages
+                .lock()
+                .unwrap()
+                .insert(message_id, vec![proposal_block(&proposal)]);
+        }
+        api
+    }
+
+    #[tokio::test]
+    async fn lookup_by_title_applies_the_one_pending_unique_id_card() {
+        let api = api_with_pending_ids(&["workspace-create-a"]);
+        let srv = server(api.clone());
+        let out = tool_json(
+            &call(
+                &srv,
+                &format!(
+                    "return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"
+                ),
+            )
+            .await,
+        );
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["proposalId"], "workspace-create-a");
+        assert_eq!(api.resolve_calls.lock().unwrap()[0].2, "workspace-create-a");
+    }
+
+    #[tokio::test]
+    async fn lookup_by_title_refuses_an_ambiguous_title() {
+        let api = api_with_pending_ids(&["workspace-create-a", "workspace-create-b"]);
+        let srv = server(api.clone());
+        let resp = call(
+            &srv,
+            &format!("return await ws.workspace.applyProposal({PENDING_ID:?}, {{ userRequested: true }});"),
+        )
+        .await;
+        assert_error_contains(&resp, "2 pending proposals are titled");
         assert!(api.create_calls.lock().unwrap().is_empty());
     }
 
@@ -14849,5 +15954,210 @@ mod app_navigation_sender_tests {
                 .contains("only available in the Assistant workspace"));
         }
         assert!(api.events.lock().unwrap().is_empty());
+    }
+}
+
+/// Cursor tool-call frames. The MCP, Task and shell frames are copied
+/// verbatim from captured cursor-agent 2026.11.05-86047df traffic (spike
+/// transcripts); edit/read/grep/glob/search shapes follow that build's
+/// `summarizeToolCall` / `extractToolCallInput` (not observed live).
+mod cursor_tool_mapping {
+    use crate::session::{self, MappedUpdate};
+    use agent_client_protocol::schema::v1::SessionNotification;
+    use serde_json::{json, Value};
+
+    fn map(update: &Value) -> (String, &'static str, Value, String) {
+        let note: SessionNotification =
+            serde_json::from_value(json!({ "sessionId": "s", "update": update })).unwrap();
+        let MappedUpdate::ToolCall(mut tc) = session::map_session_update(&note.update).unwrap()
+        else {
+            panic!("expected a tool call");
+        };
+        session::apply_cursor_tool_names(&mut tc);
+        (tc.tool_name, tc.tool_kind, tc.input, tc.tool_call_id)
+    }
+
+    #[test]
+    fn mcp_call_unwraps_server_and_tool_and_keeps_newline_ids_opaque() {
+        let id = "call-319b6c00-0bab-4561-a905-9e27aefbeb53-1\nfc_56615f74-5643-917a-ac9f-479d2fe25945_0";
+        let (name, kind, input, call_id) = map(
+            &json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":"intent-workspace: intent_ping","rawInput":{"providerIdentifier":"intent-workspace","toolName":"intent_ping","args":{}}}),
+        );
+        assert_eq!(name, "intent-workspace_intent_ping");
+        assert_eq!(kind, "other");
+        assert_eq!(input, json!({}));
+        assert_eq!(call_id, id);
+        let (name, _, input, _) = map(
+            &json!({"sessionUpdate":"tool_call","toolCallId":"replay-0-4","title":"workspace-mcp: workspace_api","kind":"other","status":"pending","rawInput":{"providerIdentifier":"workspace-mcp","toolName":"workspace_api","args":{"code":"return 1","summary":"probe"}}}),
+        );
+        assert_eq!(name, "workspace_api");
+        assert_eq!(input, json!({"code":"return 1","summary":"probe"}));
+    }
+
+    #[test]
+    fn shell_task_and_native_tools_get_names_and_kinds() {
+        let (name, kind, _, _) = map(
+            &json!({"sessionUpdate":"tool_call","toolCallId":"call-29f616b7-902c-482c-930d-030b5dc8add1-0\nfc_b4d77170-841c-9ece-ab40-6899e8653b27_0","title":"`sleep 47 && echo finished-sleep`","kind":"execute","status":"pending","rawInput":{"command":"sleep 47 && echo finished-sleep"}}),
+        );
+        assert_eq!((name.as_str(), kind), ("bash", "terminal"));
+        let (name, kind, _, _) = map(
+            &json!({"sessionUpdate":"tool_call","toolCallId":"call-d5f81713-ef9b-4563-81e1-9fccb289dc3b-0\nfc_4488f13b-7cc1-9ba7-9fe8-679b98c595e1_0","title":"`git status --short | head -5; echo \"EXIT:$?\"`","kind":"execute","status":"pending","rawInput":{"command":"git status --short | head -5; echo \"EXIT:$?\""}}),
+        );
+        assert_eq!((name.as_str(), kind), ("bash", "terminal"));
+        let (name, kind, _, _) = map(
+            &json!({"sessionUpdate":"tool_call","toolCallId":"call-27e9fb5d-2f35-4699-83db-5f3c01ce559a-3\nfc_93650954-f819-9d9f-9e36-f87a8cad6bd7_0","title":"Task: Reply with HELLO","kind":"other","status":"pending","rawInput":{"_toolName":"task","prompt":"Your only job is to reply with exactly the word HELLO and nothing else. Do not call any tools. Do not add punctuation or explanation.","description":"Reply with HELLO"}}),
+        );
+        assert_eq!((name.as_str(), kind), ("Subagent", "other"));
+        for (title, acp_kind, raw, expected_name, expected_kind) in [
+            (
+                "Edit `src/main.rs`",
+                "edit",
+                json!({"path":"src/main.rs"}),
+                "edit",
+                "file",
+            ),
+            (
+                "Read src/lib.rs (1 - 40)",
+                "read",
+                json!({"path":"src/lib.rs"}),
+                "read",
+                "file",
+            ),
+            (
+                "Delete `old.txt`",
+                "delete",
+                json!({"path":"old.txt"}),
+                "delete",
+                "file",
+            ),
+            (
+                "List the `src` directory's contents",
+                "search",
+                json!({"path":"src"}),
+                "ls",
+                "search",
+            ),
+            (
+                "grep -n \"TODO\"",
+                "search",
+                json!({"pattern":"TODO","path":"src"}),
+                "grep",
+                "search",
+            ),
+            (
+                "Find `**/*.rs`",
+                "search",
+                json!({"pattern":"**/*.rs"}),
+                "glob",
+                "search",
+            ),
+            (
+                "Search: \"auth flow\"",
+                "search",
+                json!({"query":"auth flow"}),
+                "codebase-search",
+                "search",
+            ),
+            (
+                "Web Search: \"acp spec\"",
+                "search",
+                json!({"searchTerm":"acp spec"}),
+                "web-search",
+                "search",
+            ),
+            (
+                "Web Fetch: https://example.com",
+                "fetch",
+                json!({"url":"https://example.com"}),
+                "web-fetch",
+                "other",
+            ),
+            (
+                "Update TODOs: a, b",
+                "other",
+                json!({"_toolName":"updateTodos","todos":[]}),
+                "updateTodos",
+                "other",
+            ),
+        ] {
+            let (name, kind, _, _) = map(
+                &json!({"sessionUpdate":"tool_call","toolCallId":"t","title":title,"kind":acp_kind,"status":"pending","rawInput":raw}),
+            );
+            assert_eq!(
+                (name.as_str(), kind),
+                (expected_name, expected_kind),
+                "{title}"
+            );
+        }
+    }
+
+    /// The Cursor rules are gated to Cursor sessions: the generic mapping
+    /// (every other provider) leaves Cursor-shaped frames exactly as the
+    /// pre-Cursor rules named them.
+    #[test]
+    fn generic_mapping_ignores_cursor_shapes() {
+        let generic = |update: &Value| {
+            let note: SessionNotification =
+                serde_json::from_value(json!({ "sessionId": "s", "update": update })).unwrap();
+            let MappedUpdate::ToolCall(tc) = session::map_session_update(&note.update).unwrap()
+            else {
+                panic!("expected a tool call");
+            };
+            (tc.tool_name, tc.tool_kind)
+        };
+        for (title, kind, raw, expected) in [
+            ("`ls`", "execute", json!({"command":"ls"}), "`ls`"),
+            ("Terminal", "execute", json!({"command":"ls"}), "Terminal"),
+            (
+                "Task: Reply",
+                "other",
+                json!({"_toolName":"task","prompt":"p","description":"Reply"}),
+                "Task",
+            ),
+            ("Edit `a.rs`", "edit", json!({"path":"a.rs"}), "Edit `a.rs`"),
+            (
+                "Find `*.rs`",
+                "search",
+                json!({"pattern":"*.rs"}),
+                "Find `*.rs`",
+            ),
+            (
+                "srv: tool",
+                "other",
+                json!({"providerIdentifier":"srv","toolName":"tool","args":{}}),
+                "srv",
+            ),
+        ] {
+            let (name, _) = generic(
+                &json!({"sessionUpdate":"tool_call","toolCallId":"t","title":title,"kind":kind,"status":"pending","rawInput":raw}),
+            );
+            assert_eq!(name, expected, "{title}");
+        }
+    }
+
+    #[test]
+    fn cursor_pass_keeps_unrelated_shapes_and_callback_names() {
+        let mut call = session::MappedToolCall {
+            tool_call_id: "t".into(),
+            tool_name: "workspace_api".into(),
+            name_authoritative: true,
+            title: "srv: workspace_api".into(),
+            tool_kind: "other",
+            input: json!({"code":"1","summary":"s"}),
+            output: None,
+            status: "started",
+            keeps_status: false,
+        };
+        session::apply_cursor_tool_names(&mut call);
+        assert_eq!(call.tool_name, "workspace_api");
+        call.tool_name = "`ls -la`".into();
+        call.name_authoritative = false;
+        call.title = "ls -la".into();
+        call.input = json!({"command":"ls"});
+        session::apply_cursor_tool_names(&mut call);
+        assert_eq!(
+            call.tool_name, "`ls -la`",
+            "title must be the backticked command"
+        );
     }
 }

@@ -18,6 +18,7 @@ fn version_output_never_becomes_an_error_or_account_payload() {
         );
     }
     assert_eq!(
+        // cli-fixture-version: allow — version parsing of a literal --version output
         parse_version(b"codex-cli 0.222.3\n", VersionKind::Runtime).as_deref(),
         Some("0.222.3")
     );
@@ -96,6 +97,7 @@ mod unix {
             executable(
                 &bin.join("codex"),
                 &format!(
+                    // cli-fixture-version: allow — the PATH codex must never run; its version is irrelevant
                     "#!/bin/sh\nprintf ran > '{}'\nprintf 'codex-cli 9.99.9\\n'\n",
                     path_marker.display()
                 ),
@@ -505,22 +507,25 @@ mod unix {
         let mut stdin = probe.stdin.take().unwrap();
         let mut stdout = probe.stdout.take().unwrap();
         let mut stderr = probe.stderr.take().unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(5), async {
-            stdin
-                .write_all(b"{\"request\":\"fixture\"}\n")
-                .await
+        let result = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                stdin
+                    .write_all(b"{\"request\":\"fixture\"}\n")
+                    .await
+                    .unwrap();
+                drop(stdin);
+                let mut out = String::new();
+                let mut err = String::new();
+                tokio::try_join!(
+                    stdout.read_to_string(&mut out),
+                    stderr.read_to_string(&mut err)
+                )
                 .unwrap();
-            drop(stdin);
-            let mut out = String::new();
-            let mut err = String::new();
-            tokio::try_join!(
-                stdout.read_to_string(&mut out),
-                stderr.read_to_string(&mut err)
-            )
-            .unwrap();
-            let status = probe.wait().await.unwrap();
-            (out, err, status)
-        })
+                let status = probe.wait().await.unwrap();
+                (out, err, status)
+            },
+        )
         .await
         .unwrap();
         assert_eq!(result.0, "{\"request\":\"fixture\"}\n");
@@ -650,16 +655,22 @@ child.once('message', () => {
             task: task.abort_handle(),
             observation,
         };
-        let (socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .unwrap()
-            .unwrap();
+        let (socket, _) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            listener.accept(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let mut socket = BufReader::new(socket);
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(5), socket.read_line(&mut line))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            socket.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let observed: serde_json::Value = serde_json::from_str(&line).unwrap();
         let pid = i32::try_from(observed["pid"].as_i64().unwrap()).unwrap();
         let leader = i32::try_from(observed["leader"].as_i64().unwrap()).unwrap();
@@ -671,10 +682,13 @@ child.once('message', () => {
         );
         assert!(home.is_dir());
         socket.get_mut().write_all(b"exit").await.unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(10), task)
-            .await
-            .unwrap()
-            .unwrap();
+        let result = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         if inherit_stdout {
             assert_eq!(result, Err(UnknownReason::TimedOut));
         } else {
@@ -689,15 +703,21 @@ child.once('message', () => {
             Err(nix::errno::Errno::ESRCH),
             "detached child {pid} was not reaped before its temporary home disappeared"
         );
-        let (mut notice, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .unwrap()
-            .unwrap();
+        let (mut notice, _) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            listener.accept(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let mut bytes = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), notice.read_to_end(&mut bytes))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            notice.read_to_end(&mut bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let notice: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             notice["homeExists"], true,
@@ -731,39 +751,54 @@ setInterval(() => {}, 1000);
         let path = fixture.path.clone();
         let timeout = Duration::from_secs(if during_teardown { 1 } else { 10 });
         let task = tokio::spawn(async move { local_output(command, &path, timeout).await });
-        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .unwrap()
-            .unwrap();
+        let (mut socket, _) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            listener.accept(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let mut bytes = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), socket.read_to_end(&mut bytes))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            socket.read_to_end(&mut bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let observation: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let pid = i32::try_from(observation["pid"].as_i64().unwrap()).unwrap();
         let home = PathBuf::from(observation["home"].as_str().unwrap());
         let _cleanup = Cleanup(pid);
         assert!(home.is_dir());
         if during_teardown {
-            let (mut notice, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (mut notice, _) = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let mut text = String::new();
-            tokio::time::timeout(Duration::from_secs(5), notice.read_to_string(&mut text))
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                notice.read_to_string(&mut text),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(text, "terminating");
         }
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while home.exists() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while home.exists() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("cancelled local check must finish reaping and remove its home");
         assert_eq!(
@@ -781,6 +816,7 @@ async fn installed_cli_diagnostics_measure_selected_native_entry_with_same_envir
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let cli = root.path().join("codex");
+    // cli-fixture-version: allow — diagnostics report this exact measured version
     std::fs::write(&cli,"#!/bin/sh\n[ \"$CODEX_DIAGNOSTIC_TOKEN\" = test-private-token ] || exit 7\nprintf 'codex-cli 9.8.7\\n'\n").unwrap();
     std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
     let runtime = intent_providers::installed_cli::InstalledCli::Codex

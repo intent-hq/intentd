@@ -18,11 +18,12 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,15 +44,14 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     _data_dir_guard: tempfile::TempDir,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -59,7 +59,7 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", &format!("itd-wss-lastact-{prefix}-"))
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -74,7 +74,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -199,9 +199,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -226,7 +229,8 @@ async fn next_event<S>(ws: &mut WebSocketStream<S>, types: &[&str], secs: u64) -
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "timed out waiting for {types:?}");
@@ -556,7 +560,8 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
     // pattern as the burst test), keeping the latest lastActivity. Once quiet
     // no bump is pending, so the workspace.get below must observe exactly
     // this value and the byte-equality assertion is deterministic (#1004).
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let drain_deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while let Some(evt) = try_next_event(
         &mut sub,
         &["workspace:updated"],
@@ -607,7 +612,8 @@ async fn next_subscription_push<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Va
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(
@@ -708,7 +714,8 @@ async fn last_activity_persisted_for_workspace_subscribe_snapshot() {
         .as_str()
         .expect("lastActivity string")
         .to_string();
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let drain_deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while let Some(evt) = try_next_event(
         &mut sub,
         &["workspace:updated"],
@@ -908,7 +915,8 @@ async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option
     // window, so nothing from the warm-up leaks into the burst count. An
     // outer deadline hard-bounds the drain even if some event source kept
     // emitting less than one quiet window apart.
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let drain_deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while try_next_event(
         &mut sub,
         &["workspace:updated"],
@@ -985,7 +993,7 @@ async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option
         .await
         .unwrap();
     let session = store
-        .get_agent_session(&intent_core::AgentId::from(agent_id))
+        .get_agent_session_with_transcript(&intent_core::AgentId::from(agent_id))
         .await
         .unwrap();
     let text = session
@@ -1008,7 +1016,8 @@ async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option
     // Collect workspace:updated events until the subscription has been quiet
     // for well over one debounce window (covers the trailing debounce fire).
     // Same outer deadline pattern as the warm-up drain above.
-    let collect_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let collect_deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     let mut last_activity_events = Vec::new();
     while let Some(evt) = try_next_event(
         &mut sub,

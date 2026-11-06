@@ -23,7 +23,12 @@ pub fn in_subprocess(test_name: &str) -> bool {
     for (name, body) in [
         (
             "claude",
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MOCK_CLAUDE_ROOT/cli-calls\"\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'claude 1.0.0\\n'\n".to_owned(),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MOCK_CLAUDE_ROOT/cli-calls\"\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf '%s\\n' '{}'\n",
+                intent_providers::test_support::current_cli_version(
+                    intent_providers::installed_cli::InstalledCli::Claude
+                )
+            ),
         ),
         ("node", "#!/bin/sh\nexec \"$MOCK_CLAUDE_NODE\" \"$@\"\n".to_owned()),
         (

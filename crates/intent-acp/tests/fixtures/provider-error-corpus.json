@@ -1,0 +1,338 @@
+{
+  "$comment": [
+    "Provider error corpus for the quota classifier (intent-hq/intent#7615).",
+    "Every entry is an error the pinned ACP adapters actually send to intentd, taken from the pinned packages, not hand-written.",
+    "`kinds` lists every structured error kind each pinned adapter can attach. tests/provider_error_corpus.rs renders each kind and checks the classifier.",
+    "scripts/check-provider-error-corpus.py downloads the pinned adapters and fails when they emit a kind missing here, when a listed kind disappears, when the adapter's own category disagrees with `expect`, or when a Claude Agent SDK usage-limit prefix has no rendering below. CI runs it on every PR, so an adapter pin bump that adds a limit wording fails before it merges.",
+    "`expect` is what intentd should do: `quota` means backup failover and the quota banner fire. `knownGap` marks an entry the classifier gets wrong today, and `textOnlyKnownGap` a Claude rendering it only catches through its errorKind (claude-agent-acp can send the same text with no data); the test asserts each gap still exists, so fixing one means deleting the field.",
+    "Renderings follow what intentd sees: intentd does not advertise the sessionFailure capability, so claude-agent-acp keeps the detail in `message` (`Internal error: <detail>`) and codex-acp only raises a JSON-RPC error for usageLimitExceeded (other codex kinds stream as text)."
+  ],
+  "kinds": {
+    "claude-code": {
+      "$comment": "claude-agent-acp attaches {\"errorKind\": <kind>} as JSON-RPC data. Kinds: the Claude Agent SDK's SDKAssistantMessageError union plus the adapter's own kinds. The adapter's providerFailureCategory maps rate_limit to rate_limited and billing_error / account_on_hold to quota_exhausted.",
+      "field": "errorKind",
+      "values": {
+        "rate_limit": { "expect": "quota" },
+        "billing_error": { "expect": "quota" },
+        "account_on_hold": {
+          "expect": "quota",
+          "knownGap": "claude-agent-acp maps account_on_hold to quota_exhausted, but the classifier has no marker for it. Claude Code 2.1.280 only raises it as an OAuth error (\"Your account is on hold and can't use Claude Code\"), so it is not seen on the prompt path yet."
+        },
+        "authentication_failed": { "expect": "not-quota" },
+        "oauth_org_not_allowed": { "expect": "not-quota" },
+        "verification_required": { "expect": "not-quota" },
+        "cloud_credential_error": { "expect": "not-quota" },
+        "overloaded": { "expect": "not-quota" },
+        "invalid_request": { "expect": "not-quota" },
+        "model_not_found": { "expect": "not-quota" },
+        "max_output_tokens": { "expect": "not-quota" },
+        "server_error": { "expect": "not-quota" },
+        "unknown": { "expect": "not-quota" },
+        "no_result": { "expect": "not-quota" },
+        "incomplete_tool_call": { "expect": "not-quota" },
+        "transport_lost": { "expect": "not-quota" },
+        "worker_shutdown": { "expect": "not-quota" }
+      }
+    },
+    "codex": {
+      "$comment": "codex-acp attaches {\"message\", \"codexErrorInfo\"} as JSON-RPC data. String kinds and structured kinds (an object keyed by kind, carrying httpStatusCode) come from STRING_CODEX_ERROR_CATEGORIES and STRUCTURED_CODEX_ERROR_CATEGORIES. codex-acp maps any kind with httpStatusCode 429 to rate_limited, so the test also renders every structured kind with 429 and expects quota. WIRE GAP: that mapping and every kind except those in raisedAsRpcError only exist on codex-acp's typed session-failure path, which intentd does not advertise. Today intentd receives rateLimitExceeded, HTTP 429 and the rest as streamed agent text with no prompt error, so neither failover nor the quota banner can see them; these kind cases pin the classifier for the day they arrive as errors.",
+      "field": "codexErrorInfo",
+      "raisedAsRpcError": ["usageLimitExceeded"],
+      "values": {
+        "usageLimitExceeded": { "expect": "quota" },
+        "rateLimitExceeded": { "expect": "quota" },
+        "contextWindowExceeded": { "expect": "not-quota" },
+        "sessionBudgetExceeded": { "expect": "not-quota" },
+        "flexUnavailable": { "expect": "not-quota" },
+        "serverOverloaded": { "expect": "not-quota" },
+        "cyberPolicy": { "expect": "not-quota" },
+        "misalignmentPolicyViolation": { "expect": "not-quota" },
+        "tooManyDenials": { "expect": "not-quota" },
+        "internalServerError": { "expect": "not-quota" },
+        "unauthorized": { "expect": "not-quota" },
+        "badRequest": { "expect": "not-quota" },
+        "threadRollbackFailed": { "expect": "not-quota" },
+        "sandboxError": { "expect": "not-quota" },
+        "other": { "expect": "not-quota" }
+      },
+      "structuredValues": {
+        "httpConnectionFailed": { "expect": "not-quota" },
+        "responseStreamConnectionFailed": { "expect": "not-quota" },
+        "responseStreamDisconnected": { "expect": "not-quota" },
+        "responseTooManyFailedAttempts": { "expect": "not-quota" },
+        "activeTurnNotSteerable": { "expect": "not-quota" }
+      }
+    }
+  },
+  "renderings": [
+    {
+      "adapter": "claude-code",
+      "source": "Observed in intent-hq/intent#7615: Claude Code weekly plan limit",
+      "message": "Internal error: You've hit your weekly limit · resets Oct 27, 11am (UTC)",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Observed in intent-hq/intent#7615: Claude Code monthly spend cap",
+      "message": "Internal error: You've hit your monthly spend limit · raise it at https://claude.ai/settings/usage?from=cc_cli_limit_message · your weekly limit resets Oct 27, 11am (UTC)",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 limit message template (`You've hit your ${limit}${suffix}`), five_hour window",
+      "message": "Internal error: You've hit your session limit · resets 4pm (UTC)",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 limit message template, seven_day_opus window",
+      "message": "Internal error: You've hit your Opus limit · resets Oct 27, 11am (UTC)",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 limit message template, seven_day_sonnet window",
+      "message": "Internal error: You've hit your Sonnet limit · resets Oct 27, 11am (UTC)",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 channel spend cap",
+      "message": "Internal error: You've hit your channel's monthly spend limit.",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 team shared budget (group_pool)",
+      "message": "Internal error: You've hit your team's shared budget. /model to switch models.",
+      "data": { "errorKind": "rate_limit" },
+      "textOnlyKnownGap": "Starts with an SDK USAGE_LIMIT_ERROR_PREFIXES entry, so claude-agent-acp files it as quota_exhausted even with no errorKind; without the errorKind data no classifier marker matches the text.",
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 model usage-credit limit (seven_day_overage_included)",
+      "message": "Internal error: You've reached your Fable limit.",
+      "data": { "errorKind": "rate_limit" },
+      "textOnlyKnownGap": "Starts with an SDK USAGE_LIMIT_ERROR_PREFIXES entry, so claude-agent-acp files it as quota_exhausted even with no errorKind; without the errorKind data no classifier marker matches the text.",
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES: model needs usage credits",
+      "message": "Internal error: Fable 5 requires usage credits.",
+      "data": { "errorKind": "rate_limit" },
+      "textOnlyKnownGap": "Starts with an SDK USAGE_LIMIT_ERROR_PREFIXES entry, so claude-agent-acp files it as quota_exhausted even with no errorKind; without the errorKind data no classifier marker matches the text.",
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES",
+      "message": "Internal error: You're out of usage credits. Switch to another model to continue.",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES",
+      "message": "Internal error: Your org is out of usage · add funds to continue",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES",
+      "message": "Internal error: Your org is out of usage · contact your admin",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES",
+      "message": "Internal error: Your seat type doesn't include usage credits",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES",
+      "message": "Internal error: Your seat type doesn't include usage",
+      "data": { "errorKind": "rate_limit" },
+      "textOnlyKnownGap": "Starts with an SDK USAGE_LIMIT_ERROR_PREFIXES entry, so claude-agent-acp files it as quota_exhausted even with no errorKind; without the errorKind data no classifier marker matches the text.",
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES",
+      "message": "Internal error: Your usage allocation has been disabled by your admin",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES",
+      "message": "Internal error: Your group's usage limit is set to $0",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES",
+      "message": "Internal error: You're out of extra usage",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES",
+      "message": "Internal error: Your seat type doesn't include extra usage",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 billing rejection",
+      "message": "Internal error: Credit balance is too low",
+      "data": { "errorKind": "billing_error" },
+      "textOnlyKnownGap": "Only caught through errorKind; no marker matches the text. Not an SDK usage-limit prefix, so the adapter does not file it as a limit without the kind either.",
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 1M-context usage-credit rejection (tagged rate_limit)",
+      "message": "Internal error: API Error: Usage credits required for 1M context · turn on usage credits at claude.ai/settings/usage (Settings → Usage)",
+      "data": { "errorKind": "rate_limit" },
+      "textOnlyKnownGap": "Only caught through errorKind; no marker matches the text. Not an SDK usage-limit prefix, so the adapter does not file it as a limit without the kind either.",
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 server-side 429 for subscribers. Tagged rate_limit, so it reads as quota by design even though the text says it is not a usage limit",
+      "message": "Internal error: API Error: Server is temporarily limiting requests (not your usage limit) · this may be a temporary capacity issue.",
+      "data": { "errorKind": "rate_limit" },
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 off-switch model block (tagged rate_limit)",
+      "message": "Internal error: Claude Fable 5 is currently unavailable.",
+      "data": { "errorKind": "rate_limit" },
+      "textOnlyKnownGap": "Only caught through errorKind; no marker matches the text. Not an SDK usage-limit prefix, so the adapter does not file it as a limit without the kind either.",
+      "expect": "quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 context overflow",
+      "message": "Internal error: Prompt is too long",
+      "data": { "errorKind": "invalid_request" },
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 plan feature gate (says \"your plan\", but is not a usage limit)",
+      "message": "Internal error: Auto mode is unavailable for your plan",
+      "data": { "errorKind": "invalid_request" },
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 external API key rejection",
+      "message": "Internal error: Invalid API key · Fix external API key",
+      "data": { "errorKind": "authentication_failed" },
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "Claude Code 2.1.280 request timeout",
+      "message": "Internal error: Request timed out",
+      "data": { "errorKind": "server_error" },
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "claude-agent-acp error_max_turns result: message.errors from Claude Code 2.1.280 (`Reached maximum number of turns (${maxTurns})`), no assistant error kind",
+      "message": "Internal error: Reached maximum number of turns (25)",
+      "data": null,
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "claude-agent-acp error_max_budget_usd result: message.errors from Claude Code 2.1.280 (`Reached maximum budget ($${budget})`), a local --max-budget-usd cap, not the account allowance",
+      "message": "Internal error: Reached maximum budget ($5)",
+      "data": null,
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "claude-agent-acp error_max_turns fallback when the result carries no errors (the subtype)",
+      "message": "Internal error: error_max_turns",
+      "data": null,
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "claude-agent-acp error_max_budget_usd fallback when the result carries no errors (the subtype)",
+      "message": "Internal error: error_max_budget_usd",
+      "data": null,
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "claude-agent-acp RequestError.authRequired() for a signed-out CLI",
+      "code": -32000,
+      "message": "Authentication required",
+      "data": null,
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "claude-agent-acp TURN_NO_RESULT_MESSAGE",
+      "message": "Internal error: The turn ended without a result: the agent went idle while this prompt was still in flight (e.g. the model stream dropped mid-turn). Any partial output may be incomplete; please retry.",
+      "data": { "errorKind": "no_result" },
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "claude-agent-acp 0.95.0 stuck tool calls: Claude ended the turn while dispatched tool calls had no results (the adapter files it as internal_error)",
+      "message": "Internal error: Claude ended the turn without returning results for tool calls: toolu_01AbCdEfGhIjKlMnOpQrStUv",
+      "data": { "errorKind": "incomplete_tool_call" },
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "codex",
+      "source": "codex 0.160.1 usage-limit wording, raised by codex-acp as an internal error",
+      "message": "Internal error",
+      "data": {
+        "message": "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 5:00 PM.",
+        "codexErrorInfo": "usageLimitExceeded"
+      },
+      "expect": "quota"
+    },
+    {
+      "adapter": "codex",
+      "source": "codex 0.160.1 workspace usage-limit wording",
+      "message": "Internal error",
+      "data": {
+        "message": "You've hit your usage limit. To get more access now, send a request to your admin or try again at 5:00 PM.",
+        "codexErrorInfo": "usageLimitExceeded"
+      },
+      "expect": "quota"
+    },
+    {
+      "adapter": "codex",
+      "source": "codex 0.160.1 workspace credit limit",
+      "message": "Internal error",
+      "data": {
+        "message": "You've reached your workspace credit limit",
+        "codexErrorInfo": "usageLimitExceeded"
+      },
+      "expect": "quota"
+    }
+  ]
+}

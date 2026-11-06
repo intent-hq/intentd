@@ -21,10 +21,10 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn upsert_task_agent_link(&self, link: &TaskAgentLink) -> Result<TaskAgentLink> {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT OR REPLACE INTO task_agent_link ({TASK_AGENT_LINK_COLUMNS}) \
              VALUES (?, ?, ?, ?, ?, ?)"
-        ))
+        )))
         .bind(&link.workspace_id.0)
         .bind(link.note_id.as_str())
         .bind(&link.task_key)
@@ -72,10 +72,10 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<TaskAgentLink>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {TASK_AGENT_LINK_COLUMNS} FROM task_agent_link \
              WHERE workspace_id = ? ORDER BY created_at, note_id, task_key"
-        ))
+        )))
         .bind(&workspace_id.0)
         .fetch_all(self.read_pool())
         .await

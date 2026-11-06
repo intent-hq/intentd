@@ -81,9 +81,12 @@ async fn assert_committed_identity_tail_survives_early_close(external: bool) {
                     .unwrap();
             config["identity"]["provider"] = toml_edit::value("gitlab");
             std::fs::write(registry.config_path(), config.to_string()).unwrap();
-            timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .unwrap();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                entered.notified(),
+            )
+            .await
+            .unwrap();
             // The actual watcher has committed the registry and entered its
             // callback under the revision gate before root admission closes.
             services.begin_settings_shutdown();
@@ -100,7 +103,12 @@ async fn assert_committed_identity_tail_survives_early_close(external: bool) {
                 .await
             );
             release.notify_one();
-            timeout(Duration::from_secs(5), stopped).await.unwrap();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                stopped,
+            )
+            .await
+            .unwrap();
         } else {
             let guard = services.gitlab_credential_gate.lock().await;
             let mut request = Box::pin(services.settings_update(json!([
@@ -117,9 +125,12 @@ async fn assert_committed_identity_tail_survives_early_close(external: bool) {
             drop(request);
             drop(guard);
         }
-        timeout(Duration::from_secs(5), services.shutdown_store_writers())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            services.shutdown_store_writers(),
+        )
+        .await
+        .unwrap();
         server.abort();
         let _ = server.await;
         bus.shutdown().await.unwrap();
@@ -231,25 +242,31 @@ async fn assert_identity_tail_preserves_newer_setting(rejected: bool) {
         .settings_update(json!([{"path":"identity.provider","value":"gitlab"}]))
         .await
         .unwrap();
-    timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     services
         .settings_update(json!([{"path":"identity.provider","value":"github"}]))
         .await
         .unwrap();
-    let newer = timeout(Duration::from_secs(5), async {
-        loop {
-            let primary = services.store.get_primary_principal().await.unwrap();
-            if primary
-                .identity_key()
-                .is_some_and(|identity| identity.provider == "github")
-            {
-                break primary;
+    let newer = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let primary = services.store.get_primary_principal().await.unwrap();
+                if primary
+                    .identity_key()
+                    .is_some_and(|identity| identity.provider == "github")
+                {
+                    break primary;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     // The newer identity has actually persisted while the older real network
@@ -259,18 +276,24 @@ async fn assert_identity_tail_preserves_newer_setting(rejected: bool) {
     let worker = services.clone();
     let drain = intent_core::spawn_daemon(async move { worker.shutdown_store_writers().await });
     assert_eq!(
-        timeout(Duration::from_secs(5), pending_rx)
-            .await
-            .unwrap()
-            .unwrap(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            pending_rx
+        )
+        .await
+        .unwrap()
+        .unwrap(),
         "store-tasks"
     );
     assert!(!drain.is_finished());
     release.notify_one();
-    timeout(Duration::from_secs(5), drain)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        drain,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     server.await.unwrap();
     bus.shutdown().await.unwrap();
     services.store.close().await;
@@ -455,9 +478,12 @@ async fn assert_probe_preserves_newer_token_during_get(retry: bool) {
     let probe = intent_core::spawn_daemon(async move {
         worker.source_control_get_user("gitlab".into(), None).await
     });
-    timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     let held_binding = services.repository_connection_directory().binding();
     eprintln!(
         "held probe retry={retry} ready={} refreshes={} old_gets={} rotated_gets={}",
@@ -470,7 +496,7 @@ async fn assert_probe_preserves_newer_token_during_get(retry: bool) {
     // This full public mutation must acquire the credential gate and finish its
     // actual persistence while the older real HTTP response remains held.
     let newer = timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         services.source_control_connect(
             "gitlab".into(),
             None,
@@ -496,11 +522,14 @@ async fn assert_probe_preserves_newer_token_during_get(retry: bool) {
         Some("newer-pat")
     );
     release.notify_one();
-    let result = timeout(Duration::from_secs(5), probe)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let result = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        probe,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
     // The original response belongs to its captured source. It cannot adopt
     // the replacement's identity; a distinct current request can observe it.
     assert_eq!(result, json!({"user": null}));
@@ -616,9 +645,12 @@ async fn gitlab_probe_retains_refresh_and_disconnect_results_through_shutdown() 
                     .source_control_auth_status("gitlab".into(), None)
                     .await
             });
-            timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .unwrap();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                entered.notified(),
+            )
+            .await
+            .unwrap();
             match outcome {
                 0 => {
                     caller.abort();
@@ -626,19 +658,25 @@ async fn gitlab_probe_retains_refresh_and_disconnect_results_through_shutdown() 
                 }
                 3 => {
                     fail.send(()).unwrap();
-                    let error = timeout(Duration::from_secs(5), caller)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .unwrap_err();
+                    let error = timeout(
+                        intentd_test_support::test_timeout(Duration::from_secs(5)),
+                        caller,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
                     assert!(error.to_string().contains("probe failed"));
                 }
                 _ => {
-                    let error = timeout(Duration::from_secs(5), caller)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .unwrap_err();
+                    let error = timeout(
+                        intentd_test_support::test_timeout(Duration::from_secs(5)),
+                        caller,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
                     assert!(error.to_string().contains("timed out"));
                 }
             }
@@ -650,20 +688,26 @@ async fn gitlab_probe_retains_refresh_and_disconnect_results_through_shutdown() 
                 closer.shutdown_store_writers().await;
             });
             assert_eq!(
-                timeout(Duration::from_secs(5), at_drain)
-                    .await
-                    .unwrap()
-                    .unwrap(),
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    at_drain
+                )
+                .await
+                .unwrap()
+                .unwrap(),
                 "settings-tasks"
             );
             assert!(services.settings_tasks.is_closed());
             assert!(!drain.is_finished());
             assert_eq!(raw.load(SECRET_ACCOUNT).unwrap().as_deref(), Some("old"));
             release.send(()).unwrap();
-            timeout(Duration::from_secs(5), drain)
-                .await
-                .unwrap()
-                .unwrap();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                drain,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             server.abort();
             let _ = server.await;
             assert!(services.gitlab_credential_gate.try_lock().is_ok());
@@ -900,9 +944,12 @@ async fn gitlab_direct_mutations_retain_actual_results_and_guards() {
                         .await
                 })
             };
-            timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .unwrap();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                entered.notified(),
+            )
+            .await
+            .unwrap();
             match outcome {
                 0 => {
                     caller.abort();
@@ -910,19 +957,25 @@ async fn gitlab_direct_mutations_retain_actual_results_and_guards() {
                 }
                 3 => {
                     fail.send(()).unwrap();
-                    let error = timeout(Duration::from_secs(5), caller)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .unwrap_err();
+                    let error = timeout(
+                        intentd_test_support::test_timeout(Duration::from_secs(5)),
+                        caller,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
                     assert!(error.to_string().contains("operation failed"));
                 }
                 _ => {
-                    let error = timeout(Duration::from_secs(5), caller)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .unwrap_err();
+                    let error = timeout(
+                        intentd_test_support::test_timeout(Duration::from_secs(5)),
+                        caller,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
                     assert!(error.to_string().contains("timed out"));
                 }
             }
@@ -934,20 +987,26 @@ async fn gitlab_direct_mutations_retain_actual_results_and_guards() {
                 closer.shutdown_store_writers().await;
             });
             assert_eq!(
-                timeout(Duration::from_secs(5), at_drain)
-                    .await
-                    .unwrap()
-                    .unwrap(),
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    at_drain
+                )
+                .await
+                .unwrap()
+                .unwrap(),
                 "settings-tasks"
             );
             assert!(services.settings_tasks.is_closed());
             assert!(!drain.is_finished());
             assert_eq!(raw.load(SECRET_ACCOUNT).unwrap().as_deref(), Some("old"));
             release.send(()).unwrap();
-            timeout(Duration::from_secs(5), drain)
-                .await
-                .unwrap()
-                .unwrap();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                drain,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert!(services.gitlab_credential_gate.try_lock().is_ok());
             assert!(services.secrets.state.lock().unwrap().mutations.is_empty());
             assert_eq!(
@@ -1124,10 +1183,13 @@ async fn gitlab_settlement_prevents_stale_sibling_reads_refilling_cache() {
             }));
         }
         for _ in accounts {
-            timeout(Duration::from_secs(5), ready.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                ready.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         }
         let writer = backend.clone();
         let operation = secrets.operation();
@@ -1212,10 +1274,13 @@ async fn gitlab_partial_error_cannot_publish_after_newer_revoke() {
     }
     let (host, server) = crate::source_control_auth_ops::startup_tests::authorized_host().await;
     services.gitlab_connect_device(host).await.unwrap();
-    timeout(Duration::from_secs(5), at_publication)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        at_publication,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
         Some("partial-token")
@@ -1226,10 +1291,13 @@ async fn gitlab_partial_error_cannot_publish_after_newer_revoke() {
             .source_control_revoke("gitlab".into(), Some("gitlab.result.test".into()))
             .await
     });
-    let blocked = timeout(Duration::from_secs(5), gate_result)
-        .await
-        .unwrap()
-        .unwrap();
+    let blocked = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        gate_result,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     // Synchronize at the actual credential gate, not the outer request poll.
     // In the faulty ordering revoke can finish before the old event is released.
     if blocked {
@@ -1238,17 +1306,23 @@ async fn gitlab_partial_error_cannot_publish_after_newer_revoke() {
             Some("partial-token")
         );
         release.send(()).unwrap();
-        timeout(Duration::from_secs(5), revoked)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            revoked,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     } else {
-        timeout(Duration::from_secs(5), revoked)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            revoked,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         release.send(()).unwrap();
     }
     services.shutdown_store_writers().await;
@@ -1332,34 +1406,42 @@ async fn gitlab_poll_retains_prewrite_and_worker_failure_through_real_drain() {
         }
         let (host, server) = crate::source_control_auth_ops::startup_tests::authorized_host().await;
         services.gitlab_connect_device(host).await.unwrap();
-        timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .unwrap();
         if outcome == 3 {
             panic_worker.send(()).unwrap();
             timeout(
-                Duration::from_secs(5),
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
                 services.secrets.gitlab_poll_worker_failed.notified(),
             )
             .await
             .unwrap();
         } else {
-            timeout(Duration::from_secs(5), async {
-                loop {
-                    if services
-                        .secrets
-                        .state
-                        .lock()
-                        .unwrap()
-                        .mutations
-                        .iter()
-                        .any(|r| r.account == SECRET_ACCOUNT && r.timed_out.load(Ordering::SeqCst))
-                    {
-                        break;
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                async {
+                    loop {
+                        if services
+                            .secrets
+                            .state
+                            .lock()
+                            .unwrap()
+                            .mutations
+                            .iter()
+                            .any(|r| {
+                                r.account == SECRET_ACCOUNT && r.timed_out.load(Ordering::SeqCst)
+                            })
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
                     }
-                    tokio::task::yield_now().await;
-                }
-            })
+                },
+            )
             .await
             .unwrap();
         }
@@ -1371,10 +1453,13 @@ async fn gitlab_poll_retains_prewrite_and_worker_failure_through_real_drain() {
         let draining = intent_core::spawn_daemon(async move {
             owner.shutdown_store_writers().await;
         });
-        let stage = timeout(Duration::from_secs(5), at_fence)
-            .await
-            .unwrap()
-            .unwrap();
+        let stage = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            at_fence,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(services.settings_tasks.is_closed());
         assert_eq!(
             stage,
@@ -1389,10 +1474,13 @@ async fn gitlab_poll_retains_prewrite_and_worker_failure_through_real_drain() {
             "real shutdown passed the held write"
         );
         release.send(()).unwrap();
-        timeout(Duration::from_secs(5), draining)
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            draining,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         server.await.unwrap();
         assert!(services.gitlab_credential_gate.try_lock().is_ok());
         assert!(services.secrets.state.lock().unwrap().mutations.is_empty());
@@ -1482,9 +1570,12 @@ async fn gitlab_partial_result_invalidates_siblings_without_consuming_other_rece
             })
             .await
     });
-    timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     assert!(response
         .await
         .unwrap()
@@ -1566,24 +1657,27 @@ fn hold_github_write(
 }
 
 async fn wait_github_write_timeout(secrets: &AsyncSecretStore) {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if secrets
-                .state
-                .lock()
-                .unwrap()
-                .mutations
-                .iter()
-                .any(|record| {
-                    record.account == crate::github_auth_ops::SECRET_ACCOUNT
-                        && record.timed_out.load(Ordering::SeqCst)
-                })
-            {
-                return;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if secrets
+                    .state
+                    .lock()
+                    .unwrap()
+                    .mutations
+                    .iter()
+                    .any(|record| {
+                        record.account == crate::github_auth_ops::SECRET_ACCOUNT
+                            && record.timed_out.load(Ordering::SeqCst)
+                    })
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
 }
@@ -1630,9 +1724,12 @@ async fn github_poll_provenance_panic_keeps_finalization_guard() {
         crate::github_auth_ops::credential_tests::accept_identity(),
     )
     .await;
-    timeout(Duration::from_secs(5), engine_entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        engine_entered.notified(),
+    )
+    .await
+    .unwrap();
     let record = services
         .secrets
         .state
@@ -1652,9 +1749,12 @@ async fn github_poll_provenance_panic_keeps_finalization_guard() {
         *secrets.panic_mutation_caller.lock().unwrap() = Some(worker_failure);
     }));
     release_engine.send(()).unwrap();
-    timeout(Duration::from_secs(5), backend.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        backend.entered.notified(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         raw.load(crate::github_auth_ops::SECRET_ACCOUNT)
             .unwrap()
@@ -1663,7 +1763,7 @@ async fn github_poll_provenance_panic_keeps_finalization_guard() {
     );
     panic_worker.send(()).unwrap();
     timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         services.secrets.github_poll_worker_failed.notified(),
     )
     .await
@@ -1681,7 +1781,12 @@ async fn github_poll_provenance_panic_keeps_finalization_guard() {
         None
     );
     release_marker.send(()).unwrap();
-    timeout(Duration::from_secs(5), drain).await.unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        drain,
+    )
+    .await
+    .unwrap();
     flow.await.unwrap();
     assert!(services.secrets.github_mutation.try_lock().is_ok());
     assert!(services.secrets.state.lock().unwrap().mutations.is_empty());
@@ -1775,15 +1880,21 @@ async fn assert_github_idle_poll_shutdown(close_before_worker: bool) {
             .is_some());
         services.begin_settings_shutdown();
     } else {
-        timeout(Duration::from_secs(5), observed_pending)
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            observed_pending,
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
     assert!(services.github_auth_flow.lock().await.is_some());
-    timeout(Duration::from_secs(5), services.shutdown_store_writers())
-        .await
-        .expect("shutdown retained an idle GitHub cadence until device expiry");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        services.shutdown_store_writers(),
+    )
+    .await
+    .expect("shutdown retained an idle GitHub cadence until device expiry");
     assert!(services.github_auth_flow.lock().await.is_none());
     assert!(services.store_tasks.is_closed());
     if close_before_worker {
@@ -1843,13 +1954,16 @@ async fn github_poll_shutdown_retains_real_write_and_panic_settlement() {
             crate::github_auth_ops::credential_tests::accept_identity(),
         )
         .await;
-        timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .unwrap();
         if outcome == 3 {
             panic_worker.send(()).unwrap();
             timeout(
-                Duration::from_secs(5),
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
                 services.secrets.github_poll_worker_failed.notified(),
             )
             .await
@@ -1869,7 +1983,12 @@ async fn github_poll_shutdown_retains_real_write_and_panic_settlement() {
             "shutdown abandoned the actual engine blocking closure"
         );
         release.send(()).unwrap();
-        timeout(Duration::from_secs(5), drain).await.unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            drain,
+        )
+        .await
+        .unwrap();
         flow.await.unwrap();
         assert!(services.secrets.github_mutation.try_lock().is_ok());
         assert!(services.secrets.state.lock().unwrap().mutations.is_empty());
@@ -1920,9 +2039,12 @@ async fn github_poll_late_result_cannot_overwrite_newer_generation() {
         crate::github_auth_ops::credential_tests::accept_identity(),
     )
     .await;
-    timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     wait_github_write_timeout(&services.secrets).await;
     let (blocked, observed_blocked) = tokio::sync::oneshot::channel();
     *services.secrets.github_lock_pending.lock().unwrap() = Some(blocked);
@@ -1937,23 +2059,32 @@ async fn github_poll_late_result_cannot_overwrite_newer_generation() {
         .settings_update(json!([{"path":"sourceControl.github.token","value":"newer-token"}]));
     tokio::pin!(newer);
     assert!(poll_fn(|cx| Poll::Ready(newer.as_mut().poll(cx).is_pending())).await);
-    timeout(Duration::from_secs(5), observed_blocked)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        observed_blocked,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         raw.load(crate::github_auth_ops::SECRET_ACCOUNT).unwrap(),
         None
     );
     release.send(()).unwrap();
-    timeout(Duration::from_secs(5), newer)
-        .await
-        .unwrap()
-        .unwrap();
-    timeout(Duration::from_secs(5), flow)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        newer,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        flow,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     services.shutdown_store_writers().await;
     assert_eq!(
         raw.load(crate::github_auth_ops::SECRET_ACCOUNT)
@@ -2021,10 +2152,13 @@ async fn cancelling_observer_after_pending_poll_preserves_actual_handle() {
             })
             .await
     });
-    timeout(Duration::from_secs(5), first_seen)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        first_seen,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
     let record = secrets.state.lock().unwrap().mutations[0].clone();
@@ -2034,10 +2168,13 @@ async fn cancelling_observer_after_pending_poll_preserves_actual_handle() {
     let observer = tokio::spawn(async move { observer.settle_detached("linear.token").await });
     // The signal comes AFTER JoinHandle::poll returned Pending, with the
     // record lock held. This is not cancellation of a record-lock waiter.
-    timeout(Duration::from_secs(5), observer_seen)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        observer_seen,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     observer.abort();
     assert!(observer.await.unwrap_err().is_cancelled());
     assert!(matches!(
@@ -2053,7 +2190,12 @@ async fn cancelling_observer_after_pending_poll_preserves_actual_handle() {
         () = std::future::ready(()) => {}
     }
     release.send(()).unwrap();
-    timeout(Duration::from_secs(5), drain).await.unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        drain,
+    )
+    .await
+    .unwrap();
     assert!(
         matches!(secrets.mutation_result(&record).await, Err(Error::InvalidParams(message)) if message == "same actual result")
     );
@@ -2088,21 +2230,27 @@ async fn provisional_secret_is_not_executable_before_admission() {
     // observer all the way through before allowing registration to proceed.
     // Otherwise it cannot snapshot the private record until admission ends.
     if observer_can_snapshot {
-        timeout(Duration::from_secs(5), &mut observer)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            &mut observer,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     }
     secrets.mutation_tasks.close();
     release.send(()).unwrap();
     assert!(write.await.unwrap().is_err());
     if !observer_can_snapshot {
-        timeout(Duration::from_secs(5), observer)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            observer,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     }
     secrets.shutdown_mutations().await;
     assert_eq!(
@@ -2214,15 +2362,21 @@ async fn direct_worker_panic_retains_live_mutation_and_guard() {
                 worker.mcp_servers_toggle("held".into(), false, None).await
             }
         });
-        timeout(Duration::from_secs(5), backend.entered.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            backend.entered.notified(),
+        )
+        .await
+        .unwrap();
         fail.send(()).unwrap();
-        let error = timeout(Duration::from_secs(5), request)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
+        let error = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            request,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
         assert!(error.to_string().contains("state may be unknown"));
         if github {
             assert!(services.secrets.github_mutation.try_lock().is_err());
@@ -2240,7 +2394,12 @@ async fn direct_worker_panic_retains_live_mutation_and_guard() {
         assert!(poll_fn(|cx| Poll::Ready(drain.as_mut().poll(cx).is_pending())).await);
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
         release.send(()).unwrap();
-        timeout(Duration::from_secs(5), drain).await.unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            drain,
+        )
+        .await
+        .unwrap();
         if github {
             assert!(services.secrets.github_mutation.try_lock().is_ok());
             assert_eq!(services.secrets.load(backend.account).await.unwrap(), None);
@@ -2250,7 +2409,14 @@ async fn direct_worker_panic_retains_live_mutation_and_guard() {
                 "unknown operation must not claim completed reconciliation"
             );
         } else {
-            drop(timeout(Duration::from_secs(5), account).await.unwrap());
+            drop(
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    account,
+                )
+                .await
+                .unwrap(),
+            );
             let actual: Value = serde_json::from_str(
                 &services
                     .secrets
@@ -2491,14 +2657,20 @@ async fn direct_secret_timeout_retains_actual_outcome_and_refuses_after_close() 
                     writer.mcp_servers_toggle("held".into(), false, None).await
                 }
             });
-            timeout(Duration::from_secs(5), backend.entered.notified())
-                .await
-                .unwrap();
-            let error = timeout(Duration::from_secs(5), response)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap_err();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                backend.entered.notified(),
+            )
+            .await
+            .unwrap();
+            let error = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                response,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
             assert!(error.to_string().contains("state may be unknown"));
             assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
             assert!(services
@@ -2523,7 +2695,12 @@ async fn direct_secret_timeout_retains_actual_outcome_and_refuses_after_close() 
                 () = std::future::ready(()) => {}
             }
             release.send(()).unwrap();
-            timeout(Duration::from_secs(5), drain).await.unwrap();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                drain,
+            )
+            .await
+            .unwrap();
             assert!(services.secrets.state.lock().unwrap().mutations.is_empty());
             if github {
                 let expected = if outcome == 0 {
@@ -2622,9 +2799,12 @@ async fn direct_revoke_timeout_serializes_newer_settings_owner() {
     Arc::get_mut(&mut services.secrets).unwrap().write_timeout = Duration::from_millis(10);
     let writer = services.clone();
     let response = intent_core::spawn_daemon(async move { writer.github_revoke().await });
-    timeout(Duration::from_secs(5), backend.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        backend.entered.notified(),
+    )
+    .await
+    .unwrap();
     assert!(response
         .await
         .unwrap()
@@ -2637,10 +2817,13 @@ async fn direct_revoke_timeout_serializes_newer_settings_owner() {
         services.settings_update(json!([{"path":"sourceControl.github.token","value":"newer"}]));
     tokio::pin!(newer);
     assert!(poll_fn(|cx| Poll::Ready(newer.as_mut().poll(cx).is_pending())).await);
-    timeout(Duration::from_secs(5), observed_blocked)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        observed_blocked,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         backend.calls.load(Ordering::SeqCst),
         1,
@@ -2658,11 +2841,19 @@ async fn direct_revoke_timeout_serializes_newer_settings_owner() {
         () = std::future::ready(()) => {}
     }
     release.send(()).unwrap();
-    timeout(Duration::from_secs(5), &mut newer)
-        .await
-        .unwrap()
-        .unwrap();
-    timeout(Duration::from_secs(5), drain).await.unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        &mut newer,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        drain,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         services
             .secrets
@@ -2696,9 +2887,12 @@ async fn direct_github_revoke_finishes_after_caller_cancel() {
     services.github_login_base_uri = Some("http://127.0.0.1:1".into());
     let writer = services.clone();
     let response = intent_core::spawn_daemon(async move { writer.github_revoke().await });
-    timeout(Duration::from_secs(5), backend.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        backend.entered.notified(),
+    )
+    .await
+    .unwrap();
     response.abort();
     assert!(response.await.unwrap_err().is_cancelled());
     let drain = services.shutdown_store_writers();
@@ -2709,7 +2903,12 @@ async fn direct_github_revoke_finishes_after_caller_cancel() {
         () = std::future::ready(()) => {}
     }
     release.send(()).unwrap();
-    timeout(Duration::from_secs(5), drain).await.unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        drain,
+    )
+    .await
+    .unwrap();
     bus.shutdown().await.unwrap();
     services.store.close().await;
     assert_eq!(backend.inner.load(backend.account).unwrap(), None);
@@ -2760,9 +2959,12 @@ async fn direct_mcp_toggle_finishes_after_caller_cancel() {
     let response = intent_core::spawn_daemon(async move {
         writer.mcp_servers_toggle("held".into(), false, None).await
     });
-    timeout(Duration::from_secs(5), backend.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        backend.entered.notified(),
+    )
+    .await
+    .unwrap();
     response.abort();
     assert!(response.await.unwrap_err().is_cancelled());
     let drain = services.shutdown_store_writers();
@@ -2773,7 +2975,12 @@ async fn direct_mcp_toggle_finishes_after_caller_cancel() {
         () = std::future::ready(()) => {}
     }
     release.send(()).unwrap();
-    timeout(Duration::from_secs(5), drain).await.unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        drain,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         services
             .settings_get("mcp.disabledServers".into())
@@ -2830,15 +3037,21 @@ async fn settings_worker_panic_retains_live_write_and_account_guards() {
             ]))
             .await
     });
-    timeout(Duration::from_secs(5), backend.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        backend.entered.notified(),
+    )
+    .await
+    .unwrap();
     fail.send(()).unwrap();
-    let error = timeout(Duration::from_secs(5), request)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
+    let error = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        request,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap_err();
     assert!(error.to_string().contains("state may be unknown"));
     assert!(
         services.gitlab_credential_gate.try_lock().is_err(),
@@ -2860,8 +3073,20 @@ async fn settings_worker_panic_retains_live_write_and_account_guards() {
         None
     );
     release.send(()).unwrap();
-    timeout(Duration::from_secs(5), &mut drain).await.unwrap();
-    drop(timeout(Duration::from_secs(5), accounts).await.unwrap());
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        &mut drain,
+    )
+    .await
+    .unwrap();
+    drop(
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            accounts,
+        )
+        .await
+        .unwrap(),
+    );
     assert!(services.gitlab_credential_gate.try_lock().is_ok());
     assert!(services.secrets.state.lock().unwrap().mutations.is_empty());
     assert_eq!(
@@ -2922,14 +3147,20 @@ async fn settings_owner_recovers_captured_result_after_completion_observer_panic
             ]))
             .await
     });
-    timeout(Duration::from_secs(5), backend.entered.notified())
-        .await
-        .unwrap();
-    let error = timeout(Duration::from_secs(5), request)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        backend.entered.notified(),
+    )
+    .await
+    .unwrap();
+    let error = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        request,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap_err();
     assert!(error.to_string().contains("unknown"));
     let record = services.secrets.state.lock().unwrap().mutations[0].clone();
     let (captured, observed) = tokio::sync::oneshot::channel();
@@ -2945,7 +3176,12 @@ async fn settings_owner_recovers_captured_result_after_completion_observer_panic
         () = std::future::ready(()) => {}
     }
     release.send(()).unwrap();
-    timeout(Duration::from_secs(5), drain).await.unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        drain,
+    )
+    .await
+    .unwrap();
     observed.await.unwrap();
     assert!(matches!(
         *record.state.lock().await,
@@ -3070,9 +3306,12 @@ async fn cancelled_hook_owner_finishes_before_final_listener_stop() {
             .settings_update(json!([{"path":"server.wsApi.enabled","value":true}]))
             .await
     }));
-    timeout(Duration::from_secs(5), control.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        control.entered.notified(),
+    )
+    .await
+    .unwrap();
     caller.abort();
     let _ = caller.await;
     services.begin_settings_shutdown();
@@ -3086,9 +3325,12 @@ async fn cancelled_hook_owner_finishes_before_final_listener_stop() {
         () = std::future::ready(()) => {}
     }
     control.release.notify_one();
-    timeout(Duration::from_secs(5), async {
-        tokio::join!(first, second);
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            tokio::join!(first, second);
+        },
+    )
     .await
     .unwrap();
     // The same composition dependency as main: early settings join, then the
@@ -3204,11 +3446,14 @@ async fn cancelled_settlement_observer_leaves_original_receipt_owned() {
     let record = secrets.state.lock().unwrap().mutations[0].clone();
     let observer = secrets.clone();
     let observer = tokio::spawn(async move { observer.settle_detached("linear.token").await });
-    timeout(Duration::from_secs(5), async {
-        while record.settling.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while record.settling.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     observer.abort();
@@ -3222,7 +3467,12 @@ async fn cancelled_settlement_observer_leaves_original_receipt_owned() {
         () = std::future::ready(()) => {}
     }
     release.send(()).unwrap();
-    timeout(Duration::from_secs(5), drain).await.unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        drain,
+    )
+    .await
+    .unwrap();
     assert!(secrets.settle_detached("linear.token").await.unwrap());
     assert!(matches!(
         secrets.mutation_result(&record).await,
@@ -3270,9 +3520,12 @@ async fn completed_secret_receipt_survives_other_observers_and_preserves_error()
             () = std::future::ready(()) => {}
         }
         release.send(()).unwrap();
-        timeout(Duration::from_secs(5), &mut shutdown)
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            &mut shutdown,
+        )
+        .await
+        .unwrap();
         assert!(secrets.settle_detached("linear.token").await.unwrap());
         assert!(secrets
             .clone()

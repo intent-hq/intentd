@@ -9,7 +9,6 @@ use std::fmt::Write as _;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::TaskStatus;
-use intent_sourcecontrol::PrAncestry;
 
 use super::{ChildSettlementParams, Doctrine, Harness, HarnessEntry, TurnEnvelopeParams};
 use crate::agent_ops::ready_delta::{UnblockedReason, UnblockedTask};
@@ -46,11 +45,13 @@ pub(crate) const FEATURE_LABELS: &[(&str, &str)] = &[
     ("scripts", "Saved scripts (ws.script.*)"),
     ("terminalAccess", "Terminal read access (ws.terminal.*)"),
     ("browserAutomation", "Browser automation (ws.browser.*)"),
+    ("desktopControl", "Desktop control (ws.desktop.*)"),
     ("richChatBlocks", "Rich chat block guidance"),
     (
         "structuredQuestions",
         "Structured questions (ws.app.question.ask)",
     ),
+    ("secretRequests", "Secret requests (ws.secret.*)"),
     (
         "attentionRequests",
         "Attention requests (reportBlocker / requestDiscussion)",
@@ -113,7 +114,7 @@ pub(super) fn single_line_name(name: Option<&str>) -> Option<String> {
 
 /// Cap (in chars) on the `[hook logs]` section appended to dispatch/evict
 /// wakes.
-pub(crate) const HOOK_WAKE_LOGS_CAP: usize = 2048;
+pub const HOOK_WAKE_LOGS_CAP: usize = 2048;
 
 /// `{name} ({id})` display label for a settling child, falling back to the
 /// bare id when no name resolved.
@@ -167,6 +168,60 @@ fn attention_verb(kind: &str) -> &str {
     }
 }
 
+/// Per-reviewer review changes (intentd#2605: a repeated `changes
+/// requested` left the decision and counts unchanged, so no wake fired).
+/// Reported only when BOTH snapshots carry `latestReviews`, so a baseline
+/// persisted before the field existed is adopted silently. Two lines:
+/// a reviewer's latest review identity moved ("new review"), and an
+/// approve / changes-requested review is now known to be on an older
+/// commit and was not already reported so ("older commit"; a baseline whose
+/// head was unknown counts as not yet reported).
+fn diff_latest_reviews(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
+    let (Some(before), Some(after)) = (
+        old.requirements.approvals.latest_reviews.as_ref(),
+        new.requirements.approvals.latest_reviews.as_ref(),
+    ) else {
+        return Vec::new();
+    };
+    let short = |sha: &str| -> String { sha.chars().take(8).collect() };
+    let head = new.head_sha.as_deref().filter(|h| !h.is_empty());
+    let mut changes = Vec::new();
+    // Oldest first, so a wake reads chronologically.
+    for review in after.iter().rev() {
+        let prior = before.iter().find(|b| b.reviewer == review.reviewer);
+        let state = review.state.replace('_', " ");
+        if prior.is_none_or(|p| p.identity() != review.identity()) {
+            let place = match (review.commit_sha.as_deref(), review.on_current_head) {
+                (Some(commit), Some(true)) => format!(" on {} (current head)", short(commit)),
+                (Some(commit), Some(false)) => format!(
+                    " on {} (older commit; head is {})",
+                    short(commit),
+                    head.map_or_else(|| "unknown".to_string(), short)
+                ),
+                (Some(commit), None) => format!(" on {}", short(commit)),
+                (None, _) => String::new(),
+            };
+            changes.push(format!(
+                "new review from {}: {state}{place}",
+                review.reviewer
+            ));
+        } else if matches!(review.state.as_str(), "approved" | "changes_requested")
+            && review.on_current_head == Some(false)
+            && prior.is_some_and(|p| p.on_current_head != Some(false))
+        {
+            if let (Some(commit), Some(head)) = (review.commit_sha.as_deref(), head) {
+                changes.push(format!(
+                    "{}'s latest review ({state}) is on an older commit {}; head is {}",
+                    review.reviewer,
+                    short(commit),
+                    short(head)
+                ));
+            }
+        }
+    }
+    changes
+}
+
 fn describe_opt<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map_or_else(|| "unknown".to_string(), |v| v.to_string())
 }
@@ -192,7 +247,7 @@ fn plural(n: i64) -> &'static str {
 /// name's required flag, independently of uncertainty for other check names.
 ///
 /// Normal success transitions are suppressed: a check going `pending` →
-/// `passed`, or appearing already green, is expected progress rather than a
+/// `passed` or `skipped`, or appearing already green or skipped, is expected progress rather than a
 /// reportable change — the suite-completion summary in
 /// [`V1::pr_diff_lines`] covers the "everything finished" moment. A
 /// `failed` → `passed` recovery IS reported, since it resolves a previously
@@ -215,13 +270,14 @@ fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> 
     for check in &n.items {
         match before.get(&check.name) {
             None => {
-                if check.status != "passed" {
+                if !matches!(check.status.as_str(), "passed" | "skipped") {
                     changes.push(format!("check started: {} ({})", check.name, check.status));
                 }
             }
             Some(prev) => {
                 if prev.status != check.status
-                    && !(check.status == "passed" && prev.status == "pending")
+                    && !(matches!(check.status.as_str(), "passed" | "skipped")
+                        && prev.status == "pending")
                 {
                     changes.push(format!(
                         "check {}: {} → {}",
@@ -578,8 +634,37 @@ impl Harness for V1 {
             .to_string()
     }
 
-    fn note_images_notice(&self, n: usize) -> String {
-        format!("[System: {n} image(s) from the referenced note(s) are attached to this message.]")
+    fn note_reference_notice(
+        &self,
+        title: &str,
+        id: &str,
+        image_urls: &[String],
+        omitted: usize,
+    ) -> String {
+        let (title, id) = (notice_field(title), notice_field(id));
+        let mut notice = format!(
+            "[Note in context: \"{title}\" (ID: {id}). Its content is NOT inlined in this \
+             message; read it with ws.note.read(\"{id}\")."
+        );
+        if !image_urls.is_empty() {
+            let total = image_urls.len() + omitted;
+            let _ = write!(
+                notice,
+                " It embeds {total} image(s), also NOT inlined; view one with \
+                 ws.note.readAsset(\"<url>\"):"
+            );
+            for url in image_urls {
+                let _ = write!(notice, "\n- {url}");
+            }
+            if omitted > 0 {
+                let _ = write!(
+                    notice,
+                    "\n- …and {omitted} more (listed in the note content)"
+                );
+            }
+        }
+        notice.push(']');
+        notice
     }
 
     fn attachment_reference_notice(
@@ -966,95 +1051,23 @@ impl Harness for V1 {
     }
 
     fn pr_checklist(&self, s: &PrMonitorSnapshot) -> String {
-        let r = &s.requirements;
-        let mut lines = vec![format!("state: {}", r.state)];
-        let approvals = match r.approvals.needed {
-            Some(needed) => format!(
-                "approvals: {} ({}/{} required)",
-                r.approvals.decision, r.approvals.have, needed
-            ),
-            None => format!(
-                "approvals: {} ({} approving)",
-                r.approvals.decision, r.approvals.have
-            ),
-        };
-        lines.push(approvals);
-        if r.approvals.changes_requested > 0 {
-            lines.push(format!(
-                "changes requested by {} reviewer{}",
-                r.approvals.changes_requested,
-                plural(r.approvals.changes_requested)
-            ));
-        }
-        let mut checks = format!(
-            "checks: {} passed, {} failed, {} pending (of {})",
-            r.checks.passed, r.checks.failed, r.checks.pending, r.checks.total
-        );
-        if !r.checks.failing_required.is_empty() {
-            let _ = write!(
-                checks,
-                "; failing required: {}",
-                r.checks.failing_required.join(", ")
-            );
-        }
-        if !r.checks.pending_required.is_empty() {
-            let _ = write!(
-                checks,
-                "; pending required: {}",
-                r.checks.pending_required.join(", ")
-            );
-        }
-        if !r.checks.required_known {
-            checks.push_str(" (required-check flags unavailable)");
-        }
-        lines.push(checks);
-        let count = match r.threads.unresolved {
-            Some(n) => n.to_string(),
-            None => "unknown (thread resolution state unreadable)".to_string(),
-        };
-        let threads = match r.threads.resolution_required {
-            Some(true) => format!("unresolved threads: {count} (resolution required to merge)"),
-            _ => format!("unresolved threads: {count}"),
-        };
-        lines.push(threads);
-        if r.has_conflicts {
-            lines.push("merge conflicts present".to_string());
-        }
-        lines.push(match &r.ancestry {
-            PrAncestry::Unknown => "branch ancestry: unknown".to_string(),
-            PrAncestry::Known { behind_by, .. } => {
-                let suffix = if *behind_by == 1 { "" } else { "s" };
-                let mut line = format!("branch ancestry: {behind_by} commit{suffix} behind base");
-                if *behind_by > 0 && crate::pr_monitor::requirements_ready(r) {
-                    line.push_str(" (behind but mergeable)");
-                }
-                line
+        let mut requirements =
+            serde_json::to_value(&s.requirements).expect("serialize requirements");
+        // A carried-forward list is bookkeeping, not this read's observation:
+        // render the row as unknown rather than as fresh data.
+        if s.latest_reviews_carried {
+            if let Some(approvals) = requirements
+                .get_mut("approvals")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                approvals.remove("latestReviews");
             }
-        });
-        lines.push(
-            match r.branch_update_required {
-                Some(true) => "forge requires a branch update before merging",
-                Some(false) => "forge branch-update requirement: not required",
-                None => "forge branch-update requirement: unknown",
-            }
-            .to_string(),
-        );
-        if r.is_in_merge_queue == Some(true) {
-            lines.push("in merge queue".to_string());
         }
-        if let Some(reason) = &r.merge_blocked_reason {
-            lines.push(format!("blocked: {reason}"));
-        }
-        if !r.rules_known {
-            lines.push(
-                "(branch rules unreadable — approval/thread requirements unknown)".to_string(),
-            );
-        }
-        lines
-            .into_iter()
-            .map(|l| format!("- {l}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        super::review_wake::checklist(
+            &requirements,
+            s.head_sha.as_deref(),
+            crate::pr_monitor::requirements_ready(&s.requirements),
+        )
     }
 
     fn pr_diff_lines(&self, old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
@@ -1108,6 +1121,7 @@ impl Harness for V1 {
                 describe_opt(n.approvals.needed)
             ));
         }
+        changes.extend(diff_latest_reviews(old, new));
 
         // Comments + threads.
         if old.conversation_count != new.conversation_count {
@@ -1160,14 +1174,35 @@ impl Harness for V1 {
             && n.checks.pending == 0
             && n.checks.total > 0
         {
-            changes.push(if n.checks.failed == 0 {
-                format!("all checks passed ({})", n.checks.total)
-            } else {
-                format!(
-                    "all checks completed: {} passed, {} failed",
-                    n.checks.passed, n.checks.failed
-                )
-            });
+            changes.push(super::review_wake::checks_completed(
+                n.checks.total,
+                n.checks.passed,
+                n.checks.failed,
+                &n.checks.names_with("skipped"),
+            ));
+        }
+
+        // CI never started on the head (intentd#2531): reported once per
+        // head, keyed on the flagged SHA. Its clearing is silent — arriving
+        // checks, a new head or conflicts report themselves.
+        if let Some(stall) = &n.checks_not_started {
+            let flagged_before = o
+                .checks_not_started
+                .as_ref()
+                .is_some_and(|s| s.head_sha == stall.head_sha)
+                || [old, new].iter().any(|s| {
+                    s.checks_not_started_delivered.as_deref() == Some(stall.head_sha.as_str())
+                });
+            if !flagged_before {
+                let short: String = stall.head_sha.chars().take(8).collect();
+                changes.push(format!(
+                    "no checks reported for head {short} after {}+ min — CI may never have \
+                     started; push again (e.g. an empty commit) or rebase to trigger it \
+                     (expected only if the required checks are path-filtered or run only in \
+                     the merge queue)",
+                    stall.threshold_minutes
+                ));
+            }
         }
 
         // Mergeability + residual signals. `unknown` is a transient GitHub
@@ -1235,6 +1270,43 @@ impl Harness for V1 {
                 });
             }
         }
+        // The queue entry's state is otherwise informational (position,
+        // size, estimate), but `unmergeable` strands the PR: it conflicts
+        // with an entry ahead and will never merge on its own, and its
+        // branch is locked while queued (intentd#2897 sat ~55 min). The
+        // forge can also raise the flag with no real conflict (intentd#2937
+        // re-enqueued unchanged and merged), so the advice checks before
+        // fixing anything. Recovery
+        // reports only while the entry is still read with a known state;
+        // leaving the queue reports itself.
+        let entry_state = |r: &crate::pr_ops::MergeRequirements| {
+            r.merge_queue
+                .as_ref()
+                .filter(|_| r.is_in_merge_queue == Some(true))
+                .and_then(|e| e.state.clone())
+        };
+        match (entry_state(o).as_deref(), entry_state(n).as_deref()) {
+            (before, Some("unmergeable")) if before != Some("unmergeable") => {
+                changes.push(
+                    "merge queue entry is UNMERGEABLE: the PR conflicts with an entry ahead of \
+                     it and will not merge. Its branch is locked while queued, so a push is \
+                     rejected — remove it from the queue first (GraphQL dequeuePullRequest), \
+                     then git fetch origin and check the conflict is real: git merge-tree \
+                     --write-tree <entry ahead's merge-group branch \
+                     origin/gh-readonly-queue/<base>/pr-<ahead>-<sha>, or origin/<base> when none is \
+                     ahead> <this head>. If that is clean the flag was stale: enqueue the same \
+                     commit again; otherwise fix the branch, then enqueue it again"
+                        .to_string(),
+                );
+            }
+            (Some("unmergeable"), Some(after)) if after != "unmergeable" => {
+                changes.push(format!(
+                    "merge queue entry is no longer unmergeable (now {})",
+                    after.replace('_', " ")
+                ));
+            }
+            _ => {}
+        }
         if o.mergeable != n.mergeable && n.mergeable.is_some() {
             changes.push(format!(
                 "mergeable: {} → {}",
@@ -1266,19 +1338,13 @@ impl Harness for V1 {
         changes: &[String],
         snapshot: &PrMonitorSnapshot,
     ) -> String {
-        let bullets = changes
-            .iter()
-            .map(|c| format!("- {c}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "[PR monitor {label}] {} change{} detected on \"{}\" ({}):\n{bullets}\n\nWhere the PR \
-             stands now:\n{}",
-            changes.len(),
-            plural(i64::try_from(changes.len()).expect("value fits in i64")),
-            snapshot.title,
-            snapshot.url,
-            self.pr_checklist(snapshot)
+        super::review_wake::changed(
+            "PR",
+            label,
+            changes,
+            &snapshot.title,
+            &snapshot.url,
+            &self.pr_checklist(snapshot),
         )
     }
 
@@ -1288,25 +1354,14 @@ impl Harness for V1 {
         changes: &[String],
         snapshot: &PrMonitorSnapshot,
     ) -> String {
-        let outcome = if snapshot.requirements.state == "merged" {
-            "was MERGED"
-        } else {
-            "was CLOSED without merging"
-        };
-        let mut body = format!(
-            "[PR monitor {label}] \"{}\" {outcome} ({}).\n\nMonitoring has STOPPED — this monitor \
-             is retired and will not report again.",
-            snapshot.title, snapshot.url
-        );
-        if !changes.is_empty() {
-            let bullets = changes
-                .iter()
-                .map(|c| format!("- {c}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let _ = write!(body, "\n\nChanges since the last report:\n{bullets}");
-        }
-        body
+        super::review_wake::terminal(
+            "PR",
+            label,
+            changes,
+            &snapshot.title,
+            &snapshot.url,
+            snapshot.requirements.state == "merged",
+        )
     }
 
     fn pr_monitor_cancelled_from_app_notice(&self, label: &str) -> String {
@@ -1417,4 +1472,21 @@ impl Harness for V1 {
              your other work or end your turn."
         )
     }
+}
+
+/// A user-controlled value (note title / id) made safe to quote inside a
+/// bracketed prompt notice: control characters (newlines included) become
+/// spaces, `"` becomes `'`, and `[` / `]` become `(` / `)`, so the value
+/// cannot close the notice or forge a separate system note.
+fn notice_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            c if c.is_control() => ' ',
+            '"' => '\'',
+            '[' => '(',
+            ']' => ')',
+            c => c,
+        })
+        .collect()
 }

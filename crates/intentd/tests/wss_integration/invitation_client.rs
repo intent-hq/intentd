@@ -16,7 +16,9 @@ use fixture_client::{await_workspace_updated, from_raw, wss_rpc, RawWs};
 
 const INTERVAL: Duration = Duration::from_millis(25);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(75);
-const OBSERVE_TIMEOUT: Duration = Duration::from_secs(5);
+fn observe_timeout() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(5))
+}
 
 async fn start_gated() -> (Server, watch::Sender<bool>) {
     let (gate, receiver) = watch::channel(false);
@@ -32,7 +34,7 @@ async fn start_gated() -> (Server, watch::Sender<bool>) {
 }
 
 async fn wait_registered(srv: &Server, count: usize) {
-    tokio::time::timeout(OBSERVE_TIMEOUT, async {
+    tokio::time::timeout(observe_timeout(), async {
         while srv.ws.client_count() != count {
             tokio::task::yield_now().await;
         }
@@ -42,7 +44,7 @@ async fn wait_registered(srv: &Server, count: usize) {
 }
 
 async fn pass_deadline(registered: Instant) {
-    tokio::time::timeout(OBSERVE_TIMEOUT, async {
+    tokio::time::timeout(observe_timeout(), async {
         while registered.elapsed() <= HEARTBEAT_TIMEOUT {
             // timing-guard: observe the real monotonic deadline while reaping is gated
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -57,7 +59,7 @@ async fn pass_deadline(registered: Instant) {
 }
 
 async fn wait_reaped(srv: &Server, initial_count: usize) {
-    tokio::time::timeout(OBSERVE_TIMEOUT, async {
+    tokio::time::timeout(observe_timeout(), async {
         while srv.ws.client_count() >= initial_count {
             tokio::task::yield_now().await;
         }
@@ -77,7 +79,7 @@ async fn assert_abrupt_eof(ws: &mut RawWs) {
     // the existing TLS read side, without polling/sending any WebSocket frame.
     let mut pending = Vec::new();
     let result = tokio::time::timeout(
-        OBSERVE_TIMEOUT,
+        observe_timeout(),
         ws.get_mut().take(64 * 1024).read_to_end(&mut pending),
     )
     .await
@@ -93,7 +95,7 @@ async fn invitation_unpolled_client_is_reaped_after_gate_release() {
     let (srv, gate) = start_gated().await;
     let mut client = connect_ws(srv.port, srv.cfg.clone()).await;
     client.send(Message::Text(json!({"jsonrpc":"2.0","id":1,"method":"events.subscribe","params":{"eventTypes":["workspace:updated"]}}).to_string().into())).await.expect("raw subscribe");
-    tokio::time::timeout(OBSERVE_TIMEOUT, async {
+    tokio::time::timeout(observe_timeout(), async {
         loop {
             match client.next().await {
                 Some(Ok(Message::Text(text))) => {
@@ -203,7 +205,7 @@ async fn invitation_client_drop_releases_socket_without_reaping() {
     wait_registered(&srv, 1).await;
     assert!(!*gate.borrow(), "heartbeat reaping remains disabled");
     drop(client);
-    tokio::time::timeout(OBSERVE_TIMEOUT, async {
+    tokio::time::timeout(observe_timeout(), async {
         while srv.ws.client_count() != 0 {
             tokio::task::yield_now().await;
         }

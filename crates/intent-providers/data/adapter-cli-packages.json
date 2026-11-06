@@ -4,24 +4,33 @@
     "cliPackage": "@anthropic-ai/claude-code",
     "package": {
       "dependencies": {
-        "@agentclientprotocol/sdk": "1.5.0",
-        "@anthropic-ai/claude-agent-sdk": "0.3.280",
-        "zod": "4.6.5"
+        "@agentclientprotocol/sdk": "2.0.1",
+        "@anthropic-ai/claude-agent-sdk": "0.3.309",
+        "diff": "9.0.0",
+        "zod": "4.6.7"
       },
       "name": "@agentclientprotocol/claude-agent-acp",
       "optionalDependencies": {},
       "peerDependencies": {},
-      "version": "0.81.1"
+      "version": "0.95.0"
     },
-    "pinConstant": "CLAUDE_AGENT_ACP_NPX_PACKAGE"
+    "pinConstant": "CLAUDE_AGENT_ACP_NPX_PACKAGE",
+    "runtime": {
+      "claudeCodeVersion": "2.1.309",
+      "name": "@anthropic-ai/claude-agent-sdk",
+      "version": "0.3.309"
+    },
+    "runtimePackage": "@anthropic-ai/claude-agent-sdk",
+    "runtimeVersionField": "claudeCodeVersion"
   },
   "codex": {
     "cliCommand": "codex",
     "cliPackage": "@openai/codex",
     "package": {
       "dependencies": {
-        "@agentclientprotocol/sdk": "^1.5.0",
-        "@openai/codex": "^0.159.1",
+        "@agentclientprotocol/sdk": "~2.1.0",
+        "@openai/codex": "^0.165.0",
+        "cross-spawn": "^7.0.6",
         "diff": "^9.0.0",
         "open": "^11.0.1",
         "vscode-jsonrpc": "^9.0.1",
@@ -30,7 +39,7 @@
       "name": "@agentclientprotocol/codex-acp",
       "optionalDependencies": {},
       "peerDependencies": {},
-      "version": "2.1.1"
+      "version": "2.5.0"
     },
     "pinConstant": "CODEX_ACP_NPX_PACKAGE"
   },

@@ -10,6 +10,9 @@
 //! the original effective URL, including port/prefix/escapes; the legacy Git URL
 //! parser is only a syntax filter, never a qualified identity source.
 
+#[path = "repository_context_reader/known.rs"]
+pub(crate) mod known;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;

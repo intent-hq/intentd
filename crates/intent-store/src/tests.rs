@@ -9,8 +9,8 @@ use intent_core::{
     ClientId, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType,
     Error, EventActor, Hook, HookId, HookListRow, HookState, Note, NoteId, NoteMetadata,
     NoteVersionAuthor, NoteVisibility, Principal, PrincipalId, PrincipalIdentity, TaskMetadata,
-    TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceInvite,
-    WorkspaceRole, WorkspaceStatus,
+    TaskStatus, Workspace, WorkspaceAttention, WorkspaceId, WorkspaceInvite, WorkspaceRole,
+    WorkspaceStatus,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -22,13 +22,21 @@ mod human_attribution;
 mod script_initialization;
 mod script_monitors;
 mod sharing;
+mod workspace_auto_archive_disabled;
 mod workspace_delete;
+mod workspace_label;
+mod workspace_plain_folder;
+mod workspace_retired;
 
+mod derived_index;
 mod metadata_key_json;
-mod note_annotations;
 mod note_line_attribution;
-mod note_pages;
+mod note_paging_removal;
 mod note_search;
+mod note_write_lock;
+mod pull_request_workspace;
+mod workspace_pr_settled;
+mod write_acquire_retry;
 
 #[tokio::test]
 async fn workspace_content_clocks_project_only_requested_timestamps_in_batches() {
@@ -93,52 +101,26 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         title: title.to_string(),
         branch: "feature/test".to_string(),
         base_ref: Some("main".to_string()),
-        base_commit_sha: None,
         status: if archived {
             WorkspaceStatus::Archived
         } else {
             WorkspaceStatus::Active
         },
         status_message: Some("working".to_string()),
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
         attention: WorkspaceAttention::Unread,
         created_at: ts.clone(),
         updated_at: ts.clone(),
         last_activity: Some(ts),
-        last_content_activity: None,
         tags: vec!["alpha".to_string(), "beta".to_string()],
         path: Some("/tmp/ws-meta".to_string()),
         repository_path: Some("/tmp/repo".to_string()),
         repository_owner: Some("intent-hq".to_string()),
         repository_name: Some("intentd".to_string()),
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
         default_model: Some("opus".to_string()),
         pr_number: Some(42),
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
         archived,
         archived_at: if archived { Some(now_iso()) } else { None },
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -362,10 +344,16 @@ async fn workspace_round_trip_and_archive_filter() {
         .await
         .expect("insert archived");
 
-    let all = store.list_workspaces(true).await.expect("list all");
+    let all = store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list all");
     assert_eq!(all.len(), 2);
 
-    let visible = store.list_workspaces(false).await.expect("list visible");
+    let visible = store
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("list visible");
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id, active_id);
 
@@ -1344,7 +1332,11 @@ async fn note_version_records_rev_and_looks_up_base_by_rev() {
     // matches what the row now carries.
     note.content = "one".to_string();
     let rev1 = store
-        .update_note_versioned(&note, Some(0))
+        .update_note_versioned(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+        )
         .await
         .expect("versioned update");
     assert_eq!(rev1, 1);
@@ -1359,7 +1351,13 @@ async fn note_version_records_rev_and_looks_up_base_by_rev() {
 
     // Unconditional write: same contract (1 → 2).
     note.content = "two".to_string();
-    let rev2 = store.update_note(&note).await.expect("update");
+    let rev2 = store
+        .update_note(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+        )
+        .await
+        .expect("update");
     assert_eq!(rev2, 2);
     store
         .append_note_version(&note, &author, &ts, rev2)
@@ -1385,7 +1383,13 @@ async fn note_version_records_rev_and_looks_up_base_by_rev() {
     // A metadata-only write bumps rev without a snapshot (2 → 3): the
     // content as of rev 3 is the last content-write snapshot at or below it.
     note.is_pinned = true;
-    let rev3 = store.update_note(&note).await.expect("metadata update");
+    let rev3 = store
+        .update_note(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+        )
+        .await
+        .expect("metadata update");
     assert_eq!(rev3, 3);
     assert_eq!(
         by_rev(3).await.expect("metadata-only rev 3"),
@@ -1409,7 +1413,13 @@ async fn note_version_records_rev_and_looks_up_base_by_rev() {
     // gone: `None`, not an error.
     for _ in 0..MAX_NOTE_VERSIONS {
         note.content = "churn".to_string();
-        let rev = store.update_note(&note).await.expect("churn update");
+        let rev = store
+            .update_note(
+                &store.lock_note_content(&note.workspace_id, &note.id).await,
+                &note,
+            )
+            .await
+            .expect("churn update");
         store
             .append_note_version(&note, &author, &ts, rev)
             .await
@@ -1744,14 +1754,26 @@ async fn note_rev_increments_on_update() {
     // First update bumps rev → 1 (the bump is store-owned, ignoring the stale
     // in-memory `rev` carried by the passed-in note).
     note.content = "# Hello v2".to_string();
-    store.update_note(&note).await.expect("update note");
+    store
+        .update_note(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+        )
+        .await
+        .expect("update note");
     let after_first = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(after_first.rev, 1);
     assert_eq!(after_first.content, "# Hello v2");
 
     // A second update bumps again → 2 (monotonic).
     note.content = "# Hello v3".to_string();
-    store.update_note(&note).await.expect("update note");
+    store
+        .update_note(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+        )
+        .await
+        .expect("update note");
     let after_second = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(after_second.rev, 2);
 }
@@ -1790,7 +1812,11 @@ async fn update_note_versioned_hit_miss_and_absent() {
     // HIT: expected_version matches the stored rev (0) → write + bump to 1.
     note.content = "v1".to_string();
     store
-        .update_note_versioned(&note, Some(0))
+        .update_note_versioned(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+        )
         .await
         .expect("versioned hit");
     let after_hit = store.get_note(&ws_id, &note.id).await.expect("get note");
@@ -1800,7 +1826,13 @@ async fn update_note_versioned_hit_miss_and_absent() {
     // MISS: stale expected_version (0, but stored rev is now 1) → Conflict
     // carrying the current entity under `current` (rev 1, unchanged content).
     note.content = "v2-should-not-persist".to_string();
-    let conflict = store.update_note_versioned(&note, Some(0)).await;
+    let conflict = store
+        .update_note_versioned(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+        )
+        .await;
     match conflict {
         Err(intent_core::Error::Conflict { current }) => {
             assert_eq!(current["rev"], 1);
@@ -1817,7 +1849,11 @@ async fn update_note_versioned_hit_miss_and_absent() {
     // ABSENT: no expected_version → last-writer-wins (unconditional bump → 2).
     note.content = "v2".to_string();
     store
-        .update_note_versioned(&note, None)
+        .update_note_versioned(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            None,
+        )
         .await
         .expect("absent degrades to last-writer-wins");
     let after_absent = store.get_note(&ws_id, &note.id).await.expect("get note");
@@ -1827,7 +1863,16 @@ async fn update_note_versioned_hit_miss_and_absent() {
     // A versioned write against a missing row is NotFound (not Conflict).
     let mut ghost = note.clone();
     ghost.id = NoteId::new();
-    match store.update_note_versioned(&ghost, Some(5)).await {
+    match store
+        .update_note_versioned(
+            &store
+                .lock_note_content(&ghost.workspace_id, &ghost.id)
+                .await,
+            &ghost,
+            Some(5),
+        )
+        .await
+    {
         Err(intent_core::Error::NotFound(_)) => {}
         other => panic!("expected NotFound for absent row, got {other:?}"),
     }
@@ -2269,7 +2314,15 @@ async fn task_metadata_round_trip_and_list_tasks() {
     let read = store.get_note(&ws_id, &projected.id).await.expect("get B");
     assert!(read.metadata.task.unwrap().unmet_depends_on.is_empty());
     projected.metadata.task.as_mut().unwrap().unmet_depends_on = vec![NoteId::from("dep-2")];
-    store.update_note(&projected).await.expect("update B");
+    store
+        .update_note(
+            &store
+                .lock_note_content(&projected.workspace_id, &projected.id)
+                .await,
+            &projected,
+        )
+        .await
+        .expect("update B");
     let read = store
         .get_note(&ws_id, &projected.id)
         .await
@@ -2436,7 +2489,13 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
     note.content = "with <!--anchor:c1:start-->markers<!--anchor:c1:end-->".to_string();
     let c1 = sample_comment(&note.id, "c1", "c1");
     let rev = store
-        .update_note_with_comment(&note, Some(0), &c1, &author)
+        .update_note_with_comment(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+            &c1,
+            &author,
+        )
         .await
         .expect("atomic update+insert");
     assert_eq!(rev, 1);
@@ -2455,7 +2514,13 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
     note.content = "rewrite-that-must-roll-back".to_string();
     let dup = sample_comment(&note.id, "c1", "c1");
     assert!(store
-        .update_note_with_comment(&note, None, &dup, &author)
+        .update_note_with_comment(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            None,
+            &dup,
+            &author
+        )
         .await
         .is_err());
     let after_fail = store.get_note(&ws_id, &note.id).await.expect("get note");
@@ -2470,7 +2535,13 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
     // current entity; neither the rewrite nor the comment persists.
     let c3 = sample_comment(&note.id, "c3", "c3");
     match store
-        .update_note_with_comment(&note, Some(0), &c3, &author)
+        .update_note_with_comment(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+            &c3,
+            &author,
+        )
         .await
     {
         Err(intent_core::Error::Conflict { current }) => {
@@ -2490,7 +2561,15 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
     ghost.id = NoteId::new();
     let c2 = sample_comment(&ghost.id, "c2", "c2");
     match store
-        .update_note_with_comment(&ghost, None, &c2, &author)
+        .update_note_with_comment(
+            &store
+                .lock_note_content(&ghost.workspace_id, &ghost.id)
+                .await,
+            &ghost,
+            None,
+            &c2,
+            &author,
+        )
         .await
     {
         Err(intent_core::Error::NotFound(_)) => {}
@@ -2522,7 +2601,13 @@ async fn update_note_with_version_is_atomic_and_gates_on_expected_version() {
 
     note.content = "one".to_string();
     let (rev, v) = store
-        .update_note_with_version(&note, Some(0), &author, &ts)
+        .update_note_with_version(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+            &author,
+            &ts,
+        )
         .await
         .expect("gated write");
     assert_eq!((rev, v), (1, 1));
@@ -2543,7 +2628,13 @@ async fn update_note_with_version_is_atomic_and_gates_on_expected_version() {
     // Unconditional write: rev and v both advance.
     note.content = "two".to_string();
     let (rev, v) = store
-        .update_note_with_version(&note, None, &author, &ts)
+        .update_note_with_version(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            None,
+            &author,
+            &ts,
+        )
         .await
         .expect("unconditional write");
     assert_eq!((rev, v), (2, 2));
@@ -2551,7 +2642,13 @@ async fn update_note_with_version_is_atomic_and_gates_on_expected_version() {
     // Stale gate: Conflict carrying the current row; nothing persisted.
     note.content = "stale".to_string();
     match store
-        .update_note_with_version(&note, Some(1), &author, &ts)
+        .update_note_with_version(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(1),
+            &author,
+            &ts,
+        )
         .await
     {
         Err(intent_core::Error::Conflict { current }) => {
@@ -2571,7 +2668,15 @@ async fn update_note_with_version_is_atomic_and_gates_on_expected_version() {
     let mut ghost = note.clone();
     ghost.id = NoteId::new();
     match store
-        .update_note_with_version(&ghost, None, &author, &ts)
+        .update_note_with_version(
+            &store
+                .lock_note_content(&ghost.workspace_id, &ghost.id)
+                .await,
+            &ghost,
+            None,
+            &author,
+            &ts,
+        )
         .await
     {
         Err(intent_core::Error::NotFound(_)) => {}
@@ -2662,6 +2767,9 @@ async fn update_note_with_version_and_children_is_all_or_nothing() {
     parent.content = format!("- [ ] [Child](intent://local/task/{})", child.id.0);
     let (rev, v) = store
         .update_note_with_version_and_children(
+            &store
+                .lock_note_content(&parent.workspace_id, &parent.id)
+                .await,
             &parent,
             Some(0),
             std::slice::from_ref(&child),
@@ -2703,6 +2811,9 @@ async fn update_note_with_version_and_children_is_all_or_nothing() {
     parent.content = "stale rewrite".to_string();
     match store
         .update_note_with_version_and_children(
+            &store
+                .lock_note_content(&parent.workspace_id, &parent.id)
+                .await,
             &parent,
             Some(0),
             std::slice::from_ref(&ghost_child),
@@ -2767,6 +2878,9 @@ async fn update_note_with_version_and_children_rolls_back_on_mid_body_child_erro
     parent.content = "rewritten parent".to_string();
     let result = store
         .update_note_with_version_and_children(
+            &store
+                .lock_note_content(&parent.workspace_id, &parent.id)
+                .await,
             &parent,
             Some(0),
             &[child.clone(), child.clone()],
@@ -2809,7 +2923,15 @@ async fn update_note_with_version_and_children_rolls_back_on_mid_body_child_erro
     );
 
     let (rev, v) = store
-        .update_note_with_version(&parent, Some(0), &author, &ts)
+        .update_note_with_version(
+            &store
+                .lock_note_content(&parent.workspace_id, &parent.id)
+                .await,
+            &parent,
+            Some(0),
+            &author,
+            &ts,
+        )
         .await
         .expect("pool usable after rollback");
     assert_eq!((rev, v), (1, 2));
@@ -2846,7 +2968,13 @@ async fn update_note_with_comment_detaches_conn_on_failed_body_error_rollback() 
     note.content = "rewrite-that-must-roll-back".to_string();
     let c1 = sample_comment(&note.id, "c1", "c1");
     let err = store
-        .update_note_with_comment(&note, None, &c1, &version_author())
+        .update_note_with_comment(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            None,
+            &c1,
+            &version_author(),
+        )
         .await
         .expect_err("UPDATE must fail on the rollback trigger");
     assert!(
@@ -2869,7 +2997,13 @@ async fn update_note_with_comment_detaches_conn_on_failed_body_error_rollback() 
         .await
         .expect("drop trap trigger");
     let rev = store
-        .update_note_with_comment(&note, None, &c1, &version_author())
+        .update_note_with_comment(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            None,
+            &c1,
+            &version_author(),
+        )
         .await
         .expect("update after detach");
     assert_eq!(rev, 1);
@@ -4007,7 +4141,7 @@ async fn retention_delete_query_plan_uses_index() {
 
 /// Disk-space reclamation: a freshly created database is in
 /// `auto_vacuum = INCREMENTAL` mode, pages emptied by retention deletes land
-/// on the freelist, and bounded `Store::incremental_vacuum` calls actually
+/// on the freelist, and bounded `Store::incremental_vacuum_chunk` calls actually
 /// release them (freelist shrinks, logical `page_count` drops).
 #[tokio::test]
 async fn incremental_vacuum_releases_freelist_pages() {
@@ -4068,7 +4202,11 @@ async fn incremental_vacuum_releases_freelist_pages() {
     );
 
     // A bounded call frees at most `max_pages` per invocation.
-    let freed_bounded = store.incremental_vacuum(8).await.expect("bounded vacuum");
+    let freed_bounded = store
+        .incremental_vacuum_chunk(8)
+        .await
+        .expect("bounded vacuum")
+        .pages_freed;
     assert!(
         freed_bounded > 0 && freed_bounded <= 8,
         "bounded incremental_vacuum should free 1..=8 pages (got {freed_bounded})"
@@ -4076,9 +4214,10 @@ async fn incremental_vacuum_releases_freelist_pages() {
 
     // Draining the rest empties the freelist and shrinks the logical DB size.
     let freed_rest = store
-        .incremental_vacuum(1_000_000)
+        .incremental_vacuum_chunk(1_000_000)
         .await
-        .expect("drain vacuum");
+        .expect("drain vacuum")
+        .pages_freed;
     assert_eq!(
         freed_bounded + freed_rest,
         freelist_after_delete.cast_unsigned(),
@@ -4095,6 +4234,79 @@ async fn incremental_vacuum_releases_freelist_pages() {
         pages_after < pages_before,
         "page_count should shrink after vacuum ({pages_before} -> {pages_after})"
     );
+}
+
+/// `Store::incremental_vacuum_chunk` frees at most `max_pages` per step on
+/// one write connection, reports the freelist left behind exactly as
+/// `PRAGMA freelist_count` sees it, and releases the connection so the next
+/// writer can acquire it immediately (intent-hq/intent#7448).
+#[tokio::test]
+async fn incremental_vacuum_chunk_reports_freed_and_remaining() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    let payload = "x".repeat(4096);
+    let seed: Vec<NewEvent> = (0..200)
+        .map(|_| NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            event_type: events::TERMINAL_DATA.to_string(),
+            actor: EventActor::default(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({ "chunk": payload }),
+        })
+        .collect();
+    for batch in seed.chunks(100) {
+        store.insert_events(batch).await.expect("insert batch");
+    }
+    store
+        .delete_ephemeral_events_before("2027-01-01T00:00:00Z")
+        .await
+        .expect("sweep");
+    let freelist_before = store.freelist_count().await.expect("freelist");
+    assert!(
+        freelist_before > 8,
+        "seed should leave a freelist (got {freelist_before})"
+    );
+
+    let chunk = store.incremental_vacuum_chunk(4).await.expect("chunk");
+    assert!(
+        (1..=4).contains(&chunk.pages_freed),
+        "a 4-page chunk frees 1..=4 pages (got {})",
+        chunk.pages_freed
+    );
+    let freelist_after = store.freelist_count().await.expect("freelist");
+    assert_eq!(chunk.freelist_remaining, freelist_after.cast_unsigned());
+    assert_eq!(
+        chunk.pages_freed + chunk.freelist_remaining,
+        freelist_before.cast_unsigned()
+    );
+    // Pool release on drop is asynchronous in sqlx, so wait briefly rather
+    // than `try_acquire`; a held connection would block for the full 10 s
+    // acquire timeout.
+    let reacquired = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+        store.write_pool().acquire(),
+    )
+    .await;
+    assert!(
+        matches!(reacquired, Ok(Ok(_))),
+        "the chunk must hand the write connection back to the pool"
+    );
+    drop(reacquired);
+    assert!(store.page_size().await.expect("page_size") > 0);
+
+    // `PRAGMA incremental_vacuum(0)` means "the whole freelist" to SQLite;
+    // the chunk clamps it to a single page instead.
+    let zero = store.incremental_vacuum_chunk(0).await.expect("zero chunk");
+    assert_eq!(
+        zero.pages_freed, 1,
+        "a 0-page request must free exactly 1 page"
+    );
+    assert!(zero.freelist_remaining > 0);
 }
 
 /// One-time activation (monorepo#720 finding 1): a legacy database created
@@ -4203,9 +4415,10 @@ async fn activate_incremental_vacuum_converts_legacy_none_db() {
         "churn deletes should leave pages on the freelist"
     );
     let freed = store
-        .incremental_vacuum(1_000_000)
+        .incremental_vacuum_chunk(1_000_000)
         .await
-        .expect("incremental vacuum");
+        .expect("incremental vacuum")
+        .pages_freed;
     assert!(
         freed > 0,
         "incremental_vacuum should release pages after activation (got {freed})"
@@ -4263,6 +4476,7 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
         created_at: ts.clone(),
         updated_at: ts,
         sandbox_id: None,
@@ -4309,7 +4523,7 @@ async fn materialize_harness_features_first_write_wins() {
         "lost race adopts the winner's snapshot, not the loser's"
     );
     let row = store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("get session");
     assert_eq!(
@@ -4357,7 +4571,10 @@ async fn agent_session_round_trip_and_append_only_log() {
     assert_eq!(m1.seq, 1);
 
     // Round-trip the session with its full message log (chronological order).
-    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    let loaded = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(loaded.name, "Builder");
     assert_eq!(loaded.model.as_deref(), Some("opus"));
     assert_eq!(loaded.status, AgentStatus::Pending);
@@ -4382,7 +4599,10 @@ async fn agent_session_round_trip_and_append_only_log() {
     assert_eq!(recent.len(), 1);
     assert_eq!(recent[0].seq, 1);
 
-    let listed = store.list_agent_sessions(&ws).await.expect("list");
+    let listed = store
+        .list_agent_sessions_with_transcripts(&ws)
+        .await
+        .expect("list");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, agent_id);
     assert_eq!(listed[0].messages.len(), 2);
@@ -4421,7 +4641,10 @@ async fn agent_session_attention_request_round_trip_and_clear() {
         .await
         .expect("set attention request");
 
-    let loaded = store.get_agent_session(&agent_id).await.expect("reload");
+    let loaded = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("reload");
     assert_eq!(loaded.attention_request_kind.as_deref(), Some("blocker"));
     assert_eq!(
         loaded.attention_request_reason.as_deref(),
@@ -4446,7 +4669,10 @@ async fn agent_session_attention_request_round_trip_and_clear() {
         .clear_attention_request(&ws, &agent_id, "t-clear-1")
         .await
         .expect("clear"));
-    let cleared = store.get_agent_session(&agent_id).await.expect("cleared");
+    let cleared = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("cleared");
     assert_eq!(cleared.attention_request_kind, None);
     assert_eq!(cleared.attention_request_reason, None);
     assert_eq!(cleared.attention_request_timestamp, None);
@@ -4505,7 +4731,10 @@ async fn full_row_update_never_touches_attention_request_columns() {
         .set_attention_request(&ws, &agent_id, "blocker", "sandbox broken", "t-attn")
         .await
         .expect("set attention request");
-    let stale = store.get_agent_session(&agent_id).await.expect("snapshot");
+    let stale = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("snapshot");
     assert_eq!(stale.attention_request_kind.as_deref(), Some("blocker"));
     assert!(store
         .clear_attention_request(&ws, &agent_id, "t-clear")
@@ -4515,7 +4744,10 @@ async fn full_row_update_never_touches_attention_request_columns() {
         .update_agent_session(&ws, &stale)
         .await
         .expect("racing full-row persist");
-    let after = store.get_agent_session(&agent_id).await.expect("reload");
+    let after = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("reload");
     assert_eq!(
         after.attention_request_kind, None,
         "full-row persist of a stale session must not resurrect a cleared request"
@@ -4524,7 +4756,10 @@ async fn full_row_update_never_touches_attention_request_columns() {
     assert_eq!(after.attention_request_timestamp, None);
 
     // Race B: a stale request-free snapshot must not clobber a fresh request.
-    let stale = store.get_agent_session(&agent_id).await.expect("snapshot");
+    let stale = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("snapshot");
     store
         .set_attention_request(&ws, &agent_id, "discussion", "need a decision", "t-attn-2")
         .await
@@ -4533,7 +4768,10 @@ async fn full_row_update_never_touches_attention_request_columns() {
         .update_agent_session(&ws, &stale)
         .await
         .expect("racing full-row persist");
-    let after = store.get_agent_session(&agent_id).await.expect("reload");
+    let after = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("reload");
     assert_eq!(
         after.attention_request_kind.as_deref(),
         Some("discussion"),
@@ -4589,7 +4827,10 @@ async fn agent_session_with_messages_is_atomic() {
         .await
         .expect("insert with messages");
 
-    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    let loaded = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(loaded.messages.len(), 2);
     assert_eq!(loaded.messages[0].seq, 0);
     assert_eq!(loaded.messages[0].role, "user");
@@ -4612,7 +4853,7 @@ async fn agent_session_with_messages_is_atomic() {
 /// `get_agent_session_status` is the lightweight status-only accessor backing
 /// the STAB-52 queue-drain gate: it returns the persisted status without
 /// loading the message log, tracks `set_agent_session_status` updates, and
-/// mirrors `get_agent_session`'s `NotFound` for missing rows.
+/// mirrors `get_agent_session_with_transcript`'s `NotFound` for missing rows.
 #[tokio::test]
 async fn agent_session_status_only_lookup() {
     let tmp = TempDb::new();
@@ -4780,7 +5021,7 @@ async fn agent_session_stop_reason_set_clear_unchanged() {
 
     // Verify initial state: stop_reason is None.
     let loaded = store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("get session");
     assert_eq!(loaded.stop_reason, None);
@@ -4799,7 +5040,7 @@ async fn agent_session_stop_reason_set_clear_unchanged() {
         .await
         .expect("set status with stop_reason");
     let loaded = store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("get after set");
     assert_eq!(loaded.stop_reason, Some("error".to_string()));
@@ -4812,7 +5053,7 @@ async fn agent_session_stop_reason_set_clear_unchanged() {
         .await
         .expect("set status without touching stop_reason");
     let loaded = store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("get after unchanged");
     assert_eq!(loaded.stop_reason, Some("error".to_string()));
@@ -4832,7 +5073,7 @@ async fn agent_session_stop_reason_set_clear_unchanged() {
         .await
         .expect("clear stop_reason");
     let loaded = store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("get after clear");
     assert_eq!(loaded.stop_reason, None);
@@ -4849,7 +5090,7 @@ async fn agent_session_stop_reason_set_clear_unchanged() {
         .await
         .expect("update with stop_reason");
     let loaded = store
-        .get_agent_session(&agent_id)
+        .get_agent_session_with_transcript(&agent_id)
         .await
         .expect("get after update");
     assert_eq!(loaded.stop_reason, Some("max_turns".to_string()));
@@ -4913,9 +5154,12 @@ async fn agent_message_metadata_round_trip() {
     assert_eq!(messages[0].metadata.as_ref(), Some(&metadata));
     assert!(messages[1].metadata.is_none());
 
-    // The metadata payload also round-trips through the get_agent_session
+    // The metadata payload also round-trips through the get_agent_session_with_transcript
     // aggregate loader (transcript embedded on the session).
-    let session = store.get_agent_session(&agent_id).await.expect("get");
+    let session = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(session.messages.len(), 2);
     assert_eq!(session.messages[0].metadata.as_ref(), Some(&metadata));
     assert!(session.messages[1].metadata.is_none());
@@ -5218,7 +5462,10 @@ async fn agent_session_gap_fields_round_trip() {
         .await
         .expect("insert session");
 
-    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    let loaded = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(loaded.delegation_depth, Some(2));
     assert!(loaded.is_background, "is_background must round-trip");
     assert_eq!(loaded.initial_message.as_deref(), Some("kick off"));
@@ -5244,7 +5491,10 @@ async fn agent_session_gap_fields_round_trip() {
         .update_agent_session(&ws, &updated)
         .await
         .expect("update");
-    let reloaded = store.get_agent_session(&agent_id).await.expect("reload");
+    let reloaded = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("reload");
     assert_eq!(reloaded.completion_report.as_deref(), Some("done"));
     assert_eq!(reloaded.completion_report_timestamp.as_deref(), Some("t9"));
     // The spawn-time fields survive the update untouched.
@@ -5295,7 +5545,10 @@ async fn transient_streaming_flags_are_never_persisted() {
         .insert_agent_session(&sample_agent_session(&agent_id, &ws))
         .await
         .expect("insert session");
-    let loaded = store.get_agent_session(&agent_id).await.expect("get");
+    let loaded = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     let v = serde_json::to_value(&loaded).expect("session json");
     let obj = v.as_object().expect("object");
     for forbidden in [
@@ -5329,7 +5582,7 @@ async fn agent_session_parent_agent_id_round_trips() {
         .expect("insert orphan");
     assert_eq!(
         store
-            .get_agent_session(&orphan)
+            .get_agent_session_with_transcript(&orphan)
             .await
             .expect("get")
             .parent_agent_id,
@@ -5347,7 +5600,7 @@ async fn agent_session_parent_agent_id_round_trips() {
         .expect("insert child");
     assert_eq!(
         store
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("get")
             .parent_agent_id,
@@ -5355,7 +5608,10 @@ async fn agent_session_parent_agent_id_round_trips() {
     );
 
     // Update clears the linkage back to None.
-    let mut cleared = store.get_agent_session(&child).await.expect("get");
+    let mut cleared = store
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("get");
     cleared.parent_agent_id = None;
     store
         .update_agent_session(&ws, &cleared)
@@ -5363,7 +5619,7 @@ async fn agent_session_parent_agent_id_round_trips() {
         .expect("update");
     assert_eq!(
         store
-            .get_agent_session(&child)
+            .get_agent_session_with_transcript(&child)
             .await
             .expect("get")
             .parent_agent_id,
@@ -5389,7 +5645,7 @@ async fn agent_session_specialist_round_trips() {
         .expect("insert plain");
     assert_eq!(
         store
-            .get_agent_session(&plain)
+            .get_agent_session_with_transcript(&plain)
             .await
             .expect("get")
             .specialist,
@@ -5406,14 +5662,17 @@ async fn agent_session_specialist_round_trips() {
         .expect("insert specialist");
     assert_eq!(
         store
-            .get_agent_session(&spec_agent)
+            .get_agent_session_with_transcript(&spec_agent)
             .await
             .expect("get")
             .specialist,
         Some("implementor".to_string())
     );
 
-    let mut updated = store.get_agent_session(&spec_agent).await.expect("get");
+    let mut updated = store
+        .get_agent_session_with_transcript(&spec_agent)
+        .await
+        .expect("get");
     updated.name = "Renamed".to_string();
     store
         .update_agent_session(&ws, &updated)
@@ -5421,7 +5680,7 @@ async fn agent_session_specialist_round_trips() {
         .expect("update");
     assert_eq!(
         store
-            .get_agent_session(&spec_agent)
+            .get_agent_session_with_transcript(&spec_agent)
             .await
             .expect("get")
             .specialist,
@@ -5460,7 +5719,10 @@ async fn agent_acp_session_id_is_write_once() {
         .is_err());
 
     // update_agent_session also refuses to overwrite a set acpSessionId.
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     s.acp_session_id = Some("acp-3".to_string());
     assert!(store.update_agent_session(&ws, &s).await.is_err());
 }
@@ -5492,7 +5754,10 @@ async fn replace_acp_session_id_is_no_clobber_cas() {
         .await
         .expect("cas returns canonical");
     assert_eq!(kept, "acp-1", "diverged expected-old reuses the stored id");
-    let stored = store.get_agent_session(&agent_id).await.expect("get");
+    let stored = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(stored.acp_session_id.as_deref(), Some("acp-1"));
 
     // CAS swap: a matching expected-old replaces with the fresh id (the
@@ -5502,7 +5767,10 @@ async fn replace_acp_session_id_is_no_clobber_cas() {
         .await
         .expect("cas swaps on match");
     assert_eq!(swapped, "acp-2");
-    let stored = store.get_agent_session(&agent_id).await.expect("get");
+    let stored = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(stored.acp_session_id.as_deref(), Some("acp-2"));
 
     // A missing session surfaces NotFound rather than a silent no-op.
@@ -5528,7 +5796,10 @@ async fn agent_provider_is_immutable_once_set() {
         .expect("insert session");
 
     // Provider starts unset, so first set (via update) is allowed.
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     s.provider = Some("auggie".to_string());
     s.status = AgentStatus::Active;
     store
@@ -5537,7 +5808,10 @@ async fn agent_provider_is_immutable_once_set() {
         .expect("set provider");
 
     // Provider can still be changed before first real use (before acp_session_id is set).
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     s.provider = Some("opencode".to_string());
     store
         .update_agent_session(&ws, &s)
@@ -5551,7 +5825,10 @@ async fn agent_provider_is_immutable_once_set() {
         .expect("set acp session id");
 
     // Now changing the provider is rejected.
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     s.provider = Some("claude-code".to_string());
     assert!(store.update_agent_session(&ws, &s).await.is_err());
 }
@@ -5578,7 +5855,10 @@ async fn agent_provider_immutable_after_acp_session_even_from_none() {
         .expect("set acp session id");
 
     // Now trying to set provider from None→Some should be rejected.
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(s.provider, None);
     s.provider = Some("auggie".to_string());
     assert!(store.update_agent_session(&ws, &s).await.is_err());
@@ -5600,7 +5880,10 @@ async fn agent_provider_change_rejected_when_setting_acp_session_id() {
         .expect("insert session");
 
     // Set provider first
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     s.provider = Some("auggie".to_string());
     store
         .update_agent_session(&ws, &s)
@@ -5608,7 +5891,10 @@ async fn agent_provider_change_rejected_when_setting_acp_session_id() {
         .expect("set provider");
 
     // Trying to change provider in the same update that sets acp_session_id should be rejected.
-    let mut s = store.get_agent_session(&agent_id).await.expect("get");
+    let mut s = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     s.provider = Some("opencode".to_string());
     s.acp_session_id = Some("acp-1".to_string());
     assert!(store.update_agent_session(&ws, &s).await.is_err());
@@ -6171,6 +6457,7 @@ async fn script_upsert_list_remove_round_trip() {
         auto_start: Some(true),
         created_at: now_iso(),
         updated_at: None,
+        remote_author: None,
     };
     store.upsert_script(&script).await.expect("insert");
 
@@ -6203,6 +6490,7 @@ async fn script_upsert_list_remove_round_trip() {
         auto_start: None,
         created_at: now_iso(),
         updated_at: None,
+        remote_author: None,
     };
     store.upsert_script(&sparse).await.expect("insert sparse");
     let listed = store.list_all_scripts().await.expect("list");
@@ -6215,6 +6503,64 @@ async fn script_upsert_list_remove_round_trip() {
     let listed = store.list_all_scripts().await.expect("list");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, "s-2");
+}
+
+#[tokio::test]
+async fn script_remote_author_round_trips_and_reaches_summaries() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let remote_author = intent_core::ScriptRemoteAuthor {
+        node_id: "mac-studio".to_string(),
+        agent_id: intent_core::AgentId::from("agent-r1"),
+    };
+    let script = intent_core::Script {
+        purpose: intent_core::ScriptPurpose::Saved,
+        archived_at: None,
+        last_run: None,
+        id: "s-remote".to_string(),
+        workspace_id: "ws-1".to_string(),
+        name: "test".to_string(),
+        command: "cargo test".to_string(),
+        cwd: None,
+        env: None,
+        mode: intent_core::ScriptMode::Command,
+        category: None,
+        source: "agent".to_string(),
+        auto_start: None,
+        created_at: now_iso(),
+        updated_at: None,
+        remote_author: Some(remote_author.clone()),
+    };
+    store.upsert_script(&script).await.expect("insert");
+    store
+        .upsert_scripts(&[intent_core::Script {
+            id: "s-local".to_string(),
+            remote_author: None,
+            ..script.clone()
+        }])
+        .await
+        .expect("bulk insert");
+    let ws = WorkspaceId::from("ws-1");
+    let got = store
+        .get_script_in_workspace(&ws, "s-remote")
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(got.remote_author, Some(remote_author));
+    assert_eq!(
+        serde_json::to_value(&got).unwrap()["remoteAuthor"],
+        serde_json::json!({ "nodeId": "mac-studio", "agentId": "agent-r1" })
+    );
+    let local = store
+        .get_script_in_workspace(&ws, "s-local")
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(local.remote_author, None);
+    assert!(serde_json::to_value(&local)
+        .unwrap()
+        .get("remoteAuthor")
+        .is_none());
 }
 
 #[tokio::test]
@@ -6247,6 +6593,7 @@ async fn script_bulk_upsert_round_trip_replace_and_chunking() {
             auto_start: (i % 2 == 0).then_some(true),
             created_at: now_iso(),
             updated_at: None,
+            remote_author: None,
         })
         .collect();
     store.upsert_scripts(&scripts).await.expect("bulk insert");
@@ -6290,6 +6637,7 @@ async fn script_was_running_marker_set_clear_and_reset_semantics() {
         auto_start: None,
         created_at: now_iso(),
         updated_at: None,
+        remote_author: None,
     };
     store
         .upsert_script(&script("ws-1", "s-1"))
@@ -6477,49 +6825,11 @@ async fn concurrent_writes_no_sqlite_busy() {
                     id: ws_id.clone(),
                     title: format!("Workspace {i}"),
                     branch: format!("main-{i}"),
-                    base_ref: None,
-                    base_commit_sha: None,
-                    status: WorkspaceStatus::Active,
-                    status_message: None,
-                    status_image_asset_id: None,
-                    activity: WorkspaceActivity::Idle,
                     attention: WorkspaceAttention::Unread,
                     created_at: ts.clone(),
                     updated_at: ts.clone(),
-                    last_activity: None,
-                    last_content_activity: None,
-                    tags: vec![],
                     path: Some(format!("/tmp/ws-{i}")),
-                    repository_path: None,
-                    repository_owner: None,
-                    repository_name: None,
-                    worktree_path: None,
-                    scope: None,
-                    skip_worktree: false,
-                    setup_script: None,
-                    is_remote: false,
-                    default_model: None,
-                    pr_number: None,
-                    pr_url: None,
-                    pr_status: None,
-                    active_pull_request: None,
-                    pull_requests: None,
-                    context_links: None,
-                    archived: false,
-                    archived_at: None,
-                    task_stats: None,
-                    agent_summary: None,
-                    diff_summary: None,
-                    token_usage: None,
-                    cow_supported: None,
-                    browser_client_id: None,
-                    pull_requests_total: None,
-                    display_status: None,
-                    waiting: false,
-                    checkout_mode: None,
-                    disk_usage: None,
-                    pending_delete_at: None,
-                    membership: None,
+                    ..Default::default()
                 };
                 store.insert_workspace(&workspace).await
             })
@@ -6535,7 +6845,10 @@ async fn concurrent_writes_no_sqlite_busy() {
             let store = store.clone();
             let started = std::time::Instant::now();
             tokio::spawn(async move {
-                let result = store.list_workspaces(false).await.map(|ws| ws.len());
+                let result = store
+                    .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+                    .await
+                    .map(|ws| ws.len());
                 (result, started.elapsed())
             })
         })
@@ -6570,7 +6883,10 @@ async fn concurrent_writes_no_sqlite_busy() {
     );
 
     // Verify all 50 workspaces were written
-    let all_workspaces = store.list_workspaces(false).await.unwrap();
+    let all_workspaces = store
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .unwrap();
     assert_eq!(
         all_workspaces.len(),
         50,
@@ -6608,7 +6924,10 @@ async fn periodic_wal_checkpoint_runs_and_stops() {
     // Verify the store still works after aborting the checkpoint task
     let ws = sample_workspace(&WorkspaceId::new(), "Test", false);
     store.insert_workspace(&ws).await.unwrap();
-    let loaded = store.list_workspaces(false).await.unwrap();
+    let loaded = store
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .unwrap();
     assert_eq!(loaded.len(), 1);
 }
 
@@ -6681,7 +7000,10 @@ async fn agent_message_append_refreshes_updated_at() {
         .expect("insert session");
 
     // Baseline: the session was inserted with updated_at = "2026-01-01T00:00:00Z".
-    let before = store.get_agent_session(&agent_id).await.expect("get");
+    let before = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(before.updated_at, "2026-01-01T00:00:00Z");
 
     // Append a message with a later timestamp.
@@ -6704,7 +7026,10 @@ async fn agent_message_append_refreshes_updated_at() {
         .expect("refresh timestamp");
 
     // The session's updated_at should now reflect the message timestamp.
-    let after = store.get_agent_session(&agent_id).await.expect("get");
+    let after = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("get");
     assert_eq!(
         after.updated_at, later,
         "updated_at must advance when a message is appended"
@@ -7277,7 +7602,9 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     // Upper bound on how long the holder keeps the connection if the append
     // never reports a timeout; the test then fails on the observer assertion
     // instead of hanging. Also bounds the pool-open retries below.
-    const WATCHDOG: Duration = Duration::from_secs(15);
+    fn watchdog() -> Duration {
+        intentd_test_support::test_timeout(Duration::from_secs(15))
+    }
     let tmp = TempDb::new();
     // Migrate with the ordinary store, then reopen with a short acquire
     // timeout on the write pool. sqlx opens the pool's first connection
@@ -7286,7 +7613,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     // until the watchdog deadline; once it succeeds the connection stays idle
     // in the pool and the hold below reuses it without a fresh open.
     drop(Store::open(&tmp.path).await.expect("open store"));
-    let open_deadline = tokio::time::Instant::now() + WATCHDOG;
+    let open_deadline = tokio::time::Instant::now() + watchdog();
     let write_pool = loop {
         match crate::connect_write_with_acquire_timeout(&tmp.path, ACQUIRE_TIMEOUT).await {
             Ok(pool) => break pool,
@@ -7300,7 +7627,9 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
         }
     };
     let store = Store {
-        note_pages: std::sync::Arc::default(),
+        task_event_baselines: std::sync::Arc::default(),
+        task_events_enabled: std::sync::Arc::default(),
+        note_write_lanes: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: write_pool.into(),
         read_pool: crate::connect_read(&tmp.path)
@@ -7308,6 +7637,8 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
             .expect("open read pool")
             .into(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
+        desktop_writes: crate::desktop_repo::DesktopWrites::default(),
+        desktop_delete_barrier: std::sync::Arc::default(),
         export_author_barrier: std::sync::Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
     };
@@ -7333,7 +7664,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     let holder = {
         let observed = Arc::clone(&observed);
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + WATCHDOG;
+            let deadline = tokio::time::Instant::now() + watchdog();
             while observed.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -8217,9 +8548,9 @@ async fn rewind_repository_authority(store: &Store) {
         "credential",
     ] {
         for suffix in ["ai", "ad", "au"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DROP TRIGGER repository_authority_{kind}_{suffix}"
-            ))
+            )))
             .execute(store.write_pool())
             .await
             .expect("drop 0144 source trigger");
@@ -9530,6 +9861,7 @@ async fn invite_reusable_migration_keeps_pre_upgrade_redeemed_links_exhausted() 
         .expect("migration 0129 present");
     let sql: String = migration
         .sql
+        .as_str()
         .lines()
         .filter(|l| !l.trim_start().starts_with("--"))
         .collect::<Vec<_>>()
@@ -9540,7 +9872,7 @@ async fn invite_reusable_migration_keeps_pre_upgrade_redeemed_links_exhausted() 
             if body.is_empty() || body.starts_with("ALTER TABLE") {
                 continue;
             }
-            sqlx::query(body)
+            sqlx::query(sqlx::AssertSqlSafe(body))
                 .execute(store.write_pool())
                 .await
                 .expect("run migration statement");
@@ -10310,10 +10642,10 @@ async fn archived_workspace_refuses_member_add_invite_mint_and_join() {
         None,
         "a refused mint leaves no row"
     );
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO workspace_invite ({}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         crate::principal_repo::INVITE_COLUMNS
-    ))
+    )))
     .bind("smuggled")
     .bind(&ws.0)
     .bind("hash-smuggled")
@@ -11073,13 +11405,528 @@ async fn gitlab_upgrade_from_populated_main_preserves_shipped_data_and_checksums
         let provenance: (String, Option<String>) = sqlx::query_as("SELECT target_provenance,target_provider FROM pr_monitor WHERE monitor_id='upgrade-pr'").fetch_one(store.read_pool()).await.unwrap();
         assert_eq!(provenance, ("unresolved".into(), None));
         let selection: (String, Option<String>, Option<String>) = sqlx::query_as("SELECT choice_mode,remote_name,historical_source FROM repository_selection_state WHERE workspace_id='upgrade-workspace' AND root_kind='primary'").fetch_one(store.read_pool()).await.unwrap();
-        assert_eq!(
-            selection,
-            ("unresolved".into(), None, Some("workspace-metadata".into()))
-        );
+        // 0146 backfilled metadata history; 0163 repairs it to never-saved.
+        assert_eq!(selection, ("never".into(), None, None));
         let revision: i64 = sqlx::query_scalar("SELECT revision FROM repository_authority_revision WHERE kind='credential' AND subject_id='upgrade-credential'").fetch_one(store.read_pool()).await.unwrap();
         assert_eq!(revision, 1);
         store.read_pool().close().await;
         store.write_pool().close().await;
     }
+}
+
+#[path = "discussion_tests.rs"]
+mod discussion;
+
+/// 0162 backfills legacy rows' NULL / blank provider, model and reasoning
+/// effort from the identity their last turn ran under — fill-only, skipping
+/// rows without evidence, legacy provider aliases, malformed JSON, the
+/// `"default"` alias and any model/effort from a provider the session has
+/// since left — and replaying it changes nothing.
+#[tokio::test]
+async fn backfill_agent_session_identity_fills_legacy_rows_from_last_turn() {
+    // (id, provider, model, effort, last_turn_provider, last_turn_model, last_turn_effort)
+    type Seed = (
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+    );
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::from("ws-0162");
+    store
+        .insert_workspace(&sample_workspace(&ws, "0162", false))
+        .await
+        .expect("insert workspace");
+    let seeds: [Seed; 10] = [
+        (
+            "agent-legacy",
+            None,
+            None,
+            None,
+            Some("codex"),
+            Some("gpt-6-astra"),
+            Some(
+                r#"{"effort":null,"default_value":"max","provider":"codex","model":"gpt-6-astra"}"#,
+            ),
+        ),
+        (
+            "agent-blank",
+            Some(""),
+            Some(" "),
+            Some(""),
+            Some("claude-code"),
+            Some("opus"),
+            Some(
+                r#"{"effort":"high","default_value":"medium","provider":"claude-code","model":"opus"}"#,
+            ),
+        ),
+        (
+            "agent-effort-only-evidence",
+            None,
+            Some("m"),
+            None,
+            None,
+            None,
+            Some(r#"{"effort":null,"default_value":"low","provider":"grok","model":null}"#),
+        ),
+        ("agent-no-evidence", None, None, None, None, None, None),
+        (
+            "agent-alias",
+            None,
+            Some("m"),
+            None,
+            Some("default"),
+            None,
+            Some(r#"{"effort":null,"default_value":"default","provider":"default","model":null}"#),
+        ),
+        (
+            "agent-set",
+            Some("auggie"),
+            Some("sonnet"),
+            Some("low"),
+            Some("codex"),
+            Some("gpt-6-astra"),
+            Some(
+                r#"{"effort":"max","default_value":"max","provider":"codex","model":"gpt-6-astra"}"#,
+            ),
+        ),
+        (
+            "agent-bad-json",
+            None,
+            Some("m"),
+            None,
+            None,
+            None,
+            Some("not json"),
+        ),
+        (
+            "agent-moved",
+            Some("claude-code"),
+            None,
+            None,
+            Some("codex"),
+            Some("gpt-6-astra"),
+            Some(
+                r#"{"effort":"xhigh","default_value":"max","provider":"codex","model":"gpt-6-astra"}"#,
+            ),
+        ),
+        (
+            "agent-compound",
+            None,
+            None,
+            None,
+            Some("codex"),
+            Some("codex:gpt-5"),
+            None,
+        ),
+        (
+            "agent-default-model",
+            None,
+            None,
+            None,
+            Some("claude-code"),
+            Some("default"),
+            None,
+        ),
+    ];
+    for (id, provider, model, effort, ltp, ltm, lte) in seeds {
+        let mut s = sample_agent_session(&AgentId::from(id), &ws);
+        s.provider = provider.map(str::to_string);
+        s.model = model.map(str::to_string);
+        s.reasoning_effort = effort.map(str::to_string);
+        store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        sqlx::query(
+            "UPDATE agent_session SET last_turn_provider=?, last_turn_model=?, \
+             last_turn_effort=? WHERE id=?",
+        )
+        .bind(ltp)
+        .bind(ltm)
+        .bind(lte)
+        .bind(id)
+        .execute(store.write_pool())
+        .await
+        .expect("seed last turn");
+    }
+
+    let migration = crate::MIGRATOR
+        .migrations
+        .iter()
+        .find(|m| m.version == 162)
+        .expect("migration 0162 present");
+    let sql: String = migration
+        .sql
+        .as_str()
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let replay = || async {
+        for statement in sql.split(';') {
+            let body = statement.trim();
+            // The column ALTER already ran at open; replay the data backfill.
+            if !body.is_empty() && !body.starts_with("ALTER TABLE") {
+                sqlx::query(sqlx::AssertSqlSafe(body))
+                    .execute(store.write_pool())
+                    .await
+                    .expect("run migration statement");
+            }
+        }
+    };
+    replay().await;
+    let read = || async {
+        let mut rows = Vec::new();
+        for (id, ..) in seeds {
+            let row = sqlx::query(
+                "SELECT provider, model, reasoning_effort, reasoning_effort_auto \
+                 FROM agent_session WHERE id=?",
+            )
+            .bind(id)
+            .fetch_one(store.read_pool())
+            .await
+            .expect("read");
+            rows.push((
+                id,
+                row.get::<Option<String>, _>("provider"),
+                row.get::<Option<String>, _>("model"),
+                row.get::<Option<String>, _>("reasoning_effort"),
+                row.get::<i64, _>("reasoning_effort_auto"),
+            ));
+        }
+        rows
+    };
+    let first = read().await;
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(
+        first,
+        vec![
+            // An Auto turn's default is flagged as Auto-pinned (1); an
+            // explicit selection is not (0).
+            ("agent-legacy", s("codex"), s("gpt-6-astra"), s("max"), 1),
+            ("agent-blank", s("claude-code"), s("opus"), s("high"), 0),
+            ("agent-effort-only-evidence", s("grok"), s("m"), s("low"), 1),
+            ("agent-no-evidence", None, None, None, 0),
+            ("agent-alias", None, s("m"), None, 0),
+            ("agent-set", s("auggie"), s("sonnet"), s("low"), 0),
+            ("agent-bad-json", None, s("m"), None, 0),
+            // Provider since moved: the old provider's model/effort never
+            // carries over.
+            ("agent-moved", s("claude-code"), None, None, 0),
+            ("agent-compound", s("codex"), s("gpt-5"), None, 0),
+            ("agent-default-model", s("claude-code"), None, None, 0),
+        ]
+    );
+    replay().await;
+    assert_eq!(read().await, first, "idempotent");
+}
+
+/// intent-hq/intent#7449: 0163 stops the lifecycle triggers from turning
+/// owner/name metadata into unresolved history and repairs the rows they (and
+/// the 0146 backfill) wrote, without touching saved choices, resets or imports.
+#[tokio::test]
+async fn never_saved_default_upgrade_repairs_only_metadata_history() {
+    let tmp = TempDb::new();
+    let pool = crate::connect_write(&tmp.path).await.unwrap();
+    let prefix = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            crate::MIGRATOR
+                .iter()
+                .filter(|m| m.version <= 162)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    prefix.run(&pool).await.unwrap();
+    sqlx::raw_sql(r"
+        INSERT INTO workspace(id,title,branch,created_at,updated_at,repository_path,repository_owner,repository_name) VALUES
+          ('meta','t','main','c','u','/meta','octo','project'),
+          ('remote','t','main','c','u','/remote','octo','project'),
+          ('auto','t','main','c','u','/auto','octo','project'),
+          ('reset','t','main','c','u','/reset','octo','project'),
+          ('import','t','main','c','u','/import','octo','project'),
+          ('plain','t','main','c','u','/plain',NULL,NULL),
+          ('recreated','t','main','c','u','/recreated','octo','project'),
+          ('saved-recreated','t','main','c','u','/saved','octo','project');
+        INSERT INTO workspace_git_root(id,workspace_id,path,source,repo_owner,repo_name,registered_commit_sha,created_at,updated_at) VALUES
+          ('meta-root','plain','/plain/sub','agent','octo','sub',NULL,'c','u'),
+          ('sha-root','plain','/plain/sha','agent',NULL,NULL,'abc123','c','u'),
+          ('remote-root','plain','/plain/remote','agent','octo','sub',NULL,'c','u');
+        UPDATE repository_selection_state SET selection_revision=selection_revision+1,choice_incarnation=root_incarnation,
+          choice_mode='remote',remote_name='upstream',historical_source=NULL,historical_record_id=NULL
+          WHERE workspace_id IN ('remote','saved-recreated') AND root_kind='primary' OR root_id='remote-root';
+        UPDATE repository_selection_state SET selection_revision=selection_revision+1,choice_incarnation=root_incarnation,
+          choice_mode='automatic',historical_source=NULL,historical_record_id=NULL WHERE workspace_id='auto';
+        UPDATE repository_selection_state SET selection_revision=selection_revision+1,choice_incarnation=root_incarnation,
+          choice_mode='reset',historical_source=NULL,historical_record_id=NULL WHERE workspace_id='reset';
+        UPDATE repository_selection_state SET selection_revision=selection_revision+1,choice_incarnation=root_incarnation,
+          choice_mode='unresolved',historical_source=NULL,historical_record_id=NULL WHERE workspace_id='import';
+        DELETE FROM workspace WHERE id IN ('recreated','saved-recreated');
+        INSERT INTO workspace(id,title,branch,created_at,updated_at,repository_path,repository_owner,repository_name) VALUES
+          ('recreated','t','main','c','u','/recreated','octo','project'),
+          ('saved-recreated','t','main','c','u','/saved','octo','project');
+    ").execute(&pool).await.unwrap();
+    let state = "SELECT workspace_id||'/'||root_id, json_array(root_incarnation,selection_revision,choice_incarnation,choice_mode,remote_name,historical_source,historical_record_id) FROM repository_selection_state ORDER BY 1";
+    let before: BTreeMap<String, String> = sqlx::query_as(state)
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    let modes = |rows: &BTreeMap<String, String>| {
+        rows.iter()
+            .map(|(k, v)| {
+                let v: serde_json::Value = serde_json::from_str(v).unwrap();
+                (k.clone(), v[3].as_str().unwrap().to_string())
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let unresolved_before: Vec<_> = modes(&before)
+        .into_iter()
+        .filter(|(_, m)| m == "unresolved")
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        unresolved_before,
+        [
+            "import/",
+            "meta/",
+            "plain/meta-root",
+            "plain/sha-root",
+            "recreated/"
+        ],
+        "0162 triggers mark metadata roots unresolved: {before:?}"
+    );
+    pool.close().await;
+
+    let repaired = ["meta/", "plain/meta-root", "plain/sha-root", "recreated/"];
+    let store = Store::open(&tmp.path).await.unwrap();
+    let after: BTreeMap<String, String> = sqlx::query_as(state)
+        .fetch_all(store.read_pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>()
+    );
+    for (key, old) in &before {
+        let new = &after[key];
+        if repaired.contains(&key.as_str()) {
+            let old: serde_json::Value = serde_json::from_str(old).unwrap();
+            let new: serde_json::Value = serde_json::from_str(new).unwrap();
+            assert_eq!(new[0], old[0], "{key}: incarnation unchanged");
+            assert_eq!(
+                new[1],
+                old[1].as_i64().unwrap() + 1,
+                "{key}: revision advances"
+            );
+            assert_eq!(
+                new[2], new[0],
+                "{key}: choice belongs to the current incarnation"
+            );
+            assert_eq!(
+                new.as_array().unwrap()[3..],
+                [
+                    serde_json::json!("never"),
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                    serde_json::Value::Null
+                ],
+                "{key}"
+            );
+        } else {
+            assert_eq!(new, old, "{key}: untouched");
+        }
+    }
+    for (workspace, expected) in [
+        ("meta", "never"),
+        ("recreated", "never"),
+        ("auto", "automatic"),
+        ("reset", "reset"),
+        ("import", "unresolved-historical"),
+        ("saved-recreated", "unresolved-historical"),
+        ("remote", "explicit-remote"),
+    ] {
+        let root = intent_core::RepositoryRootId {
+            workspace_id: WorkspaceId::from(workspace),
+            kind: intent_core::RepositoryRootKind::Primary,
+        };
+        let got = match store
+            .repository_selection_snapshot(&root)
+            .await
+            .unwrap()
+            .selection()
+            .unwrap()
+        {
+            crate::RepositoryStoredSelection::NeverSaved => "never".to_string(),
+            crate::RepositoryStoredSelection::Reset => "reset".to_string(),
+            crate::RepositoryStoredSelection::Saved(saved) => serde_json::to_value(saved).unwrap()
+                ["mode"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        };
+        assert_eq!(got, expected, "{workspace}");
+    }
+
+    // The repair is the only top-level (unindented) statement updating the
+    // table; trigger bodies are indented.
+    let sql = &crate::MIGRATOR
+        .iter()
+        .find(|m| m.version == 163)
+        .expect("migration 0163 present")
+        .sql
+        .as_str();
+    let top_level: Vec<&str> = sql
+        .match_indices("\nUPDATE repository_selection_state")
+        .map(|(at, _)| {
+            let rest = &sql[at + 1..];
+            &rest[..=rest.find(';').expect("terminated repair statement")]
+        })
+        .collect();
+    assert_eq!(top_level.len(), 1, "{top_level:?}");
+    let repair = top_level[0];
+    assert!(
+        repair.contains("WHERE choice_mode='unresolved' AND historical_source IS NOT NULL;"),
+        "{repair}"
+    );
+    let replay = sqlx::raw_sql(repair)
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(replay.rows_affected(), 0, "replaying the repair is a no-op");
+    store.read_pool().close().await;
+    store.write_pool().close().await;
+}
+
+#[tokio::test]
+async fn guest_roles_upgrade_preserves_grants_counts_and_authority_triggers() {
+    let tmp = TempDb::new();
+    let pool = crate::connect_write(&tmp.path).await.unwrap();
+    let prefix = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            crate::MIGRATOR
+                .iter()
+                .filter(|m| m.version < 171)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    prefix.run(&pool).await.unwrap();
+    sqlx::raw_sql("INSERT INTO principal(id,created_at,updated_at) VALUES('role-guest','original','original');
+        INSERT INTO workspace(id,title,branch,created_at,updated_at,repository_path,repository_owner,repository_name)
+        VALUES('role-workspace','Roles','main','original','original','/owned/repository','Owner','Project');
+        INSERT INTO workspace_member VALUES('role-workspace','role-guest','collaborator','original');")
+        .execute(&pool).await.unwrap();
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM repository_authority_revision WHERE kind='workspace_member' AND subject_id='role-workspace' AND member_id='role-guest'").fetch_one(&pool).await.unwrap();
+    pool.close().await;
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::from("role-workspace");
+    let guest = PrincipalId::from("role-guest");
+    let owner = store.get_primary_principal().await.unwrap();
+    assert_eq!(
+        store.get_workspace_member_role(&ws, &guest).await.unwrap(),
+        Some(WorkspaceRole::Collaborator)
+    );
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        1
+    );
+    assert!(store
+        .set_workspace_guest_role(&ws, &guest, WorkspaceRole::Manager, Some(&owner.id))
+        .await
+        .unwrap());
+    assert!(!store
+        .set_workspace_guest_role(&ws, &guest, WorkspaceRole::Manager, Some(&owner.id))
+        .await
+        .unwrap());
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        1
+    );
+    let now: i64 = sqlx::query_scalar("SELECT revision FROM repository_authority_revision WHERE kind='workspace_member' AND subject_id='role-workspace' AND member_id='role-guest'").fetch_one(store.read_pool()).await.unwrap();
+    assert_eq!(
+        now,
+        revision + 1,
+        "only the meaningful role change advances authority"
+    );
+    assert!(matches!(
+        store
+            .set_workspace_guest_role(&ws, &owner.id, WorkspaceRole::Manager, Some(&owner.id))
+            .await,
+        Err(Error::InvalidParams(_))
+    ));
+    assert!(matches!(
+        store
+            .set_workspace_guest_role(&ws, &guest, WorkspaceRole::Collaborator, Some(&guest))
+            .await,
+        Err(Error::Forbidden(_))
+    ));
+    sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES(?,?)")
+        .bind(guest.as_str())
+        .bind(now_iso())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        0
+    );
+    assert!(matches!(
+        store
+            .set_workspace_guest_role(&ws, &guest, WorkspaceRole::Collaborator, Some(&owner.id))
+            .await,
+        Err(Error::HostMembershipRequired)
+    ));
+    sqlx::query("DELETE FROM host_member WHERE principal_id=?")
+        .bind(guest.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        1
+    );
+    store.close().await;
+    let store = Store::open(&tmp.path).await.unwrap();
+    let row = store
+        .list_workspace_members(&ws)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.principal_id == guest)
+        .unwrap();
+    assert_eq!(row.role, WorkspaceRole::Manager);
+    assert_eq!(row.added_at, "original");
+    let revoked = store.revoke_principal_access(&guest).await.unwrap();
+    assert_eq!(revoked.workspaces, vec![ws.clone()]);
+    assert_eq!(
+        store.get_workspace_member_role(&ws, &guest).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        0
+    );
+    let next = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&next, "owner trigger", false))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_workspace_member_role(&next, &owner.id)
+            .await
+            .unwrap(),
+        Some(WorkspaceRole::Owner)
+    );
 }

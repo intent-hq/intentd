@@ -128,6 +128,20 @@ navigation are deterministic offscreen thanks to viewport emulation. Reveal a ta
 only when the user should see it, and prefer the default `focus: false` so you never
 steal focus.
 
+**Frame rate during agent use.** While you act on a tab you own, it draws at full
+frame rate (requestAnimationFrame, CSS animations, timers) even when it is hidden or
+the app window is minimized or covered. Content actions on it (`evaluate`,
+`screenshot`, `snapshot`, `getAccessibilityTree`, `navigate`, `focusTab`,
+`startSession`, and the `startCapture` / `captureStep` / `startTrace` session steps)
+keep it at full rate for as long as they run and for 30 s
+after your last action; after that an idle hidden tab drops back to a throttled,
+uneven rate to save battery. So animation, flicker and timing measured
+inside one `evaluate`, or across calls a few seconds apart, are real. After a longer
+gap, the first frames of the next action can still be throttled: send a cheap action
+first (e.g. `evaluate` of `1`). A trace or capture whose steps are more than 30 s apart
+is throttled in between, so keep its start and stop close together. Tabs you do not
+own keep the browser's normal throttling.
+
 **Capture ops and workspace visibility.** Layout-only actions (`openTab` hidden or
 visible, `closeTab`, `showTab`, `focusTab`, `claimTab`, `resizeTab`, …) do not need
 the workspace to be open/visible in the app: they apply their effects to the
@@ -147,15 +161,20 @@ the tab to register). For the three capture ops the whole pipeline — mount, wa
 the page to finish loading, capture — is bounded by one request deadline, so the op
 is designed not to outlive the request; `navigate` runs only the mount step with no
 deadline (its mount wait has its own cap), never waits for the page to settle, and
-does no origin check; `snapshot` does not go through the mount path at all. A mount
-on demand against a not-in-view workspace succeeds with the same additive `warning`
-string. When a mount, settle, or paint cannot happen, the op fails as an
+does no origin check; `snapshot` and the session actions (`startSession`,
+`startCapture`, `captureStep`, `startTrace`) run the same mount step under the request
+deadline, without the settle or origin check. A workspace that is not open in any
+window (its tab was closed, or it was not reopened since a restart) is hosted in the
+background by an open app window on the same host — no workspace tab, navigation, or
+focus — so tab ops and captures work without opening it. Captures also keep painting
+while the app window is minimized or covered by other apps. A mount on demand against
+a not-in-view workspace succeeds with the same additive `warning` string. When a mount, settle, or paint cannot happen, the op fails as an
 action-result error (`success: false`, `error` naming the cause and remedy) with an
 additive structured `errorCode`: `workspace-not-visible` (the tab could not be
-mounted while the workspace is not displayed in any window — either no window hosts
-it at all, or a background window hosts it but the offscreen mount wait ran out at
-its cap; retry shortly or `listTabs`, and open the workspace in a window if it is
-open nowhere), `deadline-exhausted` (capture ops only: the request deadline ran out
+mounted while the workspace is not displayed in any window — either no app window is
+connected to its host to host it at all, or a background window hosts it but the
+offscreen mount wait ran out at its cap; retry shortly or `listTabs`, and open an
+Intent window if none is open), `deadline-exhausted` (capture ops only: the request deadline ran out
 at a named stage — retry), `still-loading` (capture ops only: the page was still
 loading after the bounded wait — retry, or `snapshot` with `waitFor: { networkIdle }`
 first), `navigated-away` (capture ops only, and only checked right after a mount on
@@ -179,6 +198,7 @@ naming the "action execution" stage instead of a per-action `errorCode`.
 - `{ action: "screenshot", tabId? }` - Take a screenshot
 - `{ action: "evaluate", expression, tabId? }` - Run JavaScript in the page
 - `{ action: "focusTab", tabId? }` - Focus/remount a visible tab (fails on a hidden tab — use showTab)
+- `{ action: "previewHtml", html, width?, appearance? }` - Check a self-contained `ws-block:html` visual before showing it, in an invisible window with the app sandbox, fonts and themes (no tab, server or focus change). `width` is CSS pixels, 320 to 1600 (default 800; about 390 for phones). `appearance` is `"light"` (default) or `"dark"`. As a single action, `r.result` has `assetUrl`, `width`, `height`, `contentHeight`, `truncated` (full-height PNG capped at 8000px), `appearance` and `consoleMessages` (`[{ level, message }]`); view it with `return await ws.note.readAsset(r.result.assetUrl)`. Without `assetUrl`, the result keeps `base64` and `mimeType`. Frontends without this action report it as unsupported.
 
 ## Capture Actions (for debugging)
 - `{ action: "snapshot", workspaceId, name?, reload?, waitFor? }` - Quick point-in-time capture
@@ -282,5 +302,28 @@ Chrome link, find the preview's stable `requestedUrl` in `listTabs`, read its da
 port, call idempotent `openTunnel { remotePort }`, and use the returned current
 `http://127.0.0.1:<localPort>` URL. This works whether the previous forward survived or
 had to be re-created.
+
+## Troubleshooting Timeouts
+
+A `ws.browser.exec` call that gets no answer fails with `reverse request timed out:
+browser.exec: browser client "<name>" (<clientId>) on connection <n> over <transport>,
+connected <time> did not accept or answer the request within <s>s`. Call the read-only
+`ws.browser.clients()` to see what the daemon holds right now:
+
+- `clients` — every connected app (`clientId`, `name?`, `canHostBrowser`) with its live
+  `connections`, oldest first: `connectionId` (the `<n>` in the error), `transport`
+  (`uds` / `wss`), `connectedAt`, `canHostBrowser`. `clientId` matches `listTabs`
+  `hostClientId`.
+- `unpinned` — where a request with no pin would go: the first-connected client that can
+  host a browser, via its newest connection.
+- `workspace` — where this workspace's `ws.browser.exec` goes, with `source`:
+  `workspace` (the workspace's browser-client pin), `desktop` (the client controlling
+  this workspace's desktop), `tabs` (the host of this workspace's claimed tabs) or
+  `default` (same as `unpinned`).
+
+A route names `clientId` and `connectionId`; when nothing would answer it has
+`connectionId: null` and an `error` (for example `no client connected`). If the
+connection that timed out is not the newest one of its client, or several connections
+of one app are listed, include the `ws.browser.clients()` output when you report it.
 
 Use `browser_docs` with topic="capture" or topic="examples" for detailed usage.

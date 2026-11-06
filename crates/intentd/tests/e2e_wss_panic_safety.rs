@@ -131,7 +131,7 @@ async fn make_services() -> (Arc<dyn WorkspaceApi>, EventBus, tempfile::TempDir)
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.path().join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic workspaces root");
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root);
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
@@ -273,7 +273,8 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
     // trail the final response. Loop for the full window, skipping Ping/Pong,
     // so a heartbeat can't mask a trailing Text frame. `timeout_at` keeps the
     // fixed deadline without computing a (potentially negative) remainder.
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let deadline = tokio::time::Instant::now()
+        + intentd_test_support::test_timeout(Duration::from_millis(300));
     loop {
         match tokio::time::timeout_at(deadline, ws.next()).await {
             Err(_) => break,

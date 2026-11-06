@@ -337,18 +337,21 @@ async fn run_restart_case(
     // must not settle or drain ordinary input behind a prompt owner,
     // or input held under edit behind an unsolicited wake. This is a negative event
     // assertion with a deadline, not a sleep used to order the test.
-    let premature = timeout(Duration::from_secs(6), async {
-        loop {
-            let event = next_agent_event(&mut sub, &agent).await;
-            assert_ne!(
-                event["type"], "agent:idle",
-                "unfinished compaction became idle"
-            );
-            if event["type"] == "agent:stream:end" {
-                return event;
+    let premature = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(6)),
+        async {
+            loop {
+                let event = next_agent_event(&mut sub, &agent).await;
+                assert_ne!(
+                    event["type"], "agent:idle",
+                    "unfinished compaction became idle"
+                );
+                if event["type"] == "agent:stream:end" {
+                    return event;
+                }
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(
         premature.is_err(),

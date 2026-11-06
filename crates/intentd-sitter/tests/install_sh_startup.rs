@@ -17,8 +17,10 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+use intentd_test_support::GuardedChild;
 
 fn install_sh() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.sh");
@@ -290,6 +292,7 @@ fn run_owner_check_diagnostic(
 }
 
 /// Run the shipped `resolve_data_dir` and return the dir it names.
+#[track_caller]
 fn run_resolve_data_dir(cwd: &Path, os: &str, home: &Path, data_dir: Option<&str>) -> String {
     let driver = format!(
         "set -eu\nos={os}\n{functions}\nresolve_data_dir\n",
@@ -330,28 +333,22 @@ fn created_dir(path: &Path) -> PathBuf {
 
 /// A live process to stand in for the running daemon, killed on drop so a
 /// failing test never leaks it.
-struct LiveProcess(Child);
+struct LiveProcess(GuardedChild);
 
 impl LiveProcess {
     fn spawn() -> Self {
-        let child = Command::new("sleep")
-            .arg("120")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let child = GuardedChild::spawn(
+            Command::new("sleep")
+                .arg("120")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .unwrap();
         Self(child)
     }
 
     fn pid(&self) -> u32 {
         self.0.id()
-    }
-}
-
-impl Drop for LiveProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 
@@ -376,6 +373,7 @@ fn daemon_read_pid(contents: &str) -> Option<u32> {
 
 /// The pid the shipped `data_dir_owner_pid` reads out of a pidfile holding
 /// `contents`, if any.
+#[track_caller]
 fn installer_owner_pid(root: &Path, case: &str, contents: &str) -> Option<u32> {
     let data_dir = root.join(case);
     write_pid_file(&data_dir, contents);
@@ -792,6 +790,7 @@ fn unreachable_service_manager_stub(dir: &Path) -> PathBuf {
 
 /// Refusal assertions shared by the "still refused" cases below: same exit,
 /// same message, no PROCEEDED — the exemption must not soften the refusal.
+#[track_caller]
 fn assert_refused(os: &str, output: &Output) {
     assert_eq!(
         output.status.code(),
@@ -1192,6 +1191,15 @@ impl WaitCase {
     /// it took. A `fail` exits the driver, so an absent VERDICT line on stdout
     /// is itself the "reported a failure" signal.
     fn run(&self) -> (Output, Duration) {
+        self.run_within(intentd_test_support::test_timeout(Duration::from_secs(240)))
+    }
+
+    /// [`Self::run`] under a hang guard: the driver is killed and the test
+    /// fails when it is still waiting after `guard`. With a deadline or
+    /// settle of [`UNREACHED`] polls, a wait that sits one out hangs into this
+    /// guard instead of passing slowly.
+    #[track_caller]
+    fn run_within(&self, guard: Duration) -> (Output, Duration) {
         let driver = format!(
             "set -eu\n\
              info() {{ printf '%s\\n' \"install.sh: $*\"; }}\n\
@@ -1225,13 +1233,34 @@ impl WaitCase {
             ]),
         );
         let started = Instant::now();
-        let output = Command::new("/bin/sh")
+        let child = Command::new("/bin/sh")
             .arg("-c")
             .arg(driver)
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
-        (output, started.elapsed())
+        let pid = child.id();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(child.wait_with_output());
+        });
+        let Ok(output) = finished.recv_timeout(guard) else {
+            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            panic!("verify_daemon was still waiting after {guard:?}");
+        };
+        (output.unwrap(), started.elapsed())
     }
+}
+
+/// A deadline or settle window (in polled seconds) no test reaches: a case
+/// that must end on evidence uses it, so waiting the window out hangs into
+/// [`WaitCase::run_within`]'s guard instead of passing slowly.
+const UNREACHED: u32 = 1_000_000;
+
+/// Hang guard for a case decided within a few polls.
+fn decided_guard() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(60))
 }
 
 /// The case the shipped fix missed, reproduced literally: the sitter is still
@@ -1275,10 +1304,10 @@ fn a_crash_after_the_old_sixty_second_window_is_still_reported() {
 /// — a decided failure must not sit out the (now much longer) deadline.
 #[test]
 fn crash_evidence_ends_the_wait_instead_of_burning_the_deadline() {
-    let case = WaitCase::new("exit 1", 120, 1, 2);
+    let case = WaitCase::new("exit 1", UNREACHED, 1, 2);
     let writer = case.append_log_after(Duration::from_secs(3), CRASH_LINE);
 
-    let (output, elapsed) = case.run();
+    let (output, _) = case.run_within(decided_guard());
     writer.join().unwrap();
 
     assert_eq!(
@@ -1294,20 +1323,16 @@ fn crash_evidence_ends_the_wait_instead_of_burning_the_deadline() {
         stderr.contains("Your auto-resume choice ('on') was not applied"),
         "stderr: {stderr}"
     );
-    assert!(
-        elapsed < Duration::from_secs(30),
-        "a decided failure must be reported promptly, took {elapsed:?}"
-    );
 }
 
 /// The sitter's give-up banner is terminal — nothing can change after it, so
 /// it is reported at once, with no settle grace.
 #[test]
 fn the_give_up_banner_is_reported_immediately() {
-    let case = WaitCase::new("exit 1", 60, 1, 30);
+    let case = WaitCase::new("exit 1", UNREACHED, 1, UNREACHED);
     case.append_log(GIVE_UP_LINE);
 
-    let (output, elapsed) = case.run();
+    let (output, _) = case.run_within(decided_guard());
 
     assert_eq!(
         output.status.code(),
@@ -1317,10 +1342,6 @@ fn the_give_up_banner_is_reported_immediately() {
     );
     let stderr = stderr_of(&output);
     assert!(stderr.contains("has given up"), "stderr: {stderr}");
-    assert!(
-        elapsed < Duration::from_secs(20),
-        "a stopped service is decided; took {elapsed:?}"
-    );
 }
 
 /// Polling the log continuously means crash lines are seen early — including
@@ -1351,9 +1372,9 @@ fn a_crash_the_daemon_recovers_from_is_not_a_failure() {
 /// longer for undecided cases must not make a working install slower.
 #[test]
 fn a_responsive_daemon_returns_at_once() {
-    let case = WaitCase::new("exit 0", 300, 2, 10);
+    let case = WaitCase::new("exit 0", UNREACHED, 2, UNREACHED);
 
-    let (output, elapsed) = case.run();
+    let (output, _) = case.run_within(decided_guard());
 
     assert_eq!(
         output.status.code(),
@@ -1362,10 +1383,6 @@ fn a_responsive_daemon_returns_at_once() {
         stderr_of(&output)
     );
     assert!(stdout_of(&output).contains("VERDICT up"));
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "success must not wait, took {elapsed:?}"
-    );
 }
 
 /// Deadline reached with a quiet log: a genuinely slow download still looks

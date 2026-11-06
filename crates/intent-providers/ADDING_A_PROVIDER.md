@@ -72,8 +72,17 @@ needs. Fields that matter most:
   resolves) vs `npx_only_package` (spawn via npx with a version we pin, skipping
   adapter auto-discovery entirely; claude-code, codex, pi). Codex and Claude always
   use their reviewed adapter pins with the execution host's canonical `codex` / `claude`
-  executable, resolved from enhanced PATH. Both the installed CLI and npx are required;
-  there is no bundled-runtime fallback. Legacy `providers.paths.codex` and
+  executable, resolved from enhanced PATH. Both the installed CLI and npx are required.
+  When the installed CLI's version is confirmed below the adapter-derived minimum
+  (`adapter_cli`), launches substitute Intent's bundled copy: the exact
+  `bundled` package (Codex: the adapter-declared minimum; Claude: the pinned Agent SDK's
+  `claudeCodeVersion`, whose same-minor `.0` is the minimum), installed on first use
+  with the host's npm under `~/.local/share/intent/providers/bundled-cli`
+  (`crates/intent-services/src/bundled_cli.rs`). A missing or unknown-version CLI is
+  never replaced. If the bundled install fails, Codex launches fail with both reasons;
+  Claude launches keep the installed CLI (Claude had no launch minimum before). Discovery reports `cliBundledVersion` and never installs. The
+  Claude `claudeCodeVersion` snapshot is kept in sync by `provider_cli_metadata.py` and
+  the auto-pin automation (`runtimePackage` / `runtimeVersionField`). Legacy `providers.paths.codex` and
   `providers.paths["claude-code"]` adapter overrides are ignored on all launch/catalog
   paths, with one warning per provider per daemon process. Remove those settings and
   install the canonical CLI on the execution host. `CODEX_PATH` and
@@ -139,7 +148,7 @@ intentd assembles one effective system prompt per agent (`assemble_system_prompt
 | `RulesFileFlag` | auggie (`--rules`), droid (`--append-system-prompt-file`) | `create_agent` writes a temp rules file; `build_provider_args` (`crates/intent-providers/src/args.rs`) appends `rules_flag` + path, gated on `supports_rules_file`. |
 | `SessionMeta` | claude-code (system prompt), codex (session title only) | `build_session_meta` (`crates/intent-services/src/agent_session.rs`) builds a provider-shaped `_meta`: claude-code `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": "<prompt>" }` (a string `systemPrompt` fully replaces the claude_code preset prompt — at adapter 0.66.0 the string is passed to the SDK as-is and treated as a custom prompt, so the model sees only our assembled instructions), sent on `session/new` **and** `session/load` (and the recreate path); codex `{ "sessionTitle": "<agent name>" }`, sent on `session/new` only (create + recreate; never on `session/load` — monorepo#3151), while its system prompt still travels via `FirstTurnPrepend` below. Carried by `session::new_session` / `load_session` (`crates/intent-acp/src/session.rs`). |
 | `EnvConfig` | opencode | `build_provider_env` (`crates/intent-providers/src/args.rs`) emits `OPENCODE_CONFIG_CONTENT` with an `instructions: [<rules file path>]` key (plus `model`, `permission`, `mcp` — see §3b and §6). |
-| `FirstTurnPrepend` | codex (the pinned codex-acp adapter ignores `_meta.developerInstructions`, #479), cortex, pi, grok (fallback), antigravity, plus the e2e-only `mock` provider | `arm_first_turn_prepend` / `build_first_turn_prepend` (`crates/intent-services/src/agent_manager.rs`): the persisted prompt is prepended as a `<system>` block on the first turn of a *fresh* session only (never on a `session/load` resume, which retained context). |
+| `FirstTurnPrepend` | codex (the pinned codex-acp adapter ignores `_meta.developerInstructions`, #479), cortex, pi, grok (fallback), antigravity, cursor, plus the e2e-only `mock` provider | `arm_first_turn_prepend` / `build_first_turn_prepend` (`crates/intent-services/src/agent_manager.rs`): the persisted prompt is prepended as a `<system>` block on the first turn of a *fresh* session only (never on a `session/load` resume, which retained context). |
 | `None` | — | Provider gets no system prompt. Avoid if at all possible. |
 
 Add a new mechanism only if the provider genuinely supports none of these; prefer reusing
@@ -165,7 +174,7 @@ per provider — pick exactly one delivery path:
   `opencode_env_mcp_config` → `to_opencode_mcp_config` serializes the set as the
   OpenCode `mcp` block, merged into `OPENCODE_CONFIG_CONTENT` by `build_provider_env`
   (`SpawnOptions.env_mcp_config`, `crates/intent-acp/src/spawn.rs`).
-- **(c) ACP session field** (claude-code, codex, droid, grok, antigravity):
+- **(c) ACP session field** (claude-code, codex, droid, grok, antigravity, cursor):
   `supports_session_mcp_servers: true`. `create_agent` stashes
   `to_acp_session_mcp_servers(...)` on the agent handle; `start_session`
   (`crates/intent-services/src/agent_manager.rs`) passes it into every session-open
@@ -253,10 +262,11 @@ certainly needs new normalization arms:
     expose native delegation even when both are false. The derived minimum
     gate excludes older parsers that reject `agents.enabled` with an
     `AgentRoleToml` error (intent-hq/intent#6982).
-    The launch boundary keeps `CODEX_PATH` on the exact installed CLI and
-    rejects a confirmed version below the minimum derived from the pinned
-    adapter's CLI declaration. This prevents older runtimes that drop the
-    feature policy on later turns from bypassing native-subagent denial.
+    The launch boundary keeps `CODEX_PATH` on the exact installed CLI, or on
+    Intent's bundled Codex when the installed one is confirmed below the
+    minimum derived from the pinned adapter's CLI declaration, and rejects
+    any launched version below that minimum. This prevents older runtimes that
+    drop the feature policy on later turns from bypassing native-subagent denial.
     No user configuration is changed. Node.js and npm/npx are required even on hosts
     with a native adapter; missing prerequisites produce an actionable error.
     The unchanged frontend may still offer Codex on a native-only host; the
@@ -350,6 +360,42 @@ semantics). Today that is **Grok Build** only (`/bin/bash -lc '…'` in
 `command`). intentd then spawns the packed line exactly as Node `shell: true`
 would — `/bin/sh -c` on POSIX, the native shell (PowerShell `-Command` /
 `cmd /c`) on Windows — instead of exec'ing the packed string as argv[0].
+
+## Cursor (`cursor-agent acp`)
+
+Verified against Cursor CLI 2026.11.05-86047df. Code: `intent-providers/src/cursor.rs`,
+`intent-services/src/cursor_cli.rs`, the `cursor` arms in `provider_auth.rs` /
+`provider_models`, and `derive_cursor_tool_name` in `intent-acp/src/session.rs`.
+
+- **Discovery** — `providers.paths.cursor`, then `cursor-agent` on the enhanced PATH,
+  then the newest `~/.local/share/cursor-agent/versions/<ver>/cursor-agent`. Never a
+  bare `agent`. The Grok agent host channel (`cursor-agent update --channel grok`)
+  repoints the `~/.local/bin` links: candidates resolving into `$GROK_HOME` or named
+  `agent-host*` are skipped, an active `<CURSOR_CONFIG_DIR>/grok-switch.json` skips the
+  PATH tier, and a `--version` starting `grok ` marks the row unavailable
+  (`unavailableReason`) and fails agent creation.
+- **Auth** — `cursor-agent models` (stored login or `CURSOR_API_KEY`; the stored login
+  wins).
+- **Models** — `cursor/list_available_models` after `initialize`, with no `session/new`,
+  so refreshes add nothing to Cursor's chat history. Catalog ids are base models
+  (`default` = Auto); at session start the pick is mapped to the session's own
+  `model` option variant (`<base>[…]`) and applied with `session/set_config_option`.
+  No match or a rejection fails setup with an actionable error. Cursor also saves the
+  applied model as the user's CLI default (accepted).
+- **Never send ACP `authenticate`** — `cursor_login` on a signed-out host starts a
+  browser login. A stored login is picked up at process start.
+- **Agent requests** — `cursor/ask_question` is answered `skipped` (a `-32601` makes
+  Cursor re-ask through permission prompts that auto-approval would answer);
+  `cursor/task` (sent after a native Task run) gets an empty success.
+  Auto-approved permissions pick `allow_once` (`ProviderConfig::auto_allow_once`):
+  Cursor's `allow-always` writes the user's `cli-config.json` allowlist.
+- **Teardown** — `cursor-agent acp` ignores stdin EOF and spawns a worker-server plus a
+  language-server chain in its process group; the usual `killpg` teardown covers it
+  (asserted in `e2e_wss_cursor_provider`).
+- **Native subagents** — Cursor's `Task` tool stays callable without the `subagents`
+  capability and there is no disable flag, so the restriction is prompt-only
+  (`ProviderConfig::system_prompt_note`, appended by `rules::with_provider_prompt_note`).
+  Task runs map to `Subagent` in the timeline.
 
 ## Antigravity setup and compatibility boundary
 

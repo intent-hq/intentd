@@ -224,13 +224,13 @@ impl<T: Conflate> ConflationBuffer<T> {
 
     /// Drain every pending entry with blocking (backpressured) sends — the
     /// barrier path. Returns `false` when the outbound channel closed.
-    pub(crate) async fn drain_all(
+    pub(crate) async fn drain_all<F: Into<crate::OutboundFrame>>(
         &mut self,
-        out_tx: &mpsc::Sender<String>,
-        mut build: impl FnMut(T) -> String,
+        out_tx: &mpsc::Sender<crate::OutboundFrame>,
+        mut build: impl FnMut(T) -> F,
     ) -> bool {
         while let Some(item) = self.pop() {
-            if out_tx.send(build(item)).await.is_err() {
+            if out_tx.send(build(item).into()).await.is_err() {
                 return false;
             }
         }
@@ -291,6 +291,12 @@ fn terminal_cursor(data: &Value, byte_len: usize) -> TerminalCursor<'_> {
 }
 
 impl EventItem {
+    pub(crate) fn event(&self) -> &Event {
+        match self {
+            Self::Latest(event) | Self::Terminal { event, .. } => event,
+        }
+    }
+
     /// Wrap a conflatable bus event for buffering, per its key kind.
     pub(crate) fn new(key: &Key, event: Event) -> Self {
         match key {
@@ -577,17 +583,17 @@ pub(crate) enum Enqueue<T> {
 /// pending same-key item. A buffer at its entry/byte bound hands the item
 /// back as [`Enqueue::Overflow`] — the caller then blocks (original
 /// backpressure semantics), so the bound never loses data.
-pub(crate) fn offer<T: Conflate>(
+pub(crate) fn offer<T: Conflate, F: Into<crate::OutboundFrame>>(
     buffer: &mut ConflationBuffer<T>,
     key: Key,
     item: T,
-    out_tx: &mpsc::Sender<String>,
-    build: impl FnOnce(T) -> String,
+    out_tx: &mpsc::Sender<crate::OutboundFrame>,
+    build: impl FnOnce(T) -> F,
 ) -> Enqueue<T> {
     if buffer.is_empty() {
         match out_tx.try_reserve() {
             Ok(permit) => {
-                permit.send(build(item));
+                permit.send(build(item).into());
                 return Enqueue::Sent;
             }
             Err(mpsc::error::TrySendError::Closed(())) => return Enqueue::Closed,

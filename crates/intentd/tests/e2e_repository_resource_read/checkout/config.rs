@@ -104,7 +104,12 @@ async fn checkout_config_real_transports_valid_absent_and_tolerant_present() {
             .iter()
             .filter(|(_, path)| path.starts_with(FILE))
             .all(|(method, path)| method == "GET" && path == &format!("{FILE}?ref={SHA}")));
-        assert!(h.store.list_workspaces(true).await.unwrap().is_empty());
+        assert!(h
+            .store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .is_empty());
         client.close().await;
         h.finish().await;
     }
@@ -215,7 +220,7 @@ async fn checkout_config_rejects_branch_project_and_authority_changes_during_rea
             client.close().await;
             response
         });
-        tokio::time::timeout(ACQUIRE, server.state.entered.notified())
+        tokio::time::timeout(acquire(), server.state.entered.notified())
             .await
             .unwrap();
         match change {
@@ -250,7 +255,7 @@ async fn checkout_config_rejects_branch_project_and_authority_changes_during_rea
             _ => unreachable!(),
         }
         server.state.release.notify_one();
-        let response = tokio::time::timeout(ACQUIRE, pending)
+        let response = tokio::time::timeout(acquire(), pending)
             .await
             .unwrap()
             .unwrap();

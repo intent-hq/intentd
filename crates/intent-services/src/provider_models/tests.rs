@@ -2202,14 +2202,11 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
     .unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let start = std::time::Instant::now();
+    // Left alone, the CLI would exit 0 with no output after its sleep, so
+    // the timeout error alone says the timeout cut it short.
     let err = super::run_opencode_models_cli(bin, std::time::Duration::from_secs(5))
         .await
         .unwrap_err();
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(20),
-        "timeout must cut the wedged CLI short"
-    );
     assert_eq!(err, "opencode models timed out");
 
     // kill_on_drop reaps the child when the timed-out output future drops:
@@ -2222,7 +2219,8 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
         .parse()
         .expect("pid");
     let pid = nix::unistd::Pid::from_raw(pid);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
     while nix::sys::signal::kill(pid, None).is_ok() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -2469,6 +2467,30 @@ fn auth_required_detection() {
 }
 
 #[test]
+fn auth_required_detection_recognizes_claude_expired_oauth() {
+    for message in [
+        "Internal error: Failed to authenticate: OAuth session expired and could not be refreshed",
+        "Failed to authenticate: OAuth session expired and could not be refreshed",
+        "FAILED TO AUTHENTICATE: OAUTH SESSION EXPIRED AND COULD NOT BE REFRESHED",
+    ] {
+        assert!(is_auth_required_error(-32603, message), "{message}");
+    }
+}
+
+#[test]
+fn auth_required_detection_rejects_unrelated_expiry() {
+    for message in [
+        "Internal error",
+        "session expired",
+        "tool execution deadline expired",
+        "Failed to refresh model catalog",
+        "OAuth callback listener failed to start",
+    ] {
+        assert!(!is_auth_required_error(-32603, message), "{message}");
+    }
+}
+
+#[test]
 fn installed_cli_probe_copies_routing_credentials_but_not_tools_or_hooks() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("config.toml");
@@ -2509,4 +2531,86 @@ command = "must-not-run"
     );
     assert!(parsed.get("mcp_servers").is_none());
     assert!(parsed.get("hooks").is_none());
+}
+
+#[test]
+fn unresolvable_adapter_is_a_prerequisite_failure_with_unchanged_text() {
+    for provider in ["codex", "claude-code"] {
+        let err = super::adapter_unavailable(provider);
+        assert_eq!(
+            err.kind,
+            Some(crate::model_catalog::ModelWarningKind::PrerequisiteMissing),
+            "{provider}"
+        );
+        assert_eq!(
+            err.reason,
+            crate::complete_ops::missing_one_shot_adapter_message(provider)
+        );
+    }
+}
+
+#[test]
+fn catalog_unavailable_from_plain_text_has_no_kind() {
+    let err = super::CatalogUnavailable::from("model probe timed out");
+    assert_eq!(err.kind, None);
+    let fetch = super::ProviderModelsFetch::from_unavailable("codex", err);
+    assert_eq!(
+        fetch.warning.as_deref(),
+        Some("codex: model probe timed out")
+    );
+    assert_eq!(fetch.warning_kind, None);
+    let fetch = super::ProviderModelsFetch::from_unavailable(
+        "codex",
+        super::CatalogUnavailable {
+            reason: "Install codex".into(),
+            kind: Some(crate::model_catalog::ModelWarningKind::CliMissing),
+        },
+    );
+    assert_eq!(fetch.warning.as_deref(), Some("codex: Install codex"));
+    assert_eq!(
+        fetch.warning_kind,
+        Some(crate::model_catalog::ModelWarningKind::CliMissing)
+    );
+}
+
+/// `cursor/list_available_models` result shape (captured from cursor-agent
+/// 2026.11.05-86047df, cut to three models; `Fast\u{200b}\u{200b}` padding
+/// as emitted).
+#[test]
+fn cursor_available_models_map_base_ids_and_clean_names() {
+    let result = json!({"models":[
+        {"value":"default","name":"Auto","configOptions":[]},
+        {"value":"grok-4.7","name":"Grok 4.7  Low Fast\u{200b}\u{200b}","configOptions":[
+            {"id":"fast","name":"Fast","category":"model_config","type":"select","currentValue":"true",
+             "options":[{"value":"false","name":"Off"},{"value":"true","name":"Fast\u{200b}\u{200b}"}]}]},
+        {"value":"claude-sonnet-4","name":"Claude Sonnet 4","configOptions":[]},
+        {"name":"no value"}
+    ]});
+    let rows = super::parse::parse_cursor_available_models(&result);
+    assert_eq!(
+        rows,
+        vec![
+            json!({ "id": "default", "name": "Auto", "provider": "cursor", "isDefault": true }),
+            json!({ "id": "grok-4.7", "name": "Grok 4.7 Low Fast", "provider": "cursor" }),
+            json!({ "id": "claude-sonnet-4", "name": "Claude Sonnet 4", "provider": "cursor" }),
+        ]
+    );
+}
+
+#[test]
+fn cursor_outcome_maps_auth_required_and_empty() {
+    let auth = super::cursor_fetch_outcome(Err(super::ProbeError::Rpc(intent_acp::JsonRpcError {
+        code: -32000,
+        message: "Authentication required".into(),
+        data: None,
+    })));
+    assert!(auth.models.is_none());
+    assert_eq!(
+        auth.warning.as_deref(),
+        Some("cursor: authentication required")
+    );
+    let empty = super::cursor_fetch_outcome(Err(super::ProbeError::Empty));
+    assert_eq!(empty.warning.as_deref(), Some("cursor: no models reported"));
+    let ok = super::cursor_fetch_outcome(Ok(vec![json!({"id":"default"})]));
+    assert_eq!(ok.models.unwrap().len(), 1);
 }

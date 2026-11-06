@@ -37,18 +37,18 @@
 //! hit; only the bare word `grep` is recognised (not `command grep`,
 //! `/usr/bin/grep`, an env-prefixed `LC_ALL=C grep`, or `xargs grep`);
 //! here-docs and backtick substitutions are lexed as ordinary text.
+//!
+//! The shell lexer is deliberately its own: quoting, `$(…)`, `#` comments,
+//! and redirections have no counterpart in the shared Rust token reader
+//! (`intentd_test_support::source_lint::tokenize`), so it carries the
+//! discovery lint's `source-lint-scaffolding` opt-out.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const WORKFLOWS_DIR: &str = ".github/workflows";
+use intentd_test_support::source_lint::workspace_root;
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("canonicalize workspace root")
-}
+const WORKFLOWS_DIR: &str = ".github/workflows";
 
 fn workflow_files(root: &Path) -> Vec<PathBuf> {
     let dir = root.join(WORKFLOWS_DIR);
@@ -129,6 +129,7 @@ fn logical_lines(text: &str) -> Vec<Logical> {
 }
 
 #[derive(Debug, PartialEq)]
+// source-lint-scaffolding: allow — shell words and operators, not Rust tokens
 enum Tok {
     /// A shell word with quotes removed, and the physical line it starts on.
     Word { text: String, line: usize },
@@ -289,6 +290,7 @@ impl Lexer<'_> {
     }
 }
 
+// source-lint-scaffolding: allow — runs the shell lexer above, not a Rust reader
 fn tokenize(l: &Logical) -> Vec<Tok> {
     Lexer {
         l,

@@ -1,15 +1,15 @@
 //! Real authenticated TLS/WSS script monitor controls and lifecycle events.
 //! Registration uses the service endpoint called by the authenticated MCP helper.
 #![cfg(unix)]
-mod common;
+use crate::common;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, Result as CoreResult, Workspace,
-    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, Result as CoreResult, Workspace, WorkspaceApi,
+    WorkspaceId,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -134,49 +134,11 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         id: id.clone(),
         title: "Script monitor".into(),
         branch: "feature".into(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
         repository_owner: Some("o".into()),
         repository_name: Some("r".into()),
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -226,6 +188,7 @@ fn agent_session(ws: &WorkspaceId, id: &str) -> AgentSession {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     }
 }
 
@@ -247,12 +210,18 @@ async fn boot() -> Fixture {
         .insert_agent_session(&agent_session(&ws_id, agent_id.as_str()))
         .await
         .expect("seed agent");
+    // A peer top-level agent, so retiring the monitored agent is not refused
+    // as the workspace's last top-level agent.
+    store
+        .insert_agent_session(&agent_session(&ws_id, "agent-prmon-e2e-peer"))
+        .await
+        .expect("seed peer agent");
 
-    let services = Arc::new(
-        Services::new(store.clone())
+    let services = Arc::new(intent_app::compose(
+        Services::new_isolated(store.clone())
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone()),
-    );
+    ));
     let api: Arc<dyn WorkspaceApi> = services.clone();
     let tls = ensure_tls_certificate(&dir).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());
@@ -319,24 +288,27 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
 
 /// Wait for the next `events.event` notification whose `type` matches.
 async fn next_event(ws: &mut TlsWs, event_type: &str) -> Value {
-    timeout(Duration::from_secs(10), async {
-        loop {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!(event_type)
-                    {
-                        return v["params"]["event"].clone();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"] == json!(event_type)
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Message::Ping(p) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    _ => {}
                 }
-                Message::Ping(p) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
 }

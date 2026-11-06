@@ -5,17 +5,24 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod adoption;
+mod child_git;
+pub(crate) use child_git::{
+    GitlabChildCredential, GitlabChildCredentialReceipt, GitlabChildOutputGuard,
+    GitlabChildPolicyCapture, GitlabChildPolicyExpected, GitlabChildPolicyOutput,
+    GitlabChildPolicyReceipt, GitlabChildPolicyStatus,
+};
 #[cfg(not(test))]
 mod secret_reader;
 #[cfg(test)]
 pub(crate) mod secret_reader;
-pub(crate) use adoption::{logical_instance, RepositorySettingsWrite};
+pub use adoption::logical_instance;
+pub(crate) use adoption::RepositorySettingsWrite;
 pub(super) use secret_reader::GitlabSourceRead;
 pub(crate) use secret_reader::RepositoryReadEligibility;
 pub(crate) use secret_reader::RepositorySettledConnection;
 pub(crate) use secret_reader::{
-    RepositoryAttachmentState, RepositoryChildPolicyState, RepositoryConnectionFacts,
-    RepositoryDescriptorState,
+    NativeReviewObservation, RepositoryAttachmentState, RepositoryChildPolicyState,
+    RepositoryConnectionFacts, RepositoryDescriptorState,
 };
 
 use intent_sourcecontrol::gitlab_auth::{
@@ -38,6 +45,33 @@ use crate::repository_credentials::{
 pub(crate) struct GitlabCredentialGate {
     mutex: Arc<tokio::sync::Mutex<()>>,
     repository: Arc<OnceLock<Arc<RepositoryOwner>>>,
+    /// Turns between native review's own optional-metadata readers: the
+    /// consuming currency check and the background monitor observation.
+    native_review: Arc<NativeReviewGate>,
+}
+
+/// A turn is held only while its holder try-locks the ranked optional metadata
+/// locks (and, for the monitor, compares the snapshot). No holder blocks on a
+/// lock, awaits or runs a caller transfer while holding a turn, so waiting for
+/// one is bounded and cannot join a wait cycle. The gate guards no data.
+#[derive(Default)]
+pub(crate) struct NativeReviewGate {
+    busy: Mutex<bool>,
+    idle: std::sync::Condvar,
+}
+
+/// One held turn; `Send` so it can be released inside a metadata batch.
+pub(crate) struct NativeReviewTurn(Arc<NativeReviewGate>);
+
+impl Drop for NativeReviewTurn {
+    fn drop(&mut self) {
+        *self
+            .0
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.0.idle.notify_one();
+    }
 }
 
 pub(crate) struct GitlabCredentialGuard {
@@ -46,7 +80,7 @@ pub(crate) struct GitlabCredentialGuard {
 }
 
 impl GitlabCredentialGuard {
-    pub(super) fn lease(&self) -> PersistenceLease {
+    pub(crate) fn lease(&self) -> PersistenceLease {
         self.lease.clone()
     }
 }
@@ -66,7 +100,41 @@ impl GitlabCredentialGate {
         Self {
             mutex: Arc::new(tokio::sync::Mutex::new(())),
             repository: Arc::new(OnceLock::new()),
+            native_review: Arc::default(),
         }
+    }
+
+    /// Wait for the current native-review metadata reader's turn to end. Turns
+    /// are short and never wait on another lock, so this wait is bounded.
+    pub(crate) fn native_review_turn(&self) -> NativeReviewTurn {
+        let gate = &self.native_review;
+        let mut busy = gate
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *busy {
+            busy = gate
+                .idle
+                .wait(busy)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *busy = true;
+        NativeReviewTurn(gate.clone())
+    }
+
+    /// Background readers skip instead of queueing behind a consuming check.
+    pub(crate) fn try_native_review_turn(&self) -> Option<NativeReviewTurn> {
+        let gate = &self.native_review;
+        let mut busy = match gate.busy.try_lock() {
+            Ok(busy) => busy,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        if *busy {
+            return None;
+        }
+        *busy = true;
+        Some(NativeReviewTurn(gate.clone()))
     }
 
     pub(crate) async fn lock(&self) -> GitlabCredentialGuard {
@@ -165,7 +233,9 @@ impl GitlabCredentialGate {
                 publication_confirmed: kind != RepositoryMutationKind::Replace,
                 persisted: false,
                 candidate: None,
+                child_choice: ChildChoice::Pending,
             }),
+            kind,
         })
     }
 }
@@ -198,7 +268,22 @@ pub(crate) struct RepositoryWrite {
     #[cfg(test)]
     write_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     state: Mutex<WriteState>,
+    kind: RepositoryMutationKind,
 }
+/// Equality evidence for one completed operation, never account authority.
+pub(crate) struct CompletedRepositorySource {
+    owner: Arc<RepositoryOwner>,
+    fingerprint: secret_reader::SourceFingerprint,
+    config: Option<intent_core::settings_file::GitlabSettings>,
+    descriptor: Option<GitlabDescriptor>,
+}
+
+enum ChildChoice {
+    Pending,
+    Absent,
+    Known(bool),
+}
+
 struct WriteState {
     reservation: Option<RepositoryWriterReservation>,
     mutation: Option<RepositoryWriterMutation>,
@@ -207,6 +292,7 @@ struct WriteState {
     publication_confirmed: bool,
     persisted: bool,
     candidate: Option<secret_reader::SourceFingerprint>,
+    child_choice: ChildChoice,
 }
 
 impl RepositoryWrite {
@@ -252,6 +338,8 @@ impl RepositoryWrite {
             .as_ref()
             .ok_or(intent_sourcecontrol::Error::AdmissionRetired)?
             .check_current()
+            .map_err(map_owner_error)?;
+        self.prepare_child_choice(&mut state)
             .map_err(map_owner_error)
     }
 
@@ -263,6 +351,7 @@ impl RepositoryWrite {
             .lock()
             .map_err(|_| map_owner_error(RepositoryCredentialError::Indeterminate))?;
         state.disconnected = true;
+        state.child_choice = ChildChoice::Pending;
         state.publication_confirmed = true;
         Ok(())
     }
@@ -272,6 +361,105 @@ impl RepositoryWrite {
     pub(super) fn confirm_publication(&self, confirmed: bool) {
         if let Ok(mut state) = self.state.lock() {
             state.publication_confirmed = confirmed;
+            self.settle(&mut state);
+        }
+    }
+
+    pub(crate) fn native_retirement_pending(&self) -> bool {
+        !self.owner.directory.native_contexts.settled()
+            || !self.owner.evidence.native_contexts.settled()
+    }
+
+    /// Only call after the persistence worker releases its physical leases.
+    /// The original supervisor retains this write across waiter cancellation.
+    pub(crate) async fn join_native_retirement(&self) -> intent_core::Result<()> {
+        let unavailable =
+            |_| intent_core::Error::Internal("original native retirement unconfirmed".into());
+        self.owner
+            .directory
+            .native_contexts
+            .join()
+            .await
+            .map_err(unavailable)?;
+        self.owner
+            .evidence
+            .native_contexts
+            .join()
+            .await
+            .map_err(unavailable)
+    }
+
+    pub(crate) async fn completed_source(
+        &self,
+        store: intent_core::FileSecretStore,
+        lease: PersistenceLease,
+    ) -> intent_core::Result<CompletedRepositorySource> {
+        let unavailable = || {
+            intent_core::Error::Internal("original completed credential source unavailable".into())
+        };
+        let config = self
+            .owner
+            .settings
+            .get()
+            .map(|settings| {
+                settings
+                    .config
+                    .lock()
+                    .map(|config| config.clone())
+                    .map_err(|_| unavailable())
+            })
+            .transpose()?;
+        let descriptor = self
+            .owner
+            .descriptor
+            .lock()
+            .map_err(|_| unavailable())?
+            .clone();
+        let material = secret_reader::load_material(store, lease)
+            .await
+            .map_err(|_| unavailable())?;
+        Ok(CompletedRepositorySource {
+            owner: self.owner.clone(),
+            fingerprint: material.fingerprint(&self.owner.evidence),
+            config,
+            descriptor,
+        })
+    }
+
+    pub(crate) async fn check_completed_source(
+        &self,
+        original: intent_core::Result<CompletedRepositorySource>,
+        store: intent_core::FileSecretStore,
+        lease: PersistenceLease,
+    ) -> intent_core::Result<()> {
+        let checked = async {
+            let original = original?;
+            let current = self.completed_source(store, lease).await?;
+            if !Arc::ptr_eq(&original.owner, &self.owner)
+                || original.fingerprint != current.fingerprint
+                || original.config != current.config
+                || original.descriptor != current.descriptor
+            {
+                return Err(intent_core::Error::Internal(
+                    "original completed credential source changed".into(),
+                ));
+            }
+            Ok(())
+        }
+        .await;
+        if checked.is_err() {
+            if let Ok(state) = self.state.lock() {
+                if let Some(mutation) = &state.mutation {
+                    let _ = mutation.completion().indeterminate();
+                }
+            }
+            let _ = self.owner.evidence.invalidate();
+        }
+        checked
+    }
+
+    pub(crate) fn retry_native_settlement(&self) {
+        if let Ok(mut state) = self.state.lock() {
             self.settle(&mut state);
         }
     }
@@ -319,6 +507,9 @@ impl RepositoryWrite {
                     {
                         tracing::debug!(%error, "repository source evidence remains unavailable");
                     } else if let Some(settings) = self.owner.settings.get() {
+                        if let ChildChoice::Known(enabled) = state.child_choice {
+                            let _ = self.owner.directory.restore_child_policy(&binding, enabled);
+                        }
                         if let Ok(mut source) = settings.source_descriptor.lock() {
                             *source = Some(descriptor.clone());
                         }

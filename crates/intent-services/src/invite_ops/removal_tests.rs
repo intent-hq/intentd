@@ -456,7 +456,11 @@ async fn member_removal_serializes_human_queue_admission_and_preserves_automatio
         assert_eq!(queue["queue"].as_array().unwrap().len(), 1);
         assert_eq!(queue["queue"][0]["content"], "automation survives");
         assert_eq!(
-            f.store.get_agent_session(&id).await.unwrap().status,
+            f.store
+                .get_agent_session_with_transcript(&id)
+                .await
+                .unwrap()
+                .status,
             session.status
         );
         let rows = f.store.load_all_agent_queues().await.unwrap();

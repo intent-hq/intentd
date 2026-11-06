@@ -12,6 +12,17 @@ use crate::ids::WorkspaceId;
 /// whose format version it does not understand.
 pub const TRANSFER_FORMAT_VERSION: u32 = 2;
 
+/// The version written to and required in
+/// [`TransferManifest::creating_intentd_version`]. Export, the import check and
+/// every test manifest must use this one constant, because
+/// `env!("CARGO_PKG_VERSION")` expands to the version of whichever crate it
+/// appears in and crate versions can drift apart in a release. Release #2464
+/// left the intentd binary crate at 0.11.6 and the libraries at 0.11.5.
+/// The value is the library crates' shared version, which can differ from the
+/// binary's reported version while such drift lasts. Enforced by
+/// `crates/intent-core/tests/transfer_version_source_lint.rs`.
+pub const CREATING_INTENTD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Per-table row statistics for one workspace-scoped table included in a
 /// transfer (`event` is deliberately absent: event history stays on the
 /// source). `approx_bytes` is the summed byte length of every column value
@@ -94,7 +105,7 @@ pub struct TransferGitSummary {
 
 /// The versioned transfer manifest embedded in every export archive.
 /// `creating_intentd_version` is the exact daemon version that produced it
-/// (`CARGO_PKG_VERSION`); the import side rejects on mismatch (exact-match
+/// ([`CREATING_INTENTD_VERSION`]); the import side rejects on mismatch (exact-match
 /// gating, spec "Resolved Design Decisions" #5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

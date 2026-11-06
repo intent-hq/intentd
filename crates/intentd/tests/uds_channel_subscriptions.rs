@@ -6,7 +6,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,10 +53,13 @@ async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
 
 async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     let mut line = String::new();
-    let n = timeout(Duration::from_secs(2), reader.read_line(&mut line))
-        .await
-        .expect("timed out waiting for a frame")
-        .expect("read failed");
+    let n = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("timed out waiting for a frame")
+    .expect("read failed");
     assert!(n > 0, "connection closed unexpectedly");
     serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
 }
@@ -125,7 +128,7 @@ fn boot(
     let socket = sock_dir.path().join("uds.sock");
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn intent_core::WorkspaceApi> = Arc::new(
-        Services::new(bus.store().clone())
+        Services::new_isolated(bus.store().clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
             .with_event_bus(bus.clone()),
@@ -351,6 +354,223 @@ async fn comment_channel_snapshot_then_updated_delta() {
         thread["rev"].is_null(),
         "comment entities carry no rev (R3 scopes rev to Note/Task)"
     );
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// Bounded reads: the `comment.subscribe` seq-0 snapshot is the first
+/// `comment.list` page and carries `nextToken`; following it through
+/// `comment.list` serves the remaining threads.
+#[intent_test_macros::daemon_test]
+async fn comment_channel_snapshot_is_paged_with_next_token() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
+
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let n = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "note.create",
+        json!({ "workspaceId": ws_id, "title": "N", "content": "alpha beta gamma" }),
+    )
+    .await;
+    let note_id = n["note"]["id"].as_str().unwrap().to_string();
+    let mut thread_ids = Vec::new();
+    for (i, word) in ["alpha", "beta", "gamma"].into_iter().enumerate() {
+        let c = rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            20 + i64::try_from(i).unwrap(),
+            "comment.add",
+            json!({
+                "workspaceId": ws_id,
+                "noteId": note_id,
+                "searchContext": "alpha beta gamma",
+                "commentTarget": word,
+                "comment": format!("on {word}")
+            }),
+        )
+        .await;
+        thread_ids.push(c["commentId"].as_str().unwrap().to_string());
+    }
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "comment.subscribe",
+        "params": { "workspaceId": ws_id, "noteId": note_id, "limit": 2 }
+    });
+    send(&mut sub_write, &serde_json::to_string(&frame).unwrap()).await;
+    let resp = read_json(&mut sub_reader).await;
+    assert!(resp["result"]["subscriptionId"].is_string(), "{resp}");
+    let snap = read_json(&mut sub_reader).await;
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["seq"], 0);
+    let first = snap["params"]["snapshot"]
+        .as_array()
+        .expect("snapshot array")
+        .clone();
+    assert_eq!(first.len(), 2, "the snapshot is one page: {snap}");
+    let token = snap["params"]["nextToken"]
+        .as_str()
+        .expect("a paged snapshot carries nextToken")
+        .to_string();
+
+    let rest = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        30,
+        "comment.list",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "limit": 2, "nextToken": token }),
+    )
+    .await;
+    assert!(rest["nextToken"].is_null(), "the walk ends: {rest}");
+    let mut seen: Vec<String> = first
+        .iter()
+        .chain(rest["threads"].as_array().expect("threads"))
+        .map(|t| t["threadId"].as_str().unwrap().to_string())
+        .collect();
+    seen.sort();
+    thread_ids.sort();
+    assert_eq!(seen, thread_ids, "every thread served once");
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// Bounded reads: the `task.subscribe` seq-0 snapshot is the first bounded
+/// page of task notes (frame under the 512,000-byte budget) and carries
+/// `nextToken`; following it through the paged `task.list` serves every
+/// remaining task exactly once. A plain `task.list` keeps its whole-list
+/// reply.
+#[intent_test_macros::daemon_test]
+async fn task_channel_snapshot_is_paged_with_next_token() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let (socket, server, shutdown_tx, _ws_root, _sock_dir) = boot(&bus);
+
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let body = "t".repeat(60_000);
+    let mut task_ids = Vec::new();
+    for i in 0..12_i64 {
+        let n = rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            100 + i,
+            "note.create",
+            json!({ "workspaceId": ws_id, "title": format!("T{i}"), "content": body }),
+        )
+        .await;
+        let note_id = n["note"]["id"].as_str().unwrap().to_string();
+        rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            200 + i,
+            "task.markAsTask",
+            json!({ "workspaceId": ws_id, "noteId": note_id, "status": "not_started" }),
+        )
+        .await;
+        task_ids.push(note_id);
+    }
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    let frame = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "task.subscribe",
+        "params": { "workspaceId": ws_id }
+    });
+    send(&mut sub_write, &serde_json::to_string(&frame).unwrap()).await;
+    let resp = read_json(&mut sub_reader).await;
+    assert!(resp["result"]["subscriptionId"].is_string(), "{resp}");
+    let snap = read_json(&mut sub_reader).await;
+    assert_eq!(snap["params"]["kind"], "snapshot");
+    assert_eq!(snap["params"]["seq"], 0);
+    let frame_bytes = serde_json::to_string(&snap).unwrap().len();
+    assert!(
+        frame_bytes <= 512_000,
+        "snapshot frame is {frame_bytes} bytes"
+    );
+    let first = snap["params"]["snapshot"]
+        .as_array()
+        .expect("snapshot array")
+        .clone();
+    assert!(
+        !first.is_empty() && first.len() < task_ids.len(),
+        "the snapshot is one bounded page of {} rows",
+        first.len()
+    );
+    assert_eq!(first[0]["content"], body.as_str(), "rows are whole notes");
+    assert_eq!(first[0]["specLinked"], false);
+    let mut seen: Vec<String> = first
+        .iter()
+        .map(|t| t["id"].as_str().unwrap().to_string())
+        .collect();
+    let mut token = snap["params"]["nextToken"]
+        .as_str()
+        .expect("a paged snapshot carries nextToken")
+        .to_string();
+    for id in 300.. {
+        let page = rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            id,
+            "task.list",
+            json!({ "workspaceId": ws_id, "limit": 5, "nextToken": token }),
+        )
+        .await;
+        assert!(page["stats"].is_object(), "paged task.list keeps stats");
+        let rows = page["tasks"].as_array().expect("tasks");
+        assert!(rows.len() <= 5);
+        for row in rows {
+            assert_eq!(row["status"], "not_started", "WorkspaceTask rows: {row}");
+            assert_eq!(row["workspaceId"], ws_id.as_str(), "paged rows are scoped");
+            seen.push(row["id"].as_str().unwrap().to_string());
+        }
+        match page["nextToken"].as_str() {
+            Some(next) => token = next.to_string(),
+            None => break,
+        }
+    }
+    seen.sort();
+    let mut expected = task_ids.clone();
+    expected.sort();
+    assert_eq!(seen, expected, "every task served exactly once");
+
+    let whole = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        400,
+        "task.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(whole["tasks"].as_array().unwrap().len(), task_ids.len());
+    assert!(whole.get("nextToken").is_none(), "unpaged reply unchanged");
 
     let _ = shutdown_tx.send(());
     let _ = server.await;

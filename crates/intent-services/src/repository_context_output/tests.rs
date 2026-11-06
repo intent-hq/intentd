@@ -25,9 +25,12 @@ impl Hold {
         self.release.acquire().await.unwrap().forget();
     }
     pub(crate) async fn reached(&self) {
-        tokio::time::timeout(Duration::from_secs(15), self.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            crate::test_support::fixture_timeout(Duration::from_secs(15)),
+            self.entered.notified(),
+        )
+        .await
+        .unwrap();
     }
     pub(crate) fn resume(&self) {
         self.release.add_permits(1);
@@ -132,22 +135,40 @@ pub(crate) fn controlled(f: &LiveFixture, c: Arc<Control>) -> WorkspaceMcpServer
         .with_repository_guidance(&f.session, f.owner.guidance_source())
 }
 pub(crate) async fn tcp(server: WorkspaceMcpServer, code: &str) -> Value {
+    tcp_within(
+        server,
+        code,
+        crate::test_support::fixture_timeout(Duration::from_secs(15)),
+    )
+    .await
+}
+/// [`tcp`] for a 63/64 acquisition control: the served server carries the
+/// shared quota script budget and the reply is guarded against its timer.
+pub(crate) async fn quota_tcp(server: WorkspaceMcpServer, code: &str) -> Value {
+    use crate::test_support::quota_script;
+    let server = quota_script::budget(server);
+    let budget = server.workspace_api_timeout();
+    quota_script::guard(
+        "context-output-quota-tcp",
+        budget,
+        tcp_within(server, code, quota_script::QUOTA_TRANSPORT_WAIT),
+    )
+    .await
+}
+async fn tcp_within(server: WorkspaceMcpServer, code: &str, wait: Duration) -> Value {
     let bridge = intent_acp::mcp_bridge::serve_workspace_mcp_tcp(Arc::new(server))
         .await
         .unwrap();
-    let mut stream = tokio::net::TcpStream::connect(bridge.addr()).await.unwrap();
+    let mut stream = bridge.connect().await.unwrap();
     stream
         .write_all(format!("{}\n", call(code)).as_bytes())
         .await
         .unwrap();
     let mut line = String::new();
-    tokio::time::timeout(
-        Duration::from_secs(15),
-        BufReader::new(stream).read_line(&mut line),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    tokio::time::timeout(wait, BufReader::new(stream).read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
     drop(bridge);
     serde_json::from_str(&line).unwrap()
 }
@@ -252,9 +273,10 @@ async fn prompt_exchange(
             .unwrap();
         frame
     };
-    let (result, frame) = tokio::time::timeout(Duration::from_secs(15), async {
-        tokio::join!(request, peer)
-    })
+    let (result, frame) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async { tokio::join!(request, peer) },
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -370,10 +392,13 @@ async fn context_output_actual_settings_publication_order_and_origin_only_revisi
         });
         publication.reached().await;
         final_hold.resume();
-        let result = tokio::time::timeout(Duration::from_secs(15), task)
-            .await
-            .unwrap()
-            .unwrap();
+        let result = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             result.to_string().contains(FACTS),
             mode != "auth",
@@ -439,10 +464,13 @@ async fn context_output_busy_snapshot_and_optional_provider_fence_omit_without_w
         });
         held.reached().await;
         gate.resume();
-        let result = tokio::time::timeout(Duration::from_secs(15), task)
-            .await
-            .unwrap()
-            .unwrap();
+        let result = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(result.to_string().contains("ordinary-complete"), "{result}");
         assert!(!result.to_string().contains(FACTS), "{result}");
         held.release();
@@ -803,10 +831,13 @@ async fn context_output_actual_outer_settings_writers_release_metadata_before_sn
         });
         hold.reached().await;
         gate.resume();
-        let reply = tokio::time::timeout(Duration::from_secs(15), task)
-            .await
-            .unwrap()
-            .unwrap();
+        let reply = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             reply
                 .to_string()
@@ -867,7 +898,8 @@ async fn context_output_original_missing_settings_attachment_omits_after_late_in
     .unwrap();
     let owner = RepositoryContextOwner::bind(
         service.clone(),
-        RepositoryReadOwner::capture(service.clone()),
+        RepositoryReadOwner::capture(service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &physical,
     )
     .unwrap();
@@ -896,6 +928,104 @@ async fn context_output_original_missing_settings_attachment_omits_after_late_in
     assert!(!packet.to_string().contains(FACTS));
     assert!(packet.to_string().contains("original user prompt"));
     owner.drain_jobs().await;
+}
+
+/// A plain-folder workspace (§5.1) gets no per-prompt repository guidance
+/// or facts envelope on the latest harness, while a git workspace on the
+/// same daemon keeps it.
+#[intent_test_macros::daemon_test]
+async fn context_output_plain_folder_session_prepares_no_guidance() {
+    use crate::repository_admission::lifecycle::physical_owner::{
+        RepositoryCreationIntent, RepositoryCreationOwner,
+    };
+    use crate::repository_admission::read_request::RepositoryReadOwner;
+    use crate::repository_admission_source_tests::fixtures::Fixture as GitFixture;
+    let git = GitFixture::new().await;
+    git.git(
+        &git.path,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/team/plain.git",
+        ],
+    );
+    let registry = Arc::new(
+        crate::SettingsRegistry::load(git.dir.path().join("context-settings.toml")).unwrap(),
+    );
+    let service = Arc::new(
+        crate::Services::new_repository_fixture(
+            git.store.clone(),
+            intent_core::FileSecretStore::with_path(git.dir.path().join("context-secrets.json")),
+            None,
+        )
+        .with_settings_registry(registry)
+        .with_workspaces_root(git.dir.path().join("workspaces")),
+    );
+    let folder = git.dir.path().join("plain-notes");
+    std::fs::create_dir_all(&folder).unwrap();
+    let folder = folder.to_string_lossy().into_owned();
+    let plain = intent_core::Workspace {
+        id: intent_core::WorkspaceId::from("ws-plain-guidance"),
+        title: "Notes".into(),
+        branch: String::new(),
+        path: Some(folder.clone()),
+        repository_path: Some(folder),
+        worktree_path: None,
+        plain_folder: true,
+        created_at: git.workspace.created_at.clone(),
+        updated_at: git.workspace.updated_at.clone(),
+        ..Default::default()
+    };
+    service.store.insert_workspace(&plain).await.unwrap();
+    let lifecycle = service.repository_lifecycle_registry().await.unwrap();
+    for (workspace_id, expect_guidance) in [(git.workspace.id.clone(), true), (plain.id, false)] {
+        let session: intent_core::AgentSession = serde_json::from_value(serde_json::json!({
+            "id": intent_core::AgentId::new(),
+            "workspaceId": workspace_id,
+            "name": "plain-folder-guidance",
+            "status": "active",
+            "harnessVersion": intent_core::CURRENT_HARNESS_VERSION,
+            "createdAt": "2026-11-01T00:00:00Z",
+            "updatedAt": "2026-11-01T00:00:00Z"
+        }))
+        .unwrap();
+        service.store.insert_agent_session(&session).await.unwrap();
+        let physical = RepositoryCreationOwner::allocate(
+            &lifecycle,
+            &service.store,
+            session.workspace_id.clone(),
+            session.id.clone(),
+            RepositoryCreationIntent::FirstSet,
+        )
+        .unwrap()
+        .initialize(&service.store, || async {
+            Ok("scripted ACP initialization".into())
+        })
+        .await
+        .unwrap();
+        let owner = RepositoryContextOwner::bind(
+            service.clone(),
+            RepositoryReadOwner::capture(service.clone())
+                .map(RepositoryReadOwner::with_review_monitoring),
+            &physical,
+        )
+        .unwrap();
+        let caller = Caller::Agent {
+            agent_id: session.id.clone(),
+        };
+        let guidance = intent_core::with_caller(caller, async {
+            owner.capture_prompt().unwrap().prepare().await
+        })
+        .await;
+        assert_eq!(
+            guidance.is_some(),
+            expect_guidance,
+            "{}",
+            session.workspace_id.as_str()
+        );
+        owner.drain_jobs().await;
+    }
 }
 
 #[intent_test_macros::daemon_test]
@@ -1005,10 +1135,13 @@ async fn context_output_shared_provider_poison_refuses_required_but_omits_option
         .join()
         .is_err());
         gate.resume();
-        let reply = tokio::time::timeout(Duration::from_secs(15), task)
-            .await
-            .unwrap()
-            .unwrap();
+        let reply = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(!reply.to_string().contains(FACTS));
         if required {
             assert!(
@@ -1061,19 +1194,25 @@ async fn context_output_mixed_original_worktree_locks_omit_only_optional_and_kee
         held.reached().await;
         final_gate.resume();
         if mode == "optional-busy" {
-            let reply = tokio::time::timeout(Duration::from_secs(15), &mut task)
-                .await
-                .unwrap()
-                .unwrap();
+            let reply = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(15)),
+                &mut task,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert!(reply.to_string().contains("mixed-lock-result"), "{reply}");
             assert!(!reply.to_string().contains(FACTS));
             held.resume();
             holder.await.unwrap();
         } else {
             assert!(
-                tokio::time::timeout(Duration::from_millis(80), &mut task)
-                    .await
-                    .is_err(),
+                tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_millis(80)),
+                    &mut task
+                )
+                .await
+                .is_err(),
                 "shared required lock cannot be bypassed"
             );
             if mode == "shared-retired" {
@@ -1081,10 +1220,13 @@ async fn context_output_mixed_original_worktree_locks_omit_only_optional_and_kee
             }
             held.resume();
             holder.await.unwrap();
-            let reply = tokio::time::timeout(Duration::from_secs(15), task)
-                .await
-                .unwrap()
-                .unwrap();
+            let reply = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(15)),
+                task,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             if mode == "shared-retired" {
                 assert!(
                     reply
@@ -1106,7 +1248,7 @@ async fn manager_prompt_worker<T: Send + 'static>(
     services: Arc<crate::Services>,
     body: impl std::future::Future<Output = T> + Send + 'static,
 ) -> T {
-    intent_core::spawn_daemon(crate::host_execution::background_execution(
+    intent_core::spawn_daemon(crate::execution_call::background_execution(
         services.as_ref().clone(),
         None,
         body,
@@ -1473,5 +1615,140 @@ async fn manager_prompt_output_final_construction_poll_and_consumed_packet_never
         .await;
         f.owner.drain_jobs().await;
         assert_eq!(http.count(), 0);
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn monitor_guidance_current_context_continuation_preserves_saved_session() {
+    fn delivered_targets(reply: &Value) -> Vec<Value> {
+        let texts = reply["result"]["content"].as_array().unwrap();
+        let guidance: Vec<_> = texts
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .filter_map(|text| text.split_once(FACTS).map(|(_, facts)| facts))
+            .collect();
+        assert_eq!(
+            guidance.len(),
+            1,
+            "one delivered repository context: {reply}"
+        );
+        guidance[0]
+            .lines()
+            .filter(|line| line.starts_with('{'))
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter_map(|row| row["targets"].as_array().cloned())
+            .flatten()
+            .collect()
+    }
+    for version in intent_core::REPOSITORY_GUIDANCE_HARNESS_VERSIONS
+        .iter()
+        .copied()
+    {
+        let http = ReadServer::new().await;
+        let f = LiveFixture::with_version(&http, version).await;
+        let store = &f.base.auth.service.store;
+        let original = store
+            .get_agent_session_with_transcript(&f.session.id)
+            .await
+            .unwrap();
+        let first = tcp(f.server(), "return 41;").await;
+        let first_targets = delivered_targets(&first);
+        assert_eq!(first_targets.len(), 1);
+        let original_target = &first_targets[0];
+        assert_eq!(
+            original_target["target"],
+            serde_json::json!({
+                "provider":"gitlab",
+                "instanceBaseUrl":http.fixture.descriptor.instance().as_str(),
+                "projectPath":"group/project"
+            })
+        );
+        assert_eq!(original_target["availability"], "connected");
+        assert!(original_target["connection"].is_object());
+        for operation in ["read-review", "read-issue"] {
+            let capabilities: Vec<_> = original_target["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|capability| capability["operation"] == operation)
+                .collect();
+            assert_eq!(
+                capabilities,
+                vec![&serde_json::json!({"operation":operation,"state":"unknown"})]
+            );
+        }
+        let first_text = first.to_string();
+        assert!(first_text.contains("group/project"), "{first}");
+        assert_eq!(
+            first_text.contains("Qualified monitoring is prepared but production-disabled"),
+            intent_core::harness_uses_repository_monitor_guidance(version)
+        );
+        f.base.git.git(
+            &f.base.git.path,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/team/continued.git",
+            ],
+        );
+        let next = tcp(f.server(), "return 42;").await;
+        let next_text = next.to_string();
+        assert!(next_text.contains("team/continued"), "{next}");
+        assert!(!next_text.contains("group/project"), "{next}");
+        let next_targets = delivered_targets(&next);
+        assert_eq!(next_targets.len(), 1);
+        let continued_target = &next_targets[0];
+        assert_eq!(
+            continued_target["target"],
+            serde_json::json!({
+                "provider":"github",
+                "instanceBaseUrl":"https://github.com",
+                "projectPath":"team/continued"
+            })
+        );
+        assert_eq!(continued_target["availability"], "unknown");
+        assert!(continued_target.get("connection").is_none());
+        let expected_capabilities: Vec<_> = [
+            "read-review",
+            "read-issue",
+            "create-review",
+            "clone",
+            "fetch",
+            "push",
+        ]
+        .into_iter()
+        .map(|operation| serde_json::json!({"operation":operation,"state":"unknown"}))
+        .collect();
+        assert_eq!(
+            continued_target["capabilities"],
+            serde_json::json!(expected_capabilities)
+        );
+        assert_eq!(
+            next_text.contains(
+                "Existing watches and restored history keep their original target and account"
+            ),
+            intent_core::harness_uses_repository_monitor_guidance(version)
+        );
+        let caller = Caller::Agent {
+            agent_id: f.session.id.clone(),
+        };
+        let capture = f.prompt_capture().await;
+        let continuation = intent_core::with_caller(caller.clone(), capture.prepare()).await;
+        assert!(continuation.is_some());
+        let (frame, ok) =
+            intent_core::with_caller(caller, prompt_exchange(continuation, false)).await;
+        assert!(ok);
+        assert!(frame.to_string().contains("team/continued"));
+        assert!(!frame.to_string().contains("group/project"));
+        let saved = store
+            .get_agent_session_with_transcript(&f.session.id)
+            .await
+            .unwrap();
+        assert_eq!(saved.harness_version, original.harness_version);
+        assert_eq!(saved.harness_features, original.harness_features);
+        assert_eq!(saved.acp_session_id, original.acp_session_id);
+        assert_eq!(http.count(), 0, "context guidance does not poll the forge");
+        f.owner.drain_jobs().await;
     }
 }

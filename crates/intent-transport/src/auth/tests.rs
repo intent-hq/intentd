@@ -55,6 +55,44 @@ impl TokenStore for BlockingTokenStore {
     }
 }
 
+/// A `TokenStore` whose `load_token` blocks until the test opens the gate,
+/// then returns a token. A caller that sees `None` while the gate is still
+/// shut was answered by the wrapper's timeout, not by the store — proof
+/// with no clock.
+#[derive(Default)]
+struct GatedTokenStore {
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+impl GatedTokenStore {
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+impl TokenStore for GatedTokenStore {
+    fn load_token(&self) -> Option<String> {
+        let open = self.open.lock().unwrap();
+        drop(self.opened.wait_while(open, |open| !*open).unwrap());
+        Some("late-token".to_string())
+    }
+    fn store_token(&self, _token: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Opens the gate on drop, so a failing test never leaves the blocking-pool
+/// thread parked past the runtime's shutdown.
+struct OpenOnDrop(Arc<GatedTokenStore>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
 /// A `TokenStore` whose `load_token` waits on a barrier so tests can hold
 /// ONE call in flight while probing generation-guard semantics.
 struct BarrierTokenStore {
@@ -514,9 +552,15 @@ fn origin_rejects_empty_authority_and_missing_scheme() {
 
 /// A wedged keychain: `load_token` returns `None` within the timeout and the
 /// caller sees an unset token instead of hanging forever.
+///
+/// The keychain stays wedged until the load has returned, so a `None` can
+/// only come from the wrapper's timeout; a wrapper that waited for the store
+/// would hang into the hang guard instead of passing slowly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn load_token_returns_none_on_timeout() {
-    let inner: Arc<dyn TokenStore> = Arc::new(BlockingTokenStore::default());
+    let gated = Arc::new(GatedTokenStore::default());
+    let _open = OpenOnDrop(gated.clone());
+    let inner: Arc<dyn TokenStore> = gated.clone();
     let store = AsyncTokenStore::with_timings(
         inner,
         Duration::from_millis(50),
@@ -524,14 +568,13 @@ async fn load_token_returns_none_on_timeout() {
         Duration::from_secs(60),
         Duration::from_secs(60),
     );
-    let start = Instant::now();
-    let v = store.load_token().await;
-    let elapsed = start.elapsed();
+    let v = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        store.load_token(),
+    )
+    .await
+    .expect("load must not wait for a wedged keychain");
     assert!(v.is_none(), "wedged keychain must resolve to None");
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "load must return within its deadline, took {elapsed:?}"
-    );
 }
 
 /// Concurrent callers share the single in-flight keychain call — a wedged
@@ -648,7 +691,11 @@ async fn imported_owner_credential_late_write_keeps_fence_after_timeout_or_cance
             self.entered.notify_one();
             let (lock, cv) = &self.release;
             let (_released, timeout) = cv
-                .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(10), |v| !*v)
+                .wait_timeout_while(
+                    lock.lock().unwrap(),
+                    intentd_test_support::test_timeout(Duration::from_secs(10)),
+                    |v| !*v,
+                )
                 .unwrap();
             assert!(!timeout.timed_out());
             *self.token.lock().unwrap() = Some(token.to_owned());
@@ -680,9 +727,12 @@ async fn imported_owner_credential_late_write_keeps_fence_after_timeout_or_cance
             let new = new.clone();
             async move { store.store_token(&new).await }
         });
-        tokio::time::timeout(Duration::from_secs(5), backing.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            backing.entered.notified(),
+        )
+        .await
+        .unwrap();
         if cancel {
             writer.abort();
             assert!(writer.await.unwrap_err().is_cancelled());
@@ -737,7 +787,11 @@ async fn imported_owner_credential_wait_is_bounded_by_load_timeout() {
         token,
     };
     let writer = store.admission.write().await;
-    let result = tokio::time::timeout(Duration::from_millis(500), authority.authorize()).await;
+    let result = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        authority.authorize(),
+    )
+    .await;
     drop(writer);
     assert!(
         matches!(result, Ok(Err(_))),
@@ -764,7 +818,7 @@ async fn imported_owner_credential_write_wait_is_bounded_by_write_timeout() {
     };
     let lease = authority.authorize().await.unwrap();
     let result = tokio::time::timeout(
-        Duration::from_millis(500),
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
         store.store_token(&"cd".repeat(32)),
     )
     .await;
@@ -825,9 +879,12 @@ async fn exercise_writer_ready_after_wait(elapsed: Duration, expired: bool) {
     };
     // A wrongly admitted blocking write owns the lock until publication. Wait
     // for that precise boundary before inspecting its effects, without sleeps.
-    let idle = timeout(Duration::from_secs(5), store.admission.write())
-        .await
-        .unwrap();
+    let idle = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        store.admission.write(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         backing.writes.load(Ordering::SeqCst),
         usize::from(!expired),

@@ -11,7 +11,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -49,7 +49,7 @@ async fn boot() -> Fixture {
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.path().join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_workspaces_root(workspaces_root)
         .with_event_bus(bus.clone());
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
@@ -98,6 +98,7 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
     .expect("response timeout")
 }
 
+#[track_caller]
 fn run_git(args: &[&str], dir: &Path) {
     let out = std::process::Command::new("git")
         .args(args)
@@ -129,7 +130,8 @@ fn seed_repo(tag: &str) -> tempfile::TempDir {
 /// `secs` of quiet, whichever comes first.
 async fn drain_progress_events(ws: &mut PlainWs, progress_id: &str, secs: u64) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -354,7 +356,8 @@ async fn workspace_create_without_progress_id_stays_silent_over_wss() {
 
     // Give any (erroneous) frames a moment to arrive, then assert silence.
     let mut leaked: Vec<Value> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {

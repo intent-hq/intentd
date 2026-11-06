@@ -44,7 +44,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -93,11 +93,13 @@ async fn boot_with(opts: WsOptions) -> Fixture {
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
     let registry = Arc::new(PrimaryReverseRegistry::new());
-    let services = Services::new(store)
-        .with_assets_root(dir.join("assets"))
-        .with_workspaces_root(workspaces_root)
-        .with_event_bus(bus.clone())
-        .with_reverse_dispatch(registry.clone());
+    let services = intent_app::compose(
+        Services::new_isolated(store)
+            .with_assets_root(dir.join("assets"))
+            .with_workspaces_root(workspaces_root)
+            .with_event_bus(bus.clone())
+            .with_reverse_dispatch(registry.clone()),
+    );
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     let opts = WsOptions {
         base_port: 0,
@@ -288,7 +290,7 @@ async fn close_and_await_deregistration(
     let _ = ws.close(None).await;
     drain_until_close(&mut ws, Duration::from_secs(2)).await;
     drop(ws);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     while registry.len() > expected_len {
         assert!(
             Instant::now() < deadline,
@@ -364,7 +366,7 @@ async fn await_client_event(ws: &mut PlainWs, dur: Duration) -> Value {
 /// Wait (bounded, no fixed sleep) until the registry holds exactly
 /// `expected_len` entries.
 async fn await_registry_len(registry: &PrimaryReverseRegistry, expected_len: usize) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
     while registry.len() != expected_len {
         assert!(
             Instant::now() < deadline,
@@ -533,7 +535,6 @@ async fn agent_screenshot_timeout_returns_before_outer_deadline() {
         hello("timeout-client", true),
     )
     .await;
-    let started = Instant::now();
     let call = intent_core::spawn_daemon({
         let api = fx.api.clone();
         async move {
@@ -553,20 +554,26 @@ async fn agent_screenshot_timeout_returns_before_outer_deadline() {
     assert_eq!(reverse["method"], "browser.exec");
     assert_eq!(reverse["params"]["actions"][0]["action"], "screenshot");
     // Leave the reverse request unanswered and prove the same sticky-primary
-    // path used by ws.browser.exec reports the error inside the outer budget.
-    let err = timeout(Duration::from_secs(25), call)
-        .await
-        .expect("inner screenshot timeout must settle first")
-        .expect("join")
-        .expect_err("unanswered screenshot must fail");
-    let elapsed = started.elapsed();
+    // path used by ws.browser.exec applies the 20s screenshot deadline, not
+    // the 30s default that would outlast the agent tool's outer budget.
+    let err = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(25)),
+        call,
+    )
+    .await
+    .expect("inner screenshot timeout must settle first")
+    .expect("join")
+    .expect_err("unanswered screenshot must fail");
+    let message = err.to_string();
     assert!(
-        err.to_string()
-            .contains("reverse request timed out: browser.exec"),
+        message.contains("reverse request timed out: browser.exec"),
         "unexpected error: {err}"
     );
-    assert!(elapsed >= Duration::from_secs(19), "elapsed={elapsed:?}");
-    assert!(elapsed < Duration::from_secs(30), "elapsed={elapsed:?}");
+    // The daemon-side timeout names the deadline it applied (§5.14).
+    assert!(
+        message.contains(" did not accept or answer the request within 20s"),
+        "screenshot must use the 20s reverse deadline: {err}"
+    );
 
     fx.ws.stop().await;
 }

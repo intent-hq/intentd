@@ -23,14 +23,14 @@ fn write_specialist(dir: &Path, id: &str, frontmatter: &str) {
     .expect("write specialist");
 }
 
-fn set(svc: &Services, path: &str, value: Value) {
+pub(super) fn set(svc: &Services, path: &str, value: Value) {
     svc.settings_registry()
         .expect("registry")
         .apply(&[(path.into(), value)])
         .expect("setting");
 }
 
-async fn setup() -> (TempDb, Services, WorkspaceId) {
+pub(super) async fn setup() -> (TempDb, Services, WorkspaceId) {
     let tmp = TempDb::new();
     let root = tmp.path.parent().unwrap();
     let store = Store::open(&tmp.path).await.expect("store");
@@ -45,7 +45,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId) {
         "pinned",
         "codingAgent: auggie\nmodel: pinned-model\naliases: [\"pin-alias\"]\nreasoningEffort: low\nmodelOptions: [{\"provider\":\"auggie\",\"model\":\"pinned-model\",\"reasoningEffort\":\"high\"}]\n",
     );
-    let svc = Services::new(store)
+    let svc = Services::new_isolated(store)
         .with_settings_registry(Arc::new(
             crate::SettingsRegistry::load(root.join("config.toml")).expect("registry"),
         ))
@@ -97,7 +97,7 @@ async fn create(
 async fn assert_pinned(svc: &Services, id: &str) {
     let session = svc
         .store()
-        .get_agent_session(&AgentId::from(id))
+        .get_agent_session_with_transcript(&AgentId::from(id))
         .await
         .expect("persisted session");
     assert_eq!(session.provider.as_deref(), Some("auggie"));
@@ -230,13 +230,17 @@ async fn specialist_provider_wake_create_preserves_explicit_choices() {
             .expect("wake creates with explicit choices");
         let session = svc
             .store()
-            .get_agent_session(&AgentId::from(result["agentId"].as_str().unwrap()))
+            .get_agent_session_with_transcript(&AgentId::from(result["agentId"].as_str().unwrap()))
             .await
             .expect("persisted session");
         let use_pin = provider.is_none() && model.is_none();
         assert_eq!(
             session.provider.as_deref(),
-            if use_pin { Some("auggie") } else { provider }
+            if use_pin {
+                Some("auggie")
+            } else {
+                provider.or(Some("grok"))
+            }
         );
         assert_eq!(
             session.model.as_deref(),
@@ -346,8 +350,8 @@ async fn specialist_provider_explicit_choices_and_effort_stay_authoritative() {
         let agent = &created["agent"];
         assert_eq!(
             agent["provider"].as_str(),
-            provider,
-            "explicit model alone retains default-provider behavior"
+            provider.or(Some("grok")),
+            "explicit model alone resolves on the default provider, pinned on the row"
         );
         assert_eq!(agent["model"], "default-model");
         assert_eq!(agent["reasoningEffort"], "high");
@@ -430,7 +434,9 @@ async fn specialist_provider_uses_merged_tiers_and_preserves_an_explicit_clear()
 
     write_specialist(&user, "pinned", "codingAgent: \"\"\nmodel: \"\"\n");
     let unpinned = create(&svc, &ws, None, AgentCreateExtra::default()).await;
-    assert!(unpinned["agent"]["provider"].is_null());
+    // An unpinned specialist resolves on the settings default, which the
+    // create pins on the row (never inherited from a later default change).
+    assert_eq!(unpinned["agent"]["provider"], "grok");
     assert_eq!(unpinned["agent"]["model"], "default-model");
     assert_eq!(unpinned["agent"]["reasoningEffort"], "low");
     let preview = svc
@@ -462,7 +468,12 @@ async fn specialist_provider_invalid_pins_leave_no_creation_side_effects() {
         );
         set(&svc, "providers.enabled", json!({"auggie": false}));
         let sessions = svc.store().list_all_agent_sessions().await.unwrap().len();
-        let workspaces = svc.store().list_workspaces(true).await.unwrap().len();
+        let workspaces = svc
+            .store()
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .len();
         let notes = svc.store().list_all_notes().await.unwrap().len();
         let events = svc
             .store()
@@ -524,7 +535,11 @@ async fn specialist_provider_invalid_pins_leave_no_creation_side_effects() {
             sessions
         );
         assert_eq!(
-            svc.store().list_workspaces(true).await.unwrap().len(),
+            svc.store()
+                .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .unwrap()
+                .len(),
             workspaces
         );
         assert_eq!(svc.store().list_all_notes().await.unwrap().len(), notes);
@@ -557,7 +572,8 @@ async fn specialist_provider_invalid_pins_leave_no_creation_side_effects() {
             AgentCreateExtra::default(),
         )
         .await;
-        assert!(model_only["agent"]["provider"].is_null());
+        // Model-only creates resolve on the settings default and pin it.
+        assert_eq!(model_only["agent"]["provider"], "grok");
     }
 }
 

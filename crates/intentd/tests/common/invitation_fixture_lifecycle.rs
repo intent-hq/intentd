@@ -29,18 +29,24 @@ async fn assert_fixture_teardown(teardown: impl FnOnce(Daemon)) {
     drop(command);
     let daemon = Daemon { child };
     let mut ready = [0; 5];
-    tokio::time::timeout(Duration::from_secs(3), reader.read_exact(&mut ready))
-        .await
-        .expect("descendant readiness deadline")
-        .expect("descendant readiness");
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        reader.read_exact(&mut ready),
+    )
+    .await
+    .expect("descendant readiness deadline")
+    .expect("descendant readiness");
     assert_eq!(&ready, b"ready");
     teardown(daemon);
     reader.shutdown().await.expect("close unused write half");
     let mut remaining = Vec::new();
-    tokio::time::timeout(Duration::from_secs(3), reader.read_to_end(&mut remaining))
-        .await
-        .expect("fixture descendant still holds stdout after daemon teardown")
-        .expect("read fixture EOF");
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        reader.read_to_end(&mut remaining),
+    )
+    .await
+    .expect("fixture descendant still holds stdout after daemon teardown")
+    .expect("read fixture EOF");
     assert!(remaining.is_empty());
 }
 

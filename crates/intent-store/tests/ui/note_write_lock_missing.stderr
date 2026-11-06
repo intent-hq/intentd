@@ -1,0 +1,15 @@
+error[E0061]: this method takes 5 arguments but 4 arguments were supplied
+ --> tests/ui/note_write_lock_missing.rs:8:10
+  |
+8 |         .update_note_with_version(note, None, &author, "2026-01-01T00:00:00Z")
+  |          ^^^^^^^^^^^^^^^^^^^^^^^^ ---- argument #1 of type `&NoteWriteLock` is missing
+  |
+note: method defined here
+ --> src/note_version_repo.rs
+  |
+  |     pub async fn update_note_with_version(
+  |                  ^^^^^^^^^^^^^^^^^^^^^^^^
+help: provide the argument
+  |
+8 |         .update_note_with_version(/* &NoteWriteLock */, note, None, &author, "2026-01-01T00:00:00Z")
+  |                                   +++++++++++++++++++++

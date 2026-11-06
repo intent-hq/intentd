@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use git2::{Commit, Oid, Patch, Repository, Sort};
+use git2::{Commit, Oid, Patch, Repository};
 use intent_core::{iso_from_unix_secs, Error, Result};
 
 use crate::status::current_branch;
@@ -79,7 +79,14 @@ pub fn history_since(
         }
     }
     walk.simplify_first_parent().map_err(map_git_err)?;
-    walk.set_sorting(Sort::TIME).map_err(map_git_err)?;
+    // Deliberately unsorted (#7392). Any libgit2 sort mode makes the revwalk
+    // "limited": before yielding the first commit it walks every commit it can
+    // reach, so with no hidden base a 10-commit page read the whole
+    // first-parent chain (seconds on a ~1M-commit repository). The unsorted
+    // walk adds parents lazily, so the cost is bounded by the commits taken.
+    // A first-parent walk from one tip is a single chain, so the unsorted
+    // order is parent order — what `git log --first-parent` prints, and what
+    // `PushedCheck` relies on — even when committer clocks are skewed.
 
     let timing_enabled = tracing::enabled!(tracing::Level::DEBUG);
     let mut diff_elapsed = Duration::ZERO;
@@ -497,7 +504,7 @@ fn history_bounded_from_repo(
     }
 
     walk.simplify_first_parent().map_err(map_git_err)?;
-    walk.set_sorting(Sort::TIME).map_err(map_git_err)?;
+    // Unsorted on purpose; see the note in `history_since` (#7392).
 
     let timing_enabled = tracing::enabled!(tracing::Level::DEBUG);
     let mut diff_elapsed = Duration::ZERO;
@@ -705,8 +712,8 @@ mod tests {
         .unwrap();
     }
 
-    /// Like `commit_file` but with an explicit commit timestamp, so `Sort::TIME`
-    /// walks return a deterministic newest-first order (same-second commits tie).
+    /// Like `commit_file` but with an explicit commit timestamp, for tests that
+    /// need distinct (or deliberately skewed) commit times.
     fn commit_file_at(worktree: &Path, rel: &str, contents: &str, unix_secs: i64) {
         crate::testutil::write_file(worktree, rel, contents);
         let repo = Repository::open(worktree).unwrap();
@@ -902,6 +909,85 @@ mod tests {
         let mut none = PushedCheck::new(None);
         assert!(!none.check(&repo, tip));
         assert!(!none.check(&repo, tip));
+    }
+
+    /// Delete the loose object for `oid`, so any walk that reaches it fails.
+    fn delete_loose_object(worktree: &Path, oid: Oid) {
+        let hex = oid.to_string();
+        let path = worktree
+            .join(".git/objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Build `n` commits on top of a root commit whose object is then removed,
+    /// returning the newest-first hashes of the `n` surviving commits. A walk
+    /// that visits history beyond the page it returns reaches the missing
+    /// root and errors, so this bounds the work without timing (#7392).
+    fn deep_chain_with_missing_root(name: &str, n: i64) -> (crate::testutil::TempDir, Vec<String>) {
+        let dir = init_repo(name);
+        commit_file_at(dir.path(), "root.txt", "root\n", T0);
+        let repo = Repository::open(dir.path()).unwrap();
+        let root = repo.head().unwrap().target().unwrap();
+        let mut hashes = Vec::new();
+        for i in 0..n {
+            commit_file_at(dir.path(), "churn.txt", &format!("rev {i}\n"), T0 + 1 + i);
+            hashes.push(repo.head().unwrap().target().unwrap().to_string());
+        }
+        hashes.reverse();
+        delete_loose_object(dir.path(), root);
+        (dir, hashes)
+    }
+
+    #[test]
+    fn history_since_page_does_not_walk_whole_history() {
+        let (dir, hashes) = deep_chain_with_missing_root("history-bounded-work", 30);
+        let page = history_since(dir.path(), None, 10, false).unwrap();
+        let got: Vec<_> = page.iter().map(|c| c.hash.clone()).collect();
+        assert_eq!(got, hashes[..10]);
+        let with_files = history_since(dir.path(), None, 10, true).unwrap();
+        assert_eq!(with_files.len(), 10);
+    }
+
+    #[test]
+    fn history_bounded_page_does_not_walk_whole_history() {
+        let (dir, hashes) = deep_chain_with_missing_root("history-bounded-older-work", 30);
+        let page = history_bounded(dir.path(), None, 10, false, false).unwrap();
+        let got: Vec<_> = page.iter().map(|c| c.hash.clone()).collect();
+        assert_eq!(got, hashes[..10]);
+        // "Show previous" pushes the boundary instead of HEAD; it must stay
+        // bounded by the page as well.
+        let older = history_bounded(dir.path(), Some(&hashes[5]), 10, true, false).unwrap();
+        let got: Vec<_> = older.iter().map(|c| c.hash.clone()).collect();
+        assert_eq!(got, hashes[5..15]);
+    }
+
+    #[test]
+    fn history_follows_first_parent_chain_despite_clock_skew() {
+        // A committer clock that runs backwards must not reorder the chain:
+        // `git log --first-parent` lists it in parent order.
+        let dir = init_repo("history-clock-skew");
+        commit_file_at(dir.path(), "a.txt", "a\n", T0 + 100);
+        commit_file_at(dir.path(), "b.txt", "b\n", T0);
+        commit_file_at(dir.path(), "c.txt", "c\n", T0 + 50);
+        let out = Command::new("git")
+            .current_dir(dir.path())
+            .args(["log", "--first-parent", "--no-merges", "--format=%H"])
+            .output()
+            .unwrap();
+        let expected: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(expected.len(), 3);
+        let got: Vec<_> = history(dir.path(), 50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.hash)
+            .collect();
+        assert_eq!(got, expected);
     }
 
     #[test]

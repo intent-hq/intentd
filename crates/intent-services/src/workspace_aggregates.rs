@@ -267,11 +267,14 @@ mod tests {
         let cache = Arc::new(WorkspaceAggregateCache::new());
         let gate = cache.cow_probe_gate.lock().await;
         cache.prewarm_cow_supported(root.clone());
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !cache.cow_in_flight.lock().unwrap().contains_key(&root) {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            async {
+                while !cache.cow_in_flight.lock().unwrap().contains_key(&root) {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("prewarm should enter shared flight");
         let waiter_cache = Arc::clone(&cache);

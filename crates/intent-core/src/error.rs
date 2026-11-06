@@ -8,12 +8,6 @@
 /// Domain error type for intentd.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Bounded cancellable deletion control failure.
-    #[error("{}", .0.wire_code())]
-    NoteDelete(crate::note_delete::NoteDeleteError),
-    /// Bounded note page failure; never carries source content.
-    #[error("{}", .0.wire_code())]
-    NotePage(crate::note_page::NotePageError),
     /// Safe member recovery for a classified execution authorization error.
     /// The source preserves the owner's established error contract internally.
     #[error("{}", authorization.message())]
@@ -37,6 +31,60 @@ pub enum Error {
     /// A requested entity does not exist.
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// The workspace is retired (§5.1 `workspace.retire`): its checkout
+    /// folder was deleted, so a call that needs disk state (file write,
+    /// script start, terminal, git ops, commit) is refused. Surfaces as
+    /// `-32602` with machine-readable
+    /// `error.data = { code: "workspace-retired", workspaceId }`.
+    #[error("workspace {workspace_id} is retired; its folder on disk was deleted")]
+    WorkspaceRetired { workspace_id: String },
+
+    /// `workspace.retire` on a workspace whose folder is not a daemon-owned
+    /// git worktree (§5.1): a `cow` / `direct` checkout (the folder IS the
+    /// repository, so deleting it loses the branch), a `skipIsolation`
+    /// workspace (the folder is the user's repository), a remote workspace,
+    /// or one without a checkout. Nothing is changed. Surfaces as `-32602`
+    /// with `error.data = { code: "retire-unsupported", checkoutMode? }`.
+    /// A plain-folder workspace (`plain_folder: true`, §5.1 "Plain-folder
+    /// workspaces") adds `plainFolder: true` and the message
+    /// `workspace.retire is not available in plain-folder workspaces`.
+    /// Kept small (no owned reason string) so [`Error`] does not grow.
+    #[error("{}", retire_unsupported_message(workspace_id, *plain_folder))]
+    RetireUnsupported {
+        workspace_id: String,
+        checkout_mode: Option<crate::model::CheckoutMode>,
+        plain_folder: bool,
+    },
+
+    /// An operation that needs git or a forge, called for a plain-folder
+    /// workspace (§5.1 "Plain-folder workspaces"), e.g. `workspace.duplicate`.
+    /// Nothing is changed. Surfaces as `-32602` with `error.data = { code:
+    /// "plain-folder-unsupported", operation }`.
+    #[error("{operation} is not available in plain-folder workspaces")]
+    PlainFolderUnsupported { operation: &'static str },
+
+    /// A `workspace.create { plainFolder: true }` request-shape rejection
+    /// (§5.1 "Plain-folder workspaces"): a git-only option, a pr-kind
+    /// context link, or a missing `repositoryPath`. Same `-32602` and message
+    /// shape as [`Error::InvalidParams`], plus the documented
+    /// `error.data = { code: "invalid-params" }`.
+    #[error("invalid params: {0}")]
+    PlainFolderInvalidParams(String),
+
+    /// `workspace.create { plainFolder: true }` named a path that cannot hold
+    /// a plain folder (§5.1). Raised before any side effect. Surfaces as
+    /// `-32602` with `error.data = { code: "plain-folder-path-rejected",
+    /// reason, path, repositoryRoot? }`. Boxed to keep [`Error`] small.
+    #[error("{}", .0.message())]
+    PlainFolderPathRejected(Box<PlainFolderPathRejection>),
+
+    /// A §5.56 secret-request call failed for a typed reason
+    /// (`secret-request-unknown`, `invalid-params`, `secret-unavailable`).
+    /// Surfaces as `-32602` with `error.data = { code }`. The message names
+    /// the request or secret only — it never carries a secret value.
+    #[error("{message}")]
+    SecretRequest { code: &'static str, message: String },
 
     /// libgit2 classified an authentication failure. Legacy wire rendering
     /// matches Internal; shared execution may attach safe recovery.
@@ -70,6 +118,69 @@ pub enum Error {
     #[error("invalid params: cannot resolve base ref '{base_ref}'")]
     BaseRefUnresolvable { base_ref: String },
 
+    /// A guarded whole-content note write (`note.setContent` / the content
+    /// arm of `note.update` carrying `baseContentBytes`) whose base size does
+    /// not match the base the daemon resolved, or whose base is unknown
+    /// (`resolved_base_bytes: None`). Nothing is written. Surfaces as
+    /// `-32602` with `error.data = { code: "content-base-mismatch",
+    /// baseContentBytes, resolvedBaseBytes }` (protocol "Truncated note reads").
+    #[error("Content base does not match the stored note; re-read the full note and retry.")]
+    ContentBaseMismatch {
+        base_content_bytes: u64,
+        resolved_base_bytes: Option<u64>,
+    },
+
+    /// No node can run the requested agent placement. Surfaces as `-32602`
+    /// with [`crate::placement::PlacementUnavailable::message`] and the
+    /// documented `error.data = { code: "placement-unavailable", requested,
+    /// reason, availablePlatforms, supportedPlatforms, availableOs,
+    /// retryable, observedAt }`. The text form carries the data too, for MCP.
+    #[error("{0}")]
+    PlacementUnavailable(Box<crate::placement::PlacementUnavailable>),
+
+    /// No exposed machine offers the requested model. Surfaces as `-32602`
+    /// with [`crate::machines::ModelUnavailable::message`] and `error.data =
+    /// { code: "model-unavailable", provider, model, machines, retryable }`.
+    #[error("{0}")]
+    ModelUnavailable(Box<crate::machines::ModelUnavailable>),
+
+    /// A backend and a machine share no node-link protocol version.
+    /// Surfaces as `-32602` with
+    /// [`crate::machines::MachineUpdateRequired::message`] and `error.data =
+    /// { code: "machine-update-required", machineVersion, backendVersion,
+    /// update }`.
+    #[error("{0}")]
+    MachineUpdateRequired(Box<crate::machines::MachineUpdateRequired>),
+
+    /// The daemon runs in node mode (`intentd serve --node` or
+    /// `daemon.mode = "node"`): its own orchestration is off, so a method
+    /// outside the node-mode list, or a front door that would start local
+    /// work, is refused. Surfaces as `-32003` with `error.data = { code:
+    /// "node-mode", detail }`, the same envelope the transport's node-mode
+    /// gate emits.
+    #[error("not available in node mode: {0}")]
+    NodeMode(String),
+
+    /// A named provider profile request failed (PROTOCOL §5.54). `data`
+    /// carries the machine-readable discriminator (`data.code`, e.g.
+    /// `invalid-params` + `fieldErrors`, `provider-profile-in-use` + `inUse`,
+    /// `provider-profile-not-found`, `provider-profiles-unreadable`) and is
+    /// passed through verbatim as `error.data`. `internal` selects `-32603`
+    /// (an unreadable profile file); otherwise `-32602`. Neither `message`
+    /// nor `data` ever carries an environment value.
+    #[error("{}", .0.message)]
+    ProviderProfile(Box<ProviderProfileFailure>),
+
+    /// A `remoteMachines.*` request about an exposed machine failed
+    /// (`machine-unreachable` with the routes tried, `machine-revoked`,
+    /// `machine-in-use`), or `workspace.create`'s placed initial agent could
+    /// not start after the workspace committed (`launch-failed`). `data`
+    /// (`data.code` plus details) is passed through verbatim as
+    /// `error.data`; `internal` selects `-32603`, otherwise `-32602`.
+    /// Neither carries the executor token.
+    #[error("{}", .0.message)]
+    RemoteMachine(Box<ProviderProfileFailure>),
+
     /// A `workspace.create` clone/provisioning step failed.
     /// Carries a machine-readable category plus a sanitized human-readable
     /// detail (git stderr tail with credentials redacted) so clients can show
@@ -84,6 +195,15 @@ pub enum Error {
         category: CloneErrorCategory,
         detail: String,
     },
+
+    /// A local-repo `workspace.create` could not refresh its base branch
+    /// (`git fetch <remote> <base>` before the worktree / `CoW` checkout; PROTOCOL
+    /// §9.2). Surfaces as `-32603` with a readable `message` and
+    /// `error.data = { code: "base-refresh-failed", category, detail, baseRef,
+    /// remote }`. `detail` is git's (bounded, credential-redacted) output.
+    /// Distinct from [`Error::CloneFailed`]: its classifier is fetch-specific.
+    #[error("{}", .0.message())]
+    BaseRefreshFailed(Box<BaseRefreshFailure>),
 
     /// The `voice.transcribe` provider API key is missing. Surfaces as
     /// `-32603` with the same "Internal error" message as the plain
@@ -180,6 +300,13 @@ pub enum Error {
     /// "source control auth error" (monorepo#2961). Surfaces as `-32603`.
     #[error("source control rate limited: {0}")]
     RateLimited(String),
+
+    /// A request forwarded to an agent's provider adapter failed (JSON-RPC
+    /// error, timeout, or the connection ended before or during the request),
+    /// e.g. `agent.workers.stop` (PROTOCOL §5.5b). Surfaces as `-32603` with
+    /// `data.code: "provider-error"`.
+    #[error("provider request failed: {0}")]
+    ProviderRequest(String),
 
     /// The bound caller lacks the capability for this operation (multiplayer
     /// w3 capability matrix: an Owner-only or administrator-only method
@@ -308,8 +435,9 @@ pub enum InviteErrorKind {
     PinMismatch,
     /// The pinned login does not name a GitHub account.
     PinUnknown,
-    /// Minting an invite requires the owner's linked GitHub identity
-    /// (`github.authStatus.isConfigured`).
+    /// Sharing requires a connected owner forge: with neither GitHub nor
+    /// GitLab connected on the host, no invite is minted and no open invite
+    /// is redeemed (the code name predates GitLab identities).
     GithubIdentityRequired,
     /// The primary user's GitHub identity cannot change while other
     /// principals or open invites exist (reconnect guard).
@@ -397,8 +525,9 @@ impl InviteErrorKind {
                 "invalid params: pinLogin does not name a GitHub account"
             }
             InviteErrorKind::GithubIdentityRequired => {
-                "unsupported: inviting requires a linked forge identity — connect GitHub \
-                 (github.connect) or GitLab (sourceControl.connect) before creating an invite"
+                "unsupported: sharing requires the host owner's connected forge identity — \
+                 connect GitHub (github.connect) or GitLab (sourceControl.connect) to create \
+                 or redeem invites"
             }
             InviteErrorKind::IdentityLocked => {
                 "unsupported: the primary GitHub identity cannot change while other \
@@ -513,6 +642,88 @@ impl CloneErrorCategory {
     }
 }
 
+/// Why a workspace base refresh (`git fetch`) failed (PROTOCOL §9.2
+/// `data.category`). Classified from the fetch's outcome and stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseRefreshErrorCategory {
+    /// The daemon killed the fetch at its wall-clock bound.
+    Timeout,
+    /// "Host key verification failed": the SSH host is not trusted yet.
+    SshHostKey,
+    /// No usable credential (SSH key / agent, HTTPS credential).
+    AuthRequired,
+    /// The remote host could not be reached (DNS, connect, route).
+    Network,
+    /// The remote repository or path does not exist.
+    RepoNotFound,
+    /// The remote refused access to an existing repository (HTTP 403).
+    AccessDenied,
+    /// Anything else; `detail` still carries git's message.
+    Other,
+}
+
+impl BaseRefreshErrorCategory {
+    /// Stable wire identifier (`error.data.category`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::SshHostKey => "ssh-host-key",
+            Self::AuthRequired => "auth-required",
+            Self::Network => "network",
+            Self::RepoNotFound => "repo-not-found",
+            Self::AccessDenied => "access-denied",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Payload of [`Error::BaseRefreshFailed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseRefreshFailure {
+    pub category: BaseRefreshErrorCategory,
+    /// Git's fetch output (bounded tail), credentials redacted.
+    pub detail: String,
+    /// Canonical base branch name (remote prefix stripped).
+    pub base_ref: String,
+    /// Remote name (e.g. `origin`).
+    pub remote: String,
+}
+
+impl BaseRefreshFailure {
+    /// One-line wire `message`: `Couldn't update <base> from <remote>:
+    /// <cause>`, where the cause is the first meaningful line of `detail`
+    /// (skipping blank, `hint:` and `warning:` lines). The full text stays in
+    /// `detail`.
+    #[must_use]
+    pub fn message(&self) -> String {
+        let cause = self
+            .detail
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                let lower = line.to_ascii_lowercase();
+                !line.is_empty() && !lower.starts_with("hint:") && !lower.starts_with("warning:")
+            })
+            .unwrap_or_else(|| self.detail.trim());
+        format!(
+            "Couldn't update {} from {}: {cause}",
+            self.base_ref, self.remote
+        )
+    }
+}
+
+/// Message for [`Error::RetireUnsupported`].
+fn retire_unsupported_message(workspace_id: &str, plain_folder: bool) -> String {
+    if plain_folder {
+        "workspace.retire is not available in plain-folder workspaces".to_string()
+    } else {
+        format!(
+            "workspace {workspace_id} cannot be retired: only git worktree workspaces can retire"
+        )
+    }
+}
+
 impl Error {
     #[must_use]
     pub fn execution_authorization(
@@ -528,23 +739,36 @@ impl Error {
     #[must_use]
     pub fn code(&self) -> i32 {
         match self {
-            Error::NoteDelete(kind) => kind.rpc_code(),
             Error::ExecutionAuthorization { source, .. } => match source.as_ref() {
                 Error::CloneFailed { .. } | Error::SourceControlUnauthorized { .. } => source.code(),
                 _ => -32603,
             },
 
-            Error::NotePage(crate::note_page::NotePageError::Stale)
-            | Error::Conflict { .. } => -32005,
+            Error::ProviderProfile(failure) | Error::RemoteMachine(failure) => {
+                if failure.internal {
+                    -32603
+                } else {
+                    -32602
+                }
+            }
             Error::IdentityMismatch
             | Error::IdentityInUse
             | Error::HostMembershipRequired
             | Error::InvalidParams(_)
             | Error::NotFound(_)
+            | Error::WorkspaceRetired { .. }
+            | Error::RetireUnsupported { .. }
+            | Error::PlainFolderUnsupported { .. }
+            | Error::PlainFolderInvalidParams(_)
+            | Error::PlainFolderPathRejected(_)
+            | Error::SecretRequest { .. }
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
-            | Error::NotAFile { .. }
-            | Error::NotePage(_) => -32602,
+            | Error::PlacementUnavailable(_)
+            | Error::ModelUnavailable(_)
+            | Error::MachineUpdateRequired(_)
+            | Error::ContentBaseMismatch { .. }
+            | Error::NotAFile { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {
                 CloneErrorCategory::PathInvalid | CloneErrorCategory::DestinationExistsNonEmpty => {
                     -32602
@@ -557,6 +781,7 @@ impl Error {
                 | CloneErrorCategory::Other => -32603,
             },
             Error::Internal(_)
+            | Error::BaseRefreshFailed(_)
             | Error::GitAuthorization(_)
             | Error::VoiceNotConfigured { .. }
             | Error::ListenerDown
@@ -566,13 +791,160 @@ impl Error {
             | Error::DeviceGrantUnsupported { .. }
             | Error::SourceControlUnauthorized { .. }
             | Error::RateLimited(_)
+            | Error::ProviderRequest(_)
             | Error::IdentityProof(_)
             | Error::IdentityUnverifiable { .. }
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
-            Error::Forbidden(_) => -32003,
+            Error::Conflict { .. } => -32005,
+            Error::Forbidden(_) | Error::NodeMode(_) => -32003,
             Error::Invite(kind) => kind.code(),
         }
+    }
+}
+
+/// Why a plain-folder create path was refused (§5.1 `reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainFolderPathReason {
+    /// The folder (or, for a new folder, its parent) is a git repository or
+    /// inside one.
+    InsideGitRepo,
+    /// The path is the daemon workspaces root or inside it.
+    InsideWorkspacesRoot,
+    /// The path contains a daemon workspaces root (the boot root or a
+    /// configured `workspace.worktreesLocation`), e.g. the home folder.
+    ContainsWorkspacesRoot,
+    /// The path exists and is not a directory.
+    NotADirectory,
+    /// The path does not exist and neither does its parent.
+    ParentMissing,
+}
+
+impl PlainFolderPathReason {
+    /// Wire `error.data.reason` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InsideGitRepo => "inside-git-repo",
+            Self::InsideWorkspacesRoot => "inside-workspaces-root",
+            Self::ContainsWorkspacesRoot => "contains-workspaces-root",
+            Self::NotADirectory => "not-a-directory",
+            Self::ParentMissing => "parent-missing",
+        }
+    }
+}
+
+/// Payload of [`Error::PlainFolderPathRejected`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainFolderPathRejection {
+    pub reason: PlainFolderPathReason,
+    /// The requested (tilde-expanded) `repositoryPath`.
+    pub path: String,
+    /// Top level of the enclosing repository, for `InsideGitRepo` only.
+    pub repository_root: Option<String>,
+}
+
+impl PlainFolderPathRejection {
+    /// Human-readable `error.message`.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self.reason {
+            PlainFolderPathReason::InsideGitRepo => format!(
+                "{} is inside the git repository {}; choose a folder outside any git repository or create a git workspace",
+                self.path,
+                self.repository_root.as_deref().unwrap_or("(unknown)")
+            ),
+            PlainFolderPathReason::InsideWorkspacesRoot => format!(
+                "{} is inside the Intent workspaces folder; choose a folder outside it",
+                self.path
+            ),
+            PlainFolderPathReason::ContainsWorkspacesRoot => format!(
+                "{} contains the Intent workspaces folder; choose a folder that does not hold it",
+                self.path
+            ),
+            PlainFolderPathReason::NotADirectory => {
+                format!("{} exists and is not a folder", self.path)
+            }
+            PlainFolderPathReason::ParentMissing => format!(
+                "{} does not exist and neither does its parent folder",
+                self.path
+            ),
+        }
+    }
+}
+
+/// Payload of [`Error::ProviderProfile`], boxed to keep [`Error`] small.
+#[derive(Debug)]
+pub struct ProviderProfileFailure {
+    /// `-32603` when true (unreadable profile file); otherwise `-32602`.
+    pub internal: bool,
+    /// Human message; never carries an environment value.
+    pub message: String,
+    /// `error.data`, passed through verbatim (`data.code` plus details).
+    pub data: serde_json::Value,
+}
+
+impl Error {
+    /// Build an [`Error::ProviderProfile`].
+    #[must_use]
+    pub fn provider_profile(
+        internal: bool,
+        message: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        Self::ProviderProfile(Box::new(ProviderProfileFailure {
+            internal,
+            message: message.into(),
+            data,
+        }))
+    }
+}
+
+impl Error {
+    /// Append `hint` to an admission failure's message, leaving its code and
+    /// `error.data` unchanged: the typed placement, model and update
+    /// failures, provider-profile and remote-machine failures, and
+    /// invalid params. Other errors are returned as they are.
+    #[must_use]
+    pub fn with_hint(self, hint: &str) -> Self {
+        match self {
+            Self::PlacementUnavailable(mut failure) => {
+                failure.hint = Some(hint.to_owned());
+                Self::PlacementUnavailable(failure)
+            }
+            Self::ModelUnavailable(mut failure) => {
+                failure.hint = Some(hint.to_owned());
+                Self::ModelUnavailable(failure)
+            }
+            Self::MachineUpdateRequired(mut failure) => {
+                failure.hint = Some(hint.to_owned());
+                Self::MachineUpdateRequired(failure)
+            }
+            Self::ProviderProfile(mut failure) => {
+                failure.message = format!("{} {hint}", failure.message);
+                Self::ProviderProfile(failure)
+            }
+            Self::RemoteMachine(mut failure) => {
+                failure.message = format!("{} {hint}", failure.message);
+                Self::RemoteMachine(failure)
+            }
+            Self::InvalidParams(message) => Self::InvalidParams(format!("{message} {hint}")),
+            other => other,
+        }
+    }
+
+    /// Build an [`Error::RemoteMachine`]; `data` must carry `code`.
+    #[must_use]
+    pub fn remote_machine(
+        internal: bool,
+        message: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        Self::RemoteMachine(Box::new(ProviderProfileFailure {
+            internal,
+            message: message.into(),
+            data,
+        }))
     }
 }
 

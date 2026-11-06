@@ -13,17 +13,26 @@
 //!   Guest hellos enter only the device roster. Current members can host
 //!   ordinary workspace browsers; each dispatch rechecks their authority.
 //!   Chief and host reverse requests select only administrator connections.
-//! - [`ReverseTarget::Default`] → the **first-connected** eligible connection
-//!   (unchanged single-desktop behaviour); none → `NoClient`.
+//! - [`ReverseTarget::Default`] → the client of the **oldest live** eligible
+//!   registration, via its **newest** eligible connection (a stale older
+//!   socket of that client is skipped). Re-evaluated per request: when that
+//!   registration drops, the next-oldest registration's client wins even if
+//!   the first client still has a newer connection. None → `NoClient`.
 //! - [`ReverseTarget::Client`] / [`ReverseTarget::Pinned`] → the **newest**
 //!   eligible connection of that logical `clientId`; none →
 //!   `ClientOffline { client_id, name, pinned }`.
+//!
+//! The shared REV-2 cases in `tests/fixtures/browser-routing.json` (a copy
+//! of the monorepo's `docs/protocol/fixtures/browser-routing/routing.json`)
+//! run against this registry in `primary/tests.rs`.
 //!
 //! Every accepted UDS or WSS connection registers its per-connection
 //! [`ReverseChannel`] with the shared [`PrimaryReverseRegistry`] and holds the
 //! returned [`PrimaryReverseGuard`] for the life of the connection. A
 //! successful `client.hello` binds the connection's logical identity onto the
-//! entry ([`PrimaryReverseGuard::bind`]; a re-hello updates it). Dropping the
+//! entry ([`PrimaryReverseGuard::bind`], which takes the hello's
+//! [`HelloBinding`] so every bind holds a [`BindingReservation`]; a re-hello
+//! updates it). Dropping the
 //! guard removes the entry — on normal exit, panic-unwind, and task abort
 //! (the WSS heartbeat reaper) alike.
 //!
@@ -42,8 +51,9 @@ use std::sync::{Arc, Mutex};
 
 pub use intent_core::ResolvedClient;
 use intent_core::{
-    now_iso, AgentReverseDispatch, BoxFuture, ClientHostInfo, ClientId, ReverseDispatchError,
-    ReverseLiveClient, ReverseTarget, WorkspaceApi, WorkspaceId,
+    now_iso, AgentReverseDispatch, BoxFuture, ClientHostInfo, ClientId, ReverseClientConnections,
+    ReverseConnectionInfo, ReverseConnectionSnapshot, ReverseDispatchError, ReverseLiveClient,
+    ReverseRoute, ReverseTarget, WorkspaceApi, WorkspaceId,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -240,6 +250,12 @@ struct State {
     bound: HashMap<u64, ClientId>,
     /// Maintained on mutation, so roster reads clone only the returned rows.
     devices: Vec<ReverseLiveClient>,
+    /// `clientId`s with a `client.hello` in flight (reserved before the hello
+    /// persists its client row, released after the bind), counted per id.
+    /// Read by [`PrimaryReverseRegistry::client_active`] so the superseded-id
+    /// tab rehome (intent-hq/intent#8045) never moves a host that is about to
+    /// bind.
+    binding: HashMap<ClientId, usize>,
 }
 
 impl State {
@@ -293,6 +309,7 @@ impl State {
 struct Inner {
     state: Mutex<State>,
     next_id: AtomicU64,
+    desktop_changes: Arc<tokio::sync::Notify>,
     /// Source of [`Entry::hello_seq`]; bumped under the `entries` lock.
     next_hello_seq: AtomicU64,
     /// Ordered transition queue. Every `send` happens while `entries` is
@@ -312,6 +329,7 @@ impl Default for Inner {
         Self {
             state: Mutex::new(State::default()),
             next_id: AtomicU64::new(0),
+            desktop_changes: Arc::new(tokio::sync::Notify::new()),
             next_hello_seq: AtomicU64::new(0),
             transitions,
             transition_rx: Mutex::new(Some(transition_rx)),
@@ -322,6 +340,7 @@ impl Default for Inner {
 }
 
 struct Entry {
+    monitor_hello: monitor::ConnectionHello,
     /// Monotonic registration sequence — the arrival order.
     id: u64,
     channel: ReverseChannel,
@@ -335,6 +354,7 @@ struct Entry {
     hello_seq: u64,
     device: Option<devices::DeviceBinding>,
     device_managed: bool,
+    desktop_epoch: String,
 }
 
 impl Entry {
@@ -367,6 +387,7 @@ impl Inner {
         let mut state = self.lock();
         let pos = state.entries.iter().position(|e| e.id == id)?;
         let entry = state.entries.remove(pos)?;
+        self.desktop_changes.notify_waiters();
         if entry.device_managed {
             state.refresh_devices(&self.transitions);
         }
@@ -379,6 +400,8 @@ impl Inner {
                     .send(ClientTransition::Disconnected(identity));
             }
         }
+        drop(state);
+        entry.monitor_hello.retire();
         Some(entry.channel)
     }
 }
@@ -398,23 +421,142 @@ fn resolve_entry_matching<'a>(
     allowed: impl Fn(&Entry) -> bool,
 ) -> Result<&'a Entry, ReverseDispatchError> {
     match target {
-        ReverseTarget::Default => entries
-            .iter()
-            .find(|e| e.is_eligible() && allowed(e))
-            .ok_or(ReverseDispatchError::NoClient),
-        ReverseTarget::Client(client_id) | ReverseTarget::Pinned(client_id) => entries
-            .iter()
-            .rev()
-            .find(|e| e.is_eligible() && e.has_client(client_id) && allowed(e))
-            .ok_or_else(|| ReverseDispatchError::ClientOffline {
-                client_id: client_id.clone(),
-                name: entries
-                    .iter()
-                    .rev()
-                    .filter(|e| e.has_client(client_id))
-                    .find_map(|e| e.identity.as_ref().and_then(|i| i.name.clone())),
-                pinned: matches!(target, ReverseTarget::Pinned(_)),
+        // The client of the oldest live eligible registration is the
+        // primary (re-evaluated per request, so it changes when that
+        // registration drops even if the client has a newer connection),
+        // and the request goes to that client's newest eligible connection,
+        // the same rule as `Client` / `Pinned`: an older socket of the same
+        // app that stopped answering must not take every unpinned dispatch
+        // (intent-hq/intent#7902).
+        ReverseTarget::Default => {
+            let first = entries
+                .iter()
+                .find(|e| e.is_eligible() && allowed(e))
+                .ok_or(ReverseDispatchError::NoClient)?;
+            let client_id = &first
+                .identity
+                .as_ref()
+                .expect("an eligible entry always carries an identity")
+                .client_id;
+            // `first` itself matches, so the newest match always exists.
+            Ok(newest_eligible_of(entries, client_id, &allowed).unwrap_or(first))
+        }
+        ReverseTarget::Client(client_id) | ReverseTarget::Pinned(client_id) => {
+            newest_eligible_of(entries, client_id, &allowed).ok_or_else(|| {
+                ReverseDispatchError::ClientOffline {
+                    client_id: client_id.clone(),
+                    name: entries
+                        .iter()
+                        .rev()
+                        .filter(|e| e.has_client(client_id))
+                        .find_map(|e| e.identity.as_ref().and_then(|i| i.name.clone())),
+                    pinned: matches!(target, ReverseTarget::Pinned(_)),
+                }
+            })
+        }
+    }
+}
+
+/// The newest eligible, `allowed` connection of logical client `client_id`.
+fn newest_eligible_of<'a>(
+    entries: &'a VecDeque<Entry>,
+    client_id: &ClientId,
+    allowed: &impl Fn(&Entry) -> bool,
+) -> Option<&'a Entry> {
+    entries
+        .iter()
+        .rev()
+        .find(|e| e.is_eligible() && e.has_client(client_id) && allowed(e))
+}
+
+/// One logical client's live hello'd connections, oldest first, and the
+/// identity of its newest hello (by hello sequence, not registration
+/// order), which supplies the display fields.
+struct ClientGroup<'a> {
+    newest: &'a ReverseClientIdentity,
+    newest_hello: u64,
+    entries: Vec<&'a Entry>,
+}
+
+/// Hello'd `entries` grouped by `clientId`, in first-connection order;
+/// un-hello'd connections are omitted. Shared by `client.list`
+/// ([`PrimaryReverseRegistry::live_clients`]) and `ws.browser.clients()`
+/// ([`PrimaryReverseRegistry::connection_snapshot`]) so both name a client
+/// the same way.
+fn group_by_client(entries: &VecDeque<Entry>) -> Vec<ClientGroup<'_>> {
+    let mut groups: Vec<ClientGroup<'_>> = Vec::new();
+    for entry in entries {
+        let Some(identity) = &entry.identity else {
+            continue;
+        };
+        match groups
+            .iter_mut()
+            .find(|g| g.newest.client_id == identity.client_id)
+        {
+            Some(group) => {
+                group.entries.push(entry);
+                if entry.hello_seq > group.newest_hello {
+                    group.newest_hello = entry.hello_seq;
+                    group.newest = identity;
+                }
+            }
+            None => groups.push(ClientGroup {
+                newest: identity,
+                newest_hello: entry.hello_seq,
+                entries: vec![entry],
             }),
+        }
+    }
+    groups
+}
+
+/// Whether a `browser.exec` scoped to `workspace_id` may go to member
+/// connections; Chief (and an unscoped request) selects administrator
+/// connections only.
+fn member_scoped(workspace_id: &str) -> bool {
+    !workspace_id.is_empty() && !WorkspaceId::from(workspace_id).is_chief()
+}
+
+/// The connection a reverse request went to, captured cheaply under the
+/// registry lock and formatted only if the request times out.
+struct ConnectionLabel {
+    id: u64,
+    transport: ReverseTransport,
+    connected_at: String,
+    client: Option<(ClientId, Option<String>)>,
+}
+
+impl ConnectionLabel {
+    fn of(entry: &Entry) -> Self {
+        Self {
+            id: entry.id,
+            transport: entry.transport,
+            connected_at: entry.connected_at.clone(),
+            client: entry
+                .identity
+                .as_ref()
+                .map(|i| (i.client_id.clone(), i.name.clone())),
+        }
+    }
+}
+
+/// `browser client "<name>" (<clientId>) on connection <n> over <transport>,
+/// connected <ts>`, so a report of a silent client says which one it was.
+/// The hello-supplied name is Debug-escaped.
+impl std::fmt::Display for ConnectionLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.client {
+            Some((id, Some(name))) => write!(f, "browser client {name:?} ({})", id.as_str())?,
+            Some((id, None)) => write!(f, "browser client {}", id.as_str())?,
+            None => f.write_str("browser client")?,
+        }
+        write!(
+            f,
+            " on connection {} over {}, connected {}",
+            self.id,
+            self.transport.as_str(),
+            self.connected_at
+        )
     }
 }
 
@@ -429,7 +571,7 @@ impl PrimaryReverseRegistry {
     /// return a guard whose drop removes the entry (RAII: the caller holds it
     /// for the connection's lifetime). The connection is not an eligible
     /// reverse target until [`PrimaryReverseGuard::bind`] attaches a
-    /// `client.hello` identity advertising `browserExec`.
+    /// `client.hello` identity (a [`HelloBinding`]) advertising `browserExec`.
     ///
     /// # Panics
     ///
@@ -447,6 +589,7 @@ impl PrimaryReverseRegistry {
             return PrimaryReverseGuard { registry: None, id };
         }
         state.entries.push_back(Entry {
+            monitor_hello: monitor::ConnectionHello::default(),
             id,
             channel,
             transport,
@@ -455,6 +598,7 @@ impl PrimaryReverseRegistry {
             hello_seq: 0,
             device: None,
             device_managed: false,
+            desktop_epoch: intent_core::desktop::new_connection_epoch(),
         });
         PrimaryReverseGuard {
             registry: Some(self.inner.clone()),
@@ -463,7 +607,8 @@ impl PrimaryReverseRegistry {
     }
 
     /// The channel a [`ReverseTarget::Default`] dispatch would use right now
-    /// (the first-connected eligible connection), or `None` when no eligible
+    /// (the first-connected eligible client's newest eligible connection),
+    /// or `None` when no eligible
     /// client is connected. A cheap clone of the entry's channel; the entry
     /// stays registered.
     ///
@@ -515,55 +660,115 @@ impl PrimaryReverseRegistry {
     #[must_use]
     pub fn live_clients(&self) -> Vec<LiveClient> {
         let state = self.inner.lock();
-        let mut clients: Vec<(LiveClient, u64)> = Vec::new();
-        for entry in &state.entries {
-            let Some(identity) = &entry.identity else {
-                continue;
-            };
-            match clients
-                .iter_mut()
-                .find(|(c, _)| c.client_id == identity.client_id)
-            {
-                Some((client, newest_hello)) => {
-                    client.connections += 1;
-                    client.transports.push(entry.transport);
-                    client.browser_exec |= identity.browser_exec();
-                    // Newest hello wins for the display fields — by hello
-                    // sequence, not by which connection registered first.
-                    if entry.hello_seq > *newest_hello {
-                        *newest_hello = entry.hello_seq;
-                        client.name.clone_from(&identity.name);
-                        client.capabilities.clone_from(&identity.capabilities);
-                        client.host.clone_from(&identity.host);
-                    }
+        group_by_client(&state.entries)
+            .into_iter()
+            .map(|group| {
+                let browser_exec = group.entries.iter().any(|e| {
+                    e.identity
+                        .as_ref()
+                        .is_some_and(ReverseClientIdentity::browser_exec)
+                });
+                let mut capabilities = match &group.newest.capabilities {
+                    Value::Object(map) => map.clone(),
+                    _ => serde_json::Map::new(),
+                };
+                capabilities.insert("browserExec".into(), Value::Bool(browser_exec));
+                LiveClient {
+                    client_id: group.newest.client_id.clone(),
+                    name: group.newest.name.clone(),
+                    capabilities: Value::Object(capabilities),
+                    host: group.newest.host.clone(),
+                    browser_exec,
+                    connections: group.entries.len(),
+                    transports: group.entries.iter().map(|e| e.transport).collect(),
+                    connected_at: group.entries[0].connected_at.clone(),
                 }
-                None => clients.push((
-                    LiveClient {
-                        client_id: identity.client_id.clone(),
-                        name: identity.name.clone(),
-                        capabilities: identity.capabilities.clone(),
-                        host: identity.host.clone(),
-                        browser_exec: identity.browser_exec(),
-                        connections: 1,
-                        transports: vec![entry.transport],
+            })
+            .collect()
+    }
+
+    /// Every live hello'd connection grouped by `clientId` (the grouping and
+    /// newest-hello `name` of [`Self::live_clients`]) plus where each of
+    /// `targets` would be delivered for a `browser.exec` scoped to
+    /// `workspace_id` — the same eligibility, scope and newest-connection
+    /// rules as `dispatch`. A connection's `can_host_browser` applies that
+    /// same scope (Chief: administrator connections only). One lock
+    /// acquisition, so the routes always name a listed connection, under
+    /// the listed client name. Read-only: nothing is sent to any client.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
+    pub fn connection_snapshot(
+        &self,
+        workspace_id: &WorkspaceId,
+        targets: &[ReverseTarget],
+    ) -> ReverseConnectionSnapshot {
+        let member_scope = member_scoped(workspace_id.as_str());
+        let in_scope = |entry: &Entry| member_scope || entry.channel.is_administrator();
+        let state = self.inner.lock();
+        let clients: Vec<ReverseClientConnections> = group_by_client(&state.entries)
+            .into_iter()
+            .map(|group| {
+                let connections: Vec<ReverseConnectionInfo> = group
+                    .entries
+                    .iter()
+                    .map(|entry| ReverseConnectionInfo {
+                        connection_id: entry.id,
+                        transport: entry.transport.as_str().to_string(),
                         connected_at: entry.connected_at.clone(),
-                    },
-                    entry.hello_seq,
-                )),
-            }
-        }
-        let mut clients: Vec<LiveClient> = clients.into_iter().map(|(c, _)| c).collect();
-        for client in &mut clients {
-            let bag = match &mut client.capabilities {
-                Value::Object(map) => map,
-                other => {
-                    *other = Value::Object(serde_json::Map::new());
-                    other.as_object_mut().expect("just set an object")
+                        can_host_browser: entry.is_eligible() && in_scope(entry),
+                    })
+                    .collect();
+                ReverseClientConnections {
+                    client_id: group.newest.client_id.clone(),
+                    name: group.newest.name.clone(),
+                    can_host_browser: connections.iter().any(|c| c.can_host_browser),
+                    connections,
                 }
-            };
-            bag.insert("browserExec".into(), Value::Bool(client.browser_exec));
-        }
-        clients
+            })
+            .collect();
+        let routes = targets
+            .iter()
+            .map(
+                |target| match resolve_entry_matching(&state.entries, target, in_scope) {
+                    Ok(entry) => {
+                        let client_id = &entry
+                            .identity
+                            .as_ref()
+                            .expect("an eligible entry always carries an identity")
+                            .client_id;
+                        ReverseRoute {
+                            client_id: Some(client_id.clone()),
+                            name: clients
+                                .iter()
+                                .find(|c| &c.client_id == client_id)
+                                .and_then(|c| c.name.clone()),
+                            connection_id: Some(entry.id),
+                            error: None,
+                        }
+                    }
+                    Err(error) => ReverseRoute::failed(&error),
+                },
+            )
+            .collect();
+        ReverseConnectionSnapshot { clients, routes }
+    }
+
+    /// Whether `client_id` has a live hello'd connection or a `client.hello`
+    /// in flight ([`PrimaryReverseGuard::claim_hello`]). A hello reserves
+    /// its id before it persists the client row, and the store serializes that
+    /// write with the rehome's transaction, so a host this reports inactive
+    /// inside the rehome's write transaction can only bind after the commit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
+    pub fn client_active(&self, client_id: &ClientId) -> bool {
+        let state = self.inner.lock();
+        state.presence.contains_key(client_id) || state.binding.contains_key(client_id)
     }
 
     /// Presence of the given logical clients: one O(1) index lookup per
@@ -697,6 +902,32 @@ impl PrimaryReverseRegistry {
 }
 
 impl AgentReverseDispatch for PrimaryReverseRegistry {
+    fn desktop_candidates(
+        &self,
+        principal: &intent_core::PrincipalId,
+    ) -> Vec<intent_core::desktop::DesktopConnection> {
+        desktop::candidates(self, principal)
+    }
+    fn desktop_changes(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(self.inner.desktop_changes.clone())
+    }
+
+    fn desktop_resolve(
+        &self,
+        target: &ReverseTarget,
+        principal: &intent_core::PrincipalId,
+    ) -> intent_core::desktop::DesktopResult<intent_core::desktop::DesktopConnection> {
+        desktop::resolve(self, target, principal)
+    }
+
+    fn desktop_dispatch(
+        &self,
+        connection: intent_core::desktop::DesktopConnection,
+        params: Value,
+    ) -> BoxFuture<'_, intent_core::desktop::DesktopResult<Value>> {
+        Box::pin(desktop::dispatch(self, connection, params))
+    }
+
     fn is_connected(&self) -> bool {
         self.primary().is_some()
     }
@@ -705,11 +936,23 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
         PrimaryReverseRegistry::resolve(self, target)
     }
 
+    fn client_active(&self, client_id: &ClientId) -> bool {
+        PrimaryReverseRegistry::client_active(self, client_id)
+    }
+
     fn live_clients(&self) -> Vec<ReverseLiveClient> {
         PrimaryReverseRegistry::live_clients(self)
             .iter()
             .map(LiveClient::to_wire)
             .collect()
+    }
+
+    fn connection_snapshot(
+        &self,
+        workspace_id: &WorkspaceId,
+        targets: &[ReverseTarget],
+    ) -> ReverseConnectionSnapshot {
+        PrimaryReverseRegistry::connection_snapshot(self, workspace_id, targets)
     }
 
     fn authenticated_clients(&self) -> Vec<ReverseLiveClient> {
@@ -751,21 +994,28 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
         params: Value,
         target: ReverseTarget,
     ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
-        let member_scope = method == "browser.exec"
-            && params["workspaceId"]
-                .as_str()
-                .is_some_and(|ws| !ws.is_empty() && !intent_core::WorkspaceId::from(ws).is_chief());
-        let channel = resolve_entry_matching(&self.inner.lock().entries, &target, |entry| {
+        let member_scope =
+            method == "browser.exec" && params["workspaceId"].as_str().is_some_and(member_scoped);
+        let resolved = resolve_entry_matching(&self.inner.lock().entries, &target, |entry| {
             member_scope || entry.channel.is_administrator()
         })
-        .map(|e| e.channel.clone());
+        .map(|e| (e.channel.clone(), ConnectionLabel::of(e)));
         Box::pin(async move {
-            let channel = channel?;
+            let (channel, connection) = resolved?;
             let timeout = request_timeout(method, &params);
             channel.request(method, params, timeout).await.map_err(|e| {
+                let message = if e.timed_out {
+                    format!(
+                        "{}: {connection} did not accept or answer the request within {}s",
+                        e.message,
+                        timeout.as_secs()
+                    )
+                } else {
+                    e.message
+                };
                 ReverseDispatchError::Transport {
                     code: e.code,
-                    message: e.message,
+                    message,
                 }
             })
         })
@@ -797,7 +1047,207 @@ async fn publish_client_event(api: &dyn WorkspaceApi, transition: &ClientTransit
     }
 }
 
+/// A `client.hello` in flight for one `clientId`
+/// ([`PrimaryReverseGuard::claim_hello`]); released on drop. Owned by the
+/// connection that took it: only that connection can bind with it
+/// ([`HelloClaim::complete`], [`PrimaryReverseGuard::bind`]).
+pub struct BindingReservation {
+    inner: Arc<Inner>,
+    connection: u64,
+    client_id: ClientId,
+}
+
+impl BindingReservation {
+    /// The reserved `clientId`.
+    #[must_use]
+    pub fn client_id(&self) -> &ClientId {
+        &self.client_id
+    }
+
+    /// Pair this reservation with the profile a successful `client.hello`
+    /// presented, producing the only value [`PrimaryReverseGuard::bind`]
+    /// accepts. The bound identity takes its `clientId` from the reservation
+    /// itself, so a bound host is always one
+    /// [`PrimaryReverseRegistry::client_active`] already reports
+    /// (intent-hq/intent#8045) — there is no identity to mismatch.
+    fn into_hello_binding(
+        self,
+        name: Option<String>,
+        capabilities: Value,
+        host: ClientHostInfo,
+    ) -> HelloBinding {
+        let identity = ReverseClientIdentity {
+            client_id: self.client_id.clone(),
+            name,
+            capabilities,
+            host,
+        };
+        HelloBinding {
+            reservation: self,
+            identity,
+        }
+    }
+}
+
+/// The `clientId` a `client.hello` resolved, claimed for this connection
+/// ([`PrimaryReverseGuard::claim_hello`]) before the hello persists its client
+/// row. Holds the id's [`BindingReservation`] — none for a detached guard —
+/// and is the only source of the identity the hello binds
+/// ([`Self::complete`]), so the bound, reserved and persisted ids are one
+/// value by construction. Dropping it releases the reservation.
+#[must_use = "dropping a claim releases its reservation"]
+pub struct HelloClaim(Claim);
+
+/// A [`HelloClaim`]'s id: the reservation carries it when there is one, so
+/// the claimed and reserved ids cannot differ.
+enum Claim {
+    Reserved(BindingReservation),
+    Unreserved(ClientId),
+}
+
+impl HelloClaim {
+    /// A claim that reserves nothing, as a detached guard's claim does. Its
+    /// hello completes without a [`HelloBinding`], so it can never bind.
+    #[cfg(test)]
+    pub(crate) fn unreserved(client_id: ClientId) -> Self {
+        Self(Claim::Unreserved(client_id))
+    }
+
+    /// The claimed `clientId`.
+    #[must_use]
+    pub fn client_id(&self) -> &ClientId {
+        match &self.0 {
+            Claim::Reserved(reservation) => &reservation.client_id,
+            Claim::Unreserved(client_id) => client_id,
+        }
+    }
+
+    /// Finish a successful hello with the profile it presented: the claimed
+    /// id plus that profile, paired with the claim's reservation when it has
+    /// one.
+    pub fn complete(
+        self,
+        name: Option<String>,
+        capabilities: Value,
+        host: ClientHostInfo,
+    ) -> ClaimedHello {
+        match self.0 {
+            Claim::Reserved(reservation) => {
+                ClaimedHello::Reserved(reservation.into_hello_binding(name, capabilities, host))
+            }
+            Claim::Unreserved(client_id) => ClaimedHello::Unreserved(ReverseClientIdentity {
+                client_id,
+                name,
+                capabilities,
+                host,
+            }),
+        }
+    }
+}
+
+/// A successful `client.hello`'s identity ([`HelloClaim::complete`]):
+/// bindable when its claim held a reservation.
+#[must_use = "dropping a reserved hello releases its reservation before it binds"]
+pub enum ClaimedHello {
+    /// Reserved: the connection may bind it ([`PrimaryReverseGuard::bind`]).
+    Reserved(HelloBinding),
+    /// Unreserved (a detached guard): never bound as a browser host.
+    Unreserved(ReverseClientIdentity),
+}
+
+impl ClaimedHello {
+    /// The hello'd identity.
+    #[must_use]
+    pub fn identity(&self) -> &ReverseClientIdentity {
+        match self {
+            Self::Reserved(hello) => hello.identity(),
+            Self::Unreserved(identity) => identity,
+        }
+    }
+}
+
+/// A successful `client.hello`'s identity together with the
+/// [`BindingReservation`] that keeps its `clientId` active
+/// ([`PrimaryReverseRegistry::client_active`]). [`PrimaryReverseGuard::bind`]
+/// takes one, so every bind path — the hello itself and a later role change —
+/// necessarily holds the reservation the superseded-id tab rehome relies on
+/// (intent-hq/intent#8045): a bind path without one does not compile.
+/// Built only by [`HelloClaim::complete`], which takes its
+/// `clientId` from the reservation; dropping it releases the reservation.
+pub struct HelloBinding {
+    reservation: BindingReservation,
+    identity: ReverseClientIdentity,
+}
+
+impl HelloBinding {
+    /// The hello'd identity this binding attaches.
+    #[must_use]
+    pub fn identity(&self) -> &ReverseClientIdentity {
+        &self.identity
+    }
+
+    /// The bound `clientId` (also the reserved one).
+    #[must_use]
+    pub fn client_id(&self) -> &ClientId {
+        &self.identity.client_id
+    }
+}
+
+impl Drop for BindingReservation {
+    fn drop(&mut self) {
+        let mut state = self.inner.lock();
+        if let Some(count) = state.binding.get_mut(&self.client_id) {
+            *count -= 1;
+            if *count == 0 {
+                state.binding.remove(&self.client_id);
+            }
+        }
+    }
+}
+
 impl PrimaryReverseGuard {
+    /// Reserve `client_id` for this connection's in-flight `client.hello`:
+    /// take it before the hello persists its client row and hold it until the
+    /// bind, so [`PrimaryReverseRegistry::client_active`] reports the id
+    /// throughout. `None` for a detached guard.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
+    fn reserve_binding(&self, client_id: ClientId) -> Option<BindingReservation> {
+        let inner = self.registry.as_ref()?;
+        *inner.lock().binding.entry(client_id.clone()).or_insert(0) += 1;
+        Some(BindingReservation {
+            inner: Arc::clone(inner),
+            connection: self.id,
+            client_id,
+        })
+    }
+
+    /// Claim `client_id` for this connection's `client.hello`
+    /// ([`HelloClaim`]): reserve it ([`Self::reserve_binding`]) and carry it
+    /// as the id the hello persists and binds. A detached guard's claim is
+    /// unreserved.
+    pub fn claim_hello(&self, client_id: ClientId) -> HelloClaim {
+        HelloClaim(match self.reserve_binding(client_id.clone()) {
+            Some(reservation) => Claim::Reserved(reservation),
+            None => Claim::Unreserved(client_id),
+        })
+    }
+
+    pub(crate) fn desktop_connection(&self) -> Option<intent_core::desktop::DesktopConnection> {
+        let inner = self.registry.as_ref()?;
+        let state = inner.lock();
+        let entry = state.entries.iter().find(|entry| entry.id == self.id)?;
+        let device = entry.device.as_ref()?;
+        Some(intent_core::desktop::DesktopConnection {
+            client_id: device.identity.client_id.clone(),
+            principal_id: device.principal_id.clone(),
+            connection_epoch: entry.desktop_epoch.clone(),
+        })
+    }
+
     /// The registry this guard is registered in (`None` for a detached guard),
     /// so a connection-task fast-path can read presence
     /// ([`PrimaryReverseRegistry::host_presence`]) without threading the
@@ -827,7 +1277,11 @@ impl PrimaryReverseGuard {
     }
 
     /// Attach (or replace, on re-hello) this connection's logical identity
-    /// after a successful `client.hello`. Queues the resulting logical-client
+    /// after a successful `client.hello`. Requires the connection's own
+    /// [`HelloBinding`], so the bound `clientId` is reserved
+    /// ([`Self::claim_hello`]) for as long as the caller keeps it; a
+    /// binding reserved by another connection or registry is refused.
+    /// Queues the resulting logical-client
     /// transitions (a `Disconnected` for a previous `clientId` this
     /// connection was the last of, then a `Connected` for a new `clientId`
     /// with no other live connection) under the registry lock.
@@ -840,10 +1294,20 @@ impl PrimaryReverseGuard {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
-    pub fn bind(&self, identity: ReverseClientIdentity) {
+    pub fn bind(&self, hello: &HelloBinding) {
         let Some(inner) = &self.registry else {
             return;
         };
+        let reservation = &hello.reservation;
+        if reservation.connection != self.id || !Arc::ptr_eq(&reservation.inner, inner) {
+            tracing::warn!(
+                client_id = %hello.client_id().as_str(),
+                "reverse: refused a bind with another connection's reservation"
+            );
+            return;
+        }
+        inner.desktop_changes.notify_waiters();
+        let identity = hello.identity.clone();
         let mut state = inner.lock();
         let Some(pos) = state.entries.iter().position(|e| e.id == self.id) else {
             return;
@@ -878,6 +1342,25 @@ impl PrimaryReverseGuard {
                 .transitions
                 .send(ClientTransition::Connected(identity));
         }
+    }
+}
+
+#[cfg(test)]
+impl PrimaryReverseGuard {
+    /// Test shorthand for a successful hello: reserve `identity`'s
+    /// `clientId`, pair it, and [`Self::bind`]. Returns the binding (holding
+    /// the reservation) so a test can keep the id reserved or rebind.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a detached guard, which has no registry to reserve in.
+    pub(crate) fn bind_hello(&self, identity: ReverseClientIdentity) -> HelloBinding {
+        let hello = self
+            .reserve_binding(identity.client_id)
+            .expect("registered guard")
+            .into_hello_binding(identity.name, identity.capabilities, identity.host);
+        self.bind(&hello);
+        hello
     }
 }
 
@@ -918,4 +1401,6 @@ impl Drop for PrimaryReverseGuard {
 #[cfg(test)]
 mod tests;
 
+mod desktop;
 mod devices;
+pub(crate) mod monitor;

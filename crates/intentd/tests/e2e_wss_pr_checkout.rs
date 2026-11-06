@@ -1,7 +1,7 @@
 //! PR checkout correctness over the real WebSocket router and local bare Git.
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use async_trait::async_trait;
 use intent_sourcecontrol::{
@@ -41,7 +41,7 @@ async fn boot(branch: &str) -> Fixture {
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_workspaces_root(workspaces_root)
         .with_event_bus(bus.clone())
         .with_source_control(Arc::new(RecordingForge {
@@ -251,6 +251,7 @@ impl SourceControl for RecordingForge {
     }
 }
 
+#[track_caller]
 fn git(path: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")

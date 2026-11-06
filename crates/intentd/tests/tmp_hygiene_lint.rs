@@ -54,6 +54,7 @@ fn is_src_test_file(rel: &Path) -> bool {
         || rel.components().any(|c| c.as_os_str() == "tests")
 }
 
+#[track_caller]
 fn scanned_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let Ok(crates) = fs::read_dir(root.join("crates")) else {

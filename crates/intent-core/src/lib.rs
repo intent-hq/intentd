@@ -19,12 +19,14 @@ fn disable_node_compile_cache() {
 pub mod agent_configs;
 pub(crate) mod agent_logs;
 pub mod agent_runtime;
+pub mod agent_tmp;
 pub mod caller;
 pub mod chief_cwd;
 pub mod cli_env;
 pub mod clock;
 pub mod config;
 pub mod discovery_cache;
+pub mod discussion;
 pub mod error;
 pub mod events;
 pub mod execution;
@@ -32,30 +34,43 @@ pub mod git_remote_url;
 pub mod host_membership;
 pub mod human_author;
 pub mod ids;
+pub mod link_traffic;
+pub mod machine_selection;
+pub mod machines;
+pub mod message_block_page;
 pub mod model;
 pub mod native_review;
+pub mod node_link;
 pub mod nodes;
-pub mod note_annotation;
-pub mod note_delete;
-pub mod note_page;
+pub mod note_read_bounds;
 pub mod path_utils;
+pub mod placement;
 pub mod process_policy;
+pub mod pull_request_key;
+pub use pull_request_key::{pull_request_key, PullRequestSelector};
 #[doc(hidden)]
 pub mod queue_visibility_contract;
+pub mod remote_launch;
 pub mod replay_preview;
 pub mod repo_ref;
+pub mod review_monitor;
 pub mod script_lists;
 pub mod script_monitor;
 pub mod script_output;
 pub use script_monitor::{ScriptMonitor, ScriptMonitorTrigger};
+pub mod gitlab_child_git;
 pub mod repository_checkout;
 pub mod repository_context;
 #[doc(hidden)]
 pub mod repository_request;
+pub mod repository_resource_pages;
 pub mod secrets;
 pub mod server_control;
 pub mod settings_file;
 pub mod slug;
+pub mod startup;
+pub mod test_isolation;
+pub mod text_field_page;
 pub mod tilde;
 pub(crate) mod traits;
 pub mod transfer;
@@ -68,6 +83,9 @@ pub use agent_configs::{
 pub use agent_logs::{
     agent_logs_root, create_agent_log_dir, current_agent_log_file_name, open_agent_log_file,
     sweep_agent_logs, AGENT_LOG_RETENTION_DAYS,
+};
+pub use agent_tmp::{
+    agent_tmp_root, prepare_agent_tmp_root, sweep_agent_tmp_root, AgentTempDir, AGENT_TMP_ENV_KEYS,
 };
 pub use caller::{
     current_caller, is_human_authored_metadata, project_queue_for_caller,
@@ -82,19 +100,30 @@ pub use clock::{
 };
 pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
-pub use error::{CloneErrorCategory, Error, IdentityProofErrorKind, InviteErrorKind, Result};
+pub use error::{
+    BaseRefreshErrorCategory, BaseRefreshFailure, CloneErrorCategory, Error,
+    IdentityProofErrorKind, InviteErrorKind, PlainFolderPathReason, PlainFolderPathRejection,
+    ProviderProfileFailure, Result,
+};
 pub use events::is_known_event_type;
 pub use git_remote_url::GitRemoteUrl;
 pub use host_membership::{
     HostInvite, HostMember, HostMembershipState, HostRole, InviteScope, PrincipalRevocation,
 };
 pub use ids::{
-    AgentId, ClientId, HookId, NoteId, PrMonitorId, PrincipalId, WorkspaceGitRootId, WorkspaceId,
-    CHIEF_WORKSPACE_ID,
+    AgentId, ClientId, ExecutorCredentialId, HookId, NoteId, PrMonitorId, PrincipalId,
+    WorkspaceGitRootId, WorkspaceId, CHIEF_WORKSPACE_ID,
+};
+pub use message_block_page::{
+    page_message_block, MessageBlockPage, AGENT_MESSAGE_BLOCK_MAX_BYTES, MESSAGE_BLOCK_MAX_BYTES,
+    MESSAGE_BLOCK_MIN_BYTES,
 };
 pub use model::asset_extension_from_mime;
 pub use model::extract_spec_task_ids;
 pub use model::harness_supports_repository_guidance;
+pub use model::harness_uses_repository_monitor_guidance;
+#[doc(hidden)]
+pub use model::harness_versions_after_current;
 pub use model::token_usage_reported;
 pub use model::MessageOrigin;
 pub use model::CURRENT_HARNESS_VERSION;
@@ -103,24 +132,31 @@ pub use model::LAST_SEEN_MESSAGE_ID_KEY;
 pub use model::MAX_DELEGATION_DEPTH;
 pub use model::PENDING_PROPOSALS_KEY;
 pub use model::PENDING_QUESTIONS_MESSAGE_ID_KEY;
+pub use model::PENDING_WORKSPACE_PURGE_NOTICE_KEY;
+pub use model::PROPOSAL_CREATED_WORKSPACES_KEY;
 pub use model::PROPOSAL_OUTCOME_APPLIED;
 pub use model::PROPOSAL_OUTCOME_DISMISSED;
 pub use model::PROPOSAL_RESOLUTIONS_KEY;
+pub use model::REPOSITORY_GUIDANCE_HARNESS_VERSIONS;
+pub use model::REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS;
+pub use model::WORKSPACE_PURGED_STATUS_MESSAGE;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
     cap_json_value, fit_agent_list_frame, format_key_bytes_table, last_tool_use_preview,
-    note_list_slim_row, serialized_key_bytes, slim_body_size, slim_heavy_body,
-    AgentDelegatedCounts, AgentListFrameFit, AgentListRowScope, AgentOrphanedDelegatedCounts,
-    AgentParentDelegatedCounts, AgentScopeCounts, ConversationProjection, NoteListProjection,
-    AGENT_LIST_FRAME_BUDGET_BYTES, AGENT_LIST_NAME_CAP_BYTES, AGENT_LIST_PATH_CAP_BYTES,
-    AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_PREVIEW_FLOOR_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
-    AGENT_LIST_ROW_KEYS, AGENT_LIST_ROW_METADATA_KEYS, NOTE_LIST_PREVIEW_CHARS,
-    SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
+    note_bounded_row, note_list_slim_row, serialized_key_bytes, slim_body_size, slim_heavy_body,
+    truncated_content_len, AgentDelegatedCounts, AgentListFrameFit, AgentListRowScope,
+    AgentOrphanedDelegatedCounts, AgentParentDelegatedCounts, AgentScopeCounts,
+    ConversationProjection, NoteListProjection, AGENT_LIST_FRAME_BUDGET_BYTES,
+    AGENT_LIST_NAME_CAP_BYTES, AGENT_LIST_PATH_CAP_BYTES, AGENT_LIST_PREVIEW_BUDGET_BYTES,
+    AGENT_LIST_PREVIEW_FLOOR_BYTES, AGENT_LIST_ROW_BUDGET_BYTES, AGENT_LIST_ROW_KEYS,
+    AGENT_LIST_ROW_METADATA_KEYS, NOTE_LIST_PREVIEW_CHARS, SLIM_PAGE_BUDGET_BYTES,
+    SLIM_PROJECTION_BUDGET_BYTES,
 };
 pub use model::{chief_prompt_version, CHIEF_PROMPT_VERSION_KEY};
 pub use model::{chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
 pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};
 pub use model::{lift_from_principal_id, FROM_PRINCIPAL_ID_KEY};
+pub use model::{normalize_workspace_label, WORKSPACE_LABEL_MAX_CHARS, WORKSPACE_LABEL_PINNED};
 pub use model::{
     ActorType, AgentActivity, AgentCreateExtra, AgentDelegateInput, AgentLite, AgentMessage,
     AgentMetadata, AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
@@ -129,29 +165,37 @@ pub use model::{
     CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
     CommentRespondResult, CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary,
     CommentType, CommentWire, ContentType, ContextItem, ContextLink, ContextLinkKind, ContextUsage,
-    CreatedTaskEntry, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus, GitAgentCommitResult,
-    GitBranchStatus, GitBranches, GitFileStatus, GitMergeConflicts, GitPullResult, GitStatus, Hook,
-    HookListRow, HookState, HookSummary, KnownRepo, LineAttributionAuthor,
-    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteMetadata,
-    NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
+    CreatedTaskEntry, CrossWorkspaceSearch, DiskUsageBreakdownEntry, Draft, Event, EventActor,
+    EventQueryParams, EventSubscribeResult, EventUnsubscribeResult, FileActivity, FileStatus,
+    GitAgentCommitResult, GitBranchStatus, GitBranches, GitFileStatus, GitMergeConflicts,
+    GitPullResult, GitStatus, Hook, HookListRow, HookState, HookSummary, InitialAgentLaunchFailure,
+    KnownRepo, LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData,
+    LineAttributionInfo, Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult,
+    NoteDeleteResult, NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult,
+    NoteMetadata, NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
     PendingProposal, PrMonitor, PrMonitorState, ProjectType, PullRequestInfo, PullRequestStatus,
-    ReadAssetResult, RepoConfig, RepoScript, RepoScriptCategory, RepoScriptMode, SaveAssetResult,
-    Script, ScriptArchiveFilter, ScriptCreateParams, ScriptLastRun, ScriptMode, ScriptPurpose,
-    ScriptRunOutcome, ScriptRuntimeState, ScriptStatus, SessionStats, SetupScript,
-    SetupScriptGeneratedBy, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
-    TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
-    TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
-    TaskSubtask, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
+    PullRequestWorkspace, ReadAssetResult, RepoConfig, RepoScript, RepoScriptCategory,
+    RepoScriptMode, SaveAssetResult, Script, ScriptArchiveFilter, ScriptCreateParams,
+    ScriptLastRun, ScriptMode, ScriptPurpose, ScriptRemoteAuthor, ScriptRunOutcome,
+    ScriptRuntimeState, ScriptStatus, SessionStats, SetupScript, SetupScriptGeneratedBy,
+    TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult, TaskCreatePrerequisiteResult,
+    TaskGetMyTaskResult, TaskListPage, TaskListResult, TaskMarkAsTaskResult, TaskMetadata,
+    TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus, TaskSubtask,
+    TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult, TokenUsage,
     TokenUsageCrossFilterRow, TokenUsageTotals, TopChangedFile, UsageCost, Workspace,
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
-    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateResult, WorkspaceDiskUsage,
-    WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot, WorkspaceGitRootSource,
-    WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
-    WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
+    WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateOrigin,
+    WorkspaceCreateOriginRequest, WorkspaceCreateProposalOutcome, WorkspaceCreateResult,
+    WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot,
+    WorkspaceGitRootSource, WorkspaceListFilter, WorkspaceSetupState, WorkspaceSetupStatus,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    PROPOSAL_ORIGIN_NOT_RESOLVED, SUPPORTED_ASSET_MIME_TYPES,
+};
+pub use model::{
+    AgentListPage, AgentListSelection, AGENT_LIST_DEFAULT_LIMIT, AGENT_LIST_MAX_LIMIT,
+    AGENT_LIST_PAGE_BUDGET_BYTES, AGENT_QUEUE_DEFAULT_LIMIT, AGENT_QUEUE_MAX_LIMIT,
+    AGENT_QUEUE_PAGE_BUDGET_BYTES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use model::{
@@ -161,6 +205,10 @@ pub use model::{
 pub use model::{
     InvitePin, InviteProofClaim, Principal, PrincipalCredential, PrincipalIdentity,
     WorkspaceInvite, WorkspaceMember, WorkspaceMembership, WorkspaceRole,
+};
+pub use model::{
+    WorkspacePage, WORKSPACE_LIST_BUDGET_BYTES, WORKSPACE_LIST_DEFAULT_LIMIT,
+    WORKSPACE_LIST_MAX_LIMIT,
 };
 pub use model::{
     WORKSPACE_LIST_PR_CAP, WORKSPACE_LIST_PR_KEYS, WORKSPACE_LIST_ROW_BUDGET_BYTES,
@@ -193,11 +241,14 @@ pub use settings_file::{
 };
 pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};
 pub use traits::{
-    AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, PublishEvent,
-    ResolvedClient, RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError,
-    ReverseLiveClient, ReverseTarget, WorkspaceApi,
+    AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, GitDiffPage,
+    PublishEvent, ResolvedClient, RetrieveRequest, RetrieveResult, RetrievedItem,
+    ReverseClientConnections, ReverseConnectionInfo, ReverseConnectionSnapshot,
+    ReverseDispatchError, ReverseLiveClient, ReverseRoute, ReverseTarget, WorkspaceApi,
 };
 pub use turn_attachments::{
     is_workspace_api_input, new_attachment_id, AttachmentPolicy, TurnAttachment,
     TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
 };
+
+pub mod desktop;

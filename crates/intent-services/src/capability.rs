@@ -54,11 +54,6 @@ use crate::Services;
 #[cfg(test)]
 mod host_role_tests;
 
-#[cfg(test)]
-pub(crate) fn reran_unarmed(test: &str) -> bool {
-    tests::reran_unarmed(test)
-}
-
 /// The log line an unbound gate evaluation emits (once per gate per process).
 pub const UNBOUND_GATE_LOG: &str = "capability gate evaluated without a bound Caller; refusing";
 
@@ -77,13 +72,19 @@ pub const ASSERT_BOUND_CALLER_ENV: &str = "INTENTD_ASSERT_BOUND_CALLER";
 /// request is refused: `Forbidden`, logged once per `gate` per process so a
 /// missed spawn binding shows up in the daemon log — and, under
 /// [`ASSERT_BOUND_CALLER_ENV`], fatal to the process.
-pub(crate) fn gated_collaborator_caller(gate: &str) -> Result<Option<PrincipalId>> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn gated_collaborator_caller(gate: &str) -> Result<Option<PrincipalId>> {
     match current_caller() {
         Some(Caller::Wire {
             principal_id,
             host_role: intent_core::HostRole::Member | intent_core::HostRole::Guest,
         }) => Ok(Some(principal_id)),
         Some(Caller::Wire { .. } | Caller::Agent { .. } | Caller::Daemon) => Ok(None),
+        // Never ungated: an executor credential has no method authority.
+        Some(Caller::Executor { .. }) => Err(crate::principal_ops::executor_forbidden()),
         None => {
             static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
             let first = WARNED
@@ -172,7 +173,11 @@ impl Services {
 
     /// Member+ gate for a workspace-scoped read / steer / edit. A
     /// collaborator who is not a member gets `NotFound`.
-    pub(crate) async fn require_member(&self, workspace_id: &WorkspaceId) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_member(&self, workspace_id: &WorkspaceId) -> Result<()> {
         if let Some(principal_id) = gated_collaborator_caller("member")? {
             match self.store.get_host_role(&principal_id).await {
                 Ok(HostRole::Owner) => return Ok(()),
@@ -203,7 +208,11 @@ impl Services {
 
     /// Shared host execution and safe host reads. The current durable role,
     /// not a repository identity or the role cached at admission, grants it.
-    pub(crate) async fn require_host_execution(&self, what: &str) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_host_execution(&self, what: &str) -> Result<()> {
         let Some(principal_id) = gated_collaborator_caller(what)? else {
             return Ok(());
         };
@@ -216,7 +225,11 @@ impl Services {
     /// Workspace management is independent of daemon administration. Keep
     /// the existing explicit workspace-owner path; inherited host membership
     /// applies only to ordinary workspaces and overrides retained guest rows.
-    pub(crate) async fn require_workspace_manager(
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_workspace_manager(
         &self,
         workspace_id: &WorkspaceId,
         what: &str,
@@ -239,14 +252,100 @@ impl Services {
         self.require_owner(workspace_id, what).await
     }
 
+    /// Scoped authority for agent creation and operating saved scripts. Never
+    /// use for terminal access, arbitrary execution, sharing or workspace CRUD.
+    /// Returns whether this is a restricted Manager guest (for field checks).
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_workspace_operator(
+        &self,
+        workspace_id: &WorkspaceId,
+        what: &str,
+    ) -> Result<bool> {
+        if let Some(principal_id) = gated_collaborator_caller(what)? {
+            if self.store.get_host_role(&principal_id).await? == HostRole::Guest {
+                match self
+                    .store
+                    .get_workspace_member_role(workspace_id, &principal_id)
+                    .await?
+                {
+                    Some(WorkspaceRole::Manager) => return Ok(true),
+                    Some(WorkspaceRole::Collaborator) => {
+                        return Err(Error::Forbidden(format!(
+                            "{what} requires a workspace Manager"
+                        )))
+                    }
+                    None => return Err(not_a_member(workspace_id)),
+                    Some(WorkspaceRole::Owner) => {}
+                }
+            }
+        }
+        self.require_workspace_manager(workspace_id, what).await?;
+        Ok(false)
+    }
+
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_saved_script_operator(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+        what: &str,
+    ) -> Result<()> {
+        if self.require_workspace_operator(workspace_id, what).await? {
+            let script = self
+                .store
+                .get_script_in_workspace(workspace_id, script_id)
+                .await?
+                .ok_or_else(|| Error::NotFound("script".into()))?;
+            if script.purpose != intent_core::ScriptPurpose::Saved {
+                return Err(Error::Forbidden(format!("{what} requires a saved script")));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn workspace_members_set_role_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+        role: WorkspaceRole,
+    ) -> Result<Value> {
+        self.require_owner(workspace_id, "workspace.members.setRole")
+            .await?;
+        self.store.get_workspace(workspace_id).await?;
+        let actor = gated_collaborator_caller("workspace.members.setRole")?;
+        let changed = self
+            .store
+            .set_workspace_guest_role(workspace_id, principal_id, role, actor.as_ref())
+            .await?;
+        if changed {
+            crate::publish_event(
+                self.event_bus.as_ref(),
+                crate::workspace_updated_event(
+                    workspace_id,
+                    &json!({"members":true,"rolePrincipalId":principal_id,"role":role}),
+                ),
+            )
+            .await;
+        }
+        Ok(
+            json!({"workspaceId":workspace_id,"principalId":principal_id,"role":role,"changed":changed}),
+        )
+    }
+
     /// Owner-only gate. A collaborator member gets `Forbidden`; a non-member
     /// `NotFound`.
     pub(crate) async fn require_owner(&self, workspace_id: &WorkspaceId, what: &str) -> Result<()> {
         match self.collaborator_role(workspace_id, what).await? {
             None | Some((_, Some(WorkspaceRole::Owner))) => Ok(()),
-            Some((_, Some(WorkspaceRole::Collaborator))) => Err(Error::Forbidden(format!(
-                "{what} requires the workspace owner"
-            ))),
+            Some((_, Some(WorkspaceRole::Collaborator | WorkspaceRole::Manager))) => Err(
+                Error::Forbidden(format!("{what} requires the workspace owner")),
+            ),
             Some((_, None)) => Err(not_a_member(workspace_id)),
         }
     }
@@ -270,13 +369,18 @@ impl Services {
             .store
             .get_agent_session_summary(agent_id)
             .await?
-            .workspace_id)
+            .workspace_id
+            .clone())
     }
 
     /// Member+ gate keyed by agent: resolves the agent's workspace (one point
     /// read, collaborator callers only) and requires membership there. An
     /// unknown agent is `NotFound` either way.
-    pub(crate) async fn require_agent_member(&self, agent_id: &AgentId) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_agent_member(&self, agent_id: &AgentId) -> Result<()> {
         if gated_collaborator_caller("member")?.is_none() {
             return Ok(());
         }
@@ -319,11 +423,11 @@ impl Services {
 
     /// PTY ids are host-global. Resolve their workspace before admitting a
     /// member; an ACP session-scoped PTY is not a workspace terminal.
-    pub(crate) async fn require_terminal_manager(
-        &self,
-        terminal_id: &str,
-        what: &str,
-    ) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_terminal_manager(&self, terminal_id: &str, what: &str) -> Result<()> {
         if gated_collaborator_caller(what)?.is_none() {
             return Ok(());
         }
@@ -333,47 +437,6 @@ impl Services {
         let workspace_id = WorkspaceId::from(info.scope.as_str());
         self.require_workspace_manager(&workspace_id, what).await?;
         self.store.get_workspace(&workspace_id).await.map(|_| ())
-    }
-
-    /// Chunk/session handles never confer another authenticated person's
-    /// transfer authority. Reconnects retain access through the same principal.
-    pub(crate) async fn require_import_actor(&self, id: &str, what: &str) -> Result<()> {
-        self.require_host_execution(what).await?;
-        let Some(principal) = gated_collaborator_caller(what)? else {
-            return Ok(());
-        };
-        let imports = self
-            .transfer_imports
-            .lock()
-            .expect("transfer import registry poisoned");
-        if imports
-            .get(id)
-            .is_some_and(|s| s.initiator.as_ref() != Some(&principal))
-        {
-            return Err(Error::NotFound(format!("import {id}")));
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn require_export_actor(&self, id: &str, what: &str) -> Result<()> {
-        let Some(principal) = gated_collaborator_caller(what)? else {
-            return Ok(());
-        };
-        let session = self
-            .transfer_exports
-            .lock()
-            .expect("transfer export registry poisoned")
-            .get(id)
-            .map(|s| (s.workspace_id.clone(), s.initiator.clone()));
-        let Some((workspace, initiator)) = session else {
-            self.require_host_execution(what).await?;
-            return Ok(());
-        };
-        self.require_workspace_manager(&workspace, what).await?;
-        if initiator.as_ref() != Some(&principal) {
-            return Err(Error::NotFound(format!("export {id}")));
-        }
-        Ok(())
     }
 
     /// Path-based `git.*` gate (`git.getBranches` / `branchStatus` / `pull` /
@@ -792,7 +855,11 @@ impl Services {
         workspace_id: &WorkspaceId,
         principal_id: &PrincipalId,
     ) {
-        let sessions = match self.store.list_agent_sessions(workspace_id).await {
+        let sessions = match self
+            .store
+            .list_agent_sessions_with_transcripts(workspace_id)
+            .await
+        {
             Ok(sessions) => sessions,
             Err(e) => {
                 tracing::warn!(error = %e, workspace = %workspace_id, "members.remove: agent list failed; queued messages kept");
@@ -832,21 +899,10 @@ mod sharing_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    pub(super) use crate::test_support::capability_fixtures::{fixture, Role};
     use crate::tests::{workspace, TempDb};
-    use intent_core::{now_iso, with_caller, Principal, WorkspaceApi};
+    use intent_core::{with_caller, WorkspaceApi};
     use intent_store::Store;
-    use std::future::Future;
-
-    /// The caller roles of the matrix, one column each.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Role {
-        Administrator,
-        Owner,
-        Collaborator,
-        NonMember,
-        Agent,
-        Daemon,
-    }
 
     const ROLES: [Role; 6] = [
         Role::Administrator,
@@ -857,105 +913,6 @@ mod tests {
         Role::Daemon,
     ];
 
-    /// One workspace with a non-administrator **owner** (the primary is
-    /// demoted so the one-owner index admits the promotion), a collaborator
-    /// member, and a principal with no membership.
-    struct Fixture {
-        services: Services,
-        ws: WorkspaceId,
-        other_ws: WorkspaceId,
-        primary: PrincipalId,
-        owner: PrincipalId,
-        collaborator: PrincipalId,
-        outsider: PrincipalId,
-    }
-
-    fn principal(login: &str) -> Principal {
-        Principal {
-            id: PrincipalId::new(),
-            identity: None,
-            github_user_id: None,
-            login: Some(login.to_string()),
-            display_name: Some(format!("{login} name")),
-            avatar_url: None,
-            is_primary: false,
-            created_at: now_iso(),
-            updated_at: now_iso(),
-        }
-    }
-
-    async fn fixture(tmp: &TempDb) -> Fixture {
-        let store = Store::open(&tmp.path).await.expect("open store");
-        let ws = WorkspaceId::new();
-        store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let other_ws = WorkspaceId::new();
-        store
-            .insert_workspace(&workspace(&other_ws))
-            .await
-            .expect("other ws");
-        let primary = store.get_primary_principal().await.expect("primary").id;
-        let (owner, collaborator, outsider) = (
-            principal("owner"),
-            principal("collab"),
-            principal("outsider"),
-        );
-        for p in [&owner, &collaborator, &outsider] {
-            store.upsert_principal(p).await.expect("principal");
-        }
-        store
-            .set_workspace_member_role(&ws, &primary, WorkspaceRole::Collaborator)
-            .await
-            .expect("demote primary");
-        store
-            .add_workspace_member(&ws, &owner.id, WorkspaceRole::Owner)
-            .await
-            .expect("owner");
-        store
-            .add_workspace_member(&ws, &collaborator.id, WorkspaceRole::Collaborator)
-            .await
-            .expect("collaborator");
-        let workspaces_root = tmp.path.parent().expect("temp db dir").join("workspaces");
-        Fixture {
-            services: Services::new(store).with_workspaces_root(workspaces_root),
-            ws,
-            other_ws,
-            primary,
-            owner: owner.id,
-            collaborator: collaborator.id,
-            outsider: outsider.id,
-        }
-    }
-
-    impl Fixture {
-        fn caller(&self, role: Role) -> Caller {
-            let wire = |principal_id: &PrincipalId, is_administrator| Caller::Wire {
-                principal_id: principal_id.clone(),
-                host_role: if is_administrator {
-                    intent_core::HostRole::Owner
-                } else {
-                    intent_core::HostRole::Guest
-                },
-            };
-            match role {
-                Role::Administrator => wire(&self.primary, true),
-                Role::Owner => wire(&self.owner, false),
-                Role::Collaborator => wire(&self.collaborator, false),
-                Role::NonMember => wire(&self.outsider, false),
-                Role::Agent => Caller::Agent {
-                    agent_id: AgentId::new(),
-                },
-                Role::Daemon => Caller::Daemon,
-            }
-        }
-
-        async fn run<T, F>(&self, role: Role, f: F) -> Result<T>
-        where
-            F: Future<Output = Result<T>>,
-        {
-            with_caller(self.caller(role), f).await
-        }
-    }
-
     /// Collapse a guarded call's outcome to the matrix cell it should land
     /// on: `ok`, `forbidden` (`-32003`) or `not-found` (membership hidden).
     fn cell<T>(r: &Result<T>) -> &'static str {
@@ -965,6 +922,28 @@ mod tests {
             Err(Error::NotFound(_)) => "not-found",
             Err(e) => panic!("unexpected error class: {e}"),
         }
+    }
+
+    /// An executor credential has no method authority: the collaborator
+    /// gate refuses it instead of treating it as unconstrained, and so does
+    /// a member-class guard behind it.
+    #[tokio::test]
+    async fn executor_callers_are_refused_not_ungated() {
+        let tmp = TempDb::new();
+        let f = fixture(&tmp).await;
+        let executor = Caller::Executor {
+            credential_id: intent_core::ExecutorCredentialId::new(),
+            backend_id: "backend-1".into(),
+        };
+        let gate = with_caller(executor.clone(), async {
+            gated_collaborator_caller("test")
+        })
+        .await;
+        assert!(matches!(gate, Err(Error::Forbidden(_))), "{gate:?}");
+        let guard = with_caller(executor.clone(), f.services.require_member(&f.ws)).await;
+        assert_eq!(cell(&guard), "forbidden");
+        let read = with_caller(executor, f.services.get_workspace(f.ws.clone())).await;
+        assert_eq!(cell(&read), "forbidden");
     }
 
     /// Member+ (Read / Steer & edit): every member and every bound
@@ -1213,7 +1192,10 @@ mod tests {
             ),
             (
                 "workspace.list",
-                f.services.list_workspaces(true).await.map(drop),
+                f.services
+                    .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                    .await
+                    .map(drop),
             ),
             (
                 "workspace.delete",
@@ -1464,7 +1446,10 @@ mod tests {
         let services = f.services.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         drop(tokio::spawn(async move {
-            let outcome = services.list_workspaces(true).await.map(|w| w.len());
+            let outcome = services
+                .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .map(|w| w.len());
             let _ = tx.send(format!("{outcome:?}"));
         }));
         let outcome = rx.await.expect("detached task reported");
@@ -1542,7 +1527,11 @@ mod tests {
         let f = fixture(&tmp).await;
         for role in ROLES {
             let listed: HashSet<WorkspaceId> = f
-                .run(role, f.services.list_workspaces(true))
+                .run(
+                    role,
+                    f.services
+                        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED),
+                )
                 .await
                 .expect("workspace.list")
                 .into_iter()
@@ -1573,6 +1562,62 @@ mod tests {
             .is_none());
     }
 
+    /// `workspace.findByPullRequest` is narrowed exactly like `workspace.list`:
+    /// with both fixture workspaces linked to one PR, a collaborator sees
+    /// only its member workspace and a non-member nothing; administrators,
+    /// agents and the daemon see both, most recently linked first. A non-PR
+    /// URL is `InvalidParams` for every caller.
+    #[tokio::test]
+    async fn find_by_pull_request_visibility_by_role() {
+        const PR: &str = "https://github.com/intent-hq/intentd/pull/7";
+        let tmp = TempDb::new();
+        let f = fixture(&tmp).await;
+        for ws in [&f.other_ws, &f.ws] {
+            sqlx::query("UPDATE workspace SET pr_url = ? WHERE id = ?")
+                .bind(PR)
+                .bind(ws.as_str())
+                .execute(f.services.store().write_pool())
+                .await
+                .expect("link workspace");
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+        for role in ROLES {
+            let found: Vec<WorkspaceId> = f
+                .run(
+                    role,
+                    f.services
+                        .find_workspaces_by_pull_request(format!("{PR}/files"), false),
+                )
+                .await
+                .expect("workspace.findByPullRequest")
+                .into_iter()
+                .map(|w| w.id)
+                .collect();
+            match role {
+                Role::Owner | Role::Collaborator => {
+                    assert_eq!(found, std::slice::from_ref(&f.ws), "{role:?}");
+                }
+                Role::NonMember => assert!(found.is_empty(), "{role:?}: {found:?}"),
+                Role::Administrator | Role::Agent | Role::Daemon => {
+                    assert_eq!(found, [f.ws.clone(), f.other_ws.clone()], "{role:?}");
+                }
+            }
+            let bad = f
+                .run(
+                    role,
+                    f.services.find_workspaces_by_pull_request(
+                        "https://github.com/o/r/issues/7".into(),
+                        false,
+                    ),
+                )
+                .await;
+            assert!(
+                matches!(bad, Err(Error::InvalidParams(_))),
+                "{role:?}: {bad:?}"
+            );
+        }
+    }
+
     /// `workspace.members.list` by the primary user whose cached row has no
     /// GitHub login spawns the same rate-limited background identity
     /// refresh `principal.me` does (intent-hq/intent#5534). The stub's
@@ -1600,11 +1645,11 @@ mod tests {
         let forge = std::sync::Arc::new(crate::tests::pr::StubForge::with_get_user_gate(
             gate.clone(),
         ));
-        let services = Services::new(store.clone()).with_source_control(forge.clone());
+        let services = Services::new_isolated(store.clone()).with_source_control(forge.clone());
         let (services, primary, ws) = (&services, &primary, &ws);
         let list = |what: &'static str| async move {
             tokio::time::timeout(
-                Duration::from_secs(1),
+                intentd_test_support::test_timeout(Duration::from_secs(1)),
                 with_caller(
                     Caller::Wire {
                         principal_id: primary.id.clone(),
@@ -1624,11 +1669,14 @@ mod tests {
         let first = list("first list").await;
         assert_eq!(first["members"][0]["principalId"], json!(primary.id.0));
         assert_eq!(first["members"][0]["login"], Value::Null);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while fetches() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while fetches() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("the refresh was spawned");
 
@@ -1657,15 +1705,18 @@ mod tests {
         // Open the gate: the detached refresh completes and persists the
         // identity; a later list carries it.
         gate.add_permits(1);
-        let attached = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let p = store.get_primary_principal().await.expect("primary");
-                if p.login.is_some() {
-                    break p;
+        let attached = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                loop {
+                    let p = store.get_primary_principal().await.expect("primary");
+                    if p.login.is_some() {
+                        break p;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+            },
+        )
         .await
         .expect("the background refresh attaches the identity");
         assert_eq!(attached.login.as_deref(), Some("octocat"));
@@ -1783,10 +1834,13 @@ mod tests {
         let added = add(&f.outsider).await.expect("add");
         // owner + demoted primary + collaborator + the new guest
         assert_eq!(added, json!({ "added": true, "memberCount": 4 }));
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-            .await
-            .expect("event in time")
-            .expect("event batch");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            events.recv(),
+        )
+        .await
+        .expect("event in time")
+        .expect("event batch");
         let ev = batch
             .iter()
             .find(|e| e.data["changes"]["addedPrincipalId"] == json!(f.outsider.0))
@@ -1806,9 +1860,12 @@ mod tests {
         let again = add(&f.outsider).await.expect("add again");
         assert_eq!(again, json!({ "added": false, "memberCount": 4 }));
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(300), events.recv())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_millis(300)),
+                events.recv()
+            )
+            .await
+            .is_err(),
             "an idempotent add publishes nothing"
         );
 
@@ -1827,9 +1884,12 @@ mod tests {
             "{seated_revoked:?}"
         );
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(300), events.recv())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_millis(300)),
+                events.recv()
+            )
+            .await
+            .is_err(),
             "a refused add publishes nothing"
         );
         assert_eq!(

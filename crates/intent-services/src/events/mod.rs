@@ -8,6 +8,7 @@ pub mod filter;
 pub(crate) mod git_metadata_watcher;
 pub mod git_status_refresher;
 pub(crate) mod linked_watch;
+pub mod monitor_delivery;
 pub mod registry;
 mod root_watch;
 pub(crate) mod shared_watch;
@@ -15,7 +16,7 @@ pub(crate) mod skills_watcher;
 pub(crate) mod specialists_watcher;
 pub mod watcher;
 
-pub use bus::{Delivery, EventBus, InvalidationSubscription, Subscription};
+pub use bus::{Delivery, EventBus, FenceHandle, Subscription};
 pub use filter::{event_type_matches, SubscriptionFilter};
 pub(crate) use filter::{
     is_agent_restricted_event_type, resolve_event_types, resolve_event_types_for_agent,

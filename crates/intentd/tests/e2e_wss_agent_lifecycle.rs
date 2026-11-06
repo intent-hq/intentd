@@ -19,8 +19,9 @@ mod creation_preferences;
 #[path = "e2e_wss_agent_lifecycle/structured_notices.rs"]
 mod structured_notices;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,27 +43,13 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 /// Live `intentd serve` process; killed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kill the whole process group (daemon + any Node.js ACP provider
-        // children) BEFORE removing the data dir, so an orphaned child can't
-        // re-create files (e.g. node-compile-cache under a redirected TMPDIR)
-        // after cleanup. The daemon is spawned with process_group(0).
-        #[cfg(unix)]
-        {
-            use nix::sys::signal::{self, Signal};
-            use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id().cast_signed());
-            let _ = signal::killpg(pid, Signal::SIGKILL);
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
+        // Kills the daemon's process group (ACP providers run in their own groups).
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -83,12 +70,6 @@ fn lifecycle_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    // Group leader so Daemon::drop can killpg the daemon + ACP children.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -96,10 +77,8 @@ fn lifecycle_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std
     cmd
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
-    lifecycle_command(data_dir, listen, env)
-        .spawn()
-        .expect("spawn intentd serve")
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
+    GuardedChild::spawn(&mut lifecycle_command(data_dir, listen, env)).expect("spawn intentd serve")
 }
 
 /// Wait for the daemon's UDS to accept connections, up to the shared
@@ -218,9 +197,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -244,9 +226,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -272,7 +257,8 @@ async fn wss_event_opt<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Option<Valu
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     wss_event_opt_until(ws, deadline).await
 }
 
@@ -317,9 +303,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss push timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss push timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -960,32 +949,35 @@ async fn text_block_media_sidecar_over_wss() {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        timeout(Duration::from_secs(30), async {
-            let mut live: Vec<Value> = Vec::new();
-            loop {
-                let frame = wss_push(chat, 30).await;
-                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-                let delta = &frame["params"]["delta"];
-                let entities = delta["added"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .chain(delta["updated"].as_array().into_iter().flatten())
-                    .filter(|e| {
-                        e["agentId"] == agent_id
-                            && e["role"] == "assistant"
-                            && e["block"]["type"] == "text"
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for entity in entities {
-                    if entity["streamingComplete"] == true {
-                        return (live, entity);
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                let mut live: Vec<Value> = Vec::new();
+                loop {
+                    let frame = wss_push(chat, 30).await;
+                    assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                    let delta = &frame["params"]["delta"];
+                    let entities = delta["added"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .chain(delta["updated"].as_array().into_iter().flatten())
+                        .filter(|e| {
+                            e["agentId"] == agent_id
+                                && e["role"] == "assistant"
+                                && e["block"]["type"] == "text"
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for entity in entities {
+                        if entity["streamingComplete"] == true {
+                            return (live, entity);
+                        }
+                        live.push(entity);
                     }
-                    live.push(entity);
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("chat channel settled the text block")
     }
@@ -1569,21 +1561,24 @@ async fn open_tool_call_suppresses_stall_status_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    let tool_statuses = timeout(Duration::from_secs(30), async {
-        let mut frames: Vec<Value> = Vec::new();
-        loop {
-            let frame = wss_event(&mut sub, 30).await;
-            let ev = &frame["params"]["event"];
-            if ev["data"]["agentId"].as_str() != Some(tool_id.as_str()) {
-                continue;
+    let tool_statuses = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            let mut frames: Vec<Value> = Vec::new();
+            loop {
+                let frame = wss_event(&mut sub, 30).await;
+                let ev = &frame["params"]["event"];
+                if ev["data"]["agentId"].as_str() != Some(tool_id.as_str()) {
+                    continue;
+                }
+                match ev["type"].as_str() {
+                    Some("agent:stream:status") => frames.push(ev["data"].clone()),
+                    Some("agent:stream:end") => return frames,
+                    _ => {}
+                }
             }
-            match ev["type"].as_str() {
-                Some("agent:stream:status") => frames.push(ev["data"].clone()),
-                Some("agent:stream:end") => return frames,
-                _ => {}
-            }
-        }
-    })
+        },
+    )
     .await
     .expect("tool turn reached its terminal stream:end in time");
     let stalled: Vec<&Value> = tool_statuses
@@ -1606,21 +1601,24 @@ async fn open_tool_call_suppresses_stall_status_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    let control_statuses = timeout(Duration::from_secs(30), async {
-        let mut frames: Vec<Value> = Vec::new();
-        loop {
-            let frame = wss_event(&mut sub, 30).await;
-            let ev = &frame["params"]["event"];
-            if ev["data"]["agentId"].as_str() != Some(control_id.as_str()) {
-                continue;
+    let control_statuses = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            let mut frames: Vec<Value> = Vec::new();
+            loop {
+                let frame = wss_event(&mut sub, 30).await;
+                let ev = &frame["params"]["event"];
+                if ev["data"]["agentId"].as_str() != Some(control_id.as_str()) {
+                    continue;
+                }
+                match ev["type"].as_str() {
+                    Some("agent:stream:status") => frames.push(ev["data"].clone()),
+                    Some("agent:stream:end") => return frames,
+                    _ => {}
+                }
             }
-            match ev["type"].as_str() {
-                Some("agent:stream:status") => frames.push(ev["data"].clone()),
-                Some("agent:stream:end") => return frames,
-                _ => {}
-            }
-        }
-    })
+        },
+    )
     .await
     .expect("control turn reached its terminal stream:end in time");
     let stalled: Vec<&Value> = control_statuses
@@ -1730,21 +1728,24 @@ async fn open_tool_call_provider_stall_fails_turn_over_wss() {
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
     // Collect this agent's frames until agent:failed rides the wire.
-    let events = timeout(Duration::from_secs(30), async {
-        let mut events: Vec<Value> = Vec::new();
-        loop {
-            let frame = wss_event(&mut sub, 30).await;
-            let ev = &frame["params"]["event"];
-            if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
-                continue;
+    let events = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            let mut events: Vec<Value> = Vec::new();
+            loop {
+                let frame = wss_event(&mut sub, 30).await;
+                let ev = &frame["params"]["event"];
+                if ev["data"]["agentId"].as_str() != Some(agent_id.as_str()) {
+                    continue;
+                }
+                let done = ev["type"] == json!("agent:failed");
+                events.push(ev.clone());
+                if done {
+                    return events;
+                }
             }
-            let done = ev["type"] == json!("agent:failed");
-            events.push(ev.clone());
-            if done {
-                return events;
-            }
-        }
-    })
+        },
+    )
     .await
     .expect("hung open tool call fails the turn within the lowered terminal threshold");
     let types: Vec<&str> = events
@@ -2318,7 +2319,7 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
         .await
         .unwrap();
     let id = intent_core::AgentId(agent_id.clone());
-    let mut seeded = store.get_agent_session(&id).await.unwrap();
+    let mut seeded = store.get_agent_session_with_transcript(&id).await.unwrap();
     let old = "2020-01-01T00:00:00.000Z";
     seeded.updated_at = old.to_string();
     store
@@ -2518,6 +2519,161 @@ async fn agent_notifications_muted_round_trip_and_idle_stamp_over_wss() {
     );
 }
 
+/// Per-agent sidebar `pinned` (PROTOCOL §5.5): `agent.update { changes:
+/// { pinned } }` persists the daemon-owned pin, returns it on the
+/// `AgentLite`, emits `agent:updated` carrying the change, never advances
+/// `updatedAt` (a preference, not activity), and rejects a non-boolean with
+/// `-32602`. `AgentLite` (`agent.create` / `agent.update` / `agent.get` /
+/// `agent.list`) always carries the boolean — its presence is the support
+/// signal — while `agent.getSession` serves it only when `true`.
+#[tokio::test]
+async fn agent_pinned_round_trip_over_wss() {
+    let Some(script) = gate("WSS pinned E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    let env: [(&str, &str); 2] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS-Pinned", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    assert_eq!(
+        created["agent"]["pinned"],
+        json!(false),
+        "fresh agent is unpinned and the field is present: {created}"
+    );
+    let fresh_session = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        fresh_session["session"].get("pinned").is_none(),
+        "agent.getSession omits an unset pin: {fresh_session}"
+    );
+
+    let rejected = wss_rpc_envelope(
+        &mut rpc,
+        11,
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "pinned": "yes" } }),
+    )
+    .await;
+    assert_eq!(
+        rejected["error"]["code"],
+        json!(-32602),
+        "non-boolean pinned is -32602: {rejected}"
+    );
+
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .unwrap();
+    let id = intent_core::AgentId(agent_id.clone());
+    let mut seeded = store.get_agent_session_with_transcript(&id).await.unwrap();
+    let old = "2020-01-01T00:00:00.000Z";
+    seeded.updated_at = old.to_string();
+    store
+        .update_agent_session(&seeded.workspace_id, &seeded)
+        .await
+        .unwrap();
+
+    for (rpc_id, pinned) in [(20, true), (21, true), (22, false), (23, true)] {
+        let response = wss_rpc_envelope(
+            &mut rpc,
+            rpc_id,
+            "agent.update",
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "pinned": pinned } }),
+        )
+        .await;
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], rpc_id);
+        assert_eq!(response["result"]["success"], true, "{response}");
+        let agent = &response["result"]["agent"];
+        assert_eq!(agent["updatedAt"], old, "pin is not activity: {agent}");
+        assert_eq!(agent["pinned"], json!(pinned), "{agent}");
+        let mut received = false;
+        for _ in 0..40 {
+            let frame = wss_event(&mut sub, 30).await;
+            let ev = &frame["params"]["event"];
+            if ev["type"] == "agent:updated" && ev["data"]["agentId"] == agent_id {
+                assert_eq!(ev["data"]["pinned"], json!(pinned), "{ev}");
+                assert!(ev["data"].get("updatedAt").is_none());
+                received = true;
+                break;
+            }
+        }
+        assert!(received, "pin change emits agent:updated");
+    }
+
+    let got = wss_rpc(
+        &mut rpc,
+        30,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(got["agent"]["pinned"], json!(true), "{got}");
+    assert_eq!(got["agent"]["updatedAt"], old, "{got}");
+    let list = wss_rpc(&mut rpc, 31, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let listed = list["agents"]
+        .as_array()
+        .expect("agents array")
+        .iter()
+        .find(|a| a["id"] == json!(agent_id))
+        .expect("pinned agent listed")
+        .clone();
+    assert_eq!(listed["pinned"], json!(true), "{listed}");
+    let session = wss_rpc(
+        &mut rpc,
+        32,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(session["session"]["pinned"], json!(true), "{session}");
+}
+
 /// Direct user retirement cancels a real parked ACP turn over authenticated
 /// WSS and preserves the streamed conversation without sending a model message.
 #[intent_test_macros::daemon_test]
@@ -2573,6 +2729,15 @@ async fn agent_retire_stops_running_turn_over_wss() {
         .as_str()
         .expect("agent id")
         .to_string();
+    // A peer top-level agent, so the last-top-level guard allows the retire.
+    let peer = wss_rpc(
+        &mut rpc,
+        9_001,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "WSS peer", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    assert!(peer["agent"]["id"].is_string(), "peer created: {peer}");
 
     let sent = wss_rpc(
         &mut rpc,
@@ -3052,7 +3217,8 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
     // failure is diagnosable from the runner output alone. No RPC in the
     // diagnostic path: after 120s of not reading `rpc` its heartbeat pongs
     // stopped, so the server may have dropped that connection already.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(120));
     let mut seen_events: Vec<Value> = Vec::new();
     loop {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
@@ -3123,7 +3289,8 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
     // otherwise keep resetting a per-read window.
     let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": agent_id })).await;
     assert_eq!(stopped["success"], true, "stop ok: {stopped}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     loop {
         let frame = wss_event_opt_until(&mut sub, deadline)
             .await
@@ -3162,7 +3329,8 @@ async fn agent_lite_live_turn_preview_overlay_over_wss() {
     )
     .await;
     assert_eq!(resumed["success"], true, "resume sendMessage ok: {resumed}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     loop {
         let frame = wss_event_opt_until(&mut sub, deadline)
             .await
@@ -5054,7 +5222,8 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     let mut child_idle = false;
     let mut child_idle_data: Option<serde_json::Value> = None;
     let mut parent_wake_ends = 0u32;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     while !(parent_idle_count >= 2 && parent_wake_ends >= 1 && child_idle) {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!(
@@ -5330,7 +5499,8 @@ async fn linked_agent_cannot_reopen_terminal_task_over_wss() {
 
     let mut task_events: Vec<Value> = Vec::new();
     let mut idle = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     while !idle {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!("timed out waiting for the agent's terminal agent:idle: {task_events:?}")
@@ -5517,7 +5687,8 @@ async fn attention_request_discussion_over_wss() {
     let mut direct_task_changed = false;
     let mut attention_task_changed: Option<Value> = None;
     let mut idle = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     while !(attention.is_some()
         && raise_updated
         && system_message
@@ -5684,7 +5855,8 @@ async fn attention_request_discussion_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     loop {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!("timed out waiting for attentionRequestCleared")
@@ -5735,7 +5907,8 @@ async fn attention_request_discussion_over_wss() {
     assert_eq!(sent["success"], true, "re-raise sendMessage ok: {sent}");
     let mut re_raised = false;
     let mut idle = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     while !(re_raised && idle) {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!("timed out waiting for the re-raise: re_raised={re_raised} idle={idle}")
@@ -5767,7 +5940,8 @@ async fn attention_request_discussion_over_wss() {
     )
     .await;
     assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     loop {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!("timed out waiting for the automatic delivery's attentionRequestCleared")
@@ -5923,7 +6097,8 @@ async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
     assert_eq!(sent["success"], true, "raise sendMessage ok: {sent}");
     let mut raised = false;
     let mut idle = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     while !(raised && idle) {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!("timed out waiting for the raise: raised={raised} idle={idle}")
@@ -5976,7 +6151,8 @@ async fn attention_request_foreground_automatic_delivery_negative_over_wss() {
     )
     .await;
     assert_eq!(auto_sent["ok"], true, "sendToTask ok: {auto_sent}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     loop {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!("timed out waiting for the automatic nudge turn's agent:idle")
@@ -6150,7 +6326,8 @@ async fn attention_request_cleared_by_drained_queue_message_over_wss() {
     assert_eq!(sent["success"], true, "raise sendMessage ok: {sent}");
     let mut raised = false;
     let mut idle = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     while !(raised && idle) {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!("timed out waiting for the raise: raised={raised} idle={idle}")
@@ -6226,7 +6403,8 @@ async fn attention_request_cleared_by_drained_queue_message_over_wss() {
     let mut stream_ends = 0usize;
     let mut processing = 0usize;
     let mut cleared_after_stream_ends: Option<usize> = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     loop {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!(
@@ -6414,7 +6592,8 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
     let mut attention: Option<Value> = None;
     let mut task_changed: Option<Value> = None;
     let mut idle = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     while !(attention.is_some() && task_changed.is_some() && idle) {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!(
@@ -6518,7 +6697,8 @@ async fn attention_request_blocker_and_taskless_caller_over_wss() {
     let mut attention: Option<Value> = None;
     let mut idle = false;
     let mut task_events = 0u32;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     while !(attention.is_some() && idle) {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!(
@@ -6706,7 +6886,8 @@ async fn delegated_child_attention_and_failure_carry_parent_agent_id_over_wss() 
     // the window is generous.
     let mut attention: Option<Value> = None;
     let mut failed: Option<Value> = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(120));
     while !(attention.is_some() && failed.is_some()) {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!(
@@ -6915,19 +7096,22 @@ async fn collaborator_steer_runs_host_exec_through_bound_bridge_over_wss() {
         .unwrap_or_else(|| panic!("messageId: {steered}"))
         .to_string();
 
-    timeout(Duration::from_secs(60), async {
-        loop {
-            let frame = wss_event(&mut sub, 60).await;
-            let ev = &frame["params"]["event"];
-            if ev["type"] == "agent:stream:end" && ev["data"]["agentId"] == agent_id.as_str() {
-                return;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(60)),
+        async {
+            loop {
+                let frame = wss_event(&mut sub, 60).await;
+                let ev = &frame["params"]["event"];
+                if ev["type"] == "agent:stream:end" && ev["data"]["agentId"] == agent_id.as_str() {
+                    return;
+                }
+                assert_ne!(
+                    ev["type"], "agent:failed",
+                    "the steered turn must not fail: {frame}"
+                );
             }
-            assert_ne!(
-                ev["type"], "agent:failed",
-                "the steered turn must not fail: {frame}"
-            );
-        }
-    })
+        },
+    )
     .await
     .expect("steered turn reached stream:end");
 
@@ -6990,7 +7174,8 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
     let db_path = data_dir.join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
+    let services =
+        Services::new_isolated(store.clone()).with_workspaces_root(ws_root.path().to_path_buf());
     let ws = WorkspaceId::new();
     store
         .insert_workspace(&workspace_seed(&ws))
@@ -7070,55 +7255,15 @@ async fn seed_queue_collaborator(data_dir: &Path, workspace_id: &str) -> &'stati
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
         title: "WSS-E2E".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -7145,9 +7290,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc envelope timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc envelope timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -7297,7 +7445,7 @@ async fn router_read_lifecycle_arms_over_wss() {
         .iter()
         .any(|n| n["id"] == json!(created_id)));
 
-    // `note.listTasks` returns a bare array (TS parity).
+    // `note.listTasks` returns one page (bounded reads).
     let tasks = wss_rpc(
         &mut rpc,
         7,
@@ -7305,7 +7453,8 @@ async fn router_read_lifecycle_arms_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": created_id }),
     )
     .await;
-    assert!(tasks.is_array(), "note.listTasks bare array: {tasks}");
+    assert!(tasks["tasks"].is_array(), "note.listTasks page: {tasks}");
+    assert_eq!(tasks["nextToken"], Value::Null, "one page: {tasks}");
 
     // --- mcp.servers.list — empty on a fresh workspace ----------------------
     let mcp = wss_rpc(&mut rpc, 8, "mcp.servers.list", json!({})).await;
@@ -7356,7 +7505,8 @@ async fn router_read_lifecycle_arms_over_wss() {
     )
     .await;
     assert_eq!(started["ok"], json!(true));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     let mut poll_id = 102;
     loop {
         let runtime = wss_rpc(
@@ -7571,7 +7721,8 @@ async fn terminal_create_env_over_wss() {
     let mut acc: Vec<u8> = Vec::new();
     let mut saw_exit = false;
     let mut saw_marker = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while !(saw_marker && saw_exit) {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -7700,6 +7851,137 @@ async fn terminal_create_env_over_wss() {
     assert_eq!(released["ok"], json!(true));
 }
 
+/// `terminal.list` rows carry `foregroundProcess` / `lastProcess`, and a
+/// `terminal:process` event fires when a job starts and when it ends.
+#[intent_test_macros::daemon_test]
+async fn terminal_process_fields_and_events_over_wss() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let (_data_dir, _daemon, ws_id, _note_id, port, fingerprint) =
+        boot_daemon_with_seeded_note().await;
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["terminal:process"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(sub_resp["subscriptionId"].is_string(), "{sub_resp}");
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        2,
+        "terminal.create",
+        json!({ "workspaceId": ws_id, "cols": 80, "rows": 24, "command": "sh" }),
+    )
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+
+    let listed = wss_rpc(
+        &mut rpc,
+        3,
+        "terminal.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let row = listed["terminals"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == terminal_id))
+        .unwrap_or_else(|| panic!("terminal listed: {listed}"));
+    assert_eq!(row["foregroundProcess"], Value::Null, "{row}");
+    assert_eq!(row["lastProcess"], Value::Null, "{row}");
+
+    let _ = wss_rpc(
+        &mut rpc,
+        4,
+        "terminal.write",
+        // timing-guard: the shell job whose foreground state is observed, not a wait
+        json!({ "terminalId": terminal_id, "data": STANDARD.encode("sleep 30\n") }),
+    )
+    .await;
+
+    let mut events: Vec<Value> = Vec::new();
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
+    let started =
+        json!({ "terminalId": terminal_id, "foregroundProcess": "sleep", "lastProcess": null });
+    let ended =
+        json!({ "terminalId": terminal_id, "foregroundProcess": null, "lastProcess": "sleep" });
+    let mut interrupted = false;
+    while !events.contains(&ended) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(next) = timeout(remaining, sub.next()).await else {
+            break;
+        };
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let frame: Value = serde_json::from_str(&text).expect("json frame");
+                let event = &frame["params"]["event"];
+                if frame["method"] != "events.event" || event["type"] != "terminal:process" {
+                    continue;
+                }
+                events.push(event["data"].clone());
+                if !interrupted && events.contains(&started) {
+                    interrupted = true;
+                    let listed = wss_rpc(
+                        &mut rpc,
+                        5,
+                        "terminal.list",
+                        json!({ "workspaceId": ws_id }),
+                    )
+                    .await;
+                    let row = listed["terminals"]
+                        .as_array()
+                        .and_then(|rows| rows.iter().find(|row| row["id"] == terminal_id))
+                        .unwrap_or_else(|| panic!("terminal listed: {listed}"));
+                    assert_eq!(row["foregroundProcess"], "sleep", "{row}");
+                    let _ = wss_rpc(
+                        &mut rpc,
+                        6,
+                        "terminal.write",
+                        json!({ "terminalId": terminal_id, "data": STANDARD.encode("\u{3}") }),
+                    )
+                    .await;
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = sub.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
+    }
+    assert_eq!(events, vec![started, ended], "terminal:process payloads");
+
+    let listed = wss_rpc(
+        &mut rpc,
+        7,
+        "terminal.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let row = listed["terminals"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == terminal_id))
+        .unwrap_or_else(|| panic!("terminal listed: {listed}"));
+    assert_eq!(row["foregroundProcess"], Value::Null, "{row}");
+    assert_eq!(row["lastProcess"], "sleep", "{row}");
+    let _ = wss_rpc(
+        &mut rpc,
+        8,
+        "terminal.kill",
+        json!({ "terminalId": terminal_id }),
+    )
+    .await;
+}
+
 /// Regression (paste/echo throughput): `terminal:data` is transient /
 /// broadcast-only (PROTOCOL §5.10 retention note, §6.5), so a PTY producing
 /// many small output chunks must (a) deliver every chunk to a live WSS
@@ -7768,7 +8050,8 @@ async fn terminal_data_many_chunks_transient_over_wss() {
     // assertion.
     let mut acc: Vec<u8> = Vec::new();
     let mut saw_exit = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     while !saw_exit {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -7879,7 +8162,8 @@ async fn event_query_event_type_glob_over_wss() {
     // Category glob matches the persisted note event(s). Poll briefly: the
     // event write is committed asynchronously relative to the RPC response.
     let mut id = 2;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     let glob_rows = loop {
         let rows = wss_rpc(
             &mut rpc,
@@ -7971,7 +8255,8 @@ async fn event_query_response_bounded_over_wss() {
     // Event writes commit asynchronously relative to the RPC responses; poll
     // until all seeded `note:created` events are visible.
     let mut id = i64::try_from(SEEDED).expect("value fits in i64") + 1;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     let rows = loop {
         let rows = wss_rpc(
             &mut rpc,
@@ -8311,7 +8596,7 @@ async fn oversized_request_head_rejected_over_wss() {
     // upgrade success; it either drops silently or returns a non-101 status.
     let mut buf = [0u8; 1024];
     let mut total = Vec::new();
-    let deadline = Duration::from_secs(2);
+    let deadline = common::test_timeout(Duration::from_secs(2));
     loop {
         match timeout(deadline, tls.read(&mut buf)).await {
             Ok(Ok(0) | Err(_)) | Err(_) => break,
@@ -8557,7 +8842,8 @@ async fn dequeued_message_publishes_agent_message_event_over_wss() {
     // for "first message" (PROTOCOL §5.5 step 6). If that emit ever went away
     // the loop would still be correct — it would just run to the deadline and
     // let the id-match assertion below decide.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while !(saw_queue_drain && stream_end_count >= 2 && user_message_event_ids.len() >= 2) {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             break;
@@ -9011,6 +9297,7 @@ async fn sub_threshold_queued_message_drains_without_annotation_over_wss() {
              waitedMs={waited_ms}: {drained}"
         );
         assert!(
+            // elapsed-assert: allow — the limit is measured too: the test's clock spans the daemon's wait, so load stretches both and cannot break the containment
             u128::from(waited_ms) <= wait_upper_bound.as_millis() + WALL_CLOCK_SLACK_MS,
             "daemon-measured wait ({waited_ms}ms) exceeds the observed upper \
              bound {wait_upper_bound:?}: {drained}"
@@ -9782,7 +10069,7 @@ async fn workspace_create_orchestrates_initial_agent_over_wss() {
                 "prompt": "build the initial feature",
                 "name": "Initial agent",
                 "model": "default", "provider": "mock",
-                "specialist": "implementor",
+                "specialist": "developer",
             },
         }),
     )
@@ -11050,7 +11337,8 @@ async fn assembled_rules_file_contains_suggested_next_steps_over_wss() {
     // so tolerate it not existing yet). Bounded wait so a hung spawn fails
     // loudly.
     let rules_dir = data_dir.join("agent-configs");
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(20));
     let mut rules_body: Option<String> = None;
     while std::time::Instant::now() < deadline {
         let mut hit: Option<PathBuf> = None;
@@ -11167,7 +11455,7 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
             "initialAgent": {
                 "name": "Coordinator",
                 "model": "default", "provider": "mock",
-                "specialist": "implementor",
+                "specialist": "developer",
             },
         }),
     )
@@ -11228,7 +11516,7 @@ async fn workspace_create_no_prompt_creates_agent_over_wss() {
 /// Specialist-derived default name over WSS (PROTOCOL §5.1/§5.5):
 /// `workspace.create` with a name-less `initialAgent` carrying a specialist
 /// derives the agent's name from the specialist's resolved display name
-/// (frontmatter `name` — "Coordinator" for the embedded `spec-writer`) and
+/// (frontmatter `name` — "Developer" for the embedded `developer`) and
 /// leaves it generated, so the opening-turn `setAgentName` can give it a
 /// task-specific name.
 #[intent_test_macros::daemon_test]
@@ -11267,7 +11555,7 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
             "branch": "feat/initial-agent-specialist-name-e2e",
             "initialAgent": {
                 "model": "default", "provider": "mock",
-                "specialist": "spec-writer",
+                "specialist": "developer",
             },
         }),
     )
@@ -11277,8 +11565,8 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
         .expect("initial agent returned")
         .to_string();
     assert_eq!(
-        created["initialAgent"]["name"], "Coordinator",
-        "name derived from spec-writer's display name: {created}"
+        created["initialAgent"]["name"], "Developer",
+        "name derived from developer's display name: {created}"
     );
     assert_eq!(
         created["initialAgent"]["nameExplicitlySet"], false,
@@ -11287,7 +11575,7 @@ async fn workspace_create_nameless_initial_agent_derives_specialist_name_over_ws
 
     // The derived name is persisted, not just projected into the create result.
     let got = wss_rpc(&mut rpc, 11, "agent.get", json!({ "agentId": agent_id })).await;
-    assert_eq!(got["agent"]["name"], "Coordinator");
+    assert_eq!(got["agent"]["name"], "Developer");
     assert_eq!(got["agent"]["nameExplicitlySet"], false);
 }
 
@@ -11632,7 +11920,8 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
     // both fire well inside the child rule's 8s pre-report delay.
     let mut child_id: Option<String> = None;
     let mut child_mid_turn = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     while !child_mid_turn {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
             panic!("timed out waiting for the child's report turn to begin: child_id={child_id:?}")
@@ -11689,7 +11978,8 @@ async fn stale_queued_redrive_annotated_and_report_kept_over_wss() {
     let mut child_stream_ends = 0u32;
     let mut child_idle = false;
     let mut child_cleared_events = 0u32;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(120));
     while !(parent_idle_count >= 2 && parent_wake_ends >= 1 && child_stream_ends >= 2 && child_idle)
     {
         let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
@@ -12799,10 +13089,51 @@ async fn image_jpg_alias_reaches_acp_unchanged_over_wss() {
     image_prompt_preparation_over_wss(ImagePreparationCase::JpegAlias).await;
 }
 
+#[intent_test_macros::daemon_test]
+async fn image_mime_parameters_reach_acp_over_wss() {
+    image_prompt_preparation_over_wss(ImagePreparationCase::MimeParameters).await;
+}
+
+/// Legacy image payloads must deliver unsupported formats as retrievable files.
+#[intent_test_macros::daemon_test]
+async fn unsupported_images_become_file_notices_over_wss() {
+    for (mime, name, bytes) in [
+        (
+            "image/svg+xml",
+            "drawing.png",
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>"#
+                .as_slice(),
+        ),
+        (
+            "image/bmp",
+            "drawing.bmp",
+            b"BMunsupported bitmap".as_slice(),
+        ),
+        (
+            "image/tiff",
+            "drawing.tiff",
+            b"IIunsupported tiff".as_slice(),
+        ),
+        ("image/avif", "drawing.avif", b"unsupported avif".as_slice()),
+        ("image/heic", "drawing.heic", b"unsupported heic".as_slice()),
+    ] {
+        image_prompt_preparation_over_wss(ImagePreparationCase::Unsupported(mime, name, bytes))
+            .await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn cross_workspace_unsupported_image_is_retrievable_over_wss() {
+    image_prompt_preparation_over_wss(ImagePreparationCase::CrossWorkspaceSvg).await;
+}
+
 enum ImagePreparationCase {
     LargePng,
     CorruptPng,
     JpegAlias,
+    MimeParameters,
+    CrossWorkspaceSvg,
+    Unsupported(&'static str, &'static str, &'static [u8]),
 }
 
 async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
@@ -12812,9 +13143,21 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     let Some(script) = gate("image prompt preparation E2E") else {
         return;
     };
+    let cross_workspace = matches!(case, ImagePreparationCase::CrossWorkspaceSvg);
+    let unsupported = cross_workspace || matches!(case, ImagePreparationCase::Unsupported(..));
     let corrupt = matches!(case, ImagePreparationCase::CorruptPng);
     let jpeg_alias = matches!(case, ImagePreparationCase::JpegAlias);
-    let (format, mime, file_name) = if jpeg_alias {
+    let (format, mime, file_name) = if let ImagePreparationCase::Unsupported(mime, name, _) = case {
+        (image::ImageFormat::Png, mime, name)
+    } else if cross_workspace {
+        (image::ImageFormat::Png, "image/svg+xml", "original.svg")
+    } else if matches!(case, ImagePreparationCase::MimeParameters) {
+        (
+            image::ImageFormat::Png,
+            " IMAGE/PNG ; charset=binary ",
+            "image.png",
+        )
+    } else if jpeg_alias {
         (image::ImageFormat::Jpeg, "image/jpg", "image.jpg")
     } else {
         (image::ImageFormat::Png, "image/png", "image.png")
@@ -12823,10 +13166,10 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     // Deterministic high-entropy pixels defeat PNG compression. This fixture
     // exceeds 5 MiB and the 2000-pixel long-edge limit, but its inline base64
     // still fits the existing 8 MiB prompt cap before preparation.
-    let (width, height) = if corrupt || jpeg_alias {
-        (20, 10)
-    } else {
+    let (width, height) = if matches!(case, ImagePreparationCase::LargePng) {
         (3000, 640)
+    } else {
+        (20, 10)
     };
     let mut state = 0x1234_5678_u32;
     let pixels = image::RgbImage::from_fn(width, height, |_, _| {
@@ -12841,10 +13184,15 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         .write_to(&mut encoded, format)
         .expect("encode genuine fixture image");
     let mut original = encoded.into_inner();
-    if corrupt {
+    if let ImagePreparationCase::Unsupported(_, _, bytes) = case {
+        original = bytes.to_vec();
+    } else if cross_workspace {
+        original = br#"<svg xmlns="http://www.w3.org/2000/svg"><text>foreign source</text></svg>"#
+            .to_vec();
+    } else if corrupt {
         original.truncate(33); // PNG signature + valid IHDR; no IDAT pixel data.
         assert!(image::load_from_memory(&original).is_err());
-    } else if !jpeg_alias {
+    } else if matches!(case, ImagePreparationCase::LargePng) {
         assert!(original.len() > 5 * 1024 * 1024, "fixture exceeds 5 MiB");
     }
     let image_b64 = base64::engine::general_purpose::STANDARD.encode(&original);
@@ -12858,7 +13206,7 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     // The workspace needs a real filesystem root: `file.placeAttachment`
     // lands bytes under `.intent/attachments/` and the reference resolution
     // reads them back from the same root.
-    let ws_id = {
+    let (ws_id, source_ws_id) = {
         use intent_store::Store;
         let store = Store::open(&data_dir.join("intentd.db"))
             .await
@@ -12872,12 +13220,30 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         let mut seed = workspace_seed(&ws);
         seed.worktree_path = Some(root.to_string_lossy().into_owned());
         store.insert_workspace(&seed).await.expect("insert ws");
-        ws.0
+        if cross_workspace {
+            let destination = intent_core::WorkspaceId::new();
+            let root = data_dir.join("receiving-root");
+            std::fs::create_dir_all(&root).expect("mkdir receiving root");
+            let mut seed = workspace_seed(&destination);
+            seed.worktree_path = Some(root.to_string_lossy().into_owned());
+            store
+                .insert_workspace(&seed)
+                .await
+                .expect("insert receiving workspace");
+            (destination.0, ws.0)
+        } else {
+            (ws.0.clone(), ws.0)
+        }
     };
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     let session_log = data_dir.join("sessions.jsonl");
-    let behavior = json!({ "response": "seen", "loadSession": corrupt }).to_string();
+    let retrieval_log = data_dir.join("retrievals.jsonl");
+    let mut behavior = json!({ "response": "seen", "loadSession": corrupt });
+    if cross_workspace {
+        behavior["attachmentRetrievalLog"] = json!(retrieval_log);
+    }
+    let behavior = behavior.to_string();
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
@@ -12916,7 +13282,7 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         10,
         "file.placeAttachment",
         json!({
-            "workspaceId": &ws_id,
+            "workspaceId": &source_ws_id,
             "fileName": file_name,
             "data": &image_b64,
             "mimeType": mime,
@@ -12929,7 +13295,8 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         .to_string();
 
     let mut outbound = Vec::new();
-    for (name, input) in [
+    let mut inline_file_id = None;
+    let mut inputs = vec![
         (
             "ImgRef",
             json!({ "type": "image", "attachmentId": &attachment_id }),
@@ -12938,7 +13305,25 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
             "ImgInline",
             json!({ "type": "image", "data": &image_b64, "mimeType": mime }),
         ),
-    ] {
+    ];
+    if cross_workspace {
+        inputs = vec![
+            (
+                "ImgRef",
+                json!({ "type": "image", "attachmentId": &attachment_id }),
+            ),
+            (
+                "ImgRefAgain",
+                json!({ "type": "image", "attachmentId": &attachment_id }),
+            ),
+        ];
+    } else if unsupported {
+        inputs.push((
+            "ImgInlineAgain",
+            json!({ "type": "image", "data": &image_b64, "mimeType": mime }),
+        ));
+    }
+    for (name, input) in inputs {
         // Separate agents ensure each path has its own first-turn prompt,
         // with no history replay or previous turn's image in the comparison.
         let created = wss_rpc(
@@ -12968,7 +13353,8 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         // Wait for both terminal events: pre-prompt failures publish failed
         // before stream:end, while successful turns publish idle afterwards.
         // The status-changed event confirms the worker's durable settlement.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(60));
         let mut ends = 0;
         let mut saw_terminal_status = false;
         let mut saw_persisted_status = false;
@@ -13097,7 +13483,8 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
                 )
                 .await;
                 assert_eq!(retry["success"], true, "follow-up accepted: {retry}");
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                let deadline = tokio::time::Instant::now()
+                    + intentd_test_support::test_timeout(Duration::from_secs(60));
                 let (mut ended, mut idle, mut settled) = (false, false, false);
                 while !(ended && idle && settled) {
                     let frame = wss_event_opt_until(&mut sub, deadline)
@@ -13165,46 +13552,127 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
             assert_eq!(matching.len(), 1, "exactly one provider prompt for {name}");
             let blocks = matching[0]["blocks"].as_array().expect("logged ACP blocks");
             let images: Vec<_> = blocks.iter().filter(|b| b["type"] == "image").collect();
-            assert_eq!(images.len(), 1, "exactly one outgoing image for {name}");
-            let data = images[0]["data"].as_str().expect("inline ACP image data");
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .expect("provider image is base64");
-            assert!(
-                bytes.len() <= 3 * 1024 * 1024,
-                "provider image exceeds 3 MiB: {} bytes",
-                bytes.len()
-            );
-            let format = image::guess_format(&bytes).expect("provider image format");
-            if jpeg_alias {
-                assert_eq!(format, image::ImageFormat::Jpeg);
-                assert_eq!(images[0]["mimeType"], "image/jpg");
-                assert!(bytes == original, "small JPEG bytes remain unchanged");
-            } else {
-                assert_eq!(
-                    images[0]["mimeType"],
-                    format.to_mime_type(),
-                    "MIME matches outgoing bytes"
+            if unsupported {
+                assert!(
+                    images.is_empty(),
+                    "unsupported image never reaches vision: {blocks:?}"
                 );
+                let notice = blocks
+                    .iter()
+                    .filter_map(|b| b["text"].as_str())
+                    .find(|text| text.starts_with("[Attachment:"))
+                    .expect("retrievable file notice");
+                assert!(notice.contains(mime));
+                let id = notice
+                    .split("attachmentId: ")
+                    .nth(1)
+                    .expect("attachment id")
+                    .split('.')
+                    .next()
+                    .expect("id terminator");
+                if cross_workspace {
+                    assert_ne!(
+                        id, attachment_id,
+                        "foreign reference gets receiving-workspace identity"
+                    );
+                    if let Some(previous) = &inline_file_id {
+                        assert_eq!(id, previous, "repeat delivery reuses receiving file");
+                    } else {
+                        inline_file_id = Some(id.to_owned());
+                    }
+                    let retrievals: Vec<Value> = std::fs::read_to_string(&retrieval_log)
+                        .expect("actual MCP retrieval log")
+                        .lines()
+                        .map(|line| serde_json::from_str(line).expect("retrieval JSON"))
+                        .collect();
+                    assert_eq!(retrievals.len(), if name == "ImgRef" { 1 } else { 2 });
+                    let retrieval = retrievals.last().expect("retrieval");
+                    assert_eq!(retrieval["attachmentId"], id);
+                    assert_ne!(
+                        retrieval["result"]["isError"], true,
+                        "receiving agent can retrieve source: {retrieval}"
+                    );
+                } else if name == "ImgRef" {
+                    assert_eq!(id, attachment_id);
+                } else if let Some(previous) = &inline_file_id {
+                    assert_eq!(
+                        id, previous,
+                        "repeated inline delivery reuses the source file"
+                    );
+                } else {
+                    inline_file_id = Some(id.to_owned());
+                }
+                let source = wss_rpc(
+                    &mut rpc,
+                    40,
+                    "file.getAttachmentInfo",
+                    json!({ "workspaceId": &ws_id, "attachmentId": id }),
+                )
+                .await;
+                assert_eq!(source["exists"], true);
+                let read = wss_rpc(&mut rpc, 41, "file.readChunk",
+                    json!({ "workspaceId": &ws_id, "path": source["path"], "offset": 0, "length": original.len() })).await;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(read["content"].as_str().expect("original file bytes"))
+                    .expect("base64 file");
+                assert_eq!(
+                    bytes, original,
+                    "file fallback preserves exact source bytes"
+                );
+                let queue = wss_rpc(
+                    &mut rpc,
+                    42,
+                    "agent.getQueue",
+                    json!({ "agentId": agent_id }),
+                )
+                .await;
+                assert!(
+                    queue["queue"].as_array().expect("queue").is_empty(),
+                    "no failed retry remains"
+                );
+            } else {
+                assert_eq!(images.len(), 1, "exactly one outgoing image for {name}");
+                let data = images[0]["data"].as_str().expect("inline ACP image data");
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .expect("provider image is base64");
+                assert!(
+                    bytes.len() <= 3 * 1024 * 1024,
+                    "provider image exceeds 3 MiB: {} bytes",
+                    bytes.len()
+                );
+                let format = image::guess_format(&bytes).expect("provider image format");
+                if jpeg_alias {
+                    assert_eq!(format, image::ImageFormat::Jpeg);
+                    assert_eq!(images[0]["mimeType"], "image/jpeg");
+                    assert!(bytes == original, "small JPEG bytes remain unchanged");
+                } else {
+                    assert_eq!(
+                        images[0]["mimeType"],
+                        format.to_mime_type(),
+                        "MIME matches outgoing bytes"
+                    );
+                }
+                let decoded = image::load_from_memory(&bytes).expect("provider image decodes");
+                assert!(
+                    decoded.width().max(decoded.height()) <= 2000,
+                    "provider image long edge exceeds 2000 pixels"
+                );
+                assert!(
+                    decoded.width() > decoded.height(),
+                    "landscape orientation preserved"
+                );
+                assert!(
+                    images[0].get("attachmentId").is_none(),
+                    "provider receives bytes, not registry references"
+                );
+                outbound.push((images[0]["mimeType"].clone(), bytes));
             }
-            let decoded = image::load_from_memory(&bytes).expect("provider image decodes");
-            assert!(
-                decoded.width().max(decoded.height()) <= 2000,
-                "provider image long edge exceeds 2000 pixels"
-            );
-            assert!(
-                decoded.width() > decoded.height(),
-                "landscape orientation preserved"
-            );
-            assert!(
-                images[0].get("attachmentId").is_none(),
-                "provider receives bytes, not registry references"
-            );
-            outbound.push((images[0]["mimeType"].clone(), bytes));
         }
 
-        if name == "ImgRef" {
-            // Preparation must never write its derived bytes onto the user row.
+        if name == "ImgRef" || !matches!(case, ImagePreparationCase::LargePng) {
+            // Large inline images are intentionally projected as thumbnails on reads.
+            // References and small inline sources must retain their submitted payload.
             let conv = wss_rpc(
                 &mut rpc,
                 14,
@@ -13222,18 +13690,15 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
                 .collect();
             assert_eq!(images.len(), 1, "one persisted image reference");
             let mut reference = images[0].clone();
-            // Conversation reads add a stable block id, not image payload.
-            reference
-                .as_object_mut()
-                .expect("image object")
-                .remove("id");
-            assert_eq!(
-                reference, input,
-                "transcript keeps the submitted reference unchanged"
-            );
+            // Conversation reads enrich inline images with layout metadata.
+            let object = reference.as_object_mut().expect("image object");
+            object.remove("id");
+            object.remove("width");
+            object.remove("height");
+            assert_eq!(reference, input, "transcript keeps the submitted source");
         }
     }
-    if !corrupt {
+    if !corrupt && !unsupported {
         assert_eq!(outbound.len(), 2);
         assert!(
             outbound[0] == outbound[1],
@@ -13247,7 +13712,7 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         &mut rpc,
         15,
         "file.getAttachmentInfo",
-        json!({ "workspaceId": &ws_id, "attachmentId": &attachment_id }),
+        json!({ "workspaceId": &source_ws_id, "attachmentId": &attachment_id }),
     )
     .await;
     assert_eq!(info["exists"], true);
@@ -13258,7 +13723,7 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         &mut rpc,
         16,
         "file.readChunk",
-        json!({ "workspaceId": &ws_id, "path": info["path"], "offset": 0, "length": original.len() }),
+        json!({ "workspaceId": &source_ws_id, "path": info["path"], "offset": 0, "length": original.len() }),
     )
     .await;
     assert_eq!(read["size"], json!(original.len()));
@@ -13598,7 +14063,8 @@ async fn interrupt_mid_tool_call_settles_and_drains_queue_over_wss() {
     let mut last_end_was_queued_turn = false;
     let mut saw_settle_idle = false;
     let mut saw_persisted_idle = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
         let event = &frame["params"]["event"];
         if event["data"]["agentId"] != json!(agent_id) {
@@ -13889,7 +14355,8 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     // Barrier: the target's workspace_api eval has started (it created the
     // entered note) and its turn has NOT ended — every step below happens
     // while the real tool call is in flight.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     let mut entered = false;
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
         let event = &frame["params"]["event"];
@@ -13969,7 +14436,8 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     // Wait for the sender's turn to end (its tool call completed → the
     // relay result note exists), then read the send outcome. The target's
     // preemption end may land during this wait, so it is tracked here too.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     let mut sender_done = false;
     let mut saw_preempt_end = false;
     let mut target_complete_ends = 0usize;
@@ -14046,7 +14514,8 @@ async fn a2a_interrupt_during_in_flight_tool_call_settles_and_drains_over_wss() 
     );
 
     // Settlement: the target drains its queue and goes idle.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(90));
     let mut saw_settle_idle = false;
     let mut saw_persisted_idle = false;
     while let Some(frame) = wss_event_opt_until(&mut sub, deadline).await {
@@ -14367,6 +14836,7 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
 }
 
 /// Walk a served payload and fail on any `file` block still carrying `data`.
+#[track_caller]
 fn assert_no_file_data(v: &Value, surface: &str) {
     match v {
         Value::Object(map) => {
@@ -14398,7 +14868,7 @@ async fn twenty_message_chat_snapshots_and_invalidation_over_wss() {
             .await
             .expect("store");
         let ws_root = common::hermetic_workspaces_root();
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(common::registry_with_default_provider(ws_root.path()));
         let ws = WorkspaceId::new();
@@ -14474,11 +14944,14 @@ async fn twenty_message_chat_snapshots_and_invalidation_over_wss() {
         .await
         .expect("subscribe");
         let response: Value = loop {
-            let frame = timeout(Duration::from_secs(15), chat.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            let frame = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(15)),
+                chat.next(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
             match frame {
                 Message::Text(text) => break serde_json::from_str(&text).unwrap(),
                 Message::Ping(p) => chat.send(Message::Pong(p)).await.unwrap(),
@@ -14602,7 +15075,7 @@ async fn legacy_inline_file_blocks_served_as_text_over_wss() {
             .await
             .expect("open store");
         let ws_root = common::hermetic_workspaces_root();
-        let services = Services::new(store.clone())
+        let services = Services::new_isolated(store.clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(common::registry_with_default_provider(ws_root.path()));
         let ws = WorkspaceId::new();
@@ -15462,28 +15935,31 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
 
     // THE §7.1 assertion: the delivered row's delta entity on the parent's
     // chat channel carries the persisted `agent_message` metadata.
-    let tagged = timeout(Duration::from_secs(60), async {
-        loop {
-            let frame = wss_push(&mut chat, 60).await;
-            if frame["params"]["kind"] != "delta" {
-                continue;
+    let tagged = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(60)),
+        async {
+            loop {
+                let frame = wss_push(&mut chat, 60).await;
+                if frame["params"]["kind"] != "delta" {
+                    continue;
+                }
+                let delta = frame["params"]["delta"].clone();
+                if let Some(entity) = delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    .find(|e| {
+                        e["block"]["text"]
+                            .as_str()
+                            .is_some_and(|t| t.contains("child says hi"))
+                    })
+                {
+                    return entity.clone();
+                }
             }
-            let delta = frame["params"]["delta"].clone();
-            if let Some(entity) = delta["added"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(delta["updated"].as_array().into_iter().flatten())
-                .find(|e| {
-                    e["block"]["text"]
-                        .as_str()
-                        .is_some_and(|t| t.contains("child says hi"))
-                })
-            {
-                return entity.clone();
-            }
-        }
-    })
+        },
+    )
     .await
     .expect("child→parent delivered row reached the chat channel");
     assert_eq!(
@@ -15513,30 +15989,33 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
     // legitimately gains ONLY the drain-time `queueInfo` stamp (PROTOCOL
     // §5.5), never `agent_message` attribution; the assertion below allows
     // exactly that.
-    timeout(Duration::from_secs(60), async {
-        loop {
-            let frame = wss_push(&mut chat, 60).await;
-            if frame["params"]["kind"] != "delta" {
-                continue;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(60)),
+        async {
+            loop {
+                let frame = wss_push(&mut chat, 60).await;
+                if frame["params"]["kind"] != "delta" {
+                    continue;
+                }
+                let delta = frame["params"]["delta"].clone();
+                let done = delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    .any(|e| {
+                        e["role"] == "assistant"
+                            && e["streamingComplete"] == json!(true)
+                            && e["block"]["text"]
+                                .as_str()
+                                .is_some_and(|t| t.contains("plain reply"))
+                    });
+                if done {
+                    return;
+                }
             }
-            let delta = frame["params"]["delta"].clone();
-            let done = delta["added"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(delta["updated"].as_array().into_iter().flatten())
-                .any(|e| {
-                    e["role"] == "assistant"
-                        && e["streamingComplete"] == json!(true)
-                        && e["block"]["text"]
-                            .as_str()
-                            .is_some_and(|t| t.contains("plain reply"))
-                });
-            if done {
-                return;
-            }
-        }
-    })
+        },
+    )
     .await
     .expect("parent's child-message turn replied on the chat channel");
     let human = wss_rpc(
@@ -15547,28 +16026,31 @@ async fn child_to_parent_send_suppresses_watch_and_delta_carries_metadata_over_w
     )
     .await;
     assert_eq!(human["success"], true, "human sendMessage ok: {human}");
-    let lean = timeout(Duration::from_secs(60), async {
-        loop {
-            let frame = wss_push(&mut chat, 60).await;
-            if frame["params"]["kind"] != "delta" {
-                continue;
+    let lean = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(60)),
+        async {
+            loop {
+                let frame = wss_push(&mut chat, 60).await;
+                if frame["params"]["kind"] != "delta" {
+                    continue;
+                }
+                let delta = frame["params"]["delta"].clone();
+                if let Some(entity) = delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    .find(|e| {
+                        e["block"]["text"]
+                            .as_str()
+                            .is_some_and(|t| t.contains("human hello"))
+                    })
+                {
+                    return entity.clone();
+                }
             }
-            let delta = frame["params"]["delta"].clone();
-            if let Some(entity) = delta["added"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(delta["updated"].as_array().into_iter().flatten())
-                .find(|e| {
-                    e["block"]["text"]
-                        .as_str()
-                        .is_some_and(|t| t.contains("human hello"))
-                })
-            {
-                return entity.clone();
-            }
-        }
-    })
+        },
+    )
     .await
     .expect("human row reached the chat channel");
     // A human row carries the daemon's `fromPrincipalId` stamp for the wire
@@ -15888,55 +16370,57 @@ async fn edit_and_regenerate_truncates_and_replays_history_over_wss() {
     assert_eq!(messages[3]["role"], "assistant");
 
     let replacement_assistant_id = messages[3]["id"].clone();
-    timeout(Duration::from_secs(30), async {
-        let mut saw_reset = false;
-        let mut seq = 0;
-        loop {
-            let frame = wss_push(&mut chat, 30).await;
-            let params = &frame["params"];
-            assert_eq!(params["subscriptionId"], chat_response["subscriptionId"]);
-            seq += 1;
-            assert_eq!(params["seq"], seq, "reset keeps the sequence contiguous");
-            if params["kind"] == "snapshot" {
-                let snapshot = &params["snapshot"];
-                assert_eq!(snapshot["resumed"], false, "discard the cached suffix");
-                assert_eq!(snapshot["deltaEncoding"], "incremental");
-                let rows = snapshot["messages"].as_array().expect("reset rows");
-                assert!(rows.iter().all(|row| !removed_ids.contains(&row["id"])));
-                saw_reset = true;
-                // A fast replacement can finish before the bounded reset read.
-                if rows
-                    .iter()
-                    .any(|row| row["id"] == replacement_assistant_id && row["isStreaming"] != true)
-                {
-                    break;
-                }
-            } else {
-                let entities = ["added", "updated"]
-                    .into_iter()
-                    .flat_map(|key| params["delta"][key].as_array().into_iter().flatten());
-                let mut completed = false;
-                for entity in entities {
-                    if saw_reset {
-                        assert!(
-                            !removed_ids.contains(&entity["messageId"]),
-                            "old row restored: {frame}"
-                        );
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            let mut saw_reset = false;
+            let mut seq = 0;
+            loop {
+                let frame = wss_push(&mut chat, 30).await;
+                let params = &frame["params"];
+                assert_eq!(params["subscriptionId"], chat_response["subscriptionId"]);
+                seq += 1;
+                assert_eq!(params["seq"], seq, "reset keeps the sequence contiguous");
+                if params["kind"] == "snapshot" {
+                    let snapshot = &params["snapshot"];
+                    assert_eq!(snapshot["resumed"], false, "discard the cached suffix");
+                    assert_eq!(snapshot["deltaEncoding"], "incremental");
+                    let rows = snapshot["messages"].as_array().expect("reset rows");
+                    assert!(rows.iter().all(|row| !removed_ids.contains(&row["id"])));
+                    saw_reset = true;
+                    // A fast replacement can finish before the bounded reset read.
+                    if rows.iter().any(|row| {
+                        row["id"] == replacement_assistant_id && row["isStreaming"] != true
+                    }) {
+                        break;
                     }
-                    completed |= entity["messageId"] == replacement_assistant_id
-                        && entity["streamingComplete"] == true;
-                }
-                if completed {
-                    assert!(
-                        saw_reset,
-                        "replacement streamed without invalidating the old transcript"
-                    );
-                    break;
+                } else {
+                    let entities = ["added", "updated"]
+                        .into_iter()
+                        .flat_map(|key| params["delta"][key].as_array().into_iter().flatten());
+                    let mut completed = false;
+                    for entity in entities {
+                        if saw_reset {
+                            assert!(
+                                !removed_ids.contains(&entity["messageId"]),
+                                "old row restored: {frame}"
+                            );
+                        }
+                        completed |= entity["messageId"] == replacement_assistant_id
+                            && entity["streamingComplete"] == true;
+                    }
+                    if completed {
+                        assert!(
+                            saw_reset,
+                            "replacement streamed without invalidating the old transcript"
+                        );
+                        break;
+                    }
                 }
             }
-        }
-        assert!(saw_reset, "edit must reset the standing chat subscription");
-    })
+            assert!(saw_reset, "edit must reset the standing chat subscription");
+        },
+    )
     .await
     .expect("standing chat converged through the regenerated turn");
 
@@ -16384,46 +16868,52 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
     // The agent is observably mid-stream once the chunk event lands. The whole
     // wait is bounded by a single deadline (per-frame reads inside `wss_event`
     // would otherwise reset on heartbeat Pings and hang on a missing chunk).
-    timeout(Duration::from_secs(30), async {
-        loop {
-            let frame = wss_event(&mut sub, 30).await;
-            if frame["params"]["event"]["type"] == "agent:stream:activity" {
-                return;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let frame = wss_event(&mut sub, 30).await;
+                if frame["params"]["event"]["type"] == "agent:stream:activity" {
+                    return;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("mock streamed its pre-park chunk");
 
     // The chat channel saw the streamed block too — capture its id so the
     // terminal assertions below key off the exact block that streamed live.
     // Single total deadline, same rationale as above.
-    let streamed_block_id = timeout(Duration::from_secs(30), async {
-        loop {
-            let frame = wss_push(&mut chat, 30).await;
-            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-            let delta = &frame["params"]["delta"];
-            if let Some(entity) = delta["added"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(delta["updated"].as_array().into_iter().flatten())
-                .find(|e| {
-                    e["block"]["text"]
-                        .as_str()
-                        .is_some_and(|t| t.contains("streaming-before-cancel"))
-                })
-            {
-                // Live (pre-terminal) entities carry no row metadata — there
-                // is no persisted row yet to lift it from.
-                assert!(
-                    entity.get("metadata").is_none(),
-                    "live chunk entity carries no row metadata: {entity}"
-                );
-                return entity["block"]["id"].as_str().map(String::from);
+    let streamed_block_id = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let frame = wss_push(&mut chat, 30).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = &frame["params"]["delta"];
+                if let Some(entity) = delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    .find(|e| {
+                        e["block"]["text"]
+                            .as_str()
+                            .is_some_and(|t| t.contains("streaming-before-cancel"))
+                    })
+                {
+                    // Live (pre-terminal) entities carry no row metadata — there
+                    // is no persisted row yet to lift it from.
+                    assert!(
+                        entity.get("metadata").is_none(),
+                        "live chunk entity carries no row metadata: {entity}"
+                    );
+                    return entity["block"]["id"].as_str().map(String::from);
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("streamed text block reached chat channel in time")
     .expect("streamed text block carries an id");
@@ -16434,23 +16924,26 @@ async fn interrupt_mid_stream_keeps_partial_blocks_over_wss() {
 
     // Terminal reconcile: the streamed block survives (added or updated with
     // `streamingComplete: true`) and NOTHING is removed. Single total deadline.
-    let terminal = timeout(Duration::from_secs(30), async {
-        loop {
-            let frame = wss_push(&mut chat, 30).await;
-            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-            let delta = frame["params"]["delta"].clone();
-            let is_terminal = ["added", "updated"].iter().any(|key| {
-                delta[*key]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|e| e.get("streamingComplete") == Some(&Value::Bool(true)))
-            });
-            if is_terminal {
-                return delta;
+    let terminal = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let frame = wss_push(&mut chat, 30).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = frame["params"]["delta"].clone();
+                let is_terminal = ["added", "updated"].iter().any(|key| {
+                    delta[*key]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|e| e.get("streamingComplete") == Some(&Value::Bool(true)))
+                });
+                if is_terminal {
+                    return delta;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("terminal (streamingComplete) delta arrived");
     assert_eq!(
@@ -16621,54 +17114,60 @@ async fn proposal_resource_standalone_block_over_chat_subscribe() {
 
     // The live channel delivers the standalone proposal block. Single total
     // deadline (per-frame reads would reset on heartbeat Pings).
-    let proposal_block_id = timeout(Duration::from_secs(30), async {
-        loop {
-            let frame = wss_push(&mut chat, 30).await;
-            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-            let delta = &frame["params"]["delta"];
-            if let Some(entity) = delta["added"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(delta["updated"].as_array().into_iter().flatten())
-                .find(|e| {
-                    e["block"]["type"] == "resource"
-                        && e["block"]["resource"]["mimeType"]
-                            == "application/vnd.intent.proposal+json"
-                })
-            {
-                assert_eq!(
-                    entity["block"]["resource"]["text"],
-                    json!("{\"kind\":\"settings-change\"}"),
-                    "resource echoed verbatim: {entity}"
-                );
-                return entity["block"]["id"].as_str().map(String::from);
+    let proposal_block_id = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let frame = wss_push(&mut chat, 30).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = &frame["params"]["delta"];
+                if let Some(entity) = delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    .find(|e| {
+                        e["block"]["type"] == "resource"
+                            && e["block"]["resource"]["mimeType"]
+                                == "application/vnd.intent.proposal+json"
+                    })
+                {
+                    assert_eq!(
+                        entity["block"]["resource"]["text"],
+                        json!("{\"kind\":\"settings-change\"}"),
+                        "resource echoed verbatim: {entity}"
+                    );
+                    return entity["block"]["id"].as_str().map(String::from);
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("standalone proposal block reached chat channel in time")
     .expect("standalone proposal block carries an id");
 
     // Terminal reconcile: the proposal block's id matches the persisted
     // transcript, so it is NOT in `removedIds` (clean reconcile).
-    let terminal = timeout(Duration::from_secs(30), async {
-        loop {
-            let frame = wss_push(&mut chat, 30).await;
-            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-            let delta = frame["params"]["delta"].clone();
-            let is_terminal = ["added", "updated"].iter().any(|key| {
-                delta[*key]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|e| e.get("streamingComplete") == Some(&Value::Bool(true)))
-            });
-            if is_terminal {
-                return delta;
+    let terminal = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let frame = wss_push(&mut chat, 30).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = frame["params"]["delta"].clone();
+                let is_terminal = ["added", "updated"].iter().any(|key| {
+                    delta[*key]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|e| e.get("streamingComplete") == Some(&Value::Bool(true)))
+                });
+                if is_terminal {
+                    return delta;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("terminal (streamingComplete) delta arrived");
     assert!(
@@ -16817,53 +17316,59 @@ async fn proposal_lifted_from_collapsed_output_over_chat_subscribe() {
 
     // The live channel delivers the REBUILT standalone proposal block even
     // though the rawOutput carried no resource item.
-    let proposal_block_id = timeout(Duration::from_secs(30), async {
-        loop {
-            let frame = wss_push(&mut chat, 30).await;
-            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-            let delta = &frame["params"]["delta"];
-            if let Some(entity) = delta["added"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(delta["updated"].as_array().into_iter().flatten())
-                .find(|e| {
-                    e["block"]["type"] == "resource"
-                        && e["block"]["resource"]["mimeType"]
-                            == "application/vnd.intent.proposal+json"
-                })
-            {
-                assert_eq!(
-                    entity["block"]["resource"]["uri"],
-                    json!("intent-proposal://settings-change/Update"),
-                    "uri rebuilt from the collapsed payload: {entity}"
-                );
-                return entity["block"]["id"].as_str().map(String::from);
+    let proposal_block_id = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let frame = wss_push(&mut chat, 30).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = &frame["params"]["delta"];
+                if let Some(entity) = delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    .find(|e| {
+                        e["block"]["type"] == "resource"
+                            && e["block"]["resource"]["mimeType"]
+                                == "application/vnd.intent.proposal+json"
+                    })
+                {
+                    assert_eq!(
+                        entity["block"]["resource"]["uri"],
+                        json!("intent-proposal://settings-change/Update"),
+                        "uri rebuilt from the collapsed payload: {entity}"
+                    );
+                    return entity["block"]["id"].as_str().map(String::from);
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("standalone proposal block reached chat channel in time")
     .expect("standalone proposal block carries an id");
 
     // Terminal reconcile keeps the rebuilt block (live and persisted agree).
-    let terminal = timeout(Duration::from_secs(30), async {
-        loop {
-            let frame = wss_push(&mut chat, 30).await;
-            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-            let delta = frame["params"]["delta"].clone();
-            let is_terminal = ["added", "updated"].iter().any(|key| {
-                delta[*key]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|e| e.get("streamingComplete") == Some(&Value::Bool(true)))
-            });
-            if is_terminal {
-                return delta;
+    let terminal = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let frame = wss_push(&mut chat, 30).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = frame["params"]["delta"].clone();
+                let is_terminal = ["added", "updated"].iter().any(|key| {
+                    delta[*key]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|e| e.get("streamingComplete") == Some(&Value::Bool(true)))
+                });
+                if is_terminal {
+                    return delta;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("terminal (streamingComplete) delta arrived");
     assert!(
@@ -17089,6 +17594,30 @@ async fn token_usage_captured_at_turn_end_over_wss() {
         usage["lastScanAt"].is_string(),
         "lastScanAt stamped by the live update: {read}"
     );
+    // Additive agentNames (§5.23): the snapshot names the agent so clients can
+    // label rows for agents they have not loaded.
+    assert_eq!(
+        usage["agentNames"][&agent_id], "Usage",
+        "agentNames: {read}"
+    );
+
+    // A rename alone refreshes agentNames and publishes the changed snapshot.
+    let renamed = wss_rpc(
+        &mut rpc,
+        15,
+        "agent.rename",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "name": "Usage renamed" }),
+    )
+    .await;
+    assert_eq!(renamed["success"], true, "rename ok: {renamed}");
+    let ev3 = wss_event(&mut sub, 30).await;
+    let ev3 = &ev3["params"]["event"];
+    assert_eq!(ev3["type"], "workspace:tokenUsage-changed");
+    assert_eq!(
+        ev3["data"]["tokenUsage"]["agentNames"][&agent_id], "Usage renamed",
+        "rename publishes the refreshed name: {ev3}"
+    );
+    assert_eq!(ev3["data"]["tokenUsage"]["totals"]["inputTokens"], 100);
 }
 
 /// ACP `usage_update` cost capture over the real WSS transport (§5.23): the
@@ -17360,7 +17889,8 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
         )
         .await;
         assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(30));
         let mut ended = false;
         let mut idle = false;
         while !(ended && idle) {
@@ -17441,19 +17971,22 @@ async fn assert_codex_npx_subagent_policy_over_wss(advertise_load: bool) {
                 nix::sys::signal::Signal::SIGKILL,
             )
             .expect("kill idle mock child");
-            timeout(Duration::from_secs(15), async {
-                let mut interval = tokio::time::interval(Duration::from_millis(25));
-                loop {
-                    interval.tick().await;
-                    if tokio::fs::read_to_string(data_dir.join("daemon.log"))
-                        .await
-                        .expect("daemon log")
-                        .contains("idle agent child exited unexpectedly; handle reaped")
-                    {
-                        break;
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(15)),
+                async {
+                    let mut interval = tokio::time::interval(Duration::from_millis(25));
+                    loop {
+                        interval.tick().await;
+                        if tokio::fs::read_to_string(data_dir.join("daemon.log"))
+                            .await
+                            .expect("daemon log")
+                            .contains("idle agent child exited unexpectedly; handle reaped")
+                        {
+                            break;
+                        }
                     }
-                }
-            })
+                },
+            )
             .await
             .expect("daemon reaped the idle mock child");
         } else {
@@ -17791,22 +18324,25 @@ async fn status_only_tool_update_preserves_richer_title_over_wss() {
     // Collect the agent:tool:call events for the call until the terminal
     // stream:end. Single total deadline (per-frame reads would reset on
     // heartbeat Pings).
-    let tool_events = timeout(Duration::from_secs(30), async {
-        let mut events: Vec<Value> = Vec::new();
-        loop {
-            let frame = wss_event(&mut sub, 30).await;
-            let ev = &frame["params"]["event"];
-            match ev["type"].as_str() {
-                Some("agent:tool:call")
-                    if ev["data"]["toolCallId"].as_str() == Some("tc_title") =>
-                {
-                    events.push(ev["data"].clone());
+    let tool_events = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            let mut events: Vec<Value> = Vec::new();
+            loop {
+                let frame = wss_event(&mut sub, 30).await;
+                let ev = &frame["params"]["event"];
+                match ev["type"].as_str() {
+                    Some("agent:tool:call")
+                        if ev["data"]["toolCallId"].as_str() == Some("tc_title") =>
+                    {
+                        events.push(ev["data"].clone());
+                    }
+                    Some("agent:stream:end") => return events,
+                    _ => {}
                 }
-                Some("agent:stream:end") => return events,
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await
     .expect("turn reached its terminal stream:end in time");
     assert_eq!(
@@ -17849,32 +18385,37 @@ async fn status_only_tool_update_preserves_richer_title_over_wss() {
     // final delta. Before the fix, the status-only update shipped a rebuilt
     // block with `name: ""` and no `_acpTitle`, wiping the title live.
     let mut last_tool_block: Option<Value> = None;
-    let terminal = timeout(Duration::from_secs(30), async {
-        loop {
-            let frame = wss_push(&mut chat, 30).await;
-            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-            let delta = frame["params"]["delta"].clone();
-            let mut is_terminal = false;
-            for key in ["added", "updated"] {
-                for e in delta[key].as_array().into_iter().flatten() {
-                    if e["block"]["type"] == "tool_use" && e["block"]["toolCallId"] == "tc_title" {
-                        last_tool_block = Some(e["block"].clone());
-                    }
-                    // Terminal = the ASSISTANT turn's reconcile; user-row
-                    // deltas also carry `streamingComplete: true` but arrive
-                    // before the turn streams.
-                    if e["role"] == "assistant"
-                        && e.get("streamingComplete") == Some(&Value::Bool(true))
-                    {
-                        is_terminal = true;
+    let terminal = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let frame = wss_push(&mut chat, 30).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = frame["params"]["delta"].clone();
+                let mut is_terminal = false;
+                for key in ["added", "updated"] {
+                    for e in delta[key].as_array().into_iter().flatten() {
+                        if e["block"]["type"] == "tool_use"
+                            && e["block"]["toolCallId"] == "tc_title"
+                        {
+                            last_tool_block = Some(e["block"].clone());
+                        }
+                        // Terminal = the ASSISTANT turn's reconcile; user-row
+                        // deltas also carry `streamingComplete: true` but arrive
+                        // before the turn streams.
+                        if e["role"] == "assistant"
+                            && e.get("streamingComplete") == Some(&Value::Bool(true))
+                        {
+                            is_terminal = true;
+                        }
                     }
                 }
+                if is_terminal {
+                    return delta;
+                }
             }
-            if is_terminal {
-                return delta;
-            }
-        }
-    })
+        },
+    )
     .await
     .expect("terminal (streamingComplete) delta arrived");
     let live_block = last_tool_block.expect("tool_use block reached the chat channel");
@@ -17946,22 +18487,25 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     F: FnMut(&Value) -> bool,
 {
-    timeout(Duration::from_secs(secs), async {
-        loop {
-            let frame = wss_push(chat, secs).await;
-            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-            let delta = frame["params"]["delta"].clone();
-            if let Some(entity) = delta["added"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(delta["updated"].as_array().into_iter().flatten())
-                .find(|e| pred(e))
-            {
-                return (entity.clone(), delta);
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(secs)),
+        async {
+            loop {
+                let frame = wss_push(chat, secs).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = frame["params"]["delta"].clone();
+                if let Some(entity) = delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    .find(|e| pred(e))
+                {
+                    return (entity.clone(), delta);
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("matching chat delta entity arrived in time")
 }
@@ -18412,18 +18956,21 @@ async fn tool_call_activity_pings_carry_last_tool_use_over_wss() {
 
     // Collect every activity frame up to the terminal stream:end under one
     // total deadline (per-frame reads would reset on heartbeat Pings).
-    let activities = timeout(Duration::from_secs(30), async {
-        let mut frames: Vec<Value> = Vec::new();
-        loop {
-            let frame = wss_event(&mut sub, 30).await;
-            let ev = &frame["params"]["event"];
-            match ev["type"].as_str() {
-                Some("agent:stream:activity") => frames.push(ev["data"].clone()),
-                Some("agent:stream:end") => return frames,
-                _ => {}
+    let activities = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            let mut frames: Vec<Value> = Vec::new();
+            loop {
+                let frame = wss_event(&mut sub, 30).await;
+                let ev = &frame["params"]["event"];
+                match ev["type"].as_str() {
+                    Some("agent:stream:activity") => frames.push(ev["data"].clone()),
+                    Some("agent:stream:end") => return frames,
+                    _ => {}
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("turn reached its terminal stream:end in time");
 
@@ -18546,40 +19093,43 @@ async fn thinking_blocks_stream_and_persist_over_wss() {
 
     // Collect live blocks until the turn's terminal (streamingComplete) delta.
     // Single total deadline (per-frame reads would reset on heartbeat Pings).
-    let live: Vec<Value> = timeout(Duration::from_secs(30), async {
-        // Latest-wins per block id: the accumulating chunk deltas re-send the
-        // whole block, so the last copy seen is the complete one.
-        let mut blocks: Vec<Value> = Vec::new();
-        loop {
-            let frame = wss_push(&mut chat, 30).await;
-            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-            let delta = &frame["params"]["delta"];
-            let mut terminal = false;
-            for entity in delta["added"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(delta["updated"].as_array().into_iter().flatten())
-                // The echoed user message rides the same channel and is
-                // complete on arrival; only the assistant turn ends the loop.
-                .filter(|e| {
-                    !e["messageId"]
-                        .as_str()
-                        .is_some_and(|id| id.starts_with("user-msg"))
-                })
-            {
-                terminal |= entity.get("streamingComplete") == Some(&Value::Bool(true));
-                let block = entity["block"].clone();
-                match blocks.iter_mut().find(|b| b["id"] == block["id"]) {
-                    Some(existing) => *existing = block,
-                    None => blocks.push(block),
+    let live: Vec<Value> = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            // Latest-wins per block id: the accumulating chunk deltas re-send the
+            // whole block, so the last copy seen is the complete one.
+            let mut blocks: Vec<Value> = Vec::new();
+            loop {
+                let frame = wss_push(&mut chat, 30).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = &frame["params"]["delta"];
+                let mut terminal = false;
+                for entity in delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    // The echoed user message rides the same channel and is
+                    // complete on arrival; only the assistant turn ends the loop.
+                    .filter(|e| {
+                        !e["messageId"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("user-msg"))
+                    })
+                {
+                    terminal |= entity.get("streamingComplete") == Some(&Value::Bool(true));
+                    let block = entity["block"].clone();
+                    match blocks.iter_mut().find(|b| b["id"] == block["id"]) {
+                        Some(existing) => *existing = block,
+                        None => blocks.push(block),
+                    }
+                }
+                if terminal {
+                    return blocks;
                 }
             }
-            if terminal {
-                return blocks;
-            }
-        }
-    })
+        },
+    )
     .await
     .expect("turn reached its terminal delta in time");
 
@@ -18739,7 +19289,8 @@ async fn ttl_reap_evicted_event_and_send_restores_over_wss() {
     // additive `"idle-ttl"` reason and the §6.7 self-sufficient payload.
     let mut ends = 0u32;
     let mut evicted_frame: Option<Value> = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while evicted_frame.is_none() {
         let frame = wss_event_opt_until(&mut sub, deadline)
             .await
@@ -18778,7 +19329,8 @@ async fn ttl_reap_evicted_event_and_send_restores_over_wss() {
     .await;
     assert_eq!(sent2["success"], true, "post-reap sendMessage ok: {sent2}");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let frame = wss_event_opt_until(&mut sub, deadline)
             .await
@@ -18932,7 +19484,8 @@ async fn queued_spawn_resumes_exactly_once_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "holder sendMessage ok: {sent}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let frame = wss_event_opt_until(&mut sub, deadline)
             .await
@@ -18963,7 +19516,8 @@ async fn queued_spawn_resumes_exactly_once_over_wss() {
     // The waiter parks: `agent:process:queued` with the `"slots"` reason.
     let mut queued_frames: Vec<Value> = Vec::new();
     let mut resumed_frames: Vec<Value> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while queued_frames.is_empty() {
         let frame = wss_event_opt_until(&mut sub, deadline)
             .await
@@ -18992,7 +19546,8 @@ async fn queued_spawn_resumes_exactly_once_over_wss() {
     let stopped = wss_rpc(&mut rpc, 14, "agent.stop", json!({ "agentId": holder })).await;
     assert_eq!(stopped["success"], true, "holder stop ok: {stopped}");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     loop {
         let frame = wss_event_opt_until(&mut sub, deadline)
             .await
@@ -19134,7 +19689,8 @@ async fn natural_turn_end_admits_queued_spawn_in_one_pass_over_wss() {
     )
     .await;
     assert_eq!(sent["success"], true, "holder sendMessage ok: {sent}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let frame = wss_event_opt_until(&mut sub, deadline)
             .await
@@ -19165,7 +19721,8 @@ async fn natural_turn_end_admits_queued_spawn_in_one_pass_over_wss() {
     // before the holder's turn ends.
     let mut queued_frames: Vec<Value> = Vec::new();
     let mut resumed_frames: Vec<Value> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while queued_frames.is_empty() {
         let frame = wss_event_opt_until(&mut sub, deadline)
             .await
@@ -19198,7 +19755,8 @@ async fn natural_turn_end_admits_queued_spawn_in_one_pass_over_wss() {
     // `resumed` must follow it on the wakeup path, not on the timed re-check.
     let mut holder_ended_at: Option<tokio::time::Instant> = None;
     let mut waiter_resumed_at: Option<tokio::time::Instant> = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     loop {
         let frame = wss_event_opt_until(&mut sub, deadline)
             .await
@@ -19358,16 +19916,19 @@ async fn agent_stop_on_wedged_transport_emits_terminal_events_over_wss() {
     // cancel tries to enqueue, or the cancel would land normally and the
     // test would pass vacuously (the daemon-log WARN assert below keeps
     // this honest either way).
-    timeout(Duration::from_secs(30), async {
-        loop {
-            let frame = wss_event(&mut sub, 30).await;
-            if frame["params"]["event"]["type"] == "agent:stream:activity"
-                && frame["params"]["event"]["data"]["agentId"].as_str() == Some(&agent_id)
-            {
-                return;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                let frame = wss_event(&mut sub, 30).await;
+                if frame["params"]["event"]["type"] == "agent:stream:activity"
+                    && frame["params"]["event"]["data"]["agentId"].as_str() == Some(&agent_id)
+                {
+                    return;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("mock streamed its pre-wedge chunk");
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -19381,7 +19942,8 @@ async fn agent_stop_on_wedged_transport_emits_terminal_events_over_wss() {
     // never a failed.
     let mut end_frame: Option<Value> = None;
     let mut saw_idle = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while !(end_frame.is_some() && saw_idle) {
         let frame = wss_event_opt_until(&mut sub, deadline)
             .await
@@ -19553,7 +20115,8 @@ async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
     // A live daemon turn is NOT a provider receipt: the child is deliberately
     // held before recording the prompt. Keep the original five-second budget
     // for both turn-liveness and the provider receipt below (intent#6689).
-    let receipt_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let receipt_deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
     let mut in_flight = false;
     let mut i = 0;
     while tokio::time::Instant::now() < receipt_deadline {
@@ -19620,7 +20183,8 @@ async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
     // streaming zombie chunks; the quirk tears the child down underneath them.
     let stopped = wss_rpc(&mut rpc, 12, "agent.stop", json!({ "agentId": agent_id })).await;
     assert_eq!(stopped["success"], true, "stop ok: {stopped}");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let frame = wss_event_opt_until(&mut sub, deadline)
             .await
@@ -19677,7 +20241,8 @@ async fn kill_on_interrupt_quirk_fences_zombie_chunks_over_wss() {
 
     let mut saw_resume_end = false;
     let mut tainted_deltas: Vec<String> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while !saw_resume_end {
         let frame = wss_event_opt_until(&mut sub, deadline)
             .await
@@ -19802,8 +20367,8 @@ async fn specialist_placeholder_first_message_naming_over_wss() {
 
     for (index, (name, explicit, needs_name)) in [
         (None, false, true),
-        (Some("Implementor 2"), false, true),
-        (Some("Implementor"), true, false),
+        (Some("Developer 2"), false, true),
+        (Some("Developer"), true, false),
         (Some("Fix the sidebar"), false, false),
     ]
     .into_iter()
@@ -19811,7 +20376,7 @@ async fn specialist_placeholder_first_message_naming_over_wss() {
     {
         let mut params = json!({
             "workspaceId": ws_id, "provider": "mock", "model": "default",
-            "specialistId": "implementor",
+            "specialistId": "developer",
         });
         if let Some(name) = name {
             params["name"] = json!(name);
@@ -19819,7 +20384,7 @@ async fn specialist_placeholder_first_message_naming_over_wss() {
         }
         let created = wss_rpc(&mut rpc, 10, "agent.create", params).await;
         let agent_id = created["agent"]["id"].as_str().unwrap();
-        assert_eq!(created["agent"]["name"], name.unwrap_or("Implementor"));
+        assert_eq!(created["agent"]["name"], name.unwrap_or("Developer"));
         assert_eq!(created["agent"]["nameExplicitlySet"], explicit);
 
         for turn in 0..2 {
@@ -19834,18 +20399,21 @@ async fn specialist_placeholder_first_message_naming_over_wss() {
             )
             .await;
             assert_eq!(sent["success"], true);
-            timeout(Duration::from_secs(30), async {
-                loop {
-                    let frame = wss_event(&mut sub, 30).await;
-                    let event = &frame["params"]["event"];
-                    if event["type"] == "agent:status-changed"
-                        && event["data"]["agentId"] == agent_id
-                        && event["data"]["status"] == "idle"
-                    {
-                        break;
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(30)),
+                async {
+                    loop {
+                        let frame = wss_event(&mut sub, 30).await;
+                        let event = &frame["params"]["event"];
+                        if event["type"] == "agent:status-changed"
+                            && event["data"]["agentId"] == agent_id
+                            && event["data"]["status"] == "idle"
+                        {
+                            break;
+                        }
                     }
-                }
-            })
+                },
+            )
             .await
             .expect("agent turn settled");
             let log = std::fs::read_to_string(&prompt_log).expect("provider prompt log");
@@ -19873,7 +20441,7 @@ async fn specialist_placeholder_first_message_naming_over_wss() {
         let got = wss_rpc(&mut rpc, 12, "agent.get", json!({"agentId": agent_id})).await;
         assert_eq!(
             got["agent"]["name"],
-            name.unwrap_or("Implementor"),
+            name.unwrap_or("Developer"),
             "the hint itself never mutates the stored name"
         );
     }

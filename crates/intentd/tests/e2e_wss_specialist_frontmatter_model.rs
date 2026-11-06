@@ -5,10 +5,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,14 +30,13 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     _data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -44,7 +44,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -62,7 +62,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -172,9 +172,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -360,7 +363,11 @@ async fn specialist_provider_and_frontmatter_model_resolved_over_wss() {
         .await
         .expect("read store");
     let sessions_before = store.list_all_agent_sessions().await.unwrap().len();
-    let workspaces_before = store.list_workspaces(true).await.unwrap().len();
+    let workspaces_before = store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap()
+        .len();
     let notes_before = store.list_all_notes().await.unwrap().len();
     let query = intent_store::EventQuery {
         event_types: vec!["agent:created".into(), "workspace:created".into()],
@@ -401,7 +408,11 @@ async fn specialist_provider_and_frontmatter_model_resolved_over_wss() {
         sessions_before
     );
     assert_eq!(
-        store.list_workspaces(true).await.unwrap().len(),
+        store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .len(),
         workspaces_before
     );
     assert_eq!(store.list_all_notes().await.unwrap().len(), notes_before);
@@ -413,20 +424,23 @@ async fn specialist_provider_and_frontmatter_model_resolved_over_wss() {
     drop(daemon);
 }
 
-/// WSS e2e for specialist aliases (PROTOCOL §5.11): the bundled v1.1
-/// `spec-writer` carries `aliases: ["coordinator"]`, so `agent.create` with
-/// `specialistId: "coordinator"` persists the CANONICAL id (`spec-writer`)
-/// on the session — surfaced as `metadata.specialist` — and resolves the
-/// specialist's display name; `specialist.get` on the alias serves the
-/// canonical resolved view.
+/// Specialist aliases resolve and persist the canonical identity over WSS.
 #[tokio::test]
 async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
 
+    let specialists = data_dir.join(".intent/specialists");
+    std::fs::create_dir_all(&specialists).unwrap();
+    std::fs::write(
+        specialists.join("custom-planner.md"),
+        "---\nname: Custom planner\ndescription: Planning\naliases: [\"planning-alias\"]\n---\nPlan the task.",
+    )
+    .unwrap();
+
     // Pre-seed a workspace (repository_path so project-tier resolution has a
-    // root; the alias itself resolves from the embedded bundled floor).
+    // root; the alias itself resolves from an authored project specialist).
     let ws_id = {
         use intent_core::WorkspaceId;
         use intent_store::Store;
@@ -462,17 +476,23 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
     let mut ws = connect_ws(port, cfg).await;
 
     // specialist.get on the alias serves the canonical resolved view.
-    let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "coordinator" })).await;
+    let got = wss_rpc(
+        &mut ws,
+        2,
+        "specialist.get",
+        json!({ "id": "planning-alias", "workspacePath": data_dir }),
+    )
+    .await;
     assert_eq!(
-        got["specialist"]["id"], "spec-writer",
+        got["specialist"]["id"], "custom-planner",
         "alias resolves to the canonical def over WSS"
     );
-    assert_eq!(got["specialist"]["aliases"], json!(["coordinator"]));
+    assert_eq!(got["specialist"]["aliases"], json!(["planning-alias"]));
 
     // agent.create with the alias persists the canonical specialist id and
     // derives the display name from the canonical specialist. The explicit
-    // provider + bare model satisfies provider resolution (the bundled
-    // spec-writer pins no frontmatter model and this hermetic env configures
+    // provider + bare model satisfies provider resolution (the custom
+    // custom-planner pins no frontmatter model and this hermetic env configures
     // no default provider) without touching the alias seam under test.
     let created = wss_rpc(
         &mut ws,
@@ -480,7 +500,7 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         "agent.create",
         json!({
             "workspaceId": ws_id,
-            "specialistId": "coordinator",
+            "specialistId": "planning-alias",
             "model": "opus",
             "provider": "auggie"
         }),
@@ -488,47 +508,58 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
     .await;
     let agent_id = created["agent"]["id"].as_str().expect("agent id");
     assert_eq!(
-        created["agent"]["metadata"]["specialist"], "spec-writer",
+        created["agent"]["metadata"]["specialist"], "custom-planner",
         "alias create persists the canonical id, not the alias"
     );
-    assert_eq!(created["agent"]["name"], "Coordinator");
+    assert_eq!(created["agent"]["name"], "Custom planner");
 
     // agent.get round-trips the canonical id from the persisted row.
     let get_res = wss_rpc(&mut ws, 4, "agent.get", json!({ "agentId": agent_id })).await;
     assert_eq!(
-        get_res["agent"]["metadata"]["specialist"], "spec-writer",
+        get_res["agent"]["metadata"]["specialist"], "custom-planner",
         "persisted session carries the canonical id"
     );
 
-    // An UNKNOWN specialist id is rejected with `-32602` naming the id and
-    // the known catalog ids (monorepo#3497) — no session is created.
-    let rejected = wss_rpc_raw(
-        &mut ws,
-        5,
-        "agent.create",
-        json!({
-            "workspaceId": ws_id,
-            "specialistId": "no-such-specialist",
-            "model": "opus",
-            "provider": "auggie"
-        }),
-    )
-    .await;
-    assert_eq!(
-        rejected["error"]["code"], -32602,
-        "unknown specialist rejects with invalid-params: {rejected}"
-    );
-    let msg = rejected["error"]["message"]
-        .as_str()
-        .expect("error message");
-    assert!(
-        msg.contains("unknown specialist: no-such-specialist"),
-        "error names the id: {msg}"
-    );
-    assert!(
-        msg.contains("known specialists:") && msg.contains("spec-writer"),
-        "error lists the known ids: {msg}"
-    );
+    // Removed bundled choices cannot create new sessions.
+    for removed in [
+        "spec-writer",
+        "coordinator",
+        "lead",
+        "implementor",
+        "verifier",
+        "developer-legacy",
+        "coordinator-legacy",
+        "implementor-legacy",
+        "verifier-legacy",
+    ] {
+        let rejected = wss_rpc_raw(
+            &mut ws,
+            5,
+            "agent.create",
+            json!({
+                "workspaceId": ws_id,
+                "specialistId": removed,
+                "model": "opus",
+                "provider": "auggie"
+            }),
+        )
+        .await;
+        assert_eq!(
+            rejected["error"]["code"], -32602,
+            "unknown specialist rejects with invalid-params: {rejected}"
+        );
+        let msg = rejected["error"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            msg.contains(&format!("unknown specialist: {removed}")),
+            "error names the id: {msg}"
+        );
+        assert!(
+            msg.contains("known specialists:") && msg.contains("developer"),
+            "error lists the known ids: {msg}"
+        );
+    }
 
     drop(daemon);
 }
@@ -650,14 +681,11 @@ async fn embedded_bundled_catalog_over_wss() {
         [
             "chief-of-staff",
             "developer",
-            "implementor",
             "pr-reviewer",
-            "spec-writer",
             "ui-designer",
-            "verifier",
             "vulnerability-scanner",
         ],
-        "bundled catalog over WSS is exactly the eight catalog-visible embedded ids"
+        "bundled catalog over WSS contains only the current specialists"
     );
     assert!(!ids.contains(&"ralph"), "retired Ralph is not cataloged");
     for spec in specs {
@@ -930,9 +958,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -1255,54 +1286,14 @@ async fn specialist_picker_metadata_round_trips_over_wss() {
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
         title: "WSS-E2E".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }

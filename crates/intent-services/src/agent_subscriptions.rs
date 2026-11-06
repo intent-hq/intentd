@@ -634,7 +634,7 @@ impl Services {
     /// was registered; a no-op when the name is already current.
     ///
     /// `new_parent_name` is `None` when the caller's current display name
-    /// could not be resolved (e.g. `store.get_agent_session` failed under
+    /// could not be resolved (e.g. `store.get_agent_session_with_transcript` failed under
     /// contention, Copilot #104 thread `PRRT_kwDOS9Wxuc6QKWuU`): the reuse
     /// still proceeds, but the existing stored name is left intact rather
     /// than overwritten with an empty placeholder that would degrade
@@ -643,7 +643,7 @@ impl Services {
     /// `resolved_parent_workspace_id` is `Some` only when the caller resolved
     /// the parent's home workspace from an actual session row (never from a
     /// call-workspace fallback): a watch originally registered with fallback
-    /// anchors (a transient `get_agent_session` failure) has its
+    /// anchors (a transient `get_agent_session_with_transcript` failure) has its
     /// `parent_workspace_id` corrected on reuse, so subsequent wakes and
     /// `agent:subscriptions-changed` land in the parent's true home
     /// workspace. Refreshing only the parent anchor cannot violate the scope
@@ -780,7 +780,7 @@ impl Services {
     /// common no-watch case costs no store read; otherwise this is one
     /// message-free session-summaries read. Best-effort: a store read
     /// failure is logged and fails open to `false` (mirrors
-    /// [`Services::workspace_has_active_hooks`]) so list/get emission is
+    /// [`Services::workspace_has_active_hooks_or_script_monitors`]) so list/get emission is
     /// never wedged and activity is never fabricated.
     pub(crate) async fn workspace_has_waiting_agent_subscriptions(
         &self,
@@ -808,7 +808,7 @@ impl Services {
     pub(crate) fn workspace_has_waiting_agent_subscriptions_in_sessions(
         &self,
         workspace_id: &WorkspaceId,
-        sessions: &[intent_core::AgentSession],
+        sessions: &[intent_store::AgentSessionSummary],
     ) -> bool {
         let parents = self.waiting_subscription_parent_ids(workspace_id);
         Self::sessions_include_waiting_parent(sessions, &parents)
@@ -830,7 +830,7 @@ impl Services {
     }
 
     fn sessions_include_waiting_parent(
-        sessions: &[intent_core::AgentSession],
+        sessions: &[intent_store::AgentSessionSummary],
         parents: &[AgentId],
     ) -> bool {
         !parents.is_empty()
@@ -1485,7 +1485,7 @@ impl Services {
             .get_or_init(|| GroupPersistLane::new(self.store.clone()))
     }
 
-    pub(crate) async fn shutdown_group_persistence(&self) {
+    pub async fn shutdown_group_persistence(&self) {
         // Initialize even an unused lane so later calls cannot reopen admission.
         self.group_persist_lane().shutdown().await;
     }
@@ -1944,10 +1944,17 @@ impl Services {
                         // sender-watches that get no report-time wake).
                         if settled
                             && matches!(call_site, WatchReconcileCallSite::Registration)
-                            && (!self.active_hooks_for_agent(child_id).await.is_empty()
+                            && (!self
+                                .ports
+                                .runtime()
+                                .active_hooks_for_agent(self, child_id)
+                                .await
+                                .is_empty()
                                 || (!self.active_pr_monitors_for_agent(child_id).await.is_empty()
                                     || !self
-                                        .active_script_monitors_for_agent(child_id)
+                                        .ports
+                                        .runtime()
+                                        .active_script_monitors_for_agent(self, child_id)
                                         .await
                                         .is_empty())
                                 || !self.list_event_subscriptions_for_agent(child_id).is_empty())
@@ -1978,11 +1985,11 @@ impl Services {
                     let status = serde_json::to_value(session.status).unwrap_or_default();
                     (
                         event_type,
-                        session.workspace_id,
+                        session.workspace_id.clone(),
                         status,
-                        session.completion_report,
-                        session.stop_reason,
-                        Some(session.name),
+                        session.completion_report.clone(),
+                        session.stop_reason.clone(),
+                        Some(session.name.clone()),
                     )
                 }
                 Err(intent_store::Error::NotFound(_)) => (
@@ -2028,7 +2035,7 @@ impl Services {
         // `waitingOnHooks` / `waitingOnPrMonitors` stamps as a live
         // `agent:idle` emit (each omitted when the child owns none), the
         // same emit-time `isWaitingForOtherAgents` flag (pending-watch
-        // derivation with the shared `report_delivered` filter, no 2-cycle
+        // derivation with the shared `report_delivered` filter, no idle-cycle
         // guard — matching the live emit sites), and the persisted
         // completionReport under the same dual keys (canonical + legacy) —
         // which is also what lets the delivery pass apply the monorepo#1945
@@ -2038,7 +2045,10 @@ impl Services {
                 data["completionReport"] = serde_json::Value::String(report.clone());
                 data["report"] = serde_json::Value::String(report.clone());
             }
-            self.annotate_waiting_on_hooks(child_id, &mut data).await;
+            self.ports
+                .runtime()
+                .annotate_waiting_on_hooks(self, child_id, &mut data)
+                .await;
             self.annotate_waiting_on_pr_monitors(child_id, &mut data)
                 .await;
             data["isWaitingForOtherAgents"] =
@@ -2309,7 +2319,9 @@ impl Services {
                         // Failed/deleted children record regardless.
                         if event_type == intent_core::events::AGENT_IDLE
                             && !self
-                                .annotate_waiting_on_hooks(&child_id, &mut data)
+                                .ports
+                                .runtime()
+                                .annotate_waiting_on_hooks(self, &child_id, &mut data)
                                 .await
                                 .is_empty()
                             && !completion_reported
@@ -2355,11 +2367,11 @@ impl Services {
                         // Same emit-time `isWaitingForOtherAgents` stamp as
                         // the live idle emits. Usually false here (a waiting
                         // child was skipped above), but not always: the skip
-                        // uses the durable classification WITH the 2-cycle
+                        // uses the durable classification WITH the idle-cycle
                         // guard, while this stamp is the in-memory watch
-                        // derivation (report_delivered-filtered, no 2-cycle
+                        // derivation (report_delivered-filtered, no idle-cycle
                         // guard) — a child whose only outgoing watch was
-                        // declassified as a mutual-idle 2-cycle reaches this
+                        // declassified as part of an all-idle cycle reaches this
                         // line and stamps `true`.
                         if event_type == intent_core::events::AGENT_IDLE {
                             data["isWaitingForOtherAgents"] = serde_json::json!(!self
@@ -2388,7 +2400,7 @@ impl Services {
                                 &mut data, &triggers,
                             );
                         }
-                        let report = session.completion_report;
+                        let report = session.completion_report.clone();
                         // Child completion events fire in the CHILD's own
                         // workspace (which differs from the group's anchor
                         // for chief-anchored groups).
@@ -2515,7 +2527,9 @@ impl Services {
         if !completion_reported
             && (!self.active_pr_monitors_for_agent(agent_id).await.is_empty()
                 || !self
-                    .active_script_monitors_for_agent(agent_id)
+                    .ports
+                    .runtime()
+                    .active_script_monitors_for_agent(self, agent_id)
                     .await
                     .is_empty())
         {
@@ -2533,7 +2547,7 @@ impl Services {
         // agent that itself holds live outgoing completion watches on other
         // agents has not settled — it will run again when a watched target
         // completes, so its group completion must not be recorded yet.
-        // Classified live (with the 2-cycle deadlock guard) rather than from
+        // Classified live (with the idle-cycle deadlock guard) rather than from
         // the emit-time `isWaitingForOtherAgents` stamp, matching the grouped
         // branch of `deliver_completion_to_watches`; the genuine completion
         // (post-wait idle, failure, deletion, or the watch-removal backstop
@@ -2559,7 +2573,7 @@ impl Services {
             // Build event for group recording. Prefer the child's persisted
             // completion_report (set by agent.reportToParent) over the generic
             // summary, mirroring deliver_completion_to_watches logic.
-            let session = self.store.get_agent_session(agent_id).await.ok();
+            let session = self.store.get_agent_session_summary(agent_id).await.ok();
             // monorepo#1016: annotate a suspected stall (idle, no report,
             // assigned task still incomplete) on the recorded line + event
             // data. Best-effort — lookup failures fail open.
@@ -2597,7 +2611,7 @@ impl Services {
                     triggers.push(pair);
                 }
             }
-            let report = session.and_then(|s| s.completion_report);
+            let report = session.and_then(|s| s.completion_report.clone());
             let mut data = event_data.clone();
             if let Some(s) = &stall {
                 s.annotate_event_data(&mut data);
@@ -2772,10 +2786,7 @@ fn persisted_to_delegation_group(p: &PersistedDelegationGroup) -> Result<Delegat
 mod tests {
     use std::path::PathBuf;
 
-    use intent_core::{
-        AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-        WorkspaceDisplayStatus, WorkspaceStatus,
-    };
+    use intent_core::{AgentSession, AgentStatus, Workspace, WorkspaceDisplayStatus};
     use intent_store::Store;
 
     use super::*;
@@ -2807,49 +2818,9 @@ mod tests {
             id: id.clone(),
             title: "WS".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
     }
 
@@ -2899,6 +2870,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 
@@ -2920,7 +2892,8 @@ mod tests {
             .await
             .expect("child");
         let root = tempfile::tempdir().expect("temp workspaces root");
-        let services = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+        let services =
+            Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
         (tmp, root, services, ws)
     }
 
@@ -2937,9 +2910,12 @@ mod tests {
         };
         drop(held);
         if !returned_early {
-            tokio::time::timeout(std::time::Duration::from_secs(10), drain)
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+                drain,
+            )
+            .await
+            .unwrap();
         }
         assert!(
             !returned_early,

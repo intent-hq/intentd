@@ -33,7 +33,8 @@ impl Harness {
             .insert_agent_session(&session(&ws, &agent.0))
             .await
             .unwrap();
-        let services = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+        let services =
+            Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
         let registry = Arc::new(RepositoryLifecycleRegistry::default());
         registry.install(&services.store).await.unwrap();
         let owner = FixtureOriginOwner::new(&registry, Caller::Daemon).unwrap();
@@ -113,6 +114,7 @@ fn session(ws: &WorkspaceId, id: &str) -> AgentSession {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
         created_at: ts.clone(),
         updated_at: ts,
     }
@@ -166,9 +168,12 @@ async fn timer_claim_keeps_barrier_before_first_delete_sql() {
         .schedule_workspace_delete(h.ws.clone(), 0)
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        reached.notified(),
+    )
+    .await
+    .unwrap();
     let blocked = h.request(false).is_err();
     resume.notify_one();
     assert!(
@@ -267,19 +272,25 @@ impl DeletionGates {
     async fn abort(&self, key: &str) {
         let abort = self.0.lock().unwrap().aborts.remove(key).unwrap();
         abort.abort();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !abort.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            async {
+                while !abort.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .unwrap();
     }
 }
 async fn reached(notify: &tokio::sync::Notify) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        notify.notified(),
+    )
+    .await
+    .unwrap();
 }
 fn subject(h: &Harness, agent: bool) -> crate::delete_grace::PendingDeleteSubject {
     if agent {
@@ -376,7 +387,9 @@ async fn real_dispatch_holds_every_scheduling_waiter_and_writer_first_rejects_de
             })
         });
         start
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(intentd_test_support::test_timeout(
+                std::time::Duration::from_secs(5),
+            ))
             .unwrap();
         let services = h.services.clone();
         let ws = h.ws.clone();
@@ -390,7 +403,8 @@ async fn real_dispatch_holds_every_scheduling_waiter_and_writer_first_rejects_de
                 services.schedule_workspace_delete(ws, 60_000).await
             }
         }));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
         while h.request(agent).is_ok() {
             assert!(std::time::Instant::now() < deadline);
             tokio::task::yield_now().await;
@@ -449,7 +463,11 @@ async fn agent_zero_delay_claim_survives_cancel_and_store_failure() {
         .unwrap());
     resume.notify_one();
     reached(&finished).await;
-    h.services.store.get_agent_session(&h.agent).await.unwrap();
+    h.services
+        .store
+        .get_agent_session_with_transcript(&h.agent)
+        .await
+        .unwrap();
     assert!(h.request(true).is_err());
 }
 
@@ -467,7 +485,12 @@ async fn cascade_transfers_agent_claim_until_background_completion() {
         .arm("background", &h.ws.0);
     h.services.delete_workspace(h.ws.clone()).await.unwrap();
     reached(&pause).await;
-    assert!(h.services.store.get_agent_session(&h.agent).await.is_err());
+    assert!(h
+        .services
+        .store
+        .get_agent_session_with_transcript(&h.agent)
+        .await
+        .is_err());
     assert!(h.request(true).is_err());
     assert!(!h
         .services
@@ -601,7 +624,8 @@ async fn no_observer_schedule_blocks_first_install_and_cancellation_confirms_onl
     let store = Store::open(&db.path).await.unwrap();
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let services = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+    let services =
+        Services::new_isolated(store.clone()).with_workspaces_root(root.path().to_path_buf());
     services
         .schedule_workspace_delete(ws.clone(), 60_000)
         .await
@@ -735,7 +759,12 @@ async fn original_agent_metadata_error_keeps_legacy_ack_without_confirming_claim
         .execute(h.services.store.write_pool())
         .await
         .unwrap();
-    assert!(h.services.store.get_agent_session(&h.agent).await.is_err());
+    assert!(h
+        .services
+        .store
+        .get_agent_session_with_transcript(&h.agent)
+        .await
+        .is_err());
     let finished = h.services.pending_delete_test_gate.completion(&h.agent.0);
     h.services
         .agent_schedule_delete_op(h.agent.clone(), Some(h.ws.clone()), 0)
@@ -769,7 +798,7 @@ async fn unobserved_claimed_cancellation_survives_last_services_store_drop_and_r
     let store = Store::open(&db.path).await.unwrap();
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let services = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let services = Services::new_isolated(store).with_workspaces_root(root.path().to_path_buf());
     let (pause, resume) = services.pending_delete_test_gate.arm("background", &ws.0);
     services.delete_workspace(ws.clone()).await.unwrap();
     reached(&pause).await;
@@ -781,5 +810,66 @@ async fn unobserved_claimed_cancellation_survives_last_services_store_drop_and_r
     assert!(
         registry.install(&reopened).await.is_err(),
         "unconfirmed pre-observer owner survives all handles"
+    );
+}
+
+/// A `ws.secret.request` that lands while an agent delete is between its
+/// first steps and the row DELETE must not survive the deleted agent: the
+/// post-DELETE sweep removes it, and a later provide is refused (§5.56).
+#[intent_test_macros::daemon_test]
+async fn secret_request_racing_agent_delete_does_not_survive() {
+    let h = Harness::new().await;
+    let (pause, resume) = h
+        .services
+        .pending_delete_test_gate
+        .arm("agent-secret-window", &h.agent.0);
+    let finished = h.services.pending_delete_test_gate.completion(&h.agent.0);
+    h.services
+        .agent_schedule_delete_op(h.agent.clone(), Some(h.ws.clone()), 0)
+        .await
+        .unwrap();
+    reached(&pause).await;
+    let ticket = h
+        .services
+        .secret_request_op(h.ws.clone(), h.agent.clone(), "KEY".into(), "race".into())
+        .await
+        .expect("the row still exists while deletion is paused");
+    let request_id = ticket["requestId"].as_str().unwrap().to_string();
+    resume.notify_one();
+    reached(&finished).await;
+    assert!(h
+        .services
+        .store
+        .get_agent_session_with_transcript(&h.agent)
+        .await
+        .is_err());
+    assert!(h
+        .services
+        .secret_vault
+        .pending_owner(&h.ws, &request_id)
+        .is_none());
+    assert!(h
+        .services
+        .secret_vault
+        .resolve(&h.ws, &h.agent, &["KEY"])
+        .is_err());
+    let provided = h
+        .services
+        .secret_answer_op(
+            h.ws.clone(),
+            request_id,
+            crate::secret_requests::Outcome::Provided,
+            Some(zeroize::Zeroizing::new("v".to_string())),
+        )
+        .await;
+    assert!(
+        matches!(
+            provided,
+            Err(intent_core::Error::SecretRequest {
+                code: "secret-request-unknown",
+                ..
+            })
+        ),
+        "{provided:?}"
     );
 }

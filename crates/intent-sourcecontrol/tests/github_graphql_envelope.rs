@@ -1460,3 +1460,68 @@ async fn traffic_comments_count_the_single_first_page() {
     assert!(calls[0].contains("per_page=100"));
     assert!(calls[0].contains("sort=created&direction=desc"));
 }
+
+/// intentd#2605: a hand-written watch read only the first page of reviews and
+/// missed a `CHANGES_REQUESTED` review on a newer commit. `list_reviews` drains
+/// every page and keeps each review's id and commit, so the PR checklist can
+/// tell a fresh review from an older one with the same verdict.
+#[tokio::test]
+async fn list_reviews_reads_every_page_and_keeps_review_commit() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mock = spawn_mock_with(recording(seen.clone(), |target| {
+        assert!(
+            target.starts_with("/repos/o/r/pulls/7/reviews?"),
+            "{target}"
+        );
+        let page = target
+            .split(['?', '&'])
+            .find_map(|kv| kv.strip_prefix("page="))
+            .expect("page param");
+        let body = if page == "1" {
+            Value::Array(
+                (0..100)
+                    .map(|i| {
+                        json!({
+                            "id": i,
+                            "user": { "login": "bot" },
+                            "state": "COMMENTED",
+                            "submitted_at": format!("2026-10-24T10:{:02}:00Z", i % 60),
+                            "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        })
+                    })
+                    .collect(),
+            )
+        } else {
+            json!([{
+                "id": 5_639_064_405_u64,
+                "user": { "login": "bot" },
+                "state": "CHANGES_REQUESTED",
+                "body": "still broken",
+                "submitted_at": "2026-10-24T17:01:00Z",
+                "commit_id": "c0f1e6f11c0f1e6f11c0f1e6f11c0f1e6f11c0f1",
+            }])
+        };
+        (200, body.to_string())
+    }))
+    .await;
+    let sc = GitHubSourceControl::new("token-not-a-real-secret", Some(&mock.base_uri)).unwrap();
+    let reviews = sc.list_reviews(&RepoRef::new("o", "r"), 7).await.unwrap();
+    assert_eq!(reviews.len(), 101, "both pages are read");
+    let last = reviews.last().unwrap();
+    assert_eq!(
+        last.verdict,
+        intent_sourcecontrol::ReviewVerdict::RequestChanges
+    );
+    assert_eq!(last.id.as_deref(), Some("5639064405"));
+    assert_eq!(
+        last.commit_sha.as_deref(),
+        Some("c0f1e6f11c0f1e6f11c0f1e6f11c0f1e6f11c0f1")
+    );
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].contains("&page=2") || requests[1].contains("?page=2"),
+        "{}",
+        requests[1]
+    );
+}

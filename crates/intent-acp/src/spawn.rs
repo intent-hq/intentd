@@ -9,7 +9,10 @@
 //! (nice `daemon + 5` on Unix, one priority class below the daemon's on
 //! Windows; see [`agent_nice`]) so an agent process tree competing for CPU
 //! never starves the daemon that drives it — and never outranks it, however
-//! the daemon itself was niced.
+//! the daemon itself was niced. Disk IO is demoted the same way (see
+//! [`crate::io_priority`]). [`AgentPriority`] bundles both so every agent
+//! launch path — including the short-lived adapter runs spawned outside this
+//! module — applies the same policy.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +25,13 @@ use intent_providers::{
 use tokio::io::AsyncRead;
 use tokio::process::{Child, Command};
 
+use intent_core::AgentTempDir;
+
 use crate::error::{AcpError, AcpResult};
+use crate::io_priority::{
+    agent_io_priority, apply_reduced_io_priority, io_priority_shortfall, AgentIoPriority,
+};
+use crate::profile_env::ProfileEnv;
 use crate::transport::{Connection, ConnectionHooks};
 
 /// Inputs for spawning a provider process.
@@ -85,6 +94,15 @@ pub struct SpawnOptions<'a> {
     /// built-in 8192 MB default applies. The `INTENTD_ACP_NODE_MAX_OLD_SPACE_MB`
     /// env var still overrides either. Native runtimes ignore it.
     pub node_max_old_space_mb: Option<u32>,
+    /// The selected named profile's resolved overlay (PROTOCOL §5.54), or
+    /// `None` for the provider's Default configuration. Applied over the
+    /// inherited and captured environment, below Intent's launch wiring.
+    pub profile_env: Option<&'a ProfileEnv>,
+    /// Existing root under which [`prepare_provider`] creates this launch's
+    /// private [`AgentTempDir`], exported as `TMPDIR` / `TMP` / `TEMP` so
+    /// agents never share fixed temp file names. `None` leaves the child's
+    /// temp variables as inherited.
+    pub agent_tmp_root: Option<&'a Path>,
 }
 
 impl<'a> SpawnOptions<'a> {
@@ -148,6 +166,8 @@ impl<'a> SpawnOptions<'a> {
             npx_fallback_binary: None,
             npx_fallback_package: None,
             node_max_old_space_mb: None,
+            profile_env: None,
+            agent_tmp_root: None,
         }
     }
 }
@@ -433,12 +453,13 @@ fn target_nice(parent: i32, increment: i32) -> i32 {
 /// `pre_exec` (logging is not async-signal-safe there);
 /// [`reduced_priority_shortfall`] reports it from the parent once the child
 /// is up.
-fn apply_reduced_priority(cmd: &mut Command, increment: i32) {
+fn apply_reduced_priority(cmd: &mut std::process::Command, increment: i32) {
     if increment <= 0 {
         return;
     }
     #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
         // SAFETY: `getpriority`/`setpriority` are plain syscall wrappers that
         // take no pointers and touch no locks or heap state, so they are safe
         // to call between fork and exec.
@@ -474,7 +495,7 @@ fn apply_reduced_priority(cmd: &mut Command, increment: i32) {
             // parent's class) rather than guess.
             _ => return,
         };
-        cmd.creation_flags(below);
+        std::os::windows::process::CommandExt::creation_flags(cmd, below);
     }
 }
 
@@ -514,8 +535,90 @@ fn reduced_priority_shortfall(pid: u32, increment: i32) -> Option<String> {
     })
 }
 
+/// The CPU + IO priority demotion an agent child starts with: nice
+/// increment per [`agent_nice`] and IO priority per
+/// [`crate::io_priority::agent_io_priority`]. Use [`Self::from_env`] +
+/// [`Self::apply`] on any command that launches an agent process tree (ACP
+/// adapter, npx/node, provider CLI) so it can never starve the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentPriority {
+    /// Nice increment over the daemon's own nice (`0` = unchanged).
+    pub nice_increment: i32,
+    /// Disk IO demotion.
+    pub io: AgentIoPriority,
+}
+
+impl AgentPriority {
+    /// The configured demotion ([`AGENT_NICE_ENV`],
+    /// [`crate::io_priority::AGENT_IO_PRIORITY_ENV`]), read once per process
+    /// so a misconfigured value warns once rather than on every spawn.
+    #[must_use]
+    pub fn from_env() -> Self {
+        static RESOLVED: std::sync::OnceLock<AgentPriority> = std::sync::OnceLock::new();
+        *RESOLVED.get_or_init(|| Self {
+            nice_increment: agent_nice(),
+            io: agent_io_priority(),
+        })
+    }
+
+    /// Configure `cmd` so its child starts at this reduced CPU and IO
+    /// priority (never above the daemon's). Never makes the spawn fail.
+    pub fn apply(self, cmd: &mut Command) {
+        self.apply_std(cmd.as_std_mut());
+    }
+
+    /// The nice value a child of this process gets under this demotion
+    /// (`None` when this process's own nice cannot be read).
+    #[cfg(unix)]
+    #[must_use]
+    pub fn expected_nice(self) -> Option<i32> {
+        let own = nice_of(0).ok()?;
+        Some(if self.nice_increment > 0 {
+            target_nice(own, self.nice_increment)
+        } else {
+            own
+        })
+    }
+
+    /// [`Self::apply`] for a synchronous [`std::process::Command`].
+    pub fn apply_std(self, cmd: &mut std::process::Command) {
+        apply_reduced_priority(cmd, self.nice_increment);
+        apply_reduced_io_priority(cmd, self.io);
+    }
+
+    /// Why the freshly spawned child `pid` is not running at this demotion,
+    /// if it is not (see [`reduced_priority_shortfall`] and
+    /// [`io_priority_shortfall`]); `None` when it is or cannot be checked.
+    #[must_use]
+    pub fn shortfall(self, pid: u32) -> Option<String> {
+        #[cfg(unix)]
+        let cpu = reduced_priority_shortfall(pid, self.nice_increment);
+        #[cfg(not(unix))]
+        let cpu: Option<String> = None;
+        let io = io_priority_shortfall(pid, self.io);
+        match (cpu, io) {
+            (None, None) => None,
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        }
+    }
+
+    /// Log a warning when the child `pid` (if known) missed this demotion.
+    pub fn warn_on_shortfall(self, pid: Option<u32>, command: &str) {
+        if let Some(shortfall) = pid.and_then(|pid| self.shortfall(pid)) {
+            tracing::warn!(
+                command = %command,
+                pid,
+                nice_increment = self.nice_increment,
+                io_priority = ?self.io,
+                "agent child not started at reduced priority: {shortfall}"
+            );
+        }
+    }
+}
+
 /// Build the `tokio` command (args + env + enriched `PATH` + piped stdio +
-/// `kill_on_drop` + reduced priority per [`agent_nice`]) without spawning
+/// `kill_on_drop` + reduced CPU/IO priority per [`AgentPriority`]) without spawning
 /// it. Exposed for testing/inspection.
 ///
 /// When `opts.provider_binary` is set (resolved to an absolute path), spawns
@@ -576,17 +679,23 @@ fn build_command_with_captured_env(
     captured: &BTreeMap<String, String>,
     nice_increment: i32,
 ) -> Command {
-    build_command_in(opts, captured, nice_increment, None, None)
+    let priority = AgentPriority {
+        nice_increment,
+        ..AgentPriority::from_env()
+    };
+    build_command_in(opts, captured, priority, None, None, None)
 }
 
 /// [`build_command_with_captured_env`] with the per-spawn [`NpxLaunchDir`]
-/// an npx launch starts in (`None` → see [`process_cwd`]).
+/// an npx launch starts in (`None` → see [`process_cwd`]) and the launch's
+/// private temp folder (`None` → temp variables stay as inherited).
 fn build_command_in(
     opts: &SpawnOptions,
     captured: &BTreeMap<String, String>,
-    nice_increment: i32,
+    priority: AgentPriority,
     npx_launch_dir: Option<&Path>,
     args: Option<Vec<String>>,
+    agent_tmp_dir: Option<&AgentTempDir>,
 ) -> Command {
     let args = args.unwrap_or_else(|| build_args(opts));
 
@@ -610,6 +719,13 @@ fn build_command_in(
         via_npx,
         opts.node_max_old_space_mb,
     );
+    // A named profile's overlay beats the inherited and captured environment
+    // but never Intent's own wiring: provider env and extra_env are applied
+    // after it (an unset never removes them), and the enforced config, npm
+    // scrub and PATH below come last.
+    if let Some(profile) = opts.profile_env {
+        profile.apply_to_command(&mut cmd);
+    }
     for (key, value) in &provider_env {
         cmd.env(key, value);
     }
@@ -626,11 +742,21 @@ fn build_command_in(
     for (key, value) in captured {
         if provider_env.contains_key(key)
             || opts.extra_env.contains_key(key)
+            || opts.profile_env.is_some_and(|p| p.controls(key))
             || std::env::var_os(key).is_some()
         {
             continue;
         }
         cmd.env(key, value);
+    }
+
+    // The launch's private temp folder is Intent wiring: it beats every
+    // inherited, captured, profile and caller value so no two agents share
+    // a temp dir (and so a fixed temp file name cannot collide).
+    if let Some(dir) = agent_tmp_dir {
+        for (key, value) in dir.env() {
+            cmd.env(key, value);
+        }
     }
 
     // Enforce both native-subagent denial settings after every env merge.
@@ -658,7 +784,12 @@ fn build_command_in(
             .keys()
             .chain(opts.extra_env.keys())
             .chain(captured.keys())
-            .map(String::as_str);
+            .map(String::as_str)
+            .chain(
+                opts.profile_env
+                    .into_iter()
+                    .flat_map(|p| p.entries().map(|(k, _)| k)),
+            );
         for key in npm_workspace_selector_env_keys(explicit) {
             cmd.env_remove(key);
         }
@@ -676,7 +807,7 @@ fn build_command_in(
     // only reaches the direct child, leaving grandchildren orphaned (§5.6).
     #[cfg(unix)]
     cmd.process_group(0);
-    apply_reduced_priority(&mut cmd, nice_increment);
+    priority.apply(&mut cmd);
     cmd
 }
 
@@ -686,6 +817,7 @@ pub struct SpawnedAgent {
     child: Child,
     connection: Connection,
     npx_launch_dir: Option<NpxLaunchDir>,
+    agent_tmp_dir: Option<AgentTempDir>,
 }
 
 impl SpawnedAgent {
@@ -739,10 +871,24 @@ impl SpawnedAgent {
         kill_result.and(wait_result)
     }
 
-    /// Decompose into the child, connection and npx launch dir (e.g. to store
-    /// separately). The launch dir must be kept alive as long as the child.
-    pub fn into_parts(self) -> (Child, Connection, Option<NpxLaunchDir>) {
-        (self.child, self.connection, self.npx_launch_dir)
+    /// Decompose into the child, connection, npx launch dir and private temp
+    /// folder (see [`SpawnOptions::agent_tmp_root`]), e.g. to store them
+    /// separately. Both directories are removed when dropped, so keep them
+    /// alive as long as the child's process tree.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Child,
+        Connection,
+        Option<NpxLaunchDir>,
+        Option<AgentTempDir>,
+    ) {
+        (
+            self.child,
+            self.connection,
+            self.npx_launch_dir,
+            self.agent_tmp_dir,
+        )
     }
 }
 
@@ -761,13 +907,17 @@ impl SpawnedAgent {
 pub struct PreparedProvider {
     pub command: Command,
     npx_launch_dir: Option<NpxLaunchDir>,
+    agent_tmp_dir: Option<AgentTempDir>,
+    /// The demotion applied to `command`, checked against the child once it
+    /// is spawned.
+    priority: AgentPriority,
 }
 
 /// Build a launch without starting a process.
 /// # Errors
 /// Returns a spawn error when the neutral directory cannot be created.
 pub fn prepare_provider(opts: &SpawnOptions) -> AcpResult<PreparedProvider> {
-    let nice_increment = agent_nice();
+    let priority = AgentPriority::from_env();
     let (_, target) = opts.launch_target();
     let command_name = target.to_string_lossy().into_owned();
     // An npx launch starts in a fresh neutral directory, never the workspace
@@ -782,17 +932,40 @@ pub fn prepare_provider(opts: &SpawnOptions) -> AcpResult<PreparedProvider> {
         None
     };
     let launch_cwd = npx_launch_dir.as_ref().map(NpxLaunchDir::path);
+    let agent_tmp_dir = create_agent_tmp_dir(opts, &command_name);
     let command = build_command_in(
         opts,
         captured_credential_env(),
-        nice_increment,
+        priority,
         launch_cwd,
         None,
+        agent_tmp_dir.as_ref(),
     );
     Ok(PreparedProvider {
         command,
         npx_launch_dir,
+        agent_tmp_dir,
+        priority,
     })
+}
+
+/// The launch's private temp folder under [`SpawnOptions::agent_tmp_root`].
+/// Fail-soft: a folder that cannot be created leaves the inherited temp
+/// variables in place rather than failing the launch.
+fn create_agent_tmp_dir(opts: &SpawnOptions, command_name: &str) -> Option<AgentTempDir> {
+    let root = opts.agent_tmp_root?;
+    match AgentTempDir::create(root) {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            tracing::warn!(
+                command = command_name,
+                root = %root.display(),
+                error = %e,
+                "cannot create agent temp dir; the agent inherits the daemon's temp dir"
+            );
+            None
+        }
+    }
 }
 
 /// Prepare an npm package using launch isolation and environment, without running
@@ -817,12 +990,14 @@ pub fn prepare_npx_package(opts: &SpawnOptions, script: &str) -> AcpResult<Prepa
         "node".into(),
         script_path.to_string_lossy().into_owned(),
     ];
+    let priority = AgentPriority::from_env();
     let mut command = build_command_in(
         opts,
         captured_credential_env(),
-        agent_nice(),
+        priority,
         Some(dir.path()),
         Some(args),
+        None,
     );
     command
         .stdin(Stdio::null())
@@ -831,6 +1006,8 @@ pub fn prepare_npx_package(opts: &SpawnOptions, script: &str) -> AcpResult<Prepa
     Ok(PreparedProvider {
         command,
         npx_launch_dir: Some(dir),
+        agent_tmp_dir: None,
+        priority,
     })
 }
 
@@ -852,9 +1029,9 @@ pub fn spawn_prepared_provider(
     let PreparedProvider {
         command: mut cmd,
         npx_launch_dir,
+        agent_tmp_dir,
+        priority,
     } = prepared;
-    #[cfg(unix)]
-    let nice_increment = agent_nice();
     let (launch, target) = opts.launch_target();
     let command_name = target.to_string_lossy().into_owned();
     let launch_cwd = npx_launch_dir.as_ref().map(NpxLaunchDir::path);
@@ -873,18 +1050,7 @@ pub fn spawn_prepared_provider(
             AcpError::Spawn(format!("{command_name}: {e}"))
         }
     })?;
-    #[cfg(unix)]
-    if let Some(shortfall) = child
-        .id()
-        .and_then(|pid| reduced_priority_shortfall(pid, nice_increment))
-    {
-        tracing::warn!(
-            command = %command_name,
-            pid = child.id(),
-            nice_increment,
-            "agent child not started at reduced priority: {shortfall}"
-        );
-    }
+    priority.warn_on_shortfall(child.id(), &command_name);
     let stdin = child
         .stdin
         .take()
@@ -902,6 +1068,7 @@ pub fn spawn_prepared_provider(
         child,
         connection,
         npx_launch_dir,
+        agent_tmp_dir,
     })
 }
 
@@ -1331,16 +1498,20 @@ mod build_command_tests {
         let cmd = build_command(&opts);
         assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
         let args = build_args(&opts);
+        // The version is derived, not repeated: the auto-pin-acp-adapters
+        // workflow bumps only the `claude_agent_acp_version!` literal. The pin's
+        // shape is checked by intent-providers' `claude_agent_acp_pin_is_single_sourced`.
         assert_eq!(
             args,
             vec![
                 "--workspaces=false".to_string(),
                 "-y".to_string(),
-                "@agentclientprotocol/claude-agent-acp@0.81.1".to_string(),
-            ],
-            "bumping the adapter pin is a deliberate change — update this literal with it"
+                format!(
+                    "@agentclientprotocol/claude-agent-acp@{}",
+                    intent_providers::CLAUDE_AGENT_ACP_VERSION
+                ),
+            ]
         );
-        assert_eq!(intent_providers::CLAUDE_AGENT_ACP_VERSION, "0.81.1");
     }
 
     #[test]
@@ -1878,6 +2049,117 @@ mod captured_env_tests {
         );
     }
 
+    fn env_removed(cmd: &Command, key: &str) -> bool {
+        cmd.as_std()
+            .get_envs()
+            .any(|(k, v)| k == key && v.is_none())
+    }
+
+    fn work_profile(extra: Vec<(String, Option<String>)>) -> crate::ProfileEnv {
+        crate::ProfileEnv::new("codex@work", "fwork", extra)
+    }
+
+    #[test]
+    fn profile_set_beats_conflicting_captured_credential() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let name = absent_var_name();
+        let profile = work_profile(vec![(name.clone(), Some("work-value".into()))]);
+        let mut opts = SpawnOptions::new(provider);
+        opts.profile_env = Some(&profile);
+        let captured = BTreeMap::from([(name.clone(), "personal-captured".to_string())]);
+        let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
+        assert_eq!(env_value(&cmd, &name).as_deref(), Some("work-value"));
+    }
+
+    #[test]
+    fn profile_unset_removes_captured_and_inherited_credentials() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let captured_name = absent_var_name();
+        // An unset is an explicit removal whether or not the daemon env
+        // carries the variable.
+        let inherited_name = "LOGNAME".to_string();
+        let profile = work_profile(vec![
+            (captured_name.clone(), None),
+            (inherited_name.clone(), None),
+        ]);
+        let mut opts = SpawnOptions::new(provider);
+        opts.profile_env = Some(&profile);
+        let captured = BTreeMap::from([(captured_name.clone(), "captured".to_string())]);
+        let cmd = build_command_with_captured_env(&opts, &captured, DEFAULT_AGENT_NICE);
+        assert!(env_removed(&cmd, &captured_name));
+        assert!(env_removed(&cmd, &inherited_name));
+    }
+
+    #[test]
+    fn profile_never_overrides_intent_launch_wiring() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let npx = Path::new("/usr/local/bin/npx");
+        let profile = work_profile(vec![
+            (
+                "INTENT_SESSION_WIRING".into(),
+                Some("profile-must-lose".into()),
+            ),
+            ("INTENT_UNSET_WIRING".into(), None),
+            ("CODEX_CONFIG".into(), Some("profile-must-lose".into())),
+            ("PATH".into(), Some("/profile/must/lose".into())),
+            (
+                "npm_config_workspace".into(),
+                Some("profile-must-lose".into()),
+            ),
+        ]);
+        let mut opts = SpawnOptions::new(provider);
+        opts.npx_fallback_binary = Some(npx);
+        opts.npx_fallback_package = provider.npx_only_package;
+        opts.profile_env = Some(&profile);
+        opts.extra_env
+            .insert("INTENT_SESSION_WIRING".into(), "intent".into());
+        opts.extra_env
+            .insert("INTENT_UNSET_WIRING".into(), "intent".into());
+        let cmd = build_command_with_captured_env(&opts, &BTreeMap::new(), DEFAULT_AGENT_NICE);
+        assert_eq!(
+            env_value(&cmd, "INTENT_SESSION_WIRING").as_deref(),
+            Some("intent")
+        );
+        assert_eq!(
+            env_value(&cmd, "INTENT_UNSET_WIRING").as_deref(),
+            Some("intent")
+        );
+        assert_eq!(
+            env_value(&cmd, "CODEX_CONFIG").as_deref(),
+            Some(CODEX_SUBAGENT_POLICY_CONFIG)
+        );
+        assert_ne!(
+            env_value(&cmd, "PATH").as_deref(),
+            Some("/profile/must/lose")
+        );
+        assert!(env_removed(&cmd, "npm_config_workspace"));
+    }
+
+    #[test]
+    fn two_profiles_build_independent_commands_without_touching_daemon_env() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let name = absent_var_name();
+        let work = work_profile(vec![(name.clone(), Some("work".into()))]);
+        let personal = crate::ProfileEnv::new(
+            "codex@personal",
+            "fp",
+            vec![(name.clone(), Some("personal".into()))],
+        );
+        let mut work_opts = SpawnOptions::new(provider);
+        work_opts.profile_env = Some(&work);
+        let mut personal_opts = SpawnOptions::new(provider);
+        personal_opts.profile_env = Some(&personal);
+        let (a, b) = std::thread::scope(|s| {
+            let a = s.spawn(|| build_command_with_captured_env(&work_opts, &BTreeMap::new(), 0));
+            let b =
+                s.spawn(|| build_command_with_captured_env(&personal_opts, &BTreeMap::new(), 0));
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert_eq!(env_value(&a, &name).as_deref(), Some("work"));
+        assert_eq!(env_value(&b, &name).as_deref(), Some("personal"));
+        assert!(std::env::var_os(&name).is_none());
+    }
+
     #[test]
     fn provider_env_wins_over_captured() {
         // OPENCODE_CONFIG_CONTENT is both provider-built (opencode always
@@ -2204,6 +2486,41 @@ mod reduced_priority_tests {
         drop(child);
     }
 
+    /// The production builder applies the configured IO demotion too: the
+    /// child it spawns reports no IO shortfall against the env-derived
+    /// [`AgentPriority`].
+    #[tokio::test]
+    async fn build_command_applies_the_configured_io_priority() {
+        let provider = sh_provider("exec sleep 30");
+        let opts = SpawnOptions::new(&provider);
+        let mut cmd = build_command_with_captured_env(&opts, &BTreeMap::new(), DEFAULT_AGENT_NICE);
+        let child = cmd.spawn().expect("spawn sleeper");
+        let pid = child.id().expect("child pid");
+        let priority = AgentPriority {
+            nice_increment: DEFAULT_AGENT_NICE,
+            io: crate::io_priority::agent_io_priority(),
+        };
+        assert_eq!(priority.shortfall(pid), None);
+        #[cfg(target_os = "linux")]
+        if priority.io != crate::io_priority::AgentIoPriority::Off {
+            use crate::io_priority::linux;
+            let own = linux::get_effective(0).expect("own ioprio");
+            let got = linux::get_effective(i32::try_from(pid).unwrap()).expect("child ioprio");
+            let expected = linux::target(own, priority.io).unwrap_or(own);
+            assert!(
+                linux::rank(got) >= linux::rank(own),
+                "child never outranks the daemon"
+            );
+            assert!(
+                linux::rank(got) >= linux::rank(expected),
+                "child at {}, expected {}",
+                linux::describe(got),
+                linux::describe(expected)
+            );
+        }
+        drop(child);
+    }
+
     #[test]
     fn reduced_priority_shortfall_is_silent_for_a_gone_child() {
         // pid_max on Linux is at most 2^22; this pid cannot exist.
@@ -2211,5 +2528,146 @@ mod reduced_priority_tests {
             reduced_priority_shortfall(0x7fff_fff0, DEFAULT_AGENT_NICE),
             None
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod agent_tmp_tests {
+    //! Each launch gets its own `TMPDIR` / `TMP` / `TEMP` folder, so agents
+    //! on one host never share a temp file name; the folder lives as long
+    //! as the launch and is removed with it.
+
+    use super::*;
+    use std::time::Duration;
+
+    fn env_value(cmd: &Command, key: &str) -> Option<String> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    fn tmp_root() -> (tempfile::TempDir, PathBuf) {
+        let base = tempfile::Builder::new()
+            .prefix("intent-acp-agent-tmp-")
+            .tempdir()
+            .expect("temp base");
+        let root = base.path().join("root");
+        intent_core::prepare_agent_tmp_root(&root).expect("prepare root");
+        (base, root)
+    }
+
+    #[test]
+    fn agent_tmp_dir_beats_caller_env_and_is_unset_without_a_root() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let (_base, root) = tmp_root();
+        let mut opts = SpawnOptions::new(provider);
+        opts.extra_env
+            .insert("TMPDIR".to_string(), "/shared/tmp".to_string());
+        let dir = AgentTempDir::create(&root).unwrap();
+        let cmd = build_command_in(
+            &opts,
+            &BTreeMap::new(),
+            AgentPriority::from_env(),
+            None,
+            None,
+            Some(&dir),
+        );
+        for key in intent_core::AGENT_TMP_ENV_KEYS {
+            assert_eq!(
+                env_value(&cmd, key).as_deref(),
+                Some(dir.path().to_str().unwrap()),
+                "{key}"
+            );
+        }
+        // Without a root the caller's value is left alone.
+        let cmd = build_command_with_captured_env(&opts, &BTreeMap::new(), 0);
+        assert_eq!(env_value(&cmd, "TMPDIR").as_deref(), Some("/shared/tmp"));
+        assert_eq!(env_value(&cmd, "TEMP"), None);
+    }
+
+    /// A launch whose root cannot hold a folder still starts, inheriting the
+    /// daemon's temp variables.
+    #[test]
+    fn missing_root_fails_soft() {
+        let provider = intent_providers::find_provider("auggie").unwrap();
+        let (base, _root) = tmp_root();
+        let missing = base.path().join("missing");
+        let mut opts = SpawnOptions::new(provider);
+        opts.agent_tmp_root = Some(&missing);
+        let prepared = prepare_provider(&opts).expect("launch still prepared");
+        assert!(prepared.agent_tmp_dir.is_none());
+        assert_eq!(env_value(&prepared.command, "TEMP"), None);
+    }
+
+    /// Two real launches report distinct private folders through the shell's
+    /// `$TMPDIR` / `$TMP` / `$TEMP` and `mktemp`; each folder exists while its
+    /// child runs and is gone once the launch is killed and dropped.
+    #[tokio::test]
+    async fn two_launches_get_distinct_tmp_dirs_removed_with_the_launch() {
+        let base_provider = *intent_providers::find_provider("auggie").unwrap();
+        let provider = intent_providers::ProviderConfig {
+            command: "sh",
+            base_args: &[
+                "-c",
+                r#"printf '%s\n%s\n%s\n%s\n' "$TMPDIR" "$TMP" "$TEMP" "$(mktemp)" > "$INTENT_TEST_OUT.part" && mv "$INTENT_TEST_OUT.part" "$INTENT_TEST_OUT"; exec sleep 30"#,
+            ],
+            model_flag: None,
+            rules_flag: None,
+            mcp_config_flag: None,
+            quiet_flag: None,
+            supports_mcp_config: false,
+            supports_rules_file: false,
+            ..base_provider
+        };
+        let (base, root) = tmp_root();
+        let mut launches = Vec::new();
+        for tag in ["one", "two"] {
+            let out = base.path().join(format!("{tag}.out"));
+            let mut opts = SpawnOptions::new(&provider);
+            opts.agent_tmp_root = Some(&root);
+            opts.extra_env
+                .insert("INTENT_TEST_OUT".to_string(), out.display().to_string());
+            let agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn sh");
+            launches.push((agent, out));
+        }
+        let mut dirs = Vec::new();
+        for (_, out) in &launches {
+            let mut report = None;
+            for _ in 0..3000 {
+                if let Ok(text) = std::fs::read_to_string(out) {
+                    report = Some(text);
+                    break;
+                }
+                // timing-guard: poll interval
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let report = report.expect("child reported its temp dir");
+            let lines: Vec<&str> = report.lines().collect();
+            assert_eq!(lines.len(), 4, "{report}");
+            let dir = PathBuf::from(lines[0]);
+            assert_eq!(lines[1], lines[0], "TMP matches TMPDIR");
+            assert_eq!(lines[2], lines[0], "TEMP matches TMPDIR");
+            assert_eq!(dir.parent(), Some(root.as_path()), "{report}");
+            assert!(
+                Path::new(lines[3]).starts_with(&dir),
+                "mktemp honoured TMPDIR: {report}"
+            );
+            assert!(dir.is_dir());
+            dirs.push(dir);
+        }
+        assert_ne!(dirs[0], dirs[1], "each launch has its own temp dir");
+
+        let (mut first, _) = launches.remove(0);
+        first.kill().await.expect("kill first");
+        drop(first);
+        assert!(!dirs[0].exists(), "first launch's temp dir removed");
+        assert!(dirs[1].is_dir(), "second launch's temp dir untouched");
+
+        let (mut second, _) = launches.remove(0);
+        second.kill().await.expect("kill second");
+        drop(second);
+        assert!(!dirs[1].exists(), "second launch's temp dir removed");
+        assert!(root.is_dir());
     }
 }

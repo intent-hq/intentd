@@ -1,9 +1,9 @@
 //! Workspace repository: insert + list, mapping rows ↔ [`Workspace`] (§9.2).
 
 use intent_core::{
-    now_iso, AgentId, CheckoutMode, ClientId, ContextLink, Error, PullRequestInfo, Result,
-    SetupScript, TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus, CHIEF_WORKSPACE_ID,
+    now_iso, AgentId, CheckoutMode, ClientId, ContextLink, Error, PullRequestInfo,
+    PullRequestWorkspace, Result, SetupScript, TokenUsage, Workspace, WorkspaceAttention,
+    WorkspaceId, WorkspaceListFilter, WorkspaceStatus, CHIEF_WORKSPACE_ID,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -15,18 +15,27 @@ use crate::agent_repo::{
 };
 use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, AgentUsageRow, Store};
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only seam: entered just before the workspace desktop cleanup
+    /// transaction, so a test can saturate the writer at exactly that step.
+    pub(crate) static DESKTOP_CLEANUP_ENTRY: std::sync::Arc<crate::desktop_repo::DeleteBarrier>;
+}
+
 const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
     status_message, status_image_asset_id, attention, path, repository_path, repository_owner, \
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
     tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
-    browser_client_id, last_content_activity";
+    browser_client_id, last_content_activity, retired_at, label, auto_archive_disabled, plain_folder";
 
 // Shared with deletion query-cost regressions so they exercise the exact
 // production statements, including their candidate-selection work.
 pub(crate) const CLEAR_NOTE_PARENT_BATCH_SQL: &str =
     "UPDATE note SET parent_id = NULL WHERE rowid IN \
     (SELECT rowid FROM note WHERE workspace_id = ? AND parent_id IS NOT NULL LIMIT ?)";
+pub(crate) const DELETE_NOTE_COMMENT_BATCH_SQL: &str = "DELETE FROM comment WHERE rowid IN \
+    (SELECT rowid FROM comment WHERE workspace_id = ? AND note_id IS NOT NULL LIMIT ?)";
 pub(crate) const DELETE_WORKSPACE_BROWSER_BATCH_SQL: &str =
     "DELETE FROM browser_tab WHERE rowid IN \
     (SELECT rowid FROM browser_tab WHERE workspace_id = ? LIMIT ?) RETURNING tab_id";
@@ -123,6 +132,66 @@ impl Store {
         Ok(clocks)
     }
 
+    /// Requested workspaces whose known PRs are all finished: at least one PR
+    /// snapshot exists on the workspace or its git roots, and every one of
+    /// them (link status, active PR, discovered pools) is `Merged` or
+    /// `Closed`. A link without a status or a malformed snapshot counts as
+    /// unknown, so the workspace is not settled. Read in bounded batches.
+    ///
+    /// # Errors
+    /// Returns an internal error if the metadata query fails.
+    pub async fn workspaces_with_settled_pull_requests(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<HashSet<WorkspaceId>> {
+        const SQL: &str = "WITH ids(id) AS (SELECT DISTINCT value FROM json_each(?1)), \
+             pools(workspace_id, pool) AS ( \
+               SELECT w.id, w.pull_requests FROM workspace w JOIN ids ON ids.id = w.id \
+                 WHERE w.pull_requests IS NOT NULL \
+               UNION ALL \
+               SELECT r.workspace_id, r.pull_requests FROM workspace_git_root r \
+                 JOIN ids ON ids.id = r.workspace_id WHERE r.pull_requests IS NOT NULL), \
+             statuses(workspace_id, status) AS ( \
+               SELECT w.id, w.pr_status FROM workspace w JOIN ids ON ids.id = w.id \
+                 WHERE w.pr_status IS NOT NULL OR w.pr_url IS NOT NULL \
+               UNION ALL \
+               SELECT r.workspace_id, r.pr_status FROM workspace_git_root r \
+                 JOIN ids ON ids.id = r.workspace_id \
+                 WHERE r.pr_status IS NOT NULL OR r.pr_url IS NOT NULL \
+               UNION ALL \
+               SELECT w.id, CASE WHEN json_valid(w.active_pull_request) \
+                 THEN json_extract(w.active_pull_request, '$.status') END \
+                 FROM workspace w JOIN ids ON ids.id = w.id \
+                 WHERE w.active_pull_request IS NOT NULL \
+               UNION ALL \
+               SELECT p.workspace_id, CASE WHEN j.type = 'object' \
+                 THEN json_extract(j.value, '$.status') END \
+                 FROM pools p, json_each(CASE WHEN json_valid(p.pool) \
+                   AND json_type(p.pool) = 'array' THEN p.pool ELSE '[null]' END) j) \
+             SELECT workspace_id FROM statuses GROUP BY workspace_id \
+             HAVING SUM(COALESCE(status IN ('Merged', 'Closed'), 0) = 0) = 0";
+        let ids: Vec<&str> = workspace_ids
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut settled = HashSet::new();
+        for batch in ids.chunks(400) {
+            let encoded = serde_json::to_string(batch)
+                .map_err(|e| Error::Internal(format!("encode workspace ids failed: {e}")))?;
+            let rows: Vec<String> = sqlx::query_scalar(SQL)
+                .bind(encoded)
+                .fetch_all(&self.read_pool)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("workspace settled pull requests read failed: {e}"))
+                })?;
+            settled.extend(rows.into_iter().map(WorkspaceId));
+        }
+        Ok(settled)
+    }
+
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     ///
     /// # Errors
@@ -194,9 +263,9 @@ impl Store {
         }
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
-        let query = sqlx::query(&sql)
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&ws.id.0)
             .bind(&ws.title)
             .bind(&ws.branch)
@@ -232,6 +301,10 @@ impl Store {
             .bind(checkout_mode_to_db(ws)?)
             .bind(ws.browser_client_id.as_ref().map(|c| c.0.clone()))
             .bind(&ws.last_content_activity)
+            .bind(&ws.retired_at)
+            .bind(&ws.label)
+            .bind(i64::from(ws.auto_archive_disabled))
+            .bind(i64::from(ws.plain_folder))
             .bind(auto_commit.map(i64::from));
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
         if let Some(admission) = admission {
@@ -250,7 +323,7 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("insert workspace failed: {e}")))?;
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -261,7 +334,7 @@ impl Store {
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_workspace(&self, id: &WorkspaceId) -> Result<Workspace> {
         let sql = format!("SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .fetch_optional(self.read_pool())
             .await
@@ -295,6 +368,13 @@ impl Store {
     /// snapshot read before a concurrent archive can never resurrect the
     /// workspace behind the archive's guest sweep (the `workspace.archive`
     /// fence relies on this — see `ArchiveFence` in `intent-services`).
+    ///
+    /// `label` is never written here either: it moves only through
+    /// [`Self::set_workspace_label`], so a stale snapshot cannot revert it.
+    /// Likewise `auto_archive_disabled` moves only through
+    /// [`Self::set_workspace_auto_archive_disabled`].
+    /// `plain_folder` is insert-only: no update path ever writes it (§5.1
+    /// "Plain-folder workspaces").
     ///
     /// # Errors
     ///
@@ -377,7 +457,7 @@ impl Store {
         .fetch_optional(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("update workspace failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         match row {
             Some(row) => col(&row, "branch"),
             None => Err(Error::NotFound(format!("workspace {}", ws.id))),
@@ -420,7 +500,7 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("reconcile workspace branch failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(result.rows_affected() != 0)
     }
 
@@ -786,7 +866,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_workspace_unread_if_all_seen(&self, id: &WorkspaceId) -> Result<bool> {
         let sql = clear_workspace_unread_if_all_seen_sql();
-        let res = sqlx::query(&sql)
+        let res = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .execute(self.write_pool())
             .await
@@ -824,16 +904,17 @@ impl Store {
         }
         let res = sqlx::query(
             "UPDATE workspace SET status=?, archived=0, archived_at=NULL, updated_at=? \
-             WHERE id=? AND archived=1",
+             WHERE id=? AND archived=1 AND status <> ?",
         )
         .bind(enum_to_db(&WorkspaceStatus::Active)?)
         .bind(updated_at)
         .bind(&id.0)
+        .bind(enum_to_db(&WorkspaceStatus::Retired)?)
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("conditional unarchive failed: {e}")))?;
         if res.rows_affected() > 0 {
-            lifecycle.settle();
+            lifecycle.settle_after_retirement().await?;
             return Ok(true);
         }
         // Zero rows: either the row is already active (no flip) or the
@@ -849,7 +930,7 @@ impl Store {
         if col::<i64>(&row, "present")? == 0 {
             return Err(Error::NotFound(format!("workspace {id}")));
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(false)
     }
 
@@ -969,6 +1050,11 @@ impl Store {
         disposition: &mut RepositoryWorkspaceDeleteDisposition,
         committed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
+        // Hold through every bounded sweep and final commit/failure. All private
+        // desktop producers use this same Store-level admission gate.
+        // Wait before taking database-wide lifecycle serialization: another
+        // deletion holding this guard needs that serialization for agent cleanup.
+        let _desktop_deletion = self.desktop_writes.delete(id).await;
         let mut lifecycle = self.repository_lifecycle_write().await?;
         // In particular, a missing workspace must not delete opaque draft
         // keys. The final transaction also checks existence for racing deletes.
@@ -1004,6 +1090,43 @@ impl Store {
         )
         .await?;
 
+        // Runtime writers are stopped. Revoke/drain private desktop state once
+        // before deleting any agent, just like the recovery sweep above. A
+        // failure leaves all sessions intact; a later failure may revoke grants
+        // early but cannot leave authority attached to a deleted agent.
+        #[cfg(test)]
+        if let Ok(barrier) = DESKTOP_CLEANUP_ENTRY.try_with(std::sync::Arc::clone) {
+            barrier.entered.notify_one();
+            barrier.release.notified().await;
+        }
+        // A busy or saturated writer retries the whole idempotent cleanup
+        // transaction, so it cannot fail the delete half-way (intent-hq/intent#7705).
+        crate::with_write_txn_retry(|| async {
+            let mut desktop_tx =
+                self.write_pool().begin().await.map_err(|e| {
+                    Error::Internal(format!("begin workspace desktop cleanup: {e}"))
+                })?;
+            crate::desktop_repo::delete_desktop_scope(&mut desktop_tx, id, None).await?;
+            desktop_tx
+                .commit()
+                .await
+                .map_err(|e| Error::Internal(format!("commit workspace desktop cleanup: {e}")))
+        })
+        .await?;
+
+        #[cfg(test)]
+        {
+            let barrier = self
+                .desktop_delete_barrier
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(barrier) = barrier {
+                barrier.entered.notify_one();
+                barrier.release.notified().await;
+            }
+        }
+
         // IDs only: never hydrate sessions or their transcripts. Each session
         // uses the same bounded payload/message cleanup as agent.delete.
         while let Some(agent_id) = sqlx::query_scalar::<_, String>(
@@ -1038,15 +1161,31 @@ impl Store {
             delete_in_bounded_batches(self.write_pool(), &sql, &id.0, DELETE_CASCADE_BATCH).await?;
         }
 
-        // Publish a durable retirement fence only after bounded parent clears
-        // and an atomic final parent-link check. Drain annotation fan-out in
-        // separately limited statements before canonical parent deletion.
-        crate::workspace_annotation_cleanup::drain(self, &id.0).await?;
+        // A note's parent-clear trigger can otherwise update every child in
+        // one statement. Clear the links first, then sweep its heavy children
+        // before the notes themselves. All predicates remain workspace-scoped.
+        delete_in_bounded_batches(
+            self.write_pool(),
+            CLEAR_NOTE_PARENT_BATCH_SQL,
+            &id.0,
+            DELETE_CASCADE_BATCH,
+        )
+        .await?;
+        // Retired note paging rows (intent-hq/intent#7515) can greatly
+        // outnumber notes until the post-startup cleanup drops their tables.
+        // Remove them in bounded batches so no note batch cascades into them.
+        self.delete_workspace_retired_note_paging(&id.0).await?;
+        // Partial indexes contain only remaining parent links and note-bound
+        // comments, so batches do not rescan processed notes or no-note rows.
+        // Preserve comments with no note (no cascade before).
+        delete_in_bounded_batches(
+            self.write_pool(),
+            DELETE_NOTE_COMMENT_BATCH_SQL,
+            &id.0,
+            DELETE_CASCADE_BATCH,
+        )
+        .await?;
         for table in [
-            // Derived page rows can greatly outnumber notes; do not leave them
-            // to a single note/head foreign-key cascade.
-            "note_page_entry",
-            "note_page_piece",
             "note_version",
             "note_line_attribution",
             "note",
@@ -1057,6 +1196,7 @@ impl Store {
             "agent_metrics",
             "workspace_context_item",
             "workspace_git_root",
+            "pull_request_workspace",
             "workspace_invite",
             "workspace_mcp_disabled_server",
             "draft",
@@ -1076,10 +1216,15 @@ impl Store {
             let id = id.clone();
             let deleted = tokio::spawn(async move {
                 // Keep the writer until eviction so a subsequent writer also
-                // observes the completed batch's overlay cleanup.
-                let mut conn = store.write_pool().acquire().await.map_err(|e| {
-                    Error::Internal(format!("delete workspace browser acquire failed: {e}"))
-                })?;
+                // observes the completed batch's overlay cleanup. Only the
+                // acquire is retried (nothing has run yet), so a saturated
+                // writer does not fail the sweep (intent-hq/intent#7705).
+                let mut conn = crate::with_write_txn_retry(|| async {
+                    store.write_pool().acquire().await.map_err(|e| {
+                        Error::Internal(format!("delete workspace browser acquire failed: {e}"))
+                    })
+                })
+                .await?;
                 let tab_ids: Vec<String> = sqlx::query_scalar(DELETE_WORKSPACE_BROWSER_BATCH_SQL)
                     .bind(&id.0)
                     .bind(DELETE_CASCADE_BATCH)
@@ -1112,7 +1257,7 @@ impl Store {
                 // completed. Preserve this fact even if ticket settlement panics.
                 committed.store(true, std::sync::atomic::Ordering::Release);
             }
-            lifecycle.finish(result)
+            lifecycle.finish(result).await
         })
         .await
         .map_err(|e| Error::Internal(format!("delete workspace final task failed: {e}")))?
@@ -1151,11 +1296,23 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace drafts failed: {e}")))?;
+            crate::desktop_repo::delete_desktop_scope(&mut tx, id, None).await?;
             sqlx::query("DELETE FROM settings WHERE key = ?")
                 .bind(crate::settings_repo::agent_creation_preferences_key(id))
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("delete agent creation preferences: {e}")))?;
+            // A plain-folder row's folder outlives the row on the tombstone
+            // (migration 0178), read in the same transaction as the delete.
+            let plain_folder_path: Option<String> = sqlx::query_scalar(
+                "SELECT repository_path FROM workspace \
+                 WHERE id = ? AND plain_folder = 1 AND repository_path != ''",
+            )
+            .bind(&id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("read plain folder path failed: {e}")))?
+            .flatten();
             let res = sqlx::query(DELETE_WORKSPACE_SQL)
                 .bind(&id.0)
                 .execute(&mut *tx)
@@ -1165,10 +1322,12 @@ impl Store {
                 return Err(Error::NotFound(format!("workspace {id}")));
             }
             sqlx::query(
-                "INSERT OR REPLACE INTO deleted_workspace_id (id, deleted_at) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO deleted_workspace_id (id, deleted_at, plain_folder_path) \
+                 VALUES (?, ?, ?)",
             )
             .bind(&id.0)
             .bind(now_iso())
+            .bind(plain_folder_path)
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("record deleted workspace id failed: {e}")))?;
@@ -1181,6 +1340,27 @@ impl Store {
         self.browser_tab_displayed
             .forget_all(tab_ids.iter().map(String::as_str));
         Ok(())
+    }
+
+    /// The folder of every plain-folder workspace the store knows (PROTOCOL
+    /// §5.1 "Plain-folder workspaces"): live, archived and retired rows plus
+    /// deleted ones remembered on their tombstone. Path-based cleanup sweeps
+    /// never remove a directory overlapping one of these.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails; callers
+    /// then skip the sweep (fail closed).
+    pub async fn plain_folder_paths(&self) -> Result<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT repository_path FROM workspace \
+             WHERE plain_folder = 1 AND repository_path IS NOT NULL AND repository_path != '' \
+             UNION SELECT plain_folder_path FROM deleted_workspace_id \
+             WHERE plain_folder_path IS NOT NULL AND plain_folder_path != ''",
+        )
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("plain folder paths lookup failed: {e}")))
     }
 
     /// Whether a workspace id was ever used — a live row exists **or** a
@@ -1268,6 +1448,55 @@ impl Store {
         Ok(())
     }
 
+    /// Scoped write of the Home workspace label (`workspace.update { label }`):
+    /// `None` clears it. After insert this is the only writer of the column —
+    /// `update_workspace` never touches it — so a stale [`Workspace`]
+    /// snapshot passed to a full-row update cannot revert a newer label.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_label(&self, id: &WorkspaceId, label: Option<&str>) -> Result<()> {
+        let res = sqlx::query("UPDATE workspace SET label = ? WHERE id = ?")
+            .bind(label)
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set workspace label failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(())
+    }
+
+    /// Scoped write of the per-workspace auto-archive opt-out
+    /// (`workspace.update { autoArchiveDisabled }`). After insert this is the
+    /// only writer of the column — `update_workspace` never touches it — so a
+    /// stale [`Workspace`] snapshot passed to a full-row update cannot revert
+    /// a newer value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_auto_archive_disabled(
+        &self,
+        id: &WorkspaceId,
+        disabled: bool,
+    ) -> Result<()> {
+        let res = sqlx::query("UPDATE workspace SET auto_archive_disabled = ? WHERE id = ?")
+            .bind(i64::from(disabled))
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("set workspace auto-archive opt-out failed: {e}"))
+            })?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(())
+    }
+
     /// The persisted per-workspace auto-commit override. `Ok(None)` for
     /// pre-migration rows (NULL column) — the caller resolves NULL against
     /// the global `git.autoCommit` setting. `NotFound` when the workspace
@@ -1332,28 +1561,278 @@ impl Store {
         }
     }
 
-    /// List workspaces, filtering archived rows unless `include_archived`.
-    /// The seeded virtual [`CHIEF_WORKSPACE_ID`] row is always excluded — Chief
-    /// is synthesized on read by the service layer and never surfaces via
-    /// `workspace.list` (TS `findAll` parity, `workspace.repository.ts`).
+    /// List workspaces admitted by `filter`: archived rows only with
+    /// `include_archived`, retired rows only with `include_retired`
+    /// (`include_archived` alone never returns a retired row — retired is
+    /// opt-in on every list surface, PROTOCOL §5.1). The seeded virtual
+    /// [`CHIEF_WORKSPACE_ID`] row is always excluded — Chief is synthesized
+    /// on read by the service layer and never surfaces via `workspace.list`
+    /// (TS `findAll` parity, `workspace.repository.ts`).
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
-    pub async fn list_workspaces(&self, include_archived: bool) -> Result<Vec<Workspace>> {
-        let sql = if include_archived {
-            format!("SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? ORDER BY created_at")
-        } else {
-            format!(
-                "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND archived = 0 ORDER BY created_at"
-            )
+    pub async fn list_workspaces(&self, filter: WorkspaceListFilter) -> Result<Vec<Workspace>> {
+        let retired = enum_to_db(&WorkspaceStatus::Retired)?;
+        // A retired row is also `archived = 1`, so the two predicates are
+        // composed explicitly: retired rows pass only on `include_retired`,
+        // other archived rows only on `include_archived`.
+        let predicate = match (filter.include_archived, filter.include_retired) {
+            (true, true) => "1 = 1 OR status = ?",
+            (true, false) => "status <> ?",
+            (false, true) => "archived = 0 OR status = ?",
+            (false, false) => "archived = 0 AND status <> ?",
         };
-        let rows = sqlx::query(&sql)
+        let sql = format!(
+            "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND ({predicate}) \
+             ORDER BY created_at"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(CHIEF_WORKSPACE_ID)
+            .bind(&retired)
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list workspaces failed: {e}")))?;
         rows.iter().map(map_workspace_row).collect()
+    }
+
+    /// One keyset page of [`Store::list_workspaces`] in `(created_at, id)`
+    /// order: at most `limit` rows strictly after `after` (`(created_at,
+    /// id)` of the previous page's last row), so the read costs O(page).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_workspaces_page(
+        &self,
+        filter: WorkspaceListFilter,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> Result<Vec<Workspace>> {
+        let retired = enum_to_db(&WorkspaceStatus::Retired)?;
+        let predicate = match (filter.include_archived, filter.include_retired) {
+            (true, true) => "1 = 1 OR status = ?",
+            (true, false) => "status <> ?",
+            (false, true) => "archived = 0 OR status = ?",
+            (false, false) => "archived = 0 AND status <> ?",
+        };
+        let keyset = if after.is_some() {
+            " AND (created_at > ? OR (created_at = ? AND id > ?))"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT {WORKSPACE_COLUMNS} FROM workspace WHERE id <> ? AND ({predicate}){keyset} \
+             ORDER BY created_at, id LIMIT ?"
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(CHIEF_WORKSPACE_ID)
+            .bind(&retired);
+        if let Some((created_at, id)) = after {
+            query = query.bind(created_at).bind(created_at).bind(id);
+        }
+        let rows = query
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("list workspaces page failed: {e}")))?;
+        rows.iter().map(map_workspace_row).collect()
+    }
+
+    /// The retired workspace a call is scoped to: `workspace_id` when that
+    /// row is `Retired`, else the workspace of the agent session `agent_id`
+    /// when it is `Retired`; `None` otherwise (including unknown ids). One
+    /// indexed statement — the RPC read-only gate for retired workspaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn retired_workspace_for(
+        &self,
+        workspace_id: Option<&WorkspaceId>,
+        agent_id: Option<&AgentId>,
+    ) -> Result<Option<WorkspaceId>> {
+        let id: Option<String> = sqlx::query_scalar(
+            "SELECT w.id FROM workspace AS w WHERE w.status = ? AND (w.id = ? OR w.id = \
+             (SELECT a.workspace_id FROM agent_session AS a WHERE a.id = ?)) LIMIT 1",
+        )
+        .bind(enum_to_db(&WorkspaceStatus::Retired)?)
+        .bind(workspace_id.map(|w| w.0.as_str()))
+        .bind(agent_id.map(|a| a.0.as_str()))
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("retired workspace lookup failed: {e}")))?;
+        Ok(id.map(WorkspaceId))
+    }
+
+    /// Scoped, conditional retire flip (`workspace.retire`, PROTOCOL §5.1):
+    /// set `status = Retired`, `retired_at`, `updated_at` and the purge
+    /// `status_message` ([`intent_core::WORKSPACE_PURGED_STATUS_MESSAGE`],
+    /// replacing the previous message) ONLY when the
+    /// row is currently archived and not already retired. The caller runs
+    /// the archive flip first for an Active workspace, so a retired row is
+    /// always `archived = 1` (`archived_at` kept). Every other column —
+    /// including the persisted checkout paths and branch — is untouched, and
+    /// no other row is deleted. Returns whether this call performed the flip;
+    /// `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn retire_workspace_if_archived(
+        &self,
+        id: &WorkspaceId,
+        retired_at: &str,
+    ) -> Result<bool> {
+        let retired = enum_to_db(&WorkspaceStatus::Retired)?;
+        let res = sqlx::query(
+            "UPDATE workspace SET status=?, retired_at=?, updated_at=?, status_message=? \
+             WHERE id=? AND archived=1 AND status <> ?",
+        )
+        .bind(&retired)
+        .bind(retired_at)
+        .bind(retired_at)
+        .bind(intent_core::WORKSPACE_PURGED_STATUS_MESSAGE)
+        .bind(&id.0)
+        .bind(&retired)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("conditional retire failed: {e}")))?;
+        if res.rows_affected() > 0 {
+            return Ok(true);
+        }
+        let present: i64 =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace WHERE id = ?)")
+                .bind(&id.0)
+                .fetch_one(self.read_pool())
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("conditional retire presence check failed: {e}"))
+                })?;
+        if present == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(false)
+    }
+
+    /// Scoped, conditional revive flip (PROTOCOL §5.1 "Revive"): flip a
+    /// `Retired` row back to `Active` — clear `archived`, `archived_at` and
+    /// `retired_at` — and record the fresh checkout's `branch` and
+    /// `base_commit_sha`, ONLY when the row is currently retired. The purge
+    /// `status_message` is cleared when it still equals
+    /// [`intent_core::WORKSPACE_PURGED_STATUS_MESSAGE`]; a message changed
+    /// since the retire is kept. Every other column is untouched. Returns whether this call performed the flip;
+    /// `NotFound` when the workspace does not exist. Same archive-binding
+    /// lifecycle bracket as [`Self::unarchive_workspace_if_archived`] (a
+    /// retired row is always archived).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn revive_workspace_if_retired(
+        &self,
+        id: &WorkspaceId,
+        branch: &str,
+        base_commit_sha: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        self.revive_workspace_if_retired_with_notice(id, branch, base_commit_sha, updated_at, None)
+            .await
+    }
+
+    /// [`Self::revive_workspace_if_retired`] that also leaves a one-time
+    /// prompt notice pending on the workspace's agent sessions **in the same
+    /// `BEGIN IMMEDIATE` transaction** as the flip: no reader can observe the
+    /// revived (Active) row without the notices, and a crash can never commit
+    /// one without the other. `notice` is `(metadata key, text, excluded
+    /// session)`; every session of the workspace except the excluded one
+    /// gets the key set. Nothing is written when the row is not retired.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn revive_workspace_if_retired_with_notice(
+        &self,
+        id: &WorkspaceId,
+        branch: &str,
+        base_commit_sha: Option<&str>,
+        updated_at: &str,
+        notice: Option<(&str, &str, Option<&AgentId>)>,
+    ) -> Result<bool> {
+        let retired = enum_to_db(&WorkspaceStatus::Retired)?;
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM workspace WHERE id=?")
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("read retired binding failed: {e}")))?;
+        let Some(status) = status else {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        };
+        if status != retired {
+            lifecycle.settle_after_retirement().await?;
+            return Ok(false);
+        }
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("revive workspace acquire failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("revive workspace begin failed: {e}")))?;
+        let body: Result<bool> = async {
+            let res = sqlx::query(
+                "UPDATE workspace SET status=?, archived=0, archived_at=NULL, retired_at=NULL, \
+                 branch=?, base_commit_sha=?, updated_at=?, \
+                 status_message=CASE WHEN status_message=? THEN NULL ELSE status_message END \
+                 WHERE id=? AND status=?",
+            )
+            .bind(enum_to_db(&WorkspaceStatus::Active)?)
+            .bind(branch)
+            .bind(base_commit_sha)
+            .bind(updated_at)
+            .bind(intent_core::WORKSPACE_PURGED_STATUS_MESSAGE)
+            .bind(&id.0)
+            .bind(&retired)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("conditional revive failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Ok(false);
+            }
+            if let Some((key, text, excluded)) = notice {
+                sqlx::query(
+                    "UPDATE agent_session SET \
+                     metadata = json_set(\
+                         CASE \
+                             WHEN metadata IS NULL THEN '{}' \
+                             WHEN json_type(metadata) = 'object' THEN metadata \
+                             ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                         END, \
+                         '$.' || ?, ?) \
+                     WHERE workspace_id = ? AND (? IS NULL OR id <> ?)",
+                )
+                .bind(key)
+                .bind(text)
+                .bind(&id.0)
+                .bind(excluded.map(|a| a.0.as_str()))
+                .bind(excluded.map(|a| a.0.as_str()))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("revive pending notice write failed: {e}")))?;
+            }
+            Ok(true)
+        }
+        .await;
+        let result =
+            crate::commit_with_rollback_guard(conn, body, "revive workspace commit failed").await;
+        let settled = lifecycle.settle_after_retirement().await;
+        let flipped = result?;
+        settled?;
+        Ok(flipped)
     }
 
     /// Ordinary workspace keys for inherited host access, without hydrating
@@ -1390,7 +1869,7 @@ impl Store {
              SELECT 1 FROM json_each(workspace.pull_requests) AS je \
              WHERE je.value ->> '$.url' = ? COLLATE NOCASE))) ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(CHIEF_WORKSPACE_ID)
             .bind(url)
             .bind(url)
@@ -1401,6 +1880,98 @@ impl Store {
             })?;
         rows.iter().map(map_workspace_row).collect()
     }
+
+    /// Workspaces linked to the PR whose canonical key is `pr_key`
+    /// (`workspace.findByPullRequest`, §5.1 "Pull request workspace lookup"),
+    /// most recently linked first, ties by id ascending. Links are recorded
+    /// by the migration 0161 triggers whenever a workspace or git root
+    /// persists a changed PR snapshot. Archived rows are included; remote rows
+    /// and the seeded virtual [`CHIEF_WORKSPACE_ID`] row never are. Reads only
+    /// the four projected columns. `pr_key` must already be canonical — see
+    /// `intent_core::pull_request_key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_pull_request_workspaces(
+        &self,
+        pr_key: &str,
+        include_retired: bool,
+    ) -> Result<Vec<PullRequestWorkspace>> {
+        let rows = sqlx::query(
+            "SELECT w.id, w.title, w.archived, p.linked_at FROM pull_request_workspace AS p \
+             JOIN workspace AS w ON w.id = p.workspace_id \
+             WHERE p.pr_key = ? AND w.id <> ? AND w.is_remote = 0 \
+             AND (? OR w.status <> ?) \
+             ORDER BY p.linked_at DESC, w.id ASC",
+        )
+        .bind(pr_key)
+        .bind(CHIEF_WORKSPACE_ID)
+        .bind(include_retired)
+        .bind(enum_to_db(&WorkspaceStatus::Retired)?)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("list pull request workspaces failed: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                Ok(PullRequestWorkspace {
+                    id: WorkspaceId(col(row, "id")?),
+                    title: col(row, "title")?,
+                    archived: col::<i64>(row, "archived")? != 0,
+                    linked_at: col(row, "linked_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Every PR link recorded for the workspaces in `workspace_ids`
+    /// (`ws.crossWorkspace.search({ pr })`), most recently linked first, ties
+    /// by key then workspace id. The caller resolves which keys a reference
+    /// names (`intent_core::PullRequestSelector`); this read uses the
+    /// `workspace_id` index, so its cost tracks the scoped workspaces' links
+    /// rather than the whole table. An empty scope reads nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_pull_request_links_for_workspaces(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<Vec<PullRequestLink>> {
+        if workspace_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = serde_json::to_string(workspace_ids)
+            .map_err(|e| Error::Internal(format!("encode workspace ids failed: {e}")))?;
+        let rows = sqlx::query(
+            "SELECT pr_key, workspace_id, linked_at FROM pull_request_workspace \
+             WHERE workspace_id IN (SELECT value FROM json_each(?)) \
+             ORDER BY linked_at DESC, pr_key ASC, workspace_id ASC",
+        )
+        .bind(ids)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("list pull request links failed: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                Ok(PullRequestLink {
+                    pr_key: col(row, "pr_key")?,
+                    workspace_id: WorkspaceId(col(row, "workspace_id")?),
+                    linked_at: col(row, "linked_at")?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// One recorded PR <-> workspace link (migration 0161): the canonical
+/// `<host>/<owner>/<repo>/pull/<number>` key, the linked workspace, and when
+/// the link was first recorded (RFC 3339).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestLink {
+    pub pr_key: String,
+    pub workspace_id: WorkspaceId,
+    pub linked_at: String,
 }
 
 fn col<'r, T>(row: &'r SqliteRow, name: &str) -> Result<T>
@@ -1441,7 +2012,7 @@ fn active_pr_from_db(s: Option<String>) -> Result<Option<PullRequestInfo>> {
 /// [`Store::update_workspace_pr_linkage_rebased`].
 fn pr_linkage_update(
     ws: &Workspace,
-) -> Result<sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'_>>> {
+) -> Result<sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>> {
     Ok(sqlx::query(
         "UPDATE workspace SET pr_number=?, pr_url=?, pr_status=?, \
          active_pull_request=?, pull_requests=?, updated_at=? WHERE id=?",
@@ -1563,8 +2134,6 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         status: enum_from_db::<WorkspaceStatus>(&col::<String>(row, "status")?)?,
         status_message: col(row, "status_message")?,
         status_image_asset_id: col(row, "status_image_asset_id")?,
-        // Derived, read-only; never persisted (§9.9).
-        activity: WorkspaceActivity::Idle,
         attention: enum_from_db::<WorkspaceAttention>(&col::<String>(row, "attention")?)?,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
@@ -1589,23 +2158,50 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         context_links,
         archived: col::<i64>(row, "archived")? != 0,
         archived_at: col(row, "archived_at")?,
-        // Card aggregates are computed on the workspace.list/get emit path
-        // (intent-services), never persisted.
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        display_status: None,
-        waiting: false,
+        retired_at: col(row, "retired_at")?,
         token_usage,
-        // cow_supported is computed on the emit path (intent-services), never persisted.
-        cow_supported: None,
         checkout_mode,
         browser_client_id: col::<Option<String>>(row, "browser_client_id")?.map(ClientId),
-        // disk_usage is computed on the emit path (intent-services), never persisted.
-        disk_usage: None,
-        pending_delete_at: None,
-        // pull_requests_total is set by the list-row slimming (intent-core), never persisted.
-        pull_requests_total: None,
-        membership: None,
+        label: col(row, "label")?,
+        auto_archive_disabled: col::<i64>(row, "auto_archive_disabled")? != 0,
+        plain_folder: col::<i64>(row, "plain_folder")? != 0,
+        // The remaining fields are never persisted: `activity` is derived
+        // (§9.9), the emit-only fields (card aggregates, `displayStatus`, the
+        // wait/script/background flags, `cowSupported`, `diskUsage`,
+        // `pendingDeleteAt`, `membership`) are filled by intent-services, and
+        // `pullRequestsTotal` by list-row slimming (intent-core). A new
+        // persisted column must be read above;
+        // `every_selected_column_is_read_by_the_row_mapper` enforces that.
+        ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod row_mapper_tests {
+    use super::WORKSPACE_COLUMNS;
+
+    /// `map_workspace_row` ends in `..Default::default()`, so the compiler no
+    /// longer forces it to read a new field. A column added to
+    /// `WORKSPACE_COLUMNS` (written by INSERT, served by SELECT) but never
+    /// read here would round-trip as the default; fail instead.
+    #[test]
+    fn every_selected_column_is_read_by_the_row_mapper() {
+        let src = include_str!("workspace_repo.rs");
+        let start = src
+            .find("fn map_workspace_row(")
+            .expect("map_workspace_row in workspace_repo.rs");
+        let len = src[start..]
+            .find("\n}\n")
+            .expect("end of map_workspace_row");
+        let body = &src[start..start + len];
+        let missing: Vec<&str> = WORKSPACE_COLUMNS
+            .split(',')
+            .map(str::trim)
+            .filter(|column| !body.contains(&format!("\"{column}\"")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "WORKSPACE_COLUMNS lists columns map_workspace_row never reads: {missing:?}"
+        );
+    }
 }

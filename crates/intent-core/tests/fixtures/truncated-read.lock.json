@@ -1,0 +1,7 @@
+{
+  "lockVersion": 1,
+  "sourceRepository": "intent-hq/intent",
+  "sourcePath": "docs/protocol/fixtures/notes/truncated-read.json",
+  "sourceCommit": "5edc385ea032d1a2d58f636a6e124cec2f8b59cc",
+  "fileSha256": "17587bf752d0ecebeefce0672e9b3d79c9c2e1d82285d3dceb5915474459289a"
+}

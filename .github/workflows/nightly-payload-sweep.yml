@@ -1,0 +1,148 @@
+name: Nightly Payload Sweep
+
+# Runs the ignored full-scale tests every night: the 500 KiB read payload
+# sweep (crates/intent-app/tests/payload_budget) and the large-state fixture's
+# timed build, both with INTENTD_LARGE_STATE_SCALE=full. PR CI runs only the
+# ci preset (payload_budget_sweep_ci). A failing run fails this workflow; the
+# separate nightly-payload-report.yml (workflow_run, default-branch code only)
+# files or comments on the intent-hq/intent issues.
+on:
+  schedule:
+    - cron: '41 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A manual run should not cancel a nightly run and discard its evidence.
+concurrency:
+  group: nightly-payload-sweep-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  runner-route:
+    uses: ./.github/workflows/runner-route.yml
+    with:
+      slot_jobs: >-
+        [{"key":"payload-sweep","label":"gh-linux-8x","rust":true,"minutes":30}]
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+
+  sweep:
+    name: Full-scale payload sweep
+    needs: [runner-route]
+    # A failed route still runs the sweep on its burst label.
+    if: ${{ !cancelled() }}
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.slots || '{}')['payload-sweep'] || fromJSON('["warp-ubuntu-2404-x64-8x"]') }}
+    # Cold build of intent-app's tests plus the full sweep (about 5 min on a
+    # loaded dev host) and the fixture's full-scale build (about 1 min).
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      INTENTD_ASSERT_BOUND_CALLER: "1"
+      INTENTD_LARGE_STATE_SCALE: full
+      # crates.io resilience, matching ci.yml: run 41963501305's first
+      # `cargo test` died on "curl failed: [16] Error in the HTTP2 framing
+      # layer" (serde_with), so the fixture test never ran
+      # (intent-hq/intent#8585). scripts/test-ci-cargo-network.py keeps these
+      # and the fetch step below in place.
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_NET_RETRY: "10"
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Configure the self-hosted compiler cache
+        shell: bash
+        env:
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
+      # Same no-op-or-install probe as ci.yml's check job (monorepo#1515).
+      - name: Install libssl-dev if missing
+        run: |
+          if ! pkg-config --exists openssl; then
+            for i in 1 2 3; do
+              if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
+              if [ "$i" -eq 3 ]; then exit 1; fi
+              sleep $((i * 15))
+            done
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
+          fi
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+      # Download the locked crates with backoff, so a crates.io blip fails
+      # this setup step (reported as an incident) instead of a test.
+      - name: Fetch locked crates
+        run: python3 -I -B scripts/fetch-locked-crates.py
+      # Both ignored full-scale tests, every time; the log is the reporter's
+      # evidence, so the step keeps going after the first failure and fails
+      # at the end if either did.
+      - name: Full-scale sweep
+        id: sweep
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/payload-sweep"
+          # A persistent slot may keep an older report; never upload that one.
+          rm -f "${CARGO_TARGET_DIR:-target}/tmp/payload-budget-report-baseline-full.txt"
+          log="$RUNNER_TEMP/payload-sweep/test.log"
+          status=0
+          cargo test --locked -p intent-services --lib -- --ignored large_state_fixture_full_scale_build_time 2>&1 | tee "$log" || status=1
+          cargo test --locked -p intent-app --test payload_budget -- --ignored payload_budget_sweep_full_scale 2>&1 | tee -a "$log" || status=1
+          exit "$status"
+      - name: Record sweep evidence
+        if: always()
+        shell: bash
+        env:
+          SWEEP_OUTCOME: ${{ steps.sweep.outcome }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_EVENT: ${{ github.event_name }}
+        run: |
+          dir="$RUNNER_TEMP/payload-sweep"
+          mkdir -p "$dir"
+          touch "$dir/test.log"
+          # The sweep writes it to CARGO_TARGET_TMPDIR (<target dir>/tmp).
+          report="${CARGO_TARGET_DIR:-target}/tmp/payload-budget-report-baseline-full.txt"
+          present=false
+          if [ -f "$report" ]; then cp "$report" "$dir/size-report.txt"; present=true; fi
+          python3 - "$dir/outcome.json" "$present" <<'PY'
+          import json, os, sys
+          json.dump({
+              "schemaVersion": 1,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "runId": os.environ["GITHUB_RUN_ID"],
+              "runAttempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "sha": os.environ["GITHUB_SHA"],
+              "ref": os.environ["SOURCE_REF"],
+              "event": os.environ["SOURCE_EVENT"],
+              "testOutcome": os.environ["SWEEP_OUTCOME"],
+              "reportPresent": sys.argv[2] == "true",
+          }, open(sys.argv[1], "w"), indent=2)
+          PY
+          if [ "$present" = true ]; then
+            { echo '### Largest read replies (full scale)'; echo '```'; head -n 40 "$dir/size-report.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload sweep evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-payload-sweep
+          path: ${{ runner.temp }}/payload-sweep/
+          if-no-files-found: error
+          retention-days: 14

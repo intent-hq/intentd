@@ -1,0 +1,114 @@
+{
+  "input": {
+    "list": [
+      {"origin": "legacy-github","payload": {"monitorId": "github","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","url": "https://github.com/Owner/Repo/pull/17","title": "github","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "open","approvals": {"have": 1}}}},
+      {"origin": "qualified","payload": {"monitorId": "gitlab","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","url": "https://gitlab.com/Owner/Repo/-/merge_requests/17","title": "gitlab","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "closed","approvals": {"have": null},"availability": {"approvals": "unknown"}},"resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}},
+      {"origin": "qualified","payload": {"monitorId": "github","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","url": "https://github.com/Owner/Repo/pull/17","title": "github","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "open","approvals": {"have": null},"availability": {"approvals": "unknown"}},"resource": {"repository": {"provider": "github","instanceBaseUrl": "https://github.com","projectPath": "Owner/Repo"},"kind": "pull-request","number": 17}}}
+    ],
+    "events": [
+      {"origin": "legacy-github","payload": {"monitorId": "github","repo": "Owner/Repo","prNumber": 17,"state": "active"}},
+      {"origin": "qualified","payload": {"monitorId": "gitlab","repo": "Owner/Repo","prNumber": 17,"resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}}
+    ],
+    "waiting": [
+      {"origin": "legacy-github","payload": {"monitorId": "github","repo": "Owner/Repo","prNumber": 17}},
+      {"origin": "qualified","payload": {"monitorId": "gitlab","repo": "Owner/Repo","prNumber": 17,"resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}}
+    ],
+    "refusal": [
+      {"origin": "legacy-github","payload": {"ok": false,"refused": true,"reason": "already-monitored","ownerAgentId": "agent","monitorId": "github","repo": "Owner/Repo","prNumber": 17}},
+      {"origin": "qualified","payload": {"ok": false,"refused": true,"ownerAgentId": "agent","monitorId": "gitlab","resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}}
+    ],
+    "registration": [
+      {"origin": "legacy-github","payload": {"ok": true,"monitor": {"monitorId": "github","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","url": "https://github.com/Owner/Repo/pull/17","title": "github","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "open","approvals": {"have": 1}}}}},
+      {"origin": "qualified","payload": {"ok": true,"monitor": {"monitorId": "gitlab","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","url": "https://gitlab.com/Owner/Repo/-/merge_requests/17","title": "gitlab","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "closed","approvals": {"have": null},"availability": {"approvals": "unknown"}},"resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}}}
+    ],
+    "snapshot": [
+      {"origin": "legacy-github","payload": {"state": "open","approvals": {"have": 1}}},
+      {"origin": "qualified","payload": {"state": "closed","approvals": {"have": null},"availability": {"approvals": "unknown"}}}
+    ],
+    "wake": [
+      {"origin": "legacy-github","payload": {"body": "GitHub changed","metadata": {"type": "pr_monitor_wake","monitorId": "github","repo": "Owner/Repo","prNumber": 17,"reason": "changed"}}},
+      {"origin": "qualified","payload": {"body": "GitLab private changes","metadata": {"type": "pr_monitor_wake","monitorId": "gitlab","repo": "Owner/Repo","prNumber": 17,"reason": "changed","resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}}}
+    ],
+    "replay": [
+      {"origin": "legacy-github","payload": {"body": "GitHub changed","metadata": {"type": "pr_monitor_wake","monitorId": "github","repo": "Owner/Repo","prNumber": 17,"reason": "changed"}}},
+      {"origin": "qualified","payload": {"body": "GitLab private changes","metadata": {"type": "pr_monitor_wake","monitorId": "gitlab","repo": "Owner/Repo","prNumber": 17,"reason": "changed","resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}}}
+    ],
+    "missing-url": [
+      {"origin": "qualified","payload": {"monitorId": "gitlab","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","title": "gitlab","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "closed","approvals": {"have": null},"availability": {"approvals": "unknown"}},"resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}}
+    ],
+    "unresolved": [
+      {"origin": "qualified","payload": {"monitorId": "unresolved","repo": "Owner/Repo","prNumber": 17,"monitorAvailability": {"state": "unresolved","reason": "missing-provenance"}}}
+    ]
+  },
+  "legacy": {
+    "list": [
+      {"monitorId": "github","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","url": "https://github.com/Owner/Repo/pull/17","title": "github","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "open","approvals": {"have": 1}}}
+    ],
+    "events": [
+      {"monitorId": "github","repo": "Owner/Repo","prNumber": 17,"state": "active"}
+    ],
+    "waiting": [
+      {"monitorId": "github","repo": "Owner/Repo","prNumber": 17}
+    ],
+    "refusal": [
+      {"ok": false,"refused": true,"reason": "already-monitored","ownerAgentId": "agent","monitorId": "github","repo": "Owner/Repo","prNumber": 17}
+    ],
+    "registration": [
+      {"ok": true,"monitor": {"monitorId": "github","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","url": "https://github.com/Owner/Repo/pull/17","title": "github","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "open","approvals": {"have": 1}}}}
+    ],
+    "snapshot": [
+      {"state": "open","approvals": {"have": 1}}
+    ],
+    "wake": [
+      {"body": "GitHub changed","metadata": {"type": "pr_monitor_wake","monitorId": "github","repo": "Owner/Repo","prNumber": 17,"reason": "changed"}}
+    ],
+    "replay": [
+      {"body": "GitHub changed","metadata": {"type": "pr_monitor_wake","monitorId": "github","repo": "Owner/Repo","prNumber": 17,"reason": "changed"}}
+    ],
+    "missing-url": [
+    ],
+    "unresolved": [
+    ]
+  },
+  "qualified": {
+    "list": [
+      {"monitorId": "github","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","url": "https://github.com/Owner/Repo/pull/17","title": "github","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "open","approvals": {"have": 1}}},
+      {"monitorId": "gitlab","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","url": "https://gitlab.com/Owner/Repo/-/merge_requests/17","title": "gitlab","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "closed","approvals": {"have": null},"availability": {"approvals": "unknown"}},"resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}},
+      {"monitorId": "github","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","url": "https://github.com/Owner/Repo/pull/17","title": "github","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "open","approvals": {"have": null},"availability": {"approvals": "unknown"}},"resource": {"repository": {"provider": "github","instanceBaseUrl": "https://github.com","projectPath": "Owner/Repo"},"kind": "pull-request","number": 17}}
+    ],
+    "events": [
+      {"monitorId": "github","repo": "Owner/Repo","prNumber": 17,"state": "active"},
+      {"monitorId": "gitlab","repo": "Owner/Repo","prNumber": 17,"resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}
+    ],
+    "waiting": [
+      {"monitorId": "github","repo": "Owner/Repo","prNumber": 17},
+      {"monitorId": "gitlab","repo": "Owner/Repo","prNumber": 17,"resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}
+    ],
+    "refusal": [
+      {"ok": false,"refused": true,"reason": "already-monitored","ownerAgentId": "agent","monitorId": "github","repo": "Owner/Repo","prNumber": 17},
+      {"ok": false,"refused": true,"ownerAgentId": "agent","monitorId": "gitlab","resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}
+    ],
+    "registration": [
+      {"ok": true,"monitor": {"monitorId": "github","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","url": "https://github.com/Owner/Repo/pull/17","title": "github","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "open","approvals": {"have": 1}}}},
+      {"ok": true,"monitor": {"monitorId": "gitlab","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","url": "https://gitlab.com/Owner/Repo/-/merge_requests/17","title": "gitlab","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "closed","approvals": {"have": null},"availability": {"approvals": "unknown"}},"resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}}
+    ],
+    "snapshot": [
+      {"state": "open","approvals": {"have": 1}},
+      {"state": "closed","approvals": {"have": null},"availability": {"approvals": "unknown"}}
+    ],
+    "wake": [
+      {"body": "GitHub changed","metadata": {"type": "pr_monitor_wake","monitorId": "github","repo": "Owner/Repo","prNumber": 17,"reason": "changed"}},
+      {"body": "GitLab private changes","metadata": {"type": "pr_monitor_wake","monitorId": "gitlab","repo": "Owner/Repo","prNumber": 17,"reason": "changed","resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}}
+    ],
+    "replay": [
+      {"body": "GitHub changed","metadata": {"type": "pr_monitor_wake","monitorId": "github","repo": "Owner/Repo","prNumber": 17,"reason": "changed"}},
+      {"body": "GitLab private changes","metadata": {"type": "pr_monitor_wake","monitorId": "gitlab","repo": "Owner/Repo","prNumber": 17,"reason": "changed","resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}}
+    ],
+    "missing-url": [
+      {"monitorId": "gitlab","workspaceId": "ws","agentId": "agent","repo": "Owner/Repo","prNumber": 17,"state": "active","title": "gitlab","createdAt": "2026-10-09T00:00:00Z","updatedAt": "2026-10-09T00:00:00Z","pendingChanges": [],"hasPendingChanges": false,"lastSnapshot": {"state": "closed","approvals": {"have": null},"availability": {"approvals": "unknown"}},"resource": {"repository": {"provider": "gitlab","instanceBaseUrl": "https://gitlab.com","projectPath": "Owner/Repo"},"kind": "merge-request","number": 17}}
+    ],
+    "unresolved": [
+      {"monitorId": "unresolved","repo": "Owner/Repo","prNumber": 17,"monitorAvailability": {"state": "unresolved","reason": "missing-provenance"}}
+    ]
+  }
+}

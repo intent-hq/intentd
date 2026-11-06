@@ -116,6 +116,7 @@ async fn run_bridge(ws: &mut Ws, workspace_id: &str, agent_id: &str) -> Value {
     result
 }
 
+#[track_caller]
 fn assert_redacted(value: &Value) {
     let serialized = value.to_string();
     for secret in [AUTH_SECRET, ENV_SECRET, REPLACEMENT] {
@@ -139,11 +140,14 @@ async fn authenticated_fixture() -> (tokio::process::Child, String) {
         .spawn()
         .expect("start authenticated MCP fixture");
     let mut lines = BufReader::new(child.stdout.take().expect("fixture stdout")).lines();
-    let line = timeout(Duration::from_secs(10), lines.next_line())
-        .await
-        .expect("fixture startup timed out")
-        .expect("read fixture port")
-        .expect("fixture exited before startup");
+    let line = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        lines.next_line(),
+    )
+    .await
+    .expect("fixture startup timed out")
+    .expect("read fixture port")
+    .expect("fixture exited before startup");
     let port = line.strip_prefix("PORT=").expect("fixture PORT line");
     (child, format!("http://127.0.0.1:{port}"))
 }

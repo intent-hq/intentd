@@ -7,7 +7,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -80,10 +80,13 @@ async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
 
 async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     let mut line = String::new();
-    let n = timeout(Duration::from_secs(2), reader.read_line(&mut line))
-        .await
-        .expect("timed out waiting for a frame")
-        .expect("read failed");
+    let n = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("timed out waiting for a frame")
+    .expect("read failed");
     assert!(n > 0, "connection closed unexpectedly");
     serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
 }
@@ -122,7 +125,7 @@ async fn settings_rollback_on_failed_listener_start() {
     let store = Store::open(&tmpdb.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_event_bus(bus.clone())
         .with_secret_store(Arc::new(InMemorySecretStore::default()))
         .with_workspaces_root(ws_root.path().to_path_buf());

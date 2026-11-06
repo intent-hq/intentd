@@ -53,6 +53,127 @@ fn decode_token(token: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Page an `agent.getQueue` reply (PROTOCOL §5.5 "Paged queue reads"): keep
+/// at most `limit` entries from the token's offset, trimmed to
+/// [`intent_core::AGENT_QUEUE_PAGE_BUDGET_BYTES`], and add `queueLength`
+/// (the whole queue) and `nextToken` (`null` after the last entry). A
+/// refused reply (no `queue` entries visible) passes through with
+/// `nextToken: null`. Entries keep their whole-queue `position`.
+pub(crate) fn page_queue_reply(
+    mut reply: Value,
+    agent_id: &str,
+    limit: Option<i64>,
+    next_token: Option<&str>,
+) -> intent_core::Result<Value> {
+    let scope = json!(["agent.getQueue", agent_id]);
+    let limit = clamp_page_limit(
+        limit,
+        intent_core::AGENT_QUEUE_DEFAULT_LIMIT,
+        intent_core::AGENT_QUEUE_MAX_LIMIT,
+    );
+    let start = match next_token {
+        None => 0,
+        Some(token) => serde_json::from_str::<Value>(token)
+            .ok()
+            .filter(|c| c.get("version") == Some(&json!(1)) && c.get("scope") == Some(&scope))
+            .and_then(|c| c.get("offset").and_then(Value::as_u64))
+            .and_then(|q| usize::try_from(q).ok())
+            .ok_or_else(|| {
+                intent_core::Error::InvalidParams("invalid or mismatched nextToken".to_string())
+            })?,
+    };
+    let Some(obj) = reply.as_object_mut() else {
+        return Ok(reply);
+    };
+    let entries = match obj.remove("queue") {
+        Some(Value::Array(entries)) => entries,
+        _ => Vec::new(),
+    };
+    let total = entries.len();
+    if !obj.contains_key("queueLength") {
+        obj.insert("queueLength".into(), json!(total));
+    }
+    let window: Vec<Value> = entries.into_iter().skip(start).take(limit).collect();
+    let kept = fit_rows_to_budget(&window, intent_core::AGENT_QUEUE_PAGE_BUDGET_BYTES);
+    let end = start.saturating_add(kept);
+    let page: Vec<Value> = window.into_iter().take(kept).collect();
+    obj.insert("queue".into(), Value::Array(page));
+    obj.insert(
+        "nextToken".into(),
+        if end < total {
+            json!(json!({ "version": 1, "scope": scope, "offset": end }).to_string())
+        } else {
+            Value::Null
+        },
+    );
+    Ok(reply)
+}
+
+/// Clamp a list read's `limit` into `[1, max]`, `default` when absent.
+#[must_use]
+pub(crate) fn clamp_page_limit(limit: Option<i64>, default: usize, max: usize) -> usize {
+    limit.map_or(default, |l| {
+        usize::try_from(l.max(1)).unwrap_or(max).min(max)
+    })
+}
+
+/// Keyset continuation token for lists ordered by `(createdAt, id)`
+/// ascending: versioned JSON scoped to the list read (method plus the
+/// resource and filters that select its rows, the `script_lists` cursor
+/// style). The next page starts strictly after the pair.
+pub(crate) fn encode_keyset_token(scope: &Value, created_at: &str, id: &str) -> String {
+    json!({ "version": 1, "scope": scope, "created_at": created_at, "id": id }).to_string()
+}
+
+/// Decode an [`encode_keyset_token`] token minted for `scope`; a malformed
+/// or differently scoped one is `InvalidParams` (a keyset list has no
+/// sensible restart point).
+pub(crate) fn decode_keyset_token(
+    token: &str,
+    scope: &Value,
+) -> intent_core::Result<(String, String)> {
+    let invalid =
+        || intent_core::Error::InvalidParams("invalid or mismatched nextToken".to_string());
+    let cursor: Value = serde_json::from_str(token).map_err(|_| invalid())?;
+    if cursor.get("version") != Some(&json!(1)) || cursor.get("scope") != Some(scope) {
+        return Err(invalid());
+    }
+    let created_at = cursor
+        .get("created_at")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let id = cursor
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    if created_at.is_empty() || id.is_empty() {
+        return Err(invalid());
+    }
+    Ok((created_at.to_string(), id.to_string()))
+}
+
+/// How many leading `rows` fit `budget` serialized bytes (array commas
+/// included). At least one row is always admitted, so a page never comes
+/// back empty while rows remain.
+pub(crate) fn fit_rows_to_budget<T: serde::Serialize>(rows: &[T], budget: usize) -> usize {
+    let mut total = 2usize;
+    for (i, row) in rows.iter().enumerate() {
+        let size = serde_json::to_vec(row).map_or(0, |b| b.len()) + 1;
+        if i > 0 && total.saturating_add(size) > budget {
+            return i;
+        }
+        total = total.saturating_add(size);
+    }
+    rows.len()
+}
+
+/// The opaque backward continuation token whose next page ends (exclusive)
+/// at `boundary`, counted from the oldest item — the same token
+/// [`page_window`] mints, so it continues through any reader of that contract.
+pub(crate) fn backward_page_token(boundary: usize) -> String {
+    encode_token(&json!({ "b": boundary }))
+}
+
 /// Decode the oldest-indexed exclusive end carried by a backward page token.
 /// Malformed and non-backward tokens return `None`, matching [`page_window`]'s
 /// behavior of restarting from the newest page.
@@ -285,6 +406,7 @@ pub fn serialized_size<T: serde::Serialize>(row: &T) -> usize {
 }
 
 /// A page of items plus the opaque token for the next (older) page.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Page<T> {
     pub items: Vec<T>,
@@ -294,6 +416,7 @@ pub struct Page<T> {
 /// Paginate a chronological (oldest→newest) slice into a newest→oldest page.
 /// Items within the returned page are ordered newest-first; `next_token` follows
 /// the contract in [`page_window`].
+#[cfg(test)]
 pub(crate) fn paginate_slice<T: Clone>(
     source: &[T],
     limit: Option<i64>,
@@ -312,16 +435,176 @@ pub(crate) fn paginate_slice<T: Clone>(
 /// historical-output reads. Trailing blank lines are trimmed (mirroring the
 /// legacy formatted reads) before paging; the per-page size follows the standard
 /// clamp (default 50, max 200) and the token is append-stable per [`page_window`].
-pub(crate) fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) -> Value {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) -> Value {
     let mut lines: Vec<&str> = text.split('\n').collect();
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
-    let page = paginate_slice(&lines, limit, token);
-    json!({
-        "items": page.items,
-        "nextToken": page.next_token,
-    })
+    let (win, cut) = text_page_window(lines.len(), limit, token);
+    let mut window = lines[win.start..win.end].to_vec();
+    if let (Some(cut), Some(last)) = (cut, window.last_mut()) {
+        *last = &last[..floor_char_boundary(last, cut)];
+    }
+    bound_text_page(&window, win.start, win.next_token)
+}
+
+/// [`page_window`] for text pages, plus the in-line resume offset a
+/// [`bound_text_page`] token may carry: `{"b": end, "c": k}` means the
+/// window's newest line (index `end - 1`) still has its first `k` bytes to
+/// serve. Callers cut that line to `[..k]` (on a UTF-8 boundary) before
+/// budgeting the page.
+#[must_use]
+pub fn text_page_window(
+    len: usize,
+    limit: Option<i64>,
+    token: Option<&str>,
+) -> (PageWindow, Option<usize>) {
+    let win = page_window(len, limit, token);
+    let cut = token.and_then(decode_token).and_then(|v| {
+        let boundary = usize::try_from(v.get("b")?.as_u64()?).ok()?;
+        let cut = usize::try_from(v.get("c")?.as_u64()?).ok()?;
+        (boundary == win.end && win.end > win.start).then_some(cut)
+    });
+    (win, cut)
+}
+
+/// The largest UTF-8 boundary in `text` at or below `index`.
+#[must_use]
+pub fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut i = index.min(text.len());
+    while !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// The `{ items, nextToken, lineContinues? }` envelope for one text page
+/// window (`window` oldest→newest, starting at line `start`), within
+/// [`OUTPUT_TAIL_MAX_JSON_BYTES`] of JSON-escaped line text. Lines are taken
+/// newest first; when the budget stops the walk, `nextToken` resumes at the
+/// first line left out. A newest line too big on its own is served as its
+/// last bytes that fit (split on a UTF-8 boundary) with `lineContinues:
+/// true`, and `nextToken` resumes inside that line: the next page's newest
+/// item is the line's earlier part. Prepending each continued piece to the
+/// previous page's oldest item rebuilds every line exactly; no byte is lost.
+#[must_use]
+pub fn bound_text_page<S: AsRef<str>>(
+    window: &[S],
+    start: usize,
+    next_token: Option<String>,
+) -> Value {
+    let mut items: Vec<Value> = Vec::new();
+    let mut used = 0usize;
+    let mut first_kept = start + window.len();
+    let mut resume_in_line = None;
+    for line in window.iter().rev() {
+        let line = line.as_ref();
+        let len = line.chars().map(json_escaped_len).sum::<usize>() + 3;
+        if used + len > OUTPUT_TAIL_MAX_JSON_BYTES {
+            if items.is_empty() {
+                let (tail, _) = tail_within_json_bytes(line, OUTPUT_TAIL_MAX_JSON_BYTES - 3);
+                items.push(Value::from(tail));
+                resume_in_line = Some((first_kept, line.len() - tail.len()));
+            }
+            break;
+        }
+        used += len;
+        items.push(Value::from(line));
+        first_kept -= 1;
+    }
+    let next_token = match resume_in_line {
+        Some((end, cut)) => Some(encode_token(&json!({ "b": end, "c": cut }))),
+        None if first_kept > start => remint_backward_token(first_kept),
+        None => next_token,
+    };
+    let mut page = json!({ "items": items, "nextToken": next_token });
+    if resume_in_line.is_some() {
+        page["lineContinues"] = Value::Bool(true);
+    }
+    page
+}
+
+/// Fit one list row in `budget` serialized bytes by dropping its largest
+/// top-level fields (never the `keep` keys), largest first, each replaced
+/// with `<field>Omitted: true` and `<field>Bytes` (a string's UTF-8 length,
+/// otherwise its JSON size). Returns whether anything was omitted; rows
+/// already within budget are left untouched.
+pub fn bound_row(row: &mut Value, budget: usize, keep: &[&str]) -> bool {
+    if serialized_size(row) <= budget {
+        return false;
+    }
+    let Some(obj) = row.as_object_mut() else {
+        return false;
+    };
+    let mut fields: Vec<(usize, String)> = obj
+        .iter()
+        .filter(|(k, _)| !keep.contains(&k.as_str()))
+        .map(|(k, v)| (serialized_size(v), k.clone()))
+        .collect();
+    fields.sort_by(|a, b| b.cmp(a));
+    let mut omitted = false;
+    for (_, field) in fields {
+        let Some(value) = obj.remove(&field) else {
+            continue;
+        };
+        let bytes = value
+            .as_str()
+            .map_or_else(|| serialized_size(&value), str::len);
+        obj.insert(format!("{field}Omitted"), Value::Bool(true));
+        obj.insert(format!("{field}Bytes"), Value::from(bytes));
+        omitted = true;
+        if serialized_size(&Value::Object(obj.clone())) <= budget {
+            break;
+        }
+    }
+    omitted
+}
+
+/// Budget, in JSON-escaped bytes, for one text tail in a read reply
+/// (`script.output`, `script.run`'s `output`, `terminal.readOutput`): the
+/// shared 480,000-byte page budget, so the frame stays under 512,000 bytes.
+pub const OUTPUT_TAIL_MAX_JSON_BYTES: usize = 480_000;
+
+/// Bytes `c` takes inside a JSON string as `serde_json` writes it.
+fn json_escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if u32::from(c) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// The newest suffix of `text` whose JSON-escaped size fits `budget`, and
+/// whether anything was dropped. A cut inside a line moves past that line's
+/// newline (when the kept part has one) so the tail begins on a whole line.
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn tail_within_json_bytes(text: &str, budget: usize) -> (&str, bool) {
+    let mut used = 0usize;
+    let mut start = text.len();
+    for (i, c) in text.char_indices().rev() {
+        let len = json_escaped_len(c);
+        if used + len > budget {
+            let kept = &text[start..];
+            if c == '\n' {
+                return (kept, true);
+            }
+            let kept = kept
+                .find('\n')
+                .filter(|n| n + 1 < kept.len())
+                .map_or(kept, |n| &kept[n + 1..]);
+            return (kept, true);
+        }
+        used += len;
+        start = i;
+    }
+    (text, false)
 }
 
 /// Encode an opaque continuation token for offset/skip-style backward paging

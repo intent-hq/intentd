@@ -14,9 +14,7 @@
 
 #![cfg(unix)]
 
-mod common;
-
-use std::os::unix::process::CommandExt;
+use crate::common;
 
 use common::DaemonGuard;
 use std::path::Path;
@@ -30,7 +28,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -45,7 +43,7 @@ fn temp_data_dir() -> tempfile::TempDir {
 async fn await_uds(socket: &Path) -> bool {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if UnixStream::connect(socket).await.is_ok() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -149,9 +147,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -171,55 +172,15 @@ where
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
         title: "WSS-RESOLVE".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -246,10 +207,7 @@ async fn resolve_interrupted_resume_and_abandon() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    // Spawn in its own process group to prevent ACP mock process leaks
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let child = cmd.spawn().expect("spawn intentd serve");
+    let child = common::spawn_guarded(&mut cmd).expect("spawn intentd serve");
     let mut guard = DaemonGuard::process_only(child);
     assert!(await_uds(&socket).await, "daemon did not start");
 
@@ -315,6 +273,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store
             .insert_agent_session(&session1)
@@ -376,6 +335,7 @@ async fn resolve_interrupted_resume_and_abandon() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store
             .insert_agent_session(&session2)
@@ -444,7 +404,7 @@ async fn resolve_interrupted_resume_and_abandon() {
 
     let resume_agent_id = AgentId(agent_resume.clone());
     let resumed_session = store
-        .get_agent_session(&resume_agent_id)
+        .get_agent_session_with_transcript(&resume_agent_id)
         .await
         .expect("get resumed session");
     let last_user_idx = resumed_session
@@ -512,7 +472,7 @@ async fn resolve_interrupted_resume_and_abandon() {
 
     // Phase 6: Verify the abandoned agent has a system message
     let abandoned_session = store
-        .get_agent_session(&AgentId(agent_abandon.clone()))
+        .get_agent_session_with_transcript(&AgentId(agent_abandon.clone()))
         .await
         .expect("get abandoned session");
     assert!(!abandoned_session.messages.is_empty(), "expected messages");
@@ -544,8 +504,7 @@ async fn resolve_interrupted_resume_and_abandon() {
     assert_eq!(resumed2.len(), 0, "already resolved should not resume");
     assert_eq!(failed2.len(), 1, "already resolved should be in failed");
 
-    guard.child_mut().kill().expect("kill daemon");
-    guard.child_mut().wait().expect("wait daemon");
+    guard.kill_tree().expect("kill daemon");
     drop(guard);
 }
 
@@ -568,9 +527,7 @@ async fn resolve_interrupted_invalid_params_validation() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let child = cmd.spawn().expect("spawn intentd serve");
+    let child = common::spawn_guarded(&mut cmd).expect("spawn intentd serve");
     let mut guard = DaemonGuard::process_only(child);
     assert!(await_uds(&socket).await, "daemon did not start");
 
@@ -709,7 +666,6 @@ async fn resolve_interrupted_invalid_params_validation() {
     assert!(v.get("result").is_some(), "valid params should succeed");
     assert!(v.get("error").is_none(), "valid params should not error");
 
-    guard.child_mut().kill().expect("kill daemon");
-    guard.child_mut().wait().expect("wait daemon");
+    guard.kill_tree().expect("kill daemon");
     drop(guard);
 }

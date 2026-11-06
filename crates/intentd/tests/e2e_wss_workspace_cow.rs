@@ -37,10 +37,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,15 +61,14 @@ use uuid::Uuid;
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     _data_dir: tempfile::TempDir,
     scratch: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -76,7 +76,7 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", &format!("itd-wss-cow-{prefix}-"))
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     common::enable_ws_api(data_dir);
     common::seed_default_provider(data_dir);
@@ -89,7 +89,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -196,9 +196,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(20), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(20)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -222,9 +225,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -310,6 +316,7 @@ fn mock_gate(test: &str) -> Option<String> {
     Some(script)
 }
 
+#[track_caller]
 fn run_git(args: &[&str], cwd: &Path) -> String {
     let out = Command::new("git")
         .args(args)
@@ -869,13 +876,15 @@ where
 
 /// Scenario C2 — regression for monorepo#871: SLOW sandbox provisioning must
 /// not block or time out `agent.delegate`. The
-/// `INTENTD_TEST_SANDBOX_PROVISION_DELAY_MS` seam holds `provision_sandbox`
-/// for 10s (standing in for a `CoW` clone of a large checkout); the delegate
-/// must return well under that (comfortably inside the 30s `workspace_api`
-/// budget) with `effectiveIsolation: "pending"`, the `sandbox:cow:created` event
-/// arrives only after the delay, and the child's first ACP spawn waits for
+/// `INTENTD_TEST_SANDBOX_PROVISION_GATE` seam holds `provision_sandbox` until
+/// the test creates the gate file (standing in for a `CoW` clone of a large
+/// checkout); the delegate must return while provisioning is still held, with
+/// `effectiveIsolation: "pending"`, the `sandbox:cow:created` event arrives
+/// only after the gate opens, and the child's first ACP spawn waits for
 /// settlement — its actual cwd (mock `echoCwd`) is the sandbox, never the
-/// shared checkout or a half-copied directory.
+/// shared checkout or a half-copied directory. No clock is read: a timed
+/// bound on the delegate failed on loaded CI runners (intentd#2917), and a
+/// delegate that waited for provisioning now hangs into the RPC hang guard.
 #[tokio::test]
 async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
     const TEST: &str = "agent.delegate slow-provisioning WSS e2e";
@@ -887,11 +896,14 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
     };
     let root_dir = scratch_dir("sbslow");
     let root = root_dir.path().to_path_buf();
+    let gate_dir = scratch_dir("sbgate");
+    let gate = gate_dir.path().join("provisioning-may-finish");
+    let gate_env = gate.to_string_lossy().into_owned();
     let behavior = json!({ "response": "done", "echoCwd": true }).to_string();
     let extra: [(&str, &str); 3] = [
         ("MOCK_AGENT_SCRIPT_PATH", &script),
         ("MOCK_AGENT_BEHAVIOR", &behavior),
-        ("INTENTD_TEST_SANDBOX_PROVISION_DELAY_MS", "10000"),
+        ("INTENTD_TEST_SANDBOX_PROVISION_GATE", &gate_env),
     ];
     let (daemon, port, cfg) = boot(&root, &extra).await;
     let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
@@ -930,8 +942,9 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
         "subscribed: {sub_resp}"
     );
 
-    // The delegate must return promptly even though provisioning sleeps 10s.
-    let started = std::time::Instant::now();
+    // The delegate must return while provisioning is still held at the gate:
+    // the gate file is created only after this reply, so a delegate that
+    // waited for provisioning never answers and `wss_rpc`'s hang guard fails.
     let delegated = wss_rpc(
         &mut rpc,
         3,
@@ -943,7 +956,6 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
         }),
     )
     .await;
-    let elapsed = started.elapsed();
     assert_eq!(delegated["ok"], json!(true), "delegate ok: {delegated}");
     let agent_id = delegated["agentId"].as_str().expect("agentId").to_string();
     assert_eq!(
@@ -951,12 +963,9 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
         json!("pending"),
         "provisioning kicked off in the background: {delegated}"
     );
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "delegate must not ride the 10s provisioning delay (took {elapsed:?})"
-    );
 
-    // sandbox:cow:created lands only after the artificial delay settles.
+    // sandbox:cow:created lands only after the gate opens.
+    std::fs::write(&gate, b"").expect("open the provisioning gate");
     let expected_sandbox = root
         .join(&ws_id)
         .join("sandboxes")
@@ -975,10 +984,6 @@ async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
             break;
         }
     }
-    assert!(
-        started.elapsed() >= Duration::from_secs(10),
-        "sandbox:cow:created must not land before the provisioning delay elapsed"
-    );
 
     // The child's first spawn was gated on settlement: its actual working
     // directory is the fully-provisioned sandbox (mock `echoCwd` stamp). The

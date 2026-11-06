@@ -1650,10 +1650,13 @@ mod tests {
         let _stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         let mut ready = String::new();
-        tokio::time::timeout(Duration::from_secs(10), stdout.read_line(&mut ready))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            stdout.read_line(&mut ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let descendant_pid: u32 = ready.trim().parse().unwrap();
         assert_ne!(parent_pid, descendant_pid);
         let mut stderr = child.stderr.take().unwrap();
@@ -1663,7 +1666,7 @@ mod tests {
             Some(tail)
         });
         let result = tokio::time::timeout(
-            Duration::from_secs(10),
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
             wait_for_clone(&mut child, reader, Duration::ZERO),
         )
         .await;
@@ -1699,16 +1702,19 @@ mod tests {
 
         let mut stdout = child.stdout.take().expect("piped stdout");
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            let mut byte = [0u8; 1];
-            loop {
-                let n = stdout.read(&mut byte).await.unwrap_or(0);
-                if n == 0 || byte[0] == b'\n' {
-                    break;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            async {
+                let mut byte = [0u8; 1];
+                loop {
+                    let n = stdout.read(&mut byte).await.unwrap_or(0);
+                    if n == 0 || byte[0] == b'\n' {
+                        break;
+                    }
+                    line.push(byte[0] as char);
                 }
-                line.push(byte[0] as char);
-            }
-        })
+            },
+        )
         .await
         .expect("read grandchild pid");
         let grandchild_pid: i32 = line.trim().parse().expect("parse grandchild pid");

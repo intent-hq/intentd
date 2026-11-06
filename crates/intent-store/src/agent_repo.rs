@@ -16,7 +16,17 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::{enum_from_db, enum_to_db, Store};
+use crate::{enum_from_db, enum_to_db, AgentSessionSummary, FullAgentSessionRow, Store};
+
+mod review_context_enrollment;
+pub use review_context_enrollment::{
+    ReviewContextEnrollment, ReviewContextEnrollmentIntent, ReviewContextOwnerKey,
+};
+
+mod prepared_monitor_message;
+pub use prepared_monitor_message::PreparedMonitorMessage;
+mod monitor_message_provenance;
+pub use monitor_message_provenance::MonitorMessageProvenance;
 
 /// Last confirmed turn selection and the provider default to restore after a
 /// resume. A missing record is an unobserved baseline; `effort: None` is Auto.
@@ -39,7 +49,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     file_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled, harness_version, \
-    harness_features, retired_at, notifications_muted";
+    harness_features, retired_at, notifications_muted, pinned";
 
 /// Session metadata needed by the `AgentLite` summary projection.
 /// `system_prompt`, `image_blocks`, and `initial_message` are intentionally
@@ -52,7 +62,7 @@ pub(crate) const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_sess
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     context_references, file_blocks, is_background, metadata, sandbox_id, \
     sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, \
-    effort_levels, harness_version, harness_features, retired_at, notifications_muted";
+    effort_levels, harness_version, harness_features, retired_at, notifications_muted, pinned";
 
 /// Aggregate SQL behind [`Store::get_agent_session_message_stats`], extracted
 /// so tests can run `EXPLAIN QUERY PLAN` on the exact production statement
@@ -62,6 +72,26 @@ pub(crate) const SESSION_MESSAGE_STATS_SQL: &str = "SELECT s.id AS agent_id, \
     s.message_count, s.assistant_message_count, s.conversation_bytes \
     FROM agent_session s \
     WHERE s.workspace_id = ?";
+
+/// Bounded probe behind [`Store::agent_has_assistant_message`], extracted so
+/// tests can run `EXPLAIN QUERY PLAN` on the exact production statement. It
+/// must stay a single seek of `idx_agent_message_agent_role_seq` (0064): the
+/// per-turn first-turn naming check runs it on every turn, and the
+/// full-transcript read it replaced held read-pool connections for seconds
+/// on long-lived agents.
+pub(crate) const AGENT_HAS_ASSISTANT_MESSAGE_SQL: &str = "SELECT EXISTS(\
+    SELECT 1 FROM agent_message WHERE agent_id = ? AND role = 'assistant')";
+
+/// Bounded probe behind [`Store::agent_has_assistant_after_last_user`]:
+/// whether any `assistant` row follows the agent's latest `user` row. Both
+/// lookups seek `idx_agent_message_agent_role_seq` (0064) — the inner one
+/// reads the highest `user` seq, the outer one tests for a later
+/// `assistant` seq — so the cost does not grow with the transcript. With no
+/// `user` row the inner `MAX` is NULL and the probe is false. Extracted so
+/// tests can run `EXPLAIN QUERY PLAN` on the exact production statement.
+pub(crate) const AGENT_HAS_ASSISTANT_AFTER_LAST_USER_SQL: &str = "SELECT EXISTS(\
+    SELECT 1 FROM agent_message WHERE agent_id = ?1 AND role = 'assistant' AND seq > (\
+    SELECT MAX(seq) FROM agent_message WHERE agent_id = ?1 AND role = 'user'))";
 
 /// Two-phase search SQL behind [`Store::search_agent_messages_fts`],
 /// extracted so the monorepo#4127 plan-shape guard
@@ -329,7 +359,8 @@ pub(crate) fn unread_workspaces_batch_sql() -> String {
 }
 
 /// One agent session's usage inputs for the workspace token-usage tally
-/// (§5.23): `(agent_id, model, snapshot, baseline, message_usage)`.
+/// (§5.23): `(agent_id, model, snapshot, baseline, message_usage, cells, name)`,
+/// where `name` is the raw session display name.
 /// `message_usage` is non-empty only for sessions whose decoded snapshot and
 /// baseline carry no token report (the per-message fallback path — see
 /// [`Store::get_workspace_agent_usage_data`]), and carries only the usage
@@ -341,6 +372,7 @@ pub(crate) type AgentUsageRow = (
     Option<TokenUsageTotals>,
     Vec<serde_json::Value>,
     Vec<AgentUsageCellRow>,
+    String,
 );
 
 /// Indexed aggregate counts for delegated children of one parent agent.
@@ -464,7 +496,7 @@ pub(crate) async fn fetch_agent_usage_rows(
     conn: &mut sqlx::SqliteConnection,
     workspace_id: &WorkspaceId,
 ) -> Result<Vec<AgentUsageRow>> {
-    let session_sql = "SELECT id, COALESCE(NULLIF(resolved_model,''), model) AS model, token_usage, token_usage_baseline \
+    let session_sql = "SELECT id, name, COALESCE(NULLIF(resolved_model,''), model) AS model, token_usage, token_usage_baseline \
         FROM agent_session WHERE workspace_id = ?";
     let session_rows = sqlx::query(session_sql)
         .bind(&workspace_id.0)
@@ -488,7 +520,21 @@ pub(crate) async fn fetch_agent_usage_rows(
             .get::<Option<String>, _>("token_usage_baseline")
             .and_then(|s| serde_json::from_str(&s).ok());
 
-        result.push((agent_id, model, snapshot, baseline, Vec::new(), Vec::new()));
+        // Display name for `TokenUsage::agent_names` (§5.23); the services
+        // helper owns trimming and the empty-name rule.
+        let name = session_row
+            .get::<Option<String>, _>("name")
+            .unwrap_or_default();
+
+        result.push((
+            agent_id,
+            model,
+            snapshot,
+            baseline,
+            Vec::new(),
+            Vec::new(),
+            name,
+        ));
     }
 
     let mut by_agent = std::collections::HashMap::new();
@@ -555,7 +601,7 @@ pub(crate) async fn fetch_agent_usage_rows(
     } else {
         let agent_ids_json = serde_json::to_string(&fallback_agent_ids)
             .map_err(|e| Error::Internal(format!("encode fallback agent ids failed: {e}")))?;
-        sqlx::query(&fallback_message_usage_sql())
+        sqlx::query(sqlx::AssertSqlSafe(fallback_message_usage_sql()))
             .bind(agent_ids_json)
             .fetch_all(&mut *conn)
             .await
@@ -756,6 +802,87 @@ pub struct SessionMessageProjection {
 /// any realistic message.
 pub const PROJECTION_TEXT_BLOCK_CAP: u32 = 4096;
 
+/// Session `metadata` key holding the token of a manual model/provider choice
+/// no turn has started on yet (PROTOCOL §5.54 shared quota state). Written
+/// with the selection by [`Store::set_agent_session_model_choice`] and
+/// removed by [`Store::take_agent_session_manual_choice`]. Internal: never
+/// projected to clients.
+pub const MANUAL_CHOICE_METADATA_KEY: &str = "manualChoice";
+
+/// Session `metadata` key holding the provider return state (PROTOCOL
+/// §5.54 Backup failover). Written only by the single-key writers; internal:
+/// never projected to clients.
+pub const PROVIDER_RETURN_METADATA_KEY: &str = "providerReturn";
+
+/// Daemon-owned `metadata` keys: each has dedicated single-key writers, and
+/// whole-document writes ([`Store::update_agent_session`],
+/// [`Store::update_agent_session_metadata`]) never set or clear them, so a
+/// caller's stale snapshot cannot erase a newer value or bring back an old
+/// one (PROTOCOL §5.54 shared quota state).
+const DAEMON_OWNED_METADATA_KEYS: [&str; 3] = [
+    MANUAL_CHOICE_METADATA_KEY,
+    PROVIDER_RETURN_METADATA_KEY,
+    intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+];
+
+/// The two binds a whole-document `metadata` write needs (see
+/// [`daemon_owned_preserving_metadata`]): the caller's document without the
+/// daemon-owned keys, as written when the stored row has none of them; and
+/// the same as an object (a non-object document kept under
+/// `priorNonObjectMetadata`, the convention of the single-key writers), into
+/// which the stored daemon-owned keys are merged. Returned as
+/// `(raw, object)`.
+fn whole_metadata_binds(
+    value: Option<&serde_json::Value>,
+) -> Result<(Option<String>, Option<String>)> {
+    let stripped = value.map(|v| match v {
+        serde_json::Value::Object(map) => {
+            let mut map = map.clone();
+            for key in DAEMON_OWNED_METADATA_KEYS {
+                map.remove(key);
+            }
+            serde_json::Value::Object(map)
+        }
+        other => other.clone(),
+    });
+    let object = match &stripped {
+        None => serde_json::json!({}),
+        Some(v @ serde_json::Value::Object(_)) => v.clone(),
+        Some(other) => serde_json::json!({ "priorNonObjectMetadata": other }),
+    };
+    Ok((
+        encode_metadata(stripped.as_ref())?,
+        encode_metadata(Some(&object))?,
+    ))
+}
+
+/// SQL for a whole-document `metadata` write. `object_doc` and `raw_doc`
+/// are expressions over the two [`whole_metadata_binds`] values (`object_doc`
+/// comes first in the statement). When the stored row carries a
+/// daemon-owned key, the stored values are merged into `object_doc` (the
+/// manual-choice token only while `keep_choice_if` holds); otherwise
+/// `raw_doc` is written as is.
+fn daemon_owned_preserving_metadata(
+    object_doc: &str,
+    raw_doc: &str,
+    keep_choice_if: &str,
+) -> String {
+    let [choice, ret, remote] = DAEMON_OWNED_METADATA_KEYS;
+    format!(
+        "CASE WHEN metadata IS NOT NULL AND json_valid(metadata) \
+              AND json_type(metadata) = 'object' \
+              AND (json_type(metadata, '$.{choice}') IS NOT NULL \
+                   OR json_type(metadata, '$.{ret}') IS NOT NULL \
+                   OR json_type(metadata, '$.{remote}') IS NOT NULL) \
+             THEN json_patch({object_doc}, json_object(\
+                 '{choice}', CASE WHEN ({keep_choice_if}) \
+                                  THEN json(metadata -> '$.{choice}') END, \
+                 '{ret}', json(metadata -> '$.{ret}'), \
+                 '{remote}', json(metadata -> '$.{remote}'))) \
+         ELSE {raw_doc} END"
+    )
+}
+
 /// Applied at message-write time to maintain the persisted
 /// `agent_session.last_assistant_preview` / `last_user_preview` columns
 /// (0066): `None` when `content` is not a JSON array; otherwise the
@@ -940,16 +1067,16 @@ fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<String>>> {
     .transpose()
 }
 
-/// Bind the full 40-column `agent_session` insert value list onto `query`, in
+/// Bind the full 42-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place. The harness stamp (`harness_version` /
 /// `harness_features`) binds from the session struct itself.
 fn bind_session_insert<'q>(
-    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
     s: &'q AgentSession,
     task_graph_enabled: bool,
-) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>> {
+) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>> {
     Ok(query
         .bind(&s.id.0)
         .bind(&s.workspace_id.0)
@@ -991,7 +1118,40 @@ fn bind_session_insert<'q>(
         .bind(&s.harness_version)
         .bind(json_col_to_db(s.harness_features.as_ref())?)
         .bind(&s.retired_at)
-        .bind(i64::from(s.notifications_muted)))
+        .bind(i64::from(s.notifications_muted))
+        .bind(i64::from(s.pinned)))
+}
+
+/// Per-session boolean user preferences. Each is written only by its narrow
+/// writer or an explicit patch in [`Store::update_agent_session_with_preferences`],
+/// never by the ordinary full-row update.
+#[derive(Clone, Copy)]
+enum SessionPreference {
+    NotificationsMuted,
+    Pinned,
+}
+
+impl SessionPreference {
+    /// Conditional single-column UPDATE binding `(value, id, workspace_id, value)`.
+    const fn update_sql(self) -> &'static str {
+        match self {
+            Self::NotificationsMuted => {
+                "UPDATE agent_session SET notifications_muted=? \
+                 WHERE id=? AND workspace_id=? AND notifications_muted != ?"
+            }
+            Self::Pinned => {
+                "UPDATE agent_session SET pinned=? \
+                 WHERE id=? AND workspace_id=? AND pinned != ?"
+            }
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NotificationsMuted => "set notifications muted",
+            Self::Pinned => "set pinned",
+        }
+    }
 }
 
 impl Store {
@@ -1001,7 +1161,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::Internal` if encoding session fields or the insert fails, including when a server-minted agent id collides with an existing session.
-    pub async fn insert_agent_session(&self, s: &AgentSession) -> Result<()> {
+    pub async fn insert_agent_session(&self, s: &impl FullAgentSessionRow) -> Result<()> {
         self.insert_agent_session_with_task_graph(s, false).await
     }
 
@@ -1013,7 +1173,7 @@ impl Store {
     /// Returns `Error::Internal` if encoding session fields or the insert fails, including when a server-minted agent id collides with an existing session.
     pub async fn insert_agent_session_with_task_graph(
         &self,
-        s: &AgentSession,
+        s: &impl FullAgentSessionRow,
         task_graph_enabled: bool,
     ) -> Result<()> {
         self.insert_agent_session_with_preferences(s, task_graph_enabled, false)
@@ -1026,10 +1186,11 @@ impl Store {
     /// Returns an error if either write fails; neither write is committed.
     pub async fn insert_agent_session_with_preferences(
         &self,
-        s: &AgentSession,
+        s: &impl FullAgentSessionRow,
         task_graph_enabled: bool,
         remember_specialist: bool,
     ) -> Result<()> {
+        let s = s.full_row();
         let mut lifecycle = self.repository_lifecycle_write().await?;
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(s.id.clone())])?;
         let mut tx = if remember_specialist {
@@ -1044,9 +1205,13 @@ impl Store {
         };
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
-        let query = bind_session_insert(sqlx::query(&sql), s, task_graph_enabled)?;
+        let query = bind_session_insert(
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str())),
+            s,
+            task_graph_enabled,
+        )?;
         match tx.as_mut() {
             Some(tx) => query.execute(&mut **tx).await,
             None => query.execute(self.write_pool()).await,
@@ -1072,7 +1237,7 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("commit agent create: {e}")))?;
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -1093,9 +1258,10 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_agent_session_with_messages(
         &self,
-        s: &AgentSession,
+        s: &impl FullAgentSessionRow,
         messages: &[ReplaceMessage<'_>],
     ) -> Result<()> {
+        let s = s.full_row();
         let pool = self.write_pool();
         // Clone messages into owned data for the retry closure.
         let owned_messages: Vec<OwnedBatchMessage> = messages
@@ -1122,9 +1288,9 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
-            bind_session_insert(sqlx::query(&session_sql), s, false)?
+            bind_session_insert(sqlx::query(sqlx::AssertSqlSafe(session_sql.as_str())), s, false)?
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
@@ -1159,7 +1325,7 @@ impl Store {
                     UsageMessageOrigin::Agent => agent_messages += 1,
                     UsageMessageOrigin::Excluded => {}
                 }
-                sqlx::query(&insert_sql)
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql.as_str()))
                     .bind(&id)
                     .bind(&s.id.0)
                     .bind(i64::try_from(idx).unwrap_or(i64::MAX))
@@ -1214,17 +1380,23 @@ impl Store {
             Ok(())
         })
         .await;
-        lifecycle.finish(result)
+        lifecycle.finish(result).await
     }
 
     /// Fetch a session by id (with its message log), or `NotFound`.
     ///
+    /// This reads and hydrates EVERY `agent_message` row (tool payload bodies
+    /// included), so its cost grows with the conversation. Paths that only
+    /// need session columns use [`Store::get_agent_session_without_messages`]
+    /// (every column) or [`Store::get_agent_session_summary`] (no heavy
+    /// columns) instead.
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
-    pub async fn get_agent_session(&self, id: &AgentId) -> Result<AgentSession> {
+    pub async fn get_agent_session_with_transcript(&self, id: &AgentId) -> Result<AgentSession> {
         let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .fetch_optional(self.read_pool())
             .await
@@ -1239,19 +1411,43 @@ impl Store {
         }
     }
 
+    /// Every persisted session column (the heavy `system_prompt`,
+    /// `image_blocks` and `initial_message` included) WITHOUT the message
+    /// log (`messages` stays empty), or `NotFound` — the bounded
+    /// `agent.getSession` read, which serves a budgeted transcript page
+    /// instead of hydrating the whole log, and the per-turn session lookup
+    /// (`require_agent_session`), which needs `system_prompt` but never the
+    /// transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
+    pub async fn get_agent_session_without_messages(&self, id: &AgentId) -> Result<AgentSession> {
+        let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session WHERE id = ?");
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get agent session failed: {e}")))?;
+        match row {
+            Some(r) => map_session_row(&r),
+            None => Err(Error::NotFound(format!("agent session {id}"))),
+        }
+    }
+
     /// Metadata-only session lookup: the session row WITHOUT its message log
     /// (`messages` stays empty), or `NotFound` — the single-session shape of
     /// [`Store::list_agent_session_summaries`]. Used by paths that never read
     /// message bodies (`agent.get` `AgentLite` projection, workspace scope
     /// checks — monorepo#958), skipping the full transcript hydration that
-    /// `get_agent_session` performs.
+    /// `get_agent_session_with_transcript` performs.
     ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
-    pub async fn get_agent_session_summary(&self, id: &AgentId) -> Result<AgentSession> {
+    pub async fn get_agent_session_summary(&self, id: &AgentId) -> Result<AgentSessionSummary> {
         let sql = format!("SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .fetch_optional(self.read_pool())
             .await
@@ -1265,7 +1461,7 @@ impl Store {
     /// Batched status projection: the persisted [`AgentStatus`] of every id
     /// in `ids`, in ONE `IN`-list query (the `agent.getSubscriptions`
     /// `agentStatuses` map — intent-hq/monorepo#3018). Replaces a per-agent
-    /// `get_agent_session` loop that hydrated each agent's full message log
+    /// `get_agent_session_with_transcript` loop that hydrated each agent's full message log
     /// just to read `status`, so the caller stays at one statement and zero
     /// transcript bytes regardless of how many agents are present. Ids
     /// without a session row are simply absent from the result, and a row
@@ -1285,7 +1481,7 @@ impl Store {
         for chunk in ids.chunks(IDS_PER_STATEMENT) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!("SELECT id, status FROM agent_session WHERE id IN ({placeholders})");
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(&id.0);
             }
@@ -1375,8 +1571,8 @@ impl Store {
     /// Lightweight status-only lookup used by hot paths that just need the
     /// session's lifecycle status (e.g. the STAB-52 queue-drain gate). Selects
     /// a single column and skips the full message-log fetch that
-    /// `get_agent_session` performs. `NotFound` if the session is absent,
-    /// matching `get_agent_session`.
+    /// `get_agent_session_with_transcript` performs. `NotFound` if the session is absent,
+    /// matching `get_agent_session_with_transcript`.
     ///
     /// # Errors
     ///
@@ -1434,7 +1630,7 @@ impl Store {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql =
                 format!("SELECT id, updated_at FROM agent_session WHERE id IN ({placeholders})");
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(&id.0);
             }
@@ -1450,7 +1646,7 @@ impl Store {
 
     /// Lightweight name-only lookup used by hot paths that just need the
     /// session's display name (e.g. note-version author stamping). Skips the
-    /// full message-log fetch that `get_agent_session` performs.
+    /// full message-log fetch that `get_agent_session_with_transcript` performs.
     ///
     /// # Errors
     ///
@@ -1469,14 +1665,14 @@ impl Store {
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
-    pub async fn list_agent_sessions(
+    pub async fn list_agent_sessions_with_transcripts(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Vec<AgentSession>> {
         let sql = format!(
             "SELECT {SESSION_COLUMNS} FROM agent_session WHERE workspace_id = ? ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1503,11 +1699,11 @@ impl Store {
     pub async fn list_agent_session_summaries(
         &self,
         workspace_id: &WorkspaceId,
-    ) -> Result<Vec<AgentSession>> {
+    ) -> Result<Vec<AgentSessionSummary>> {
         let sql = format!(
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session WHERE workspace_id = ? ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1525,7 +1721,7 @@ impl Store {
     pub async fn list_agent_session_summaries_by_workspace(
         &self,
         workspace_ids: &[WorkspaceId],
-    ) -> Result<std::collections::HashMap<WorkspaceId, Vec<AgentSession>>> {
+    ) -> Result<std::collections::HashMap<WorkspaceId, Vec<AgentSessionSummary>>> {
         if workspace_ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -1534,7 +1730,7 @@ impl Store {
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
              WHERE workspace_id IN ({placeholders}) ORDER BY workspace_id, created_at"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
@@ -1562,12 +1758,12 @@ impl Store {
     pub async fn list_active_agent_session_summaries(
         &self,
         workspace_id: &WorkspaceId,
-    ) -> Result<Vec<AgentSession>> {
+    ) -> Result<Vec<AgentSessionSummary>> {
         let sql = format!(
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
              WHERE workspace_id = ? AND retired_at IS NULL ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1588,12 +1784,12 @@ impl Store {
     pub async fn list_retired_agent_session_summaries(
         &self,
         workspace_id: &WorkspaceId,
-    ) -> Result<Vec<AgentSession>> {
+    ) -> Result<Vec<AgentSessionSummary>> {
         let sql = format!(
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session \
              WHERE workspace_id = ? AND retired_at IS NOT NULL ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1642,10 +1838,10 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
         scope: &AgentListRowScope,
-    ) -> Result<Vec<AgentSession>> {
+    ) -> Result<Vec<AgentSessionSummary>> {
         let sql = scoped_session_summaries_sql(scope);
         let (_, extra_bind) = scope_predicate(scope);
-        let mut query = sqlx::query(&sql).bind(&workspace_id.0);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&workspace_id.0);
         if let Some(bind) = extra_bind {
             query = query.bind(bind);
         }
@@ -1701,7 +1897,7 @@ impl Store {
         workspace_id: &WorkspaceId,
     ) -> Result<AgentDelegatedCounts> {
         let sql = delegated_counts_sql();
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1861,7 +2057,7 @@ impl Store {
         extra_bind: Option<&str>,
     ) -> Result<std::collections::HashMap<String, SessionMessageProjection>> {
         let sql = session_message_projections_sql(filter);
-        let mut query = sqlx::query(&sql).bind(&workspace_id.0);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&workspace_id.0);
         if let Some(bind) = extra_bind {
             query = query.bind(bind);
         }
@@ -1965,7 +2161,7 @@ impl Store {
         workspace_id: &WorkspaceId,
     ) -> Result<bool> {
         let sql = unread_workspace_probe_sql();
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_one(self.read_pool())
             .await
@@ -1989,7 +2185,7 @@ impl Store {
         &self,
     ) -> Result<std::collections::HashSet<String>> {
         let sql = unread_workspaces_batch_sql();
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("batch workspace unread probe failed: {e}")))?;
@@ -2018,7 +2214,7 @@ impl Store {
              FROM agent_session INDEXED BY {UNREAD_TOP_LEVEL_SESSION_INDEX} \
              WHERE workspace_id IN ({placeholders}) AND {UNREAD_TOP_LEVEL_SESSION_PREDICATE}"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
@@ -2064,7 +2260,7 @@ impl Store {
                AND (json_type(s.metadata, '$.pendingQuestionsMessageId') IS NULL \
                     OR json_type(s.metadata, '$.pendingQuestionsMessageId') != 'text')"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
@@ -2385,10 +2581,10 @@ impl Store {
             })?;
             let res = match expected_model {
                 Some(expected) => {
-                    sqlx::query(&format!(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
                         "UPDATE agent_session SET resolved_model=? \
                          WHERE id=? AND workspace_id=? AND {NORMALIZED_MODEL_SQL} = ?"
-                    ))
+                    )))
                     .bind(resolved)
                     .bind(&id.0)
                     .bind(&workspace_id.0)
@@ -2397,10 +2593,10 @@ impl Store {
                     .await
                 }
                 None => {
-                    sqlx::query(&format!(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
                         "UPDATE agent_session SET resolved_model=? \
                          WHERE id=? AND workspace_id=? AND {NORMALIZED_MODEL_SQL} IS NULL"
-                    ))
+                    )))
                     .bind(resolved)
                     .bind(&id.0)
                     .bind(&workspace_id.0)
@@ -2645,10 +2841,43 @@ impl Store {
         Ok(())
     }
 
+    /// Metadata of the agent's newest `limit` identity-change system rows
+    /// (the same row set as [`Store::latest_agent_identity_notice`]),
+    /// newest first. The quota failover suppression walks a chain of
+    /// consecutive `provider_failover` hops back to the last committed turn
+    /// identity (PROTOCOL §5.54). Unparseable metadata rows are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn recent_agent_identity_notices(
+        &self,
+        agent_id: &AgentId,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT metadata FROM agent_message \
+             WHERE agent_id=? AND role='system' \
+               AND json_extract(metadata, '$.type') \
+                   IN ('model_changed', 'provider_rehomed', 'provider_failover', 'provider_returned') \
+             ORDER BY seq DESC LIMIT ?",
+        )
+        .bind(&agent_id.0)
+        .bind(i64::from(limit))
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("recent agent identity notices failed: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .flatten()
+            .filter_map(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+            .collect())
+    }
+
     /// Metadata of the agent's newest `role: "system"` transcript row that
-    /// records a spawn-identity change — a `model_changed` or a
-    /// `provider_rehomed` notice — or `None` when the transcript carries
-    /// neither. The model-change notice path reads it to tell a re-home's
+    /// records a spawn-identity change — a `model_changed`, a
+    /// `provider_rehomed`, a `provider_failover` or a `provider_returned`
+    /// notice — or `None` when the transcript carries none of them. The model-change notice path reads it to tell a re-home's
     /// deferred last-turn commit (the newest such row is the
     /// `provider_rehomed` notice for this very provider hop) from an
     /// ordinary switch, durably across spawn retries, later turns and
@@ -2666,7 +2895,8 @@ impl Store {
         let raw = sqlx::query_scalar::<_, Option<String>>(
             "SELECT metadata FROM agent_message \
              WHERE agent_id=? AND role='system' \
-               AND json_extract(metadata, '$.type') IN ('model_changed', 'provider_rehomed') \
+               AND json_extract(metadata, '$.type') \
+                   IN ('model_changed', 'provider_rehomed', 'provider_failover', 'provider_returned') \
              ORDER BY seq DESC LIMIT 1",
         )
         .bind(&agent_id.0)
@@ -2774,7 +3004,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_agent_sessions(&self) -> Result<Vec<AgentSession>> {
         let sql = format!("SELECT {SESSION_COLUMNS} FROM agent_session ORDER BY created_at");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list all agent sessions failed: {e}")))?;
@@ -2800,25 +3030,35 @@ impl Store {
     pub async fn update_agent_session(
         &self,
         workspace_id: &WorkspaceId,
-        s: &AgentSession,
+        s: &impl FullAgentSessionRow,
     ) -> Result<()> {
-        self.update_agent_session_with_preferences(workspace_id, s, false, None)
+        self.update_agent_session_with_preferences(workspace_id, s, false, None, None, false)
             .await
     }
 
-    /// Atomically update a session, optional manual specialist memory, and an
-    /// explicitly requested notification-mute patch. Ordinary row writes omit
-    /// the patch so stale session snapshots cannot revert the user's toggle.
+    /// Atomically update a session, optional manual specialist memory, and
+    /// explicitly requested notification-mute / sidebar-pin patches. Ordinary
+    /// row writes omit the patches so stale session snapshots cannot revert
+    /// the user's toggles.
+    /// `explicit_effort` marks the row's `reasoning_effort` as an explicit
+    /// choice: the same UPDATE clears the Auto-pin mark
+    /// (`reasoning_effort_auto`) even when the value is unchanged, so no
+    /// concurrent `agent.setModel` can slip between the value and the mark.
+    /// Otherwise an unchanged value keeps the mark and a changed one clears
+    /// it.
     ///
     /// # Errors
     /// Returns an error if validation or either write fails.
     pub async fn update_agent_session_with_preferences(
         &self,
         workspace_id: &WorkspaceId,
-        s: &AgentSession,
+        s: &impl FullAgentSessionRow,
         remember_specialist: bool,
         notifications_muted: Option<bool>,
+        pinned: Option<bool>,
+        explicit_effort: bool,
     ) -> Result<()> {
+        let s = s.full_row();
         let mut lifecycle = self.repository_lifecycle_write().await?;
         // Lightweight invariant check: read only workspace_id, model,
         // provider, acp_session_id (finding F3: no message fetch). Workspace
@@ -2879,7 +3119,8 @@ impl Store {
         // `notifications_muted` (0123) is excluded for the same reason: it is
         // a user toggle changed only by explicit scoped patches, so a
         // concurrent or long-lived in-memory session persisted here without
-        // such a patch can never revert the user's mute.
+        // such a patch can never revert the user's mute. `pinned` (0180) is
+        // the same kind of user toggle and is excluded on the same grounds.
         // The creation-only Assistant marker is monotonic: once absent or
         // invalidated, a stale full-row write cannot resurrect it. Evaluate
         // the stored value in this UPDATE, not in the earlier invariant read.
@@ -2899,8 +3140,8 @@ impl Store {
         if binding_changed {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(s.id.clone())])?;
         }
-        let metadata = encode_metadata(s.metadata.as_ref())?;
-        let mut tx = if remember_specialist || notifications_muted.is_some() {
+        let (metadata_raw, metadata_object) = whole_metadata_binds(s.metadata.as_ref())?;
+        let mut tx = if remember_specialist || notifications_muted.is_some() || pinned.is_some() {
             Some(
                 self.write_pool()
                     .begin()
@@ -2910,51 +3151,81 @@ impl Store {
         } else {
             None
         };
-        let query = sqlx::query(
+        // The daemon-owned keys (the manual-choice token and the return
+        // state, PROTOCOL §5.54) are owned by their dedicated writers: this
+        // whole-document write keeps the stored values and never takes them
+        // from `s`. The token is dropped when this write changes the
+        // selection (it named the old one). SQLite evaluates every SET
+        // expression on the old row, so `model` and `provider` here are the
+        // stored values.
+        let chief = |doc: &str| {
+            format!(
+                "CASE WHEN json_extract(metadata, '$.chiefPromptVersion') IS NULL \
+                 THEN json_remove({doc}, '$.chiefPromptVersion') ELSE {doc} END"
+            )
+        };
+        let metadata_sql = daemon_owned_preserving_metadata(
+            &chief("?"),
+            &chief("?"),
+            "model IS ? AND provider IS ?",
+        );
+        let sql = format!(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, file_blocks=?, \
-             is_background=?, metadata=CASE \
-                 WHEN json_extract(metadata, '$.chiefPromptVersion') IS NULL \
-                 THEN json_remove(?, '$.chiefPromptVersion') ELSE ? END, \
+             is_background=?, metadata={metadata_sql}, \
              sandbox_id=?, sandbox_path=?, sandbox_branch=?, \
-             stop_reason=?, stop_reason_timestamp=?, reasoning_effort=? \
-             WHERE id=? AND workspace_id=?",
-        )
-        .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
-        .bind(&s.acp_session_id)
-        .bind(&s.name)
-        .bind(i64::from(s.name_explicitly_set))
-        .bind(&s.model)
-        .bind(&s.provider)
-        .bind(enum_to_db(&s.status)?)
-        .bind(i64::from(s.is_active))
-        .bind(&s.system_prompt)
-        .bind(&s.updated_at)
-        .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
-        .bind(&s.specialist)
-        .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
-        .bind(i64::from(s.skip_auto_commit))
-        .bind(&s.completion_report)
-        .bind(&s.completion_report_timestamp)
-        .bind(s.delegation_depth)
-        .bind(&s.initial_message)
-        .bind(json_col_to_db(s.context_references.as_ref())?)
-        .bind(json_col_to_db(s.image_blocks.as_ref())?)
-        .bind(json_col_to_db(s.file_blocks.as_ref())?)
-        .bind(i64::from(s.is_background))
-        .bind(&metadata)
-        .bind(&metadata)
-        .bind(&s.sandbox_id)
-        .bind(&s.sandbox_path)
-        .bind(&s.sandbox_branch)
-        .bind(&s.stop_reason)
-        .bind(&s.stop_reason_timestamp)
-        .bind(&s.reasoning_effort)
-        .bind(&s.id.0)
-        .bind(&workspace_id.0);
+             stop_reason=?, stop_reason_timestamp=?, \
+             reasoning_effort_auto=CASE WHEN ? THEN 0 WHEN reasoning_effort IS ? \
+                 THEN reasoning_effort_auto ELSE 0 END, \
+             reasoning_effort=? \
+             WHERE id=? AND workspace_id=?"
+        );
+        let query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
+            .bind(&s.acp_session_id)
+            .bind(&s.name)
+            .bind(i64::from(s.name_explicitly_set))
+            .bind(&s.model)
+            .bind(&s.provider)
+            .bind(enum_to_db(&s.status)?)
+            .bind(i64::from(s.is_active))
+            .bind(&s.system_prompt)
+            .bind(&s.updated_at)
+            .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
+            .bind(&s.specialist)
+            .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
+            .bind(i64::from(s.skip_auto_commit))
+            .bind(&s.completion_report)
+            .bind(&s.completion_report_timestamp)
+            .bind(s.delegation_depth)
+            .bind(&s.initial_message)
+            .bind(json_col_to_db(s.context_references.as_ref())?)
+            .bind(json_col_to_db(s.image_blocks.as_ref())?)
+            .bind(json_col_to_db(s.file_blocks.as_ref())?)
+            .bind(i64::from(s.is_background))
+            // The object document (twice, in `chief`), keep_choice_if (stored
+            // selection unchanged), then the raw document (twice).
+            .bind(&metadata_object)
+            .bind(&metadata_object)
+            .bind(&s.model)
+            .bind(&s.provider)
+            .bind(&metadata_raw)
+            .bind(&metadata_raw)
+            .bind(&s.sandbox_id)
+            .bind(&s.sandbox_path)
+            .bind(&s.sandbox_branch)
+            .bind(&s.stop_reason)
+            .bind(&s.stop_reason_timestamp)
+            // An explicit effort write, or any effort change, clears the daemon's
+            // Auto-pin flag; an unrelated rewrite of the same value keeps it.
+            .bind(explicit_effort)
+            .bind(&s.reasoning_effort)
+            .bind(&s.reasoning_effort)
+            .bind(&s.id.0)
+            .bind(&workspace_id.0);
         let rows = match tx.as_mut() {
             Some(tx) => query.execute(&mut **tx).await,
             None => query.execute(self.write_pool()).await,
@@ -2965,18 +3236,20 @@ impl Store {
             return Err(Error::NotFound(format!("agent session {}", s.id)));
         }
         if let Some(mut tx) = tx {
-            if let Some(muted) = notifications_muted {
-                sqlx::query(
-                    "UPDATE agent_session SET notifications_muted=? \
-                     WHERE id=? AND workspace_id=? AND notifications_muted != ?",
-                )
-                .bind(i64::from(muted))
-                .bind(&s.id.0)
-                .bind(&workspace_id.0)
-                .bind(i64::from(muted))
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("set notifications muted failed: {e}")))?;
+            for (column, value) in [
+                (SessionPreference::NotificationsMuted, notifications_muted),
+                (SessionPreference::Pinned, pinned),
+            ] {
+                if let Some(value) = value {
+                    sqlx::query(column.update_sql())
+                        .bind(i64::from(value))
+                        .bind(&s.id.0)
+                        .bind(&workspace_id.0)
+                        .bind(i64::from(value))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| Error::Internal(format!("{} failed: {e}", column.label())))?;
+                }
             }
             if remember_specialist {
                 crate::settings_repo::remember_agent_specialist(&mut tx, s).await?;
@@ -2985,7 +3258,7 @@ impl Store {
                 .await
                 .map_err(|e| Error::Internal(format!("commit agent update: {e}")))?;
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -3010,18 +3283,51 @@ impl Store {
         id: &AgentId,
         muted: bool,
     ) -> Result<bool> {
-        let rows = sqlx::query(
-            "UPDATE agent_session SET notifications_muted=? \
-             WHERE id=? AND workspace_id=? AND notifications_muted != ?",
+        self.set_agent_session_preference(
+            workspace_id,
+            id,
+            SessionPreference::NotificationsMuted,
+            muted,
         )
-        .bind(i64::from(muted))
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .bind(i64::from(muted))
-        .execute(self.write_pool())
         .await
-        .map_err(|e| Error::Internal(format!("set notifications muted failed: {e}")))?
-        .rows_affected();
+    }
+
+    /// Set the session's sidebar `pinned` flag (0180) — the store side of
+    /// `agent.update { pinned }`. Same contract as
+    /// [`Store::set_agent_notifications_muted`]: returns `true` when the
+    /// stored value changed, never advances the activity timestamp, and is
+    /// (with explicit patches in mixed updates) the only writer of the column.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn set_agent_pinned(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        pinned: bool,
+    ) -> Result<bool> {
+        self.set_agent_session_preference(workspace_id, id, SessionPreference::Pinned, pinned)
+            .await
+    }
+
+    /// Narrow writer shared by the per-session user-preference flags.
+    async fn set_agent_session_preference(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        preference: SessionPreference,
+        value: bool,
+    ) -> Result<bool> {
+        let rows = sqlx::query(preference.update_sql())
+            .bind(i64::from(value))
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .bind(i64::from(value))
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("{} failed: {e}", preference.label())))?
+            .rows_affected();
         if rows == 0 {
             let exists = sqlx::query_scalar::<_, String>(
                 "SELECT id FROM agent_session WHERE id=? AND workspace_id=?",
@@ -3061,6 +3367,29 @@ impl Store {
         provider: Option<&str>,
         updated_at: &str,
     ) -> Result<()> {
+        self.set_agent_session_model_choice(workspace_id, id, model, provider, None, updated_at)
+            .await
+    }
+
+    /// [`Store::set_agent_session_model`] that also records whether the
+    /// write is a manual choice (PROTOCOL §5.54 shared quota state): `Some`
+    /// stores `manual_choice` (a fresh unique token) under
+    /// [`MANUAL_CHOICE_METADATA_KEY`] in the SAME statement as the model and
+    /// provider, `None` removes the key. A reader therefore always sees the
+    /// token of exactly the write that set the selection it read.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn set_agent_session_model_choice(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        model: &str,
+        provider: Option<&str>,
+        manual_choice: Option<&str>,
+        updated_at: &str,
+    ) -> Result<()> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         let current = self.get_agent_session_summary(id).await?;
         if current.workspace_id == *workspace_id
@@ -3068,15 +3397,40 @@ impl Store {
         {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
         }
+        // A level the daemon pinned from Auto (`reasoning_effort_auto`)
+        // belongs to the old model's default: a real model change resets it
+        // to Auto, so the new model's default applies (and is re-pinned at
+        // the next confirmed turn). A level someone chose is kept.
         let rows = sqlx::query(
-            "UPDATE agent_session SET model=?, provider=?, updated_at=? \
-             WHERE id=? AND workspace_id=?",
+            "UPDATE agent_session SET \
+               reasoning_effort = CASE WHEN reasoning_effort_auto = 1 AND model IS NOT ?1 \
+                                       THEN NULL ELSE reasoning_effort END, \
+               reasoning_effort_auto = CASE WHEN reasoning_effort_auto = 1 AND model IS NOT ?1 \
+                                            THEN 0 ELSE reasoning_effort_auto END, \
+               model=?1, provider=?2, updated_at=?3, \
+               metadata = CASE \
+                   WHEN ?6 IS NOT NULL THEN json_set(\
+                       CASE \
+                           WHEN metadata IS NULL THEN '{}' \
+                           WHEN json_type(metadata) = 'object' THEN metadata \
+                           ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                       END, \
+                       '$.' || ?7, ?6) \
+                   WHEN metadata IS NOT NULL AND json_valid(metadata) \
+                        AND json_type(metadata) = 'object' \
+                        AND json_type(metadata, '$.' || ?7) IS NOT NULL \
+                       THEN json_remove(metadata, '$.' || ?7) \
+                   ELSE metadata \
+               END \
+             WHERE id=?4 AND workspace_id=?5",
         )
         .bind(model)
         .bind(provider)
         .bind(updated_at)
         .bind(&id.0)
         .bind(&workspace_id.0)
+        .bind(manual_choice)
+        .bind(MANUAL_CHOICE_METADATA_KEY)
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("set agent session model failed: {e}")))?
@@ -3084,7 +3438,7 @@ impl Store {
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -3127,7 +3481,8 @@ impl Store {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
         }
         let rows = sqlx::query(
-            "UPDATE agent_session SET provider=?, model=?, reasoning_effort=NULL, updated_at=? \
+            "UPDATE agent_session SET provider=?, model=?, reasoning_effort=NULL, \
+             reasoning_effort_auto=0, updated_at=? \
              WHERE id=? AND workspace_id=? AND provider IS ?",
         )
         .bind(provider)
@@ -3141,7 +3496,7 @@ impl Store {
         .map_err(|e| Error::Internal(format!("rehome agent session provider failed: {e}")))?
         .rows_affected();
         if rows > 0 {
-            lifecycle.settle();
+            lifecycle.settle_after_retirement().await?;
             return Ok(true);
         }
         let exists = sqlx::query_scalar::<_, i64>(
@@ -3155,8 +3510,357 @@ impl Store {
         if exists == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(false)
+    }
+
+    /// Move a session onto a backup provider profile after a quota failure
+    /// (PROTOCOL §5.54 Backup failover): a narrow write of `provider` and
+    /// `updated_at`, plus — when `metadata_key` is `Some((key, json))` —
+    /// that one `metadata` key, in the same statement. The model id and reasoning effort carry over
+    /// unchanged — a backup is a profile of the same base provider, so the
+    /// write is what `agent.setModel` with the same model would persist.
+    /// Like [`Store::rehome_agent_session_provider`] it may change `provider`
+    /// after first real use, and it is a compare-and-set on the `provider`
+    /// and `model` columns: a concurrent `agent.setModel` that moved the
+    /// session — to another provider, or to another model on the same one —
+    /// between the caller's read and this write is never overwritten
+    /// (`Ok(false)`, nothing mutated), so the notice and `agent:updated`
+    /// never name a stale model. With `yield_to_manual_choice` the write
+    /// also requires that no manual choice token
+    /// ([`MANUAL_CHOICE_METADATA_KEY`]) is pending: an automatic move made
+    /// ahead of a turn never overrides a choice the user just saved, even
+    /// one of the same model and provider. Scoped to `workspace_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn failover_agent_session_provider(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        expected_provider: &str,
+        expected_model: Option<&str>,
+        provider: &str,
+        metadata_key: Option<(&str, &str)>,
+        yield_to_manual_choice: bool,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let current = self.get_agent_session_summary(id).await?;
+        if current.workspace_id == *workspace_id
+            && current.provider.as_deref() == Some(expected_provider)
+            && current.model.as_deref() == expected_model
+            && expected_provider != provider
+        {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
+        }
+        // The optional metadata key (a JSON value) lands in the SAME
+        // statement, so the provider move and its bookkeeping are atomic:
+        // a concurrent writer can never observe one without the other.
+        let (key, value) = metadata_key.unzip();
+        // Landing also drops a pending manual-choice token: the selection it
+        // was written with is no longer the session's.
+        let rows = sqlx::query(
+            "UPDATE agent_session SET provider=?1, \
+             metadata = CASE \
+                 WHEN ?2 IS NULL THEN CASE \
+                     WHEN metadata IS NOT NULL AND json_valid(metadata) \
+                          AND json_type(metadata) = 'object' \
+                          AND json_type(metadata, '$.' || ?10) IS NOT NULL \
+                         THEN json_remove(metadata, '$.' || ?10) \
+                     ELSE metadata END \
+                 ELSE json_set(json_remove(\
+                     CASE \
+                         WHEN metadata IS NULL THEN '{}' \
+                         WHEN json_type(metadata) = 'object' THEN metadata \
+                         ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                     END, '$.' || ?10), \
+                     '$.' || ?2, json(?3)) END, \
+             updated_at=?4 \
+             WHERE id=?5 AND workspace_id=?6 AND provider=?7 AND model IS ?8 \
+               AND (?9 = 0 OR metadata IS NULL OR NOT json_valid(metadata) \
+                    OR json_type(metadata) != 'object' \
+                    OR json_type(metadata, '$.' || ?10) IS NULL)",
+        )
+        .bind(provider)
+        .bind(key)
+        .bind(value)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(expected_provider)
+        .bind(expected_model)
+        .bind(i64::from(yield_to_manual_choice))
+        .bind(MANUAL_CHOICE_METADATA_KEY)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("failover agent session provider failed: {e}")))?
+        .rows_affected();
+        if rows > 0 {
+            lifecycle.settle_after_retirement().await?;
+            return Ok(true);
+        }
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_session WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("failover agent session provider failed: {e}")))?;
+        if exists == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        lifecycle.settle_after_retirement().await?;
+        Ok(false)
+    }
+
+    /// Remove the pending manual choice token ([`MANUAL_CHOICE_METADATA_KEY`])
+    /// only while it is still `token` (compare-and-clear): a newer manual
+    /// choice, which wrote a different token, is never cleared by a reader
+    /// that saw an older one. `Ok(false)` when the token differs or the
+    /// session is absent. `updated_at` is not touched (internal bookkeeping).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn take_agent_session_manual_choice(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        token: &str,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET metadata = json_remove(metadata, '$.' || ?1) \
+             WHERE id = ?2 AND workspace_id = ?3 AND metadata IS NOT NULL \
+               AND json_valid(metadata) AND json_type(metadata) = 'object' \
+               AND json_extract(metadata, '$.' || ?1) = ?4",
+        )
+        .bind(MANUAL_CHOICE_METADATA_KEY)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(token)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("take manual choice failed: {e}")))?
+        .rows_affected();
+        Ok(rows > 0)
+    }
+
+    /// Set one JSON `metadata` key only while the session still carries
+    /// `expected_provider` and `expected_model` (compare-and-set): daemon
+    /// bookkeeping tied to an identity it observed never lands after a
+    /// concurrent `agent.setModel` moved the session. `Ok(false)` on a
+    /// mismatch; `NotFound` when the session is absent. `key` must be a
+    /// trusted constant. With `yield_to_manual_choice` the write also does
+    /// not land while a manual choice token ([`MANUAL_CHOICE_METADATA_KEY`])
+    /// is pending: the caller's read predates that choice, whose selection
+    /// can equal the one it read.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn set_agent_session_metadata_key_json_if_identity(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        expected_provider: &str,
+        expected_model: Option<&str>,
+        key: &str,
+        value: &str,
+        yield_to_manual_choice: bool,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET \
+             metadata = json_set(\
+                 CASE \
+                     WHEN metadata IS NULL THEN '{}' \
+                     WHEN json_type(metadata) = 'object' THEN metadata \
+                     ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                 END, \
+                 '$.' || ?, json(?)), \
+             updated_at = ? \
+             WHERE id = ? AND workspace_id = ? AND provider = ? AND model IS ? \
+               AND (? = 0 OR metadata IS NULL OR NOT json_valid(metadata) \
+                    OR json_type(metadata) != 'object' \
+                    OR json_type(metadata, '$.' || ?) IS NULL)",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(expected_provider)
+        .bind(expected_model)
+        .bind(i64::from(yield_to_manual_choice))
+        .bind(MANUAL_CHOICE_METADATA_KEY)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("guarded session metadata write failed: {e}")))?
+        .rows_affected();
+        if rows > 0 {
+            return Ok(true);
+        }
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_session WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("guarded session metadata write failed: {e}")))?;
+        if exists == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(false)
+    }
+
+    /// Pin the provider of a legacy session — one whose `provider` column is
+    /// NULL or blank — at turn start. Every create pins its provider, so a
+    /// NULL column only survives on rows written before that rule; pinning it
+    /// stops the session from following later `model.defaultProvider`
+    /// changes. A narrow write of `provider` and `updated_at` only, and a
+    /// compare-and-set on the column still being NULL/blank: a concurrent
+    /// `agent.setModel` that pinned a provider first wins and the call
+    /// returns `Ok(false)` without mutating anything. Scoped to
+    /// `workspace_id` (defense-in-depth).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn pin_agent_session_provider_if_null(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        provider: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        // No lifecycle invalidation: the pinned provider is the one the
+        // session already resolves to (its last turn's, else the current
+        // default), so its repository bindings stay valid.
+        let lifecycle = self.repository_lifecycle_write().await?;
+        let current = self.get_agent_session_summary(id).await?;
+        let rows = sqlx::query(
+            "UPDATE agent_session SET provider=?, updated_at=? \
+             WHERE id=? AND workspace_id=? AND (provider IS NULL OR provider='')",
+        )
+        .bind(provider)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("pin agent session provider failed: {e}")))?
+        .rows_affected();
+        lifecycle.settle_after_retirement().await?;
+        if rows == 0 && current.workspace_id != *workspace_id {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(rows > 0)
+    }
+
+    /// Fill a session's `model` / `reasoning_effort` from the identity a turn
+    /// actually ran under, only where the column is still NULL or blank (a
+    /// legacy row, or a create that could not resolve them up front — a cold
+    /// catalog cache, or an effort left to the provider). Values already set
+    /// are never overwritten, so an `agent.setModel` / effort change racing
+    /// the commit wins. `None` arguments leave their column alone. A filled
+    /// effort is the provider's level for an Auto session, so it sets
+    /// `reasoning_effort_auto` (reset on the next real model change by
+    /// [`Store::set_agent_session_model`]). Returns whether any column
+    /// changed. Scoped to `workspace_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn fill_agent_session_identity_if_null(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let model = model.filter(|m| !m.trim().is_empty());
+        let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
+        if model.is_none() && reasoning_effort.is_none() {
+            return Ok(false);
+        }
+        // No lifecycle invalidation: the filled values are the ones the
+        // running provider already reports, so nothing the session's
+        // repository bindings depend on changes.
+        let lifecycle = self.repository_lifecycle_write().await?;
+        let rows = sqlx::query(
+            "UPDATE agent_session SET \
+               model = CASE WHEN (model IS NULL OR model='') AND ?1 IS NOT NULL \
+                            THEN ?1 ELSE model END, \
+               reasoning_effort_auto = CASE WHEN (reasoning_effort IS NULL OR reasoning_effort='') \
+                                        AND ?2 IS NOT NULL THEN 1 ELSE reasoning_effort_auto END, \
+               reasoning_effort = CASE WHEN (reasoning_effort IS NULL OR reasoning_effort='') \
+                                        AND ?2 IS NOT NULL THEN ?2 ELSE reasoning_effort END, \
+               updated_at = ?3 \
+             WHERE id=?4 AND workspace_id=?5 AND ( \
+               ((model IS NULL OR model='') AND ?1 IS NOT NULL) OR \
+               ((reasoning_effort IS NULL OR reasoning_effort='') AND ?2 IS NOT NULL))",
+        )
+        .bind(model)
+        .bind(reasoning_effort)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("fill agent session identity failed: {e}")))?
+        .rows_affected();
+        lifecycle.settle_after_retirement().await?;
+        Ok(rows > 0)
+    }
+
+    /// Fill a NULL/blank `reasoning_effort` with the level the provider
+    /// confirmed for a turn, marked Auto-pinned (`reasoning_effort_auto`),
+    /// only while the row still carries the provider and model that turn
+    /// started with (`expected_*`, `None` matching NULL). A concurrent
+    /// `agent.setModel` / provider change that landed first therefore never
+    /// inherits the old identity's level. Returns whether the fill landed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn fill_agent_session_effort_if_identity(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        effort: &str,
+        expected_provider: Option<&str>,
+        expected_model: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        if effort.trim().is_empty() {
+            return Ok(false);
+        }
+        let lifecycle = self.repository_lifecycle_write().await?;
+        let rows = sqlx::query(
+            "UPDATE agent_session SET reasoning_effort=?, reasoning_effort_auto=1, updated_at=? \
+             WHERE id=? AND workspace_id=? \
+               AND (reasoning_effort IS NULL OR TRIM(reasoning_effort)='') \
+               AND provider IS ? AND model IS ?",
+        )
+        .bind(effort)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(expected_provider)
+        .bind(expected_model)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("fill agent session effort failed: {e}")))?
+        .rows_affected();
+        lifecycle.settle_after_retirement().await?;
+        Ok(rows > 0)
     }
 
     /// Persist the assembled system prompt (the spawn path): a narrow write
@@ -3216,17 +3920,24 @@ impl Store {
         metadata: Option<&serde_json::Value>,
         updated_at: &str,
     ) -> Result<()> {
-        let rows = sqlx::query(
-            "UPDATE agent_session SET metadata=?, updated_at=? WHERE id=? AND workspace_id=?",
-        )
-        .bind(encode_metadata(metadata)?)
-        .bind(updated_at)
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("update agent session metadata failed: {e}")))?
-        .rows_affected();
+        // The daemon-owned keys are kept as stored (see
+        // `daemon_owned_preserving_metadata`): a caller's snapshot never
+        // erases or restores them.
+        let sql = format!(
+            "UPDATE agent_session SET metadata={}, updated_at=? WHERE id=? AND workspace_id=?",
+            daemon_owned_preserving_metadata("?", "?", "1")
+        );
+        let (metadata_raw, metadata_object) = whole_metadata_binds(metadata)?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(&metadata_object)
+            .bind(&metadata_raw)
+            .bind(updated_at)
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("update agent session metadata failed: {e}")))?
+            .rows_affected();
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
@@ -3313,6 +4024,56 @@ impl Store {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
         Ok(true)
+    }
+
+    /// Atomically read and remove one string-valued session metadata key:
+    /// `Ok(Some(value))` for exactly one caller per stored value (the removal
+    /// is CAS-guarded on the value just read, so two racing takers never both
+    /// get it), `Ok(None)` when the key is absent, not a string, or was taken
+    /// concurrently, or the session does not exist. `updated_at` is left
+    /// untouched (bookkeeping, not activity). `key` must be a trusted
+    /// compile-time constant.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn take_agent_session_metadata_key(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let value: Option<String> = sqlx::query_scalar(
+            "SELECT json_extract(metadata, '$.' || ?) FROM agent_session \
+             WHERE id = ? AND workspace_id = ? AND json_valid(metadata) \
+               AND json_type(metadata, '$.' || ?) = 'text'",
+        )
+        .bind(key)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(key)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("read agent session metadata key failed: {e}")))?
+        .flatten();
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let rows = sqlx::query(
+            "UPDATE agent_session SET metadata = json_remove(metadata, '$.' || ?) \
+             WHERE id = ? AND workspace_id = ? AND json_valid(metadata) \
+               AND json_extract(metadata, '$.' || ?) = ?",
+        )
+        .bind(key)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(key)
+        .bind(&value)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("take agent session metadata key failed: {e}")))?
+        .rows_affected();
+        Ok((rows > 0).then_some(value))
     }
 
     /// [`Store::set_agent_session_metadata_key`] for a JSON-typed value:
@@ -3523,7 +4284,7 @@ impl Store {
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -3617,10 +4378,10 @@ impl Store {
         } else {
             "retired_at IS NOT NULL"
         };
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE agent_session SET retired_at=?, updated_at=? \
              WHERE id=? AND workspace_id=? AND {guard}"
-        ))
+        )))
         .bind(retired_at)
         .bind(updated_at)
         .bind(&id.0)
@@ -3629,7 +4390,7 @@ impl Store {
         .await
         .map_err(|e| Error::Internal(format!("set agent session retired_at failed: {e}")))?
         .rows_affected();
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(rows > 0)
     }
 
@@ -3650,7 +4411,7 @@ impl Store {
         updated_at: &str,
     ) -> Result<bool> {
         // Conditional UPDATE: only modify rows where completion_report IS NOT NULL.
-        // This avoids the expensive get_agent_session call (which loads the full
+        // This avoids the expensive get_agent_session_with_transcript call (which loads the full
         // message log) at the start of every turn. rows_affected tells us whether
         // a report was present and cleared.
         let rows = sqlx::query(
@@ -3894,7 +4655,7 @@ impl Store {
         acp_session_id: &str,
     ) -> Result<()> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
-        let current = self.get_agent_session(id).await?;
+        let current = self.get_agent_session_summary(id).await?;
         if current.workspace_id != *workspace_id {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
@@ -3911,7 +4672,7 @@ impl Store {
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("set acp session id failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -3945,7 +4706,7 @@ impl Store {
         expected_old: &str,
         new_acp_session_id: &str,
     ) -> Result<String> {
-        let current = self.get_agent_session(id).await?;
+        let current = self.get_agent_session_summary(id).await?;
         if current.workspace_id != *workspace_id {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
@@ -4027,7 +4788,7 @@ impl Store {
             "replace acp session id commit failed",
         )
         .await;
-        lifecycle.finish(result)
+        lifecycle.finish(result).await
     }
 
     /// Shared transaction body; the caller owns serialization and commit/rollback.
@@ -4148,7 +4909,7 @@ impl Store {
             .await
     }
 
-    /// Only for workspace deletion after its bounded recovery sweep has
+    /// Only for workspace deletion after its recovery and desktop sweeps have
     /// completed, with workspace writers stopped. Keep ownership checks and
     /// all other child sweeps identical to standalone agent deletion.
     pub(super) async fn delete_workspace_agent_session(
@@ -4164,12 +4925,16 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
         id: &AgentId,
-        cleanup_recovery: bool,
+        cleanup_scope: bool,
     ) -> Result<bool> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         // Confirm the session exists under THIS workspace before touching any
         // children — the pre-delete statements are keyed by agent id alone, so
         // a mismatched workspace id must remain a no-op exactly like before.
+        // Not retried: this runs under lifecycle serialization, and a failure
+        // here has no side effects. The sweep steps after
+        // `release_serialization` run in the busy-retry window instead, so a
+        // saturated writer cannot fail the delete half-way (intent-hq/intent#7705).
         let exists: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM agent_session WHERE id = ? AND workspace_id = ?")
                 .bind(&id.0)
@@ -4204,23 +4969,57 @@ impl Store {
         }
         // Recovery history has no FK cascade. There is at most one row per
         // agent; require both owners so inconsistent metadata is not erased.
-        if cleanup_recovery {
-            sqlx::query("DELETE FROM interrupted_agent WHERE agent_id = ? AND workspace_id = ?")
+        if cleanup_scope {
+            crate::with_write_txn_retry(|| async {
+                sqlx::query("DELETE FROM interrupted_agent WHERE agent_id = ? AND workspace_id = ?")
+                    .bind(&id.0)
+                    .bind(&workspace_id.0)
+                    .execute(self.write_pool())
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("delete agent recovery history failed: {e}"))
+                    })
+            })
+            .await?;
+        }
+        if !cleanup_scope {
+            // Workspace teardown already removed private desktop state before
+            // any session deletion, with runtime writers stopped. Keep this
+            // path batch-aware instead of opening a scope transaction per agent.
+            let result = crate::with_write_txn_retry(|| async {
+                sqlx::query(DELETE_AGENT_SESSION_SQL)
+                    .bind(&id.0)
+                    .bind(&workspace_id.0)
+                    .execute(self.write_pool())
+                    .await
+                    .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))
+            })
+            .await?;
+            lifecycle.settle_after_retirement().await?;
+            return Ok(result.rows_affected() > 0);
+        }
+        // The private desktop scope and the session row go in one transaction;
+        // a busy or saturated writer retries the whole transaction (#7705).
+        let result = crate::with_write_txn_retry(|| async {
+            let mut tx = self
+                .write_pool()
+                .begin()
+                .await
+                .map_err(|e| Error::Internal(format!("delete agent transaction: {e}")))?;
+            crate::desktop_repo::delete_desktop_scope(&mut tx, workspace_id, Some(id)).await?;
+            let result = sqlx::query(DELETE_AGENT_SESSION_SQL)
                 .bind(&id.0)
                 .bind(&workspace_id.0)
-                .execute(self.write_pool())
+                .execute(&mut *tx)
                 .await
-                .map_err(|e| {
-                    Error::Internal(format!("delete agent recovery history failed: {e}"))
-                })?;
-        }
-        let result = sqlx::query(DELETE_AGENT_SESSION_SQL)
-            .bind(&id.0)
-            .bind(&workspace_id.0)
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))?;
-        lifecycle.settle();
+                .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))?;
+            tx.commit()
+                .await
+                .map_err(|e| Error::Internal(format!("delete agent commit: {e}")))?;
+            Ok(result)
+        })
+        .await?;
+        lifecycle.settle_after_retirement().await?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -4274,6 +5073,13 @@ const DELETE_MESSAGE_BATCH_SQL: &str = "DELETE FROM agent_message WHERE rowid IN
 /// implicit write transaction, and the yield between batches lets other
 /// writers queued on the pool interleave. Returns the number of non-empty
 /// batches executed.
+///
+/// Each batch runs in the busy-retry window ([`crate::with_write_txn_retry`]),
+/// so a write-pool acquire timeout or `SQLITE_BUSY` while another writer holds
+/// the single connection is waited out instead of failing the whole sweep
+/// (intent-hq/intent#7705). A retry is safe: a timed-out acquire ran nothing,
+/// a busy statement rolled back, and a batch only removes up to `batch`
+/// matching rows.
 pub(crate) async fn delete_in_bounded_batches(
     pool: &crate::StorePool,
     sql: &str,
@@ -4282,13 +5088,16 @@ pub(crate) async fn delete_in_bounded_batches(
 ) -> Result<u64> {
     let mut batches = 0u64;
     loop {
-        let removed = sqlx::query(sql)
-            .bind(scope_id)
-            .bind(batch)
-            .execute(pool)
-            .await
-            .map_err(|e| Error::Internal(format!("batched cascade delete failed: {e}")))?
-            .rows_affected();
+        let removed = crate::with_write_txn_retry(|| async {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(scope_id)
+                .bind(batch)
+                .execute(pool)
+                .await
+                .map_err(|e| Error::Internal(format!("batched cascade delete failed: {e}")))
+        })
+        .await?
+        .rows_affected();
         if removed > 0 {
             batches += 1;
         }
@@ -4308,8 +5117,8 @@ fn map_session_row(row: &SqliteRow) -> Result<AgentSession> {
     )
 }
 
-pub(crate) fn map_session_summary_row(row: &SqliteRow) -> Result<AgentSession> {
-    map_session_row_with_heavy_cols(row, None, None, None)
+pub(crate) fn map_session_summary_row(row: &SqliteRow) -> Result<AgentSessionSummary> {
+    map_session_row_with_heavy_cols(row, None, None, None).map(AgentSessionSummary::from_session)
 }
 
 fn map_session_row_with_heavy_cols(
@@ -4374,6 +5183,7 @@ fn map_session_row_with_heavy_cols(
         pending_delete_at: None,
         retired_at: col(row, "retired_at")?,
         notifications_muted: col::<i64>(row, "notifications_muted")? != 0,
+        pinned: col::<i64>(row, "pinned")? != 0,
         harness_version: col(row, "harness_version")?,
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
@@ -4644,6 +5454,41 @@ const MESSAGE_FTS_TEXT_SQL: &str = "CASE \
           WHERE json_type(m.content, je.fullkey || '.text') = 'text'), '') \
     ELSE json(m.content) END";
 
+/// Rebuild `agent_message_fts` (0074) and `agent_message_search_ctx` (0112)
+/// from `agent_message` on `conn`, which must already be inside a write
+/// transaction: delete-all, then re-insert every user/assistant row keyed by
+/// its current rowid. Shared by [`Store::rebuild_agent_message_fts`] and the
+/// offline derived-index repair (`crate::derived_index`).
+pub(crate) async fn rebuild_agent_message_search(conn: &mut sqlx::SqliteConnection) -> Result<()> {
+    sqlx::query("INSERT INTO agent_message_fts(agent_message_fts) VALUES('delete-all')")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("fts rebuild delete-all failed: {e}")))?;
+    let backfill = format!(
+        "INSERT INTO agent_message_fts(rowid, text) \
+         SELECT m.rowid, {MESSAGE_FTS_TEXT_SQL} FROM agent_message m \
+         WHERE m.role IN ('user', 'assistant')"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(backfill.as_str()))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("fts rebuild backfill failed: {e}")))?;
+    sqlx::query("DELETE FROM agent_message_search_ctx")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("search ctx rebuild clear failed: {e}")))?;
+    sqlx::query(
+        "INSERT INTO agent_message_search_ctx(message_rowid, agent_id, workspace_id, role) \
+         SELECT m.rowid, m.agent_id, s.workspace_id, m.role \
+         FROM agent_message m JOIN agent_session s ON s.id = m.agent_id \
+         WHERE m.role IN ('user', 'assistant')",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| Error::Internal(format!("search ctx rebuild backfill failed: {e}")))?;
+    Ok(())
+}
+
 /// `search.messages` `preferWorkspaceId` ranking boost, in bm25 units,
 /// subtracted from the bm25 rank (lower = better) of matches owned by the
 /// preferred workspace. Large enough to lift a preferred-workspace match above
@@ -4695,32 +5540,7 @@ impl Store {
                 .begin()
                 .await
                 .map_err(|e| Error::Internal(format!("fts rebuild begin failed: {e}")))?;
-            sqlx::query("INSERT INTO agent_message_fts(agent_message_fts) VALUES('delete-all')")
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("fts rebuild delete-all failed: {e}")))?;
-            let backfill = format!(
-                "INSERT INTO agent_message_fts(rowid, text) \
-                 SELECT m.rowid, {MESSAGE_FTS_TEXT_SQL} FROM agent_message m \
-                 WHERE m.role IN ('user', 'assistant')"
-            );
-            sqlx::query(&backfill)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("fts rebuild backfill failed: {e}")))?;
-            sqlx::query("DELETE FROM agent_message_search_ctx")
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("search ctx rebuild clear failed: {e}")))?;
-            sqlx::query(
-                "INSERT INTO agent_message_search_ctx(message_rowid, agent_id, workspace_id, role) \
-                 SELECT m.rowid, m.agent_id, s.workspace_id, m.role \
-                 FROM agent_message m JOIN agent_session s ON s.id = m.agent_id \
-                 WHERE m.role IN ('user', 'assistant')",
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| Error::Internal(format!("search ctx rebuild backfill failed: {e}")))?;
+            rebuild_agent_message_search(&mut tx).await?;
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("fts rebuild commit failed: {e}")))?;
@@ -4805,7 +5625,7 @@ impl Store {
     ) -> Result<Vec<MessageFtsMatch>> {
         let sql =
             search_messages_fts_sql(workspace_id.is_some(), agent_id.is_some(), role.is_some());
-        let mut query = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(prefer_workspace_id.map(|w| w.0.as_str()))
             .bind(PREFER_WORKSPACE_BOOST)
             .bind(ARCHIVED_WORKSPACE_PENALTY)
@@ -5007,6 +5827,15 @@ impl Store {
         let Some(row) = row else {
             return Ok(None);
         };
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut tx = self
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::Internal(format!("prestage message payload begin failed: {e}")))?;
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::MonitorHistory(
+            agent_id.clone(),
+        )])?;
         sqlx::query(PAYLOAD_UPSERT_SQL)
             .bind(message_id)
             .bind(&agent_id.0)
@@ -5014,9 +5843,13 @@ impl Store {
             .bind(row.kind)
             .bind(row.encoding)
             .bind(&row.body)
-            .execute(self.write_pool())
+            .execute(&mut *tx)
             .await
             .map_err(|e| Error::Internal(format!("prestage message payload failed: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("prestage message payload commit failed: {e}")))?;
+        lifecycle.settle_after_retirement().await?;
         Ok(Some(slim))
     }
 
@@ -5199,7 +6032,7 @@ impl Store {
             && stale_keys.is_empty()
             && origin == UsageMessageOrigin::Excluded
         {
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(id)
                 .bind(&agent_id.0)
                 .bind(seq)
@@ -5229,7 +6062,7 @@ impl Store {
                 let mut tx = pool.begin().await.map_err(|e| {
                     Error::Internal(format!("append agent message begin failed: {e}"))
                 })?;
-                sqlx::query(&sql)
+                sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                     .bind(id)
                     .bind(&agent_id.0)
                     .bind(seq)
@@ -5258,7 +6091,7 @@ impl Store {
                     })?;
                 }
                 if let (Some((_, value)), Some(update_sql)) = (&preview_update, &update_sql) {
-                    sqlx::query(update_sql)
+                    sqlx::query(sqlx::AssertSqlSafe(update_sql.as_str()))
                         .bind(value.as_str())
                         .bind(role)
                         .bind(id)
@@ -5316,6 +6149,43 @@ impl Store {
         })
     }
 
+    /// Whether `agent_id` has at least one persisted `assistant` message —
+    /// exactly `get_agent_messages(agent_id, None)?.iter().any(|m| m.role ==
+    /// "assistant")`, without reading or decoding the transcript. One seek of
+    /// the `(agent_id, role, seq)` index, so the cost does not grow with the
+    /// conversation; it answers the per-turn "is this the first turn?" check.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn agent_has_assistant_message(&self, agent_id: &AgentId) -> Result<bool> {
+        let exists: i64 = sqlx::query_scalar(AGENT_HAS_ASSISTANT_MESSAGE_SQL)
+            .bind(&agent_id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("probe assistant message failed: {e}")))?;
+        Ok(exists != 0)
+    }
+
+    /// Whether an `assistant` message follows `agent_id`'s latest `user`
+    /// message — exactly the transcript test "the last `user` row exists and
+    /// some later row is `assistant`" over `get_agent_messages(agent_id,
+    /// None)`, without reading or decoding the transcript. Two seeks of the
+    /// `(agent_id, role, seq)` index; it answers the quota-failover "was the
+    /// cut-short turn partially answered?" check at turn start.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn agent_has_assistant_after_last_user(&self, agent_id: &AgentId) -> Result<bool> {
+        let exists: i64 = sqlx::query_scalar(AGENT_HAS_ASSISTANT_AFTER_LAST_USER_SQL)
+            .bind(&agent_id.0)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("probe assistant after last user failed: {e}")))?;
+        Ok(exists != 0)
+    }
+
     /// Read an agent's messages in chronological (`seq` ascending) order. When
     /// `limit` is set, returns the most-recent `limit` messages (still ordered
     /// oldest→newest), matching `agent.getConversation` (PROTOCOL §5.5).
@@ -5338,7 +6208,7 @@ impl Store {
             ),
         };
         let mut tx = self.begin_read_snapshot().await?;
-        let mut query = sqlx::query(&sql).bind(&agent_id.0);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&agent_id.0);
         if let Some(n) = limit {
             query = query.bind(n);
         }
@@ -5404,7 +6274,7 @@ impl Store {
                 crate::message_payload::KIND_TOOL_USE_INPUT,
                 crate::message_payload::KIND_TOOL_RESULT_OUTPUT
             );
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(id);
             }
@@ -5475,7 +6345,7 @@ impl Store {
             "SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? ORDER BY seq ASC"
         );
         let mut tx = self.begin_read_snapshot().await?;
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&agent_id.0)
             .fetch_all(&mut *tx)
             .await
@@ -5502,7 +6372,7 @@ impl Store {
         );
         let mut after_rowid: i64 = 0;
         loop {
-            let rows = sqlx::query(&page_sql)
+            let rows = sqlx::query(sqlx::AssertSqlSafe(page_sql.as_str()))
                 .bind(&agent_id.0)
                 .bind(after_rowid)
                 .bind(ROWS_PER_PAGE)
@@ -5603,7 +6473,7 @@ impl Store {
         let mut total: u64 = 0;
         let mut after_rowid: i64 = 0;
         loop {
-            let rows = sqlx::query(&scan_sql)
+            let rows = sqlx::query(sqlx::AssertSqlSafe(scan_sql.as_str()))
                 .bind(after_rowid)
                 .bind(cutoff_iso)
                 .bind(CHUNK)
@@ -5662,9 +6532,20 @@ impl Store {
             .map_err(|e| Error::Internal(format!("payload compaction task failed: {e}")))?;
 
             let compacted = crate::with_write_txn_retry(|| async {
-                let mut tx = pool.begin().await.map_err(|e| {
+                let mut lifecycle = self.repository_lifecycle_write().await?;
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| {
                     Error::Internal(format!("compact tool payloads begin failed: {e}"))
                 })?;
+                lifecycle.begin(
+                    &converted
+                        .iter()
+                        .map(|row| {
+                            crate::RepositoryLifecycleKey::MonitorHistory(AgentId(
+                                row.agent_id.clone(),
+                            ))
+                        })
+                        .collect::<Vec<_>>(),
+                )?;
                 let mut n: u64 = 0;
                 for row in &converted {
                     let deleted = sqlx::query(
@@ -5700,6 +6581,7 @@ impl Store {
                 tx.commit().await.map_err(|e| {
                     Error::Internal(format!("compact tool payloads commit failed: {e}"))
                 })?;
+                lifecycle.settle_after_retirement().await?;
                 Ok(n)
             })
             .await?;
@@ -5777,7 +6659,7 @@ impl Store {
              WHERE agent_id = ? AND role != 'system' ORDER BY seq DESC LIMIT 1"
         );
         let mut tx = self.begin_read_snapshot().await?;
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&agent_id.0)
             .fetch_optional(&mut *tx)
             .await
@@ -5870,7 +6752,7 @@ impl Store {
     ) -> Result<Option<AgentMessage>> {
         let sql =
             format!("SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? AND id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&agent_id.0)
             .bind(message_id)
             .fetch_optional(&mut **tx)
@@ -5958,12 +6840,12 @@ impl Store {
     pub async fn list_child_agent_summaries(
         &self,
         parent_agent_id: &AgentId,
-    ) -> Result<Vec<AgentSession>> {
+    ) -> Result<Vec<AgentSessionSummary>> {
         let sql = format!(
             "SELECT {SESSION_SUMMARY_COLUMNS} FROM agent_session INDEXED BY idx_agent_parent \
              WHERE parent_agent_id = ? ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&parent_agent_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -6124,7 +7006,7 @@ impl Store {
              SELECT {MESSAGE_COLUMNS} FROM bounded \
              WHERE COALESCE(preceding_bytes, 0) < ? ORDER BY seq DESC"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(agent_id.as_str())
             .bind(before_seq.unwrap_or(i64::MAX))
             .bind(i64::try_from(limit.clamp(1, 8)).unwrap_or(8))
@@ -6150,7 +7032,7 @@ impl Store {
             "SELECT {MESSAGE_COLUMNS} FROM agent_message WHERE agent_id = ? \
              ORDER BY seq ASC LIMIT ? OFFSET ?"
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&agent_id.0)
             .bind(limit.max(0))
             .bind(offset.max(0))
@@ -6160,14 +7042,9 @@ impl Store {
     }
 
     /// Read an agent's user-role messages as lightweight index items in
-    /// chronological (`seq` ascending) order — the `agent.listUserMessages`
-    /// projection (PROTOCOL §5.5). Bounded cost by construction: user rows
-    /// are selected, their plain text extracted ([`MESSAGE_FTS_TEXT_SQL`],
-    /// the same expression the FTS index uses), and the preview truncated to
-    /// `preview_chars` characters (`SQLite` `substr` counts characters, so the
-    /// cut is char-boundary safe) all inside SQL — full `content` blobs are
-    /// never transferred out of the database or decoded. `metadata` is
-    /// passed through verbatim when present.
+    /// chronological (`seq` ascending) order — the unpaged
+    /// `agent.listUserMessages` projection (PROTOCOL §5.5). Equivalent to
+    /// [`Self::get_agent_user_message_index_page`] with no page bound.
     ///
     /// # Errors
     ///
@@ -6178,35 +7055,114 @@ impl Store {
         agent_id: &AgentId,
         preview_chars: usize,
     ) -> Result<Vec<UserMessageIndexItem>> {
+        Ok(self
+            .get_agent_user_message_index_page(agent_id, preview_chars, None)
+            .await?
+            .items)
+    }
+
+    /// Read an agent's user-role messages as lightweight index items in
+    /// chronological (`seq` ascending) order — the `agent.listUserMessages`
+    /// projection (PROTOCOL §5.5). Bounded cost by construction: user rows
+    /// are selected, their plain text extracted ([`MESSAGE_FTS_TEXT_SQL`],
+    /// the same expression the FTS index uses), and the preview truncated to
+    /// `preview_chars` characters (`SQLite` `substr` counts characters, so the
+    /// cut is char-boundary safe) all inside SQL — full `content` blobs are
+    /// never transferred out of the database or decoded. `metadata` is
+    /// projected inside SQL down to the classification fields
+    /// ([`project_user_message_index_metadata`]), so heavy keys such as an
+    /// event notification's `events` payload never leave the database
+    /// either (intent-hq/intent#8278).
+    ///
+    /// With a `page`, only the newest `page.limit` rows strictly older than
+    /// `page.before_seq` (all rows when `None`) are read, still returned
+    /// oldest→newest; [`UserMessageIndexPage::next_before_seq`] is the `seq`
+    /// of the oldest returned row when older rows remain.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation or a row decode
+    /// fails.
+    pub async fn get_agent_user_message_index_page(
+        &self,
+        agent_id: &AgentId,
+        preview_chars: usize,
+        page: Option<UserMessageIndexPageRequest>,
+    ) -> Result<UserMessageIndexPage> {
+        let metadata_sql = user_message_index_metadata_sql();
+        let (before_sql, order_sql) = match page {
+            Some(UserMessageIndexPageRequest {
+                before_seq: Some(_),
+                ..
+            }) => ("AND m.seq < ?", "ORDER BY m.seq DESC LIMIT ?"),
+            Some(_) => ("", "ORDER BY m.seq DESC LIMIT ?"),
+            None => ("", "ORDER BY m.seq ASC"),
+        };
         let sql = format!(
-            "SELECT m.id, substr({MESSAGE_FTS_TEXT_SQL}, 1, ?) AS preview, \
-                    m.metadata, m.created_at \
+            "SELECT m.id, m.seq, substr({MESSAGE_FTS_TEXT_SQL}, 1, ?) AS preview, \
+                    {metadata_sql} AS metadata, m.created_at, \
+                    (COALESCE(json_extract(m.metadata, '$.type') = 'pr_monitor_wake' \
+                      AND (json_type(m.metadata, '$.resource') IS NOT NULL \
+                        OR json_type(m.metadata, '$.availability') IS NOT NULL), 0) \
+                     OR CASE WHEN json_valid(m.content) AND json_type(m.content) = 'array' THEN EXISTS(\
+                       SELECT 1 FROM json_each(m.content) block \
+                       WHERE json_extract(m.content, block.fullkey || '.messageMetadata.type') = 'pr_monitor_wake' \
+                         AND (json_type(m.content, block.fullkey || '.messageMetadata.resource') IS NOT NULL \
+                           OR json_type(m.content, block.fullkey || '.messageMetadata.availability') IS NOT NULL)\
+                     ) ELSE 0 END) AS qualified_monitor \
              FROM agent_message m \
-             WHERE m.agent_id = ? AND m.role = 'user' ORDER BY m.seq ASC"
+             WHERE m.agent_id = ? AND m.role = 'user' {before_sql} {order_sql}"
         );
-        let rows = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(i64::try_from(preview_chars).unwrap_or(i64::MAX))
-            .bind(&agent_id.0)
+            .bind(&agent_id.0);
+        if let Some(page) = page {
+            if let Some(before_seq) = page.before_seq {
+                query = query.bind(before_seq);
+            }
+            // One extra row tells whether older history remains.
+            query = query.bind(i64::try_from(page.limit).unwrap_or(i64::MAX - 1) + 1);
+        }
+        let rows = query
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get agent user message index failed: {e}")))?;
-        rows.iter()
-            .map(|row| {
-                let metadata: Option<serde_json::Value> =
-                    match col::<Option<String>>(row, "metadata")? {
-                        Some(raw) => Some(serde_json::from_str(&raw).map_err(|e| {
-                            Error::Internal(format!("decode message metadata failed: {e}"))
-                        })?),
-                        None => None,
-                    };
-                Ok(UserMessageIndexItem {
-                    id: col(row, "id")?,
-                    preview: col::<Option<String>>(row, "preview")?.unwrap_or_default(),
-                    metadata,
-                    created_at: col(row, "created_at")?,
-                })
-            })
-            .collect()
+        let mut items = Vec::with_capacity(rows.len());
+        let mut seqs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let metadata = match col::<Option<String>>(row, "metadata")? {
+                Some(raw) => {
+                    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+                        Error::Internal(format!("decode message metadata failed: {e}"))
+                    })?;
+                    project_user_message_index_metadata(&value)
+                }
+                None => None,
+            };
+            let seq = col::<i64>(row, "seq")?;
+            seqs.push(seq);
+            items.push(UserMessageIndexItem {
+                qualified_monitor: col(row, "qualified_monitor")?,
+                seq,
+                id: col(row, "id")?,
+                preview: col::<Option<String>>(row, "preview")?.unwrap_or_default(),
+                metadata,
+                created_at: col(row, "created_at")?,
+            });
+        }
+        let mut next_before_seq = None;
+        if let Some(page) = page {
+            if items.len() > page.limit {
+                items.truncate(page.limit);
+                seqs.truncate(page.limit);
+                next_before_seq = seqs.last().copied();
+            }
+            items.reverse();
+        }
+        Ok(UserMessageIndexPage {
+            items,
+            next_before_seq,
+        })
     }
 
     /// Read the persisted image-thumbnail maps (0097) for the message ids in
@@ -6242,7 +7198,7 @@ impl Store {
                AND m.id IN ({placeholders})",
             crate::message_payload::KIND_THUMBNAILS
         );
-        let mut query = sqlx::query(&sql).bind(&agent_id.0);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&agent_id.0);
         for id in message_ids {
             query = query.bind(id);
         }
@@ -6327,9 +7283,19 @@ impl Store {
         let prepared = batch_content_cols_and_payload_rows(&owned_messages).await?;
 
         crate::with_write_txn_retry(|| async {
-            let mut tx = pool.begin().await.map_err(|e| {
+            let mut lifecycle = self.repository_lifecycle_write().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| {
                 Error::Internal(format!("replace agent messages begin failed: {e}"))
             })?;
+            lifecycle.begin(&[
+                crate::RepositoryLifecycleKey::MonitorHistory(agent_id.clone()),
+                crate::RepositoryLifecycleKey::Agent(agent_id.clone()),
+            ])?;
+            // A transcript replacement cannot inherit its prior native family,
+            // even when the replacement's public message bytes are identical.
+            sqlx::query("DELETE FROM review_context_enrollment WHERE agent_id=?")
+                .bind(&agent_id.0).execute(&mut *tx).await
+                .map_err(|_| Error::Internal("private native enrollment invalidation failed".into()))?;
             // Cascade sweeps the old rows' agent_message_payload side rows;
             // the 0108 AFTER DELETE trigger resolves the session through the
             // denormalized agent_id, so conversation_bytes stays balanced.
@@ -6480,7 +7446,7 @@ impl Store {
                         _ => Some("excluded"),
                     }
                 };
-                sqlx::query(&insert_sql)
+                sqlx::query(sqlx::AssertSqlSafe(insert_sql.as_str()))
                     .bind(&id)
                     .bind(&agent_id.0)
                     .bind(seq)
@@ -6539,6 +7505,7 @@ impl Store {
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("replace agent messages commit failed: {e}"))
             })?;
+            lifecycle.settle_after_retirement().await?;
             Ok(inserted)
         })
         .await
@@ -6578,9 +7545,13 @@ impl Store {
              WHERE agent_id = ? AND role = ? ORDER BY seq DESC LIMIT 1"
         );
         crate::with_write_txn_retry(|| async {
-            let mut tx = pool.begin().await.map_err(|e| {
+            let mut lifecycle = self.repository_lifecycle_write().await?;
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|e| {
                 Error::Internal(format!("truncate agent messages begin failed: {e}"))
             })?;
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::MonitorHistory(
+                agent_id.clone(),
+            )])?;
             // Count only the suffix being deleted, using the same persisted
             // provenance as append/replacement. Historical token spend and
             // costs survive transcript edits, including cells reduced to zero
@@ -6624,7 +7595,7 @@ impl Store {
             // body — no payload hydration needed here.
             let mut newest: Vec<AgentMessage> = Vec::with_capacity(2);
             for role in ["assistant", "user"] {
-                let row = sqlx::query(&newest_of_role_sql)
+                let row = sqlx::query(sqlx::AssertSqlSafe(newest_of_role_sql.as_str()))
                     .bind(&agent_id.0)
                     .bind(role)
                     .fetch_optional(&mut *tx)
@@ -6668,6 +7639,7 @@ impl Store {
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("truncate agent messages commit failed: {e}"))
             })?;
+            lifecycle.settle_after_retirement().await?;
             Ok(usize::try_from(deleted).unwrap_or(usize::MAX))
         })
         .await
@@ -6859,14 +7831,153 @@ pub struct ReplaceMessage<'a> {
 
 /// One row of the `agent.listUserMessages` index
 /// ([`Store::get_agent_user_message_index`]): the message id, a bounded
-/// plain-text preview, the verbatim metadata (when present), and the
-/// creation timestamp — never the full content blob.
+/// plain-text preview, the projected classification metadata
+/// ([`project_user_message_index_metadata`], when any field survives), and
+/// the creation timestamp — never the full content blob.
 #[derive(Debug, Clone)]
 pub struct UserMessageIndexItem {
+    /// Whole-envelope classification only, never authorization. Kept internal
+    /// to Store consumers; public index DTOs must not serialize this field.
+    pub qualified_monitor: bool,
+    /// The row's transcript `seq`: the cursor a byte-trimmed page resumes
+    /// below (`agent.listUserMessages` `nextToken`).
+    pub seq: i64,
     pub id: String,
     pub preview: String,
     pub metadata: Option<serde_json::Value>,
     pub created_at: String,
+}
+
+/// A page bound for [`Store::get_agent_user_message_index_page`]: the newest
+/// `limit` user rows whose `seq` is strictly below `before_seq` (no bound
+/// when `None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserMessageIndexPageRequest {
+    pub limit: usize,
+    pub before_seq: Option<i64>,
+}
+
+/// The result of [`Store::get_agent_user_message_index_page`]: the items
+/// oldest→newest and, when a paged read left older rows unread, the `seq`
+/// to pass as the next page's `before_seq`.
+#[derive(Debug, Clone)]
+pub struct UserMessageIndexPage {
+    pub items: Vec<UserMessageIndexItem>,
+    pub next_before_seq: Option<i64>,
+}
+
+/// Top-level string metadata fields `agent.listUserMessages` serves: the
+/// authorship markers clients use to tell human rows from automated ones
+/// (PROTOCOL §5.5).
+const USER_MESSAGE_INDEX_STRING_KEYS: [&str; 4] =
+    ["type", "source", "fromAgentId", "fromPrincipalId"];
+
+/// `queueInfo` sub-fields `agent.listUserMessages` serves, with the JSON
+/// type each must have: the dequeue-wait note markers clients strip from
+/// previews.
+const USER_MESSAGE_INDEX_QUEUE_INFO_KEYS: [(&str, IndexValueKind); 3] = [
+    ("queuedAt", IndexValueKind::String),
+    ("waitedMs", IndexValueKind::Number),
+    ("batchId", IndexValueKind::String),
+];
+
+#[derive(Debug, Clone, Copy)]
+enum IndexValueKind {
+    String,
+    Number,
+}
+
+impl IndexValueKind {
+    fn admits(self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Number => value.is_number(),
+        }
+    }
+
+    fn sql_types(self) -> &'static str {
+        match self {
+            Self::String => "('text')",
+            Self::Number => "('integer','real')",
+        }
+    }
+}
+
+/// Project persisted user-row metadata down to what `agent.listUserMessages`
+/// serves (PROTOCOL §5.5, intent-hq/intent#8278): the string-valued `type`,
+/// `source`, `fromAgentId` and `fromPrincipalId`, plus `queueInfo` narrowed
+/// to a string `queuedAt`, a numeric `waitedMs` and a string `batchId`.
+/// Every other key — notably an event notification's `events` payload — is
+/// dropped. `None` when nothing survives (including non-object metadata).
+#[must_use]
+pub fn project_user_message_index_metadata(
+    metadata: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let source = metadata.as_object()?;
+    let mut out = serde_json::Map::new();
+    for key in USER_MESSAGE_INDEX_STRING_KEYS {
+        if let Some(value) = source.get(key).filter(|v| v.is_string()) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(queue_info) = source
+        .get("queueInfo")
+        .and_then(serde_json::Value::as_object)
+    {
+        let mut projected = serde_json::Map::new();
+        for (key, kind) in USER_MESSAGE_INDEX_QUEUE_INFO_KEYS {
+            if let Some(value) = queue_info.get(key).filter(|v| kind.admits(v)) {
+                projected.insert(key.to_string(), value.clone());
+            }
+        }
+        if !projected.is_empty() {
+            out.insert(
+                "queueInfo".to_string(),
+                serde_json::Value::Object(projected),
+            );
+        }
+    }
+    (!out.is_empty()).then_some(serde_json::Value::Object(out))
+}
+
+/// SQL expression pre-trimming `m.metadata` to the same fields as
+/// [`project_user_message_index_metadata`], so only the small projection
+/// leaves `SQLite`. Absent fields come out as JSON `null`; the Rust
+/// projection then drops them, so it stays the single source of truth.
+fn user_message_index_metadata_sql() -> String {
+    let field = |path: &str, types: &str| {
+        format!(
+            "CASE WHEN json_type(m.metadata, '{path}') IN {types} \
+             THEN json_extract(m.metadata, '{path}') END"
+        )
+    };
+    let mut args: Vec<String> = USER_MESSAGE_INDEX_STRING_KEYS
+        .iter()
+        .map(|key| {
+            format!(
+                "'{key}', {}",
+                field(&format!("$.{key}"), IndexValueKind::String.sql_types())
+            )
+        })
+        .collect();
+    let queue_args: Vec<String> = USER_MESSAGE_INDEX_QUEUE_INFO_KEYS
+        .iter()
+        .map(|(key, kind)| {
+            format!(
+                "'{key}', {}",
+                field(&format!("$.queueInfo.{key}"), kind.sql_types())
+            )
+        })
+        .collect();
+    args.push(format!(
+        "'queueInfo', CASE WHEN json_type(m.metadata, '$.queueInfo') = 'object' \
+         THEN json_object({}) END",
+        queue_args.join(", ")
+    ));
+    format!(
+        "CASE WHEN m.metadata IS NULL THEN NULL ELSE json_object({}) END",
+        args.join(", ")
+    )
 }
 
 fn map_message_row(row: &SqliteRow) -> Result<AgentMessage> {
@@ -6972,7 +8083,7 @@ mod tests {
                 ),
             ),
         ] {
-            let details: Vec<String> = sqlx::query(&sql)
+            let details: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind("ws-plan")
                 .fetch_all(store.read_pool())
                 .await
@@ -7050,7 +8161,7 @@ mod tests {
         }
         for (label, sql, bind) in statements {
             let plan_sql = format!("EXPLAIN QUERY PLAN {sql}");
-            let mut plan = sqlx::query(&plan_sql).bind("ws-plan");
+            let mut plan = sqlx::query(sqlx::AssertSqlSafe(plan_sql.as_str())).bind("ws-plan");
             if let Some(bind) = &bind {
                 plan = plan.bind(bind);
             }
@@ -7284,7 +8395,7 @@ mod tests {
             parent_agent_id: None,
             orphaned_only: false,
         };
-        let ids = |rows: &[AgentSession]| -> std::collections::BTreeSet<String> {
+        let ids = |rows: &[AgentSessionSummary]| -> std::collections::BTreeSet<String> {
             rows.iter().map(|s| s.id.0.clone()).collect()
         };
         let orphan_rows = store
@@ -7583,8 +8694,8 @@ mod tests {
         ] {
             let plan_sql = format!("EXPLAIN QUERY PLAN {sql}");
             let bytecode_sql = format!("EXPLAIN {sql}");
-            let mut plan = sqlx::query(&plan_sql);
-            let mut bytecode = sqlx::query(&bytecode_sql);
+            let mut plan = sqlx::query(sqlx::AssertSqlSafe(plan_sql.as_str()));
+            let mut bytecode = sqlx::query(sqlx::AssertSqlSafe(bytecode_sql.as_str()));
             if bind {
                 plan = plan.bind("ws-plan");
                 bytecode = bytecode.bind("ws-plan");
@@ -7648,19 +8759,20 @@ mod tests {
             .replace("'$.lastSeenMessageId'", "'$.lastSeenMessageId')");
         assert_ne!(control_sql, unread_workspaces_batch_sql());
         let control_bytecode_sql = format!("EXPLAIN {control_sql}");
-        let ops: Vec<(String, i64, i64)> = sqlx::query(&control_bytecode_sql)
-            .fetch_all(store.read_pool())
-            .await
-            .expect("explain control bytecode")
-            .iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("opcode"),
-                    row.get::<i64, _>("p1"),
-                    row.get::<i64, _>("p2"),
-                )
-            })
-            .collect();
+        let ops: Vec<(String, i64, i64)> =
+            sqlx::query(sqlx::AssertSqlSafe(control_bytecode_sql.as_str()))
+                .fetch_all(store.read_pool())
+                .await
+                .expect("explain control bytecode")
+                .iter()
+                .map(|row| {
+                    (
+                        row.get::<String, _>("opcode"),
+                        row.get::<i64, _>("p1"),
+                        row.get::<i64, _>("p2"),
+                    )
+                })
+                .collect();
         let opcodes: Vec<&str> = ops.iter().map(|(op, _, _)| op.as_str()).collect();
         assert!(
             opcodes.contains(&"Function"),
@@ -7879,7 +8991,10 @@ mod tests {
                     .expect("set mute"),
                 changed
             );
-            let stored = store.get_agent_session(&agent).await.expect("reload");
+            let stored = store
+                .get_agent_session_with_transcript(&agent)
+                .await
+                .expect("reload");
             assert_eq!(stored.notifications_muted, muted);
             assert_eq!(
                 stored.updated_at, old,
@@ -7896,7 +9011,10 @@ mod tests {
                 .await,
             Err(Error::NotFound(_))
         ));
-        let stored = store.get_agent_session(&agent).await.expect("reload");
+        let stored = store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("reload");
         assert!(!stored.notifications_muted);
         assert_eq!(stored.updated_at, old);
     }
@@ -7917,7 +9035,10 @@ mod tests {
         let agent = AgentId("agent-muted-race".to_string());
         seed_unread_top_level_session(&store, &ws, &agent, &ts).await;
 
-        let stale = store.get_agent_session(&agent).await.expect("load session");
+        let stale = store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("load session");
         assert!(!stale.notifications_muted);
 
         assert!(store
@@ -7938,7 +9059,10 @@ mod tests {
             .update_agent_session(&ws, &stale)
             .await
             .expect("stale full-row update");
-        let after = store.get_agent_session(&agent).await.expect("reload");
+        let after = store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("reload");
         assert!(
             after.notifications_muted,
             "full-row update must not clobber notifications_muted"
@@ -7950,7 +9074,7 @@ mod tests {
             .expect("unmute"));
         assert!(
             !store
-                .get_agent_session(&agent)
+                .get_agent_session_with_transcript(&agent)
                 .await
                 .expect("reload")
                 .notifications_muted
@@ -7961,6 +9085,95 @@ mod tests {
                 .await,
             Err(Error::NotFound(_))
         ));
+    }
+
+    /// `set_agent_pinned` (0180) follows the mute contract: it reports whether
+    /// the flag changed, never advances the activity timestamp, is scoped to
+    /// the workspace, and a stale full-row `update_agent_session` carrying the
+    /// pre-toggle flag leaves the persisted pin untouched. An explicit patch in
+    /// a mixed update writes it alongside the row.
+    #[tokio::test]
+    async fn pinned_is_a_preference_that_survives_stale_full_row_update() {
+        let tmp = TempDb::new("test-agent-pinned");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ws = WorkspaceId("ws-pinned".to_string());
+        insert_test_workspace(&store, &ws).await;
+        let agent = AgentId("agent-pinned".to_string());
+        let old = "2020-01-01T00:00:00.000Z";
+        seed_unread_top_level_session(&store, &ws, &agent, old).await;
+
+        let stale = store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("load session");
+        assert!(!stale.pinned, "new sessions are unpinned");
+
+        for (pinned, changed) in [(true, true), (true, false)] {
+            assert_eq!(
+                store
+                    .set_agent_pinned(&ws, &agent, pinned)
+                    .await
+                    .expect("set pinned"),
+                changed
+            );
+            let stored = store
+                .get_agent_session_with_transcript(&agent)
+                .await
+                .expect("reload");
+            assert!(stored.pinned);
+            assert_eq!(stored.updated_at, old, "a pin is not agent activity");
+        }
+
+        store
+            .update_agent_session(&ws, &stale)
+            .await
+            .expect("stale full-row update");
+        assert!(
+            store
+                .get_agent_session_with_transcript(&agent)
+                .await
+                .expect("reload")
+                .pinned,
+            "full-row update must not clobber pinned"
+        );
+
+        let mut mixed = store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("reload");
+        mixed.name = "Renamed".to_string();
+        mixed.pinned = false;
+        store
+            .update_agent_session_with_preferences(&ws, &mixed, false, None, Some(false), false)
+            .await
+            .expect("mixed update with pin patch");
+        let after = store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .expect("reload");
+        assert!(!after.pinned, "explicit patch unpins");
+        assert_eq!(after.name, "Renamed");
+        assert!(!after.notifications_muted, "mute untouched by a pin patch");
+
+        assert!(matches!(
+            store
+                .set_agent_pinned(&WorkspaceId("wrong-workspace".to_string()), &agent, true)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            store
+                .set_agent_pinned(&ws, &AgentId("agent-missing".to_string()), true)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(
+            !store
+                .get_agent_session_with_transcript(&agent)
+                .await
+                .expect("reload")
+                .pinned
+        );
     }
 
     /// A muted session (`notifications_muted = 1`) never counts as unread:
@@ -8098,9 +9311,7 @@ mod tests {
     /// error — and must not surface the retired "supply a fresh id" guidance.
     #[tokio::test]
     async fn insert_agent_session_duplicate_id_is_internal_error() {
-        use intent_core::{
-            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-        };
+        use intent_core::{now_iso, Workspace};
 
         use uuid::Uuid;
         let tmp = TempDb::new("test-agent-repo");
@@ -8111,49 +9322,9 @@ mod tests {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store
             .insert_workspace(&workspace)
@@ -8204,6 +9375,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
         let err = store
@@ -8224,9 +9396,7 @@ mod tests {
     /// session id maps to `NotFound`.
     #[tokio::test]
     async fn token_usage_snapshot_roundtrip_and_replace() {
-        use intent_core::{
-            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-        };
+        use intent_core::{now_iso, Workspace};
 
         use uuid::Uuid;
         let tmp = TempDb::new("test-agent-repo");
@@ -8237,49 +9407,9 @@ mod tests {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store
             .insert_workspace(&workspace)
@@ -8331,6 +9461,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -9007,54 +10138,14 @@ mod tests {
 
     /// Minimal workspace literal for the baseline-fold tests below.
     fn baseline_test_workspace(ws_id: &WorkspaceId, ts: &str) -> intent_core::Workspace {
-        use intent_core::{Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+        use intent_core::Workspace;
         Workspace {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.to_string(),
             updated_at: ts.to_string(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
     }
 
@@ -9110,6 +10201,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 
@@ -10406,11 +11498,13 @@ mod tests {
     }
 
     async fn count_rows(store: &Store, table: &str, agent_id: &AgentId) -> i64 {
-        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE agent_id = ?"))
-            .bind(&agent_id.0)
-            .fetch_one(store.read_pool())
-            .await
-            .expect("count rows")
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE agent_id = ?"
+        )))
+        .bind(&agent_id.0)
+        .fetch_one(store.read_pool())
+        .await
+        .expect("count rows")
     }
 
     /// intent-hq/intent#3827: deleting a session with a history far larger
@@ -11115,7 +12209,10 @@ mod tests {
             .await
             .expect("swap");
         assert_eq!(canonical, "acp-2");
-        let sess = store.get_agent_session(&agent_id).await.expect("get");
+        let sess = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(sess.acp_session_id.as_deref(), Some("acp-2"));
         let rows = store
             .get_workspace_agent_usage_data(&ws_id)
@@ -11272,7 +12369,10 @@ mod tests {
             .set_acp_session_id(&ws_id, &first_set, "acp-first")
             .await
             .expect("first set");
-        let sess = store.get_agent_session(&first_set).await.expect("get");
+        let sess = store
+            .get_agent_session_with_transcript(&first_set)
+            .await
+            .expect("get");
         assert_eq!(sess.acp_session_id.as_deref(), Some("acp-first"));
 
         // Replace with nothing stored: sets the id and folds the snapshot.
@@ -11526,7 +12626,10 @@ mod tests {
             .expect("commit probe txn");
         drop(conn);
 
-        let sess = store.get_agent_session(&agent_id).await.expect("get");
+        let sess = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(sess.acp_session_id.as_deref(), Some("acp-current"));
         let rows = store
             .get_workspace_agent_usage_data(&ws_id)
@@ -11767,7 +12870,7 @@ mod tests {
             .is_none());
         assert_eq!(
             store
-                .get_agent_session(&id)
+                .get_agent_session_with_transcript(&id)
                 .await
                 .unwrap()
                 .reasoning_effort
@@ -11797,7 +12900,10 @@ mod tests {
         session.reasoning_effort = Some("high".to_string());
         store.insert_agent_session(&session).await.expect("insert");
 
-        let full = store.get_agent_session(&agent_id).await.expect("get");
+        let full = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(full.reasoning_effort.as_deref(), Some("high"));
         let summary = store
             .get_agent_session_summary(&agent_id)
@@ -11810,7 +12916,10 @@ mod tests {
             .update_agent_session(&ws_id, &session)
             .await
             .expect("update");
-        let cleared = store.get_agent_session(&agent_id).await.expect("get");
+        let cleared = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(cleared.reasoning_effort, None, "cleared on update");
     }
 
@@ -11839,7 +12948,10 @@ mod tests {
         session.effort_levels = Some(levels.clone());
         store.insert_agent_session(&session).await.expect("insert");
 
-        let full = store.get_agent_session(&agent_id).await.expect("get");
+        let full = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(full.effort_levels.as_deref(), Some(levels.as_slice()));
         let summary = store
             .get_agent_session_summary(&agent_id)
@@ -11859,7 +12971,10 @@ mod tests {
             .await
             .expect("set changed");
         assert!(changed, "different set must report a change");
-        let read = store.get_agent_session(&agent_id).await.expect("get");
+        let read = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(read.effort_levels.as_deref(), Some(with_max.as_slice()));
 
         // The full-row update excludes the column — a stale in-memory session
@@ -11868,7 +12983,10 @@ mod tests {
             .update_agent_session(&ws_id, &session)
             .await
             .expect("full-row update");
-        let preserved = store.get_agent_session(&agent_id).await.expect("get");
+        let preserved = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(
             preserved.effort_levels.as_deref(),
             Some(with_max.as_slice()),
@@ -11881,7 +12999,10 @@ mod tests {
             .await
             .expect("clear");
         assert!(cleared, "clearing a present set is a change");
-        let read = store.get_agent_session(&agent_id).await.expect("get");
+        let read = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(read.effort_levels, None);
         let cleared_again = store
             .set_agent_effort_levels(&ws_id, &agent_id, None, &now_iso())
@@ -11977,7 +13098,10 @@ mod tests {
 
         let store = Store::open(&tmp).await.expect("reopen applies 0080");
         for (id, (model, _, expected_model, expected_effort)) in ids.iter().zip(&cases) {
-            let session = store.get_agent_session(id).await.expect("get");
+            let session = store
+                .get_agent_session_with_transcript(id)
+                .await
+                .expect("get");
             assert_eq!(
                 session.model.as_deref(),
                 Some(*expected_model),
@@ -12216,13 +13340,16 @@ mod tests {
 
         // Full-row hydration (0113 already ran on the empty table, so only
         // the backstop can split this row).
-        let read = store.get_agent_session(&agent_id).await.expect("get");
+        let read = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(read.model.as_deref(), Some("claude-opus-4"));
         assert_eq!(read.provider.as_deref(), Some("anthropic"));
 
         // Summary hydration goes through the same mapping.
         let listed = store
-            .list_agent_sessions(&ws_id)
+            .list_agent_sessions_with_transcripts(&ws_id)
             .await
             .expect("list")
             .into_iter()
@@ -12283,9 +13410,9 @@ mod tests {
             .get_workspace_agent_usage_data(&ws_id)
             .await
             .expect("usage rollup");
-        let (_, rollup_model, _, _, _, _) = rows
+        let (_, rollup_model, _, _, _, _, _) = rows
             .into_iter()
-            .find(|(id, _, _, _, _, _)| *id == agent_id.0)
+            .find(|(id, _, _, _, _, _, _)| *id == agent_id.0)
             .expect("rollup row");
         assert_eq!(rollup_model.as_deref(), Some("claude-opus-4"));
     }
@@ -12316,7 +13443,10 @@ mod tests {
 
         // Round trip: reads surface the split identity; persisting it back
         // must pass the guard even though the raw row is still compound.
-        let mut read = store.get_agent_session(&agent_id).await.expect("get");
+        let mut read = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(read.provider.as_deref(), Some("anthropic"));
         read.name = "Renamed".to_string();
         store
@@ -12549,7 +13679,7 @@ mod tests {
             .filter(|row| !intent_core::token_usage_reported(row.3.as_ref(), row.2.as_ref()))
             .map(|row| row.0.as_str())
             .collect::<Vec<_>>();
-        let fetched_ids = sqlx::query(&fallback_message_usage_sql())
+        let fetched_ids = sqlx::query(sqlx::AssertSqlSafe(fallback_message_usage_sql()))
             .bind(serde_json::to_string(&fallback_ids).unwrap())
             .fetch_all(store.read_pool())
             .await
@@ -12696,7 +13826,7 @@ mod tests {
         // a plan that scans agent_message loads and parses every body, which is
         // exactly the cost this read is supposed to avoid.
         let plan_sql = format!("EXPLAIN QUERY PLAN {}", fallback_message_usage_sql());
-        let plan: String = sqlx::query(&plan_sql)
+        let plan: String = sqlx::query(sqlx::AssertSqlSafe(plan_sql.as_str()))
             .bind(serde_json::to_string(&[&cost_only.0]).unwrap())
             .fetch_all(store.read_pool())
             .await
@@ -12822,9 +13952,7 @@ mod tests {
 
     #[tokio::test]
     async fn re_interruption_resets_resolution() {
-        use intent_core::{
-            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-        };
+        use intent_core::{now_iso, Workspace};
 
         let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
@@ -12837,49 +13965,9 @@ mod tests {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store
             .insert_workspace(&workspace)
@@ -12957,9 +14045,7 @@ mod tests {
 
     #[tokio::test]
     async fn double_claim_race() {
-        use intent_core::{
-            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-        };
+        use intent_core::{now_iso, Workspace};
 
         let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
@@ -12972,49 +14058,9 @@ mod tests {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store
             .insert_workspace(&workspace)
@@ -13044,10 +14090,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_agent_session_summaries_excludes_messages() {
-        use intent_core::{
-            now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-            WorkspaceStatus,
-        };
+        use intent_core::{now_iso, AgentSession, AgentStatus, Workspace};
 
         let tmp = TempDb::new("test-summaries");
         let store = Store::open(&tmp).await.expect("create test store");
@@ -13059,49 +14102,9 @@ mod tests {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store
             .insert_workspace(&workspace)
@@ -13159,6 +14162,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store
             .insert_agent_session(&session)
@@ -13176,11 +14180,11 @@ mod tests {
             .await
             .expect("append message");
 
-        // list_agent_sessions should include messages
+        // list_agent_sessions_with_transcripts should include messages
         let full = store
-            .list_agent_sessions(&ws_id)
+            .list_agent_sessions_with_transcripts(&ws_id)
             .await
-            .expect("list_agent_sessions");
+            .expect("list_agent_sessions_with_transcripts");
         assert_eq!(full.len(), 1, "should have one session");
         assert_eq!(
             full[0].system_prompt.as_deref(),
@@ -13199,7 +14203,7 @@ mod tests {
         assert_eq!(
             full[0].messages.len(),
             1,
-            "list_agent_sessions should include messages"
+            "list_agent_sessions_with_transcripts should include messages"
         );
 
         // list_agent_session_summaries should exclude messages
@@ -13243,10 +14247,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_agent_session_invariants_without_messages() {
-        use intent_core::{
-            now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-            WorkspaceStatus,
-        };
+        use intent_core::{now_iso, AgentSession, AgentStatus, Workspace};
 
         let tmp = TempDb::new("test-update-inv");
         let store = Store::open(&tmp).await.expect("create test store");
@@ -13260,49 +14261,9 @@ mod tests {
                 id: id.clone(),
                 title: "Test".to_string(),
                 branch: "main".to_string(),
-                base_ref: None,
-                base_commit_sha: None,
-                status: WorkspaceStatus::Active,
-                status_message: None,
-                status_image_asset_id: None,
-                activity: WorkspaceActivity::Idle,
-                attention: WorkspaceAttention::None,
                 created_at: ts.clone(),
                 updated_at: ts.clone(),
-                last_activity: None,
-                last_content_activity: None,
-                tags: vec![],
-                path: None,
-                repository_path: None,
-                repository_owner: None,
-                repository_name: None,
-                worktree_path: None,
-                scope: None,
-                skip_worktree: false,
-                setup_script: None,
-                is_remote: false,
-                default_model: None,
-                pr_number: None,
-                pr_url: None,
-                pr_status: None,
-                active_pull_request: None,
-                pull_requests: None,
-                context_links: None,
-                archived: false,
-                archived_at: None,
-                task_stats: None,
-                agent_summary: None,
-                diff_summary: None,
-                token_usage: None,
-                cow_supported: None,
-                browser_client_id: None,
-                pull_requests_total: None,
-                display_status: None,
-                waiting: false,
-                checkout_mode: None,
-                disk_usage: None,
-                pending_delete_at: None,
-                membership: None,
+                ..Default::default()
             };
             store.insert_workspace(&workspace).await.expect("insert");
         }
@@ -13354,6 +14315,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -13405,6 +14367,183 @@ mod tests {
         assert!(result4.is_ok(), "name change should succeed");
     }
 
+    /// The confirmed-effort fill lands only while the row still carries the
+    /// turn's provider/model: a model switch that landed first never inherits
+    /// the old model's level. A landed fill is Auto-pinned; an explicit
+    /// choice clears the mark.
+    #[tokio::test]
+    async fn effort_fill_is_guarded_by_the_turn_identity() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-effort-guard".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-effort-guard".to_string());
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-live"));
+        session.provider = Some("codex".to_string());
+        session.model = Some("model-a".to_string());
+        session.reasoning_effort = None;
+        store.insert_agent_session(&session).await.expect("insert");
+        store
+            .set_agent_session_model(&ws_id, &agent_id, "model-b", Some("codex"), &ts)
+            .await
+            .expect("racing model switch");
+        assert!(
+            !store
+                .fill_agent_session_effort_if_identity(
+                    &ws_id,
+                    &agent_id,
+                    "high",
+                    Some("codex"),
+                    Some("model-a"),
+                    &ts
+                )
+                .await
+                .unwrap(),
+            "model A's level must not land on model B"
+        );
+        assert_eq!(
+            store
+                .get_agent_session_with_transcript(&agent_id)
+                .await
+                .unwrap()
+                .reasoning_effort,
+            None
+        );
+        assert!(store
+            .fill_agent_session_effort_if_identity(
+                &ws_id,
+                &agent_id,
+                "low",
+                Some("codex"),
+                Some("model-b"),
+                &ts
+            )
+            .await
+            .unwrap());
+        let auto = |store: &Store| {
+            let store = store.clone();
+            let id = agent_id.0.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT reasoning_effort_auto FROM agent_session WHERE id=?",
+                )
+                .bind(id)
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(auto(&store).await, 1, "a landed fill is Auto-pinned");
+        let mut row = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .unwrap();
+        store
+            .update_agent_session_with_preferences(&ws_id, &row, false, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            auto(&store).await,
+            1,
+            "an unrelated same-value rewrite keeps the mark"
+        );
+        row.reasoning_effort = Some("low".into());
+        store
+            .update_agent_session_with_preferences(&ws_id, &row, false, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            auto(&store).await,
+            0,
+            "an explicit same-value choice clears the mark in the same write"
+        );
+    }
+
+    /// `pin_agent_session_provider_if_null` only lands on a NULL/blank
+    /// provider (compare-and-set: a provider pinned first wins), and
+    /// `fill_agent_session_identity_if_null` only fills NULL/blank columns.
+    #[tokio::test]
+    async fn legacy_identity_writers_fill_only_unset_columns() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-legacy-identity".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-legacy-identity".to_string());
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-live"));
+        session.provider = None;
+        session.model = None;
+        session.reasoning_effort = None;
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let other = WorkspaceId("ws-other".to_string());
+        assert!(matches!(
+            store
+                .pin_agent_session_provider_if_null(&other, &agent_id, "codex", &ts)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(store
+            .pin_agent_session_provider_if_null(&ws_id, &agent_id, "codex", &ts)
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .pin_agent_session_provider_if_null(&ws_id, &agent_id, "claude-code", &ts)
+                .await
+                .unwrap(),
+            "an already pinned provider is never overwritten"
+        );
+
+        assert!(!store
+            .fill_agent_session_identity_if_null(&other, &agent_id, Some("x"), Some("y"), &ts)
+            .await
+            .unwrap());
+        assert!(store
+            .fill_agent_session_identity_if_null(&ws_id, &agent_id, Some("gpt-5"), None, &ts)
+            .await
+            .unwrap());
+        assert!(store
+            .fill_agent_session_identity_if_null(
+                &ws_id,
+                &agent_id,
+                Some("other-model"),
+                Some("medium"),
+                &ts
+            )
+            .await
+            .unwrap());
+        assert!(!store
+            .fill_agent_session_identity_if_null(
+                &ws_id,
+                &agent_id,
+                Some("other-model"),
+                Some("high"),
+                &ts
+            )
+            .await
+            .unwrap());
+        let got = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .unwrap();
+        assert_eq!(got.provider.as_deref(), Some("codex"));
+        assert_eq!(got.model.as_deref(), Some("gpt-5"), "set model kept");
+        assert_eq!(got.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(got.acp_session_id.as_deref(), Some("acp-live"));
+    }
+
     /// The narrow `set_agent_session_model` writer (`agent.setModel`,
     /// monorepo#882): a cross-provider switch lands even after first real use
     /// (`acp_session_id` set) — the case `update_agent_session`'s
@@ -13443,7 +14582,10 @@ mod tests {
             .expect_err("cross-workspace write must not mutate");
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
         // The read backstop splits the seeded compound id on read.
-        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        let unchanged = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(unchanged.model.as_deref(), Some("default"));
         assert_eq!(unchanged.provider.as_deref(), Some("mock"));
 
@@ -13459,7 +14601,10 @@ mod tests {
             )
             .await
             .expect("intentional cross-provider switch");
-        let after = store.get_agent_session(&agent_id).await.expect("get after");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get after");
         assert_eq!(after.model.as_deref(), Some("grok-4-fast"));
         assert_eq!(after.provider.as_deref(), Some("grok"));
         assert_eq!(after.updated_at, updated_at);
@@ -13511,7 +14656,10 @@ mod tests {
             .await
             .expect_err("cross-workspace write must not mutate");
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
-        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        let unchanged = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(unchanged.provider.as_deref(), Some("auggie"));
         assert_eq!(unchanged.model.as_deref(), Some("opus4.7"));
         assert_eq!(unchanged.reasoning_effort.as_deref(), Some("high"));
@@ -13529,7 +14677,10 @@ mod tests {
             .await
             .expect("stale expected provider is not an error");
         assert!(!landed, "compare-and-set must not land on a mismatch");
-        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        let unchanged = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(unchanged.provider.as_deref(), Some("auggie"));
         assert_eq!(unchanged.reasoning_effort.as_deref(), Some("high"));
 
@@ -13546,7 +14697,10 @@ mod tests {
             .await
             .expect("re-home after first real use");
         assert!(landed);
-        let after = store.get_agent_session(&agent_id).await.expect("get after");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get after");
         assert_eq!(after.provider.as_deref(), Some("codex"));
         assert_eq!(after.model, None, "target CLI default clears the model");
         assert_eq!(after.reasoning_effort, None, "effort never carries over");
@@ -13566,7 +14720,10 @@ mod tests {
             .await
             .expect("re-home with a settings default model");
         assert!(landed);
-        let with_model = store.get_agent_session(&agent_id).await.expect("get");
+        let with_model = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(with_model.provider.as_deref(), Some("mock"));
         assert_eq!(with_model.model.as_deref(), Some("m-1"));
 
@@ -13600,8 +14757,738 @@ mod tests {
                 .expect("NULL column re-home"),
             "None matches a NULL column"
         );
-        let after = store.get_agent_session(&null_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&null_id)
+            .await
+            .expect("get");
         assert_eq!(after.provider.as_deref(), Some("mock"));
+    }
+
+    /// The narrow `failover_agent_session_provider` writer (quota failover,
+    /// PROTOCOL §5.54 Backup failover): only `provider` and `updated_at`
+    /// change — the model id and reasoning effort carry over to the backup,
+    /// as `agent.setModel` with the same model would keep them. Compare-and-
+    /// set on the provider the caller read; a wrong workspace is `NotFound`.
+    #[tokio::test]
+    async fn failover_agent_session_provider_switches_only_the_provider() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-failover".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-live"));
+        session.provider = Some("claude-code".to_string());
+        session.model = Some("opus".to_string());
+        session.reasoning_effort = Some("high".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let err = store
+            .failover_agent_session_provider(
+                &WorkspaceId("ws-other".to_string()),
+                &agent_id,
+                "claude-code",
+                Some("opus"),
+                "claude-code@pbackup",
+                None,
+                false,
+                &now_iso(),
+            )
+            .await
+            .expect_err("cross-workspace write must not mutate");
+        assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+
+        let landed = store
+            .failover_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                "claude-code@pother",
+                Some("opus"),
+                "claude-code@pbackup",
+                None,
+                false,
+                &now_iso(),
+            )
+            .await
+            .expect("stale expected provider is not an error");
+        assert!(!landed, "compare-and-set must not land on a mismatch");
+        let unchanged = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
+        assert_eq!(unchanged.provider.as_deref(), Some("claude-code"));
+
+        // Same provider, but the model moved since the caller's read: no
+        // write, so a notice can never name a stale model.
+        let landed = store
+            .failover_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                Some("sonnet"),
+                "claude-code@pbackup",
+                None,
+                false,
+                &now_iso(),
+            )
+            .await
+            .expect("stale expected model is not an error");
+        assert!(!landed, "compare-and-set covers the model too");
+        let unchanged = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
+        assert_eq!(unchanged.provider.as_deref(), Some("claude-code"));
+
+        let updated_at = now_iso();
+        let landed = store
+            .failover_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                Some("opus"),
+                "claude-code@pbackup",
+                None,
+                false,
+                &updated_at,
+            )
+            .await
+            .expect("failover after first real use");
+        assert!(landed);
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get after");
+        assert_eq!(after.provider.as_deref(), Some("claude-code@pbackup"));
+        assert_eq!(after.model.as_deref(), Some("opus"), "model id unchanged");
+        assert_eq!(after.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(after.updated_at, updated_at);
+        assert_eq!(after.acp_session_id.as_deref(), Some("acp-live"));
+        assert_eq!(after.name, "Baseline", "unrelated columns untouched");
+    }
+
+    /// A manual choice token (PROTOCOL §5.54 shared quota state) lands with
+    /// the selection, is cleared only by the reader holding that exact
+    /// token, survives a value-equal later choice (a new token), is dropped
+    /// by an automatic selection write and by a landed failover, and makes
+    /// a yielding failover a no-op.
+    #[tokio::test]
+    async fn manual_choice_token_lifecycle() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-manual-choice".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.provider = Some("claude-code".to_string());
+        session.model = Some("opus".to_string());
+        session.metadata = Some(serde_json::json!({ "keep": 1 }));
+        store.insert_agent_session(&session).await.expect("insert");
+        let token = |store: &Store| {
+            let store = store.clone();
+            let agent_id = agent_id.clone();
+            async move {
+                store
+                    .get_agent_session_with_transcript(&agent_id)
+                    .await
+                    .expect("get")
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| {
+                        m.get(MANUAL_CHOICE_METADATA_KEY)
+                            .and_then(|t| t.as_str().map(str::to_owned))
+                    })
+            }
+        };
+        let choose = |store: &Store, model: &'static str, t: &'static str| {
+            let store = store.clone();
+            let agent_id = agent_id.clone();
+            let ws_id = ws_id.clone();
+            async move {
+                store
+                    .set_agent_session_model_choice(
+                        &ws_id,
+                        &agent_id,
+                        model,
+                        Some("claude-code"),
+                        Some(t),
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("choose");
+            }
+        };
+
+        choose(&store, "opus", "t1").await;
+        assert_eq!(token(&store).await.as_deref(), Some("t1"));
+        let row = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
+        assert_eq!(row.metadata.as_ref().unwrap()["keep"], 1, "other keys kept");
+        // M1 -> M2 -> M1: the stale t1 reader clears nothing.
+        choose(&store, "sonnet", "t2").await;
+        choose(&store, "opus", "t3").await;
+        assert!(!store
+            .take_agent_session_manual_choice(&ws_id, &agent_id, "t1")
+            .await
+            .expect("take"));
+        assert_eq!(token(&store).await.as_deref(), Some("t3"));
+        // A yielding failover does not move a pending choice.
+        assert!(!store
+            .failover_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                Some("opus"),
+                "claude-code@b1",
+                None,
+                true,
+                &now_iso(),
+            )
+            .await
+            .expect("yielding failover"));
+        // The holder of t3 clears it, once.
+        assert!(store
+            .take_agent_session_manual_choice(&ws_id, &agent_id, "t3")
+            .await
+            .expect("take"));
+        assert!(!store
+            .take_agent_session_manual_choice(&ws_id, &agent_id, "t3")
+            .await
+            .expect("take"));
+        assert_eq!(token(&store).await, None);
+        // An automatic selection write drops a pending token.
+        choose(&store, "opus", "t4").await;
+        store
+            .set_agent_session_model(&ws_id, &agent_id, "opus", Some("claude-code"), &now_iso())
+            .await
+            .expect("automatic write");
+        assert_eq!(token(&store).await, None);
+        // A landed (non-yielding) failover drops it too.
+        choose(&store, "opus", "t5").await;
+        assert!(store
+            .failover_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                Some("opus"),
+                "claude-code@b1",
+                Some(("providerReturn", "{\"home\":\"claude-code\"}")),
+                false,
+                &now_iso(),
+            )
+            .await
+            .expect("failover"));
+        let row = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
+        let metadata = row.metadata.expect("metadata");
+        assert!(metadata.get(MANUAL_CHOICE_METADATA_KEY).is_none());
+        assert_eq!(metadata["providerReturn"]["home"], "claude-code");
+        assert_eq!(metadata["keep"], 1);
+    }
+
+    /// Remote launch: the `remotePlacement` projection mirror is daemon-owned.
+    /// A whole-document metadata write (`agent.update` and friends) can
+    /// neither erase it nor forge one.
+    #[tokio::test]
+    async fn whole_document_writes_cannot_set_or_clear_remote_placement() {
+        use intent_core::now_iso;
+        use intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-remote-placement".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let placed = AgentId("agent-placed".to_string());
+        let local = AgentId("agent-local".to_string());
+        for id in [&placed, &local] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert");
+        }
+        store
+            .set_agent_session_metadata_key_json(
+                &ws_id,
+                &placed,
+                REMOTE_PLACEMENT_METADATA_KEY,
+                r#"{"nodeId":"node-1"}"#,
+                &now_iso(),
+            )
+            .await
+            .expect("set view");
+        let forged =
+            serde_json::json!({ "keep": 1, REMOTE_PLACEMENT_METADATA_KEY: { "nodeId": "forged" } });
+        for id in [&placed, &local] {
+            store
+                .update_agent_session_metadata(&ws_id, id, Some(&forged), &now_iso())
+                .await
+                .expect("whole write");
+        }
+        let placed_meta = store
+            .get_agent_session_with_transcript(&placed)
+            .await
+            .unwrap()
+            .metadata
+            .unwrap();
+        assert_eq!(
+            placed_meta[REMOTE_PLACEMENT_METADATA_KEY]["nodeId"],
+            "node-1"
+        );
+        assert_eq!(placed_meta["keep"], 1);
+        let local_meta = store
+            .get_agent_session_with_transcript(&local)
+            .await
+            .unwrap()
+            .metadata
+            .unwrap();
+        assert!(local_meta.get(REMOTE_PLACEMENT_METADATA_KEY).is_none());
+        assert_eq!(local_meta["keep"], 1);
+    }
+
+    /// Review of intentd#2624: whole-document writes keep the daemon-owned
+    /// keys (the manual-choice token and the return state) as stored, for
+    /// every document shape a stale snapshot can carry (JSON null, array,
+    /// scalar, object), and never bring back stale values.
+    #[tokio::test]
+    async fn whole_document_writes_keep_daemon_owned_keys_for_any_shape() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-daemon-owned".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let shapes = [
+            serde_json::json!(null),
+            serde_json::json!([1, 2]),
+            serde_json::json!("legacy"),
+            serde_json::json!(7),
+        ];
+        for shape in shapes {
+            for full_row in [true, false] {
+                let case = format!("{shape} full_row={full_row}");
+                let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+                let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+                session.provider = Some("claude-code".to_string());
+                session.model = Some("opus".to_string());
+                store.insert_agent_session(&session).await.expect("insert");
+                let mut stale = store
+                    .get_agent_session_with_transcript(&agent_id)
+                    .await
+                    .expect("get");
+                stale.metadata = Some(shape.clone());
+                store
+                    .set_agent_session_model_choice(
+                        &ws_id,
+                        &agent_id,
+                        "opus",
+                        Some("claude-code"),
+                        Some("t1"),
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("choose");
+                store
+                    .set_agent_session_metadata_key_json(
+                        &ws_id,
+                        &agent_id,
+                        PROVIDER_RETURN_METADATA_KEY,
+                        r#"{"home":"claude-code@new"}"#,
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("return state");
+                if full_row {
+                    store
+                        .update_agent_session(&ws_id, &stale)
+                        .await
+                        .expect("update");
+                } else {
+                    store
+                        .update_agent_session_metadata(
+                            &ws_id,
+                            &agent_id,
+                            stale.metadata.as_ref(),
+                            &now_iso(),
+                        )
+                        .await
+                        .expect("metadata write");
+                }
+                let metadata = store
+                    .get_agent_session_with_transcript(&agent_id)
+                    .await
+                    .expect("get")
+                    .metadata
+                    .expect("metadata");
+                assert_eq!(metadata[MANUAL_CHOICE_METADATA_KEY], "t1", "{case}");
+                assert_eq!(
+                    metadata[PROVIDER_RETURN_METADATA_KEY]["home"], "claude-code@new",
+                    "{case}"
+                );
+                assert_eq!(metadata["priorNonObjectMetadata"], shape, "{case}");
+            }
+        }
+
+        // Stale object documents: stored values win, absent ones stay absent.
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.provider = Some("claude-code".to_string());
+        session.model = Some("opus".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+        let mut stale = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
+        stale.metadata = Some(serde_json::json!({
+            "keep": 1,
+            MANUAL_CHOICE_METADATA_KEY: "old",
+            PROVIDER_RETURN_METADATA_KEY: { "home": "claude-code@old", "returning": "timer" },
+        }));
+        for full_row in [true, false] {
+            if full_row {
+                store
+                    .update_agent_session(&ws_id, &stale)
+                    .await
+                    .expect("update");
+            } else {
+                store
+                    .update_agent_session_metadata(
+                        &ws_id,
+                        &agent_id,
+                        stale.metadata.as_ref(),
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("metadata write");
+            }
+            let metadata = store
+                .get_agent_session_with_transcript(&agent_id)
+                .await
+                .expect("get")
+                .metadata
+                .unwrap();
+            assert_eq!(metadata["keep"], 1);
+            assert!(
+                metadata.get(MANUAL_CHOICE_METADATA_KEY).is_none(),
+                "full_row={full_row}"
+            );
+            assert!(
+                metadata.get(PROVIDER_RETURN_METADATA_KEY).is_none(),
+                "full_row={full_row}"
+            );
+        }
+        store
+            .set_agent_session_metadata_key_json(
+                &ws_id,
+                &agent_id,
+                PROVIDER_RETURN_METADATA_KEY,
+                r#"{"home":"claude-code@new"}"#,
+                &now_iso(),
+            )
+            .await
+            .expect("return state");
+        store
+            .update_agent_session(&ws_id, &stale)
+            .await
+            .expect("update");
+        let metadata = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get")
+            .metadata
+            .unwrap();
+        assert_eq!(
+            metadata[PROVIDER_RETURN_METADATA_KEY],
+            serde_json::json!({ "home": "claude-code@new" }),
+            "replaced as a whole, never merged with the stale state"
+        );
+        assert!(metadata.get(MANUAL_CHOICE_METADATA_KEY).is_none());
+        assert_eq!(metadata["keep"], 1);
+    }
+
+    /// Review of intentd#2624: the stored manual-choice token is
+    /// authoritative against whole-document writers. A stale snapshot
+    /// (without the token, or with an older one) neither erases a newer
+    /// choice nor restores a used one; a write that changes the selection
+    /// drops it; the yielding identity-guarded writer does not land while it
+    /// is pending.
+    #[tokio::test]
+    async fn stale_full_writes_keep_the_stored_manual_choice() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-manual-choice-stale".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.provider = Some("claude-code".to_string());
+        session.model = Some("opus".to_string());
+        session.metadata = Some(serde_json::json!({ "keep": 1 }));
+        store.insert_agent_session(&session).await.expect("insert");
+        let get = || {
+            let store = store.clone();
+            let agent_id = agent_id.clone();
+            async move {
+                store
+                    .get_agent_session_with_transcript(&agent_id)
+                    .await
+                    .expect("get")
+            }
+        };
+        let token_in = |s: &AgentSession| {
+            s.metadata.as_ref().and_then(|m| {
+                m.get(MANUAL_CHOICE_METADATA_KEY)
+                    .and_then(|t| t.as_str().map(str::to_owned))
+            })
+        };
+        let choose = |model: &'static str, t: &'static str| {
+            let store = store.clone();
+            let agent_id = agent_id.clone();
+            let ws_id = ws_id.clone();
+            async move {
+                store
+                    .set_agent_session_model_choice(
+                        &ws_id,
+                        &agent_id,
+                        model,
+                        Some("claude-code"),
+                        Some(t),
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("choose");
+            }
+        };
+
+        let stale_none = get().await;
+        choose("opus", "t1").await;
+        let stale_t1 = get().await;
+        choose("sonnet", "t2").await;
+        choose("opus", "t3").await;
+
+        // A stale rename-style full-row write, without the token.
+        let mut renamed = stale_none.clone();
+        renamed.name = "renamed".to_string();
+        store
+            .update_agent_session(&ws_id, &renamed)
+            .await
+            .expect("update");
+        let row = get().await;
+        assert_eq!(row.name, "renamed");
+        assert_eq!(token_in(&row).as_deref(), Some("t3"));
+        assert_eq!(row.metadata.as_ref().unwrap()["keep"], 1);
+        // With an older token: the stored one wins.
+        store
+            .update_agent_session(&ws_id, &stale_t1)
+            .await
+            .expect("update");
+        assert_eq!(token_in(&get().await).as_deref(), Some("t3"));
+        store
+            .update_agent_session_metadata(
+                &ws_id,
+                &agent_id,
+                stale_t1.metadata.as_ref(),
+                &now_iso(),
+            )
+            .await
+            .expect("metadata write");
+        assert_eq!(token_in(&get().await).as_deref(), Some("t3"));
+        store
+            .update_agent_session_metadata(&ws_id, &agent_id, None, &now_iso())
+            .await
+            .expect("metadata write");
+        assert_eq!(token_in(&get().await).as_deref(), Some("t3"));
+
+        // The yielding identity-guarded writer waits for the pending choice.
+        assert!(!store
+            .set_agent_session_metadata_key_json_if_identity(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                Some("opus"),
+                "providerReturn",
+                "{}",
+                true,
+                &now_iso(),
+            )
+            .await
+            .expect("yielding write"));
+        assert!(get()
+            .await
+            .metadata
+            .unwrap()
+            .get("providerReturn")
+            .is_none());
+
+        // Once used, a stale document never brings a token back.
+        assert!(store
+            .take_agent_session_manual_choice(&ws_id, &agent_id, "t3")
+            .await
+            .expect("take"));
+        store
+            .update_agent_session(&ws_id, &stale_t1)
+            .await
+            .expect("update");
+        assert_eq!(token_in(&get().await), None);
+        store
+            .update_agent_session_metadata(
+                &ws_id,
+                &agent_id,
+                stale_t1.metadata.as_ref(),
+                &now_iso(),
+            )
+            .await
+            .expect("metadata write");
+        assert_eq!(token_in(&get().await), None);
+        assert!(store
+            .set_agent_session_metadata_key_json_if_identity(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                Some("opus"),
+                "providerReturn",
+                "{}",
+                true,
+                &now_iso(),
+            )
+            .await
+            .expect("yielding write, nothing pending"));
+
+        // A full-row write that changes the selection drops the token: it
+        // named the previous selection.
+        choose("opus", "t4").await;
+        let mut moved = get().await;
+        moved.model = Some("sonnet".to_string());
+        store
+            .update_agent_session(&ws_id, &moved)
+            .await
+            .expect("update");
+        let row = get().await;
+        assert_eq!(row.model.as_deref(), Some("sonnet"));
+        assert_eq!(token_in(&row), None);
+    }
+
+    /// The failover writer can carry one metadata key in the same statement
+    /// (the provider move and the return bookkeeping are atomic), and the
+    /// identity-guarded metadata writer refuses once a concurrent switch
+    /// moved the session, so stale bookkeeping can never land after it.
+    #[tokio::test]
+    async fn failover_bookkeeping_is_atomic_with_the_move_and_identity_guarded() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-failover-meta".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.provider = Some("claude-code".to_string());
+        session.model = Some("opus".to_string());
+        session.metadata = Some(serde_json::json!({ "keep": 1 }));
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let state = r#"{"home":"claude-code","awayOn":"claude-code@pb"}"#;
+        assert!(store
+            .failover_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                Some("opus"),
+                "claude-code@pb",
+                Some(("providerReturn", state)),
+                false,
+                &now_iso(),
+            )
+            .await
+            .unwrap());
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .unwrap();
+        assert_eq!(after.provider.as_deref(), Some("claude-code@pb"));
+        let metadata = after.metadata.unwrap();
+        assert_eq!(metadata["providerReturn"]["awayOn"], "claude-code@pb");
+        assert_eq!(metadata["keep"], 1, "sibling keys preserved");
+
+        // A user switch lands; stale bookkeeping for the old identity is refused.
+        store
+            .set_agent_session_model(
+                &ws_id,
+                &agent_id,
+                "opus",
+                Some("claude-code@pwork"),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        assert!(!store
+            .set_agent_session_metadata_key_json_if_identity(
+                &ws_id,
+                &agent_id,
+                "claude-code@pb",
+                Some("opus"),
+                "providerReturn",
+                state,
+                false,
+                &now_iso(),
+            )
+            .await
+            .unwrap());
+        assert!(store
+            .set_agent_session_metadata_key_json_if_identity(
+                &ws_id,
+                &agent_id,
+                "claude-code@pwork",
+                Some("opus"),
+                "providerReturn",
+                "null",
+                false,
+                &now_iso(),
+            )
+            .await
+            .unwrap());
+        let cleared = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .unwrap()
+            .metadata
+            .unwrap();
+        assert!(cleared["providerReturn"].is_null());
     }
 
     /// `latest_agent_identity_notice` (intent-hq/intent#5737) returns the
@@ -13716,6 +15603,35 @@ mod tests {
             .expect("model_changed row");
         assert_eq!(latest["type"], "model_changed", "newest identity row wins");
         assert_eq!(latest["toProvider"], "a");
+
+        // A quota failover switch is an identity change too.
+        append(
+            &agent_id,
+            "system",
+            serde_json::json!({ "type": "provider_failover", "fromProvider": "a", "toProvider": "c" }),
+        )
+        .await;
+        let latest = store
+            .latest_agent_identity_notice(&agent_id)
+            .await
+            .expect("read")
+            .expect("provider_failover row");
+        assert_eq!(latest["type"], "provider_failover");
+        assert_eq!(latest["toProvider"], "c");
+
+        let recent = store
+            .recent_agent_identity_notices(&agent_id, 2)
+            .await
+            .expect("read");
+        let types: Vec<_> = recent.iter().map(|m| m["type"].clone()).collect();
+        assert_eq!(
+            types,
+            vec![
+                serde_json::json!("provider_failover"),
+                serde_json::json!("model_changed")
+            ],
+            "newest first, bounded, identity rows only"
+        );
     }
 
     /// monorepo#1936 regression: the spawn path's system-prompt persist is a
@@ -13751,7 +15667,10 @@ mod tests {
             .await
             .expect_err("cross-workspace write must not mutate");
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
-        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        let unchanged = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(unchanged.system_prompt, None);
 
         // A model switch lands mid-spawn (after the spawn path read its
@@ -13774,7 +15693,10 @@ mod tests {
             .set_agent_session_system_prompt(&ws_id, &agent_id, "assembled prompt")
             .await
             .expect("persist system prompt");
-        let after = store.get_agent_session(&agent_id).await.expect("get after");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get after");
         assert_eq!(after.system_prompt.as_deref(), Some("assembled prompt"));
         // The read backstop splits the compound id; the prefix wins over the
         // stored provider column.
@@ -13790,10 +15712,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_agent_session_message_stats() {
-        use intent_core::{
-            now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-            WorkspaceStatus,
-        };
+        use intent_core::{now_iso, AgentSession, AgentStatus, Workspace};
 
         let tmp = TempDb::new("test-msg-stats");
         let store = Store::open(&tmp).await.expect("create test store");
@@ -13805,49 +15724,9 @@ mod tests {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store.insert_workspace(&workspace).await.expect("insert");
 
@@ -13901,6 +15780,7 @@ mod tests {
                 pending_delete_at: None,
                 retired_at: None,
                 notifications_muted: false,
+                pinned: false,
             };
             store.insert_agent_session(&session).await.expect("insert");
         }
@@ -13984,7 +15864,7 @@ mod tests {
             ),
         ];
         for (name, sql) in statements {
-            let plan_rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+            let plan_rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
                 .bind("ws-any")
                 .fetch_all(store.read_pool())
                 .await
@@ -13999,6 +15879,271 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The per-turn first-turn probe must stay one index seek: a plan that
+    /// scans `agent_message` (or reads its rows instead of the covering
+    /// index) would bring back the per-turn cost that grew with the transcript.
+    #[tokio::test]
+    async fn agent_has_assistant_message_is_a_covering_index_seek() {
+        let tmp = TempDb::new("test-assistant-probe-plan");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let plan_rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {AGENT_HAS_ASSISTANT_MESSAGE_SQL}"
+        )))
+        .bind("agent-any")
+        .fetch_all(store.read_pool())
+        .await
+        .expect("explain query plan");
+        let details: Vec<String> = plan_rows.iter().map(|row| row.get("detail")).collect();
+        let message_steps: Vec<&String> = details
+            .iter()
+            .filter(|detail| detail.contains("agent_message"))
+            .collect();
+        assert!(!message_steps.is_empty(), "plan: {details:?}");
+        for detail in message_steps {
+            assert!(
+                detail.starts_with("SEARCH")
+                    && detail.contains("COVERING INDEX idx_agent_message_agent_role_seq"),
+                "probe must seek the (agent_id, role, seq) covering index, got {detail:?} \
+                 (plan: {details:?})"
+            );
+        }
+    }
+
+    /// `agent_has_assistant_message` agrees with the full-transcript check it
+    /// replaced across every write path: append, the `agent.replaceMessages`
+    /// swap, the `agent.editAndRegenerate` truncation, and a direct role
+    /// UPDATE — and is scoped to one agent.
+    #[tokio::test]
+    async fn agent_has_assistant_message_tracks_transcript_writes() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-assistant-probe");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-assistant-probe".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent = AgentId("agent-assistant-probe".to_string());
+        let other = AgentId("agent-assistant-probe-other".to_string());
+        for id in [&agent, &other] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+        }
+        let full_check = |store: &Store, id: &AgentId| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                store
+                    .get_agent_messages(&id, None)
+                    .await
+                    .expect("full read")
+                    .iter()
+                    .any(|m| m.role == "assistant")
+            }
+        };
+        let text = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
+
+        assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
+
+        let user = store
+            .append_agent_message(&agent, "user", &text("q1"), &ts)
+            .await
+            .expect("append user");
+        assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(!full_check(&store, &agent).await);
+
+        store
+            .append_agent_message(&agent, "assistant", &text("a1"), &ts)
+            .await
+            .expect("append assistant");
+        let user2 = store
+            .append_agent_message(&agent, "user", &text("q2"), &ts)
+            .await
+            .expect("append user 2");
+        store
+            .append_agent_message(&agent, "assistant", &text("a2"), &ts)
+            .await
+            .expect("append assistant 2");
+        assert!(store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(full_check(&store, &agent).await);
+        assert!(
+            !store.agent_has_assistant_message(&other).await.unwrap(),
+            "another agent's assistant rows do not count"
+        );
+
+        // Truncation that keeps an earlier assistant reply.
+        store
+            .truncate_agent_messages_from(&agent, user2.seq)
+            .await
+            .expect("truncate after first reply");
+        assert!(store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(full_check(&store, &agent).await);
+
+        // Truncation back to the first user message drops every reply.
+        store
+            .truncate_agent_messages_from(&agent, user.seq + 1)
+            .await
+            .expect("truncate to first prompt");
+        assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(!full_check(&store, &agent).await);
+
+        // The replaceMessages swap.
+        let reply = text("swapped");
+        store
+            .replace_agent_messages(
+                &agent,
+                &[ReplaceMessage {
+                    role: "assistant",
+                    content: &reply,
+                    metadata: None,
+                    created_at: &ts,
+                }],
+            )
+            .await
+            .expect("replace");
+        assert!(store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(full_check(&store, &agent).await);
+
+        // A direct role UPDATE.
+        sqlx::query("UPDATE agent_message SET role = 'user' WHERE agent_id = ?")
+            .bind(&agent.0)
+            .execute(store.write_pool())
+            .await
+            .expect("direct update");
+        assert!(!store.agent_has_assistant_message(&agent).await.unwrap());
+        assert!(!full_check(&store, &agent).await);
+    }
+
+    /// The quota-failover partial-turn probe must stay index seeks: both
+    /// the `MAX(seq)` user lookup and the later-assistant test read only the
+    /// `(agent_id, role, seq)` covering index, never `agent_message` rows.
+    #[tokio::test]
+    async fn agent_has_assistant_after_last_user_is_a_covering_index_seek() {
+        let tmp = TempDb::new("test-assistant-after-user-plan");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let plan_rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {AGENT_HAS_ASSISTANT_AFTER_LAST_USER_SQL}"
+        )))
+        .bind("agent-any")
+        .fetch_all(store.read_pool())
+        .await
+        .expect("explain query plan");
+        let details: Vec<String> = plan_rows.iter().map(|row| row.get("detail")).collect();
+        let message_steps: Vec<&String> = details
+            .iter()
+            .filter(|detail| detail.contains("agent_message"))
+            .collect();
+        assert_eq!(message_steps.len(), 2, "plan: {details:?}");
+        for detail in message_steps {
+            assert!(
+                detail.starts_with("SEARCH")
+                    && detail.contains("COVERING INDEX idx_agent_message_agent_role_seq"),
+                "probe must seek the (agent_id, role, seq) covering index, got {detail:?} \
+                 (plan: {details:?})"
+            );
+        }
+    }
+
+    /// `agent_has_assistant_after_last_user` agrees with the transcript scan
+    /// it replaced: no rows, a trailing user row, an answered turn, system
+    /// rows interleaved after the user row, truncation, and per-agent scope.
+    #[tokio::test]
+    async fn agent_has_assistant_after_last_user_matches_transcript_scan() {
+        use intent_core::now_iso;
+        let tmp = TempDb::new("test-assistant-after-user");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-assistant-after-user".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent = AgentId("agent-assistant-after-user".to_string());
+        let other = AgentId("agent-assistant-after-user-other".to_string());
+        for id in [&agent, &other] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert session");
+        }
+        let scan = |store: &Store, id: &AgentId| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                let messages = store
+                    .get_agent_messages(&id, None)
+                    .await
+                    .expect("full read");
+                messages
+                    .iter()
+                    .rposition(|m| m.role == "user")
+                    .is_some_and(|i| messages[i + 1..].iter().any(|m| m.role == "assistant"))
+            }
+        };
+        let check = |expected: bool| {
+            let store = store.clone();
+            let agent = agent.clone();
+            async move {
+                assert_eq!(
+                    store
+                        .agent_has_assistant_after_last_user(&agent)
+                        .await
+                        .unwrap(),
+                    expected
+                );
+                assert_eq!(scan(&store, &agent).await, expected);
+            }
+        };
+        let text = |t: &str| serde_json::json!([{"type": "text", "text": t}]);
+
+        check(false).await;
+        store
+            .append_agent_message(&agent, "assistant", &text("greeting"), &ts)
+            .await
+            .expect("append assistant with no user");
+        check(false).await;
+        let user = store
+            .append_agent_message(&agent, "user", &text("q1"), &ts)
+            .await
+            .expect("append user");
+        check(false).await;
+        store
+            .append_agent_message(&agent, "system", &text("model changed"), &ts)
+            .await
+            .expect("append system");
+        check(false).await;
+        store
+            .append_agent_message(&agent, "assistant", &text("partial"), &ts)
+            .await
+            .expect("append assistant");
+        check(true).await;
+        assert!(
+            !store
+                .agent_has_assistant_after_last_user(&other)
+                .await
+                .unwrap(),
+            "another agent's rows do not count"
+        );
+        store
+            .append_agent_message(&agent, "user", &text("q2"), &ts)
+            .await
+            .expect("append user 2");
+        check(false).await;
+        store
+            .append_agent_message(&agent, "assistant", &text("a2"), &ts)
+            .await
+            .expect("append assistant 2");
+        check(true).await;
+        store
+            .truncate_agent_messages_from(&agent, user.seq + 1)
+            .await
+            .expect("truncate to first prompt");
+        check(false).await;
     }
 
     /// Recompute one session's stats live from `agent_message` — the ground
@@ -14301,9 +16446,76 @@ mod tests {
 
     /// `get_agent_user_message_index` (`agent.listUserMessages`, §5.5)
     /// returns only user-role rows, oldest→newest, with previews bounded to
-    /// the requested char count and metadata passed through verbatim; other
+    /// the requested char count and metadata projected; other
     /// roles are excluded in SQL and an empty/unknown agent yields an empty
     /// index.
+    #[tokio::test]
+    async fn get_agent_user_message_index_classifies_whole_monitor_envelopes() {
+        let tmp = TempDb::new("monitor-index-classification");
+        let store = Store::open(&tmp).await.unwrap();
+        let ts = intent_core::now_iso();
+        let ws = WorkspaceId("ws-monitor-index".into());
+        let agent = AgentId("agent-monitor-index".into());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws, &ts, None))
+            .await
+            .unwrap();
+        let cases = [
+            (serde_json::json!([{"text":"ordinary αβ"}]), None, false),
+            (
+                serde_json::json!([{"text":"legacy"}]),
+                Some(
+                    serde_json::json!({"type":"pr_monitor_wake","repo":"owner/repo","prNumber":4}),
+                ),
+                false,
+            ),
+            (
+                serde_json::json!([{"text":"private"}]),
+                Some(serde_json::json!({"type":"pr_monitor_wake","resource":null})),
+                true,
+            ),
+            (
+                serde_json::json!([{"text":"private"}]),
+                Some(serde_json::json!({"type":"pr_monitor_wake","availability":{}})),
+                true,
+            ),
+            (
+                serde_json::json!([{"text":"private","messageMetadata":{"type":"pr_monitor_wake","resource":{}}},{"text":"sibling"}]),
+                None,
+                true,
+            ),
+            (
+                serde_json::json!(["string block",{"text":"private","messageMetadata":{"type":"pr_monitor_wake","availability":null}}]),
+                None,
+                true,
+            ),
+            (
+                serde_json::json!([{"text":"ordinary","messageMetadata":{"type":"other","resource":{}}}]),
+                None,
+                false,
+            ),
+        ];
+        for (body, metadata, _) in &cases {
+            store
+                .append_agent_message_with_metadata(&agent, "user", body, metadata.as_ref(), &ts)
+                .await
+                .unwrap();
+        }
+        let index = store
+            .get_agent_user_message_index(&agent, 10)
+            .await
+            .unwrap();
+        assert_eq!(index.len(), cases.len());
+        for (item, (_, _, qualified)) in index.iter().zip(&cases) {
+            assert_eq!(item.qualified_monitor, *qualified);
+            assert!(item.preview.chars().count() <= 10);
+        }
+    }
+
     #[tokio::test]
     async fn get_agent_user_message_index_filters_roles_and_bounds_previews() {
         use intent_core::now_iso;
@@ -14395,8 +16607,8 @@ mod tests {
         );
         assert_eq!(
             items[1].metadata,
-            Some(serde_json::json!({"automated": true, "source": "hook"})),
-            "metadata passes through verbatim"
+            Some(serde_json::json!({"source": "hook"})),
+            "metadata is projected to the classification fields"
         );
         assert_eq!(
             items[2].preview.chars().count(),
@@ -14423,6 +16635,186 @@ mod tests {
             .await
             .expect("empty index")
             .is_empty());
+    }
+
+    /// Regression for intent-hq/intent#8278: a busy coordinator's
+    /// event-notification rows carry whole event payloads in
+    /// `metadata.events`, which made the index ~20 MB. The index serves only
+    /// the classification fields, trimmed inside SQL, and the SQL pre-trim
+    /// agrees with the Rust projection on every shape.
+    #[tokio::test]
+    async fn get_agent_user_message_index_projects_heavy_metadata() {
+        let tmp = TempDb::new("index-metadata-projection");
+        let store = Store::open(&tmp).await.unwrap();
+        let ts = intent_core::now_iso();
+        let ws = WorkspaceId("ws-index-projection".into());
+        let agent = AgentId("agent-index-projection".into());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws, &ts, None))
+            .await
+            .unwrap();
+        let report = "r".repeat(64 * 1024);
+        let cases = [
+            (
+                serde_json::json!({
+                    "type": "event_notification",
+                    "events": [{"type": "agent:reportToParent", "report": report}],
+                    "queueInfo": {
+                        "queuedAt": "2026-11-01T07:01:11Z",
+                        "waitedMs": 6200,
+                        "batchId": "b-1",
+                        "queuedMessageId": "q-1",
+                        "extra": {"big": report},
+                    },
+                }),
+                Some(serde_json::json!({
+                    "type": "event_notification",
+                    "queueInfo": {"queuedAt": "2026-11-01T07:01:11Z", "waitedMs": 6200, "batchId": "b-1"},
+                })),
+            ),
+            (
+                serde_json::json!({"fromAgentId": "agent-a", "source": "system", "fromPrincipalId": "p-1", "model": "m"}),
+                Some(
+                    serde_json::json!({"fromAgentId": "agent-a", "source": "system", "fromPrincipalId": "p-1"}),
+                ),
+            ),
+            (
+                serde_json::json!({"type": 7, "source": {"nested": true}, "queueInfo": {"queuedAt": 1, "waitedMs": "x"}}),
+                None,
+            ),
+            (
+                serde_json::json!({"queueInfo": {"queuedMessageId": "q-2"}}),
+                None,
+            ),
+            (serde_json::json!({"userAppMessageId": "app-1"}), None),
+            (
+                serde_json::json!({"queueInfo": {"waitedMs": 1.5}}),
+                Some(serde_json::json!({"queueInfo": {"waitedMs": 1.5}})),
+            ),
+            (serde_json::json!(["not", "an", "object"]), None),
+            (serde_json::json!("string metadata"), None),
+        ];
+        for (metadata, _) in &cases {
+            store
+                .append_agent_message_with_metadata(
+                    &agent,
+                    "user",
+                    &serde_json::json!([{"type": "text", "text": "row"}]),
+                    Some(metadata),
+                    &ts,
+                )
+                .await
+                .unwrap();
+        }
+        let index = store
+            .get_agent_user_message_index(&agent, 10)
+            .await
+            .unwrap();
+        assert_eq!(index.len(), cases.len());
+        for (item, (metadata, expected)) in index.iter().zip(&cases) {
+            assert_eq!(&item.metadata, expected, "projection of {metadata}");
+            assert_eq!(
+                &project_user_message_index_metadata(metadata),
+                expected,
+                "Rust projection of {metadata}"
+            );
+        }
+        let encoded =
+            serde_json::to_string(&index.iter().map(|i| i.metadata.clone()).collect::<Vec<_>>())
+                .unwrap();
+        assert!(
+            encoded.len() < 1024,
+            "heavy keys never leave the store: {encoded}"
+        );
+    }
+
+    /// A paged index read serves the newest `limit` rows oldest→newest, and
+    /// its `next_before_seq` walks older pages to the start without gaps or
+    /// repeats.
+    #[tokio::test]
+    async fn get_agent_user_message_index_page_walks_newest_first() {
+        let tmp = TempDb::new("index-paging");
+        let store = Store::open(&tmp).await.unwrap();
+        let ts = intent_core::now_iso();
+        let ws = WorkspaceId("ws-index-paging".into());
+        let agent = AgentId("agent-index-paging".into());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws, &ts))
+            .await
+            .unwrap();
+        store
+            .insert_agent_session(&baseline_test_session(&agent, &ws, &ts, None))
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for n in 0..7 {
+            let row = store
+                .append_agent_message(
+                    &agent,
+                    "user",
+                    &serde_json::json!([{"type": "text", "text": format!("user {n}")}]),
+                    &ts,
+                )
+                .await
+                .unwrap();
+            ids.push(row.id);
+            store
+                .append_agent_message(
+                    &agent,
+                    "assistant",
+                    &serde_json::json!([{"type": "text", "text": "reply"}]),
+                    &ts,
+                )
+                .await
+                .unwrap();
+        }
+        let page = |before_seq| UserMessageIndexPageRequest {
+            limit: 3,
+            before_seq,
+        };
+        let first = store
+            .get_agent_user_message_index_page(&agent, 300, Some(page(None)))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.items.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+            ids[4..].to_vec(),
+            "newest rows, oldest→newest"
+        );
+        let mut walked: Vec<String> = first.items.iter().map(|i| i.id.clone()).collect();
+        let mut cursor = first.next_before_seq;
+        let mut pages = 1;
+        while let Some(before_seq) = cursor {
+            let next = store
+                .get_agent_user_message_index_page(&agent, 300, Some(page(Some(before_seq))))
+                .await
+                .unwrap();
+            let mut older: Vec<String> = next.items.iter().map(|i| i.id.clone()).collect();
+            older.append(&mut walked);
+            walked = older;
+            cursor = next.next_before_seq;
+            pages += 1;
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(walked, ids, "pages cover every user row exactly once");
+
+        let exact = store
+            .get_agent_user_message_index_page(
+                &agent,
+                300,
+                Some(UserMessageIndexPageRequest {
+                    limit: 7,
+                    before_seq: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.items.len(), 7);
+        assert_eq!(exact.next_before_seq, None, "no older rows remain");
     }
 
     /// The SQL preview extraction (`MESSAGE_FTS_TEXT_SQL` + `substr`) shapes:
@@ -14498,7 +16890,7 @@ mod tests {
 
     /// `get_agent_session_summary` returns the session row with `messages`
     /// empty even when a transcript exists, and maps an unknown id to
-    /// `NotFound` (matching `get_agent_session`).
+    /// `NotFound` (matching `get_agent_session_with_transcript`).
     #[tokio::test]
     async fn get_agent_session_summary_excludes_messages() {
         use intent_core::now_iso;
@@ -14546,6 +16938,83 @@ mod tests {
             Err(Error::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    /// A summary omits `system_prompt` (and the other heavy columns), and the
+    /// only way to persist a change found through one is to re-read the full
+    /// row: `AgentSessionSummary` cannot reach `update_agent_session` (pinned
+    /// at compile time by `tests/agent_session_summary_api.rs`). This guards
+    /// the runtime half: the full-row re-read keeps `system_prompt`, so the
+    /// write-back cannot clear it.
+    #[tokio::test]
+    async fn summary_lacks_heavy_columns_and_full_row_write_back_keeps_system_prompt() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-summary-write".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.system_prompt = Some("keep me".to_string());
+        session.initial_message = Some("first".to_string());
+        store
+            .insert_agent_session(&session)
+            .await
+            .expect("insert session");
+
+        let summary = store
+            .get_agent_session_summary(&agent_id)
+            .await
+            .expect("summary");
+        assert_eq!(summary.system_prompt, None, "summary omits system_prompt");
+        assert_eq!(
+            summary.initial_message, None,
+            "summary omits initial_message"
+        );
+
+        let mut full = store
+            .get_agent_session_without_messages(&agent_id)
+            .await
+            .expect("full row");
+        full.name = "Renamed".to_string();
+        store
+            .update_agent_session(&ws_id, &full)
+            .await
+            .expect("update");
+
+        let stored = store
+            .get_agent_session_without_messages(&agent_id)
+            .await
+            .expect("re-read");
+        assert_eq!(stored.name, "Renamed");
+        assert_eq!(stored.system_prompt.as_deref(), Some("keep me"));
+        assert_eq!(stored.initial_message.as_deref(), Some("first"));
+    }
+
+    /// `AgentSessionSummary::from_session` strips the heavy columns and the
+    /// message log, so a summary built from a full row has the same shape as
+    /// a summary read.
+    #[test]
+    fn summary_from_session_strips_heavy_columns() {
+        let ts = intent_core::now_iso();
+        let ws_id = WorkspaceId("ws-summary-shape".to_string());
+        let agent_id = AgentId("agent-summary-shape".to_string());
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.system_prompt = Some("prompt".to_string());
+        session.initial_message = Some("first".to_string());
+        session.image_blocks = Some(serde_json::json!([{"type": "image"}]));
+        let summary = AgentSessionSummary::from_session(session);
+        assert_eq!(summary.system_prompt, None);
+        assert_eq!(summary.initial_message, None);
+        assert_eq!(summary.image_blocks, None);
+        assert!(summary.messages.is_empty());
+        assert_eq!(summary.into_read_only_session().id, agent_id);
     }
 
     /// `get_agent_statuses` returns every requested id's persisted status in
@@ -14701,7 +17170,10 @@ mod tests {
             .await
             .expect("update metadata");
 
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(after.metadata, Some(metadata.clone()));
         assert_eq!(after.updated_at, later);
         assert_eq!(
@@ -14780,7 +17252,10 @@ mod tests {
                 .remove(&ws)
                 .unwrap(),
         ];
-        let full = store.list_agent_sessions(&ws).await.unwrap();
+        let full = store
+            .list_agent_sessions_with_transcripts(&ws)
+            .await
+            .unwrap();
         let mut individual = Vec::new();
         for session in &full {
             individual.push(store.get_agent_session_summary(&session.id).await.unwrap());
@@ -14792,7 +17267,15 @@ mod tests {
                 let original = full.iter().find(|s| s.id == row.id).unwrap();
                 assert_eq!(row.metadata, original.metadata);
                 let expected = original.metadata.as_ref().and_then(chief_prompt_version);
-                let lite = AgentLite::from_session(row, 0, None, None, None, None, None);
+                let lite = AgentLite::from_session(
+                    row.into_read_only_session(),
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
                 assert_eq!(lite.metadata.chief_prompt_version, expected);
                 assert_eq!(
                     serde_json::to_value(lite).unwrap()["metadata"]
@@ -14823,7 +17306,7 @@ mod tests {
         store.update_agent_session(&ws, &stale).await.unwrap();
         assert_eq!(
             store
-                .get_agent_session(&id)
+                .get_agent_session_with_transcript(&id)
                 .await
                 .unwrap()
                 .metadata
@@ -14844,7 +17327,7 @@ mod tests {
         stale.name = "Renamed by stale writer".into();
         stale.metadata.as_mut().unwrap()["unrelated"] = json!("preserved");
         store.update_agent_session(&ws, &stale).await.unwrap();
-        let after = store.get_agent_session(&id).await.unwrap();
+        let after = store.get_agent_session_with_transcript(&id).await.unwrap();
         assert_eq!(after.name, stale.name);
         assert_eq!(
             after.metadata,
@@ -14906,7 +17389,10 @@ mod tests {
             .await
             .expect("sibling write");
         assert!(wrote);
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         let metadata = after.metadata.as_ref().expect("metadata");
         assert_eq!(metadata["lastSeenMessageId"], serde_json::json!("msg-1"));
         assert_eq!(
@@ -14932,7 +17418,10 @@ mod tests {
             .await
             .expect("guard miss is not an error");
         assert!(!wrote, "stale expected value must not write");
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(
             after.metadata.as_ref().expect("metadata")["lastSeenMessageId"],
             serde_json::json!("msg-1"),
@@ -14952,7 +17441,10 @@ mod tests {
             .await
             .expect("guard hit");
         assert!(wrote);
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         let metadata = after.metadata.as_ref().expect("metadata");
         assert_eq!(metadata["lastSeenMessageId"], serde_json::json!("msg-2"));
         assert_eq!(
@@ -14981,7 +17473,10 @@ mod tests {
             .await
             .expect("legacy write");
         assert!(wrote);
-        let after = store.get_agent_session(&legacy).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&legacy)
+            .await
+            .expect("get");
         let metadata = after.metadata.as_ref().expect("metadata");
         assert_eq!(metadata["lastSeenMessageId"], serde_json::json!("msg-1"));
         assert_eq!(
@@ -15060,7 +17555,10 @@ mod tests {
             .await
             .expect("no-touch write");
         assert!(wrote);
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(
             after.metadata.as_ref().expect("metadata")["lastSeenMessageId"],
             serde_json::json!("msg-1")
@@ -15083,7 +17581,10 @@ mod tests {
             .await
             .expect("guard miss is not an error");
         assert!(!wrote);
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(after.updated_at, pinned);
 
         // Default variant: `Some(ts)` still refreshes the column.
@@ -15100,7 +17601,10 @@ mod tests {
             .await
             .expect("stamping write");
         assert!(wrote);
-        let after = store.get_agent_session(&agent_id).await.expect("get");
+        let after = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
         assert_eq!(
             after.updated_at, later,
             "updated_at: Some(ts) must refresh the column"
@@ -15998,10 +18502,12 @@ mod tests {
         // migration added), then re-run the migration file verbatim via
         // raw_sql — no statement re-parsing (PR #742 review).
         for column in ["last_assistant_preview", "last_user_preview"] {
-            sqlx::query(&format!("ALTER TABLE agent_session DROP COLUMN {column}"))
-                .execute(store.write_pool())
-                .await
-                .expect("drop preview column");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE agent_session DROP COLUMN {column}"
+            )))
+            .execute(store.write_pool())
+            .await
+            .expect("drop preview column");
         }
         sqlx::raw_sql(include_str!(
             "../migrations/0066_agent_session_last_message_previews.sql"
@@ -16677,7 +19183,7 @@ mod tests {
             .expect("insert seeded session");
         let stamped = read_id_column(&store, &seeded).await;
         let persisted = store
-            .get_agent_session(&seeded)
+            .get_agent_session_with_transcript(&seeded)
             .await
             .expect("reload seeded session");
         assert_eq!(persisted.messages.len(), 3);
@@ -18007,7 +20513,10 @@ mod tests {
         session.harness_features = Some(snapshot.clone());
         store.insert_agent_session(&session).await.expect("insert");
 
-        let full = store.get_agent_session(&session.id).await.expect("get");
+        let full = store
+            .get_agent_session_with_transcript(&session.id)
+            .await
+            .expect("get");
         assert_eq!(full.harness_version, "2.3");
         assert_eq!(full.harness_features, Some(snapshot.clone()));
         let summary = store
@@ -18043,7 +20552,10 @@ mod tests {
         .await
         .expect("raw legacy insert");
 
-        let full = store.get_agent_session(&session.id).await.expect("get");
+        let full = store
+            .get_agent_session_with_transcript(&session.id)
+            .await
+            .expect("get");
         assert_eq!(full.harness_version, "1.0", "backfill pins 1.0");
         assert_eq!(full.harness_features, None, "legacy rows carry no snapshot");
         let summary = store
@@ -18136,6 +20648,7 @@ mod tests {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             created_at: ts.clone(),
@@ -18313,57 +20826,15 @@ mod tests {
 
     /// Insert a minimal workspace row so agent-session FKs resolve.
     async fn insert_test_workspace(store: &Store, ws_id: &WorkspaceId) {
-        use intent_core::{
-            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-        };
+        use intent_core::{now_iso, Workspace};
         let ts = now_iso();
         let workspace = Workspace {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store
             .insert_workspace(&workspace)
@@ -18596,7 +21067,7 @@ mod tests {
             "EXPLAIN QUERY PLAN {}",
             search_messages_fts_sql(true, true, true)
         );
-        let plan: Vec<String> = sqlx::query(&sql)
+        let plan: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind("ws-plan")
             .bind(PREFER_WORKSPACE_BOOST)
             .bind(ARCHIVED_WORKSPACE_PENALTY)

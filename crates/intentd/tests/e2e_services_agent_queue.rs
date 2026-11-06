@@ -7,15 +7,12 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;
 
-use intent_core::{
-    now_iso, AgentId, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
-};
+use intent_core::{now_iso, AgentId, Workspace, WorkspaceApi, WorkspaceId};
 use intent_services::{EventBus, Services};
 use intent_store::Store;
 use serde_json::json;
@@ -26,49 +23,11 @@ fn workspace(id: &WorkspaceId, path: &Path) -> Workspace {
         id: id.clone(),
         title: "E2E-agent-queue".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts.clone(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
         path: Some(path.display().to_string()),
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
         worktree_path: Some(path.display().to_string()),
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -82,7 +41,7 @@ async fn setup() -> (Arc<Services>, WorkspaceId, tempfile::TempDir) {
 
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(tmp.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(&ws_root))
         .with_event_bus(bus.clone());
@@ -251,7 +210,7 @@ async fn agent_diagnostics_baseline() {
 
     // Get diagnostics with no agents
     let diag = services
-        .agent_diagnostics(ws.clone(), None, None, None)
+        .agent_diagnostics(ws.clone(), None, None, None, None)
         .await
         .expect("get diagnostics");
     assert_eq!(diag["ok"], true);
@@ -275,7 +234,7 @@ async fn agent_diagnostics_baseline() {
 
     // Get diagnostics focused on this agent
     let diag2 = services
-        .agent_diagnostics(ws.clone(), Some(agent_id.clone()), None, None)
+        .agent_diagnostics(ws.clone(), Some(agent_id.clone()), None, None, None)
         .await
         .expect("get diagnostics with agent filter");
     assert_eq!(diag2["ok"], true);

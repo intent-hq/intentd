@@ -10,7 +10,7 @@ use crate::repository_read_source::tests::{ActualRead, ReadServer};
 use intent_acp::mcp_server::WorkspaceMcpServer;
 use intent_core::{
     AgentId, AgentSession, HistoricalTargetSource, PrincipalId, ReviewSelectionOutcome,
-    WorkspaceGitRoot, WorkspaceGitRootId,
+    ReviewSelectionSource, WorkspaceGitRoot, WorkspaceGitRootId,
 };
 use intent_store::RepositoryLifecycleObserver;
 use intent_store::{RepositorySelectionChange, RepositorySelectionWriteResult};
@@ -26,10 +26,16 @@ impl LiveFixture {
     pub(crate) async fn new(http: &ReadServer) -> Self {
         Self::from_base(ActualRead::new(http).await).await
     }
+    pub(crate) async fn with_version(http: &ReadServer, version: &str) -> Self {
+        Self::from_base_with_version(ActualRead::new(http).await, version).await
+    }
     async fn from_base(base: ActualRead) -> Self {
+        Self::from_base_with_version(base, "3.0").await
+    }
+    async fn from_base_with_version(base: ActualRead, version: &str) -> Self {
         let session: AgentSession = serde_json::from_value(json!({
             "id":AgentId::new(),"workspaceId":base.git.workspace.id,"name":"real-context",
-            "status":"active","harnessVersion":"3.0", "createdAt":"2026-09-28T00:00:00Z","updatedAt":"2026-09-28T00:00:00Z"
+            "status":"active","harnessVersion":version, "createdAt":"2026-09-28T00:00:00Z","updatedAt":"2026-09-28T00:00:00Z"
         })).unwrap();
         base.auth
             .service
@@ -58,7 +64,8 @@ impl LiveFixture {
         .unwrap();
         let owner = RepositoryContextOwner::bind(
             base.auth.service.clone(),
-            RepositoryReadOwner::capture(base.auth.service.clone()),
+            RepositoryReadOwner::capture(base.auth.service.clone())
+                .map(RepositoryReadOwner::with_review_monitoring),
             &physical,
         )
         .unwrap();
@@ -247,7 +254,8 @@ async fn live_context_original_allocation_epoch_invalidation_and_checked_overflo
     let foreign = Arc::new(f.base.auth.service.as_ref().clone());
     assert!(RepositoryContextOwner::bind(
         foreign,
-        RepositoryReadOwner::capture(f.base.auth.service.clone()),
+        RepositoryReadOwner::capture(f.base.auth.service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &f.physical
     )
     .is_err());
@@ -268,7 +276,8 @@ async fn live_context_original_allocation_epoch_invalidation_and_checked_overflo
     );
     let separate = RepositoryContextOwner::bind(
         f.base.auth.service.clone(),
-        RepositoryReadOwner::capture(f.base.auth.service.clone()),
+        RepositoryReadOwner::capture(f.base.auth.service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &f.physical,
     )
     .unwrap();
@@ -322,15 +331,22 @@ impl BlockingHold {
         let guard = self.released.lock().unwrap();
         let (guard, timed) = self
             .ready
-            .wait_timeout_while(guard, std::time::Duration::from_secs(30), |done| !*done)
+            .wait_timeout_while(
+                guard,
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(30)),
+                |done| !*done,
+            )
             .unwrap();
         drop(guard);
         assert!(!timed.timed_out(), "blocking fixture release deadline");
     }
     pub(crate) async fn reached(&self) {
-        tokio::time::timeout(std::time::Duration::from_secs(15), self.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(15)),
+            self.entered.notified(),
+        )
+        .await
+        .unwrap();
     }
     pub(crate) fn release(&self) {
         *self.released.lock().unwrap() = true;
@@ -371,9 +387,12 @@ async fn live_context_cancelled_blocking_job_keeps_real_lock_and_rejects_late_pu
         "the real worktree lease stays with the worker"
     );
     held.release();
-    tokio::time::timeout(std::time::Duration::from_secs(15), f.owner.drain_jobs())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(15)),
+        f.owner.drain_jobs(),
+    )
+    .await
+    .unwrap();
     assert_eq!(f.owner.jobs.active.load(Ordering::Acquire), 0);
     assert!(
         f.owner.revision.lock().unwrap().published.is_none(),
@@ -396,11 +415,14 @@ async fn live_context_concurrent_observation_cannot_publish_an_older_attempt() {
     held.reached().await;
     let b = f.prompt_capture().await;
     let second = tokio::spawn(b.prepare());
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        while f.owner.revision.lock().unwrap().attempt < 2 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(15)),
+        async {
+            while f.owner.revision.lock().unwrap().attempt < 2 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     held.release();
@@ -410,8 +432,11 @@ async fn live_context_concurrent_observation_cannot_publish_an_older_attempt() {
     assert_eq!(http.count(), 0);
 }
 
+/// intent-hq/intent#7449: repository owner/name metadata on a new workspace
+/// is not a saved choice, so the live repository context agents see and the
+/// repo-less review read agree on the same Automatic target.
 #[intent_test_macros::daemon_test]
-async fn live_context_historical_primary_and_root_incarnation_never_self_heal_from_remotes() {
+async fn live_context_and_repo_less_read_agree_for_workspace_with_repository_metadata() {
     let http = ReadServer::new().await;
     let mut base = ActualRead::new(&http).await;
     base.auth
@@ -420,14 +445,41 @@ async fn live_context_historical_primary_and_root_incarnation_never_self_heal_fr
         .delete_workspace(&base.git.workspace.id)
         .await
         .unwrap();
-    base.git.workspace.repository_owner = Some("historical-owner".into());
-    base.git.workspace.repository_name = Some("historical-name".into());
+    base.git.workspace.repository_owner = Some("group".into());
+    base.git.workspace.repository_name = Some("project".into());
     base.auth
         .service
         .store
         .insert_workspace(&base.git.workspace)
         .await
         .unwrap();
+    let f = LiveFixture::from_base(base).await;
+    let (_, context) = f.observe().await;
+    let selection = &context.value().context.roots[0].review_selection;
+    assert_eq!(selection.saved, SavedReviewSelection::Automatic);
+    let ReviewSelectionOutcome::Resolved { target, source } = &selection.outcome else {
+        panic!(
+            "metadata must not require a selection: {:?}",
+            selection.outcome
+        );
+    };
+    assert_eq!(*source, ReviewSelectionSource::Automatic);
+    assert_eq!(target.project_path, "group/project");
+    let read =
+        crate::repository_read_source::tests::run(&f.server(), "return await ws.pr.snapshot(4);")
+            .await;
+    assert!(read.to_string().contains("actual review"), "{read}");
+}
+
+#[intent_test_macros::daemon_test]
+async fn live_context_historical_primary_and_root_incarnation_never_self_heal_from_remotes() {
+    let http = ReadServer::new().await;
+    let base = ActualRead::new(&http).await;
+    crate::repository_admission_source_tests::fixtures::Fixture::seed_unresolved_history(
+        &base.auth.service.store,
+        &base.git.workspace.id,
+    )
+    .await;
     let f = LiveFixture::from_base(base).await;
     let (_, context) = f.observe().await;
     let saved = &context.value().context.roots[0].review_selection.saved;
@@ -526,7 +578,8 @@ async fn live_context_foreign_domain_pending_wire_and_physical_loss_never_gain_o
     let other = LiveFixture::new(&other_http).await;
     assert!(RepositoryContextOwner::bind(
         f.base.auth.service.clone(),
-        RepositoryReadOwner::capture(f.base.auth.service.clone()),
+        RepositoryReadOwner::capture(f.base.auth.service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &other.physical
     )
     .is_err());
@@ -557,7 +610,8 @@ async fn live_context_foreign_domain_pending_wire_and_physical_loss_never_gain_o
         .unwrap();
     assert!(RepositoryContextOwner::bind(
         f.base.auth.service.clone(),
-        RepositoryReadOwner::capture(f.base.auth.service.clone()),
+        RepositoryReadOwner::capture(f.base.auth.service.clone())
+            .map(RepositoryReadOwner::with_review_monitoring),
         &f.physical
     )
     .is_err());

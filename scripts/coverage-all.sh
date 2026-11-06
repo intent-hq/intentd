@@ -28,14 +28,22 @@ echo "Running all workspace tests with coverage instrumentation (nextest)..."
 # auggie_context_e2e test is env-gated (INTENTD_AUGGIE_E2E) and skips cleanly in CI
 # STAB-40, STAB-42, STAB-43, STAB-44 fixed (file sync, multi-threaded runtime, timeout multiplier)
 # Note: nextest does not run doctests; the workspace has none, so nothing is lost
-INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" scripts/with-test-policy.sh cargo llvm-cov --no-report nextest --workspace
+# --max-fail=25: keep running after a failure, so one merge-queue run lists
+# every failing test instead of one per ejection (intentd#2543: the first
+# failure left 10424/15393 tests unrun), yet stop a systemic break (every e2e
+# test hanging to its 180s kill) well before the step timeout. The exit
+# status still fails the job.
+# In CI, ci-killed-rustc-retry.sh retries the build once when the runner
+# kills rustc with no compiler error (an out-of-memory kill); locally it
+# runs the command unchanged.
+INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" scripts/ci-killed-rustc-retry.sh "$BASH" scripts/with-test-policy.sh cargo llvm-cov --no-report nextest --max-fail=25 --workspace
 
 # Generate lcov.info if requested (for CI artifact upload)
 # Do this BEFORE the floor check so the artifact is available even on failure
 if [ "${GENERATE_LCOV:-}" = "1" ]; then
     echo ""
     echo "Generating lcov.info..."
-    cargo llvm-cov report --lcov --output-path lcov.info
+    "$BASH" scripts/coverage-report.sh --lcov --output-path lcov.info
 fi
 
 # One report invocation prints the summary AND enforces the floor (if a numeric
@@ -55,9 +63,9 @@ if [ $# -gt 0 ]; then
 else
     echo "Generating coverage report..."
 fi
-if ! cargo llvm-cov report "${REPORT_ARGS[@]}" | tee coverage-summary.txt; then
+if ! "$BASH" scripts/coverage-report.sh "${REPORT_ARGS[@]}" | tee coverage-summary.txt; then
     # Only a floor miss leaves a rendered summary behind; other report failures
-    # (profdata merge, missing llvm-tools) already print their own error.
+    # (coverage tooling faults, missing llvm-tools) already print their own error.
     if [ -n "$FLOOR" ] && grep -q '^TOTAL' coverage-summary.txt; then
         echo "ERROR: line coverage is below the ${FLOOR}% floor (see TOTAL above)" >&2
     fi

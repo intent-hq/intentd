@@ -28,9 +28,12 @@ async fn disconnect_cancels_the_operation_and_cancellation_cannot_be_overwritten
     );
     assert_eq!(op.status().phase, Phase::Cancelled);
     drop(op);
-    tokio::time::timeout(std::time::Duration::from_millis(50), signal.cancelled())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_millis(50)),
+        signal.cancelled(),
+    )
+    .await
+    .unwrap();
 }
 
 #[test]

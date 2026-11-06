@@ -1,0 +1,107 @@
+# End-to-end test map for scripts/changed-tests.sh (`make test-changed`, CI's
+# coverage-changed).
+#
+# A change to crates/<c>/src selects only <c>'s own tests, but the tests that
+# exercise that source often live in another crate (intentd's end-to-end
+# suites, or another crate's unit tests). Each entry below makes a change to
+# matching source also run the named module, so PR CI catches the break
+# instead of the merge queue (intentd#2617: a script-binding change in intent-acp broke
+# e2e_wss_hook_mcp_tools::script_monitors, which only coverage-e2e ran).
+#
+# Format, one entry per line (`#` starts a comment line):
+#   <source glob>  <crate>::<test binary>  [<module path>]
+# - <source glob>: a Bash pattern matched against the repo-relative path of a
+#   changed file; `*` also matches `/`.
+# - <crate>::<test binary>: the nextest binary id, e.g. intentd::suite_wss_g_r
+#   (the cargo [[test]] target, root file crates/<crate>/tests/<binary>.rs),
+#   or <crate>::lib for the crate's library unit tests (root file
+#   crates/<crate>/src/lib.rs; the crate must not also have a tests/lib.rs).
+# - <module path>: the test-name prefix inside that binary, e.g.
+#   e2e_wss_hook_mcp_tools::script_monitors or, for a lib,
+#   model_preference::tests; omit it to run the whole binary.
+# The selection is `--test <binary> -E 'binary_id(=<crate>::<binary>)&test(/^(<module path>)::/)'`,
+# or `--lib -E 'binary_id(=<crate>)&test(/^(<module path>)::/)'` for <crate>::lib.
+#
+# `scripts/changed-tests.sh --check-map` (CI's release-scripts job, and every
+# selection run) fails when a glob matches no file or a binary or module no
+# longer exists. Editing this file runs every module it names.
+
+# Script bindings (ws.script.*): the MCP binding drives script creation,
+# start/run and monitors end to end.
+crates/intent-acp/src/mcp_server/bindings/script.rs  intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
+crates/intent-acp/src/mcp_server/bindings/script.rs  intentd::suite_wss_s_z    e2e_wss_script_monitors
+crates/intent-acp/src/mcp_server/bindings/script.rs  intentd::wss_integration  script_lifecycle
+
+# Script bridge (intent-js): every ws.* call from an agent's workspace_api
+# script or a hook's script crosses its host() bridge. A change to its src
+# alone selects only intent-js's own tests; intentd#2811 (engine.rs plus an
+# intent-acp test) ran intent-acp and intent-js, then failed coverage-e2e in
+# the merge queue on desktop_control::cursor_move. desktop_control drives
+# ws.desktop.* through workspace_api, script_lifecycle runs workspace_api
+# scripts over MCP, and e2e_wss_hook_mcp_tools runs hook scripts (hook_manager
+# evaluates them through intent-js). The workspace_api binding suites call
+# ws.* bindings through the bridge end to end, and e2e_hook_lifecycle runs
+# hook scripts. e2e_wss_archive_from_hook and e2e_wss_display_status_hooks
+# schedule hooks through workspace_api and run their scripts;
+# e2e_wss_chief_workspace and e2e_mock_agent_ws_app call ws.app.* and the
+# chief bindings through workspace_api; e2e_mcp_bridge_resilience runs a slow
+# workspace_api script (its other scenarios test the mcp-bridge transport, but
+# a map entry selects the whole module). The library unit tests of every
+# crate depending on intent-js directly (intent-acp's tests_wsapi*,
+# intent-services, intent-svc-runtime's hook_manager) are selected by
+# changed-tests.sh's lib_rdeps_roots, not by entries here.
+crates/intent-js/src/*                               intentd::wss_integration  desktop_control
+crates/intent-js/src/*                               intentd::wss_integration  script_lifecycle
+crates/intent-js/src/*                               intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools
+crates/intent-js/src/*                               intentd::suite_wss_agents e2e_mock_agent_workspace_api_bindings
+crates/intent-js/src/*                               intentd::suite_wss_agents e2e_mock_agent_workspace_api_bindings2
+crates/intent-js/src/*                               intentd::suite_e2e        e2e_hook_lifecycle
+crates/intent-js/src/*                               intentd::suite_e2e        e2e_mcp_bridge_resilience
+crates/intent-js/src/*                               intentd::suite_wss_a_f    e2e_wss_archive_from_hook
+crates/intent-js/src/*                               intentd::suite_wss_a_f    e2e_wss_display_status_hooks
+crates/intent-js/src/*                               intentd::suite_wss_a_f    e2e_wss_chief_workspace
+crates/intent-js/src/*                               intentd::suite_wss_agents e2e_mock_agent_ws_app
+
+# Desktop binding (ws.desktop.*): the workspace_api tests that drive it.
+crates/intent-acp/src/mcp_server/bindings/desktop.rs intentd::wss_integration  desktop_control
+
+# Script monitors: registration, completion wakes and the start-time monitor.
+crates/intent-core/src/script_monitor.rs             intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
+crates/intent-core/src/script_monitor.rs             intentd::suite_wss_s_z    e2e_wss_script_monitors
+crates/intent-svc-runtime/src/script_monitor.rs      intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
+crates/intent-svc-runtime/src/script_monitor.rs      intentd::suite_wss_s_z    e2e_wss_script_monitors
+crates/intent-svc-runtime/src/script_ops.rs          intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
+crates/intent-svc-runtime/src/script_ops.rs          intentd::suite_wss_s_z    e2e_wss_script_monitors
+crates/intent-svc-runtime/src/script_ops/monitors.rs intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
+crates/intent-svc-runtime/src/script_ops/monitors.rs intentd::suite_wss_s_z    e2e_wss_script_monitors
+
+# Adapter pins (claude-agent-acp / codex-acp): the guards that must move with
+# a pin bump live in intent-services' unit tests and an intentd end-to-end
+# module, so a pin-only PR's coverage-changed ran none of them and each
+# merge-queue run surfaced one more (intentd#2543). The auto-pin-acp-adapters
+# PRs edit both files. claude_adapter_contract is not mapped: it skips without
+# its adapter fixture, and CI's check job already runs it with one.
+crates/intent-providers/src/config.rs                    intent-services::lib      agent_workers::tests
+crates/intent-providers/src/config.rs                    intent-services::lib      model_preference::tests
+crates/intent-providers/src/config.rs                    intentd::suite_wss_agents e2e_wss_agent_workers
+crates/intent-providers/data/adapter-cli-packages.json   intent-services::lib      agent_workers::tests
+crates/intent-providers/data/adapter-cli-packages.json   intent-services::lib      model_preference::tests
+crates/intent-providers/data/adapter-cli-packages.json   intentd::suite_wss_agents e2e_wss_agent_workers
+
+# Remote launch: the head connector and port, the node runtime and its git
+# checkouts, and the git-over-link pieces they compose, against a real
+# `intentd node` process.
+crates/intent-svc-remote/src/*                       intentd::suite_e2e        e2e_remote_launch
+crates/intent-git/src/node_git.rs                    intentd::suite_e2e        e2e_remote_launch
+crates/intent-transport/src/node_link/*              intentd::suite_e2e        e2e_remote_launch
+crates/intent-core/src/remote_launch.rs              intentd::suite_e2e        e2e_remote_launch
+
+# The shared agent egress registry and the secret / exec bindings are proved
+# by the secret-value egress contract in intent-services.
+crates/intent-acp/src/egress_registry.rs                 intent-services::lib      tests_secret_egress
+crates/intent-acp/src/mcp_server/bindings/secret.rs      intent-services::lib      tests_secret_egress
+crates/intent-acp/src/mcp_server/bindings/host.rs        intent-services::lib      tests_secret_egress
+
+# Workspace base refresh (fetch before worktree/CoW create): the classified
+# base-refresh-failed envelope is exercised end to end over WSS.
+crates/intent-git/src/fetch.rs                       intentd::suite_wss_repo   e2e_wss_workspace_create_worktree_errors

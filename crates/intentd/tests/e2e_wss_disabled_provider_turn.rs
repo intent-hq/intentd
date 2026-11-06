@@ -1,5 +1,5 @@
 //! WSS end-to-end: a turn for a session whose provider was disabled in
-//! Settings > Agents never spawns that provider (intent-hq/intent#5737).
+//! Settings > Providers never spawns that provider (intent-hq/intent#5737).
 //!
 //! Creates an agent on the mock provider, runs one turn (baseline), flips
 //! `providers.enabled.mock` to `false` through `settings.update` — with the
@@ -19,7 +19,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::Stdio;
@@ -187,9 +187,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -213,9 +216,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -370,7 +376,7 @@ async fn disabled_provider_turn_is_rejected_before_spawn_over_wss() {
         "baseline turn streams output from the mock child: {baseline:?}"
     );
 
-    // Disable mock in Settings > Agents, AND make it the settings default so
+    // Disable mock in Settings > Providers, AND make it the settings default so
     // the turn-start re-home finds no usable target (the only runnable
     // provider in this harness is the one being disabled).
     wss_rpc(
@@ -409,7 +415,7 @@ async fn disabled_provider_turn_is_rejected_before_spawn_over_wss() {
         "the turn-start rejection is the not-enabled InvalidParams labelled session/prompt: {error}"
     );
     assert!(
-        error.contains("Settings > Agents"),
+        error.contains("Settings > Providers"),
         "rejection names the remedy: {error}"
     );
     assert!(

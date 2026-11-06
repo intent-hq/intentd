@@ -13,10 +13,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,14 +36,13 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     _data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -50,7 +50,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-browser-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -67,7 +67,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -380,8 +380,14 @@ async fn browser_exec_fe_json_rpc_error_surfaces_as_internal_error() {
         .contains("CDP not attached"));
 }
 
+/// An unanswered client-triggered screenshot comes back over WSS as the
+/// daemon's reverse timeout (`-32603`), not a hang. Which deadline it gets
+/// (20s, inside the JavaScript tool's 30s outer budget, rather than the 30s
+/// default) is pinned without wall-clock timing on a paused clock at the
+/// `browser::exec` call site:
+/// intent-transport `browser::tests::exec_arms_the_screenshot_deadline_for_an_unanswered_screenshot`.
 #[tokio::test]
-async fn browser_exec_screenshot_timeout_returns_before_outer_deadline_over_wss() {
+async fn browser_exec_unanswered_screenshot_times_out_over_wss() {
     let (_daemon, port, cfg) = boot().await;
     let mut ws = connect_ws(port, cfg).await;
     let frame = json!({
@@ -390,7 +396,6 @@ async fn browser_exec_screenshot_timeout_returns_before_outer_deadline_over_wss(
         "method": "browser.exec",
         "params": { "actions": [{ "action": "screenshot" }] },
     });
-    let started = tokio::time::Instant::now();
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .unwrap();
@@ -398,16 +403,16 @@ async fn browser_exec_screenshot_timeout_returns_before_outer_deadline_over_wss(
     let reverse = read_text(&mut ws).await;
     assert_eq!(reverse["method"], "browser.exec");
     assert_eq!(reverse["params"]["actions"][0]["action"], "screenshot");
-    // Do not answer the reverse request. The daemon must settle the caller
-    // before the JavaScript tool's 30-second outer budget expires.
-    let response = read_text_with_timeout(&mut ws, Duration::from_secs(25)).await;
-    let elapsed = started.elapsed();
+    // Do not answer the reverse request; the daemon's own deadline settles it.
+    let response = read_text_with_timeout(
+        &mut ws,
+        intentd_test_support::test_timeout(Duration::from_secs(40)),
+    )
+    .await;
     assert_eq!(response["id"], 32);
     assert_eq!(response["error"]["code"], -32603);
     assert!(response["error"]["message"]
         .as_str()
         .unwrap()
         .contains("reverse request timed out: browser.exec"));
-    assert!(elapsed >= Duration::from_secs(19), "elapsed={elapsed:?}");
-    assert!(elapsed < Duration::from_secs(30), "elapsed={elapsed:?}");
 }

@@ -30,6 +30,7 @@ async fn list(srv: &Server, id: &WorkspaceId) -> Value {
     reply["result"].clone()
 }
 
+#[track_caller]
 fn named<'a>(skills: &'a Value, name: &str) -> &'a Value {
     let matches: Vec<_> = skills
         .as_array()
@@ -57,25 +58,28 @@ async fn wss_linked_skills_external_edits_additions_deletions_and_root_retarget_
     srv.store.insert_workspace(&row).await.unwrap();
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     ws.send(Message::text(json!({"jsonrpc":"2.0","id":72,"method":"events.subscribe","params":{"eventTypes":["skills:changed"],"workspaceId":id}}).to_string())).await.unwrap();
-    let sub = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let reply: Value = serde_json::from_str(&text).unwrap();
-                    if reply["id"] == 72 {
-                        break reply;
+    let sub = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let reply: Value = serde_json::from_str(&text).unwrap();
+                        if reply["id"] == 72 {
+                            break reply;
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => ws.send(Message::Pong(p)).await.unwrap(),
+                    Some(Ok(_)) => {}
+                    other => panic!("subscription stream closed: {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => ws.send(Message::Pong(p)).await.unwrap(),
-                Some(Ok(_)) => {}
-                other => panic!("subscription stream closed: {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("subscription reply");
     assert!(sub["result"]["subscriptionId"].is_string(), "{sub}");
-    let cache = Services::new(srv.store.clone()).git_status_cache();
+    let cache = Services::new_isolated(srv.store.clone()).git_status_cache();
     let refresher = Arc::new(GitStatusRefresher::start(
         srv.bus.clone(),
         srv.api.clone(),
@@ -130,25 +134,28 @@ async fn wss_linked_skills_external_edits_additions_deletions_and_root_retarget_
                 std::fs::remove_file(srv.dir.path().join("external-definition.txt")).unwrap();
             }
         }
-        let event = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let value: Value = serde_json::from_str(&text).unwrap();
-                        if value["method"] == "events.event"
-                            && value["params"]["event"]["type"] == "skills:changed"
-                        {
-                            return value;
+        let event = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let value: Value = serde_json::from_str(&text).unwrap();
+                            if value["method"] == "events.event"
+                                && value["params"]["event"]["type"] == "skills:changed"
+                            {
+                                return value;
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            ws.send(Message::Pong(p)).await.unwrap();
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("event stream closed: {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        ws.send(Message::Pong(p)).await.unwrap();
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("event stream closed: {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("no skills:changed event at step {step}"));
         assert_eq!(event["jsonrpc"], "2.0");
@@ -488,7 +495,8 @@ async fn wss_linked_skills_custom_config_directory_and_empty_fallback() {
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));
         std::fs::create_dir_all(data.join("workspaces")).unwrap();
-        let mut daemon = common::DaemonGuard::process_only(command.spawn().unwrap());
+        let mut daemon =
+            common::DaemonGuard::process_only(common::spawn_guarded(&mut command).unwrap());
         let socket = data.join("intentd.sock");
         common::await_daemon_listening(daemon.child_mut(), &socket, &log_path).await;
         let status = common::await_wss_status_logged(&socket, &log_path).await;
@@ -526,22 +534,30 @@ async fn wss_linked_skills_custom_config_directory_and_empty_fallback() {
         if mode != "empty" {
             let mut events = connect_ws(port, cfg.clone()).await;
             events.send(Message::text(json!({"jsonrpc":"2.0","id":3,"method":"events.subscribe","params":{"workspaceId":id,"eventTypes":["skills:changed"]}}).to_string())).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    match events.next().await {
-                        Some(Ok(Message::Text(text))) => {
-                            let reply: Value = serde_json::from_str(&text).unwrap();
-                            if reply["id"] == 3 {
-                                assert!(reply["result"]["subscriptionId"].is_string(), "{reply}");
-                                break;
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                async {
+                    loop {
+                        match events.next().await {
+                            Some(Ok(Message::Text(text))) => {
+                                let reply: Value = serde_json::from_str(&text).unwrap();
+                                if reply["id"] == 3 {
+                                    assert!(
+                                        reply["result"]["subscriptionId"].is_string(),
+                                        "{reply}"
+                                    );
+                                    break;
+                                }
                             }
+                            Some(Ok(Message::Ping(p))) => {
+                                events.send(Message::Pong(p)).await.unwrap();
+                            }
+                            Some(Ok(_)) => {}
+                            other => panic!("config subscription closed: {other:?}"),
                         }
-                        Some(Ok(Message::Ping(p))) => events.send(Message::Pong(p)).await.unwrap(),
-                        Some(Ok(_)) => {}
-                        other => panic!("config subscription closed: {other:?}"),
                     }
-                }
-            })
+                },
+            )
             .await
             .expect("config skills subscription");
             write_skill(
@@ -549,7 +565,7 @@ async fn wss_linked_skills_custom_config_directory_and_empty_fallback() {
                 "custom-config-fixture",
                 "live update",
             );
-            changed = tokio::time::timeout(Duration::from_secs(30), async {
+            changed = tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
                 loop {
                     match events.next().await {
                         Some(Ok(Message::Text(text))) => {
@@ -599,17 +615,20 @@ async fn shared_user_update_evidence(
     for id in [first, second] {
         let mut stream = connect_ws(port, cfg.clone()).await;
         stream.send(Message::text(json!({"jsonrpc":"2.0","id":81,"method":"events.subscribe","params":{"workspaceId":id,"eventTypes":["skills:changed"]}}).to_string())).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Some(Ok(Message::Text(text))) = stream.next().await {
-                    let reply: Value = serde_json::from_str(&text).unwrap();
-                    if reply["id"] == 81 {
-                        assert!(reply["result"]["subscriptionId"].is_string());
-                        break;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    if let Some(Ok(Message::Text(text))) = stream.next().await {
+                        let reply: Value = serde_json::from_str(&text).unwrap();
+                        if reply["id"] == 81 {
+                            assert!(reply["result"]["subscriptionId"].is_string());
+                            break;
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("fanout subscription");
         streams.push((id.to_string(), stream));
@@ -623,44 +642,54 @@ async fn shared_user_update_evidence(
         );
         for (id, stream) in &mut streams {
             let mut events = Vec::new();
-            tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
-                    match stream.next().await {
-                        Some(Ok(Message::Text(text))) => {
-                            let event: Value = serde_json::from_str(&text).unwrap();
-                            if event["method"] == "events.event"
-                                && event["params"]["event"]["type"] == "skills:changed"
-                            {
-                                events.push(event);
-                                break;
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(30)),
+                async {
+                    loop {
+                        match stream.next().await {
+                            Some(Ok(Message::Text(text))) => {
+                                let event: Value = serde_json::from_str(&text).unwrap();
+                                if event["method"] == "events.event"
+                                    && event["params"]["event"]["type"] == "skills:changed"
+                                {
+                                    events.push(event);
+                                    break;
+                                }
                             }
+                            Some(Ok(Message::Ping(p))) => {
+                                stream.send(Message::Pong(p)).await.unwrap();
+                            }
+                            Some(Ok(_)) => {}
+                            other => panic!("fanout stream closed: {other:?}"),
                         }
-                        Some(Ok(Message::Ping(p))) => stream.send(Message::Pong(p)).await.unwrap(),
-                        Some(Ok(_)) => {}
-                        other => panic!("fanout stream closed: {other:?}"),
                     }
-                }
-            })
+                },
+            )
             .await
             .expect("shared user edit must reach every workspace");
             // A bounded negative assertion detects duplicate coalesced events.
-            let _ = tokio::time::timeout(Duration::from_millis(1500), async {
-                loop {
-                    match stream.next().await {
-                        Some(Ok(Message::Text(text))) => {
-                            let event: Value = serde_json::from_str(&text).unwrap();
-                            if event["method"] == "events.event"
-                                && event["params"]["event"]["type"] == "skills:changed"
-                            {
-                                events.push(event);
+            let _ = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(1500)),
+                async {
+                    loop {
+                        match stream.next().await {
+                            Some(Ok(Message::Text(text))) => {
+                                let event: Value = serde_json::from_str(&text).unwrap();
+                                if event["method"] == "events.event"
+                                    && event["params"]["event"]["type"] == "skills:changed"
+                                {
+                                    events.push(event);
+                                }
                             }
+                            Some(Ok(Message::Ping(p))) => {
+                                stream.send(Message::Pong(p)).await.unwrap();
+                            }
+                            Some(Ok(_)) => {}
+                            other => panic!("fanout stream closed: {other:?}"),
                         }
-                        Some(Ok(Message::Ping(p))) => stream.send(Message::Pong(p)).await.unwrap(),
-                        Some(Ok(_)) => {}
-                        other => panic!("fanout stream closed: {other:?}"),
                     }
-                }
-            })
+                },
+            )
             .await;
             let listed = wss_call(
                 port,

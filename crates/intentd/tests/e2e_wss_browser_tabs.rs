@@ -12,10 +12,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,14 +36,13 @@ use common::TlsWs;
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     _data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -50,7 +50,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-tabs-")
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -65,7 +65,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -279,7 +279,7 @@ async fn next_tab_event(ws: &mut TlsWs, dur: Duration) -> Option<Value> {
 /// Close `ws` (draining the server's close handshake) and drop it.
 async fn close_ws(mut ws: TlsWs) {
     let _ = ws.close(None).await;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -710,4 +710,216 @@ async fn browser_tab_registry_round_trip_over_wss() {
     assert_eq!(tabs[0]["tabId"], "tab-3");
     assert_eq!(tabs[0]["hostConnected"], false);
     assert!(tabs[0].get("hostName").is_none(), "{res}");
+}
+
+/// `workspace.getBrowserClient` over the real transport reports an unpinned
+/// workspace's routed claimed-tab host as `target` even after that host
+/// disconnects (`resolved: null`); a set omits `target` and a clear reports
+/// the recomputed route (PROTOCOL §5.1 "Routed client (`target`)").
+#[tokio::test]
+async fn browser_client_target_names_an_offline_claimed_tab_host_over_wss() {
+    let fx = boot().await;
+    let mut viewer = connect(&fx).await;
+    let created = wss_rpc(
+        &mut viewer,
+        1,
+        "workspace.create",
+        json!({ "title": "Routed", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace id: {created}"))
+        .to_string();
+    let _ = wss_rpc(&mut viewer, 2, "client.hello", hello("desktop-b")).await;
+    let mut host = connect(&fx).await;
+    let _ = wss_rpc(&mut host, 1, "client.hello", hello("desktop-a")).await;
+
+    let mut claimed = tab("tab-claimed", "https://a.test/agent");
+    claimed["ownerAgentId"] = json!("agent-1");
+    let res = wss_rpc(
+        &mut host,
+        2,
+        "browser.upsertTab",
+        json!({ "workspaceId": ws_id, "tab": claimed }),
+    )
+    .await;
+    assert_eq!(res["result"]["tab"]["ownerAgentId"], "agent-1", "{res}");
+    close_ws(host).await;
+    let _ = await_host_offline(&mut viewer, 3, &ws_id).await;
+
+    let res = wss_rpc(
+        &mut viewer,
+        100,
+        "workspace.getBrowserClient",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        res["result"],
+        json!({ "browserClient": {
+            "source": "default",
+            "resolved": null,
+            "target": { "clientId": "desktop-a", "via": "tabs" }
+        } }),
+        "{res}"
+    );
+
+    let res = wss_rpc(
+        &mut viewer,
+        101,
+        "workspace.setBrowserClient",
+        json!({ "workspaceId": ws_id, "clientId": "desktop-b" }),
+    )
+    .await;
+    assert_eq!(
+        res["result"],
+        json!({ "browserClient": {
+            "clientId": "desktop-b",
+            "source": "workspace",
+            "resolved": { "clientId": "desktop-b", "name": "Intent Desktop @ desktop-b" }
+        } }),
+        "a set carries no target: {res}"
+    );
+
+    let res = wss_rpc(
+        &mut viewer,
+        102,
+        "workspace.setBrowserClient",
+        json!({ "workspaceId": ws_id, "clientId": null }),
+    )
+    .await;
+    assert_eq!(
+        res["result"],
+        json!({ "browserClient": {
+            "source": "default",
+            "resolved": { "clientId": "desktop-b", "name": "Intent Desktop @ desktop-b" },
+            "target": { "clientId": "desktop-b", "via": "tabs" }
+        } }),
+        "a clear reports the re-homed claimed-tab route: {res}"
+    );
+}
+
+/// intent-hq/intent#8045: a device that hello'd as `dev-1` and later presents
+/// a namespaced form of the same id (`remote-p:dev-1`, as another backend
+/// returned it) recovers the tabs it hosted under the earlier id. The hello
+/// moves them to the presented id and publishes `browser:tab-updated {
+/// changes: { hostClientId, displayed: null } }`, and `browser.listTabs` lists
+/// them on the connected host; an unrelated, still-connected host keeps its
+/// tabs.
+#[tokio::test]
+async fn hello_rehomes_tabs_from_a_superseded_client_id_over_wss() {
+    let fx = boot().await;
+    let mut rpc = connect(&fx).await;
+    let created = wss_rpc(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({ "title": "Rehome", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace id: {created}"))
+        .to_string();
+    let mut sub = connect(&fx).await;
+    let ack = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["browser:tab-opened", "browser:tab-updated", "browser:tab-closed"],
+            "workspaceId": ws_id,
+        }),
+    )
+    .await;
+    assert!(ack.get("error").is_none(), "subscribe failed: {ack}");
+
+    // The device hosts a tab under its earlier id, then goes away.
+    let mut old = connect(&fx).await;
+    let _ = wss_rpc(&mut old, 1, "client.hello", hello("dev-1")).await;
+    let res = wss_rpc(
+        &mut old,
+        2,
+        "browser.upsertTab",
+        json!({ "workspaceId": ws_id, "tab": tab("stranded", "https://a.test/") }),
+    )
+    .await;
+    assert!(res.get("error").is_none(), "{res}");
+    let ev = next_tab_event(&mut sub, Duration::from_secs(2))
+        .await
+        .expect("tab-opened event");
+    assert_eq!(ev["type"], "browser:tab-opened");
+    close_ws(old).await;
+    let _ = await_host_offline(&mut rpc, 2, &ws_id).await;
+
+    // It comes back presenting the namespaced form of the same id.
+    let mut device = connect(&fx).await;
+    let hello_res = wss_rpc(&mut device, 1, "client.hello", hello("remote-p:dev-1")).await;
+    assert_eq!(
+        hello_res["result"]["clientId"], "remote-p:dev-1",
+        "{hello_res}"
+    );
+    let ev = next_tab_event(&mut sub, Duration::from_secs(2))
+        .await
+        .expect("tab-updated event for the rehome");
+    assert_eq!(ev["type"], "browser:tab-updated", "{ev}");
+    assert_eq!(ev["workspaceId"], ws_id);
+    assert_eq!(ev["data"]["tab"]["tabId"], "stranded");
+    assert_eq!(ev["data"]["tab"]["hostClientId"], "remote-p:dev-1");
+    assert_eq!(
+        ev["data"]["changes"],
+        json!({ "hostClientId": "remote-p:dev-1", "displayed": null }),
+        "{ev}"
+    );
+    let listed = wss_rpc(
+        &mut rpc,
+        100,
+        "browser.listTabs",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let tabs = listed["result"]["tabs"].as_array().expect("tabs");
+    assert_eq!(tabs.len(), 1, "{listed}");
+    assert_eq!(tabs[0]["hostClientId"], "remote-p:dev-1");
+    assert_eq!(tabs[0]["hostConnected"], true, "{listed}");
+
+    // A still-connected host under an id that is a suffix of a later hello
+    // keeps its tabs.
+    let mut live = connect(&fx).await;
+    let _ = wss_rpc(&mut live, 1, "client.hello", hello("dev-2")).await;
+    let _ = wss_rpc(
+        &mut live,
+        2,
+        "browser.upsertTab",
+        json!({ "workspaceId": ws_id, "tab": tab("live-tab", "https://b.test/") }),
+    )
+    .await;
+    let ev = next_tab_event(&mut sub, Duration::from_secs(2))
+        .await
+        .expect("tab-opened event");
+    assert_eq!(ev["type"], "browser:tab-opened");
+    let mut other = connect(&fx).await;
+    let _ = wss_rpc(&mut other, 1, "client.hello", hello("remote-p:dev-2")).await;
+    assert!(
+        next_tab_event(&mut sub, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "a live host's tabs do not move"
+    );
+    let listed = wss_rpc(
+        &mut rpc,
+        101,
+        "browser.listTabs",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let live_tab = listed["result"]["tabs"]
+        .as_array()
+        .expect("tabs")
+        .iter()
+        .find(|t| t["tabId"] == "live-tab")
+        .cloned()
+        .unwrap_or_else(|| panic!("live tab listed: {listed}"));
+    assert_eq!(live_tab["hostClientId"], "dev-2");
 }

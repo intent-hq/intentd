@@ -22,7 +22,8 @@ pub const MANIFEST_SCHEMA_VERSION: u64 = 1;
 /// `intentd-releases` repo first, then the original `intentd` repo as a
 /// fallback. The updater tries each base in order for the manifest fetch
 /// (archive URLs come from inside the manifest, so downloads need no
-/// fallback). Overridable via [`crate::updater::Updater::with_base_url`] —
+/// fallback). In production the update-check endpoint
+/// ([`crate::telemetry`]) is tried before these. Overridable via [`crate::updater::Updater::with_base_url`] —
 /// exactly one base, no fallback — so tests can point at a local fixture
 /// server.
 pub const DEFAULT_MANIFEST_BASE_URLS: &[&str] = &[

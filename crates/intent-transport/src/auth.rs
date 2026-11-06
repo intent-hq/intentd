@@ -674,7 +674,7 @@ fn random_hex_token() -> Result<String> {
 
 /// Constant-time token comparison: reject empty/length-mismatch first, then
 /// compare the bytes in constant time. Pure (no keychain) for testability.
-fn token_matches(stored: &str, candidate: &str) -> bool {
+pub(crate) fn token_matches(stored: &str, candidate: &str) -> bool {
     if candidate.is_empty() || stored.is_empty() {
         return false;
     }

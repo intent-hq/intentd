@@ -26,6 +26,14 @@ use tempfile::TempDir;
 use super::tests::{workspace, TempDb};
 use crate::Services;
 
+fn create_custom_coordinator(dir: &Path) {
+    std::fs::write(
+        dir.join("spec-writer.md"),
+        "---\nname: Lead\ndescription: Custom coordinator\naliases: [\"coordinator\", \"lead\"]\n---\nCustom planning prompt.",
+    )
+    .unwrap();
+}
+
 /// Set up a test with a temp specialist directory structure.
 async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
     let tmp = TempDb::new();
@@ -57,7 +65,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
             ),
         ])
         .expect("seed default provider");
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_settings_registry(registry)
         .with_specialist_dirs(
             Some(specialists_dir.path().to_path_buf()),
@@ -166,7 +174,11 @@ async fn chief_prompt_version_invalidates_only_for_changed_prompt_identity() {
             )
             .await
             .unwrap();
-        let before = svc.store().get_agent_session(&id).await.unwrap();
+        let before = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         svc.agent_update_op(
             id.clone(),
             json!({
@@ -194,7 +206,11 @@ async fn chief_prompt_version_invalidates_only_for_changed_prompt_identity() {
             ));
         }
         svc.agent_update_op(id.clone(), mutation).await.unwrap();
-        let stored = svc.store().get_agent_session(&id).await.unwrap();
+        let stored = svc
+            .store()
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap();
         assert!(stored
             .metadata
             .as_ref()
@@ -435,7 +451,8 @@ async fn retired_model_tier_ignored_on_delegate_path() {
 /// (monorepo#3497). An alias still delegates fine.
 #[intent_test_macros::daemon_test]
 async fn unknown_specialist_rejects_delegate() {
-    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_custom_coordinator(specialists_dir.path());
 
     let err = svc
         .agent_delegate_op(
@@ -457,12 +474,12 @@ async fn unknown_specialist_rejects_delegate() {
     );
     let agents = svc
         .store()
-        .list_agent_sessions(&ws)
+        .list_agent_sessions_with_transcripts(&ws)
         .await
         .expect("list sessions");
     assert!(agents.is_empty(), "no child persisted on rejection");
 
-    // An alias (bundled `spec-writer` claims `coordinator`) still delegates
+    // A custom alias (`spec-writer` claims `coordinator`) still delegates
     // and persists the canonical id.
     let resp = svc
         .agent_delegate_op(
@@ -479,7 +496,7 @@ async fn unknown_specialist_rejects_delegate() {
     let child = AgentId::from(resp["agentId"].as_str().expect("agentId"));
     let session = svc
         .store()
-        .get_agent_session(&child)
+        .get_agent_session_with_transcript(&child)
         .await
         .expect("session");
     assert_eq!(session.specialist.as_deref(), Some("spec-writer"));
@@ -491,7 +508,7 @@ async fn unknown_specialist_rejects_delegate() {
 #[intent_test_macros::daemon_test]
 async fn delegate_ignores_quick_action_default_model() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
-    create_specialist_without_model(specialists_dir.path(), "implementor-test");
+    create_specialist_without_model(specialists_dir.path(), "developer-test");
 
     svc.settings_registry()
         .expect("registry wired")
@@ -512,7 +529,7 @@ async fn delegate_ignores_quick_action_default_model() {
             ws.clone(),
             intent_core::AgentDelegateInput {
                 agent_instructions: Some("do the thing".into()),
-                specialist: Some("implementor-test".into()),
+                specialist: Some("developer-test".into()),
                 ..Default::default()
             },
             None,
@@ -539,7 +556,7 @@ async fn delegate_ignores_quick_action_default_model() {
 #[intent_test_macros::daemon_test]
 async fn delegate_ignores_quick_action_type_override() {
     let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
-    create_specialist_without_model(specialists_dir.path(), "implementor-test");
+    create_specialist_without_model(specialists_dir.path(), "developer-test");
 
     svc.settings_registry()
         .expect("registry wired")
@@ -550,7 +567,7 @@ async fn delegate_ignores_quick_action_type_override() {
             ),
             (
                 "quickActions.typeOverrides".to_string(),
-                json!({ "implementor-test": "sonnet5-high" }),
+                json!({ "developer-test": "sonnet5-high" }),
             ),
         ])
         .expect("set provider default + quick-action type override");
@@ -560,7 +577,7 @@ async fn delegate_ignores_quick_action_type_override() {
             ws.clone(),
             intent_core::AgentDelegateInput {
                 agent_instructions: Some("do the thing".into()),
-                specialist: Some("implementor-test".into()),
+                specialist: Some("developer-test".into()),
                 ..Default::default()
             },
             None,
@@ -611,7 +628,7 @@ async fn bundled_specialist_inherits_model_default() {
     let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
 
     // Nothing configured → CLI default.
-    let id = create_agent(&svc, &ws, "TestAgent", None, Some("implementor".into())).await;
+    let id = create_agent(&svc, &ws, "TestAgent", None, Some("developer".into())).await;
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     assert_eq!(got.model, None, "no settings → CLI default");
 
@@ -620,7 +637,7 @@ async fn bundled_specialist_inherits_model_default() {
         .expect("registry wired")
         .apply(&[("model.default".to_string(), json!("sonnet4.5"))])
         .expect("set model.default");
-    let id = create_agent(&svc, &ws, "TestAgent2", None, Some("implementor".into())).await;
+    let id = create_agent(&svc, &ws, "TestAgent2", None, Some("developer".into())).await;
     let got = svc.agent_get_op(id.clone(), None).await.expect("get");
     assert_eq!(got.model.as_deref(), Some("sonnet4.5"));
 }
@@ -671,10 +688,10 @@ async fn spoofed_workspace_path_ignored() {
         .join("specialists");
     std::fs::create_dir_all(&evil_dir).expect("mkdir evil specialists dir");
     let specialist_content = "---\nmodel: attacker:model\n---\n# Evil Specialist";
-    std::fs::write(evil_dir.join("implementor.md"), specialist_content)
+    std::fs::write(evil_dir.join("developer.md"), specialist_content)
         .expect("write evil specialist");
 
-    // Create an agent with specialistId "implementor" and client-supplied workspacePath
+    // Create an agent with specialistId "developer" and client-supplied workspacePath
     // pointing to the evil directory. The code should derive workspace_path from the
     // stored workspace record instead.
     let extra = intent_core::AgentCreateExtra {
@@ -695,7 +712,7 @@ async fn spoofed_workspace_path_ignored() {
             ws.clone(),
             Some("TestAgent".into()),
             None, // no explicit model
-            Some("implementor".into()),
+            Some("developer".into()),
             None,
             None,
             false,
@@ -820,20 +837,20 @@ async fn omitted_name_derives_from_specialist_display_name() {
     assert_eq!(agent["nameExplicitlySet"], false);
 }
 
-/// The embedded bundled `spec-writer` resolves with zero local files: a
-/// name-less create yields its frontmatter display name "Coordinator".
+/// The embedded bundled `developer` resolves with zero local files: a
+/// name-less create yields its frontmatter display name "Developer".
 #[tokio::test]
-async fn omitted_name_derives_from_embedded_spec_writer() {
+async fn omitted_name_derives_from_embedded_developer() {
     let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
     let agent = create_agent_with_optional_name(
         &svc,
         &ws,
         None,
-        Some("spec-writer".into()),
+        Some("developer".into()),
         intent_core::AgentCreateExtra::default(),
     )
     .await;
-    assert_eq!(agent["name"], "Coordinator");
+    assert_eq!(agent["name"], "Developer");
     assert_eq!(agent["nameExplicitlySet"], false);
 }
 
@@ -845,7 +862,7 @@ async fn explicit_name_beats_specialist_display_name() {
         &svc,
         &ws,
         Some("My Explicit Name"),
-        Some("spec-writer".into()),
+        Some("developer".into()),
         intent_core::AgentCreateExtra::default(),
     )
     .await;
@@ -895,14 +912,14 @@ async fn unknown_specialist_rejects_create() {
         "error names the id: {msg}"
     );
     assert!(
-        msg.contains("known specialists:") && msg.contains("spec-writer"),
+        msg.contains("known specialists:") && msg.contains("developer"),
         "error lists the known ids: {msg}"
     );
     assert!(matches!(err, intent_core::Error::InvalidParams(_)));
     // No side effect: no session row was persisted.
     let agents = svc
         .store()
-        .list_agent_sessions(&ws)
+        .list_agent_sessions_with_transcripts(&ws)
         .await
         .expect("list sessions");
     assert!(agents.is_empty(), "no session persisted on rejection");
@@ -919,8 +936,8 @@ async fn delegate_override_keeps_derived_name_renameable() {
         ..Default::default()
     };
     let agent =
-        create_agent_with_optional_name(&svc, &ws, None, Some("spec-writer".into()), extra).await;
-    assert_eq!(agent["name"], "Coordinator");
+        create_agent_with_optional_name(&svc, &ws, None, Some("developer".into()), extra).await;
+    assert_eq!(agent["name"], "Developer");
     assert_eq!(agent["nameExplicitlySet"], false);
 }
 
@@ -948,7 +965,11 @@ async fn specialist_snapshot_persisted_at_create() {
 
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("frozen".into())).await;
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let meta = session.metadata.expect("metadata snapshot written");
     assert_eq!(
         meta["behaviorPrompt"].as_str(),
@@ -956,6 +977,54 @@ async fn specialist_snapshot_persisted_at_create() {
     );
     assert_eq!(meta["specialistName"].as_str(), Some("Frozen Name"));
     assert_eq!(meta["specialistRoleReminder"].as_str(), Some("Stay frozen"));
+}
+
+#[tokio::test]
+async fn plain_folder_specialist_snapshots_and_turn_reminders_omit_git_guidance() {
+    let (_t, svc, _git_ws, _specialists, _cfg) = setup().await;
+    let ws = WorkspaceId::new();
+    let mut row = workspace(&ws);
+    row.plain_folder = true;
+    svc.store().insert_workspace(&row).await.unwrap();
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Test".to_string()),
+            None,
+            Some("developer".into()),
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                is_background: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create");
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    let meta = session.metadata.unwrap();
+    let body = meta["behaviorPrompt"].as_str().unwrap();
+    assert!(!body.contains("rename the branch"));
+    assert!(!body.contains("Commit your changes"));
+    assert!(!body.contains("pull requests"));
+    svc.agent_update_op(
+        id.clone(),
+        json!({"specialist": "pr-reviewer", "rememberSpecialist": true}),
+    )
+    .await
+    .unwrap();
+    let injection = svc.agent_specialist_injection(&id, None).await.unwrap();
+    assert_eq!(injection.specialist_name.as_deref(), Some("Reviewer"));
+    assert!(!injection.behavior_prompt.unwrap().contains("PR "));
+    let reminder = svc.agent_role_reminder(&id).await.unwrap();
+    assert!(reminder.contains("Reviewer"));
+    assert!(!reminder.contains("PR"));
 }
 
 /// An explicit caller `metadata.behaviorPrompt` override is left untouched —
@@ -990,7 +1059,11 @@ async fn caller_behavior_prompt_override_preserved() {
         .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let meta = session.metadata.expect("metadata");
     assert_eq!(meta["behaviorPrompt"].as_str(), Some("CALLER OVERRIDE"));
     assert_eq!(meta["specialistName"].as_str(), Some("Frozen Name"));
@@ -1030,7 +1103,11 @@ async fn non_object_metadata_left_untouched() {
         .expect("create succeeds with non-object metadata");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.metadata, Some(json!("opaque")));
 }
 
@@ -1065,7 +1142,11 @@ async fn caller_reminder_removed_when_resolution_has_none() {
         .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     let meta = session.metadata.expect("metadata");
     assert_eq!(meta["specialistName"].as_str(), Some("Frozen Name"));
     assert!(
@@ -1158,11 +1239,11 @@ async fn injection_frozen_after_specialist_file_edit() {
 /// Specialist alias canonicalization (PROTOCOL §5.11): creating an agent
 /// with an alias persists the CANONICAL specialist id, and the specialist's
 /// resolution (display name, prompt snapshot) applies as if the canonical id
-/// had been passed. The bundled `spec-writer` carries `aliases:
-/// ["coordinator"]`, so this exercises the embedded floor end to end.
+/// had been passed. An authored `spec-writer` fixture claims `coordinator`.
 #[tokio::test]
 async fn alias_create_persists_canonical_specialist_id() {
-    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_custom_coordinator(specialists_dir.path());
 
     let extra = intent_core::AgentCreateExtra {
         is_background: Some(true),
@@ -1187,13 +1268,17 @@ async fn alias_create_persists_canonical_specialist_id() {
         Some("spec-writer")
     );
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.specialist.as_deref(), Some("spec-writer"));
     // Downstream resolution ran against the canonical specialist: the
     // derived display name and frozen prompt snapshot are spec-writer's.
-    assert_eq!(session.name, "Coordinator");
+    assert_eq!(session.name, "Lead");
     let meta = session.metadata.expect("metadata");
-    assert_eq!(meta["specialistName"].as_str(), Some("Coordinator"));
+    assert_eq!(meta["specialistName"].as_str(), Some("Lead"));
 
     // A directly-known canonical id is untouched.
     let extra = intent_core::AgentCreateExtra {
@@ -1247,7 +1332,8 @@ async fn alias_create_persists_canonical_specialist_id() {
 /// unchanged, an unknown id is rejected (monorepo#3497), and null clears.
 #[tokio::test]
 async fn alias_update_persists_canonical_specialist_id() {
-    let (_t, svc, ws, _specialists_dir, _cfg) = setup().await;
+    let (_t, svc, ws, specialists_dir, _cfg) = setup().await;
+    create_custom_coordinator(specialists_dir.path());
     let id = create_agent(&svc, &ws, "TestAgent", None, None).await;
 
     // Alias → canonical id.
@@ -1257,18 +1343,23 @@ async fn alias_update_persists_canonical_specialist_id() {
     )
     .await
     .expect("update with alias");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.specialist.as_deref(), Some("spec-writer"));
 
     // A directly-known canonical id is untouched.
-    svc.agent_update_op(
-        id.clone(),
-        serde_json::json!({ "specialist": "implementor" }),
-    )
-    .await
-    .expect("update with canonical id");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
-    assert_eq!(session.specialist.as_deref(), Some("implementor"));
+    svc.agent_update_op(id.clone(), serde_json::json!({ "specialist": "developer" }))
+        .await
+        .expect("update with canonical id");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
+    assert_eq!(session.specialist.as_deref(), Some("developer"));
 
     // An unknown id is rejected with `-32602` and the session is untouched
     // (monorepo#3497).
@@ -1278,10 +1369,14 @@ async fn alias_update_persists_canonical_specialist_id() {
         .expect_err("unknown specialist must reject the update");
     assert!(matches!(err, intent_core::Error::InvalidParams(_)));
     assert!(err.to_string().contains("unknown specialist: no-such"));
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.specialist.as_deref(),
-        Some("implementor"),
+        Some("developer"),
         "rejected update leaves the previous value intact"
     );
 
@@ -1289,7 +1384,11 @@ async fn alias_update_persists_canonical_specialist_id() {
     svc.agent_update_op(id.clone(), serde_json::json!({ "specialist": null }))
         .await
         .expect("update with null");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.specialist, None);
 }
 
@@ -1388,6 +1487,30 @@ fn create_specialist_with_role(dir: &Path, id: &str, role: &str) {
     std::fs::write(dir.join(format!("{id}.md")), content).expect("write specialist");
 }
 
+#[tokio::test]
+async fn general_creation_allows_editing_and_old_sessions_stay_restricted() {
+    let (_tmp, svc, ws, _specialists, _config) = setup().await;
+    let id = create_agent(&svc, &ws, "General agent", None, None).await;
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert_eq!(session.specialist, None);
+    assert!(!svc.session_specialist_is_orchestrator(&session, None));
+
+    let mut legacy = session;
+    legacy.harness_version = "3.5".into();
+    legacy.specialist = Some("spec-writer".into());
+    legacy.metadata = None;
+    assert!(svc.session_specialist_is_orchestrator(&legacy, None));
+    assert_eq!(
+        svc.session_specialist_display_name(&legacy, None)
+            .as_deref(),
+        Some("Coordinator")
+    );
+}
+
 /// The creation-time orchestrator-role decision is snapshotted into
 /// `metadata.specialistIsOrchestrator`, and the frozen value keeps gating
 /// `session_specialist_is_orchestrator` after the specialist file is edited
@@ -1402,14 +1525,18 @@ async fn orchestrator_snapshot_persisted_and_frozen_across_file_changes() {
     let orch = create_agent(&svc, &ws, "Orch", None, Some("conductor".into())).await;
     let plain = create_agent(&svc, &ws, "Plain", None, Some("plain".into())).await;
 
-    let orch_session = svc.store().get_agent_session(&orch).await.expect("session");
+    let orch_session = svc
+        .store()
+        .get_agent_session_with_transcript(&orch)
+        .await
+        .expect("session");
     assert_eq!(
         orch_session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
         json!(true)
     );
     let plain_session = svc
         .store()
-        .get_agent_session(&plain)
+        .get_agent_session_with_transcript(&plain)
         .await
         .expect("session");
     assert_eq!(
@@ -1456,7 +1583,11 @@ async fn caller_orchestrator_key_overwritten_at_create() {
         .expect("create");
     let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
 
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
         json!(false)
@@ -1473,7 +1604,11 @@ async fn update_specialist_refreshes_orchestrator_snapshot() {
     create_specialist_without_model(specialists_dir.path(), "plain");
 
     let id = create_agent(&svc, &ws, "TestAgent", None, Some("plain".into())).await;
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(
         session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
         json!(false)
@@ -1482,7 +1617,11 @@ async fn update_specialist_refreshes_orchestrator_snapshot() {
     svc.agent_update_op(id.clone(), json!({ "specialist": "conductor" }))
         .await
         .expect("update to orchestrator");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.specialist.as_deref(), Some("conductor"));
     assert_eq!(
         session.metadata.as_ref().unwrap()["specialistIsOrchestrator"],
@@ -1492,7 +1631,11 @@ async fn update_specialist_refreshes_orchestrator_snapshot() {
     svc.agent_update_op(id.clone(), json!({ "specialist": null }))
         .await
         .expect("clear specialist");
-    let session = svc.store().get_agent_session(&id).await.expect("session");
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&id)
+        .await
+        .expect("session");
     assert_eq!(session.specialist, None);
     assert!(session
         .metadata

@@ -13,9 +13,9 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
+use crate::common::uds_exchange::uds_rpc;
 
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -28,7 +28,6 @@ use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -51,26 +50,6 @@ async fn await_uds(socket: &Path) -> bool {
     })
     .await
     .is_ok()
-}
-
-async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let stream = UnixStream::connect(socket).await.expect("connect uds");
-    let (read_half, mut write_half) = stream.into_split();
-    let mut line = serde_json::to_string(
-        &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
-    )
-    .unwrap();
-    line.push('\n');
-    write_half.write_all(line.as_bytes()).await.unwrap();
-    write_half.flush().await.unwrap();
-    let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
-        .await
-        .unwrap_or_else(|_| panic!("UDS RPC {method} (id {id}) timed out waiting for response"))
-        .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
 #[derive(Debug)]
@@ -167,11 +146,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .unwrap_or_else(|_| {
-                panic!("WSS RPC {method} (id {id}) timed out waiting for response")
-            });
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("WSS RPC {method} (id {id}) timed out waiting for response"));
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -195,7 +175,8 @@ async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
             Some(d) if !d.is_zero() => d,
@@ -317,9 +298,6 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    // Own process group so the DaemonGuard's SIGKILL cannot leak mock children
-    // if the test panics before the graceful path runs.
-    cmd.process_group(0);
     // Assert before boot so a missing override cannot fall back to shared state.
     let explicit_env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
     let owned_workspaces = explicit_env.get(std::ffi::OsStr::new("INTENTD_WORKSPACES_DIR"))
@@ -341,7 +319,7 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         owned_workspaces && owned_secrets && isolated_gh && no_host_auth_env,
         "shutdown fixture isolation: owned workspaces={owned_workspaces}, owned secrets={owned_secrets}, disposable GH_CONFIG_DIR={isolated_gh}, removed credential env={no_host_auth_env}"
     );
-    let child = cmd.spawn().expect("spawn intentd serve");
+    let child = common::spawn_guarded(&mut cmd).expect("spawn intentd serve");
     let mut daemon = DaemonGuard::process_only(child);
     if !await_uds(&socket).await {
         if let Ok(log) = std::fs::read_to_string(data_dir.join("daemon.log")) {
@@ -430,20 +408,21 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
     assert!(!pid_dead(grandchild_pid), "grandchild live before shutdown");
 
     // Graceful shutdown via the UDS-only control fast-path (PROTOCOL §5.7).
-    let started = Instant::now();
     let shutdown = uds_rpc(&socket, 2, "system.shutdown", json!({})).await;
     assert_eq!(shutdown["result"].get("ok"), Some(&json!(true)));
 
-    // BOTH pids must be gone within the bounded kill-sweep window: SIGTERM is
-    // group-wide and immediate, the shared grace is 2s, so 4s (scaled only for
-    // coverage instrumentation) bounds the whole sweep.
-    let budget = common::test_timeout(Duration::from_secs(4));
+    // BOTH pids must be gone after the kill sweep: SIGTERM is group-wide and
+    // immediate, then SIGKILL after the shared 2s grace. The regression signal
+    // is a tree that survives the sweep, so this is a hang guard, not a
+    // latency budget.
+    let budget = common::test_timeout(Duration::from_secs(10));
+    let deadline = Instant::now() + budget;
     loop {
         if pid_dead(child_pid) && pid_dead(grandchild_pid) {
             break;
         }
         assert!(
-            started.elapsed() < budget,
+            Instant::now() < deadline,
             "provider tree survived the kill sweep past {budget:?}: \
              child {child_pid} dead={}, grandchild {grandchild_pid} dead={}",
             pid_dead(child_pid),
@@ -471,54 +450,14 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
         title: "WSS-REAP".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }

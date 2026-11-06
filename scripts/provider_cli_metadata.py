@@ -3,16 +3,28 @@
 
 Run python3 -S scripts/provider_cli_metadata.py after changing adapter pins.
 Runtime code never contacts npm. Tests require snapshot versions to match pins.
+
+A mapping with `runtimePackage` also snapshots that exact adapter dependency's
+`runtimeVersionField` (e.g. the Claude Agent SDK's `claudeCodeVersion`): the
+CLI version the adapter's runtime was built against, which the daemon uses as
+the bundled-CLI pin and to derive the installed-CLI minimum.
 """
+import importlib.util
 import json
 from pathlib import Path
 import re
 import urllib.parse
 import urllib.request
 
+_spec = importlib.util.spec_from_file_location("download_retry", Path(__file__).with_name("download_retry.py"))
+download_retry = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(download_retry)
+
 METADATA = "crates/intent-providers/data/adapter-cli-packages.json"
 CONFIG = "crates/intent-providers/src/config.rs"
 SECTIONS = ("dependencies", "optionalDependencies", "peerDependencies")
+EXACT = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+REGISTRY = "https://registry.npmjs.org/"
 
 
 def package_snapshot(manifest):
@@ -27,10 +39,61 @@ def package_snapshot(manifest):
     return result
 
 
-def replace_package(content, provider, manifest):
+def runtime_spec(content, provider, manifest):
+    """(name, exact version) of the runtime dependency to snapshot, or None."""
+    mapping = json.loads(content)[provider]
+    name = mapping.get("runtimePackage")
+    if name is None:
+        return None
+    package = package_snapshot(manifest)
+    declared = package["optionalDependencies"].get(name, package["dependencies"].get(name))
+    if not isinstance(declared, str) or not EXACT.fullmatch(declared):
+        raise ValueError("runtime dependency " + name + " must be an exact stable version")
+    return name, declared
+
+
+def runtime_snapshot(mapping, runtime):
+    field = mapping.get("runtimeVersionField")
+    if not isinstance(runtime, dict) or not isinstance(field, str):
+        raise ValueError("runtime metadata must identify an exact package and version field")
+    value = runtime.get(field)
+    if not isinstance(value, str) or not EXACT.fullmatch(value):
+        raise ValueError("runtime " + field + " must be an exact stable version")
+    return {"name": runtime.get("name"), "version": runtime.get("version"), field: value}
+
+
+def replace_package(content, provider, manifest, runtime=None):
+    """Snapshot the adapter manifest (and its runtime manifest when mapped)."""
+    spec = runtime_spec(content, provider, manifest)
     data = json.loads(content)
     data[provider]["package"] = package_snapshot(manifest)
+    if spec is not None:
+        if not isinstance(runtime, dict) or (runtime.get("name"), runtime.get("version")) != spec:
+            raise ValueError("runtime metadata must describe " + "@".join(spec))
+        data[provider]["runtime"] = runtime_snapshot(data[provider], runtime)
+    elif runtime is not None:
+        raise ValueError("adapter mapping declares no runtimePackage")
     return json.dumps(data, indent=2, sort_keys=True) + "\n"
+
+
+def registry_url(name, version):
+    return REGISTRY + urllib.parse.quote(name, safe="") + "/" + urllib.parse.quote(version, safe="")
+
+
+def read_manifest(url):
+    with urllib.request.urlopen(url, timeout=30) as response:
+        return json.load(response)
+
+
+def fetch_manifest(name, version, delays=None, sleep=None):
+    # A transient registry 5xx or reset retries (intent-hq/intent#8613).
+    manifest = download_retry.retrying(lambda: read_manifest(registry_url(name, version)),
+                                       "npm registry manifest " + name + "@" + version,
+                                       delays=download_retry.RETRY_DELAYS if delays is None else delays,
+                                       sleep=sleep)
+    if manifest.get("name") != name or manifest.get("version") != version:
+        raise ValueError("registry returned a different package than the exact pin")
+    return manifest
 
 
 def read_pin(config, symbol):
@@ -51,12 +114,10 @@ def refresh(root):
     for provider, mapping in json.loads(content).items():
         pin = read_pin(config, mapping["pinConstant"])
         name, version = pin.rsplit("@", 1)
-        url = "https://registry.npmjs.org/" + urllib.parse.quote(name, safe="") + "/" + urllib.parse.quote(version, safe="")
-        with urllib.request.urlopen(url, timeout=30) as response:
-            manifest = json.load(response)
-        if manifest.get("name") != name or manifest.get("version") != version:
-            raise ValueError("registry returned a different package than the exact pin")
-        content = replace_package(content, provider, manifest)
+        manifest = fetch_manifest(name, version)
+        spec = runtime_spec(content, provider, manifest)
+        runtime = fetch_manifest(*spec) if spec else None
+        content = replace_package(content, provider, manifest, runtime)
     path.write_text(content)
 
 

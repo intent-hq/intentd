@@ -7,7 +7,7 @@
 // mock ACP agent's 500 ms handshake budget. Usage, from `packages/intentd`:
 //
 //   NODE_OPTIONS="--require $PWD/crates/intentd/tests/fixtures/slow-node-startup.cjs" \
-//     cargo nextest run -p intentd --test e2e_wss_agent_spawn_retry
+//     cargo nextest run -p intentd --test suite_wss_agents -E 'test(/^e2e_wss_agent_spawn_retry::/)'
 //
 // `SLOW_NODE_STARTUP_MS` overrides the default 450 ms stall. The default leaves
 // Node's own startup to push the total over budget; on a host where that margin

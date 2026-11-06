@@ -3,24 +3,24 @@
 
 use std::collections::HashMap;
 
-use intent_core::{AgentId, AgentSession, Error, Result};
+use intent_core::{AgentId, Error, Result};
 use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::agent_repo::{
     decode_last_tool_use_col, decode_preview_col, map_session_summary_row, SESSION_SUMMARY_COLUMNS,
 };
-use crate::{SessionMessageProjection, Store};
+use crate::{AgentSessionSummary, SessionMessageProjection, Store};
 
 /// List-shaped inputs for one watched agent; no transcript or hook log bodies.
 pub struct SubscriptionAgentProjection {
     /// Metadata-only session with its actual owning workspace.
-    pub session: AgentSession,
+    pub session: AgentSessionSummary,
     /// Persisted bounded previews and trigger-maintained message count.
     pub messages: SessionMessageProjection,
     /// Active hook identity and timing only.
     pub waiting_on_hooks: Vec<Value>,
-    /// Active PR monitor identity and title only.
+    /// Proven legacy PR monitor identity and title only.
     pub waiting_on_pr_monitors: Vec<Value>,
 }
 
@@ -45,8 +45,9 @@ fn hooks_sql(placeholders: &str) -> String {
 }
 
 fn monitors_sql(placeholders: &str) -> String {
+    let targets = crate::pr_monitor_repo::TARGET_COLUMNS;
     format!(
-        "SELECT agent_id, monitor_id, repo_owner, repo_name, pr_number, \
+        "SELECT agent_id, monitor_id, repo_owner, repo_name, pr_number, {targets}, \
          CASE WHEN json_valid(last_snapshot) THEN \
          CASE WHEN json_type(last_snapshot, '$.title') = 'text' \
          THEN json_extract(last_snapshot, '$.title') END END AS title \
@@ -71,7 +72,7 @@ impl Store {
         for chunk in ids.chunks(IDS_PER_STATEMENT) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = session_sql(&placeholders);
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(&id.0);
             }
@@ -110,7 +111,7 @@ impl Store {
                 );
             }
             let sql = hooks_sql(&placeholders);
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(&id.0);
             }
@@ -132,13 +133,16 @@ impl Store {
                 }
             }
             let sql = monitors_sql(&placeholders);
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(&id.0);
             }
             for row in query.fetch_all(self.read_pool()).await.map_err(|e| {
                 Error::Internal(format!("subscription PR monitor projection failed: {e}"))
             })? {
+                if !crate::pr_monitor_repo::legacy_monitor_summary(&row)? {
+                    continue;
+                }
                 if let Some(agent) = batch.get_mut(&row.get::<String, _>("agent_id")) {
                     let mut value = json!({
                         "monitorId": row.get::<String, _>("monitor_id"),
@@ -175,7 +179,7 @@ mod tests {
             (hooks_sql("?,?"), "idx_hook_agent"),
             (monitors_sql("?,?"), "idx_pr_monitor_agent"),
         ] {
-            let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+            let plan = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
                 .bind("agent-a")
                 .bind("agent-b")
                 .fetch_all(store.read_pool())

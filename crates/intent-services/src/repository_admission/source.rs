@@ -164,11 +164,11 @@ pub(crate) async fn read_agent_identity(
         return Err(AdmissionError::Denied);
     }
     Ok(Some(RepositoryAgentIdentity {
-        id: session.id,
-        workspace_id: session.workspace_id,
-        parent_agent_id: session.parent_agent_id,
-        backend_session_id: session.backend_session_id,
-        acp_session_id: session.acp_session_id,
+        id: session.id.clone(),
+        workspace_id: session.workspace_id.clone(),
+        parent_agent_id: session.parent_agent_id.clone(),
+        backend_session_id: session.backend_session_id.clone(),
+        acp_session_id: session.acp_session_id.clone(),
     }))
 }
 
@@ -627,7 +627,7 @@ mod captured_scope_tests {
         let caller = Caller::Agent {
             agent_id: agent_id.clone(),
         };
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let registry = Arc::new(RepositoryLifecycleRegistry::default());
         registry.install(&f.store).await.unwrap();
         // The transport scope is real; physical creation remains an explicit
@@ -695,7 +695,7 @@ mod captured_scope_tests {
         let caller = Caller::Agent {
             agent_id: tests::agent(f).await,
         };
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let registry = Arc::new(RepositoryLifecycleRegistry::default());
         registry.install(&f.store).await.unwrap();
         let owner = FixtureOriginOwner::new(&registry, caller.clone()).unwrap();
@@ -769,7 +769,7 @@ mod captured_scope_tests {
             let caller = Caller::Agent {
                 agent_id: tests::agent(f).await,
             };
-            let services = Services::new(f.store.clone());
+            let services = Services::new_isolated(f.store.clone());
             let service = &services;
             let registry = Arc::new(RepositoryLifecycleRegistry::default());
             registry.install(&f.store).await.unwrap();
@@ -892,7 +892,7 @@ mod captured_scope_tests {
         let caller = Caller::Agent {
             agent_id: tests::agent(f).await,
         };
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let registry = Arc::new(RepositoryLifecycleRegistry::default());
         registry.install(&f.store).await.unwrap();
         let owner = FixtureOriginOwner::new(&registry, caller.clone()).unwrap();
@@ -953,7 +953,7 @@ mod captured_scope_tests {
         let caller = Caller::Agent {
             agent_id: agent_id.clone(),
         };
-        let services = Services::new(f.store.clone());
+        let services = Services::new_isolated(f.store.clone());
         let registry = Arc::new(RepositoryLifecycleRegistry::default());
         registry.install(&f.store).await.unwrap();
         let creator = RepositoryCreationOwner::allocate(

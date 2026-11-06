@@ -24,10 +24,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,14 +61,13 @@ const CHILD_COUNTER_MARKER: &str = "KEEP_CHILD_ACTIVE_FOR_SNAPSHOT_E2E";
 
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
         let log_path = self.data_dir.path().join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             if !log.is_empty() {
@@ -81,7 +81,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-snap-")
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -96,7 +96,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -197,11 +197,14 @@ async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
         .await
         .expect("send");
     loop {
-        let msg = timeout(Duration::from_secs(10), ws.next())
-            .await
-            .expect("ws rpc timeout")
-            .expect("ws closed")
-            .expect("ws error");
+        let msg = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            ws.next(),
+        )
+        .await
+        .expect("ws rpc timeout")
+        .expect("ws closed")
+        .expect("ws error");
         if let Message::Text(text) = msg {
             let v: Value = serde_json::from_str(&text).expect("invalid json");
             if v["id"] == id {
@@ -213,9 +216,12 @@ async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
 
 async fn wss_event(ws: &mut Ws, secs: u64) -> Value {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -300,7 +306,7 @@ fn mcp_config_files(data_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Extract the bridge `--connect <addr>` from a generated MCP config file.
-fn bridge_addr_from_config(path: &Path) -> String {
+fn bridge_addr_from_config(path: &Path) -> (String, String) {
     let cfg: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("read mcp config"))
         .expect("parse mcp config");
     let args = cfg["mcpServers"]["workspace-mcp"]["args"]
@@ -310,7 +316,14 @@ fn bridge_addr_from_config(path: &Path) -> String {
         .iter()
         .position(|a| a == "--connect")
         .expect("--connect flag in bridge args");
-    args[idx + 1].as_str().expect("bridge addr").to_string()
+    let token = cfg["mcpServers"]["workspace-mcp"]["env"]["INTENTD_MCP_BRIDGE_TOKEN"]
+        .as_str()
+        .expect("bridge secret in workspace-mcp env")
+        .to_string();
+    (
+        args[idx + 1].as_str().expect("bridge addr").to_string(),
+        token,
+    )
 }
 
 /// Per-agent MCP bridge client (newline-delimited JSON-RPC over loopback),
@@ -322,11 +335,20 @@ struct BridgeClient {
 }
 
 impl BridgeClient {
-    async fn connect(addr: &str) -> Self {
-        let stream = timeout(Duration::from_secs(10), TcpStream::connect(addr))
-            .await
-            .expect("bridge connect timeout")
-            .expect("bridge connect");
+    async fn connect((addr, token): &(String, String)) -> Self {
+        let mut stream = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            TcpStream::connect(addr),
+        )
+        .await
+        .expect("bridge connect timeout")
+        .expect("bridge connect");
+        tokio::io::AsyncWriteExt::write_all(
+            &mut stream,
+            format!("intentd-mcp-bridge-auth {token}\n").as_bytes(),
+        )
+        .await
+        .expect("bridge auth");
         let (r, w) = stream.into_split();
         let mut c = BridgeClient {
             reader: BufReader::new(r),
@@ -352,10 +374,13 @@ impl BridgeClient {
         let mut buf = String::new();
         loop {
             buf.clear();
-            let n = timeout(Duration::from_secs(30), self.reader.read_line(&mut buf))
-                .await
-                .expect("bridge read timeout")
-                .expect("bridge read");
+            let n = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(30)),
+                self.reader.read_line(&mut buf),
+            )
+            .await
+            .expect("bridge read timeout")
+            .expect("bridge read");
             assert!(n > 0, "bridge closed while waiting for response");
             let v: Value = match serde_json::from_str(buf.trim()) {
                 Ok(v) => v,
@@ -900,7 +925,8 @@ async fn snapshot_running_sub_agents_excludes_idle_children_over_wss() {
     assert_eq!(sent["result"]["success"], true, "sendMessage ok: {sent}");
 
     // In flight: the parent's snapshot must count exactly the running child.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     loop {
         let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
         assert!(!err, "snapshot poll (in flight): {text}");
@@ -918,7 +944,8 @@ async fn snapshot_running_sub_agents_excludes_idle_children_over_wss() {
     // Settled: once the child's turn ends it persists idle and must drop out
     // of the count. Pre-fix this poll never converged — the idle child is
     // non-terminal, so the unsettled blocklist kept reporting it as running.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     loop {
         let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
         assert!(!err, "snapshot poll (settled): {text}");

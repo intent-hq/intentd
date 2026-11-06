@@ -65,7 +65,12 @@ pub(crate) const PRELUDE: &str = r"
 
 /// `budget` is the caller's effective `workspace_api` eval budget; `run`
 /// derives its `timeoutSeconds` ceiling from it.
-pub(crate) async fn dispatch(
+///
+/// # Errors
+///
+/// The frame's error message: an unknown method, bad arguments, or the
+/// workspace API's refusal.
+pub async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     budget: Duration,
@@ -126,9 +131,17 @@ pub(crate) async fn dispatch(
         "restore" => archive(api, ws, args, false).await,
         "create" => create(api, ws, args).await,
         "remove" => remove(api, ws, args).await,
-        "start" => start(api, ws, args).await,
+        "start" => {
+            let mut reply = start(api, ws, args).await?;
+            arm_start_monitor(api, ws, caller, args, &mut reply).await;
+            Ok(reply)
+        }
         "stop" => stop(api, ws, args).await,
-        "restart" => restart(api, ws, args).await,
+        "restart" => {
+            let mut reply = restart(api, ws, args).await?;
+            arm_start_monitor(api, ws, caller, args, &mut reply).await;
+            Ok(reply)
+        }
         "output" => output(api, ws, args).await,
         "status" => status(api, ws, args).await,
         "run" => run(api, ws, budget, args).await,
@@ -143,6 +156,40 @@ fn page_options(args: &Value) -> Result<Value, String> {
     let mut options = args.clone();
     options["view"] = Value::String("summary".into());
     Ok(options)
+}
+
+/// Default-on completion wake: an agent that starts or restarts a
+/// command-mode script gets the same monitor `ws.script.monitor` would arm,
+/// reported under `autoMonitor` (the `script.monitor` reply: `{ ok, monitor }`
+/// or a refusal). Agents ended turns "waiting for the build" with nothing
+/// armed and stalled until someone noticed. Best-effort: a failed arm never
+/// fails the start the agent asked for; it is reported as `autoMonitorError`.
+async fn arm_start_monitor(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+    reply: &mut Value,
+) {
+    let (Some(agent), Ok(script_id), Some(run_id)) = (
+        caller,
+        req_str(args, "scriptId"),
+        reply
+            .get("runId")
+            .and_then(Value::as_str)
+            .filter(|r| !r.is_empty())
+            .map(str::to_owned),
+    ) else {
+        return;
+    };
+    match api
+        .script_start_monitor(ws.clone(), agent.clone(), script_id, run_id)
+        .await
+    {
+        Ok(Value::Null) => {}
+        Ok(monitor) => reply["autoMonitor"] = monitor,
+        Err(error) => reply["autoMonitorError"] = Value::String(error.to_string()),
+    }
 }
 
 fn monitor_owner(caller: Option<&AgentId>) -> Result<AgentId, String> {
@@ -205,6 +252,20 @@ async fn create(
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
+    // `remoteAuthor` is daemon-owned (`remoteScripts: 1`), never a param.
+    if args.get("remoteAuthor").is_some() {
+        return Err(
+            "remote-script-author-readonly: remoteAuthor is set by the backend".to_string(),
+        );
+    }
+    // Saved scripts never receive secrets (PROTOCOL §5.56): say so instead of
+    // silently ignoring the key and letting the script run without them.
+    if args.get("secretEnv").is_some() {
+        return Err(
+            "secretEnv is not supported by ws.script: secrets work only with ws.host.exec"
+                .to_string(),
+        );
+    }
     let name =
         req_str(args, "name").map_err(|_| "name, command, and mode are required.".to_string())?;
     let command = req_str(args, "command")
@@ -381,5 +442,29 @@ mod tests {
         assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(6)), 1);
         assert_eq!(run_timeout_ceiling_secs(Duration::from_secs(3)), 1);
         assert_eq!(run_timeout_ceiling_secs(Duration::from_millis(250)), 1);
+    }
+
+    struct NoApi;
+    impl WorkspaceApi for NoApi {}
+
+    /// `remoteAuthor` is set by the backend only: a local agent supplying
+    /// it is refused with the documented code before anything is saved.
+    #[tokio::test]
+    async fn create_refuses_a_remote_author_param() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(NoApi);
+        let error = create(
+            &api,
+            &WorkspaceId::from("ws"),
+            &serde_json::json!({
+                "name": "n", "command": "true", "mode": "command",
+                "remoteAuthor": { "agentId": "a", "nodeId": "n" },
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.starts_with("remote-script-author-readonly: "),
+            "{error}"
+        );
     }
 }

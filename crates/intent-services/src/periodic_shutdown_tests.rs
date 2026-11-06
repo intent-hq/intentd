@@ -44,10 +44,13 @@ pub(crate) fn hold(
 }
 
 pub(crate) async fn entered(rx: oneshot::Receiver<()>) {
-    tokio::time::timeout(Duration::from_secs(10), rx)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        rx,
+    )
+    .await
+    .unwrap()
+    .unwrap();
 }
 
 pub(crate) async fn drain_held(svc: &Services, release: oneshot::Sender<()>) {
@@ -56,17 +59,23 @@ pub(crate) async fn drain_held(svc: &Services, release: oneshot::Sender<()>) {
     let service = svc.clone();
     let drain = tokio::spawn(async move { service.shutdown_store_writers().await });
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), rx)
-            .await
-            .expect("finite drain must retain committed publication")
-            .unwrap(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            rx
+        )
+        .await
+        .expect("finite drain must retain committed publication")
+        .unwrap(),
         "store-tasks"
     );
     release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), drain)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        drain,
+    )
+    .await
+    .unwrap()
+    .unwrap();
 }
 
 #[tokio::test]

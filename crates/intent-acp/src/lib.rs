@@ -23,16 +23,20 @@ pub mod error;
 pub mod fs;
 pub mod handler;
 pub mod handshake;
+pub mod io_priority;
 pub mod mcp_bridge;
 pub mod mcp_config;
 pub(crate) mod mcp_env;
 pub mod mcp_server;
 pub mod permission;
+pub mod profile_env;
+pub mod review_monitoring;
 pub mod session;
 pub mod spawn;
 pub mod terminal;
 pub(crate) mod tool_restrictions;
 pub mod transport;
+pub mod workers;
 
 #[cfg(unix)]
 pub use descendant_sweep::{descendant_pids, descendant_pids_many, sweep_escaped_descendants};
@@ -42,26 +46,35 @@ pub use error::{
     PROVIDER_STALL_PREFIX,
 };
 pub use fs::FileService;
-pub use handler::{ClientRequestHandler, EventSink, SinkEvent};
+pub use handler::{
+    cursor_ask_question_skipped, ClientRequestHandler, EventSink, SinkEvent,
+    CURSOR_ASK_QUESTION_METHOD, CURSOR_TASK_METHOD,
+};
 pub use handshake::handshake;
-pub use mcp_bridge::{run_stdio_bridge, serve_workspace_mcp_tcp, McpBridge};
+pub use mcp_bridge::{
+    bridge_auth_line, run_stdio_bridge, serve_mcp_handler_tcp, serve_workspace_mcp_tcp, McpBridge,
+    McpHandler, BRIDGE_TOKEN_ENV,
+};
 pub use mcp_config::{
     apply_baseline_env_to_stdio_servers, normalize_mcp_servers, normalize_spaced_bridge_command,
     to_acp_session_mcp_servers, to_auggie_mcp_config, to_opencode_mcp_config, NormalizedMcpServer,
     NormalizedMcpServers,
 };
+pub use mcp_env::is_likely_secret_env_key;
 pub use mcp_env::{build_baseline_mcp_env_from_process, EnvMap};
 pub use mcp_server::bindings_prelude_for_bridge;
 pub use mcp_server::bindings_prelude_for_workspace;
+pub use mcp_server::dispatch_script_method;
 pub use mcp_server::{
-    make_workspace_host_for_bridge, SpecialistModelOption, SpecialistModelOptions,
+    make_workspace_host_for_bridge, HostFrameRouter, SpecialistModelOption, SpecialistModelOptions,
     WorkspaceMcpServer, MCP_PROTOCOL_VERSION, WORKSPACE_API_SYSTEM_PROMPT_HEADING,
 };
 pub use permission::{
     PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
 };
+pub use profile_env::{NodeAccountDirMissing, ProfileEnv};
 pub use session::{MappedToolCall, MappedUpdate};
-pub use spawn::{spawn_provider, LaunchMode, NpxLaunchDir, SpawnOptions};
+pub use spawn::{spawn_provider, AgentPriority, LaunchMode, NpxLaunchDir, SpawnOptions};
 pub use terminal::{TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo};
 pub use tool_restrictions::{
     get_native_tools_to_remove, get_tool_denylist_for_agent_type, get_tools_to_remove,
@@ -76,8 +89,20 @@ mod tests;
 #[cfg(test)]
 mod tests_wsapi5;
 
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod egress_registry;
+
 #[cfg(test)]
 mod tests_hidden_field_egress;
+
+#[cfg(test)]
+mod tests_large_note;
+
+#[cfg(test)]
+mod tests_hook_get;
+
+#[cfg(test)]
+mod tests_call_ledger;
 
 /// Test-only process-global env setup. Runs before `main()` — and therefore
 /// before any test threads exist, making `set_var` race-free. Node children

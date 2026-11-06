@@ -49,7 +49,7 @@ async fn uds_github_param_validation_and_routing() {
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn WorkspaceApi> =
-        Arc::new(Services::new(store).with_workspaces_root(ws_root.path().to_path_buf()));
+        Arc::new(Services::new_isolated(store).with_workspaces_root(ws_root.path().to_path_buf()));
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let socket = config.socket_path.clone();
     let server = intent_core::spawn_daemon(async move {

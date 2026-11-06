@@ -19,6 +19,30 @@ impl Store {
         monitor: bool,
         options: &ScriptListOptions,
     ) -> Result<Value> {
+        self.script_summary_page_inner(ws, owner, monitor, options, false)
+            .await
+    }
+
+    /// Select saved scripts before pagination for scoped guest operators.
+    /// # Errors
+    /// Rejects invalid cursors and storage failures.
+    pub async fn saved_script_summary_page(
+        &self,
+        ws: &WorkspaceId,
+        options: &ScriptListOptions,
+    ) -> Result<Value> {
+        self.script_summary_page_inner(ws, None, false, options, true)
+            .await
+    }
+
+    async fn script_summary_page_inner(
+        &self,
+        ws: &WorkspaceId,
+        owner: Option<&AgentId>,
+        monitor: bool,
+        options: &ScriptListOptions,
+        saved_only: bool,
+    ) -> Result<Value> {
         let method = if monitor {
             "scriptMonitor.list"
         } else {
@@ -34,7 +58,15 @@ impl Store {
         } else {
             "SELECT created_at,id FROM script WHERE workspace_id=? AND archived_at IS NULL AND (? IS NULL OR ? IS NULL) AND (? IS NULL OR (created_at,id)<(?,?)) ORDER BY created_at DESC,id DESC LIMIT ?"
         };
-        let mut keys: Vec<(String, String)> = sqlx::query_as(sql)
+        let sql = if saved_only {
+            sql.replace(
+                "archived_at IS NULL",
+                "archived_at IS NULL AND purpose='saved'",
+            )
+        } else {
+            sql.to_owned()
+        };
+        let mut keys: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(ws.as_str())
             .bind(owner.map(AgentId::as_str))
             .bind(owner.map(AgentId::as_str))
@@ -52,9 +84,17 @@ impl Store {
         let projection = if monitor {
             "SELECT json_object('monitorId',id,'workspaceId',workspace_id,'agentId',agent_id,'scriptId',script_id,'runId',run_id,'scriptName',json_extract(row_json,'$.scriptName'),'mode',json_extract(row_json,'$.mode'),'state','active','createdAt',created_at,'expiresAt',json_extract(row_json,'$.expiresAt'),'lineCount',json_extract(row_json,'$.lineCount'),'outputPatternPreview',substr(json_extract(row_json,'$.outputPattern'),1,160),'patternBytes',length(CAST(json_extract(row_json,'$.outputPattern') AS BLOB))) FROM script_monitor WHERE workspace_id=? AND state='active' AND (? IS NULL OR agent_id=?) AND id IN (SELECT value FROM json_each(?)) ORDER BY created_at DESC,id DESC"
         } else {
-            "SELECT json_object('id',id,'workspaceId',workspace_id,'name',name,'mode',mode,'source',source,'createdAt',created_at,'updatedAt',updated_at,'category',category,'autoStart',auto_start,'purpose',purpose,'commandPreview',substr(command,1,160),'commandBytes',length(CAST(command AS BLOB)),'lastRun',CASE WHEN last_run IS NULL THEN NULL ELSE json_remove(json(last_run),'$.error') END,'lastError',substr(json_extract(last_run,'$.error'),1,256),'lastErrorBytes',length(CAST(json_extract(last_run,'$.error') AS BLOB))) FROM script WHERE workspace_id=? AND archived_at IS NULL AND id IN (SELECT value FROM json_each(?)) ORDER BY created_at DESC,id DESC"
+            "SELECT json_object('id',id,'workspaceId',workspace_id,'name',name,'mode',mode,'source',source,'createdAt',created_at,'updatedAt',updated_at,'category',category,'autoStart',auto_start,'purpose',purpose,'commandPreview',substr(command,1,160),'commandBytes',length(CAST(command AS BLOB)),'lastRun',CASE WHEN last_run IS NULL THEN NULL ELSE json_remove(json(last_run),'$.error') END,'lastError',substr(json_extract(last_run,'$.error'),1,256),'lastErrorBytes',length(CAST(json_extract(last_run,'$.error') AS BLOB)),'remoteAuthor',CASE WHEN remote_author IS NULL THEN NULL ELSE json(remote_author) END) FROM script WHERE workspace_id=? AND archived_at IS NULL AND id IN (SELECT value FROM json_each(?)) ORDER BY created_at DESC,id DESC"
         };
-        let query = sqlx::query_scalar(projection).bind(ws.as_str());
+        let projection = if saved_only {
+            projection.replace(
+                "archived_at IS NULL",
+                "archived_at IS NULL AND purpose='saved'",
+            )
+        } else {
+            projection.to_owned()
+        };
+        let query = sqlx::query_scalar(sqlx::AssertSqlSafe(projection.as_str())).bind(ws.as_str());
         let query = if monitor {
             query
                 .bind(owner.map(AgentId::as_str))

@@ -15,10 +15,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,14 +38,13 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
         let log_path = self.data_dir.path().join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
@@ -56,7 +56,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-midturn-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -73,7 +73,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -179,9 +179,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -204,9 +207,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -255,55 +261,15 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
         title: "WSS-MIDTURN-E2E".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -649,12 +615,12 @@ async fn agent_midturn_failure_surfaces_and_retries_over_wss() {
 /// sweep the process group BEFORE awaiting drain settlement. The mock's final
 /// gated exit leaves a same-group `sleep 300` holding the inherited stderr
 /// write end open, so the drain can only hit EOF once the hint's own group
-/// sweep kills the descendant. The settle bound is widened to 30s via
-/// `INTENTD_STDERR_SETTLE_TIMEOUT_MS` and the WARN hint is required well
-/// inside it: with the sweep-then-settle ordering the hint lands in a couple
-/// of seconds, while the regressed settle-then-sweep ordering burns the full
-/// widened bound and fails the ceiling deterministically (instead of racing
-/// the default 2s timeout). The sweep must also actually reap the holder.
+/// sweep kills the descendant. The settle bound is widened to a day via
+/// `INTENTD_STDERR_SETTLE_TIMEOUT_MS`, so only the sweep can end the wait:
+/// with the sweep-then-settle ordering the hint lands at once, while the
+/// regressed settle-then-sweep ordering waits on the holder and hangs into
+/// the log wait's guard (instead of racing the default 2s timeout). The sweep
+/// must also actually reap the holder.
 #[tokio::test]
 async fn stderr_hint_settles_past_pipe_holding_descendant_over_wss() {
     let Some(script) = gate("WSS pipe-holding-descendant stderr hint E2E") else {
@@ -680,7 +646,7 @@ async fn stderr_hint_settles_past_pipe_holding_descendant_over_wss() {
         ("MOCK_AGENT_ATTEMPT_FILE", &attempt_file_s),
         ("INTENTD_SESSION_SETUP_TIMEOUT_MS", "2000"),
         ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "100,200"),
-        ("INTENTD_STDERR_SETTLE_TIMEOUT_MS", "30000"),
+        ("INTENTD_STDERR_SETTLE_TIMEOUT_MS", "86400000"),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -711,7 +677,6 @@ async fn stderr_hint_settles_past_pipe_holding_descendant_over_wss() {
         .expect("agent id")
         .to_string();
 
-    let started = std::time::Instant::now();
     let sent = wss_rpc(
         &mut rpc,
         11,
@@ -721,18 +686,12 @@ async fn stderr_hint_settles_past_pipe_holding_descendant_over_wss() {
     .await;
     assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
 
-    // The WARN hint must name the capture path — and land well inside the
-    // widened 30s settle bound: the hint's own group sweep (not the timeout)
-    // is what unblocks the drain when a descendant holds the pipe.
+    // The WARN hint must name the capture path: the hint's own group sweep
+    // (no timeout can, with a day-long settle bound) is what unblocks the
+    // drain when a descendant holds the pipe.
     let capture_dir = intent_core::agent_logs_root(&data_dir).join(&agent_id);
     let expected_hint = format!("agent stderr captured at {}", capture_dir.display());
     await_daemon_log_contains(&data_dir, &expected_hint).await;
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(15),
-        "stderr hint arrived via the group sweep, not by exhausting the 30s \
-         settle bound (took {elapsed:?})"
-    );
 
     // The capture holds the child's dying words, including the holder spawn —
     // proving the drain reached EOF and flushed past the descendant.
@@ -964,7 +923,8 @@ async fn await_pid_lines(path: &Path, n: usize) -> Vec<u32> {
 /// Bounded poll: wait until the daemon log contains `needle`.
 async fn await_daemon_log_contains(data_dir: &Path, needle: &str) {
     let log_path = data_dir.join("daemon.log");
-    for _ in 0..400 {
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(10));
+    while tokio::time::Instant::now() < deadline {
         if tokio::fs::read_to_string(&log_path)
             .await
             .unwrap_or_default()

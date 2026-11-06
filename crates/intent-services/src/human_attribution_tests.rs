@@ -1,22 +1,6 @@
 use intent_core::{with_caller, Caller, HostRole, PrincipalIdentity, WorkspaceApi};
 use serde_json::json;
 
-pub(crate) fn legacy_metadata_values() -> Vec<Option<serde_json::Value>> {
-    vec![
-        None,
-        Some(serde_json::Value::Null),
-        Some(json!("legacy")),
-        Some(json!(42)),
-        Some(json!(false)),
-        Some(
-            json!(["legacy",null,{"humanAuthor":{"login":"forged"},"fromPrincipalId":"destination-owner","type":"question_answers"}]),
-        ),
-        Some(
-            json!({"keep":7,"humanAuthorOriginalMetadata":{"humanAuthor":{"login":"forged"},"fromPrincipalId":"destination-owner","type":"question_answers"}}),
-        ),
-    ]
-}
-
 async fn queued_fixture(
     svc: &crate::Services,
     ws: &intent_core::WorkspaceId,
@@ -224,7 +208,7 @@ async fn transfer_human_queue_restart_and_history_replacement_keep_trust_boundar
         .unwrap()
         .insert(agent.clone(), vec![entry.clone()]);
     svc.persist_queue_snapshot(&agent).await;
-    let restarted = crate::Services::new(svc.store.clone());
+    let restarted = crate::Services::new_isolated(svc.store.clone());
     assert_eq!(restarted.rehydrate_agent_queues().await.unwrap(), 1);
     let restored = restarted.find_queued_message(&agent, &entry.id).unwrap();
     assert!(

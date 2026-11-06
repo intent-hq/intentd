@@ -16,7 +16,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,8 +24,7 @@ use std::time::{Duration, Instant};
 
 use intent_core::{
     now_iso, AgentId, AgentSession, AgentStatus, ContentType, Note, NoteId, NoteMetadata,
-    NoteVisibility, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
+    NoteVisibility, TaskMetadata, TaskStatus, Workspace, WorkspaceId,
 };
 use intent_services::{EventBus, Services};
 use intent_store::{ReplaceMessage, Store};
@@ -110,7 +109,7 @@ async fn boot() -> (
     let socket = sock_dir.path().join("uds.sock");
     let ws_root = common::hermetic_workspaces_root();
     let services = Arc::new(
-        Services::new(bus.store().clone())
+        Services::new_isolated(bus.store().clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
             .with_event_bus(bus.clone()),
@@ -152,49 +151,10 @@ fn seed_workspace(idx: usize) -> Workspace {
         id: WorkspaceId(format!("ws-scale-{idx}-{}", Uuid::new_v4())),
         title: format!("Scale WS {idx}"),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
         skip_worktree: true,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        display_status: None,
-        waiting: false,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -277,6 +237,7 @@ fn seed_agent_session(ws_id: &WorkspaceId, idx: usize) -> AgentSession {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     }
 }
 

@@ -53,6 +53,11 @@ use crate::config::{
     MIN_UPDATES_IDLE_CHECK_INTERVAL_MINUTES, MIN_UPDATES_IDLE_GRACE_SECONDS,
     TOOL_PAYLOAD_RETENTION_DAYS_MAX,
 };
+use crate::config::{
+    DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN, DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS,
+    SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX, SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN,
+    SCRIPT_OUTPUT_RETENTION_HOURS_MAX,
+};
 use crate::error::{Error, Result};
 
 /// Root of the `config.toml` schema. One field per top-level TOML table.
@@ -80,6 +85,7 @@ pub struct SettingsFile {
     pub logging: LoggingSettings,
     pub agents: AgentsSettings,
     pub events: EventsSettings,
+    pub scripts: ScriptsSettings,
     pub workspace_api: WorkspaceApiSettings,
     pub hooks: HooksSettings,
     pub agent_features: AgentFeaturesSettings,
@@ -87,6 +93,8 @@ pub struct SettingsFile {
     pub pr_monitor: PrMonitorSettings,
     pub pr_cache: PrCacheSettings,
     pub updates: UpdatesSettings,
+    pub remote_agents: RemoteAgentsSettings,
+    pub daemon: DaemonSettings,
 }
 
 /// `[providers]` — agent-provider selection (`providers.*`).
@@ -101,7 +109,10 @@ pub struct ProvidersSettings {
     pub enabled: Option<BTreeMap<String, bool>>,
     /// `providers.paths` — per-provider CLI path overrides.
     pub paths: BTreeMap<String, String>,
-    /// Session-only Fast mode preference; absent providers default to off.
+    /// Session-only Fast mode preference keyed by `claude-code` / `codex` or
+    /// a named-profile reference of either (`<base>@<profileId>`). Each key is
+    /// its own setting: an absent key is off, and a profile never reads its
+    /// base provider's entry.
     pub fast_mode: BTreeMap<String, bool>,
 }
 
@@ -164,8 +175,12 @@ pub struct SpecialistsSettings {
     pub dir: Option<String>,
 }
 
+/// Default `workspace.autoArchiveIdleAfterDays`: `0`, the idle auto-archive
+/// sweep is off until the user picks a number of days.
+pub const DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS: u32 = 0;
+
 /// `[workspace]` — workspace/git-adjacent knobs (`workspace.*`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct WorkspaceSettings {
     /// `workspace.branchPrefix` — prefix for agent-created branches.
@@ -177,9 +192,40 @@ pub struct WorkspaceSettings {
     /// `workspace.defaultShell` — shell used for terminals/scripts.
     pub default_shell: Option<String>,
     /// `workspace.cowIsolation` — `CoW` workspace provisioning and per-agent
-    /// sandboxing (requires `CoW` filesystem support on the workspaces root;
-    /// workspace creation fails when unsupported).
+    /// sandboxing (requires `CoW` filesystem support on the workspaces root).
+    /// A preference, not a guarantee: when the filesystem cannot `CoW`-clone,
+    /// `workspace.create` falls back to a linked worktree (local repository)
+    /// or a plain local clone (repo-cache hydration) instead of failing.
     pub cow_isolation: bool,
+    /// `workspace.autoArchiveIdleAfterDays` — archive workspaces idle for
+    /// this many days (PROTOCOL §5.12). Defaults to
+    /// [`DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS`] (`0`, off).
+    pub auto_archive_idle_after_days: u32,
+    /// `workspace.purgeArchivedAfterDays` — purge (retire) the folders of
+    /// workspaces archived longer than this many days (PROTOCOL §5.12).
+    /// Absent (`None`, the default) = off; a hand-edited `0` also reads as
+    /// off.
+    pub purge_archived_after_days: Option<u32>,
+    /// `workspace.autoRetireArchivedAfterDays` — the deprecated predecessor
+    /// of `purgeArchivedAfterDays`. Still parsed so an upgraded config.toml
+    /// loads; the boot migration rewrites it to the new key, and the purge
+    /// sweep falls back to it while the new key is unset.
+    pub auto_retire_archived_after_days: Option<u32>,
+}
+
+impl Default for WorkspaceSettings {
+    fn default() -> Self {
+        Self {
+            branch_prefix: None,
+            worktrees_location: None,
+            ssh_key_path: None,
+            default_shell: None,
+            cow_isolation: false,
+            auto_archive_idle_after_days: DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS,
+            purge_archived_after_days: None,
+            auto_retire_archived_after_days: None,
+        }
+    }
 }
 
 /// `[git]` — git behavior (`git.*`).
@@ -893,6 +939,18 @@ impl Default for AgentsSettings {
     }
 }
 
+/// Test-only env seam that resolves an `agents.resumeInterruptedOnStart` of
+/// `auto` (the schema default, also written out by the generated config
+/// template); an explicit `on` / `off`, `--resume-all`, and update restarts
+/// keep precedence, and a value other than `auto` / `on` / `off` fails daemon
+/// startup. The intentd
+/// hermetic test launcher pins it to `off`: the `auto` default resumes only
+/// on display-less hosts, so restart suites otherwise picked up an extra
+/// agent turn on CI alone (intent-hq/intent#6058, intent-hq/intent#7706).
+/// Production never sets it. Shared here so the daemon and the harness
+/// cannot drift apart on the name.
+pub const RESUME_ON_START_TEST_DEFAULT_ENV: &str = "INTENTD_TEST_RESUME_ON_START_DEFAULT";
+
 /// `agents.resumeInterruptedOnStart` values. Serializes as lowercase strings
 /// (`"auto"`, `"on"`, `"off"`). Governs plain starts only: update-triggered
 /// restarts (the sitter respawning a freshly installed version, signaled via
@@ -920,6 +978,15 @@ impl ResumeInterruptedOnStart {
             ResumeInterruptedOnStart::Off => "off",
         }
     }
+
+    /// Parse the exact wire/TOML spelling ([`Self::as_str`]); anything else
+    /// (other casing, `true`/`false`, surrounding whitespace) is `None`.
+    #[must_use]
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        [Self::Auto, Self::On, Self::Off]
+            .into_iter()
+            .find(|value| value.as_str() == raw)
+    }
 }
 
 /// `[events]` — event retention (`events.*`).
@@ -935,6 +1002,33 @@ impl Default for EventsSettings {
     fn default() -> Self {
         Self {
             stream_retention_hours: DEFAULT_STREAM_RETENTION_HOURS,
+        }
+    }
+}
+
+/// `[scripts]` — on-disk script output retention (`scripts.*`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct ScriptsSettings {
+    /// `scripts.outputRetentionHours` — hours an on-disk script run log is
+    /// kept before the output sweep deletes it; `0` disables the age sweep
+    /// (logs live until their script or workspace is deleted). Max
+    /// [`SCRIPT_OUTPUT_RETENTION_HOURS_MAX`]; read live at each sweep, no
+    /// restart required. `INTENTD_SCRIPT_OUTPUT_RETENTION_HOURS` overrides it
+    /// (see [`crate::config::script_output_retention_hours`]).
+    pub output_retention_hours: u32,
+    /// `scripts.outputMaxBytesPerRun` — per-run byte cap of one on-disk
+    /// script log; past it the newest bytes are kept and the oldest dropped
+    /// (range [`SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN`]–[`SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX`];
+    /// read live at each run start, no restart required).
+    pub output_max_bytes_per_run: u64,
+}
+
+impl Default for ScriptsSettings {
+    fn default() -> Self {
+        Self {
+            output_retention_hours: DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS,
+            output_max_bytes_per_run: DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
         }
     }
 }
@@ -1002,12 +1096,19 @@ pub struct AgentFeaturesSettings {
     /// `agentFeatures.browserAutomation` — expose browser automation
     /// (`ws.browser.*`) to agents.
     pub browser_automation: bool,
+    /// `agentFeatures.desktopControl` — desktop consent and actions for new sessions.
+    pub desktop_control: bool,
     /// `agentFeatures.richChatBlocks` — include rich chat block guidance
     /// (mermaid, ws-block, nav-link) in agent prompts.
     pub rich_chat_blocks: bool,
     /// `agentFeatures.structuredQuestions` — expose structured questions
     /// (`ws.app.question.ask`) to agents.
     pub structured_questions: bool,
+    /// `agentFeatures.secretRequests` — expose agent secret requests
+    /// (`ws.secret.*` and the `ws.host.exec` `secretEnv` option) to new
+    /// top-level sessions (PROTOCOL §5.56). Defaults **off**; effective only
+    /// while `hostExec` is also on.
+    pub secret_requests: bool,
     /// `agentFeatures.attentionRequests` — expose attention requests
     /// (`ws.agent.reportBlocker` / `ws.agent.requestDiscussion`) to agents.
     pub attention_requests: bool,
@@ -1050,8 +1151,10 @@ impl Default for AgentFeaturesSettings {
             scripts: true,
             terminal_access: true,
             browser_automation: true,
+            desktop_control: true,
             rich_chat_blocks: true,
             structured_questions: true,
+            secret_requests: false,
             attention_requests: true,
             state_snapshot: true,
             pr_monitor: true,
@@ -1145,6 +1248,62 @@ impl Default for PrCacheSettings {
             max_age_seconds: DEFAULT_PR_CACHE_MAX_AGE_SECONDS,
         }
     }
+}
+
+/// `[remoteAgents]` — machine side of daemon-to-daemon remote agents
+/// (`remoteAgents.*`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct RemoteAgentsSettings {
+    /// `remoteAgents.permission` — how remote agents' provider permission
+    /// prompts are answered, since no client is attached.
+    pub permission: RemoteAgentPermission,
+}
+
+/// `remoteAgents.permission` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteAgentPermission {
+    #[default]
+    AllowAll,
+    AutoByRisk,
+    DenyAll,
+}
+
+/// `[daemon]` — how this daemon runs (`daemon.*`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct DaemonSettings {
+    /// `daemon.mode` — `regular` (default) or `node`. Changeable only over the
+    /// local UDS seat; read once at startup.
+    pub mode: DaemonMode,
+}
+
+/// Wire path of the `daemon.mode` setting.
+pub const DAEMON_MODE_SETTING: &str = "daemon.mode";
+
+/// The `settings.*` key families a daemon in node mode reads and writes;
+/// any other key is refused with `node-mode`.
+pub const NODE_MODE_SETTING_PREFIXES: &[&str] = &["remoteAgents.", "daemon.", "server."];
+
+/// Whether a daemon in node mode reads and writes the setting at `path`.
+#[must_use]
+pub fn node_mode_setting_allowed(path: &str) -> bool {
+    NODE_MODE_SETTING_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+/// `daemon.mode` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DaemonMode {
+    /// The full daemon: workspaces, local agents and their background work.
+    #[default]
+    Regular,
+    /// Orchestration off: the daemon serves only the node-mode method list
+    /// and runs agents for the backends it is exposed to.
+    Node,
 }
 
 /// `[updates]` — idle-triggered update-check knobs (`updates.*`). The raw
@@ -1246,7 +1405,9 @@ where
 /// feature was removed) — discarded and stripped. `backgroundAgents` covers
 /// the whole renamed `[backgroundAgents]` table (monorepo#1729): its captured
 /// values are migrated into the `quickActions.*` keys at boot and the table is
-/// then stripped.
+/// then stripped. `remoteAgents.enabled` and the `[experimental]` table (its
+/// only key was `remoteAgents`) are the retired remote-agent switches: remote
+/// agents need no daemon setting, so both are discarded and stripped.
 pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "model.workspaceOverrides",
     "ai",
@@ -1254,7 +1415,28 @@ pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "workspace.autoFetch",
     "backgroundAgents",
     "agents.flushQueuedMessages",
+    "remoteAgents.enabled",
+    "experimental",
 ];
+
+/// Whether `key` is a valid `providers.fastMode` key: a Fast mode capable
+/// base provider id, or a well-formed profile reference of one
+/// (`<base>@<id>`, id matching `^[a-z0-9][a-z0-9-]{0,31}$`). Existence of
+/// the profile is checked by the daemon's `settings.update` front door.
+fn is_fast_mode_key(key: &str) -> bool {
+    const BASES: [&str; 2] = ["claude-code", "codex"];
+    let Some((base, id)) = key.split_once('@') else {
+        return BASES.contains(&key);
+    };
+    let bytes = id.as_bytes();
+    BASES.contains(&base)
+        && !bytes.is_empty()
+        && bytes.len() <= 32
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
 
 /// Legacy values captured during a tolerant parse: dotted wire path → the
 /// JSON shape of the TOML value found in the file.
@@ -1405,11 +1587,11 @@ impl SettingsFile {
             .providers
             .fast_mode
             .keys()
-            .any(|id| !matches!(id.as_str(), "claude-code" | "codex"))
+            .any(|id| !is_fast_mode_key(id))
         {
             return Err(bad(
                 "providers.fastMode",
-                "only claude-code and codex support Fast mode",
+                "only claude-code and codex (or one of their named profiles) support Fast mode",
             ));
         }
         let v = self.notifications.volume;
@@ -1516,6 +1698,27 @@ impl SettingsFile {
                 "agents.toolPayloadRetentionDays",
                 &format!(
                     "must be 0 (keep forever) or between 1 and {TOOL_PAYLOAD_RETENTION_DAYS_MAX}, got {retention_days}"
+                ),
+            ));
+        }
+        let script_hours = self.scripts.output_retention_hours;
+        if script_hours > SCRIPT_OUTPUT_RETENTION_HOURS_MAX {
+            return Err(bad(
+                "scripts.outputRetentionHours",
+                &format!(
+                    "must be 0 (keep until deleted) or between 1 and {SCRIPT_OUTPUT_RETENTION_HOURS_MAX}, got {script_hours}"
+                ),
+            ));
+        }
+        // No `0`/unlimited value: the per-run cap is the disk-growth guard.
+        let script_bytes = self.scripts.output_max_bytes_per_run;
+        if !(SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN..=SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX)
+            .contains(&script_bytes)
+        {
+            return Err(bad(
+                "scripts.outputMaxBytesPerRun",
+                &format!(
+                    "must be between {SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN} and {SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX}, got {script_bytes}"
                 ),
             ));
         }
@@ -1678,7 +1881,7 @@ providerSettings = {}
 
 [specialists]
 # Default specialist -- specialist applied when none is chosen.
-# default = "implementor"
+# default = "developer"
 
 [workspace]
 # Branch prefix -- prefix for agent-created branches.
@@ -1692,6 +1895,13 @@ providerSettings = {}
 # Copy-on-Write Isolation -- CoW workspaces + per-agent sandboxes (requires
 # CoW filesystem support on the workspaces root).
 cowIsolation = false
+# Auto-archive -- archive workspaces idle for this many days (0 = off);
+# workspaces with uncommitted changes or unpushed commits are skipped.
+autoArchiveIdleAfterDays = 0
+# Purge archived workspaces -- delete the folders of workspaces archived
+# longer than this many days; conversations, notes and the git branch are
+# kept, and folders with uncommitted changes are skipped (absent = off).
+# purgeArchivedAfterDays = 7
 
 [git]
 # Auto-commit -- allow agents to commit without explicit user request.
@@ -1933,8 +2143,9 @@ maxTopLevelAgents = 20
 # tree starts draining once the window passes instead of holding 5.85 GB for
 # another 20. Raise it to keep processes warm for longer and reclaim their
 # memory later; lower it for the reverse. Only agents idle past the TTL are
-# candidates, and the sweep
-# skips any agent reported busy when it checks. An agent is selected within
+# candidates, and the sweep skips any agent reported busy when it checks, or
+# still running a background task (a dev server, say) until that task ends --
+# at most 24 hours past the TTL. An agent is selected within
 # the TTL plus one sweep (sweep interval is ttl/4, clamped to 30-300 s); the
 # memory comes back as each kill completes, so a large idle set drains over a
 # tail rather than all at once.
@@ -1966,6 +2177,17 @@ resumeInterruptedOnStart = "auto"
 # retention/compaction sweep deletes them (0 disables).
 streamRetentionHours = 72
 
+[scripts]
+# Script output retention hours -- hours an on-disk script run log is kept
+# before the output sweep deletes it; 0 disables the age sweep and keeps logs
+# until their script or workspace is deleted (max 87600; read live at each
+# sweep, no restart required; INTENTD_SCRIPT_OUTPUT_RETENTION_HOURS overrides).
+outputRetentionHours = 168
+# Script output max bytes per run -- size cap of one run's on-disk log; past
+# it the newest bytes are kept and the oldest dropped (65536-1073741824; read
+# live at each run start, no restart required).
+outputMaxBytesPerRun = 52428800
+
 [workspaceApi]
 # Max workspace API output chars -- max characters of one workspace_api tool
 # result before the output is redirected to a file (0 = unlimited; min 1000
@@ -1994,12 +2216,17 @@ scripts = true
 terminalAccess = true
 # Browser automation -- expose browser automation (ws.browser.*) to agents.
 browserAutomation = true
+# Desktop control -- consent-based primary desktop control (ws.desktop.*).
+desktopControl = true
 # Rich chat blocks -- include rich chat block guidance (mermaid, ws-block,
 # nav-link) in agent prompts.
 richChatBlocks = true
 # Structured questions -- expose structured questions (ws.app.question.ask)
 # to agents.
 structuredQuestions = true
+# Secret requests -- let new top-level agents ask the user for secrets
+# (ws.secret.*) that intentd holds in memory for ws.host.exec.
+secretRequests = false
 # Attention requests -- expose attention requests (ws.agent.reportBlocker /
 # ws.agent.requestDiscussion) to agents.
 attentionRequests = true
@@ -2193,8 +2420,10 @@ mod tests {
         assert!(d.agent_features.scripts);
         assert!(d.agent_features.terminal_access);
         assert!(d.agent_features.browser_automation);
+        assert!(d.agent_features.desktop_control);
         assert!(d.agent_features.rich_chat_blocks);
         assert!(d.agent_features.structured_questions);
+        assert!(!d.agent_features.secret_requests);
         assert!(d.agent_features.attention_requests);
         assert!(d.agent_features.state_snapshot);
         assert!(d.agent_features.peer_agents);
@@ -2228,6 +2457,7 @@ mod tests {
         assert!(parsed.agent_features.scripts);
         assert!(parsed.agent_features.terminal_access);
         assert!(parsed.agent_features.browser_automation);
+        assert!(parsed.agent_features.desktop_control);
         assert!(parsed.agent_features.structured_questions);
         assert!(parsed.agent_features.attention_requests);
         assert!(parsed.agent_features.state_snapshot);
@@ -2356,6 +2586,23 @@ mod tests {
                 SettingsFile::parse_str(&format!("[agents]\nresumeInterruptedOnStart = {raw}\n"))
                     .expect("parses");
             assert_eq!(parsed.agents.resume_interrupted_on_start, expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn resume_interrupted_on_start_from_wire_is_exact() {
+        for value in [
+            ResumeInterruptedOnStart::Auto,
+            ResumeInterruptedOnStart::On,
+            ResumeInterruptedOnStart::Off,
+        ] {
+            assert_eq!(
+                ResumeInterruptedOnStart::from_wire(value.as_str()),
+                Some(value)
+            );
+        }
+        for raw in ["", "OFF", " off", "true", "false", "0", "maybe"] {
+            assert_eq!(ResumeInterruptedOnStart::from_wire(raw), None, "{raw:?}");
         }
     }
 
@@ -2650,6 +2897,50 @@ mod tests {
     }
 
     #[test]
+    fn auto_retire_archived_after_days_still_parses_for_migration() {
+        assert_eq!(
+            SettingsFile::default()
+                .workspace
+                .auto_retire_archived_after_days,
+            None
+        );
+        let file =
+            SettingsFile::parse_str("[workspace]\nautoRetireArchivedAfterDays = 7\n").unwrap();
+        assert_eq!(file.workspace.auto_retire_archived_after_days, Some(7));
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("autoRetireArchivedAfterDays"));
+    }
+
+    #[test]
+    fn purge_archived_after_days_parses_and_defaults_to_off() {
+        assert_eq!(
+            SettingsFile::default().workspace.purge_archived_after_days,
+            None
+        );
+        let file = SettingsFile::parse_str("[workspace]\npurgeArchivedAfterDays = 3\n").unwrap();
+        assert_eq!(file.workspace.purge_archived_after_days, Some(3));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# purgeArchivedAfterDays = 7"));
+    }
+
+    #[test]
+    fn auto_archive_idle_after_days_defaults_to_off_and_accepts_a_window() {
+        assert_eq!(
+            SettingsFile::default()
+                .workspace
+                .auto_archive_idle_after_days,
+            DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS
+        );
+        assert_eq!(DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS, 0, "off by default");
+        let absent = SettingsFile::parse_str("[workspace]\n").unwrap();
+        assert_eq!(absent.workspace.auto_archive_idle_after_days, 0);
+        let on = SettingsFile::parse_str("[workspace]\nautoArchiveIdleAfterDays = 7\n").unwrap();
+        assert_eq!(on.workspace.auto_archive_idle_after_days, 7);
+        assert!(SettingsFile::parse_str("[workspace]\nautoArchiveIdleAfterDays = -1\n").is_err());
+        let template = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        assert_eq!(template.workspace.auto_archive_idle_after_days, 0);
+        assert_eq!(template.workspace.purge_archived_after_days, None);
+    }
+
+    #[test]
     fn legacy_parse_captures_and_tolerates_auto_fetch() {
         let text = "[workspace]\nautoFetch = false\ncowIsolation = true\n";
         let (file, legacy) = SettingsFile::parse_str_with_legacy(text).expect("tolerant parse");
@@ -2659,6 +2950,32 @@ mod tests {
             Some(&serde_json::json!(false))
         );
         assert_eq!(legacy.len(), 1);
+    }
+
+    /// The retired remote-agent switches (`remoteAgents.enabled`,
+    /// `experimental.remoteAgents`) still load from an older file: they are
+    /// captured as legacy keys (logged once, then stripped at boot) while
+    /// `remoteAgents.permission` keeps parsing. The strict parse refuses
+    /// them like any other unknown key.
+    #[test]
+    fn legacy_parse_tolerates_retired_remote_agent_switches() {
+        let text = "[remoteAgents]\nenabled = true\npermission = \"denyAll\"\n\n[experimental]\nremoteAgents = true\n";
+        let (file, legacy) = SettingsFile::parse_str_with_legacy(text).expect("tolerant parse");
+        assert_eq!(
+            file.remote_agents.permission,
+            RemoteAgentPermission::DenyAll
+        );
+        assert_eq!(
+            legacy.get("remoteAgents.enabled"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            legacy.get("experimental"),
+            Some(&serde_json::json!({ "remoteAgents": true }))
+        );
+        assert_eq!(legacy.len(), 2);
+        assert!(SettingsFile::parse_str("[remoteAgents]\nenabled = true\n").is_err());
+        assert!(SettingsFile::parse_str("[experimental]\nremoteAgents = true\n").is_err());
     }
 
     #[test]
@@ -3362,6 +3679,88 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `[scripts]` ships a one-week retention window and a 50 MiB per-run
+    /// cap; an empty file and the shipped template both resolve to them.
+    #[test]
+    fn script_output_defaults_and_template_round_trip() {
+        assert_eq!(DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS, 168);
+        assert_eq!(DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN, 52_428_800);
+        let parsed = SettingsFile::parse_str("").expect("empty file parses");
+        assert_eq!(parsed.scripts, ScriptsSettings::default());
+        assert_eq!(parsed.scripts.output_retention_hours, 168);
+        assert_eq!(parsed.scripts.output_max_bytes_per_run, 52_428_800);
+
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[scripts]"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("outputRetentionHours = 168"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("outputMaxBytesPerRun = 52428800"));
+        let templated = SettingsFile::parse_str(DEFAULT_CONFIG_TEMPLATE).expect("template parses");
+        assert_eq!(templated.scripts, ScriptsSettings::default());
+
+        let custom = SettingsFile::parse_str(
+            "[scripts]\noutputRetentionHours = 0\noutputMaxBytesPerRun = 1048576\n",
+        )
+        .expect("custom values parse");
+        assert_eq!(custom.scripts.output_retention_hours, 0);
+        assert_eq!(custom.scripts.output_max_bytes_per_run, 1_048_576);
+        assert_eq!(
+            crate::config::script_output_max_bytes_per_run(&custom),
+            1_048_576
+        );
+    }
+
+    /// `scripts.outputRetentionHours` accepts `0` (keep until deleted) up to
+    /// ten years; `scripts.outputMaxBytesPerRun` is bounded on both sides with
+    /// no `0` escape hatch. Out-of-range values fail with the key and value.
+    #[test]
+    fn script_output_ranges_are_enforced() {
+        for legal in [0, 1, SCRIPT_OUTPUT_RETENTION_HOURS_MAX] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[scripts]\noutputRetentionHours = {legal}\n"))
+                    .expect("0, 1 and the upper bound are legal");
+            assert_eq!(parsed.scripts.output_retention_hours, legal);
+        }
+        for bad in ["87601", "-1"] {
+            let err =
+                SettingsFile::parse_str(&format!("[scripts]\noutputRetentionHours = {bad}\n"))
+                    .expect_err("out-of-range value must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("scripts.outputRetentionHours"),
+                "error names the offending key: {msg}"
+            );
+        }
+
+        for legal in [
+            SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN,
+            SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX,
+        ] {
+            let parsed =
+                SettingsFile::parse_str(&format!("[scripts]\noutputMaxBytesPerRun = {legal}\n"))
+                    .expect("both bounds are legal");
+            assert_eq!(parsed.scripts.output_max_bytes_per_run, legal);
+        }
+        for bad in ["0", "65535", "1073741825"] {
+            let err =
+                SettingsFile::parse_str(&format!("[scripts]\noutputMaxBytesPerRun = {bad}\n"))
+                    .expect_err("out-of-range value must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("scripts.outputMaxBytesPerRun") && msg.contains(bad),
+                "error names the offending key and value: {msg}"
+            );
+        }
+        let err = SettingsFile::parse_str("[scripts]\noutputMaxBytesPerRun = -1\n")
+            .expect_err("negative cap must be rejected");
+        assert!(
+            err.to_string().contains("scripts.outputMaxBytesPerRun"),
+            "{err}"
+        );
+
+        let err = SettingsFile::parse_str("[scripts]\nbogus = 1\n")
+            .expect_err("unknown [scripts] key must be rejected");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
     #[test]
     fn pr_monitor_explicit_override_parses() {
         let parsed = SettingsFile::parse_str(
@@ -3499,5 +3898,37 @@ mod tests {
             Some(&serde_json::json!({ "ws1": "m1" }))
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn node_mode_settings_are_limited_to_three_families() {
+        for path in [
+            "remoteAgents.permission",
+            "daemon.mode",
+            "server.wsApi.enabled",
+            "server.tunnel.enabled",
+        ] {
+            assert!(node_mode_setting_allowed(path), "{path} must be allowed");
+        }
+        for path in [
+            "",
+            "remoteAgents",
+            "daemonx.mode",
+            "experimental.remoteAgents",
+            "agents.maxConcurrent",
+            "sourceControl.github.token",
+            "providers.active",
+            "serverx.port",
+        ] {
+            assert!(!node_mode_setting_allowed(path), "{path} must be refused");
+        }
+    }
+
+    #[test]
+    fn daemon_mode_defaults_to_regular_and_parses_node() {
+        assert_eq!(SettingsFile::default().daemon.mode, DaemonMode::Regular);
+        let parsed: SettingsFile = toml::from_str("[daemon]\nmode = \"node\"\n").unwrap();
+        assert_eq!(parsed.daemon.mode, DaemonMode::Node);
+        assert!(toml::from_str::<SettingsFile>("[daemon]\nmode = \"hub\"\n").is_err());
     }
 }

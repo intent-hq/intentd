@@ -1,4 +1,5 @@
-//! Optional delivery on one confirmed physical owner and its original Query.
+//! Optional prompt delivery on one confirmed physical owner; private callbacks
+//! additionally retain and acknowledge their original Query.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +41,10 @@ pub(in crate::agent_manager) struct ServerBlueprint {
     original: Option<(Arc<Services>, AgentSession)>,
     #[cfg(test)]
     context_decorator: Option<ContextDecorator>,
+    /// Test-only `workspace_api` budget for every server this builds (the
+    /// 63/64 acquisition controls: `test_support::quota_script`).
+    #[cfg(test)]
+    workspace_api_timeout: Option<std::time::Duration>,
 }
 
 impl ServerBlueprint {
@@ -53,6 +58,8 @@ impl ServerBlueprint {
             original: None,
             #[cfg(test)]
             context_decorator: None,
+            #[cfg(test)]
+            workspace_api_timeout: None,
         }
     }
 
@@ -66,7 +73,47 @@ impl ServerBlueprint {
     }
 
     pub(in crate::agent_manager) fn server(&self) -> WorkspaceMcpServer {
-        (self.build)()
+        let server = (self.build)();
+        #[cfg(test)]
+        let server = match self.workspace_api_timeout {
+            Some(timeout) => server.with_workspace_api_timeout(timeout),
+            None => server,
+        };
+        server
+    }
+
+    /// Standard ACP confirms an original physical owner without registering a
+    /// private callback. Only sessions stamped with a version admitted by
+    /// [`intent_core::harness_uses_repository_monitor_guidance`] (3.2 and
+    /// newer) opt into this prompt envelope;
+    /// it never upgrades the initial MCP endpoint or acknowledges a Query.
+    pub(super) fn bind_prompt_context(
+        &self,
+        connection: &Arc<Connection>,
+        physical: &crate::repository_admission::lifecycle::physical_owner::RepositoryPhysicalOwner,
+        workspace: &intent_core::WorkspaceId,
+        agent: &intent_core::AgentId,
+    ) -> Option<Arc<LiveContext>> {
+        let (services, session) = self.original.as_ref()?;
+        if !intent_core::harness_uses_repository_monitor_guidance(&session.harness_version)
+            || session.retired_at.is_some()
+            || &session.workspace_id != workspace
+            || &session.id != agent
+        {
+            return None;
+        }
+        Some(Arc::new(LiveContext {
+            connection: Arc::downgrade(connection),
+            session_id: physical.confirmed_session_id().into(),
+            owner: RepositoryContextOwner::bind(
+                services.clone(),
+                self.read_owner.clone(),
+                physical,
+            ),
+            requires_callback_ack: false,
+            acknowledged: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+        }))
     }
 
     fn confirmed_server(
@@ -134,6 +181,7 @@ impl EndpointBlueprint {
         physical: &crate::repository_admission::lifecycle::physical_owner::RepositoryPhysicalOwner,
         workspace: &intent_core::WorkspaceId,
         agent: &intent_core::AgentId,
+        recipient: Option<intent_acp::review_monitoring::PendingReviewMonitoring>,
     ) -> Option<Arc<LiveContext>> {
         let (services, session) = self.server.original.as_ref()?;
         if !intent_core::harness_supports_repository_guidance(&session.harness_version)
@@ -145,23 +193,39 @@ impl EndpointBlueprint {
         }
         Some(Arc::new(LiveContext {
             connection: Arc::downgrade(connection),
+            session_id: physical.confirmed_session_id().into(),
             owner: RepositoryContextOwner::bind(
                 services.clone(),
-                self.server.read_owner.clone(),
+                self.server.read_owner.clone().map(|owner| {
+                    owner.with_monitor_recipient(
+                        recipient,
+                        connection,
+                        physical.confirmed_session_id(),
+                    )
+                }),
                 physical,
             ),
+            requires_callback_ack: true,
             acknowledged: AtomicBool::new(false),
             retired: AtomicBool::new(false),
         }))
     }
 
-    fn registration(&self, address: String) -> intent_acp::AcpResult<CallbackStdioServer> {
+    fn registration(
+        &self,
+        address: String,
+        token: &str,
+    ) -> intent_acp::AcpResult<CallbackStdioServer> {
         let mut args = self.args_before_address.clone();
         args.push(address);
+        // This endpoint serves its own listener: carry its secret, not the
+        // original session bridge's.
+        let mut env = self.env.clone();
+        env.insert(intent_acp::BRIDGE_TOKEN_ENV.to_string(), token.to_string());
         CallbackStdioServer::new(
             self.command.clone(),
             args,
-            Some(self.env.clone()),
+            Some(env),
             [CallbackTool::WorkspaceApi],
         )
     }
@@ -170,14 +234,18 @@ impl EndpointBlueprint {
 /// Retains the first binding result and its original transport, never a lookup key.
 pub(super) struct LiveContext {
     connection: Weak<Connection>,
+    session_id: String,
     owner: AdmissionResult<Arc<RepositoryContextOwner>>,
+    requires_callback_ack: bool,
     acknowledged: AtomicBool,
     retired: AtomicBool,
 }
 
 impl LiveContext {
     fn capture(&self) -> AdmissionResult<RepositoryPromptContext> {
-        if !self.acknowledged.load(Ordering::SeqCst) || self.retired.load(Ordering::SeqCst) {
+        if (self.requires_callback_ack && !self.acknowledged.load(Ordering::SeqCst))
+            || self.retired.load(Ordering::SeqCst)
+        {
             return Err(AdmissionError::Unavailable);
         }
         self.owner
@@ -186,7 +254,23 @@ impl LiveContext {
             .capture_manager_prompt()
     }
 
-    fn invalidate_and_drain(&self) {
+    pub(super) fn capture_prompt(
+        self: &Arc<Self>,
+        connection: &Arc<Connection>,
+    ) -> Option<RepositoryPromptInput> {
+        if !Weak::ptr_eq(&self.connection, &Arc::downgrade(connection))
+            || (self.requires_callback_ack && !self.acknowledged.load(Ordering::SeqCst))
+            || self.retired.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        Some(RepositoryPromptInput {
+            binding: self.clone(),
+            captured: Some(self.capture()),
+        })
+    }
+
+    pub(super) fn invalidate_and_drain(&self) {
         if let Ok(owner) = &self.owner {
             owner.invalidate();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -200,7 +284,7 @@ impl LiveContext {
         }
     }
 
-    fn retire(&self) {
+    pub(super) fn retire(&self) {
         if !self.retired.swap(true, Ordering::SeqCst) {
             self.invalidate_and_drain();
         }
@@ -214,6 +298,46 @@ pub(crate) struct RepositoryPromptInput {
     captured: Option<AdmissionResult<RepositoryPromptContext>>,
 }
 impl RepositoryPromptInput {
+    pub(crate) async fn recover_monitor(
+        &mut self,
+        row: &intent_store::QualifiedPrMonitor,
+        connection: &intent_core::RepositoryConnectionScope,
+    ) -> AdmissionResult<Arc<crate::repository_read_source::MonitorAuthority>> {
+        if !self.binding.acknowledged.load(Ordering::SeqCst)
+            || self.binding.retired.load(Ordering::SeqCst)
+        {
+            return Err(AdmissionError::Retired);
+        }
+        self.captured
+            .take()
+            .ok_or(AdmissionError::Retired)??
+            .recover_monitor(row, connection)
+            .await
+    }
+
+    pub(crate) async fn prepare_monitor(
+        &mut self,
+        authority: Arc<crate::repository_read_source::MonitorAuthority>,
+        delivery: crate::pr_monitor::qualified_cache::CacheDelivery,
+        text: String,
+    ) -> AdmissionResult<crate::repository_read_source::MonitorPromptAdmission> {
+        if !self.binding.acknowledged.load(Ordering::SeqCst)
+            || self.binding.retired.load(Ordering::SeqCst)
+        {
+            return Err(AdmissionError::Retired);
+        }
+        let original = self.captured.take().ok_or(AdmissionError::Retired)??;
+        authority
+            .prepare_prompt(
+                original.into_monitor_destination()?,
+                delivery,
+                self.binding.connection.clone(),
+                self.binding.session_id.clone(),
+                text,
+            )
+            .await
+    }
+
     pub(crate) async fn prepare(&mut self) -> Option<intent_acp::session::PromptGuidance> {
         let original = self.captured.take()?.ok()?;
         tokio::time::timeout(std::time::Duration::from_secs(1), original.prepare())
@@ -234,6 +358,9 @@ pub(super) struct Endpoint {
     changed: Notify,
     bridge: Mutex<Option<McpBridge>>,
     live: Option<Arc<LiveContext>>,
+    /// The `workspace_api` budget of the server this endpoint actually serves.
+    #[cfg(test)]
+    served_workspace_api_timeout: Mutex<Option<std::time::Duration>>,
 }
 
 impl Endpoint {
@@ -244,6 +371,8 @@ impl Endpoint {
             changed: Notify::new(),
             bridge: Mutex::new(None),
             live,
+            #[cfg(test)]
+            served_workspace_api_timeout: Mutex::new(None),
         }
     }
 
@@ -263,16 +392,7 @@ impl Endpoint {
         connection: &Arc<Connection>,
     ) -> Option<RepositoryPromptInput> {
         let live = self.live.as_ref()?;
-        if !Weak::ptr_eq(&live.connection, &Arc::downgrade(connection))
-            || !live.acknowledged.load(Ordering::SeqCst)
-            || live.retired.load(Ordering::SeqCst)
-        {
-            return None;
-        }
-        Some(RepositoryPromptInput {
-            binding: live.clone(),
-            captured: Some(live.capture()),
-        })
+        live.capture_prompt(connection)
     }
 
     pub(super) fn interrupt_context(&self) {
@@ -281,7 +401,7 @@ impl Endpoint {
         }
     }
 
-    fn install_bridge(&self, bridge: McpBridge) -> Option<String> {
+    fn install_bridge(&self, bridge: McpBridge) -> Option<(String, String)> {
         let mut slot = self.bridge.lock().unwrap();
         if self.cancelled.load(Ordering::SeqCst) {
             drop(slot);
@@ -290,8 +410,9 @@ impl Endpoint {
             return None;
         }
         let address = bridge.connect_addr();
+        let token = bridge.auth_token().to_owned();
         *slot = Some(bridge);
-        Some(address)
+        Some((address, token))
     }
 
     async fn cancelled(&self) {
@@ -371,6 +492,12 @@ impl ConfirmedCallbackAttempt {
             self.context.take().expect("one original context"),
             self.live.as_ref(),
         );
+        #[cfg(test)]
+        endpoint
+            .served_workspace_api_timeout
+            .lock()
+            .unwrap()
+            .replace(server.workspace_api_timeout());
         let bridge = match serve_workspace_mcp_tcp(Arc::new(server)).await {
             Ok(bridge) => bridge,
             Err(error) => {
@@ -378,11 +505,11 @@ impl ConfirmedCallbackAttempt {
                 return None;
             }
         };
-        let address = endpoint.install_bridge(bridge)?;
+        let (address, token) = endpoint.install_bridge(bridge)?;
         if !self.current() {
             return None;
         }
-        let server = match self.blueprint.registration(address) {
+        let server = match self.blueprint.registration(address, &token) {
             Ok(server) => server,
             Err(error) => {
                 tracing::debug!(%error, "optional callback command unavailable");
@@ -432,10 +559,20 @@ impl Drop for ConfirmedCallbackAttempt {
     }
 }
 
+/// Both variants retain the original confirmation. A standard prompt capture
+/// is made before metadata awaits, independently of callback registration.
+pub(in crate::agent_manager) enum SessionDelivery {
+    Callback(Box<ConfirmedCallbackAttempt>),
+    Prompt(RepositoryPromptInput),
+}
+
 pub(in crate::agent_manager) async fn deliver_captured(
-    delivery: Option<ConfirmedCallbackAttempt>,
+    delivery: Option<SessionDelivery>,
 ) -> Option<RepositoryPromptInput> {
-    let mut delivery = delivery?;
+    let mut delivery = match delivery? {
+        SessionDelivery::Callback(delivery) => delivery,
+        SessionDelivery::Prompt(captured) => return Some(captured),
+    };
     // Keep the completed ordinary session result independent of registration.
     let _ = delivery.deliver().await;
     if !delivery.retained {
@@ -448,9 +585,12 @@ pub(in crate::agent_manager) async fn deliver_captured(
 }
 
 #[cfg(test)]
-async fn deliver_optional(delivery: Option<ConfirmedCallbackAttempt>) {
+async fn deliver_optional(delivery: Option<SessionDelivery>) {
     let _ = deliver_captured(delivery).await;
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod prompt_envelope_tests;

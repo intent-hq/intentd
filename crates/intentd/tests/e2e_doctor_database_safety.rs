@@ -3,7 +3,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use intent_core::AgentId;
 use intent_store::Store;
@@ -81,6 +81,7 @@ impl Fixture {
         Flock::lock(file, FlockArg::LockExclusiveNonblock).unwrap()
     }
 
+    #[track_caller]
     fn assert_owned(&self) {
         let file = OpenOptions::new()
             .read(true)
@@ -146,7 +147,11 @@ impl Fixture {
     fn preflight(&self) {
         let mut probe = self.command(&std::env::current_exe().unwrap());
         probe
-            .args(["--exact", "diagnostic_fixture_is_isolated", "--nocapture"])
+            .args([
+                "--exact",
+                &common::exact_test_name(module_path!(), "diagnostic_fixture_is_isolated"),
+                "--nocapture",
+            ])
             .env(ISOLATION_PROBE, self.root.path());
         self.run(probe, "isolation");
     }
@@ -158,6 +163,7 @@ impl Fixture {
         self.run_expected(command, "doctor", success)
     }
 
+    #[track_caller]
     fn doctor(&self) {
         let stdout = self.doctor_output(true);
         assert!(stdout.contains("migrations current"), "{stdout}");
@@ -305,6 +311,92 @@ async fn doctor_preserves_live_staged_and_finalized_full_bodies() {
         (true, true, true),
         "doctor must preserve staged bytes, finalized bytes, and subsequent full-fidelity finalization"
     );
+}
+
+#[tokio::test]
+async fn doctor_preserves_desktop_journal_and_owned_deletion_cleans_it() {
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let writer = Store::open_for_daemon(&db).await.unwrap();
+    let _slim = seed(&writer).await;
+    let workspace = intent_core::WorkspaceId::from("synthetic-workspace");
+    let principal = writer.get_primary_principal().await.unwrap().id;
+    let binding = json!({"principalId": principal, "requestId": "desktop-request"});
+    writer
+        .desktop_set_permission(&principal, &workspace, &agent(), "synthetic-computer", true)
+        .await
+        .unwrap();
+    writer
+        .desktop_insert_request("desktop-request", &workspace, &agent(), &binding)
+        .await
+        .unwrap();
+    writer
+        .desktop_insert_terminal(
+            "desktop-session",
+            &workspace,
+            &agent(),
+            &binding,
+            "synthetic-hash",
+        )
+        .await
+        .unwrap();
+    assert!(writer
+        .desktop_resolve_request(
+            "desktop-request",
+            &workspace,
+            &agent(),
+            "granted",
+            &json!({"sessionId":"desktop-session"})
+        )
+        .await
+        .unwrap());
+    let before: Vec<(String, String)> =
+        sqlx::query_as("SELECT key,value FROM settings WHERE key GLOB 'desktop.v1/*' ORDER BY key")
+            .fetch_all(writer.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        before.len(),
+        4,
+        "consent, request, terminal and durable wake"
+    );
+    fixture.doctor();
+    let after: Vec<(String, String)> =
+        sqlx::query_as("SELECT key,value FROM settings WHERE key GLOB 'desktop.v1/*' ORDER BY key")
+            .fetch_all(writer.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        after, before,
+        "diagnostics cannot terminate or consume desktop state"
+    );
+    assert!(writer
+        .desktop_terminal("desktop-session")
+        .await
+        .unwrap()
+        .unwrap()["reason"]
+        .is_null());
+    assert!(
+        Store::open_for_daemon(&db).await.is_err(),
+        "doctor must not release database ownership"
+    );
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        writer.clone().delete_workspace(&workspace),
+    )
+    .await
+    .expect("owned desktop deletion must not deadlock")
+    .unwrap();
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE key GLOB 'desktop.v1/*'")
+            .fetch_one(writer.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "owned workspace deletion must clean private state"
+    );
+    writer.close().await;
 }
 
 #[tokio::test]
@@ -492,6 +584,30 @@ async fn diagnostic_handle_rejects_writes_and_checkpoint() {
     let db = fixture.data_dir().join("intentd.db");
     let writer = Store::open(&db).await.unwrap();
     seed(&writer).await;
+    // Precondition: the WAL holds frames not yet checkpointed, so a
+    // checkpoint would have work to do. Otherwise the outcome depends on the
+    // schema size (the number of migrations): once the WAL passes SQLite's
+    // 1000-page automatic checkpoint while readers keep it from restarting,
+    // every commit backfills it fully, and a read-only checkpoint of a fully
+    // backfilled WAL succeeds as a no-op. The single-connection write pool
+    // stops auto-checkpointing, then writes un-checkpointed frames.
+    sqlx::query("PRAGMA wal_autocheckpoint = 0")
+        .execute(writer.write_pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE workspace SET title = 'Synthetic (updated)' WHERE id = 'synthetic-workspace'",
+    )
+    .execute(writer.write_pool())
+    .await
+    .unwrap();
+    let shm = fs::read(db.with_extension("db-shm")).unwrap();
+    let max_frame = u32::from_ne_bytes(shm[16..20].try_into().unwrap());
+    let backfilled = u32::from_ne_bytes(shm[96..100].try_into().unwrap());
+    assert!(
+        max_frame > backfilled,
+        "fixture needs un-checkpointed WAL frames (mxFrame {max_frame}, nBackfill {backfilled})"
+    );
     let diagnostic = intent_store::DiagnosticStore::open(&db).await.unwrap();
     assert!(sqlx::query("DELETE FROM agent_message_payload")
         .execute(diagnostic.read_pool())
@@ -584,14 +700,17 @@ async fn dangling_database_alias_is_rejected_before_mutation() {
 async fn assert_released(db: &Path) {
     // Dropping a SQLx pool signals asynchronous worker shutdown. Observe the
     // actual release, rather than assuming the signal has already closed SQLite.
-    let owner = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Ok(owner) = Store::open_for_daemon(db).await {
-                break owner;
+    let owner = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Ok(owner) = Store::open_for_daemon(db).await {
+                    break owner;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .expect("last connection/options drop must eventually release ownership");
     assert!(full_body_matches(&owner, STAGED).await);
@@ -634,7 +753,13 @@ async fn escaped_handle_retains_ownership(read_pool: bool, kind: &str) {
         Store::open_for_daemon(&db).await.is_err(),
         "{kind}, read_pool={read_pool} outlived Store but lost ownership"
     );
-    let query = "UPDATE agent_session SET name = 'still writable' WHERE id = 'synthetic-agent'";
+    // Read connections enforce `query_only` (intent-hq/intent#8592), so a
+    // retained read handle proves it is still usable with a read.
+    let query = if read_pool {
+        "SELECT name FROM agent_session WHERE id = 'synthetic-agent'"
+    } else {
+        "UPDATE agent_session SET name = 'still writable' WHERE id = 'synthetic-agent'"
+    };
     if let Some(pool) = &retained_pool {
         // Force a fresh connection after dropping Store: pool options must
         // retain ownership as well as the original SQLite connection.
@@ -700,7 +825,7 @@ async fn read_detached_retains_ownership() {
     escaped_handle_retains_ownership(true, "detached").await;
 }
 
-async fn invalid_migration_is_read_only_failure(update: &str) {
+async fn invalid_migration_is_read_only_failure(update: &'static str) {
     let fixture = Fixture::new();
     let db = fixture.data_dir().join("intentd.db");
     let writer = Store::open(&db).await.unwrap();
@@ -778,9 +903,11 @@ async fn cancelled_query_ownership(renewed_read_pool: Option<bool>) {
             started_tx.send(()).unwrap();
             let (flag, changed) = &*worker_release;
             let _ = changed
-                .wait_timeout_while(flag.lock().unwrap(), Duration::from_secs(20), |released| {
-                    !*released
-                })
+                .wait_timeout_while(
+                    flag.lock().unwrap(),
+                    intentd_test_support::test_timeout(Duration::from_secs(20)),
+                    |released| !*released,
+                )
                 .unwrap();
             left.cmp(right)
         })
@@ -791,10 +918,13 @@ async fn cancelled_query_ownership(renewed_read_pool: Option<bool>) {
             .await
             .unwrap();
     });
-    tokio::time::timeout(Duration::from_secs(10), started_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        started_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     drop(owner);
     query.abort();
     assert!(query.await.unwrap_err().is_cancelled());
@@ -825,11 +955,14 @@ async fn pending_pool_close_retains_ownership_until_connections_release() {
     let closing = tokio::spawn(async move {
         closing_pool.close().await;
     });
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !pool.is_closed() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !pool.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     assert!(
@@ -875,16 +1008,19 @@ async fn cancelled_startup_keeps_ownership_during_initialization() {
     let start_path = db.clone();
     let startup = tokio::spawn(async move { Store::open_for_daemon(&start_path).await });
     let lock_path = fixture.data_dir().join("intentd.db.daemon.lock");
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) {
-                if Flock::lock(file, FlockArg::LockExclusiveNonblock).is_err() {
-                    break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) {
+                    if Flock::lock(file, FlockArg::LockExclusiveNonblock).is_err() {
+                        break;
+                    }
                 }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     startup.abort();
@@ -901,11 +1037,14 @@ async fn cancelled_startup_keeps_ownership_during_initialization() {
 async fn retire_pool_connections(pool: &intent_store::StorePool) {
     // Reads can have opened multiple connections; wait for returns and retire
     // every original connection, not just the first available idle one.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while pool.num_idle() != pool.size() as usize {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while pool.num_idle() != pool.size() as usize {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     let mut connections = Vec::new();
@@ -960,10 +1099,13 @@ async fn renewed_facade_retains_ownership(read_pool: bool, handle: &str) {
     }
     pool.close().await;
     drop(pool);
-    sqlx::query("UPDATE agent_session SET name = 'renewed' WHERE id = 'synthetic-agent'")
-        .execute(&mut connection)
-        .await
-        .unwrap();
+    // Read connections enforce `query_only` (intent-hq/intent#8592).
+    let query = if read_pool {
+        "SELECT name FROM agent_session WHERE id = 'synthetic-agent'"
+    } else {
+        "UPDATE agent_session SET name = 'renewed' WHERE id = 'synthetic-agent'"
+    };
+    sqlx::query(query).execute(&mut connection).await.unwrap();
     assert!(
         Store::open_for_daemon(&db).await.is_err(),
         "renewed {handle} lost ownership, read_pool={read_pool}"
@@ -1070,17 +1212,19 @@ async fn renewal_initialization_ownership(read: bool) {
         .unwrap();
     let prior: Vec<_> = sqlite_workers().into_iter().map(|(path, _)| path).collect();
     let acquisition = tokio::spawn(async move { pool.acquire().await });
-    let worker = tokio::time::timeout(Duration::from_secs(4), async {
-        loop {
-            if let Some((path, _)) = sqlite_workers()
-                .into_iter()
-                .find(|(path, wait)| !prior.contains(path) && wait.contains("hrtimer_nanosleep"))
-            {
-                break path;
+    let worker = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(4)),
+        async {
+            loop {
+                if let Some((path, _)) = sqlite_workers().into_iter().find(|(path, wait)| {
+                    !prior.contains(path) && wait.contains("hrtimer_nanosleep")
+                }) {
+                    break path;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .expect("renewal must reach SQLite initialization busy wait");
     assert!(!database_lock_available(&db));
@@ -1098,6 +1242,21 @@ async fn renewal_initialization_ownership(read: bool) {
         worker_running && exclusive,
         "cancelled initialization must retain exclusive ownership, read={read}"
     );
+    // The blocker left the file in rollback mode, so the released worker now
+    // finishes initialization with `PRAGMA journal_mode = WAL`. An observer
+    // opening concurrently runs the same upgrade, and SQLite fails one of two
+    // racing DELETE->WAL upgrades with SQLITE_BUSY without invoking the busy
+    // handler. Wait for the worker to finish and release ownership first.
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !database_lock_available(&db) {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("cancelled initialization must release ownership once unblocked");
     let observer = Store::open(&db).await.unwrap();
     assert_eq!(payloads(&observer, STAGED).await, before);
     finalize(&observer, STAGED, slim).await;
@@ -1115,4 +1274,116 @@ async fn write_renewal_initialization_retains_ownership_after_cancellation() {
 #[tokio::test]
 async fn read_renewal_initialization_retains_ownership_after_cancellation() {
     renewal_initialization_ownership(true).await;
+}
+
+impl Fixture {
+    fn repair_indexes(&self, success: bool) -> String {
+        let mut command = self.command(Path::new(env!("CARGO_BIN_EXE_intentd")));
+        command.arg("repair-indexes");
+        self.run_expected(command, "repair-indexes", success)
+    }
+
+    fn backups(&self) -> Vec<PathBuf> {
+        match fs::read_dir(self.data_dir().join("backups")) {
+            Ok(entries) => entries.map(|entry| entry.unwrap().path()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+const NOTE_BODY: &str = "sourceGateProgress receipt checkpoint";
+
+async fn seed_note(store: &Store) -> intent_core::Note {
+    sqlx::query("INSERT INTO workspace (id,title,branch,status,created_at,updated_at) VALUES ('synthetic-workspace','Synthetic','main','active',?,?)")
+        .bind(TIMESTAMP).bind(TIMESTAMP).execute(store.write_pool()).await.unwrap();
+    let note = intent_core::Note {
+        id: intent_core::NoteId::from("synthetic-note"),
+        workspace_id: intent_core::WorkspaceId::from("synthetic-workspace"),
+        title: "Receipts".into(),
+        content: format!("{NOTE_BODY}\n").repeat(50),
+        content_type: intent_core::ContentType::Markdown,
+        tags: vec!["review".into()],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: intent_core::NoteVisibility::Workspace,
+        metadata: intent_core::NoteMetadata::default(),
+        created_at: TIMESTAMP.into(),
+        rev: 0,
+        updated_at: TIMESTAMP.into(),
+    };
+    store.insert_note(&note).await.unwrap();
+    note
+}
+
+/// intent-hq/intent#8592: a damaged note search index is named by doctor
+/// (read-only, with the daemon's store open) and rebuilt by the offline
+/// `intentd repair-indexes`, which backs up first and keeps the note.
+#[tokio::test]
+async fn doctor_names_damaged_note_index_and_repair_indexes_rebuilds_it() {
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let writer = Store::open_for_daemon(&db).await.unwrap();
+    let note = seed_note(&writer).await;
+    sqlx::query("UPDATE note_fts_data SET block = zeroblob(length(block)) WHERE id > 10")
+        .execute(writer.write_pool())
+        .await
+        .unwrap();
+
+    // A damaged index fails doctor, so scripts and support checks notice it.
+    let doctor = fixture.doctor_output(false);
+    assert!(doctor.contains("[FAIL] integrity_check: "), "{doctor}");
+    assert!(
+        doctor.contains("the note search index (note_fts) is damaged"),
+        "{doctor}"
+    );
+    assert!(doctor.contains("intentd repair-indexes"), "{doctor}");
+    assert!(!doctor.contains("damage outside"), "{doctor}");
+
+    // While the daemon owns the database, the repair refuses and copies nothing.
+    fixture.repair_indexes(false);
+    assert!(fixture.backups().is_empty());
+    writer.close().await;
+    drop(writer);
+
+    let repair = fixture.repair_indexes(true);
+    assert!(
+        repair.contains("rebuilt: note search index (note_fts)"),
+        "{repair}"
+    );
+    assert!(repair.contains("backup written"), "{repair}");
+    let backups = fixture.backups();
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert!(backups[0].join("intentd.db").is_file());
+    let doctor = fixture.doctor_output(true);
+    assert!(doctor.contains("integrity_check: ok"), "{doctor}");
+
+    let store = Store::open(&db).await.unwrap();
+    let stored = store.get_note(&note.workspace_id, &note.id).await.unwrap();
+    assert_eq!(stored.content, note.content);
+    let hits = store
+        .search_notes_fts(
+            "sourceGateProgress",
+            &intent_store::NoteFtsOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn repair_indexes_refuses_while_the_daemon_instance_lock_is_held() {
+    let fixture = Fixture::new();
+    Store::open(&fixture.data_dir().join("intentd.db"))
+        .await
+        .unwrap()
+        .close()
+        .await;
+    let _daemon = fixture.lock();
+    fixture.repair_indexes(false);
+    let stderr = fs::read_to_string(fixture.root.path().join("repair-indexes.stderr")).unwrap();
+    assert!(stderr.contains("intentd stop"), "{stderr}");
+    assert!(fixture.backups().is_empty());
 }

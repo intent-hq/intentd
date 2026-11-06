@@ -6,8 +6,7 @@ use git2::{Repository, Signature};
 use intent_core::events::AGENT_IDLE;
 use intent_core::{
     now_iso, AgentId, AgentSession, AgentStatus, ContentType, Error, Event, EventActor, Note,
-    NoteId, NoteMetadata, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
+    NoteId, NoteMetadata, NoteVisibility, Workspace, WorkspaceId,
 };
 use intent_store::{NewTrackedChange, Store};
 use serde_json::json;
@@ -67,49 +66,10 @@ fn workspace_with_repo(id: &WorkspaceId, repo: &GitRepo) -> Workspace {
         id: id.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
         worktree_path: Some(repo.dir.to_string_lossy().to_string()),
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -188,6 +148,7 @@ fn session(
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     }
 }
 
@@ -361,8 +322,8 @@ async fn repository_only_workspace_auto_commits_via_repository_path() {
     ws.repository_path = Some(repo.dir.to_string_lossy().to_string());
     store.insert_workspace(&ws).await.expect("insert ws");
     std::fs::write(repo.dir.join("change.txt"), "agent edit\n").unwrap();
-    let svc =
-        Services::new(store).with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+    let svc = Services::new_isolated(store)
+        .with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
 
     let agent = session("agent-r1", &ws_id, None, false, "Builder", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
@@ -474,7 +435,7 @@ async fn clean_tree_is_silent_skip() {
     let ws_id = WorkspaceId::new();
     let ws = workspace_with_repo(&ws_id, &repo);
     store.insert_workspace(&ws).await.unwrap();
-    let svc = Services::new(store);
+    let svc = Services::new_isolated(store);
     let agent = session("agent-c1", &ws_id, None, false, "X", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
     let event = idle_event(&ws_id, "agent-c1", "end_turn");
@@ -836,15 +797,19 @@ async fn generation_timeout_falls_back_to_subject() {
     svc.store().insert_agent_session(&agent).await.unwrap();
     attribute_dirty_change(&svc, &ws_id, "agent-t1").await;
     let event = idle_event(&ws_id, "agent-t1", "end_turn");
-    let started = std::time::Instant::now();
+    let warnings = crate::test_tracing::Warnings::default();
+    let guard = warnings.install();
     svc.handle_agent_idle_auto_commit(&event).await;
+    drop(guard);
     // monorepo#4032: a stalled CLI must be cut off at the auto-commit budget
     // (250 ms here) — not any interactive-enhancement default — and still
-    // yield a non-error commit. Generous slack for slow CI.
+    // yield a non-error commit. The CLI hangs, so only a budget can end the
+    // run, and the failure names the budget that did.
+    let failures = warnings.containing("generate_auto_commit_message: generation failed");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(10),
-        "auto-commit was not bounded by its own budget: {:?}",
-        started.elapsed()
+        matches!(failures.as_slice(), [line]
+            if line.contains("One-shot completion timed out after 250ms")),
+        "auto-commit was not cut off by its own 250 ms budget: {failures:?}"
     );
     let (_a, _l, message) = last_commit_trailers(&repo.dir);
     // Fell back to the agent name.
@@ -1105,7 +1070,7 @@ async fn large_prompt_to_non_reading_cli_still_times_out_and_cools_down() {
     // anyway, the fallback subject lands. The outer deadline is what fails
     // when the write happens before the timed region.
     tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
         svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c4", "end_turn")),
     )
     .await
@@ -1155,7 +1120,7 @@ async fn no_changes_skips_generation_and_commit() {
     store.insert_workspace(&ws).await.unwrap();
     // No dirty files — the CLI should not be spawned.
     let (_bin_dir, bin) = fake_auggie("nochanges", "exit 99");
-    let svc = Services::new(store).with_auggie_bin(bin);
+    let svc = Services::new_isolated(store).with_auggie_bin(bin);
     let agent = session("agent-n1", &ws_id, None, false, "X", true);
     svc.store().insert_agent_session(&agent).await.unwrap();
     let event = idle_event(&ws_id, "agent-n1", "end_turn");
@@ -1268,11 +1233,14 @@ async fn auto_commit_attribution_survives_receiver_abort() {
     attribute_dirty_change(&svc, &ws, "agent-tail").await;
     let (rx, release) = hold(&svc, "git");
     let task = svc.spawn_auto_commit_loop();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while bus.subscriber_count() == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        async {
+            while bus.subscriber_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     let e = idle_event(&ws, "agent-tail", "end_turn");
@@ -1374,4 +1342,158 @@ async fn agent_commit_captures_polling_caller_before_owned_handoff() {
     assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
     assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 2);
     svc.shutdown_store_writers().await;
+}
+
+/// Captured `(level, message)` pairs for the missing-checkout tests.
+///
+/// Unix-only like its only caller: on Windows it would be dead code and
+/// fail `cargo clippy -D warnings`.
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+#[cfg(unix)]
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0
+            .lock()
+            .unwrap()
+            .push((*event.metadata().level(), message.0));
+    }
+}
+
+#[cfg(unix)]
+impl LogCapture {
+    fn count(&self, level: tracing::Level, needle: &str) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(l, m)| *l == level && m.contains(needle))
+            .count()
+    }
+}
+
+/// intent-hq/intent#7183: a workspace whose checkout folder is gone (deleted
+/// or on an unmounted volume) must not attempt auto-commit on every idle.
+/// Repeated idles skip before message generation and `git_agent_commit`,
+/// log exactly one warning, and the first idle after the folder returns
+/// commits normally with one recovery info line.
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn missing_checkout_skips_auto_commit_with_one_warning_and_resumes() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let capture = LogCapture::default();
+    let _guard = crate::test_tracing::set_capture_default(
+        tracing_subscriber::registry().with(capture.clone()),
+    );
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let (bin_dir, bin) = fake_auggie(
+        "missing-checkout",
+        r#"calls="$(dirname "$0")/calls"
+n=$(cat "$calls" 2>/dev/null || echo 0)
+echo $((n+1)) > "$calls"
+printf '{"subject": "feat: committed after remount"}'"#,
+    );
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc.with_auggie_bin(bin).with_settings_registry(registry);
+    let agent = session("agent-m1", &ws_id, None, false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-m1").await;
+    let head_before = intent_git::history::history(&repo.dir, 1).unwrap()[0]
+        .hash
+        .clone();
+
+    let away = repo.dir.with_extension("unmounted");
+    std::fs::rename(&repo.dir, &away).expect("move checkout away");
+    for _ in 0..3 {
+        svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-m1", "end_turn"))
+            .await;
+    }
+    assert_eq!(
+        fake_auggie_calls(&bin_dir),
+        0,
+        "generation ran for a missing checkout"
+    );
+    assert_eq!(
+        capture.count(tracing::Level::WARN, "workspace checkout missing"),
+        1,
+        "exactly one transition warning across repeated idles"
+    );
+    assert_eq!(
+        capture.count(tracing::Level::WARN, "auto-commit failed"),
+        0,
+        "no per-idle auto-commit failure warnings"
+    );
+    assert!(svc.worktree_presence().is_missing(&ws_id));
+
+    std::fs::rename(&away, &repo.dir).expect("move checkout back");
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-m1", "end_turn"))
+        .await;
+    assert!(!svc.worktree_presence().is_missing(&ws_id));
+    assert_eq!(
+        capture.count(tracing::Level::INFO, "workspace checkout is back"),
+        1
+    );
+    let (agent_id, _l, message) = last_commit_trailers(&repo.dir);
+    assert_eq!(agent_id.as_deref(), Some("agent-m1"));
+    assert!(
+        message.starts_with("feat: committed after remount"),
+        "got: {message}"
+    );
+    let head_after = intent_git::history::history(&repo.dir, 1).unwrap()[0]
+        .hash
+        .clone();
+    assert_ne!(head_before, head_after, "auto-commit must resume");
+    assert_eq!(
+        capture.count(tracing::Level::WARN, "workspace checkout missing"),
+        1
+    );
+}
+
+/// Plain-folder workspaces (PROTOCOL §5.1 "Plain-folder workspaces") never
+/// auto-commit, even when the folder later gained a `.git` and holds an
+/// attributed change: the persisted flag decides, not the folder contents.
+#[intent_test_macros::daemon_test]
+async fn plain_folder_workspace_never_auto_commits() {
+    let repo = init_git_repo();
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    let mut ws = workspace_with_repo(&ws_id, &repo);
+    ws.plain_folder = true;
+    store.insert_workspace(&ws).await.expect("insert ws");
+    std::fs::write(repo.dir.join("change.txt"), "agent edit\n").unwrap();
+    let svc = Services::new_isolated(store)
+        .with_auggie_bin(PathBuf::from("/nonexistent/intentd-test/auggie"));
+
+    let agent = session("agent-p1", &ws_id, None, false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-p1").await;
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-p1", "end_turn"))
+        .await;
+
+    let (agent_id, _, message) = last_commit_trailers(&repo.dir);
+    assert_eq!(agent_id, None, "no agent commit in a plain folder");
+    assert_eq!(message.trim(), "seed", "HEAD is still the seed commit");
+    assert!(
+        repo.dir.join("change.txt").exists(),
+        "the user's file is untouched"
+    );
 }

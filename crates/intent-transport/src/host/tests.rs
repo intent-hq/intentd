@@ -114,7 +114,7 @@ impl ExternalOpener for RecordingOpener {
 
 /// A reverse channel whose outbound queue is drained (and ignored).
 fn idle_reverse() -> ReverseChannel {
-    let (tx, mut rx) = mpsc::channel::<String>(8);
+    let (tx, mut rx) = mpsc::channel::<crate::OutboundFrame>(8);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
     ReverseChannel::new(tx)
 }
@@ -164,7 +164,7 @@ async fn empty_url_is_invalid_params() {
 
 #[tokio::test]
 async fn remote_dispatches_to_connected_client() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx);
     let opener = RecordingOpener::new(true);
 
@@ -189,7 +189,7 @@ async fn remote_dispatches_to_connected_client() {
 
 #[tokio::test]
 async fn remote_client_failure_is_a_proxy_error() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx);
 
     let caller = reverse.clone();
@@ -966,7 +966,7 @@ async fn open_in_editor_empty_path_is_invalid_params() {
 
 #[tokio::test]
 async fn open_in_editor_remote_dispatches_to_connected_client() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx);
     let launcher = RecordingLauncher::new(true);
 
@@ -1008,7 +1008,7 @@ async fn open_in_editor_remote_dispatches_to_connected_client() {
 
 #[tokio::test]
 async fn open_in_editor_remote_omits_absent_line_and_column() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx);
 
     let caller = reverse.clone();
@@ -1040,7 +1040,7 @@ async fn open_in_editor_remote_omits_absent_line_and_column() {
 
 #[tokio::test]
 async fn open_in_editor_remote_client_failure_is_proxy_error() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx);
 
     let caller = reverse.clone();
@@ -1150,7 +1150,7 @@ async fn pick_application_local_picker_failure_surfaces() {
 
 #[tokio::test]
 async fn pick_application_remote_dispatches_to_connected_client() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx);
     let picker = NoopAppPicker;
 
@@ -1180,7 +1180,7 @@ async fn pick_application_remote_dispatches_to_connected_client() {
 
 #[tokio::test]
 async fn pick_application_remote_missing_application_id_is_none() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx);
 
     let caller = reverse.clone();
@@ -1203,7 +1203,7 @@ async fn pick_application_remote_missing_application_id_is_none() {
 
 #[tokio::test]
 async fn pick_application_remote_client_failure_is_proxy_error() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx);
 
     let caller = reverse.clone();
@@ -1271,7 +1271,7 @@ async fn handle_open_in_editor_missing_params_are_invalid() {
 
 #[tokio::test]
 async fn handle_open_in_editor_remote_round_trips_reverse_rpc() {
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(8);
+    let (out_tx, mut out_rx) = mpsc::channel::<crate::OutboundFrame>(8);
     let reverse = ReverseChannel::new(out_tx);
 
     let caller = reverse.clone();

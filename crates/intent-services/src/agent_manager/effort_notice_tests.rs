@@ -5,6 +5,7 @@ use intent_core::AgentMessage;
 fn resolved() -> ResolvedSpawn {
     ResolvedSpawn {
         provider: *intent_providers::provider_config("auggie"),
+        selection: "auggie".into(),
         model: None,
         reasoning_effort: None,
         cwd: std::env::temp_dir(),
@@ -154,12 +155,18 @@ async fn effort_notice_uses_saved_default_only_for_matching_resumed_identity() {
         .resumed_effort_default(&id, &ws, intent_providers::provider_config("grok"), None)
         .await
         .is_empty());
-    let record = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let record = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let opened = AcpSessionOpened {
         config_options: None,
         session_id: "sid-1".into(),
         modes: None,
         thought_level: Some(option("high")),
+        filled_model: None,
     };
     mgr.install_and_apply_thought_level(&conn, &record, &opened, None, None, Some(&default))
         .await;
@@ -259,12 +266,18 @@ async fn effort_notice_learns_defaults_only_from_confirmed_model_changes() {
 async fn effort_notice_does_not_claim_auto_without_a_known_resumed_default() {
     let (mgr, id, conn, calls, _db, _task) = setup(Some(option("high"))).await;
     turn(&mgr, &id, &conn, Some("high")).await;
-    let record = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let record = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     let mut opened = AcpSessionOpened {
         config_options: None,
         session_id: "sid-1".into(),
         modes: None,
         thought_level: Some(option("high")),
+        filled_model: None,
     };
     mgr.install_and_apply_thought_level(&conn, &record, &opened, None, None, Some(""))
         .await;
@@ -312,7 +325,12 @@ async fn effort_notice_does_not_advance_on_failed_spawn() {
         .set_agent_session_last_turn_effort(&ws, &id, &baseline)
         .await
         .unwrap();
-    let mut record = mgr.services.store.get_agent_session(&id).await.unwrap();
+    let mut record = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
     record.reasoning_effort = Some("high".into());
     mgr.services
         .store
@@ -330,4 +348,49 @@ async fn effort_notice_does_not_advance_on_failed_spawn() {
         Some(baseline)
     );
     mgr.shutdown().await;
+}
+
+/// Auto resolves to the provider's default level, so Auto → that same
+/// explicit level (the session-open fill pinning the provider's current
+/// level) is not announced; a real change still is.
+#[tokio::test]
+async fn effort_notice_treats_auto_and_its_default_level_as_unchanged() {
+    let (mgr, id, conn, _, _db, _task) = setup(Some(option("medium"))).await;
+    turn(&mgr, &id, &conn, None).await;
+    turn(&mgr, &id, &conn, Some("medium")).await;
+    assert!(
+        notices(&mgr, &id).await.is_empty(),
+        "Auto(medium) == medium"
+    );
+    turn(&mgr, &id, &conn, Some("high")).await;
+    let rows = notices(&mgr, &id).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].metadata,
+        Some(json!({"type": "effort_changed", "from": "medium", "to": "high"}))
+    );
+}
+
+/// Auto → Auto is never announced, even when the provider's default level
+/// moved between the two turns.
+#[tokio::test]
+async fn effort_notice_never_announces_auto_to_auto() {
+    let (mgr, id, conn, _, _db, _task) = setup(Some(option("medium"))).await;
+    turn(&mgr, &id, &conn, None).await;
+    let ws = WorkspaceId::from("ws-1");
+    let mut baseline = mgr
+        .services
+        .store
+        .get_agent_session_last_turn_effort(&ws, &id)
+        .await
+        .unwrap()
+        .expect("first baseline");
+    baseline.default_value = "high".into();
+    mgr.services
+        .store
+        .set_agent_session_last_turn_effort(&ws, &id, &baseline)
+        .await
+        .unwrap();
+    turn(&mgr, &id, &conn, None).await;
+    assert!(notices(&mgr, &id).await.is_empty(), "no Auto to Auto row");
 }

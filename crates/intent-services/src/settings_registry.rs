@@ -49,6 +49,8 @@ use crate::source_control_auth_ops::repository_owner::{
 /// [`SettingsFile`] schema leaf-for-leaf (maps such as `providers.paths` are
 /// single leaves — their dynamic children are not individually addressable).
 pub(crate) const KNOWN_PATHS: &[&str] = &[
+    "remoteAgents.permission",
+    "daemon.mode",
     "providers.active",
     "providers.enabled",
     "providers.paths",
@@ -69,6 +71,9 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "workspace.sshKeyPath",
     "workspace.defaultShell",
     "workspace.cowIsolation",
+    "workspace.autoArchiveIdleAfterDays",
+    "workspace.purgeArchivedAfterDays",
+    "workspace.autoRetireArchivedAfterDays",
     "git.autoCommit",
     "mcp.enableUserServers",
     "mcp.disabledServers",
@@ -121,6 +126,8 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agents.toolPayloadRetentionDays",
     "agents.resumeInterruptedOnStart",
     "events.streamRetentionHours",
+    "scripts.outputRetentionHours",
+    "scripts.outputMaxBytesPerRun",
     "workspaceApi.maxOutputChars",
     "workspaceApi.toonOutput",
     "agentFeatures.backgroundHooks",
@@ -128,8 +135,10 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.scripts",
     "agentFeatures.terminalAccess",
     "agentFeatures.browserAutomation",
+    "agentFeatures.desktopControl",
     "agentFeatures.richChatBlocks",
     "agentFeatures.structuredQuestions",
+    "agentFeatures.secretRequests",
     "agentFeatures.attentionRequests",
     "agentFeatures.stateSnapshot",
     "agentFeatures.prMonitor",
@@ -1593,6 +1602,35 @@ mod tests {
     }
 
     #[test]
+    fn desktop_control_persists_resets_and_reloads() {
+        let (_dir, path) = temp_config(Some(""));
+        let reg = SettingsRegistry::load(&path).unwrap();
+        let key = "agentFeatures.desktopControl";
+        assert_eq!(reg.get(key), Some(json!(true)));
+        reg.apply(&set(key, json!(false))).unwrap();
+        assert_eq!(reg.get(key), Some(json!(false)));
+        assert_eq!(
+            SettingsRegistry::load(&path).unwrap().get(key),
+            Some(json!(false))
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(reg.apply(&set(key, json!("false"))).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        reg.apply(&set(key, Value::Null)).unwrap();
+        assert_eq!(reg.get(key), Some(json!(true)));
+        assert_eq!(reg.origin(key), Some(SettingOrigin::Default));
+        assert_eq!(
+            SettingsRegistry::load(&path).unwrap().get(key),
+            Some(json!(true))
+        );
+        reg.reload("[agentFeatures]\ndesktopControl = false\n")
+            .unwrap();
+        assert_eq!(reg.get(key), Some(json!(false)));
+        reg.reload("[agentFeatures]\n").unwrap();
+        assert_eq!(reg.get(key), Some(json!(true)));
+    }
+
+    #[test]
     fn fast_mode_persistence_atomic_validation_and_reset() {
         let (_dir, path) = temp_config(Some(""));
         let reg = SettingsRegistry::load(&path).unwrap();
@@ -1615,6 +1653,12 @@ mod tests {
             json!({"claude":true}),
             json!({"auggie":false}),
             json!({"unknown":true}),
+            json!({"auggie@p1":true}),
+            json!({"codex@":true}),
+            json!({"codex@Work":true}),
+            json!({"Codex@p1":true}),
+            json!({"codex@p1@p2":true}),
+            json!({"claude-code@ p1":true}),
         ] {
             assert!(reg
                 .apply(&[
@@ -1628,6 +1672,16 @@ mod tests {
         assert!(reg
             .apply(&set("providers.fastMode.codex", json!(true)))
             .is_err());
+        // Named-profile references of Fast mode capable bases are keys too.
+        let with_profiles = json!({"claude-code":true,"claude-code@p1":false,"codex@work-2":true});
+        reg.apply(&set("providers.fastMode", with_profiles.clone()))
+            .unwrap();
+        assert_eq!(
+            SettingsRegistry::load(&path)
+                .unwrap()
+                .get("providers.fastMode"),
+            Some(with_profiles)
+        );
         reg.apply(&set("providers.fastMode", Value::Null)).unwrap();
         assert_eq!(reg.get("providers.fastMode"), Some(json!({})));
         assert_eq!(

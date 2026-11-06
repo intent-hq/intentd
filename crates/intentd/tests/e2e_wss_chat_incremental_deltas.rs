@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -147,7 +147,7 @@ async fn boot() -> Fixture {
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(common::registry_with_default_provider(&dir))
         .with_event_bus(bus.clone());
@@ -232,22 +232,25 @@ async fn wss_rpc_raw(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Va
 /// Await the next `subscription.push` frame for `sub_id`, skipping unrelated
 /// traffic (pings, other notifications).
 async fn next_push(ws: &mut TlsWs, sub_id: &str) -> Value {
-    timeout(Duration::from_secs(15), async {
-        loop {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == json!("subscription.push")
-                        && v["params"]["subscriptionId"] == json!(sub_id)
-                    {
-                        return v;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == json!("subscription.push")
+                            && v["params"]["subscriptionId"] == json!(sub_id)
+                        {
+                            return v;
+                        }
                     }
+                    Message::Close(_) => panic!("connection closed mid-stream"),
+                    _ => {}
                 }
-                Message::Close(_) => panic!("connection closed mid-stream"),
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await
     .expect("subscription.push timeout")
 }

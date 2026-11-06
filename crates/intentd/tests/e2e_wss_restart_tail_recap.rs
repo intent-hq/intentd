@@ -23,10 +23,12 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
+use crate::common::uds_exchange::uds_rpc;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,8 +38,6 @@ use rustls::crypto::CryptoProvider;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -64,7 +64,7 @@ fn temp_data_dir() -> tempfile::TempDir {
 async fn await_uds(socket: &Path) -> bool {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if UnixStream::connect(socket).await.is_ok() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -72,26 +72,6 @@ async fn await_uds(socket: &Path) -> bool {
     })
     .await
     .is_ok()
-}
-
-async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let stream = UnixStream::connect(socket).await.expect("connect uds");
-    let (read_half, mut write_half) = stream.into_split();
-    let mut line = serde_json::to_string(
-        &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
-    )
-    .unwrap();
-    line.push('\n');
-    write_half.write_all(line.as_bytes()).await.unwrap();
-    write_half.flush().await.unwrap();
-    let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
-        .await
-        .expect("uds rpc timed out")
-        .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
 #[derive(Debug)]
@@ -180,9 +160,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(20), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(20)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -223,13 +206,8 @@ fn spawn_daemon(
     prompt_log: &Path,
     session_log: &Path,
     log_name: &str,
-) -> Child {
-    use std::os::unix::process::CommandExt;
+) -> GuardedChild {
     common::enable_ws_api(data_dir);
-    // Pin resumeInterruptedOnStart=off so the captured row stays pending until
-    // the explicit `agent.resolveInterrupted` call (the `auto` default resumes
-    // on headless hosts, which would race the assertions below).
-    common::disable_resume_on_start(data_dir);
     let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
@@ -242,8 +220,7 @@ fn spawn_daemon(
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join(log_name)).unwrap(),
         ));
-    cmd.process_group(0);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 /// Poll a JSONL log file until `pred` matches a line; returns matching lines.
@@ -251,7 +228,8 @@ async fn await_log_lines<F>(path: &Path, what: &str, pred: F) -> Vec<Value>
 where
     F: Fn(&Value) -> bool,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let lines: Vec<Value> = std::fs::read_to_string(path)
             .unwrap_or_default()
@@ -278,10 +256,11 @@ where
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
         .expect("open store");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let session = store
-            .get_agent_session(&AgentId(agent_id.to_string()))
+            .get_agent_session_with_transcript(&AgentId(agent_id.to_string()))
             .await
             .expect("get agent session");
         if pred(&session.messages) {
@@ -301,55 +280,15 @@ where
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
         title: "TAIL-RECAP-E2E".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -433,14 +372,17 @@ async fn resume_via_session_load_replays_interrupted_tail() {
     // `metadata.interrupted`) and captures the interrupted_agent row.
     let shutdown = uds_rpc(&socket, 3, "system.shutdown", json!({})).await;
     assert_eq!(shutdown["result"].get("ok"), Some(&json!(true)));
-    let exited = timeout(Duration::from_secs(15), async {
-        loop {
-            if let Ok(Some(_)) = daemon1.child_mut().try_wait() {
-                return;
+    let exited = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                if let Ok(Some(_)) = daemon1.child_mut().try_wait() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
+        },
+    )
     .await;
     assert!(exited.is_ok(), "daemon1 did not exit after system.shutdown");
     drop(daemon1);
@@ -565,7 +507,7 @@ async fn resume_via_session_load_replays_interrupted_tail() {
         .await
         .expect("open store");
     let session = store
-        .get_agent_session(&intent_core::AgentId(agent_id.clone()))
+        .get_agent_session_with_transcript(&intent_core::AgentId(agent_id.clone()))
         .await
         .expect("get agent session");
     assert!(

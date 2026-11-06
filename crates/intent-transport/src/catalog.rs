@@ -11,10 +11,16 @@
 //! may call (multiplayer w3). Its golden test asserts every cataloged method is
 //! either on the list or named in the refused remainder, so adding a method
 //! without classifying it fails CI.
+//!
+//! [`PAYLOAD_CLASSES`] and [`SNAPSHOT_CHANNELS`] classify the same surface by
+//! response size for the payload-budget sweep in `intent-app`; their goldens
+//! likewise fail CI until a new method or snapshot channel is classified.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
+#[cfg(test)]
+mod node_mode_tests;
 #[cfg(test)]
 mod tests;
 
@@ -34,8 +40,10 @@ pub const FORBIDDEN_ERROR_MESSAGE: &str = "Forbidden";
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
 /// error code (never `-32601`) when the method is recognized but fails for other reasons.
-#[cfg(test)]
-pub(crate) const ROUTER_METHODS: &[&str] = &[
+///
+/// Public (not `cfg(test)`) so intent-app's router-gating tests, which need the
+/// feature crates registered, can sweep the same list.
+pub const ROUTER_METHODS: &[&str] = &[
     "accept-changes.addRemote",
     "accept-changes.execute",
     "accept-changes.getStatus",
@@ -93,6 +101,8 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "agent.unsubscribe",
     "agent.update",
     "agent.wakeOrCreate",
+    "agent.workers.list",
+    "agent.workers.stop",
     "client.list",
     "comment.add",
     "comment.delete",
@@ -104,9 +114,25 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
     "debug.sampleStacks",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.revoke",
+    "desktop.setPermission",
+    "discussion.conversations",
+    "discussion.delete",
+    "discussion.list",
+    "discussion.react",
+    "discussion.recipients",
+    "discussion.rename",
+    "discussion.retryAgent",
+    "discussion.send",
+    "discussion.stopAgent",
     "event.agentActivity",
     "event.query",
     "event.workspaceSummary",
+    "executor.list",
+    "executor.mint",
+    "executor.revoke",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
     "file-tracking.loadCommits",
@@ -150,6 +176,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "git.removeLockFile",
     "git.renameBranch",
     "git.showFile",
+    "git.showFileChunk",
     "git.stage",
     "git.stageHunk",
     "git.status",
@@ -231,9 +258,6 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "note.add",
     "note.create",
     "note.delete",
-    "note.deleteCancel",
-    "note.deleteSchedule",
-    "note.deleteStatus",
     "note.edit",
     "note.editLines",
     "note.get",
@@ -244,11 +268,17 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "note.listTasks",
     "note.listVersions",
     "note.readAsset",
+    "note.readAssetChunk",
     "note.restoreVersion",
     "note.saveAsset",
     "note.setContent",
     "note.update",
     "note.updateMetadata",
+    "plugin.install",
+    "plugin.list",
+    "plugin.toggle",
+    "plugin.uninstall",
+    "plugin.update",
     "pr.refresh",
     "prMonitor.cancel",
     "prMonitor.flush",
@@ -262,6 +292,20 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "principal.me",
     "principal.revokeSelf",
     "providers.catalog",
+    "providers.profiles.create",
+    "providers.profiles.delete",
+    "providers.profiles.list",
+    "providers.profiles.reorder",
+    "providers.profiles.update",
+    "providers.profiles.updateDefault",
+    "remoteLinkTraffic.snapshot",
+    "remoteLinkTraffic.start",
+    "remoteLinkTraffic.stop",
+    "remoteMachines.add",
+    "remoteMachines.backendInfo",
+    "remoteMachines.list",
+    "remoteMachines.refresh",
+    "remoteMachines.remove",
     "repo.list",
     "repo.remove",
     "repo.warmCache",
@@ -297,6 +341,10 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "search.inFiles",
     "search.messages",
     "search.notes",
+    "secret.dismiss",
+    "secret.forget",
+    "secret.list",
+    "secret.provide",
     "sentry.assignIssue",
     "sentry.authStatus",
     "sentry.getIssue",
@@ -321,11 +369,19 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "sourceControl.checkout.warm",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.gitlab.childGit.get",
+    "sourceControl.gitlab.childGit.set",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
     "sourceControl.read.capture",
+    "sourceControl.read.captureScoped",
     "sourceControl.read.detail",
+    "sourceControl.read.detailScoped",
+    "sourceControl.read.discussions",
+    "sourceControl.read.list",
     "sourceControl.read.release",
+    "sourceControl.read.releaseScoped",
+    "sourceControl.read.resolveKnownRepository",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -374,6 +430,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.export.finalize",
     "workspace.export.read",
     "workspace.export.start",
+    "workspace.findByPullRequest",
     "workspace.findRepositories",
     "workspace.generateSetupScript",
     "workspace.get",
@@ -397,6 +454,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
+    "workspace.members.setRole",
     "workspace.repositoryContext",
     "workspace.repositoryContext.capture",
     "workspace.repositoryContext.release",
@@ -406,6 +464,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.repositorySelection.reset",
     "workspace.repositorySelection.save",
     "workspace.restore",
+    "workspace.retire",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
     "workspace.setBrowserClient",
@@ -443,6 +502,7 @@ pub(crate) fn canonical_method(method: &str) -> &str {
 /// drafts and the host-only `browser.*Tab*` registry reports).
 #[cfg(test)]
 pub(crate) const FASTPATH_METHODS: &[&str] = &[
+    "agent.workers.subscribe",
     "browser.closeTab",
     "browser.exec",
     "browser.listTabs",
@@ -454,6 +514,7 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "drafts.clear",
     "drafts.get",
     "drafts.set",
+    "events.fence",
     "events.subscribe",
     "events.unsubscribe",
     "host.checkAuggie",
@@ -494,9 +555,9 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "server.pairingInfo",
     "server.rotateToken",
     "system.gitCredential",
-    "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
+    "system.startupStatus",
     "system.status",
     "workspace.invite.create",
 ];
@@ -509,7 +570,9 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
 pub(crate) const NOTIFICATIONS: &[&str] = &[
     "accept-changes.retired",
     "events.event",
+    "events.lost",
     "sourceControl.read.retired",
+    "sourceControl.read.invalidated",
     "workspace.repositoryContext.retired",
     "workspace.repositorySelection.retired",
 ];
@@ -523,6 +586,7 @@ pub(crate) const NOTIFICATIONS: &[&str] = &[
 #[cfg(test)]
 pub(crate) const REVERSE_METHODS: &[&str] = &[
     "browser.exec",
+    "desktop.control",
     "host.openExternal",
     "host.openInEditor",
     "host.pickApplication",
@@ -543,25 +607,26 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
 /// methods a guest may *attempt*.
 ///
 /// Owner-only by design (never listed): every `host.*` method but the two
-/// display probes, `browser.*`, `forward.*`, `terminal.*`, `script.*`,
+/// display probes, `browser.*`, `forward.*`, `terminal.*`, script definition writes,
 /// `github.*` / `linear.*` / `sentry.*` / `voice.*` (act with the primary
 /// user's third-party credentials), `settings.*`, `repo.*`, `mcp.*`,
 /// `server.*` / `pairing.*` / `system.*` (except `system.capabilities` and
 /// `system.status`, the latter served as the guest-safe projection
 /// `control::collaborator_status_json` rather than the administrator's
 /// snapshot),
-/// `workspace.create` / `git.clone` (arbitrary host paths), agent creation /
-/// delegation (`agent.create` / `agent.delegate` / `agent.wakeOrCreate`;
-/// decided 2026-09-19: guests steer existing agents only), agent / hook /
+/// `workspace.create` / `git.clone` (arbitrary host paths), agent delegation
+/// (`agent.delegate` / `agent.wakeOrCreate`), agent / hook /
 /// PR-monitor deletion, and `agent.replaceMessages` — it persists
 /// client-supplied user rows verbatim, so a non-owner could forge
 /// `fromPrincipalId` attribution; collaborators keep
 /// `agent.editAndRegenerate` for the edit flow. The golden test in
 /// `catalog/tests.rs` freezes the refused remainder so a new method must be
-/// classified explicitly.
-pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
+/// classified explicitly. Manager-only creation and saved-script operations
+/// are admitted here and checked against current workspace roles in services.
+pub const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("agent.appendMessage", "Steer: appends a row to a workspace agent conversation; the caller's principal is stamped on user rows and, for a collaborator member, a user row's content carries the sender preamble (other roles byte-identical). Workspace-scoped, no host reach."),
     ("agent.cancelSubscriptions", "Steer: cancels an agent's own event subscriptions / delegation groups. Agent-scoped bookkeeping, no host reach."),
+    ("agent.create", "Manager: creates agents with workspace-scoped configuration; services check the durable role and reject protected overrides."),
     ("agent.dismissQuestions", "Steer: dismisses an agent's pending structured questions. Agent-scoped state only."),
     ("agent.editAndRegenerate", "Steer: edits a user message and regenerates from it; the edited content carries the collaborator sender preamble. Conversation write, workspace-scoped."),
     ("agent.editQueuedMessage", "Steer: edits a queued message; a collaborator's edit of a human-authored entry carries the sender preamble. Intentional exception: a collaborator's edit of an agent-authored (A2A / automatic) entry is NOT preambled — its sender stays the originating agent's header and the edit is recorded by the principal stamp. Queue write, agent-scoped."),
@@ -598,6 +663,9 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("agent.summary", "Read: a short summary of an agent's work. Workspace-scoped."),
     ("agent.unsubscribe", "Client boot: drops an agent subscription."),
     ("agent.update", "Steer: updates agent metadata (name, background flag). No host reach."),
+    ("agent.workers.list", "Read: provider-reported background worker snapshot of an agent (§5.5b); task labels (a shell label may be its command line, already visible in the transcript) and states, no output or output paths. Workspace-scoped."),
+    ("agent.workers.stop", "Steer: asks the provider to stop one background worker of an agent, like agent.stop for a turn (§5.5b). Agent-scoped, no host reach."),
+    ("agent.workers.subscribe", "Read: per-connection channel of complete agent.workers.list snapshots (§5.5b). Same scope as agent.workers.list."),
     ("chat.subscribe", "Client boot: the chat channel fast path the desktop renders conversations from. Workspace-scoped; delivery narrowed by the event allowlist."),
     ("chat.unsubscribe", "Client boot: drops a chat channel subscription."),
     ("client.hello", "Client boot: binds logical device metadata. The principal comes only from admission; roster visibility and browser hosting authority are independent."),
@@ -613,12 +681,23 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("crossWorkspace.listNotes", "Read: notes of a sibling workspace. Membership-filtered in the service layer."),
     ("crossWorkspace.listSiblings", "Read: sibling workspaces sharing the repo. Membership-filtered in the service layer."),
     ("crossWorkspace.readNote", "Read: a sibling workspace note. Membership-filtered in the service layer."),
+    ("desktop.revoke", "Release/report only: current workspace access and the retained granting principal/Stop credential are checked by the service; never grants execution."),
+    ("discussion.conversations", "Read: bounded participant or explicitly granted agent conversation discovery."),
+    ("discussion.delete", "Write: delete a workspace-wide discussion; workspace owner only."),
+    ("discussion.list", "Read: bounded discussion history; human participation or explicit agent grant required."),
+    ("discussion.react", "Write: set an authenticated participant reaction; human-only, idempotent desired state."),
+    ("discussion.recipients", "Read: bounded effective workspace member picker for human conversations."),
+    ("discussion.rename", "Write: rename a workspace-wide discussion; workspace owner or manager only."),
+    ("discussion.retryAgent", "Write: retry a failed or stopped addressed invocation once; human participant only."),
+    ("discussion.send", "Write: authenticated discussion message; explicit agent recipients only, caller-stamped author."),
+    ("discussion.stopAgent", "Write: stop only the addressed discussion invocation; human participant only."),
     ("drafts.clear", "Per-client: clears the caller's own draft. Keyed by the connection's principal-scoped client id."),
     ("drafts.get", "Per-client: reads the caller's own draft. Keyed by the connection's principal-scoped client id."),
     ("drafts.set", "Per-client: saves the caller's own draft. Keyed by the connection's principal-scoped client id."),
     ("event.agentActivity", "Read: durable event log for an agent. Rows are narrowed by the collaborator event allowlist."),
     ("event.query", "Read: durable event query. Rows are narrowed by the collaborator event allowlist."),
     ("event.workspaceSummary", "Read: aggregated workspace activity. Built from allowlisted event rows only."),
+    ("events.fence", "Recovery: drains all admitted subscription tails before an authoritative read."),
     ("events.subscribe", "Client boot: the general event bus subscription. Non-administrator filters are narrowed to the collaborator event allowlist at fan-out."),
     ("events.unsubscribe", "Client boot: drops an event bus subscription."),
     ("file.attachmentUpload.abort", "Edit: aborts a chat attachment upload. Attachment store under the workspace, no arbitrary host path."),
@@ -630,7 +709,7 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("file.getAttachmentInfo", "Read: metadata of a chat attachment. Workspace attachment store."),
     ("file.list", "Read: repo directory listing. Workspace-root confined."),
     ("file.mkdir", "Edit: creates a repo directory. Workspace-root confined."),
-    ("file.placeAttachment", "Edit: copies an attachment into the workspace. Workspace-root confined."),
+    ("file.placeAttachment", "Edit: places an attachment into the workspace. The destination is workspace-root confined; the host-path `sourcePath` arm requires host execution in services, so guests attach inline `data` only."),
     ("file.read", "Read: a repo file. Confined to the workspace or selected registered root."),
     ("file.readChunk", "Read: a byte range of a repo file. Confined to the workspace or selected registered root."),
     ("file.rename", "Edit: renames a repo path. Both ends workspace-root confined."),
@@ -657,6 +736,7 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("git.removeLockFile", "Edit: removes a stale index.lock inside the workspace .git (git write family, decided)."),
     ("git.renameBranch", "Edit: renames a branch (git write family, decided)."),
     ("git.showFile", "Read: a file at a ref."),
+    ("git.showFileChunk", "Read: a byte range of a file at a ref."),
     ("git.stage", "Edit: stages paths (git write family, decided)."),
     ("git.stageHunk", "Edit: stages a hunk (git write family, decided)."),
     ("git.status", "Read: porcelain status."),
@@ -671,9 +751,6 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("note.add", "Edit: appends to a note; actor recorded. Workspace-scoped."),
     ("note.create", "Edit: creates a note. Workspace-scoped."),
     ("note.delete", "Edit: deletes a note. Workspace-scoped."),
-    ("note.deleteCancel", "Edit: cancels an unclaimed note deletion owned by the caller. Workspace-scoped."),
-    ("note.deleteSchedule", "Edit: schedules guarded cancellable note deletion. Workspace-scoped."),
-    ("note.deleteStatus", "View: reads bounded note deletion state and identity. Workspace-scoped."),
     ("note.edit", "Edit: surgical text replacement in a note."),
     ("note.editLines", "Edit: line-range replacement in a note."),
     ("note.get", "Read: one note."),
@@ -687,6 +764,7 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("note.presence.unsubscribe", "Presence: drops a note presence subscription (releases the viewer lease)."),
     ("note.presence.update", "Presence: the caller's own caret on a note it is subscribed to; coalesced daemon-side, never persisted."),
     ("note.readAsset", "Read: a note asset (image/video) from the workspace asset store."),
+    ("note.readAssetChunk", "Read: a byte range of a note asset from the workspace asset store."),
     ("note.restoreVersion", "Edit: restores a note revision."),
     ("note.saveAsset", "Edit: stores a note asset in the workspace asset store."),
     ("note.setContent", "Edit: full-content note write (three-way merged on a stale rev)."),
@@ -709,6 +787,14 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("principal.revokeSelf", "Guest lifecycle: the caller revokes its OWN credentials and leaves its workspaces; the administrator is refused in the service layer. Self-directed only, no target parameter."),
     ("providers.catalog", "Client boot: static provider catalog for the composer. No credentials."),
     ("rules.get", "Read: only the global base-system-prompt override for a currently admitted guest; services recheck durable admission. Other guest rule reads and all writes remain refused."),
+    ("script.get", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
+    ("script.list", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
+    ("script.output", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
+    ("script.restart", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
+    ("script.run", "Manager: runs an existing saved script by ID; services recheck its purpose and the durable role; no command overrides."),
+    ("script.start", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
+    ("script.status", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
+    ("script.stop", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
     ("scriptMonitor.get", "Read: selected active script monitor. Workspace membership required."),
     ("scriptMonitor.list", "Read: bounded script monitor rows, optionally filtered to an owner. Workspace membership required."),
     ("search.cancel", "Read: cancels the caller's own search."),
@@ -718,6 +804,10 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("search.inFiles", "Read: workspace-scoped content search."),
     ("search.messages", "Read: workspace-scoped chat search."),
     ("search.notes", "Read: workspace-scoped note search."),
+    ("secret.dismiss", "Steer: declines an agent's pending secret request (§5.56) and delivers the declined notice through agent.sendMessage's stamping path. Agent-scoped, memory only."),
+    ("secret.forget", "Steer: drops one of an agent's memory-held secrets (§5.56). Agent-scoped, memory only, no value returned."),
+    ("secret.list", "Read: names of an agent's memory-held secrets and pending/answered requests (§5.56). Never returns a value."),
+    ("secret.provide", "Steer: answers an agent's pending secret request (§5.56); the value stays in daemon memory for that agent's ws.host.exec only and is never echoed. The notice goes through agent.sendMessage's stamping path."),
     ("skill.list", "Client boot: available skills for the composer. Names and descriptions only."),
     ("sourceControl.checkout.branches", "Original native socket and durable target-host Owner/Member; original connection, project, credential and private-cache authority through final delivery."),
     ("sourceControl.checkout.capture", "Pre-workspace acquisition: original native socket and current durable target-host Owner/Member, never guest collaboration authority."),
@@ -727,8 +817,13 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("sourceControl.checkout.repoConfig", "Original native checkout binding; fixed configuration at the observed immutable SHA; original caller, project and credential authority through final delivery."),
     ("sourceControl.checkout.warm", "Original native socket and durable target-host Owner/Member; exact selected project/branch/commit and original private-cache authority through installation."),
     ("sourceControl.read.capture", "Read acquisition: original socket, durable host execution and workspace membership; configured nonsecret instance descriptors only."),
+    ("sourceControl.read.captureScoped", "Original socket and explicitly admitted context: workspace authority or durable host Owner; original target, query, connection, provider and final delivery fences."),
     ("sourceControl.read.detail", "Read: explicit target in the original resource lifetime, with current durable authority and original managed connection/cache fences."),
+    ("sourceControl.read.detailScoped", "Original socket and explicitly admitted context: workspace authority or durable host Owner; original target, query, connection, provider and final delivery fences."),
+    ("sourceControl.read.discussions", "Original socket and explicitly admitted context: workspace authority or durable host Owner; original target, query, connection, provider and final delivery fences."),
+    ("sourceControl.read.list", "Original socket and explicitly admitted context: workspace authority or durable host Owner; original target, query, connection, provider and final delivery fences."),
     ("sourceControl.read.release", "Release: original socket only, no new read authority or cross-socket lookup."),
+    ("sourceControl.read.releaseScoped", "Original socket and explicitly admitted context: workspace authority or durable host Owner; original target, query, connection, provider and final delivery fences."),
     ("specialist.get", "Read: one specialist definition. Create/edit/delete stay daemon administration."),
     ("specialist.list", "Client boot: the specialist catalog the delegate picker renders."),
     ("stats.getRateHistory", "Read: usage rate history. Usage/stats read."),
@@ -753,6 +848,7 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("task.updateNoteStatus", "Edit: task note lifecycle status; actor recorded."),
     ("task.updateStatus", "Edit: one checkbox status by text; actor recorded."),
     ("workspace.dismissAttention", "Steer: clears a workspace attention marker."),
+    ("workspace.findByPullRequest", "Read: the workspaces linked to a PR URL (id/title/archived/linkedAt). Rows the caller is not a member of are filtered in the service layer."),
     ("workspace.get", "Read: one workspace with the caller's role. Non-members are filtered in the service layer."),
     ("workspace.getAutoCommit", "Read: the workspace auto-commit flag. Setting it stays owner-only."),
     ("workspace.getContext", "Read: workspace context items (links/notes the agents see)."),
@@ -763,6 +859,7 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("workspace.markSeen", "Steer: clears the workspace unseen marker."),
     ("workspace.members.leave", "Guest lifecycle: the caller drops its OWN collaborator membership of a workspace; owners cannot leave. Self-directed only, no target parameter; removal of others stays owner-only."),
     ("workspace.members.list", "Read: the membership roster (principal fields + role) of a member workspace. Removal stays owner-only."),
+    ("workspace.members.setRole", "Owner: updates a direct guest role; services enforce owner authority and immutable ownership."),
     ("workspace.repositoryContext", "Read: original socket/root lease; durable repository membership is rechecked. Host account metadata remains administrator-only."),
     ("workspace.repositoryContext.capture", "Read acquisition: original socket and workspace/root only; require_member decides durable local inventory permission, never write permission."),
     ("workspace.repositoryContext.release", "Release: only an original socket-owned repository lease; no cross-socket lookup or new authority."),
@@ -803,7 +900,6 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "accept-changes.release",
     "agent.cancelDelete",
     "agent.completeOnce",
-    "agent.create",
     "agent.delegate",
     "agent.delete",
     "agent.diagnostics",
@@ -817,6 +913,9 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "browser.removeTab",
     "browser.syncTabs",
     "browser.upsertTab",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.setPermission",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
     "file-tracking.loadCommits",
@@ -879,16 +978,8 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "sandbox.cow.merge",
     "script.archive",
     "script.create",
-    "script.get",
-    "script.list",
-    "script.output",
     "script.remove",
-    "script.restart",
     "script.restore",
-    "script.run",
-    "script.start",
-    "script.status",
-    "script.stop",
     "scriptMonitor.cancel",
     "scriptMonitor.cancelRun",
     "sentry.assignIssue",
@@ -934,6 +1025,7 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "workspace.members.add",
     "workspace.members.remove",
     "workspace.restore",
+    "workspace.retire",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
     "workspace.setBrowserClient",
@@ -944,3 +1036,756 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
 pub(crate) fn member_may_call(method: &str) -> bool {
     collaborator_may_call(method) || MEMBER_METHODS.contains(&canonical_method(method))
 }
+
+/// Human message of a node-mode refusal (`-32003`, `data.code: "node-mode"`).
+pub const NODE_MODE_ERROR_MESSAGE: &str = "Not available in node mode";
+
+/// `error.data` of a node-mode refusal: `{ code: "node-mode", detail }`.
+#[must_use]
+pub fn node_mode_error_data(detail: &str) -> serde_json::Value {
+    serde_json::json!({ "code": "node-mode", "detail": detail })
+}
+
+/// The deny-by-default method list a daemon in **node mode** serves
+/// (`intentd serve --node` or `daemon.mode = "node"`; monorepo nodes.md
+/// "Node mode"). Node mode turns the daemon's own orchestration off, so every
+/// other method — on every transport, local UDS included — is refused with
+/// `-32003` `data.code: "node-mode"` before any fast path or the router runs.
+/// The per-caller gates still apply on top (a guest calling a listed method is
+/// still refused by [`COLLABORATOR_METHODS`]), and local-only methods stay
+/// local-only. Adding a method is a deliberate one-line opt-in here plus the
+/// refused golden (`tests/goldens/node_mode_refused.txt`). The executor link's
+/// frame list is a second, separate opt-in.
+pub const NODE_MODE_METHODS: &[(&str, &str)] = &[
+    (
+        "client.hello",
+        "Session handshake; every client sends it first.",
+    ),
+    (
+        "executor.list",
+        "Owner: the backends with access to this machine.",
+    ),
+    (
+        "executor.mint",
+        "Owner: expose this machine to a backend (one scoped credential).",
+    ),
+    ("executor.revoke", "Owner: withdraw a backend's access."),
+    (
+        "host.status",
+        "Host OS, display and locality probe used by clients and the sitter.",
+    ),
+    (
+        "models.list",
+        "The models this machine's providers offer (capabilities report).",
+    ),
+    (
+        "pairing.getInfo",
+        "Pairing payload for the owner's own devices; local-only as today.",
+    ),
+    (
+        "pairing.getSelfInfo",
+        "This machine's own pairing identity; local-only as today.",
+    ),
+    (
+        "principal.me",
+        "The caller's own role, so a client offers owner-only actions.",
+    ),
+    (
+        "providers.catalog",
+        "The provider catalog, for the capabilities report.",
+    ),
+    (
+        "providers.profiles.list",
+        "Provider profile metadata reads (no secret values).",
+    ),
+    (
+        "server.pairingInfo",
+        "Listener routes and certificate pin; local-only as today.",
+    ),
+    (
+        "settings.get",
+        "Only the remoteAgents.*, daemon.* and server.* keys (services refuse the rest).",
+    ),
+    (
+        "settings.update",
+        "Only the remoteAgents.*, daemon.* and server.* keys (services refuse the rest).",
+    ),
+    ("system.requestUpdate", "Sitter update handshake."),
+    ("system.shutdown", "Sitter restart / intentd stop."),
+    (
+        "system.startupStatus",
+        "Startup progress, polled by the sitter and clients.",
+    ),
+    (
+        "system.status",
+        "Liveness and status snapshot (intentd status, the sitter).",
+    ),
+];
+
+/// Whether a daemon in node mode serves `method` (aliases canonicalised).
+#[must_use]
+pub fn node_mode_may_call(method: &str) -> bool {
+    static ALLOWED: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    ALLOWED
+        .get_or_init(|| NODE_MODE_METHODS.iter().map(|(m, _)| *m).collect())
+        .contains(canonical_method(method))
+}
+
+/// The HTTP paths of the WSS listener a daemon in node mode serves: health,
+/// the JSON-RPC socket (gated by [`NODE_MODE_METHODS`]) and the executor
+/// link. The guest invite endpoint and the loopback preview tunnel belong to
+/// the orchestration that node mode turns off and are refused with `403`.
+pub const NODE_MODE_HTTP_PATHS: &[&str] = &[
+    "/health",
+    crate::node_link::GIT_PATH,
+    crate::node_link::LINK_PATH,
+    "/ws",
+];
+
+/// Whether a daemon in node mode serves the HTTP `path`.
+#[must_use]
+pub fn node_mode_serves_path(path: &str) -> bool {
+    NODE_MODE_HTTP_PATHS.contains(&path)
+}
+
+/// Response-size budget for a [`PayloadClass::BoundedRead`] method: the
+/// serialized result must stay under this many bytes on the large
+/// daemon-state fixture the payload sweep in `intent-app` builds.
+pub const READ_PAYLOAD_BUDGET_BYTES: usize = 500 * 1024;
+
+/// Byte cap of one transfer chunk before base64 (`file.readChunk`,
+/// `workspace.export.read`); the same constant the service layer enforces.
+const IMPORT_MAX_CHUNK_BYTES: usize =
+    intent_services::feature_api::feature_ports::IMPORT_MAX_CHUNK_BYTES;
+
+/// How large one response of a method may legitimately be. See
+/// [`PAYLOAD_CLASSES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadClass {
+    /// A read of daemon state that must stay under
+    /// [`READ_PAYLOAD_BUDGET_BYTES`] on the large fixture.
+    BoundedRead,
+    /// An intentional large payload (file, blob, asset, export chunk).
+    /// `cap_param` is the request param a caller sets to shrink one
+    /// response, and `max_bytes` the most one response may carry before
+    /// encoding whatever the caller sends. `cap_param` is `None` when no
+    /// request param bounds the bytes: either the object is sent whole
+    /// (`max_bytes` is then the outbound frame cap) or the server cuts
+    /// fixed-size chunks (`max_bytes` is that chunk cap).
+    BulkTransfer {
+        /// Request param that shrinks one response, or `None` when the
+        /// bound is server-side only.
+        cap_param: Option<&'static str>,
+        /// Most bytes one response carries before encoding.
+        max_bytes: usize,
+    },
+    /// A read proxied to GitHub, Linear, Sentry or GitLab. `page_param`
+    /// names the page-size param the daemon clamps; `None` for a
+    /// single-object read with no page.
+    ExternalProxy {
+        /// Clamped page-size param, or `None` for a single object.
+        page_param: Option<&'static str>,
+    },
+    /// A subscription handshake or event-stream control. The reply is an
+    /// acknowledgement; any initial state goes out as a seq-0 snapshot
+    /// listed in [`SNAPSHOT_CHANNELS`].
+    Subscription,
+    /// A write or side effect (including model calls that spend tokens).
+    /// Out of the payload sweep for now.
+    Mutation,
+}
+
+/// One row of [`PAYLOAD_CLASSES`]: a method, its payload class, and a short
+/// reason saying what it returns or does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadBudget {
+    /// Canonical method name from [`ROUTER_METHODS`] or the fast paths.
+    pub method: &'static str,
+    /// The payload class the method belongs to.
+    pub class: PayloadClass,
+    /// What the method returns or does, in one short sentence.
+    pub reason: &'static str,
+}
+
+const fn bounded(method: &'static str, reason: &'static str) -> PayloadBudget {
+    PayloadBudget {
+        method,
+        class: PayloadClass::BoundedRead,
+        reason,
+    }
+}
+
+const fn bulk(
+    method: &'static str,
+    cap_param: Option<&'static str>,
+    max_bytes: usize,
+    reason: &'static str,
+) -> PayloadBudget {
+    PayloadBudget {
+        method,
+        class: PayloadClass::BulkTransfer {
+            cap_param,
+            max_bytes,
+        },
+        reason,
+    }
+}
+
+const fn proxy(
+    method: &'static str,
+    page_param: Option<&'static str>,
+    reason: &'static str,
+) -> PayloadBudget {
+    PayloadBudget {
+        method,
+        class: PayloadClass::ExternalProxy { page_param },
+        reason,
+    }
+}
+
+const fn subscription(method: &'static str, reason: &'static str) -> PayloadBudget {
+    PayloadBudget {
+        method,
+        class: PayloadClass::Subscription,
+        reason,
+    }
+}
+
+const fn mutation(method: &'static str, reason: &'static str) -> PayloadBudget {
+    PayloadBudget {
+        method,
+        class: PayloadClass::Mutation,
+        reason,
+    }
+}
+
+/// Every router and fast-path method, in exactly one payload class, sorted
+/// by method. The golden tests in `catalog/tests.rs` fail when a method in
+/// [`ROUTER_METHODS`] or the fast paths is missing here, listed twice, or
+/// listed but no longer cataloged. Public so the payload sweep in
+/// `intent-app` can call every [`PayloadClass::BoundedRead`] method against
+/// the large fixture.
+pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
+    mutation("accept-changes.addRemote", "Adds a git remote."),
+    mutation("accept-changes.execute", "Commits, pushes and opens the PR as the primary user."),
+    bounded("accept-changes.getStatus", "Accept-changes progress for one workspace."),
+    mutation("accept-changes.mergePR", "Merges a PR on the forge."),
+    mutation("accept-changes.prepare", "Stages the accept-changes plan."),
+    mutation("accept-changes.reconcile", "Reconciles accept-changes state with the forge."),
+    mutation("accept-changes.release", "Releases the accept-changes lease."),
+    mutation("agent.appendMessage", "Appends a conversation row."),
+    mutation("agent.cancelDelete", "Cancels a pending agent deletion."),
+    mutation("agent.cancelSubscriptions", "Cancels an agent's event subscriptions."),
+    mutation("agent.completeOnce", "One-shot model completion; spends tokens."),
+    mutation("agent.create", "Creates an agent."),
+    mutation("agent.delegate", "Creates and starts a delegated agent."),
+    mutation("agent.delete", "Deletes an agent."),
+    bounded("agent.diagnostics", "Agent status, queue and subscription digest."),
+    mutation("agent.dismissQuestions", "Dismisses pending structured questions."),
+    mutation("agent.editAndRegenerate", "Edits a user message and regenerates."),
+    mutation("agent.editQueuedMessage", "Edits a queued message."),
+    mutation("agent.enhancePrompt", "Rewrites a prompt with a model; spends tokens."),
+    bounded("agent.get", "One agent record."),
+    bounded("agent.getConversation", "One paginated transcript page."),
+    bounded("agent.getCreationPreferences", "Workspace specialist preference."),
+    bounded("agent.getMessageBlock", "One content block, capped at 480,000 bytes per page and paged by offset / nextOffset."),
+    bounded("agent.getModels", "Model options for one agent."),
+    bounded("agent.getQueue", "One agent's pending queue."),
+    bounded("agent.getSession", "One ACP session summary."),
+    bounded("agent.getSessionStats", "Token and turn counters."),
+    bounded("agent.getSubscriptions", "One agent's event subscriptions."),
+    bounded("agent.list", "Agents of one workspace."),
+    bounded("agent.listActive", "Active agents across workspaces."),
+    bounded("agent.listInterrupted", "Agents interrupted by a restart."),
+    bounded("agent.listUserMessages", "User rows of one conversation (prompt history)."),
+    mutation("agent.markSeen", "Clears the unseen marker."),
+    bounded("agent.memoryUsage", "Per-agent memory counters."),
+    bounded("agent.pendingPermissions", "Outstanding permission prompts."),
+    mutation("agent.queueMessage", "Queues a message."),
+    mutation("agent.removeQueuedMessage", "Retracts a queued message."),
+    mutation("agent.rename", "Renames an agent."),
+    mutation("agent.replaceMessages", "Replaces conversation rows."),
+    mutation("agent.reportToParent", "Posts a report to the parent agent."),
+    mutation("agent.resolveInterrupted", "Resumes or dismisses an interrupted agent."),
+    mutation("agent.resolveProposal", "Applies or rejects an agent proposal."),
+    mutation("agent.respondPermission", "Answers a permission prompt."),
+    mutation("agent.restore", "Restores a retired agent."),
+    mutation("agent.retire", "Retires an agent."),
+    mutation("agent.retry", "Retries a failed turn."),
+    mutation("agent.sendMessage", "Sends a message and starts a turn."),
+    mutation("agent.sendQueuedMessageNow", "Promotes a queued message."),
+    mutation("agent.sendQueuedMessagesNow", "Sends the queue as one batch."),
+    mutation("agent.sendToTask", "Messages a task's agent."),
+    mutation("agent.setModel", "Switches the agent model."),
+    mutation("agent.stop", "Stops the running turn."),
+    subscription("agent.subscribe", "Registers an agent event or collection subscription; the seq-0 snapshot is listed in SNAPSHOT_CHANNELS."),
+    bounded("agent.summary", "Short summary of one agent's work."),
+    subscription("agent.unsubscribe", "Drops an agent subscription."),
+    mutation("agent.update", "Updates agent metadata."),
+    mutation("agent.wakeOrCreate", "Resumes or creates a task agent."),
+    bounded("agent.workers.list", "Background workers of one agent."),
+    mutation("agent.workers.stop", "Stops a background worker."),
+    subscription("agent.workers.subscribe", "Registers a worker subscription; the seq-0 snapshot is listed in SNAPSHOT_CHANNELS."),
+    mutation("browser.closeTab", "Closes a tab."),
+    mutation("browser.exec", "Reverse RPC that drives the client browser."),
+    bounded("browser.listTabs", "Browser tab registry."),
+    mutation("browser.navigateTab", "Navigates a tab."),
+    mutation("browser.removeTab", "Removes a tab record."),
+    mutation("browser.syncTabs", "Replaces the tab registry."),
+    mutation("browser.upsertTab", "Writes a tab record."),
+    mutation("client.hello", "Binds the connection to a client id."),
+    bounded("client.list", "Connected clients."),
+    mutation("comment.add", "Adds a comment."),
+    mutation("comment.delete", "Deletes a comment."),
+    bounded("comment.getThread", "One comment thread."),
+    bounded("comment.list", "Comment threads of one note."),
+    mutation("comment.resolveThread", "Resolves a thread."),
+    mutation("comment.respond", "Replies in a thread."),
+    bounded("crossWorkspace.listNotes", "Notes of a sibling workspace."),
+    bounded("crossWorkspace.listSiblings", "Sibling workspaces of one repository."),
+    bounded("crossWorkspace.readNote", "One note of a sibling workspace."),
+    bounded("debug.sampleStacks", "Point-in-time sample of daemon thread stacks."),
+    bounded("desktop.getState", "Desktop control state."),
+    mutation("desktop.respondPermission", "Answers a desktop-control consent prompt."),
+    mutation("desktop.revoke", "Revokes desktop control."),
+    mutation("desktop.setPermission", "Sets desktop-control permission."),
+    bounded("discussion.conversations", "Discussion conversations page."),
+    mutation("discussion.delete", "Deletes a discussion."),
+    bounded("discussion.list", "One discussion's message page."),
+    mutation("discussion.react", "Toggles a reaction."),
+    bounded("discussion.recipients", "Addressable discussion recipients."),
+    mutation("discussion.rename", "Renames a discussion."),
+    mutation("discussion.retryAgent", "Retries an agent reply."),
+    mutation("discussion.send", "Posts a message."),
+    mutation("discussion.stopAgent", "Stops an agent reply."),
+    mutation("drafts.clear", "Clears a draft."),
+    bounded("drafts.get", "One composer draft."),
+    mutation("drafts.set", "Writes a draft."),
+    bounded("event.agentActivity", "Activity events in a time window."),
+    bounded("event.query", "Filtered activity events."),
+    bounded("event.workspaceSummary", "Aggregated activity summary."),
+    subscription("events.fence", "Event-stream barrier on the connection."),
+    subscription("events.subscribe", "Registers an event-stream subscription; it sends no seq-0 snapshot."),
+    subscription("events.unsubscribe", "Drops an event-stream subscription."),
+    bounded("executor.list", "Backends with access to this machine (active executor credentials)."),
+    mutation("executor.mint", "Mints an executor credential for a backend."),
+    mutation("executor.revoke", "Revokes an executor credential."),
+    bounded("file-tracking.getAgentLocks", "Per-agent file locks."),
+    bounded("file-tracking.getChanges", "Tracked file changes."),
+    bounded("file-tracking.loadCommits", "Commit list for the tracking view."),
+    mutation("file-tracking.stage", "Stages files."),
+    mutation("file-tracking.unstage", "Unstages files."),
+    mutation("file.attachmentUpload.abort", "Aborts an attachment upload."),
+    mutation("file.attachmentUpload.begin", "Starts an attachment upload."),
+    mutation("file.attachmentUpload.chunk", "Uploads one attachment chunk."),
+    mutation("file.attachmentUpload.commit", "Completes an attachment upload."),
+    mutation("file.delete", "Deletes a file."),
+    bounded("file.exists", "Whether one path exists."),
+    bounded("file.getAttachmentInfo", "Metadata for one attachment."),
+    bounded("file.list", "One directory listing."),
+    mutation("file.mkdir", "Creates a directory."),
+    mutation("file.placeAttachment", "Copies an attachment into the worktree."),
+    bounded("file.read", "One UTF-8 file; with maxBytes (the app always sends it) capped at the object read cap, and the whole file goes through file.readChunk. Older callers without maxBytes get the whole file."),
+    bulk("file.readChunk", Some("length"), IMPORT_MAX_CHUNK_BYTES, "Offset-windowed binary read; length is capped at the transfer chunk size before base64."),
+    mutation("file.rename", "Renames a file."),
+    bounded("file.stat", "Metadata for one path."),
+    bounded("file.tree", "Worktree file tree."),
+    mutation("file.write", "Writes a file."),
+    mutation("git.agentCommit", "Commits on behalf of an agent."),
+    bounded("git.branchDiff", "Diff of a branch against its base."),
+    bounded("git.branchStatus", "Ahead/behind status of a branch."),
+    bounded("git.changes", "Changed files of the worktree."),
+    bounded("git.checkMergeConflicts", "Merge-conflict probe."),
+    mutation("git.checkoutBranch", "Checks out a branch."),
+    mutation("git.clone", "Clones a repository."),
+    bounded("git.commitDetails", "One commit with its files."),
+    bounded("git.commits", "Commit log page."),
+    mutation("git.createBranch", "Creates a branch."),
+    bounded("git.diffs", "Worktree diffs."),
+    mutation("git.discard", "Discards changes."),
+    mutation("git.fetch", "Fetches from a remote and updates refs."),
+    bounded("git.getBranches", "Local and remote branches."),
+    bounded("git.getConfig", "Git config values."),
+    bounded("git.getRemoteUrl", "One remote URL."),
+    bounded("git.numstat", "Per-file additions and deletions."),
+    mutation("git.pull", "Pulls from a remote."),
+    mutation("git.push", "Pushes to a remote."),
+    mutation("git.removeLockFile", "Removes a stale index lock."),
+    mutation("git.renameBranch", "Renames a branch."),
+    bounded("git.showFile", "One blob at a ref; with maxBytes (the app always sends it) capped at the object read cap, and the whole blob goes through git.showFileChunk. Older callers without maxBytes get the whole blob."),
+    bulk("git.showFileChunk", Some("length"), IMPORT_MAX_CHUNK_BYTES, "Offset-windowed blob read at a ref; length is capped at the transfer chunk size before base64."),
+    mutation("git.stage", "Stages files."),
+    mutation("git.stageHunk", "Stages one hunk."),
+    bounded("git.status", "Worktree status."),
+    mutation("git.unstage", "Unstages files."),
+    mutation("git.unstageHunk", "Unstages one hunk."),
+    bounded("gitRoot.list", "Registered git roots."),
+    bounded("github.authStatus", "Local GitHub credential status."),
+    proxy("github.branches.list", Some("limit"), "Repository branches. One GitHub page."),
+    proxy("github.branches.listCached", None, "Cached branch names for one repository. Single object, no page."),
+    mutation("github.cancelAuth", "Cancels a GitHub sign-in flow."),
+    mutation("github.connect", "Starts a GitHub sign-in flow."),
+    proxy("github.getReviewThreads", Some("limit"), "PR review threads. One GitHub page."),
+    proxy("github.getUser", None, "The signed-in GitHub user. Single object, no page."),
+    mutation("github.identityProof.create", "Creates an identity-proof gist."),
+    mutation("github.identityProof.delete", "Deletes an identity-proof gist."),
+    proxy("github.issues.get", None, "One issue. Single object, no page."),
+    proxy("github.issues.list", Some("limit"), "Repository issues. One GitHub page."),
+    proxy("github.issues.search", Some("limit"), "Issue search results. One GitHub page."),
+    proxy("github.listReviewComments", Some("limit"), "PR review comments. One GitHub page."),
+    proxy("github.pulls.checks", None, "Check runs of one PR head. Single object, no page."),
+    mutation("github.pulls.create", "Opens a PR."),
+    proxy("github.pulls.files", Some("limit"), "Changed files of a PR. One GitHub page."),
+    proxy("github.pulls.get", None, "One PR. Single object, no page."),
+    proxy("github.pulls.list", Some("limit"), "Repository PRs. One GitHub page."),
+    mutation("github.pulls.merge", "Merges a PR."),
+    proxy("github.pulls.reviews", Some("limit"), "PR reviews. One GitHub page."),
+    proxy("github.pulls.search", Some("limit"), "PR search results. One GitHub page."),
+    mutation("github.pulls.updateBranch", "Updates a PR branch."),
+    proxy("github.relatedRepos.list", None, "Fork and upstream of one repository. Single object, no page."),
+    mutation("github.replyReviewComment", "Replies to a review comment."),
+    proxy("github.repoConfig.get", None, "Repository config file at a ref. Single object, no page."),
+    proxy("github.repos.get", None, "One repository. Single object, no page."),
+    proxy("github.repos.list", Some("limit"), "Accessible repositories. One GitHub page."),
+    proxy("github.repos.search", Some("limit"), "Repository search results. One GitHub page."),
+    mutation("github.resolveThread", "Resolves a review thread."),
+    mutation("github.revoke", "Revokes the GitHub token."),
+    mutation("github.unresolveThread", "Unresolves a review thread."),
+    proxy("github.users.search", Some("limit"), "User search results. One GitHub page."),
+    mutation("hook.cancel", "Cancels a hook."),
+    bounded("hook.list", "Active hooks."),
+    mutation("hook.runNow", "Runs a hook now."),
+    bounded("host.checkAuggie", "Auggie availability probe."),
+    bounded("host.checkGh", "gh availability probe."),
+    bounded("host.checkGit", "git availability probe."),
+    bounded("host.checkNode", "Node availability probe."),
+    mutation("host.createDirectory", "Creates a host directory."),
+    bounded("host.directoryStatus", "Status of one host directory."),
+    bounded("host.env", "Host environment summary."),
+    mutation("host.exec", "Runs a host command."),
+    mutation("host.execStream", "Starts a streamed host command."),
+    mutation("host.execStream.cancel", "Cancels a streamed command."),
+    mutation("host.execStream.write", "Writes streamed command input."),
+    bounded("host.executionContext", "Host execution context summary."),
+    bounded("host.findApp", "Host app lookup."),
+    bounded("host.findBinary", "Host binary lookup."),
+    mutation("host.invite.create", "Creates a host invite."),
+    bounded("host.invite.list", "Pending host invites."),
+    mutation("host.invite.revoke", "Revokes a host invite."),
+    bounded("host.invite.searchAccounts", "Account search for invites."),
+    bounded("host.listDirectory", "One host directory listing."),
+    bounded("host.listInstalledEditors", "Installed editors."),
+    bounded("host.members.list", "Host members."),
+    mutation("host.members.remove", "Removes a host member."),
+    mutation("host.openInEditor", "Opens a path in an editor."),
+    mutation("host.prepareProviderAdapters", "Installs provider adapters."),
+    bounded("host.providerAuthStatus", "Provider sign-in status."),
+    bounded("host.providerDiscovery", "Installed provider discovery."),
+    mutation("host.providerTestPrompt", "Sends a provider test prompt; spends tokens."),
+    bounded("host.status", "Host status."),
+    bounded("host.toolAvailability", "Host tool availability."),
+    bounded("identity.authStatus", "Local identity credential status."),
+    mutation("identity.cancelAuth", "Cancels an identity sign-in."),
+    mutation("identity.connect", "Starts an identity sign-in."),
+    bounded("identity.getUser", "The selected identity."),
+    mutation("identity.revoke", "Revokes an identity."),
+    mutation("identity.select", "Selects the active identity."),
+    mutation("invite.accept", "Accepts an invite."),
+    mutation("invite.challenge", "Issues an invite challenge."),
+    bounded("invite.inspect", "One invite preview."),
+    mutation("invite.prove", "Proves an invite challenge."),
+    bounded("linear.authStatus", "Local Linear credential status."),
+    mutation("linear.createIssue", "Creates a Linear issue."),
+    proxy("linear.getIssue", None, "One Linear issue. Single object, no page."),
+    proxy("linear.listIssues", Some("limit"), "Linear issues. One Linear page."),
+    proxy("linear.listLabels", Some("limit"), "Linear labels. One Linear page."),
+    proxy("linear.listProjects", Some("limit"), "Linear projects. One Linear page."),
+    proxy("linear.listTeams", Some("limit"), "Linear teams. One Linear page."),
+    proxy("linear.listWorkflowStates", Some("limit"), "Linear workflow states. One Linear page."),
+    proxy("linear.searchIssues", Some("limit"), "Linear issue search results. One Linear page."),
+    mutation("linear.updateIssue", "Updates a Linear issue."),
+    proxy("linear.viewer", None, "The signed-in Linear user. Single object, no page."),
+    mutation("mcp.oauth.delete", "Deletes MCP OAuth state."),
+    bounded("mcp.oauth.get", "One MCP OAuth record."),
+    bounded("mcp.oauth.list", "MCP OAuth records."),
+    mutation("mcp.oauth.set", "Stores MCP OAuth state."),
+    mutation("mcp.servers.create", "Creates an MCP server."),
+    mutation("mcp.servers.delete", "Deletes an MCP server."),
+    bounded("mcp.servers.getStatus", "MCP server status."),
+    bounded("mcp.servers.list", "Configured MCP servers."),
+    mutation("mcp.servers.restart", "Restarts an MCP server."),
+    mutation("mcp.servers.toggle", "Enables or disables an MCP server."),
+    mutation("mcp.servers.update", "Updates an MCP server."),
+    mutation("mcp.testConnection", "Spawns an MCP server to test it."),
+    bounded("metrics.getAgentStats", "Daemon-wide agent metrics."),
+    bounded("models.list", "Model catalog."),
+    mutation("note.add", "Appends to a note."),
+    mutation("note.create", "Creates a note."),
+    mutation("note.delete", "Deletes a note."),
+    mutation("note.edit", "Edits a note."),
+    mutation("note.editLines", "Edits note lines."),
+    bounded("note.get", "One note."),
+    bounded("note.getVersion", "One note version."),
+    mutation("note.lineAttribution.computeNow", "Recomputes line attribution."),
+    bounded("note.lineAttribution.load", "Line attribution of one note."),
+    bounded("note.list", "Notes of one workspace."),
+    bounded("note.listTasks", "Checkbox tasks of one note."),
+    bounded("note.listVersions", "Version list of one note."),
+    mutation("note.presence.update", "Updates note presence."),
+    bounded("note.readAsset", "One asset as base64; with maxBytes (the app always sends it) a larger asset is sent without its bytes, which go through note.readAssetChunk. Older callers without maxBytes get the whole asset."),
+    bulk("note.readAssetChunk", Some("length"), IMPORT_MAX_CHUNK_BYTES, "Offset-windowed asset read; length is capped at the transfer chunk size before base64."),
+    mutation("note.restoreVersion", "Restores a note version."),
+    mutation("note.saveAsset", "Saves a note asset."),
+    mutation("note.setContent", "Replaces note content."),
+    mutation("note.update", "Updates a note."),
+    mutation("note.updateMetadata", "Updates note title and tags."),
+    bounded("pairing.getInfo", "Pairing info."),
+    bounded("pairing.getSelfInfo", "This host's pairing info."),
+    mutation("plugin.install", "Installs a plugin from a folder or git URL."),
+    bounded("plugin.list", "Installed plugins."),
+    mutation("plugin.toggle", "Enables or disables a plugin."),
+    mutation("plugin.uninstall", "Removes a plugin."),
+    mutation("plugin.update", "Updates a plugin from its source."),
+    mutation("pr.refresh", "Refreshes cached PR state from the forge."),
+    mutation("prMonitor.cancel", "Cancels a PR monitor."),
+    mutation("prMonitor.flush", "Flushes a PR monitor."),
+    bounded("prMonitor.list", "PR monitors."),
+    bounded("presence.snapshot", "Current presence."),
+    mutation("presence.update", "Updates presence."),
+    mutation("primitive.addAgentAction", "Adds a rich note block."),
+    mutation("primitive.addCli", "Adds a rich note block."),
+    mutation("primitive.addPatch", "Adds a rich note block."),
+    mutation("primitive.addReference", "Adds a rich note block."),
+    bounded("principal.list", "Known principals."),
+    bounded("principal.me", "The calling principal."),
+    mutation("principal.revokeSelf", "Revokes the caller's own access."),
+    bounded("providers.catalog", "Provider catalog."),
+    mutation("providers.profiles.create", "Writes provider profiles."),
+    mutation("providers.profiles.delete", "Writes provider profiles."),
+    bounded("providers.profiles.list", "Provider profiles."),
+    mutation("providers.profiles.reorder", "Writes provider profiles."),
+    mutation("providers.profiles.update", "Writes provider profiles."),
+    mutation("providers.profiles.updateDefault", "Writes provider profiles."),
+    mutation("providers.setup.cancel", "Cancels provider setup."),
+    mutation("providers.setup.login", "Starts provider login."),
+    mutation("providers.setup.start", "Starts provider setup."),
+    bounded("providers.setup.status", "Provider setup status."),
+    bounded("remoteLinkTraffic.snapshot", "Captured executor-link traffic, bounded."),
+    mutation("remoteLinkTraffic.start", "Starts capturing executor-link traffic."),
+    mutation("remoteLinkTraffic.stop", "Stops and clears the executor-link traffic capture."),
+    mutation("remoteMachines.add", "Adds an exposed machine after probing it."),
+    bounded("remoteMachines.backendInfo", "This backend's id, name and certificate pin."),
+    bounded("remoteMachines.list", "Machines exposed to this backend."),
+    mutation("remoteMachines.refresh", "Dials a machine and refreshes its capabilities report."),
+    mutation("remoteMachines.remove", "Removes an exposed machine."),
+    bounded("repo.list", "Known repositories."),
+    mutation("repo.remove", "Removes a repository."),
+    mutation("repo.warmCache", "Warms a repository cache."),
+    mutation("repoConfig.ensureDir", "Creates the repo config directory."),
+    bounded("repoConfig.get", "Repo config of one workspace."),
+    bounded("repoConfig.has", "Whether a repo config exists."),
+    mutation("repoConfig.save", "Saves the repo config."),
+    bounded("rules.get", "One rules file."),
+    bounded("rules.list", "Rules files."),
+    mutation("rules.update", "Updates a rules file."),
+    mutation("sandbox.cow.discard", "Discards a copy-on-write sandbox."),
+    mutation("sandbox.cow.merge", "Merges a copy-on-write sandbox."),
+    mutation("script.archive", "Archives scripts."),
+    mutation("script.create", "Creates a script."),
+    bounded("script.get", "One script definition."),
+    bounded("script.list", "Scripts of one workspace."),
+    bounded("script.output", "Script output buffer page (maxLines, paginated)."),
+    mutation("script.remove", "Removes a script."),
+    mutation("script.restart", "Restarts a script."),
+    mutation("script.restore", "Restores scripts."),
+    mutation("script.run", "Runs a script."),
+    mutation("script.start", "Starts a script."),
+    bounded("script.status", "Script runtime state."),
+    mutation("script.stop", "Stops a script."),
+    mutation("scriptMonitor.cancel", "Cancels a script monitor."),
+    mutation("scriptMonitor.cancelRun", "Cancels a monitored run."),
+    bounded("scriptMonitor.get", "One script monitor."),
+    bounded("scriptMonitor.list", "Script monitors."),
+    mutation("search.cancel", "Cancels a running search."),
+    bounded("search.codebase", "Codebase search hits."),
+    bounded("search.events", "Event search hits."),
+    bounded("search.fileNames", "File-name search hits."),
+    bounded("search.inFiles", "In-file search hits."),
+    bounded("search.messages", "Message search hits."),
+    bounded("search.notes", "Note search hits."),
+    mutation("secret.dismiss", "Dismisses a secret request."),
+    mutation("secret.forget", "Forgets a secret."),
+    bounded("secret.list", "Secret names, never values."),
+    mutation("secret.provide", "Provides a secret."),
+    mutation("sentry.assignIssue", "Assigns a Sentry issue."),
+    bounded("sentry.authStatus", "Local Sentry credential status."),
+    proxy("sentry.getIssue", None, "One Sentry issue. Single object, no page."),
+    mutation("sentry.ignoreIssue", "Ignores a Sentry issue."),
+    proxy("sentry.listIssues", Some("limit"), "Sentry issues. One Sentry page."),
+    proxy("sentry.listProjects", Some("limit"), "Sentry projects. One Sentry page."),
+    mutation("sentry.resolveIssue", "Resolves a Sentry issue."),
+    proxy("sentry.searchIssues", Some("limit"), "Sentry issue search results. One Sentry page."),
+    bounded("server.pairingInfo", "Server pairing info."),
+    mutation("server.rotateToken", "Rotates the server token."),
+    bounded("settings.get", "One setting."),
+    bounded("settings.list", "All settings."),
+    mutation("settings.reset", "Resets settings."),
+    mutation("settings.update", "Updates settings."),
+    bounded("skill.list", "Available skills."),
+    bounded("sourceControl.authStatus", "Local forge credential status."),
+    mutation("sourceControl.cancelAuth", "Cancels a forge sign-in."),
+    proxy("sourceControl.checkout.branches", Some("limit"), "Forge branches. One forge page."),
+    mutation("sourceControl.checkout.capture", "Leases a checkout read session."),
+    proxy("sourceControl.checkout.project", None, "One forge project. Single object, no page."),
+    proxy("sourceControl.checkout.projects", Some("limit"), "Forge projects. One forge page."),
+    mutation("sourceControl.checkout.release", "Releases a checkout read session."),
+    proxy("sourceControl.checkout.repoConfig", None, "Repository config at a fixed SHA. Single object, no page."),
+    mutation("sourceControl.checkout.warm", "Warms a checkout cache."),
+    mutation("sourceControl.connect", "Starts a forge sign-in."),
+    proxy("sourceControl.getUser", None, "The signed-in forge user. Single object, no page."),
+    bounded("sourceControl.gitlab.childGit.get", "The GitLab child-git setting."),
+    mutation("sourceControl.gitlab.childGit.set", "Sets the GitLab child-git setting."),
+    mutation("sourceControl.identityProof.create", "Creates a forge identity proof."),
+    mutation("sourceControl.identityProof.delete", "Deletes a forge identity proof."),
+    mutation("sourceControl.read.capture", "Leases a review read session."),
+    mutation("sourceControl.read.captureScoped", "Leases a scoped review read session."),
+    proxy("sourceControl.read.detail", None, "One PR or MR. Single object, no page."),
+    proxy("sourceControl.read.detailScoped", None, "One scoped PR or MR. Single object, no page."),
+    proxy("sourceControl.read.discussions", Some("page.limit"), "PR or MR discussions. One forge page."),
+    proxy("sourceControl.read.list", Some("page.limit"), "Forge PRs or MRs. One forge page."),
+    mutation("sourceControl.read.release", "Releases a review read session."),
+    mutation("sourceControl.read.releaseScoped", "Releases a scoped review read session."),
+    bounded("sourceControl.read.resolveKnownRepository", "Resolves a repository against known roots."),
+    mutation("sourceControl.revoke", "Revokes a forge credential."),
+    mutation("specialist.create", "Creates a specialist."),
+    mutation("specialist.delete", "Deletes a specialist."),
+    mutation("specialist.edit", "Edits a specialist."),
+    bounded("specialist.get", "One specialist."),
+    bounded("specialist.list", "Specialist catalog."),
+    bounded("stats.getRateHistory", "Rate-limit history."),
+    bounded("stats.getUsage", "Usage counters."),
+    bounded("system.capabilities", "Daemon capability flags."),
+    bounded("system.gitCredential", "One scoped git credential for the helper."),
+    mutation("system.requestUpdate", "Requests a daemon update."),
+    mutation("system.shutdown", "Shuts the daemon down."),
+    bounded("system.startupStatus", "Startup progress."),
+    bounded("system.status", "Daemon status."),
+    mutation("task.assignAgent", "Writes task state."),
+    mutation("task.convertBlocks", "Writes task state."),
+    mutation("task.createPrerequisite", "Writes task state."),
+    bounded("task.get", "One task."),
+    bounded("task.getMyTask", "One task with metadata."),
+    mutation("task.linkAgent", "Writes task state."),
+    bounded("task.list", "Tasks of one workspace."),
+    bounded("task.listAgentLinks", "Task-agent links."),
+    mutation("task.markAsTask", "Writes task state."),
+    mutation("task.removeAgentFromAllTasks", "Writes task state."),
+    mutation("task.setRelations", "Writes task state."),
+    mutation("task.unlinkAgent", "Writes task state."),
+    mutation("task.update", "Writes task state."),
+    mutation("task.updateNoteStatus", "Writes task state."),
+    mutation("task.updateStatus", "Writes task state."),
+    mutation("terminal.create", "Spawns a terminal."),
+    bounded("terminal.getBuffer", "Scrollback replay on every terminal open or reconnect, so a normal operation, not a download. maxBytes keeps the tail, but an omitted or negative maxBytes returns the whole ring, which defaults to 512 KiB and an ACP terminal's outputByteLimit sets without a clamp. A known budget offender until maxBytes gets a default and maximum."),
+    mutation("terminal.kill", "Kills a terminal."),
+    bounded("terminal.list", "Terminals of one workspace."),
+    bounded("terminal.readOutput", "Terminal output page (maxLines, paginated)."),
+    mutation("terminal.resize", "Resizes a terminal."),
+    mutation("terminal.write", "Writes terminal input."),
+    bounded("unsloth.status", "Local model server status."),
+    mutation("unsloth.stop", "Stops the local model server."),
+    bounded("voice.getWorkspaceVocabulary", "Workspace vocabulary hints."),
+    mutation("voice.transcribe", "Transcribes audio with a model; spends tokens."),
+    mutation("workspace.archive", "Archives a workspace."),
+    mutation("workspace.cancelDelete", "Cancels a workspace deletion."),
+    mutation("workspace.cleanup", "Cleans up workspace files."),
+    mutation("workspace.create", "Creates a workspace."),
+    mutation("workspace.delete", "Deletes a workspace."),
+    bounded("workspace.detectProjectType", "Detected project type."),
+    bounded("workspace.diskUsage", "Workspace disk usage."),
+    mutation("workspace.dismissAttention", "Clears an attention flag."),
+    mutation("workspace.duplicate", "Duplicates a workspace."),
+    mutation("workspace.export.abort", "Aborts an export."),
+    mutation("workspace.export.finalize", "Finalizes an export."),
+    bulk("workspace.export.read", None, IMPORT_MAX_CHUNK_BYTES, "One export chunk; seq only selects which chunk. The server cuts chunks at the fixed transfer chunk cap before base64, and no request param changes it."),
+    mutation("workspace.export.start", "Starts an export."),
+    bounded("workspace.findByPullRequest", "Workspaces for one PR."),
+    bounded("workspace.findRepositories", "Repositories under a path."),
+    bounded("workspace.generateSetupScript", "Template setup script draft; not persisted."),
+    bounded("workspace.get", "One workspace."),
+    bounded("workspace.getAutoCommit", "Auto-commit setting."),
+    bounded("workspace.getBrowserClient", "Pinned browser client."),
+    bounded("workspace.getContext", "Workspace context."),
+    bounded("workspace.getSetupScript", "Saved setup script."),
+    bounded("workspace.getTokenUsage", "Workspace token usage."),
+    bounded("workspace.getUiContext", "Workspace UI context."),
+    mutation("workspace.import.abort", "Aborts an import."),
+    mutation("workspace.import.begin", "Starts an import."),
+    mutation("workspace.import.chunk", "Uploads one import chunk."),
+    mutation("workspace.import.commit", "Completes an import."),
+    mutation("workspace.initializeRepository", "Initializes a repository."),
+    mutation("workspace.invite.create", "Creates a workspace invite."),
+    bounded("workspace.invite.list", "Workspace invites."),
+    mutation("workspace.invite.revoke", "Revokes a workspace invite."),
+    bounded("workspace.list", "Workspaces."),
+    bounded("workspace.localChanges", "Local change summary."),
+    mutation("workspace.markSeen", "Marks a workspace seen."),
+    mutation("workspace.members.add", "Adds a member."),
+    mutation("workspace.members.leave", "Leaves a workspace."),
+    bounded("workspace.members.list", "Workspace members."),
+    mutation("workspace.members.remove", "Removes a member."),
+    mutation("workspace.members.setRole", "Sets a member role."),
+    bounded("workspace.repositoryContext", "Repository context of one workspace."),
+    mutation("workspace.repositoryContext.capture", "Leases a repository-context session."),
+    mutation("workspace.repositoryContext.release", "Releases a repository-context session."),
+    mutation("workspace.repositorySelection.capture", "Leases a repository-selection session."),
+    mutation("workspace.repositorySelection.reconcile", "Reconciles the repository selection."),
+    mutation("workspace.repositorySelection.release", "Releases a repository-selection session."),
+    mutation("workspace.repositorySelection.reset", "Resets the repository selection."),
+    mutation("workspace.repositorySelection.save", "Saves the repository selection."),
+    mutation("workspace.restore", "Restores a workspace."),
+    mutation("workspace.retire", "Retires a workspace."),
+    mutation("workspace.saveSetupScript", "Saves the setup script."),
+    mutation("workspace.setAutoCommit", "Sets auto-commit."),
+    mutation("workspace.setBrowserClient", "Pins the browser client."),
+    bounded("workspace.transfer.plan", "Transfer plan preview."),
+    mutation("workspace.unarchive", "Unarchives a workspace."),
+    mutation("workspace.update", "Updates a workspace."),
+    mutation("workspace.updateContext", "Updates workspace context."),
+    mutation("workspace.updateUiContext", "Updates UI context."),
+];
+
+/// Every subscription method whose subscribe sends a seq-0 snapshot (the
+/// initial state, `subscription.push { kind: "snapshot", seq: 0 }`), with
+/// what that snapshot holds. The payload sweep subscribes to each on the
+/// large fixture. A golden in `catalog/tests.rs` fails when a `*.subscribe`
+/// method is neither listed here nor named as snapshot-free.
+pub const SNAPSHOT_CHANNELS: &[(&str, &str)] = &[
+    (
+        "agent.subscribe",
+        "Collection channel (no eventTypes): agent rows of one workspace.",
+    ),
+    (
+        "agent.workers.subscribe",
+        "Background workers of one agent.",
+    ),
+    (
+        "chat.subscribe",
+        "Newest conversation page of one agent (default 20 messages, at most 200).",
+    ),
+    ("comment.subscribe", "Comment threads of one note."),
+    ("note.presence.subscribe", "Current viewers of one note."),
+    (
+        "note.subscribe",
+        "Note rows of one workspace (full or slim projection).",
+    ),
+    (
+        "presence.focus.subscribe",
+        "Focus presence of one workspace.",
+    ),
+    ("task.subscribe", "Task rows of one workspace."),
+    (
+        "workspace.subscribe",
+        "Workspace rows visible to the caller.",
+    ),
+];

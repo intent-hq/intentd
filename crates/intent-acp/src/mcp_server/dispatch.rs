@@ -16,6 +16,8 @@ use intent_core::{
 use intent_js::{eval as js_eval, eval_guarded, BoxFuture, EvalOptions, HostFn, JsError};
 use serde_json::{json, Value};
 
+use super::call_ledger::CallLedger;
+
 /// Per-invocation collector of turn attachments stamped at binding call time
 /// (monorepo#2637): every `host({...})` frame whose result carries
 /// `__mcpContentItems` contributes its resource items here, so registration
@@ -168,11 +170,10 @@ impl WorkspaceMcpServer {
         // Binding-time attachment collection (monorepo#2637): only when both
         // the registry and a caller agent are wired — otherwise host-time
         // stamping would mint nonces that never register.
-        let pending: Option<PendingAttachments> =
-            match (&self.turn_attachments, &self.caller_agent_id) {
-                (Some(_), Some(_)) => Some(Arc::new(Mutex::new(PendingAttachmentState::default()))),
-                _ => None,
-            };
+        let pending: Option<PendingAttachments> = self
+            .publishes_attachments()
+            .then(|| Arc::new(Mutex::new(PendingAttachmentState::default())));
+        let ledger = CallLedger::default();
         let host = make_workspace_host_with_pending(
             self.api.clone(),
             self.workspace_id.clone(),
@@ -182,6 +183,8 @@ impl WorkspaceMcpServer {
             self.is_sub_agent,
             self.workspace_api_timeout,
             pending.clone(),
+            self.frame_router.clone(),
+            Some(ledger.clone()),
         );
         // Wrap user code so the engine sees a small `{__k, __v}` envelope,
         // preserving the `undefined` vs `null` distinction that
@@ -364,7 +367,9 @@ impl WorkspaceMcpServer {
                 {
                     return refusal_tool_result();
                 }
-                workspace_api_error(&format_js_error(&e))
+                // intent-hq/intent#8592: the rejection discards every
+                // earlier call's result, so report what those calls did.
+                workspace_api_error(&ledger.annotate(&format_js_error(&e), output.is_none()))
             }
         };
         let total = started.elapsed();
@@ -575,18 +580,48 @@ impl WorkspaceMcpServer {
         pending_batch: Vec<TurnAttachment>,
         output: Option<&SealedPrivateOutput>,
     ) -> Result<Vec<Value>, ()> {
-        let (Some(registry), Some(agent_id)) = (&self.turn_attachments, &self.caller_agent_id)
-        else {
+        if !self.publishes_attachments() {
             return Ok(items.to_vec());
-        };
+        }
         let known: HashSet<String> = pending_batch.iter().map(|a| a.id.clone()).collect();
         let mut out = items.to_vec();
         let new_entries = stamp_and_collect(&mut out, &known);
         let mut batch = pending_batch;
         batch.extend(new_entries);
-        let batch = prepare_attachment_publication(batch, output).await?;
-        registry.register_all(agent_id, batch);
+        self.publish_attachments(batch, output).await?;
         Ok(out)
+    }
+
+    /// Whether this bridge publishes a call's cards: to the daemon-wide
+    /// registry for its caller agent, or (a remote agent's node, which has
+    /// no registry) through its frame router to head.
+    fn publishes_attachments(&self) -> bool {
+        self.caller_agent_id.is_some()
+            && (self.turn_attachments.is_some()
+                || self
+                    .frame_router
+                    .as_ref()
+                    .is_some_and(|router| router.publishes_attachments()))
+    }
+
+    /// Publish one call's cards as one batch, before the call answers.
+    async fn publish_attachments(
+        &self,
+        batch: Vec<TurnAttachment>,
+        output: Option<&SealedPrivateOutput>,
+    ) -> Result<(), ()> {
+        let Some(agent_id) = &self.caller_agent_id else {
+            return Ok(());
+        };
+        let batch = prepare_attachment_publication(batch, output).await?;
+        if let Some(registry) = &self.turn_attachments {
+            registry.register_all(agent_id, batch);
+        } else if let Some(router) = &self.frame_router {
+            if !batch.is_empty() && router.publishes_attachments() {
+                router.publish_attachments(batch).await;
+            }
+        }
+        Ok(())
     }
 
     /// Register the binding-time attachment batch on the result paths that do
@@ -598,11 +633,10 @@ impl WorkspaceMcpServer {
         pending_batch: Vec<TurnAttachment>,
         output: Option<&SealedPrivateOutput>,
     ) -> Result<(), ()> {
-        if let (Some(registry), Some(agent_id)) = (&self.turn_attachments, &self.caller_agent_id) {
-            let pending_batch = prepare_attachment_publication(pending_batch, output).await?;
-            registry.register_all(agent_id, pending_batch);
+        if !self.publishes_attachments() {
+            return Ok(());
         }
-        Ok(())
+        self.publish_attachments(pending_batch, output).await
     }
 }
 
@@ -812,10 +846,19 @@ fn stamp_and_collect(items: &mut [Value], known: &HashSet<String>) -> Vec<TurnAt
 /// runner's per-run timeout); bindings that bound a wait by the eval budget
 /// (`ws.script.run`) derive their ceiling from it, so every caller must pass
 /// its real budget.
+///
+/// `owner` is required: every frame runs with `Caller::Agent { owner }`
+/// bound, whatever scope the eval itself runs in. A hook run is daemon work
+/// (`Caller::Daemon`), but its `ws.*` calls act for the hook's owner, so
+/// every agent-only service check (the last-top-level retire guard,
+/// self-queue redaction, repository admission, …) holds from a hook exactly
+/// as it does in the owner's own turn — no per-method allowlist to keep in
+/// sync. Hook-only exceptions are capability removals in the runner's
+/// feature set, never a different identity.
 pub fn make_workspace_host_for_bridge(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
-    caller_agent_id: Option<AgentId>,
+    owner: AgentId,
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
     agent_features: AgentFeaturesSettings,
     is_sub_agent: bool,
@@ -824,11 +867,13 @@ pub fn make_workspace_host_for_bridge(
     make_workspace_host_with_pending(
         api,
         workspace_id,
-        caller_agent_id,
+        Some(owner),
         turn_attachments,
         agent_features,
         is_sub_agent,
         eval_budget,
+        None,
+        None,
         None,
     )
 }
@@ -853,6 +898,8 @@ fn make_workspace_host_with_pending(
     is_sub_agent: bool,
     eval_budget: Duration,
     pending: Option<PendingAttachments>,
+    router: Option<Arc<dyn super::HostFrameRouter>>,
+    ledger: Option<CallLedger>,
 ) -> HostFn {
     let features = Arc::new(agent_features);
     let eval_budget = super::bindings::EvalBudget::starting_now(eval_budget);
@@ -863,6 +910,10 @@ fn make_workspace_host_with_pending(
         let registry = turn_attachments.clone();
         let features = features.clone();
         let pending = pending.clone();
+        let router = router.clone();
+        let caller_scope = caller_agent_id
+            .clone()
+            .map(|agent_id| intent_core::Caller::Agent { agent_id });
         // Take the frame's sequence number NOW — synchronously, while the JS
         // engine is invoking `host()` — so parallel calls
         // (`Promise.all([...])`) keep call order even when an earlier call's
@@ -873,18 +924,37 @@ fn make_workspace_host_with_pending(
             state.next_seq += 1;
             seq
         });
-        Box::pin(async move {
-            let result = workspace_host_dispatch(
-                api,
-                workspace_id,
-                caller,
-                registry,
-                &features,
-                is_sub_agent,
-                eval_budget,
-                arg,
-            )
-            .await;
+        // Recorded when the frame first runs, like `seq`; a frame never run
+        // before the script ends never ran its call either.
+        let slot = ledger.as_ref().map(|ledger| {
+            let method = arg.get("method").and_then(Value::as_str).unwrap_or("?");
+            (ledger.clone(), ledger.start(method))
+        });
+        let frame = async move {
+            let claimed = router.as_ref().and_then(|router| {
+                let method = arg.get("method").and_then(Value::as_str)?;
+                let args = arg.get("args").cloned().unwrap_or(Value::Null);
+                router.route(method, &args)
+            });
+            let result = match claimed {
+                Some(claimed) => claimed.await,
+                None => {
+                    workspace_host_dispatch(
+                        api,
+                        workspace_id,
+                        caller,
+                        registry,
+                        &features,
+                        is_sub_agent,
+                        eval_budget,
+                        arg,
+                    )
+                    .await
+                }
+            };
+            if let Some((ledger, slot)) = &slot {
+                ledger.finish(*slot, &result);
+            }
             match (result, &pending, seq) {
                 (Ok(mut value), Some(pending), Some(seq)) => {
                     collect_binding_attachments(&mut value, pending, seq);
@@ -892,7 +962,18 @@ fn make_workspace_host_with_pending(
                 }
                 (result, ..) => result,
             }
-        }) as BoxFuture<'static, std::result::Result<Value, String>>
+        };
+        // Bind the frame's agent as its caller (multiplayer w1) around the
+        // whole frame, routed or dispatched, so the identity a service sees
+        // is the host's agent no matter which scope invoked `host()`: the
+        // `workspace_api` turn already runs as that agent, and a hook run
+        // (`Caller::Daemon`) or remote-node call must not lend the frame a
+        // different identity. Work a binding spawns inherits it.
+        let frame: BoxFuture<'static, std::result::Result<Value, String>> = match caller_scope {
+            Some(caller) => Box::pin(intent_core::with_caller(caller, frame)),
+            None => Box::pin(frame),
+        };
+        frame
     })
 }
 
@@ -925,6 +1006,13 @@ pub(super) const SUB_AGENT_QUESTION_DENIED: &str =
      unsure how to proceed without a user/coordinator decision. Check available context \
      and use your judgment for routine choices first; report completed or progressing \
      work with ws.agent.reportToParent";
+
+/// The dispatch-layer denial for a sub-agent's `secret.*` frame (PROTOCOL
+/// §5.56): secrets belong to the top-level agent that asked the user.
+pub(super) const SUB_AGENT_SECRET_DENIED: &str =
+    "ws.secret is only available to top-level agents — a sub-agent cannot ask the user for \
+     secrets or use another agent's secrets. Report the need to your parent with \
+     ws.agent.reportToParent so it can request the secret and run the command itself";
 
 /// The dispatch-layer denial for a sub-agent's sibling-workspace proposal.
 pub(super) const SUB_AGENT_PROPOSE_SIBLING_DENIED: &str =
@@ -967,6 +1055,9 @@ async fn workspace_host_dispatch(
     // a misleading "disabled in settings").
     if is_sub_agent && method.starts_with("app.question.") {
         return Err(format!("host: {SUB_AGENT_QUESTION_DENIED}"));
+    }
+    if is_sub_agent && method.starts_with("secret.") {
+        return Err(format!("host: {SUB_AGENT_SECRET_DENIED}"));
     }
     if is_sub_agent && method == "workspace.proposeSibling" {
         return Err(format!("host: {SUB_AGENT_PROPOSE_SIBLING_DENIED}"));
@@ -1186,3 +1277,7 @@ mod timeout_override_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dispatch_owner_scope_tests.rs"]
+mod owner_scope_tests;

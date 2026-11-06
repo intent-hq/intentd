@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Narrow retry wrapper for cargo invocations on the tinybox runners
+# Narrow retry wrapper for cargo invocations on self-hosted runners
 # (intent-hq/intent#5256). Merge-queue run 35200715354 failed `check` in 6 s
 # because rust-lld could not open object files rustc had just written under
 # the job's own CARGO_TARGET_DIR:

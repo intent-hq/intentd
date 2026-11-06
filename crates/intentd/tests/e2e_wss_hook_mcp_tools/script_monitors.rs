@@ -419,7 +419,7 @@ async fn monitor_worker_receipt_lifecycle(scenario: &str) {
         } else {
             "pending"
         };
-        sqlx::query(&format!("CREATE TRIGGER fail_acceptance BEFORE UPDATE OF phase ON agent_queue_admission WHEN old.phase='{old_phase}' AND new.phase='accepted' BEGIN INSERT INTO acceptance_attempts VALUES(old.turn_id); SELECT RAISE(FAIL,'injected acceptance failure'); END"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TRIGGER fail_acceptance BEFORE UPDATE OF phase ON agent_queue_admission WHEN old.phase='{old_phase}' AND new.phase='accepted' BEGIN INSERT INTO acceptance_attempts VALUES(old.turn_id); SELECT RAISE(FAIL,'injected acceptance failure'); END")))
             .execute(store.write_pool()).await.unwrap();
     }
     let mut row: ScriptMonitor = serde_json::from_value(json!({"monitorId":"worker-receipt","workspaceId":ws_id,"agentId":agent_id,"scriptId":"fixture","runId":"fixture-run","scriptName":"Fixture","mode":"command","state":"active","createdAt":now_iso(),"expiresAt":"2099-01-01T00:00:00Z"})).unwrap();

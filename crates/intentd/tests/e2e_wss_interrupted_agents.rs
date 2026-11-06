@@ -13,9 +13,8 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -43,7 +42,7 @@ fn temp_data_dir() -> tempfile::TempDir {
 async fn await_uds(socket: &Path) -> bool {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if UnixStream::connect(socket).await.is_ok() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -261,9 +260,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -288,7 +290,8 @@ async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
             Some(d) if !d.is_zero() => d,
@@ -324,9 +327,6 @@ async fn interrupted_agents_persisted_across_restart() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    // Pin resumeInterruptedOnStart=off: this suite asserts pending rows
-    // survive a restart, but the `auto` default resumes on headless hosts.
-    common::disable_resume_on_start(&data_dir);
     let mut cmd1 = common::hermetic_serve_command(&data_dir);
     cmd1.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
@@ -335,10 +335,7 @@ async fn interrupted_agents_persisted_across_restart() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    // Spawn in its own process group to prevent ACP mock process leaks
-    #[cfg(unix)]
-    cmd1.process_group(0);
-    let child1 = cmd1.spawn().expect("spawn intentd serve");
+    let child1 = common::spawn_guarded(&mut cmd1).expect("spawn intentd serve");
     let mut guard1 = DaemonGuard::new(child1, data_dir.clone(), false);
     if !await_uds(&socket).await {
         let log_path = data_dir.join("daemon.log");
@@ -409,6 +406,7 @@ async fn interrupted_agents_persisted_across_restart() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         };
         store
             .insert_agent_session(&session)
@@ -417,8 +415,7 @@ async fn interrupted_agents_persisted_across_restart() {
     }
 
     // Kill daemon to simulate restart.
-    guard1.child_mut().kill().expect("kill daemon");
-    guard1.child_mut().wait().expect("wait daemon");
+    guard1.kill_tree().expect("kill daemon");
     drop(guard1);
 
     // Phase 2: Restart daemon — heal sweep should insert interrupted_agent row.
@@ -433,9 +430,7 @@ async fn interrupted_agents_persisted_across_restart() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    #[cfg(unix)]
-    cmd2.process_group(0);
-    let child2 = cmd2.spawn().expect("spawn intentd serve 2");
+    let child2 = common::spawn_guarded(&mut cmd2).expect("spawn intentd serve 2");
     let mut guard2 = DaemonGuard::new(child2, data_dir.clone(), false);
     assert!(await_uds(&socket).await, "daemon did not restart");
 
@@ -470,8 +465,7 @@ async fn interrupted_agents_persisted_across_restart() {
     assert!(interrupted["interruptedAt"].is_string());
 
     // Phase 4: Restart again — idempotent insert should not duplicate.
-    guard2.child_mut().kill().expect("kill daemon 2");
-    guard2.child_mut().wait().expect("wait daemon 2");
+    guard2.kill_tree().expect("kill daemon 2");
     drop(guard2);
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
@@ -484,9 +478,7 @@ async fn interrupted_agents_persisted_across_restart() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    #[cfg(unix)]
-    cmd3.process_group(0);
-    let child3 = cmd3.spawn().expect("spawn intentd serve 3");
+    let child3 = common::spawn_guarded(&mut cmd3).expect("spawn intentd serve 3");
     let _guard3 = DaemonGuard::process_only(child3);
     assert!(await_uds(&socket).await, "daemon did not restart 2");
 
@@ -566,8 +558,11 @@ async fn assert_blocked_exec_stream_shutdown(eof: bool) {
         .env("INTENTD_TEST_EXEC_STREAM_WRITE_PENDING", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()));
-    command.process_group(0);
-    let mut daemon = DaemonGuard::new(command.spawn().unwrap(), data.to_path_buf(), false);
+    let mut daemon = DaemonGuard::new(
+        common::spawn_guarded(&mut command).unwrap(),
+        data.to_path_buf(),
+        false,
+    );
     assert!(await_uds(&socket).await);
     let status = common::await_wss_status(&socket).await;
     let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
@@ -587,17 +582,20 @@ async fn assert_blocked_exec_stream_shutdown(eof: bool) {
     )
     .await;
     let id = stream["requestId"].as_str().unwrap();
-    let pid: i32 = timeout(Duration::from_secs(5), async {
-        loop {
-            if let Ok(text) = std::fs::read_to_string(&pid_path) {
-                if let Ok(pid) = text.trim().parse() {
-                    break pid;
+    let pid: i32 = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&pid_path) {
+                    if let Ok(pid) = text.trim().parse() {
+                        break pid;
+                    }
                 }
+                // timing-guard: wait for this child's observable PID publication.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            // timing-guard: wait for this child's observable PID publication.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     let _stream_cleanup = StreamCleanup(pid);
@@ -613,22 +611,25 @@ async fn assert_blocked_exec_stream_shutdown(eof: bool) {
     ))
     .await
     .unwrap();
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if let Message::Text(text) = rpc.next().await.unwrap().unwrap() {
-                let frame: Value = serde_json::from_str(&text).unwrap();
-                if frame["id"] == 100 {
-                    assert_eq!(frame["jsonrpc"], "2.0");
-                    assert_eq!(frame["error"]["code"], -32602);
-                    assert!(frame["error"]["message"]
-                        .as_str()
-                        .unwrap()
-                        .contains("already active"));
-                    break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if let Message::Text(text) = rpc.next().await.unwrap().unwrap() {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    if frame["id"] == 100 {
+                        assert_eq!(frame["jsonrpc"], "2.0");
+                        assert_eq!(frame["error"]["code"], -32602);
+                        assert!(frame["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("already active"));
+                        break;
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     for request in 2..50 {
@@ -656,34 +657,40 @@ async fn assert_blocked_exec_stream_shutdown(eof: bool) {
     } else {
         "host.execStream stdin send pending"
     };
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if std::fs::read_to_string(&log_path)
-                .unwrap()
-                .contains(pending_message)
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if std::fs::read_to_string(&log_path)
+                    .unwrap()
+                    .contains(pending_message)
+                {
+                    break;
+                }
+                // timing-guard: await the actual bounded stdin send returning Pending in the admitted RPC.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            // timing-guard: await the actual bounded stdin send returning Pending in the admitted RPC.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(
         uds_rpc(&socket, 60, "system.shutdown", json!({})).await["result"]["ok"],
         true
     );
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(status) = daemon.child_mut().try_wait().unwrap() {
-                assert!(status.success());
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Some(status) = daemon.child_mut().try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                // timing-guard: poll the real daemon exit after shutdown was acknowledged.
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            // timing-guard: poll the real daemon exit after shutdown was acknowledged.
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("request drain waited for stdin before cancelling its non-reading child");
     assert_eq!(
@@ -729,8 +736,11 @@ async fn cancelled_settings_hook_joins_before_main_listener_teardown() {
         .env("INTENTD_TEST_SETTINGS_WS_START_GATE", start_path)
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()));
-    command.process_group(0);
-    let mut daemon = DaemonGuard::new(command.spawn().unwrap(), data.to_path_buf(), false);
+    let mut daemon = DaemonGuard::new(
+        common::spawn_guarded(&mut command).unwrap(),
+        data.to_path_buf(),
+        false,
+    );
     let (mut response, _) = timeout(common::daemon_startup_timeout(), responses.accept())
         .await
         .unwrap()
@@ -750,37 +760,43 @@ async fn cancelled_settings_hook_joins_before_main_listener_teardown() {
         uds_rpc(&socket, 1, "system.shutdown", json!({})).await["result"]["ok"],
         true
     );
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let log = std::fs::read_to_string(&log_path).unwrap();
-            assert!(
-                !log.contains("phase=\"wss_stop\""),
-                "main stopped WSS before joining the cancelled settings owner: {log}"
-            );
-            if log.contains("phase=\"request_drain\" state=\"completed\"") {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let log = std::fs::read_to_string(&log_path).unwrap();
+                assert!(
+                    !log.contains("phase=\"wss_stop\""),
+                    "main stopped WSS before joining the cancelled settings owner: {log}"
+                );
+                if log.contains("phase=\"request_drain\" state=\"completed\"") {
+                    break;
+                }
+                assert!(daemon.child_mut().try_wait().unwrap().is_none());
+                // timing-guard: poll the observable request-drain log while the startup barrier remains held.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            assert!(daemon.child_mut().try_wait().unwrap().is_none());
-            // timing-guard: poll the observable request-drain log while the startup barrier remains held.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     // The held hook has not even captured stop_generation. It could start a
     // fresh listener after final stop if main moved its settings join later.
     assert!(daemon.child_mut().try_wait().unwrap().is_none());
     start.write_u8(1).await.unwrap();
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(status) = daemon.child_mut().try_wait().unwrap() {
-                assert!(status.success());
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Some(status) = daemon.child_mut().try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                // timing-guard: poll std::process::Child::try_wait without blocking the async test runtime.
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            // timing-guard: poll std::process::Child::try_wait without blocking the async test runtime.
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     let log = std::fs::read_to_string(&log_path).unwrap();
@@ -857,8 +873,11 @@ await import({});
         .env("INTENTD_TEST_MCP_ENABLE_CONFIG", config.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()));
-    command.process_group(0);
-    let mut daemon = DaemonGuard::new(command.spawn().unwrap(), data.to_path_buf(), false);
+    let mut daemon = DaemonGuard::new(
+        common::spawn_guarded(&mut command).unwrap(),
+        data.to_path_buf(),
+        false,
+    );
     let (mut response, _) = timeout(common::daemon_startup_timeout(), responses.accept())
         .await
         .unwrap()
@@ -869,10 +888,13 @@ await import({});
         .unwrap();
     let mut start = BufReader::new(start);
     let mut pid = String::new();
-    timeout(Duration::from_secs(5), start.read_line(&mut pid))
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        start.read_line(&mut pid),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let child_identity: Value = serde_json::from_str(pid.trim()).unwrap();
     assert_eq!(
         child_identity[1],
@@ -886,36 +908,42 @@ await import({});
         uds_rpc(&socket, 1, "system.shutdown", json!({})).await["result"]["ok"],
         true
     );
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let log = std::fs::read_to_string(&log_path).unwrap();
-            assert!(
-                !log.contains("phase=\"mcp_shutdown\""),
-                "MCP stop passed held enable: {log}"
-            );
-            if log.contains("phase=\"request_drain\" state=\"completed\"") {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let log = std::fs::read_to_string(&log_path).unwrap();
+                assert!(
+                    !log.contains("phase=\"mcp_shutdown\""),
+                    "MCP stop passed held enable: {log}"
+                );
+                if log.contains("phase=\"request_drain\" state=\"completed\"") {
+                    break;
+                }
+                assert!(daemon.child_mut().try_wait().unwrap().is_none());
+                // timing-guard: poll the observable request-drain log while the startup barrier remains held.
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            assert!(daemon.child_mut().try_wait().unwrap().is_none());
-            // timing-guard: poll the observable request-drain log while the startup barrier remains held.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     // Child exists but is not registered in the hub until initialize completes.
     assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok());
     start.get_mut().write_u8(1).await.unwrap();
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(status) = daemon.child_mut().try_wait().unwrap() {
-                assert!(status.success());
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Some(status) = daemon.child_mut().try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                // timing-guard: poll std::process::Child::try_wait without blocking the async test runtime.
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            // timing-guard: poll std::process::Child::try_wait without blocking the async test runtime.
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -984,9 +1012,6 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    // Pin resumeInterruptedOnStart=off: this suite asserts the captured row
-    // is still pending after restart, but `auto` resumes on headless hosts.
-    common::disable_resume_on_start(&data_dir);
     let mut cmd1 = common::hermetic_serve_command(&data_dir);
     cmd1.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
@@ -998,9 +1023,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    #[cfg(unix)]
-    cmd1.process_group(0);
-    let child = cmd1.spawn().expect("spawn intentd serve");
+    let child = common::spawn_guarded(&mut cmd1).expect("spawn intentd serve");
     let mut daemon = DaemonGuard::new(child, data_dir.clone(), false);
     if !await_uds(&socket).await {
         let log_path = data_dir.join("daemon.log");
@@ -1106,18 +1129,21 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     ))
     .await
     .unwrap();
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let frame = wss_event(&mut sub, 20).await;
-            let event = &frame["params"]["event"];
-            if event["type"] == "script:state"
-                && event["data"]["scriptId"] == script_id
-                && event["data"]["status"] == "running"
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            loop {
+                let frame = wss_event(&mut sub, 20).await;
+                let event = &frame["params"]["event"];
+                if event["type"] == "script:state"
+                    && event["data"]["scriptId"] == script_id
+                    && event["data"]["status"] == "running"
+                {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("script.run must be admitted and running before shutdown");
 
@@ -1143,17 +1169,20 @@ async fn graceful_shutdown_captures_interrupted_agents() {
 
     // Wait for daemon to exit gracefully (up to 10 seconds).
     // daemon.child_mut().wait() is blocking, so we poll for process death.
-    let exit_ok = timeout(Duration::from_secs(10), async {
-        loop {
-            match daemon.child_mut().try_wait() {
-                Ok(Some(status)) => return status.success(),
-                Ok(None) => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+    let exit_ok = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match daemon.child_mut().try_wait() {
+                    Ok(Some(status)) => return status.success(),
+                    Ok(None) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(e) => panic!("failed to wait for daemon: {e}"),
                 }
-                Err(e) => panic!("failed to wait for daemon: {e}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("daemon did not exit within timeout");
     // Graceful shutdown should exit 0.
@@ -1228,9 +1257,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon2.log")).unwrap(),
         ));
-    #[cfg(unix)]
-    cmd2.process_group(0);
-    let child2 = cmd2.spawn().expect("spawn intentd serve 2");
+    let child2 = common::spawn_guarded(&mut cmd2).expect("spawn intentd serve 2");
     let _daemon2 = DaemonGuard::process_only(child2);
     assert!(await_uds(&socket).await, "daemon did not restart");
 
@@ -1296,54 +1323,14 @@ async fn graceful_shutdown_captures_interrupted_agents() {
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
         title: "WSS-INTERRUPTED".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }

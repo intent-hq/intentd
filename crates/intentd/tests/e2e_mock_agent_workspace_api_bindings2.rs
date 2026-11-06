@@ -8,16 +8,13 @@
 //! This file covers: **note**, **file**, **git**, **agent**, and **event** bindings.
 //! See `e2e_mock_agent_workspace_api_bindings.rs` for task and comment.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use intent_acp::{EventSink, SpawnOptions};
-use intent_core::{
-    now_iso, AgentId, NoteCreate, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
-};
+use intent_core::{now_iso, AgentId, NoteCreate, Workspace, WorkspaceApi, WorkspaceId};
 use intent_providers::ProviderConfig;
 use intent_services::{AgentManager, BusEventSink, EventBus, Services};
 use intent_store::Store;
@@ -28,49 +25,11 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         id: id.clone(),
         title: "E2E Bindings 2".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
         path: path.as_ref().map(|p| p.to_string_lossy().to_string()),
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
         worktree_path: path.map(|p| p.to_string_lossy().to_string()),
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -105,7 +64,7 @@ async fn event_bindings_query_and_subscribe() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
@@ -218,7 +177,7 @@ async fn file_bindings_read_write_list() {
     let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.clone())
         .with_settings_registry(common::registry_with_default_provider(&ws_root))
         .with_event_bus(bus.clone());
@@ -380,7 +339,7 @@ async fn agent_bindings_list_and_status() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
@@ -478,7 +437,10 @@ async fn agent_bindings_list_and_status() {
     );
 
     // Verify agent exists
-    let session = store.get_agent_session(&agent_id).await.expect("session");
+    let session = store
+        .get_agent_session_with_transcript(&agent_id)
+        .await
+        .expect("session");
     assert_eq!(session.id, agent_id);
 
     manager.shutdown().await;
@@ -505,7 +467,7 @@ async fn agent_bindings_list_specialists() {
     let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.clone())
         .with_settings_registry(common::registry_with_default_provider(&ws_root))
         .with_event_bus(bus.clone());
@@ -626,7 +588,7 @@ async fn agent_bindings_list_specialists() {
         }
     }
     assert!(
-        rows.iter().any(|r| r["id"] == "implementor"),
+        rows.iter().any(|r| r["id"] == "developer"),
         "bundled tier listed"
     );
     let pinned = rows
@@ -658,7 +620,7 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
@@ -960,7 +922,7 @@ async fn agent_bindings_send_single_pending_message_guard() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
@@ -1398,7 +1360,7 @@ async fn git_bindings_commit() {
     let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(repo_dir.clone())
         .with_settings_registry(common::registry_with_default_provider(&repo_dir))
         .with_event_bus(bus.clone());
@@ -1545,7 +1507,7 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
     let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(repo_dir.clone())
         .with_settings_registry(common::registry_with_default_provider(&repo_dir))
         .with_event_bus(bus.clone());
@@ -1693,7 +1655,7 @@ async fn note_bindings_edit_and_cross_workspace_reads() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
@@ -1707,11 +1669,13 @@ async fn note_bindings_edit_and_cross_workspace_reads() {
     let mut sibling = workspace(&sibling_id, None);
     sibling.repository_owner = caller.repository_owner.clone();
     sibling.repository_name = caller.repository_name.clone();
+    sibling.pr_url = Some("https://github.com/intent-hq/binding-fixture/pull/42".into());
     store.insert_workspace(&sibling).await.unwrap();
     let other_id = WorkspaceId::new();
     let mut other = workspace(&other_id, None);
     other.repository_owner = caller.repository_owner.clone();
     other.repository_name = Some("unrelated-repo".into());
+    other.pr_url = Some("https://github.com/intent-hq/unrelated-repo/pull/42".into());
     store.insert_workspace(&other).await.unwrap();
     let sibling_note = services
         .create_note(
@@ -1785,6 +1749,17 @@ async fn note_bindings_edit_and_cross_workspace_reads() {
         try {{ await ws.crossWorkspace.readNote('{other_id}', '{sibling_note_id}'); }}
         catch (e) {{ denied = String(e).includes('same repository'); }}
         if (!denied) throw new Error('foreign workspace read was not denied');
+        const byText = await ws.crossWorkspace.search('sibling content');
+        if (byText.matches.length !== 1 || byText.matches[0].id !== '{sibling_id}'
+            || byText.matches[0].notes[0].noteId !== '{sibling_note_id}'
+            || !byText.matches[0].markdownLink) throw new Error('wrong text search: ' + JSON.stringify(byText));
+        const byPr = await ws.crossWorkspace.search({{ pr: '#42' }});
+        if (byPr.matches.length !== 1 || byPr.matches[0].id !== '{sibling_id}'
+            || byPr.matches[0].pullRequests[0].number !== 42) throw new Error('wrong PR search: ' + JSON.stringify(byPr));
+        let rejected = false;
+        try {{ await ws.crossWorkspace.search({{}}); }}
+        catch (e) {{ rejected = String(e).includes('non-empty query'); }}
+        if (!rejected) throw new Error('empty search was not rejected');
         await ws.note.add('{note_id}', {{ content: 'cross-workspace checks passed' }});
         return {{ content: updated.content }};
         ",

@@ -22,6 +22,21 @@ pub(crate) struct Fixture {
 
 impl Fixture {
     pub async fn new() -> Self {
+        Self::new_with(|_| {}).await
+    }
+
+    /// A workspace inserted with repository metadata, as GitHub workspaces are
+    /// created. Metadata is not a saved choice, so the primary selection is
+    /// never-saved and reads as Automatic (intent-hq/intent#7449).
+    pub async fn with_repository_metadata(owner: &str, name: &str) -> Self {
+        Self::new_with(|workspace| {
+            workspace.repository_owner = Some(owner.into());
+            workspace.repository_name = Some(name.into());
+        })
+        .await
+    }
+
+    async fn new_with(configure: impl FnOnce(&mut Workspace)) -> Self {
         let dir = crate::test_support::test_tempdir("repository-admission-sources-");
         let path = dir.path().join("repo");
         init(&path);
@@ -31,6 +46,7 @@ impl Fixture {
         workspace.branch = "main".into();
         workspace.repository_path = Some(path.to_str().unwrap().into());
         workspace.path = Some(dir.path().join("metadata").to_str().unwrap().into());
+        configure(&mut workspace);
         store.insert_workspace(&workspace).await.unwrap();
         std::fs::write(dir.path().join("global"), "").unwrap();
         std::fs::write(dir.path().join("system"), "").unwrap();
@@ -40,6 +56,22 @@ impl Fixture {
             path,
             workspace,
         }
+    }
+
+    /// Retained historical intent that was never proved (the shape 0146 gave
+    /// pre-existing workspaces), seeded directly: no trigger produces it.
+    pub async fn seed_unresolved_history(store: &Store, workspace: &WorkspaceId) {
+        let changed = sqlx::query(
+            "UPDATE repository_selection_state SET selection_revision=selection_revision+1, \
+             choice_incarnation=root_incarnation, choice_mode='unresolved', remote_name=NULL, \
+             historical_source='workspace-metadata', historical_record_id=workspace_id \
+             WHERE workspace_id=? AND root_kind='primary' AND root_id=''",
+        )
+        .bind(workspace.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(changed.rows_affected(), 1);
     }
 
     pub fn root(&self) -> RepositoryRootId {
@@ -87,7 +119,13 @@ impl Fixture {
             .env_remove("GIT_COMMON_DIR")
             .output()
             .unwrap();
-        assert!(output.status.success(), "fixture Git failed");
+        assert!(
+            output.status.success(),
+            "fixture Git {:?} failed ({}): {}",
+            args.first(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8(output.stdout).unwrap()
     }
 }

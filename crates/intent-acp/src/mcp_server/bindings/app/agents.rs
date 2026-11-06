@@ -37,7 +37,7 @@ const DEFAULT_READ_LIMIT: i64 = 20;
 const MAX_READ_LIMIT: i64 = 100;
 /// Hard cap on `nextToken` continuations a single `readConversation` call
 /// follows when the slim page byte budget (§5.5) trims pages below their
-/// message limit. 100 messages at worst-case one message per 512 KiB page.
+/// message limit. 100 messages at worst-case one message per budgeted page.
 const READ_PAGE_WALK_CAP: usize = 100;
 
 /// Every `ws.app.agents.*` result passes through
@@ -158,7 +158,10 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
         vec![ws]
     } else {
         // All non-chief workspaces
-        let all = api.list_workspaces(true).await.map_err(map_err)?;
+        let all = api
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .map_err(map_err)?;
         all.into_iter()
             .filter(|ws| {
                 !ws.id.is_chief() && format!("{:?}", ws.status).to_lowercase() != "deleted"
@@ -291,7 +294,7 @@ pub(super) async fn read_conversation_for_agent(
     // The conversation is read under the slim projection (§5.5): bounded
     // tool/image block bodies, like every other consumer since v8.0. The
     // slim service read is also BYTE-BUDGETED — one page can carry fewer
-    // messages than its `limit` (512 KiB page budget) — and its
+    // messages than its `limit` (480,000-byte page budget) — and its
     // `totalMessages` is transcript-wide, not page-length. So: take the
     // total from the service, resolve the requested window against it
     // (turn indices are transcript positions), and follow the re-minted
@@ -484,9 +487,15 @@ async fn get_message_block(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
     api.agent_get(agent_id.clone(), Some(workspace_id.clone()))
         .await
         .map_err(map_err)?;
-    api.agent_get_message_block(agent_id, message_id, block_id, Some(workspace_id))
-        .await
-        .map_err(map_err)
+    api.agent_get_message_block(
+        agent_id,
+        message_id,
+        block_id,
+        Some(workspace_id),
+        intent_core::MessageBlockPage::default(),
+    )
+    .await
+    .map_err(map_err)
 }
 
 /// `ws.app.agents.waitFor({ agentIds, waitMode? })`: register completion
@@ -591,10 +600,7 @@ fn has_returned_content(message: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intent_core::{
-        AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, Result, Workspace,
-        WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-    };
+    use intent_core::{AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, Result, Workspace};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -616,7 +622,7 @@ mod tests {
     impl WorkspaceApi for FakeApi {
         fn list_workspaces(
             &self,
-            _include_archived: bool,
+            _filter: intent_core::WorkspaceListFilter,
         ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
             let workspaces = self.workspaces.lock().unwrap().clone();
             Box::pin(async move { Ok(workspaces) })
@@ -779,56 +785,27 @@ mod tests {
             id: WorkspaceId::from_string(id),
             title: title.to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
     }
 
     fn make_agent(id: &str, name: &str, status: AgentStatus, ws_id: &WorkspaceId) -> AgentLite {
         AgentLite {
+            digest_truncated: false,
+            last_agent_response_truncated: false,
+            last_user_message_truncated: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
+            node_id: None,
+            lease_id: None,
+            node_name: None,
+            placement: None,
+            effective_isolation: None,
+            placement_error: None,
+            submodules: None,
+            setup: None,
             id: AgentId::from_string(id),
             workspace_id: ws_id.clone(),
             parent_agent_id: None,
@@ -871,9 +848,14 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            using_earlier_profile_settings: false,
+            provider_replacement_required: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             metadata: AgentMetadata {
+                attention_request_reason_truncated: false,
+                completion_report_truncated: false,
                 is_background: false,
                 specialist: None,
                 created_by_agent_id: None,
@@ -891,6 +873,7 @@ mod tests {
                 pending_questions_message_id: None,
                 pending_proposals: Vec::new(),
                 proposal_resolutions: serde_json::Map::new(),
+                proposal_created_workspaces: serde_json::Map::new(),
                 last_seen_message_id: None,
                 is_initial_agent: None,
                 sponsor_agent_id: None,

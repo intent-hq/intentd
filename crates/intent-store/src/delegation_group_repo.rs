@@ -143,7 +143,7 @@ impl Store {
             .filter_map(|row| match row.try_get::<String, _>("workspace_id") {
                 Ok(ws_id) => Some(WorkspaceId::from(ws_id.as_str())),
                 Err(e) => {
-                    eprintln!("WARN: Skipping delegation_group row with decode error: {e}");
+                    tracing::warn!(error = %e, "Skipping delegation_group row with decode error");
                     None
                 }
             })

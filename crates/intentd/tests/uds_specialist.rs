@@ -7,7 +7,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,10 +56,13 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     let mut line = String::new();
     // 15s (not 2s): the `resolvedModel` preview's ownership guard can capture
     // the login-shell PATH on first use (one-time per process, 5s cap).
-    let n = timeout(Duration::from_secs(15), reader.read_line(&mut line))
-        .await
-        .expect("timed out waiting for a frame")
-        .expect("read failed");
+    let n = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("timed out waiting for a frame")
+    .expect("read failed");
     assert!(n > 0, "connection closed unexpectedly");
     serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
 }
@@ -133,7 +136,7 @@ async fn start_with_config(config_toml: Option<&str>) -> Harness {
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let mut services = Services::new(store)
+    let mut services = Services::new_isolated(store)
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_event_bus(bus.clone())
         .with_specialist_dirs(
@@ -212,15 +215,13 @@ async fn specialist_full_crud_and_three_tier_resolution() {
     let mut r = BufReader::new(read);
     let wp = h.work_dir.to_string_lossy().to_string();
 
-    // list — bundled tier visible (no workspaceId required). Eight of the nine
-    // embedded reference specialists are catalog-visible; retired Ralph remains
-    // directly resolvable. The two dir-seeded files override embedded copies.
+    // Bundled files can override an embedded specialist or add a custom one.
     let list = ok(&mut w, &mut r, 1, "specialist.list", json!({})).await;
     let specs = list["specialists"].as_array().expect("specialists array");
     assert_eq!(
         specs.len(),
-        8,
-        "eight catalog-visible embedded ids, two overridden from dir"
+        7,
+        "five catalog-visible embedded ids plus two custom bundled specialists"
     );
     assert!(
         specs.iter().all(|s| s["id"] != "ralph"),

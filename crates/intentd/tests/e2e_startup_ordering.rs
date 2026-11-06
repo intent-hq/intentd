@@ -6,24 +6,22 @@
 //! sidecar's probe window and get the daemon killed as unresponsive.
 //!
 //! Drives the real `intentd serve` binary with the
-//! `INTENTD_TEST_WATCHER_INIT_DELAY_MS` seam standing in for a wedged
-//! `fseventsd`: readiness must land while watcher init is still parked in that
-//! delay, proving it is off the bind critical path. The seam sleeps the *thread*
-//! (not `tokio::time::sleep`), matching the synchronous `fseventsd` IPC it stands
-//! in for, so the test also fails if init merely moves to another Tokio worker
-//! without `block_in_place`.
+//! `INTENTD_TEST_WATCHER_INIT_GATE` seam standing in for a wedged `fseventsd`:
+//! watcher init blocks until the test creates the gate file, which it does only
+//! after `system.status` has answered, so readiness provably lands while init
+//! is still parked — a bind behind init hangs into the hang guards instead of
+//! passing slowly. The seam blocks the *thread* (not the task), matching the
+//! synchronous `fseventsd` IPC it stands in for, so the test also fails if init
+//! merely moves to another Tokio worker without `block_in_place`.
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
-use std::time::{Duration, Instant};
-
-/// Artificial watcher-init delay: far longer than any plausible daemon boot,
-/// so a daemon that still binds behind watcher init cannot pass by being fast.
-const WATCHER_DELAY: Duration = Duration::from_secs(120);
+use std::process::Stdio;
+use std::time::Duration;
 
 /// Layout for the spawned daemon: a short base dir (macOS caps UDS paths at
 /// ~104 bytes) holding the data dir and a hermetic workspaces root. The base
@@ -32,6 +30,8 @@ struct TestDirs {
     _base: tempfile::TempDir,
     data_dir: PathBuf,
     workspaces: PathBuf,
+    /// Watcher init blocks until this file exists.
+    watcher_gate: PathBuf,
 }
 
 fn make_dirs() -> TestDirs {
@@ -40,32 +40,32 @@ fn make_dirs() -> TestDirs {
     let workspaces = base.path().join("workspaces");
     std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
     std::fs::create_dir_all(&workspaces).expect("mkdir workspaces root");
+    let watcher_gate = base.path().join("watcher-gate");
     TestDirs {
         _base: base,
         data_dir,
         workspaces,
+        watcher_gate,
     }
 }
 
-fn spawn_daemon(dirs: &TestDirs) -> Child {
+fn spawn_daemon(dirs: &TestDirs) -> GuardedChild {
     let log = std::fs::File::create(dirs.data_dir.join("daemon.log")).expect("create daemon log");
-    common::hermetic_serve_command(&dirs.data_dir)
-        .env("INTENTD_DATA_DIR", &dirs.data_dir)
-        .env("INTENTD_WORKSPACES_DIR", &dirs.workspaces)
-        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env(
-            "INTENTD_TEST_WATCHER_INIT_DELAY_MS",
-            WATCHER_DELAY.as_millis().to_string(),
-        )
-        // One Tokio worker: the harshest version of the saturated-runtime case.
-        // A blocking init that is merely `spawn`ed lands on the same worker that
-        // must reach the UDS bind, so this fails without `block_in_place`.
-        .env("TOKIO_WORKER_THREADS", "1")
-        .env_remove("INTENTD_AUTH_TOKEN")
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve")
+    GuardedChild::spawn(
+        common::hermetic_serve_command(&dirs.data_dir)
+            .env("INTENTD_DATA_DIR", &dirs.data_dir)
+            .env("INTENTD_WORKSPACES_DIR", &dirs.workspaces)
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env("INTENTD_TEST_WATCHER_INIT_GATE", &dirs.watcher_gate)
+            // One Tokio worker: the harshest version of the saturated-runtime case.
+            // A blocking init that is merely `spawn`ed lands on the same worker that
+            // must reach the UDS bind, so this fails without `block_in_place`.
+            .env("TOKIO_WORKER_THREADS", "1")
+            .env_remove("INTENTD_AUTH_TOKEN")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log)),
+    )
+    .expect("spawn intentd serve")
 }
 
 /// One `system.status` round-trip over the daemon's UDS control socket.
@@ -99,32 +99,35 @@ async fn listeners_bind_before_slow_watcher_init() {
     let socket = dirs.data_dir.join("intentd.sock");
     let log_path = dirs.data_dir.join("daemon.log");
 
-    let started = Instant::now();
     let mut daemon = common::DaemonGuard::process_only(spawn_daemon(&dirs));
     common::await_daemon_listening(daemon.child_mut(), &socket, &log_path).await;
 
     // `system.status` must answer over the freshly bound socket, not merely
     // accept the connection — the FE probe requires a real response.
     let resp = status_rpc(&socket).await;
-    let elapsed = started.elapsed();
     assert!(
         resp["result"].is_object(),
-        "system.status must succeed while watcher init is still delayed; got {resp}"
+        "system.status must succeed while watcher init is still held; got {resp}"
     );
-
-    // Readiness budget: generously scaled for instrumented/oversubscribed
-    // runs, but well inside the artificial watcher delay, so passing proves
-    // the bind did not wait on watcher registration.
-    let budget = common::test_timeout(Duration::from_secs(20));
+    // The gate is still closed, so init cannot have finished — and once the
+    // spawned init task reaches the gate it says so. Waiting for that keeps
+    // the seam honest: a test whose gate never engaged would pass vacuously.
+    let parked = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(20));
+    let log = loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log.contains("waiting for the gate file") {
+            break log;
+        }
+        assert!(
+            tokio::time::Instant::now() < parked,
+            "watcher init never reached the gate\n--- daemon log ---\n{log}"
+        );
+        // timing-guard: poll interval for the init task's gate acknowledgement
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert!(
-        budget < WATCHER_DELAY,
-        "readiness budget {budget:?} must stay inside the watcher delay {WATCHER_DELAY:?}"
+        !log.contains("watcher registry ready"),
+        "watcher init finished while its gate was closed\n--- daemon log ---\n{log}"
     );
-    assert!(
-        elapsed < budget,
-        "daemon answered system.status only after {elapsed:?} (budget {budget:?}) with a \
-         {WATCHER_DELAY:?} watcher-init delay in effect — the listeners are still behind \
-         slow initialization\n--- daemon log ---\n{}",
-        std::fs::read_to_string(&log_path).unwrap_or_default()
-    );
+    std::fs::write(&dirs.watcher_gate, "").expect("open the watcher-init gate");
 }

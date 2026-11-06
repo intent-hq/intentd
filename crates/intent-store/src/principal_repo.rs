@@ -278,7 +278,7 @@ impl Store {
     /// `Error::Internal` if the database operation fails.
     pub async fn get_principal(&self, id: &PrincipalId) -> Result<Principal> {
         let sql = format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .fetch_optional(self.read_pool())
             .await
@@ -303,7 +303,7 @@ impl Store {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql =
                 format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE id IN ({placeholders})");
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(&id.0);
             }
@@ -333,7 +333,7 @@ impl Store {
             if viewer.is_some() {
                 sql.push_str(" AND (id = ? OR EXISTS(SELECT 1 FROM principal v WHERE v.id = ? AND (v.is_primary = 1 OR EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = v.id))))");
             }
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(id.as_str());
             }
@@ -368,7 +368,7 @@ impl Store {
     /// the migration guarantees exactly one) or the database operation fails.
     pub async fn get_primary_principal(&self) -> Result<Principal> {
         let sql = format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE is_primary = 1");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get primary principal failed: {e}")))?;
@@ -389,7 +389,7 @@ impl Store {
     ) -> Result<Option<Principal>> {
         let sql =
             format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE {PRINCIPAL_BY_IDENTITY}");
-        let row = bind_identity(sqlx::query(&sql), identity)
+        let row = bind_identity(sqlx::query(sqlx::AssertSqlSafe(sql.as_str())), identity)
             .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("find principal by identity failed: {e}")))?;
@@ -420,7 +420,7 @@ impl Store {
         let sql = format!(
             "SELECT {PRINCIPAL_COLUMNS} FROM principal ORDER BY is_primary DESC, created_at, id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list principals failed: {e}")))?;
@@ -443,7 +443,7 @@ impl Store {
                  WHERE c.principal_id = p.id AND c.revoked_at IS NULL) \
              ORDER BY p.created_at, p.id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list credentialed guests failed: {e}")))?;
@@ -505,11 +505,12 @@ impl Store {
             "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?) \
              ON CONFLICT(id) DO UPDATE SET {PRINCIPAL_UPSERT_SET}"
         );
-        bind_principal(sqlx::query(&sql), p)
+        bind_principal(sqlx::query(sqlx::AssertSqlSafe(sql.as_str())), p)
             .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("upsert principal failed: {e}")))?;
-        lifecycle.settle();
+        drop(conn);
+        lifecycle.settle_after_retirement().await?;
         Ok(())
     }
 
@@ -625,7 +626,7 @@ impl Store {
              LEFT JOIN workspace_member m ON m.workspace_id = w.id AND m.principal_id = v.id \
              WHERE h.id = 1 AND w.id IN ({placeholders})"
         );
-        let mut query = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(viewer.map(|p| p.0.as_str()))
             .bind(intent_core::CHIEF_WORKSPACE_ID)
             .bind(intent_core::CHIEF_WORKSPACE_ID)
@@ -676,7 +677,7 @@ impl Store {
             "SELECT {MEMBER_COLUMNS} FROM workspace_member WHERE workspace_id = ? \
              ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, added_at, principal_id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -698,7 +699,7 @@ impl Store {
         let rows = sqlx::query(
             "WITH people AS (SELECT principal_id FROM workspace_member WHERE workspace_id = ? \
                  UNION SELECT principal_id FROM host_member WHERE ? <> ?) \
-             SELECT p.*, h.principal_id IS NOT NULL AS is_host_member, \
+             SELECT p.*, m.role AS direct_role, h.principal_id IS NOT NULL AS is_host_member, \
                  CASE WHEN h.principal_id IS NOT NULL AND w.id <> ? THEN h.added_at \
                       ELSE m.added_at END AS member_added_at \
              FROM people x JOIN principal p ON p.id = x.principal_id \
@@ -715,15 +716,16 @@ impl Store {
         .fetch_all(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("effective workspace roster failed: {e}")))?;
-        Ok(rows
-            .iter()
+        rows.iter()
             .map(|r| {
                 let principal = map_principal_row(r);
-                EffectiveWorkspaceMember {
+                Ok(EffectiveWorkspaceMember {
                     role: if principal.is_primary {
                         WorkspaceRole::Owner
-                    } else {
+                    } else if r.get::<bool, _>("is_host_member") {
                         WorkspaceRole::Collaborator
+                    } else {
+                        enum_from_db(r.get::<String, _>("direct_role").as_str())?
                     },
                     host_role: if principal.is_primary {
                         intent_core::HostRole::Owner
@@ -734,9 +736,9 @@ impl Store {
                     },
                     principal,
                     added_at: r.get("member_added_at"),
-                }
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// IDs for presence fan-out. Members inherit ordinary workspaces; direct
@@ -775,7 +777,7 @@ impl Store {
             "SELECT {MEMBER_COLUMNS} FROM workspace_member WHERE principal_id = ? \
              ORDER BY added_at, workspace_id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&principal_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -855,7 +857,7 @@ impl Store {
                 "INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?) \
                  ON CONFLICT(workspace_id, principal_id) DO NOTHING"
             );
-            let res = sqlx::query(&sql)
+            let res = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&workspace_id.0)
                 .bind(&principal_id.0)
                 .bind(role.as_str())
@@ -867,7 +869,7 @@ impl Store {
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("add workspace member commit failed: {e}")))?;
-            lifecycle.settle();
+            lifecycle.settle_after_retirement().await?;
             Ok(res.rows_affected() > 0)
         })
         .await
@@ -959,7 +961,7 @@ impl Store {
             let insert =
                 format!("INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?)");
             lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
-            sqlx::query(&insert)
+            sqlx::query(sqlx::AssertSqlSafe(insert.as_str()))
                 .bind(&workspace_id.0)
                 .bind(&principal_id.0)
                 .bind(WorkspaceRole::Collaborator.as_str())
@@ -974,7 +976,7 @@ impl Store {
         let result =
             crate::commit_with_rollback_guard(conn, body_result, "capped member add commit failed")
                 .await;
-        lifecycle.finish(result)
+        lifecycle.finish(result).await
     }
 
     /// Change an existing member's role. `workspace.owner_principal_id` is
@@ -1024,10 +1026,76 @@ impl Store {
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("set workspace member role commit failed: {e}"))
             })?;
-            lifecycle.settle();
+            lifecycle.settle_after_retirement().await?;
             Ok(())
         })
         .await
+    }
+
+    /// Change only a direct guest role, preserving ownership and inherited host
+    /// authority. Check the actor and target under the same write transaction.
+    ///
+    /// # Errors
+    /// Returns `Forbidden` for a non-owner actor, `InvalidParams` for immutable
+    /// roles or inherited membership, and `NotFound` for an absent member.
+    pub async fn set_workspace_guest_role(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+        role: WorkspaceRole,
+        actor: Option<&PrincipalId>,
+    ) -> Result<bool> {
+        if role == WorkspaceRole::Owner {
+            return Err(Error::InvalidParams("the owner role is immutable".into()));
+        }
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut tx = self
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::Internal(format!("set guest role begin failed: {e}")))?;
+        if let Some(actor) = actor {
+            let allowed: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM principal WHERE id = ? AND is_primary = 1) OR EXISTS(SELECT 1 FROM workspace_member WHERE workspace_id = ? AND principal_id = ? AND role = 'owner')"
+            ).bind(actor.as_str()).bind(workspace_id.as_str()).bind(actor.as_str())
+                .fetch_one(&mut *tx).await
+                .map_err(|e| Error::Internal(format!("set guest role actor failed: {e}")))?;
+            if !allowed {
+                return Err(Error::Forbidden(
+                    "workspace.members.setRole requires the workspace owner".into(),
+                ));
+            }
+        }
+        let previous = member_role_in_txn(&mut tx, workspace_id, principal_id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("workspace member {principal_id}")))?;
+        if previous == "owner" {
+            return Err(Error::InvalidParams("the owner role is immutable".into()));
+        }
+        let inherited: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?) OR EXISTS(SELECT 1 FROM principal WHERE id = ? AND is_primary = 1)")
+            .bind(principal_id.as_str()).bind(principal_id.as_str()).fetch_one(&mut *tx).await
+            .map_err(|e| Error::Internal(format!("set guest role target failed: {e}")))?;
+        if inherited {
+            return Err(Error::HostMembershipRequired);
+        }
+        let changed = previous != role.as_str();
+        if changed {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+            sqlx::query(
+                "UPDATE workspace_member SET role = ? WHERE workspace_id = ? AND principal_id = ?",
+            )
+            .bind(role.as_str())
+            .bind(workspace_id.as_str())
+            .bind(principal_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("set guest role failed: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("set guest role commit failed: {e}")))?;
+        lifecycle.settle_after_retirement().await?;
+        Ok(changed)
     }
 
     /// Remove a principal from a workspace. Returns whether a row was
@@ -1067,7 +1135,7 @@ impl Store {
             tx.commit().await.map_err(|e| {
                 Error::Internal(format!("remove workspace member commit failed: {e}"))
             })?;
-            lifecycle.settle();
+            lifecycle.settle_after_retirement().await?;
             Ok(res.rows_affected() > 0)
         })
         .await
@@ -1124,7 +1192,7 @@ impl Store {
         tx.commit()
             .await
             .map_err(|e| Error::Internal(format!("remove guest commit failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(deleted.rows_affected() > 0)
     }
 
@@ -1153,7 +1221,7 @@ impl Store {
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("insert principal credential failed: {e}")))?;
-        lifecycle.settle();
+        lifecycle.settle_after_retirement().await?;
         Ok(PrincipalCredential {
             token_hash: token_hash.to_string(),
             principal_id: principal_id.clone(),
@@ -1176,7 +1244,7 @@ impl Store {
     ) -> Result<Option<PrincipalCredential>> {
         let sql =
             format!("SELECT {CREDENTIAL_COLUMNS} FROM principal_credential WHERE token_hash = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(token_hash)
             .fetch_optional(self.read_pool())
             .await
@@ -1197,7 +1265,7 @@ impl Store {
             "SELECT {CREDENTIAL_COLUMNS} FROM principal_credential WHERE principal_id = ? \
              ORDER BY created_at DESC, token_hash"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&principal_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1277,7 +1345,8 @@ impl Store {
         .execute(&mut *conn)
         .await
         .map_err(|e| Error::Internal(format!("revoke principal credential failed: {e}")))?;
-        lifecycle.settle();
+        drop(conn);
+        lifecycle.settle_after_retirement().await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -1310,7 +1379,8 @@ impl Store {
         .execute(&mut *conn)
         .await
         .map_err(|e| Error::Internal(format!("revoke principal credentials failed: {e}")))?;
-        lifecycle.settle();
+        drop(conn);
+        lifecycle.settle_after_retirement().await?;
         Ok(res.rows_affected())
     }
 
@@ -1336,7 +1406,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_open_workspace_invites(&self) -> Result<u64> {
         let sql = format!("SELECT COUNT(*) FROM workspace_invite i WHERE {INVITE_OPEN}");
-        let n: i64 = sqlx::query_scalar(&sql)
+        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(now_iso())
             .fetch_one(self.read_pool())
             .await
@@ -1454,7 +1524,7 @@ impl Store {
                     .as_ref()
                     .and_then(PrincipalIdentity::github_user_id)
             });
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&invite.id)
                 .bind(&invite.workspace_id.0)
                 .bind(&invite.secret_hash)
@@ -1498,7 +1568,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_workspace_invite(&self, id: &str) -> Result<Option<WorkspaceInvite>> {
         let sql = format!("SELECT {INVITE_COLUMNS} FROM workspace_invite WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .fetch_optional(self.read_pool())
             .await
@@ -1520,7 +1590,7 @@ impl Store {
              WHERE i.workspace_id = ? AND {INVITE_OPEN} \
              ORDER BY i.created_at, i.id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .bind(now_iso())
             .fetch_all(self.read_pool())
@@ -1542,7 +1612,7 @@ impl Store {
         let sql = format!(
             "UPDATE workspace_invite AS i SET revoked_at = ? WHERE i.id = ? AND {INVITE_OPEN}"
         );
-        let res = sqlx::query(&sql)
+        let res = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&now)
             .bind(id)
             .bind(&now)
@@ -1572,6 +1642,35 @@ impl Store {
         id: &WorkspaceId,
         archived_at: &str,
     ) -> Result<ArchivedGuestSweep> {
+        self.archive_workspace_detaching_guests_inner(id, archived_at, false)
+            .await?
+            .ok_or_else(|| Error::Internal("manual archive refused".into()))
+    }
+
+    /// The automatic-sweep variant of [`Self::archive_workspace_detaching_guests`]:
+    /// reads `auto_archive_disabled` inside the same `BEGIN IMMEDIATE`
+    /// transaction as the flip and returns `Ok(None)` (nothing written) when
+    /// the workspace opted out, so an opt-out committed after the sweep's
+    /// last read can never be overtaken by the archive.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::archive_workspace_detaching_guests`].
+    pub async fn archive_workspace_detaching_guests_unless_auto_archive_disabled(
+        &self,
+        id: &WorkspaceId,
+        archived_at: &str,
+    ) -> Result<Option<ArchivedGuestSweep>> {
+        self.archive_workspace_detaching_guests_inner(id, archived_at, true)
+            .await
+    }
+
+    async fn archive_workspace_detaching_guests_inner(
+        &self,
+        id: &WorkspaceId,
+        archived_at: &str,
+        respect_auto_archive_opt_out: bool,
+    ) -> Result<Option<ArchivedGuestSweep>> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         let mut conn = self
             .write_pool()
@@ -1583,10 +1682,33 @@ impl Store {
             .await
             .map_err(|e| Error::Internal(format!("archive workspace begin failed: {e}")))?;
 
-        let body_result: Result<ArchivedGuestSweep> = async {
+        let body_result: Result<Option<ArchivedGuestSweep>> = async {
             let archived: Option<bool> = sqlx::query_scalar("SELECT archived FROM workspace WHERE id=?")
                 .bind(&id.0).fetch_optional(&mut *conn).await
                 .map_err(|e| Error::Internal(format!("read archive binding failed: {e}")))?;
+            // Read under the same IMMEDIATE transaction as the flip below, so a
+            // concurrent `workspace.retire` cannot land between this check and
+            // the write: a retired row is never flipped back to Archived.
+            let retired: Option<bool> = sqlx::query_scalar("SELECT status = ? FROM workspace WHERE id=?")
+                .bind(enum_to_db(&WorkspaceStatus::Retired)?)
+                .bind(&id.0).fetch_optional(&mut *conn).await
+                .map_err(|e| Error::Internal(format!("read archive status failed: {e}")))?;
+            if retired == Some(true) {
+                return Err(Error::WorkspaceRetired { workspace_id: id.0.clone() });
+            }
+            if respect_auto_archive_opt_out {
+                let opted_out: Option<bool> =
+                    sqlx::query_scalar("SELECT auto_archive_disabled <> 0 FROM workspace WHERE id=?")
+                        .bind(&id.0)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!("read auto-archive opt-out failed: {e}"))
+                        })?;
+                if opted_out == Some(true) {
+                    return Ok(None);
+                }
+            }
             if archived == Some(false) {
                 lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
             }
@@ -1639,7 +1761,7 @@ impl Store {
                 "UPDATE workspace_invite AS i SET revoked_at = ? \
                  WHERE i.workspace_id = ? AND {INVITE_OPEN}"
             );
-            let revoked = sqlx::query(&revoke_sql)
+            let revoked = sqlx::query(sqlx::AssertSqlSafe(revoke_sql.as_str()))
                 .bind(archived_at)
                 .bind(&id.0)
                 .bind(archived_at)
@@ -1653,18 +1775,18 @@ impl Store {
                     .fetch_one(&mut *conn)
                     .await
                     .map_err(|e| Error::Internal(format!("archive member count failed: {e}")))?;
-            Ok(ArchivedGuestSweep {
+            Ok(Some(ArchivedGuestSweep {
                 removed_collaborators,
                 revoked_invites: revoked.rows_affected(),
                 member_count: u64::try_from(remaining).unwrap_or(0),
-            })
+            }))
         }
         .await;
 
         let result =
             crate::commit_with_rollback_guard(conn, body_result, "archive workspace commit failed")
                 .await;
-        lifecycle.finish(result)
+        lifecycle.finish(result).await
     }
 
     /// Record a redemption of an **open** invite by `principal_id`: stamps
@@ -1688,7 +1810,7 @@ impl Store {
                  redemption_count = redemption_count + 1 \
              WHERE i.id = ? AND {INVITE_OPEN}"
         );
-        let res = sqlx::query(&sql)
+        let res = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&now)
             .bind(&principal_id.0)
             .bind(id)
@@ -1750,7 +1872,7 @@ impl Store {
                 "SELECT {INVITE_COLUMNS} FROM workspace_invite i \
                  WHERE i.id = ? AND i.workspace_id = ? AND {INVITE_OPEN}"
             );
-            let open = sqlx::query(&open_sql)
+            let open = sqlx::query(sqlx::AssertSqlSafe(open_sql.as_str()))
                 .bind(invite_id)
                 .bind(&workspace_id.0)
                 .bind(&now)
@@ -1771,7 +1893,7 @@ impl Store {
             }
             let lookup =
                 format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE {PRINCIPAL_BY_IDENTITY}");
-            let existing = bind_identity(sqlx::query(&lookup), &identity_key)
+            let existing = bind_identity(sqlx::query(sqlx::AssertSqlSafe(lookup.as_str())), &identity_key)
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|e| Error::Internal(format!("invite join principal lookup failed: {e}")))?
@@ -1854,7 +1976,7 @@ impl Store {
                 "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?){}",
                 if was_existing { format!(" ON CONFLICT(id) DO UPDATE SET {PRINCIPAL_UPSERT_SET}") } else { String::new() }
             );
-            bind_principal(sqlx::query(&upsert), &principal)
+            bind_principal(sqlx::query(sqlx::AssertSqlSafe(upsert.as_str())), &principal)
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| {
@@ -1868,7 +1990,7 @@ impl Store {
                      redemption_count = redemption_count + ? \
                  WHERE i.id = ? AND i.workspace_id = ? AND {INVITE_OPEN}"
             );
-            let redeemed = sqlx::query(&redeem_sql)
+            let redeemed = sqlx::query(sqlx::AssertSqlSafe(redeem_sql.as_str()))
                 .bind(&now)
                 .bind(&principal.id.0)
                 .bind(i64::from(!already_member))
@@ -1889,7 +2011,7 @@ impl Store {
                     "INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?) \
                      ON CONFLICT(workspace_id, principal_id) DO NOTHING"
                 );
-                sqlx::query(&member)
+                sqlx::query(sqlx::AssertSqlSafe(member.as_str()))
                     .bind(&workspace_id.0)
                     .bind(&principal.id.0)
                     .bind(WorkspaceRole::Collaborator.as_str())
@@ -1920,7 +2042,7 @@ impl Store {
 
         let result =
             crate::commit_with_rollback_guard(conn, body_result, "invite join commit failed").await;
-        lifecycle.finish(result)
+        lifecycle.finish(result).await
     }
 }
 
@@ -1984,7 +2106,7 @@ async fn sync_workspace_owner(
 pub(crate) const PRINCIPAL_BY_IDENTITY: &str =
     "identity_provider = ? AND instance_host = ? AND external_user_id = ?";
 
-type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
+type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>;
 
 pub(crate) fn bind_identity<'q>(
     query: SqliteQuery<'q>,

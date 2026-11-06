@@ -5,13 +5,17 @@
 //! version" message.
 //!
 //! Router and fast-path methods are mechanically extracted from source at test
-//! runtime to detect drift. Notifications and reverse RPCs use count-based
-//! checks only (extracting reverse `.request("...")` call sites would be
-//! fragile); renames are a lower-risk edge case caught during code review.
+//! runtime to detect drift. Every catalog entry (router, fast path, aliases,
+//! notifications, reverse RPCs) is also frozen by name in the checked-in
+//! golden `tests/goldens/method_catalog.txt` ([`method_catalog_matches_golden`]);
+//! notifications and reverse RPCs are not extracted from source (reverse
+//! `.request("...")` call sites would be fragile), so the golden is their only
+//! freeze.
 
 use super::{
-    canonical_method, collaborator_may_call, COLLABORATOR_METHODS, FASTPATH_METHODS,
-    METHOD_ALIASES, NOTIFICATIONS, REVERSE_METHODS, ROUTER_METHODS,
+    canonical_method, collaborator_may_call, PayloadClass, COLLABORATOR_METHODS, FASTPATH_METHODS,
+    METHOD_ALIASES, NOTIFICATIONS, PAYLOAD_CLASSES, READ_PAYLOAD_BUDGET_BYTES, REVERSE_METHODS,
+    ROUTER_METHODS, SNAPSHOT_CHANNELS,
 };
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -74,6 +78,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("browser.rs", "browser."),
         ("host.rs", "host."),
         ("control.rs", "system."),
+        ("startup.rs", "system."),
         ("pairing.rs", "pairing."),
         ("server.rs", "server."),
         ("provider_setup.rs", "providers.setup."),
@@ -82,6 +87,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("invite.rs", "host.invite."),
         ("presence.rs", "presence."),
         ("presence.rs", "note.presence."),
+        ("agent_workers.rs", "agent.workers."),
     ] {
         let source = std::fs::read_to_string(base_path.join(filename))
             .unwrap_or_else(|_| panic!("Failed to read {filename} at test time"));
@@ -123,93 +129,6 @@ fn extract_fastpath_methods() -> HashSet<String> {
 
     methods
 }
-
-/// Golden count: total client-callable methods (router + fastpath + aliases).
-///
-/// This constant must match the sum below. If it doesn't, you've added or
-/// removed methods without updating the catalog. The catalog freeze is
-/// intentional: any surface change requires a protocol version bump and a
-/// docs/protocol/ update.
-///
-/// REV-2 browser tab registry (intent-hq/intent#461): +4 fast-path methods
-/// (`browser.listTabs` / `browser.upsertTab` / `browser.removeTab` /
-/// `browser.syncTabs`), protocol 9.10. REV-2 routing: +2 fast-path methods
-/// (`browser.navigateTab` / `browser.closeTab`), protocol 9.11.
-///
-/// 355 → 366: `extract_router_methods` rejected `-` in method names, so the 11
-/// already-shipped `accept-changes.*` / `file-tracking.*` router arms were never
-/// frozen here. No protocol bump — the wire surface did not change.
-///
-/// Multiplayer w4 (invite links + identity-only join): +4 router methods
-/// (`workspace.invite.list` / `workspace.invite.revoke` /
-/// `workspace.members.leave` / `principal.revokeSelf`) and +2 fast-path
-/// methods (`workspace.invite.create`, `invite.redeem`).
-///
-/// Multiplayer w5 (presence): +2 fast-path methods (`presence.update`,
-/// `note.presence.update`) and +1 router method (`presence.snapshot`); the
-/// `note.presence.subscribe` / `note.presence.unsubscribe` channel pair is
-/// counted with the other subscription channels, not here.
-///
-/// Also within 10.3: +1 router method (`github.users.search`, the
-/// collaborator picker's login-prefix user search).
-///
-/// Agent memory attribution (§5.5): +1 router method (`agent.memoryUsage`).
-///
-/// Returning guest (multiplayer w4): +2 fast-path methods on the `/invite`
-/// endpoint (`invite.inspect`, `invite.accept`).
-///
-/// Gist identity proof (guest half): +2 router methods
-/// (`github.identityProof.create`, `github.identityProof.delete`).
-///
-/// Gist identity proof (host half): +2 fast-path methods on the `/invite`
-/// endpoint (`invite.challenge`, `invite.prove`).
-///
-/// Gist identity proof replaces the host-side device flow: −1 fast-path
-/// method (`invite.redeem`); the guest joins through `invite.challenge` /
-/// `invite.prove` (or `invite.accept` with a credential) instead.
-///
-/// Direct member add: +2 router methods (`principal.list`, the owner-only
-/// roster of credentialed guests; `workspace.members.add`, the owner-only
-/// direct attach of one of them).
-///
-/// Provider-generic auth (protocol 10.5, §5.27): +5 router methods
-/// (`sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
-/// `getUser`); the `github.*` auth quintet stays as byte-identical aliases.
-///
-/// Provider-generic identity proof (protocol 10.8): +2 router methods
-/// (`sourceControl.identityProof.create` / `delete`, the GitHub gist or
-/// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
-/// stays as byte-identical aliases.
-/// Direct user retirement (protocol 10.10): +1 router method (`agent.retire`).
-/// Explicit PR detail reads (protocol 13.2): +3 router methods.
-/// Explicit queued batch sending (protocol 13.1): +1 router method.
-/// Reversible script history (protocol 10.11): +2 router methods
-/// (`script.archive`, `script.restore`).
-/// Durable script monitors (protocol 12.1): +3 router methods.
-/// Protocol 13.0 removes the deprecated git.commit router method.
-// GitLab pre-workspace checkout (13.5): +6 router methods.
-// Provider adapter preparation (13.6): +1 fast-path method.
-// Cancellable note deletion (13.10): +3 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 434;
-
-/// Golden count: router methods (canonical + canonical forms of aliases).
-/// Protocol 12.0 removes five router methods, three fast paths and two aliases.
-/// Protocol 12.1 adds the three script-monitor controls.
-/// The subsequent git.commit removal removes one more router method.
-/// Protocol 13.10 adds three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 378;
-
-/// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 56;
-
-/// Golden count: method aliases.
-const EXPECTED_ALIASES: usize = 0;
-
-/// Golden count: server→client notifications.
-const EXPECTED_NOTIFICATIONS: usize = 5;
-
-/// Golden count: client-served reverse RPCs.
-const EXPECTED_REVERSE_METHODS: usize = 5;
 
 #[test]
 fn router_methods_match_actual_source() {
@@ -325,52 +244,240 @@ fn fastpath_methods_match_actual_source() {
     }
 }
 
+/// Checked-in golden list of every catalog entry, relative to the crate root.
+///
+/// Bare count constants used to freeze the catalog, but two PRs that each add
+/// a method make the identical `405 → 406` edit, which git merges silently and
+/// CI then rejects as off by one (intentd#2605). With one sorted line per
+/// entry, concurrent additions either conflict textually at merge time or
+/// merge into a list that is still correct.
+const METHOD_GOLDEN_REL: &str = "tests/goldens/method_catalog.txt";
+
+/// Set to `1` to rewrite the golden from `catalog.rs` instead of asserting.
+const UPDATE_GOLDENS_ENV: &str = "INTENTD_UPDATE_GOLDENS";
+
+const METHOD_GOLDEN_REGENERATE: &str = "INTENTD_UPDATE_GOLDENS=1 cargo test -p intent-transport --lib catalog::tests::method_catalog_matches_golden";
+
+/// The catalog surface a golden is rendered from (parameterized for tests).
+struct CatalogSurface<'a> {
+    router: &'a [&'a str],
+    fastpath: &'a [&'a str],
+    aliases: &'a [(&'a str, &'a str)],
+    notifications: &'a [&'a str],
+    reverse: &'a [&'a str],
+}
+
+const LIVE_SURFACE: CatalogSurface<'static> = CatalogSurface {
+    router: ROUTER_METHODS,
+    fastpath: FASTPATH_METHODS,
+    aliases: METHOD_ALIASES,
+    notifications: NOTIFICATIONS,
+    reverse: REVERSE_METHODS,
+};
+
+/// One `<kind> <name>` line per entry (`alias <from> -> <to>` for aliases),
+/// sorted, so the file orders by kind then name. Duplicates are kept so
+/// [`duplicate_lines`] can name them.
+fn method_golden_entries(surface: &CatalogSurface<'_>) -> Vec<String> {
+    let tagged = |kind: &str, names: &[&str]| -> Vec<String> {
+        names.iter().map(|name| format!("{kind} {name}")).collect()
+    };
+    let mut entries = Vec::new();
+    entries.extend(tagged("router", surface.router));
+    entries.extend(tagged("fastpath", surface.fastpath));
+    entries.extend(tagged("notification", surface.notifications));
+    entries.extend(tagged("reverse", surface.reverse));
+    entries.extend(
+        surface
+            .aliases
+            .iter()
+            .map(|(from, to)| format!("alias {from} -> {to}")),
+    );
+    entries.sort();
+    entries
+}
+
+/// Each line that appears more than once in sorted `lines`, once.
+fn duplicate_lines(lines: &[String]) -> Vec<&str> {
+    let mut dups: Vec<&str> = lines
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .map(|pair| pair[0].as_str())
+        .collect();
+    dups.dedup();
+    dups
+}
+
+fn render_method_golden(surface: &CatalogSurface<'_>) -> String {
+    let mut out = String::from(
+        "# Golden list of every intentd protocol catalog entry, one `<kind> <name>` per line.\n\
+         # Generated from crates/intent-transport/src/catalog.rs; do not hand-edit. Regenerate:\n",
+    );
+    let _ = writeln!(out, "#   {METHOD_GOLDEN_REGENERATE}");
+    for entry in method_golden_entries(surface) {
+        out.push_str(&entry);
+        out.push('\n');
+    }
+    out
+}
+
+/// The golden's entry lines, sorted, duplicates kept.
+fn parse_method_golden(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// `None` when `actual` (the checked-in golden) is exactly `expected`, up to
+/// CRLF line endings; otherwise a failure message listing the drifted entries
+/// and the fix.
+fn method_golden_drift(expected: &str, actual: &str) -> Option<String> {
+    let actual = actual.replace("\r\n", "\n");
+    if expected == actual {
+        return None;
+    }
+    let want = parse_method_golden(expected);
+    let have_lines = parse_method_golden(&actual);
+    let have_dups = duplicate_lines(&have_lines);
+    let want: BTreeSet<String> = want.into_iter().collect();
+    let have: BTreeSet<String> = have_lines.iter().cloned().collect();
+    let mut msg = String::from("Protocol method catalog drift: ");
+    if want == have && !have_dups.is_empty() {
+        msg.push_str("the golden repeats entries (a conflict resolution kept both sides?).\n");
+        for dup in have_dups {
+            let _ = writeln!(msg, "  duplicate line in the golden: {dup}");
+        }
+    } else if want == have {
+        msg.push_str(
+            "the golden lists the right entries but is not in canonical form (order, comments, or whitespace).\n",
+        );
+    } else {
+        msg.push_str("catalog.rs and the checked-in golden disagree.\n");
+        for missing in want.difference(&have) {
+            let _ = writeln!(msg, "  in catalog.rs but not in the golden: {missing}");
+        }
+        for extra in have.difference(&want) {
+            let _ = writeln!(msg, "  in the golden but not in catalog.rs: {extra}");
+        }
+    }
+    let _ = write!(
+        msg,
+        "If you added/removed/renamed methods, update the catalog in catalog.rs, \
+         update docs/protocol/05-method-catalog.md, and bump the protocol version; \
+         then regenerate {METHOD_GOLDEN_REL} with:\n  {METHOD_GOLDEN_REGENERATE}"
+    );
+    Some(msg)
+}
+
 #[test]
-fn catalog_counts_frozen() {
-    let router_count = ROUTER_METHODS.len();
-    let fastpath_count = FASTPATH_METHODS.len();
-    let alias_count = METHOD_ALIASES.len();
-    let total = router_count + fastpath_count + alias_count;
+fn method_catalog_matches_golden() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(METHOD_GOLDEN_REL);
+    let expected = render_method_golden(&LIVE_SURFACE);
+    if std::env::var(UPDATE_GOLDENS_ENV).is_ok_and(|v| v == "1") {
+        std::fs::create_dir_all(path.parent().expect("golden has a parent dir"))
+            .expect("create golden dir");
+        std::fs::write(&path, &expected).expect("write method golden");
+        return;
+    }
+    let actual = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {}: {e}. Generate it with:\n  {METHOD_GOLDEN_REGENERATE}",
+            path.display()
+        )
+    });
+    if let Some(msg) = method_golden_drift(&expected, &actual) {
+        panic!("{msg}");
+    }
+}
 
+#[test]
+fn method_golden_renders_sorted_kind_name_lines() {
+    let surface = CatalogSurface {
+        router: &["b.two", "a.one"],
+        fastpath: &["c.fast"],
+        aliases: &[("old.name", "a.one")],
+        notifications: &["events.event"],
+        reverse: &["a.one"],
+    };
+    let body: Vec<String> = render_method_golden(&surface)
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(str::to_string)
+        .collect();
     assert_eq!(
-        router_count, EXPECTED_ROUTER_METHODS,
-        "Router method count drift detected: expected {EXPECTED_ROUTER_METHODS}, got {router_count}. \
-         If you added/removed router methods, update ROUTER_METHODS in catalog.rs, \
-         bump EXPECTED_ROUTER_METHODS, update docs/protocol/05-method-catalog.md, and bump the protocol version."
+        body,
+        [
+            "alias old.name -> a.one",
+            "fastpath c.fast",
+            "notification events.event",
+            "reverse a.one",
+            "router a.one",
+            "router b.two",
+        ]
     );
+}
 
-    assert_eq!(
-        fastpath_count, EXPECTED_FASTPATH_METHODS,
-        "Fast-path method count drift detected: expected {EXPECTED_FASTPATH_METHODS}, got {fastpath_count}. \
-         If you added/removed fast-path methods, update FASTPATH_METHODS in catalog.rs, \
-         bump EXPECTED_FASTPATH_METHODS, update docs/protocol/05-method-catalog.md, and bump the protocol version."
+#[test]
+fn method_golden_drift_reports_missing_and_extra_entries() {
+    let golden = "# header\nrouter a.one\nrouter b.two\n";
+    let catalog = "# header\nrouter a.one\nrouter c.three\n";
+    assert_eq!(method_golden_drift(golden, golden), None);
+    let msg = method_golden_drift(catalog, golden).expect("drift detected");
+    assert!(
+        msg.contains("in catalog.rs but not in the golden: router c.three"),
+        "{msg}"
     );
-
-    assert_eq!(
-        alias_count, EXPECTED_ALIASES,
-        "Alias count drift detected: expected {EXPECTED_ALIASES}, got {alias_count}. \
-         If you added/removed aliases, update METHOD_ALIASES in catalog.rs, \
-         bump EXPECTED_ALIASES, update docs/protocol/05-method-catalog.md, and bump the protocol version."
+    assert!(
+        msg.contains("in the golden but not in catalog.rs: router b.two"),
+        "{msg}"
     );
+    assert!(msg.contains("docs/protocol/05-method-catalog.md"), "{msg}");
+    assert!(msg.contains(METHOD_GOLDEN_REGENERATE), "{msg}");
+}
 
-    assert_eq!(
-        total, EXPECTED_TOTAL_METHODS,
-        "Total method count drift detected: expected {EXPECTED_TOTAL_METHODS}, got {total} ({router_count} router + {fastpath_count} fastpath + {alias_count} aliases). \
-         Update the catalog, docs/protocol/05-method-catalog.md, and bump the protocol version."
+#[test]
+fn method_golden_drift_flags_non_canonical_order() {
+    let canonical = "# header\nrouter a.one\nrouter b.two\n";
+    let shuffled = "# header\nrouter b.two\nrouter a.one\n";
+    let msg = method_golden_drift(canonical, shuffled).expect("order drift detected");
+    assert!(msg.contains("not in canonical form"), "{msg}");
+    assert!(msg.contains(METHOD_GOLDEN_REGENERATE), "{msg}");
+}
+
+#[test]
+fn method_golden_drift_names_duplicate_lines() {
+    let canonical = "# header\nrouter a.one\nrouter b.two\n";
+    let doubled = "# header\nrouter a.one\nrouter b.two\nrouter b.two\n";
+    let msg = method_golden_drift(canonical, doubled).expect("duplicate detected");
+    assert!(
+        msg.contains("duplicate line in the golden: router b.two"),
+        "{msg}"
     );
+    assert!(!msg.contains("router a.one"), "{msg}");
+}
 
-    let notification_count = NOTIFICATIONS.len();
-    assert_eq!(
-        notification_count, EXPECTED_NOTIFICATIONS,
-        "Notification count drift detected: expected {EXPECTED_NOTIFICATIONS}, got {notification_count}. \
-         Update NOTIFICATIONS in catalog.rs, docs/protocol/05-method-catalog.md, and bump the protocol version."
-    );
+#[test]
+fn method_golden_drift_ignores_crlf_line_endings() {
+    let canonical = "# header\nrouter a.one\nrouter b.two\n";
+    let crlf = canonical.replace('\n', "\r\n");
+    assert_eq!(method_golden_drift(canonical, &crlf), None);
+}
 
-    let reverse_count = REVERSE_METHODS.len();
-    assert_eq!(
-        reverse_count, EXPECTED_REVERSE_METHODS,
-        "Reverse RPC count drift detected: expected {EXPECTED_REVERSE_METHODS}, got {reverse_count}. \
-         Update REVERSE_METHODS in catalog.rs, docs/protocol/05-method-catalog.md, and bump the protocol version."
+/// Every catalog entry renders to a distinct golden line: within one kind a
+/// name is listed once (a name may appear under two kinds, e.g. a dual-role
+/// reverse RPC that is also a router method).
+#[test]
+fn live_method_golden_has_no_duplicate_entries() {
+    let entries = method_golden_entries(&LIVE_SURFACE);
+    let dups = duplicate_lines(&entries);
+    assert!(
+        dups.is_empty(),
+        "catalog.rs lists these entries more than once: {dups:?}"
     );
 }
 
@@ -486,6 +593,14 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
         "stamped on the input in `WorkspaceApi::agent_wake_or_create`; the wake row, parked queue entry and worker options carry it",
     ),
     (
+        "secret.dismiss",
+        "the declined notice is a user-origin row delivered through `WorkspaceApi::agent_send_message`, which stamps it",
+    ),
+    (
+        "secret.provide",
+        "the provided notice (name only, never the value) is a user-origin row delivered through `WorkspaceApi::agent_send_message`, which stamps it",
+    ),
+    (
         "workspace.create",
         "the `initialAgent.prompt` kickoff is the creator's first user row, stamped in `WorkspaceApi::create_workspace` before the runtime / store-only delivery",
     ),
@@ -512,6 +627,7 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
 ///   the author projection), never a human row; `agent.respondPermission`
 ///   and `agent.stop` drive turn control without appending a chat row
 ///   (question answers travel as `agent.sendMessage` content).
+/// - `discussion.*` uses its own human-only store, never the agent transcript.
 /// - `note.*`, `comment.*`, `task.*`, `github.*` write notes, comments and
 ///   forge objects — never the agent transcript; `accept-changes.*` and
 ///   `file-tracking.*` drive the worktree / PR flow the same way.
@@ -562,6 +678,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.summary",
     "agent.unsubscribe",
     "agent.update",
+    "agent.workers.list",
+    "agent.workers.stop",
+    "agent.workers.subscribe",
     "browser.closeTab",
     "browser.exec",
     "browser.listTabs",
@@ -581,14 +700,31 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
     "debug.sampleStacks",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.revoke",
+    "desktop.setPermission",
+    "discussion.conversations",
+    "discussion.delete",
+    "discussion.list",
+    "discussion.react",
+    "discussion.recipients",
+    "discussion.rename",
+    "discussion.retryAgent",
+    "discussion.send",
+    "discussion.stopAgent",
     "drafts.clear",
     "drafts.get",
     "drafts.set",
     "event.agentActivity",
     "event.query",
     "event.workspaceSummary",
+    "events.fence",
     "events.subscribe",
     "events.unsubscribe",
+    "executor.list",
+    "executor.mint",
+    "executor.revoke",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
     "file-tracking.loadCommits",
@@ -632,6 +768,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "git.removeLockFile",
     "git.renameBranch",
     "git.showFile",
+    "git.showFileChunk",
     "git.stage",
     "git.stageHunk",
     "git.status",
@@ -740,9 +877,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "note.add",
     "note.create",
     "note.delete",
-    "note.deleteCancel",
-    "note.deleteSchedule",
-    "note.deleteStatus",
     "note.edit",
     "note.editLines",
     "note.get",
@@ -754,6 +888,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "note.listVersions",
     "note.presence.update",
     "note.readAsset",
+    "note.readAssetChunk",
     "note.restoreVersion",
     "note.saveAsset",
     "note.setContent",
@@ -761,6 +896,11 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "note.updateMetadata",
     "pairing.getInfo",
     "pairing.getSelfInfo",
+    "plugin.install",
+    "plugin.list",
+    "plugin.toggle",
+    "plugin.uninstall",
+    "plugin.update",
     "pr.refresh",
     "prMonitor.cancel",
     "prMonitor.flush",
@@ -775,10 +915,24 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "principal.me",
     "principal.revokeSelf",
     "providers.catalog",
+    "providers.profiles.create",
+    "providers.profiles.delete",
+    "providers.profiles.list",
+    "providers.profiles.reorder",
+    "providers.profiles.update",
+    "providers.profiles.updateDefault",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
     "providers.setup.status",
+    "remoteLinkTraffic.snapshot",
+    "remoteLinkTraffic.start",
+    "remoteLinkTraffic.stop",
+    "remoteMachines.add",
+    "remoteMachines.backendInfo",
+    "remoteMachines.list",
+    "remoteMachines.refresh",
+    "remoteMachines.remove",
     "repo.list",
     "repo.remove",
     "repo.warmCache",
@@ -814,6 +968,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "search.inFiles",
     "search.messages",
     "search.notes",
+    "secret.forget",
+    "secret.list",
     "sentry.assignIssue",
     "sentry.authStatus",
     "sentry.getIssue",
@@ -840,11 +996,19 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "sourceControl.checkout.warm",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.gitlab.childGit.get",
+    "sourceControl.gitlab.childGit.set",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
     "sourceControl.read.capture",
+    "sourceControl.read.captureScoped",
     "sourceControl.read.detail",
+    "sourceControl.read.detailScoped",
+    "sourceControl.read.discussions",
+    "sourceControl.read.list",
     "sourceControl.read.release",
+    "sourceControl.read.releaseScoped",
+    "sourceControl.read.resolveKnownRepository",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -855,9 +1019,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "stats.getUsage",
     "system.capabilities",
     "system.gitCredential",
-    "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
+    "system.startupStatus",
     "system.status",
     "task.assignAgent",
     "task.convertBlocks",
@@ -897,6 +1061,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.export.finalize",
     "workspace.export.read",
     "workspace.export.start",
+    "workspace.findByPullRequest",
     "workspace.findRepositories",
     "workspace.generateSetupScript",
     "workspace.get",
@@ -921,6 +1086,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
+    "workspace.members.setRole",
     "workspace.repositoryContext",
     "workspace.repositoryContext.capture",
     "workspace.repositoryContext.release",
@@ -930,6 +1096,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.repositorySelection.reset",
     "workspace.repositorySelection.save",
     "workspace.restore",
+    "workspace.retire",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
     "workspace.setBrowserClient",
@@ -1033,9 +1200,10 @@ fn user_origin_message_entry_points_frozen() {
     }
     assert_eq!(
         USER_ORIGIN_MESSAGE_ENTRY_POINTS.len(),
-        12,
-        "the user-origin entry points including explicit queue batching and \
-         workspace.create's initialAgent kickoff; a change here needs \
+        14,
+        "the user-origin entry points including explicit queue batching, \
+         workspace.create's initialAgent kickoff and the §5.56 secret-request \
+         notices; a change here needs \
          attribution coverage and docs/protocol/ updated alongside"
     );
 
@@ -1169,7 +1337,7 @@ fn extract_subscription_channel_methods() -> HashSet<String> {
 
 /// Every method a client can put on the wire: router arms, fast paths, and
 /// the subscription channels.
-fn client_callable_universe() -> BTreeSet<String> {
+pub(super) fn client_callable_universe() -> BTreeSet<String> {
     ROUTER_METHODS
         .iter()
         .chain(FASTPATH_METHODS.iter())
@@ -1185,15 +1353,14 @@ fn client_callable_universe() -> BTreeSet<String> {
 /// or named here. The failure message prints the recomputed golden.
 ///
 /// Owner-only families: `host.*` but the two display probes, `browser.*`,
-/// `forward.*`, `terminal.*`, `script.*`, `github.*`, `linear.*`, `sentry.*`,
+/// `forward.*`, `terminal.*`, script definition writes, `github.*`, `linear.*`, `sentry.*`,
 /// `voice.*`, `settings.*`, `repo.*` / `repoConfig.*`, `mcp.*`, `server.*`,
 /// `pairing.*`, `providers.setup.*`, `system.*` (but `system.capabilities`
 /// and `system.status`),
 /// `rules.list` / `rules.update`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
 /// export / import / setup / browser-client pinning, `git.clone`,
-/// `git.agentCommit` (agent-only), agent creation / delegation (decided
-/// 2026-09-19: guests steer existing agents only — `agent.create`,
-/// `agent.delegate`, `agent.wakeOrCreate`), agent deletion / proposals /
+/// `git.agentCommit` (agent-only), agent delegation (`agent.delegate`,
+/// `agent.wakeOrCreate`), agent deletion / proposals /
 /// one-shot completions, `agent.replaceMessages` (persists client-supplied user rows
 /// verbatim, so a non-owner could forge `fromPrincipalId`), hook run/cancel,
 /// PR-monitor cancel/flush, daemon-wide metrics, and the `accept-changes.*` /
@@ -1209,7 +1376,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "accept-changes.release",
     "agent.cancelDelete",
     "agent.completeOnce",
-    "agent.create",
     "agent.delegate",
     "agent.delete",
     "agent.diagnostics",
@@ -1227,6 +1393,12 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "browser.syncTabs",
     "browser.upsertTab",
     "debug.sampleStacks",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.setPermission",
+    "executor.list",
+    "executor.mint",
+    "executor.revoke",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
     "file-tracking.loadCommits",
@@ -1329,13 +1501,32 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "mcp.servers.update",
     "mcp.testConnection",
     "pairing.getInfo",
+    "plugin.install",
+    "plugin.list",
+    "plugin.toggle",
+    "plugin.uninstall",
+    "plugin.update",
     "prMonitor.cancel",
     "prMonitor.flush",
     "principal.list",
+    "providers.profiles.create",
+    "providers.profiles.delete",
+    "providers.profiles.list",
+    "providers.profiles.reorder",
+    "providers.profiles.update",
+    "providers.profiles.updateDefault",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
     "providers.setup.status",
+    "remoteLinkTraffic.snapshot",
+    "remoteLinkTraffic.start",
+    "remoteLinkTraffic.stop",
+    "remoteMachines.add",
+    "remoteMachines.backendInfo",
+    "remoteMachines.list",
+    "remoteMachines.refresh",
+    "remoteMachines.remove",
     "repo.list",
     "repo.remove",
     "repo.warmCache",
@@ -1349,16 +1540,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "sandbox.cow.merge",
     "script.archive",
     "script.create",
-    "script.get",
-    "script.list",
-    "script.output",
     "script.remove",
-    "script.restart",
     "script.restore",
-    "script.run",
-    "script.start",
-    "script.status",
-    "script.stop",
     "scriptMonitor.cancel",
     "scriptMonitor.cancelRun",
     "sentry.assignIssue",
@@ -1379,16 +1562,19 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "sourceControl.cancelAuth",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.gitlab.childGit.get",
+    "sourceControl.gitlab.childGit.set",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
+    "sourceControl.read.resolveKnownRepository",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
     "specialist.edit",
     "system.gitCredential",
-    "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
+    "system.startupStatus",
     "terminal.create",
     "terminal.getBuffer",
     "terminal.kill",
@@ -1427,6 +1613,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "workspace.members.add",
     "workspace.members.remove",
     "workspace.restore",
+    "workspace.retire",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
     "workspace.setBrowserClient",
@@ -1578,6 +1765,7 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
     assert!(collaborator_may_call("git.commits"));
     for allowed in [
         "client.hello",
+        "events.fence",
         "events.subscribe",
         "chat.subscribe",
         "workspace.subscribe",
@@ -1617,15 +1805,12 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "voice.transcribe",
         "workspace.create",
         "git.clone",
-        "agent.create",
         "agent.delegate",
         "agent.wakeOrCreate",
         "agent.delete",
         "agent.cancelDelete",
         "agent.replaceMessages",
         "terminal.list",
-        "script.get",
-        "script.list",
         "debug.sampleStacks",
     ] {
         assert!(!collaborator_may_call(refused), "{refused} must be refused");
@@ -1645,851 +1830,6 @@ fn reverse_methods_are_never_on_the_collaborator_allowlist() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Owner-only method surface, unbound (multiplayer w4b: fail-closed caller)
-// ---------------------------------------------------------------------------
-
-/// Every owner-only **router** method — `ROUTER_METHODS \ COLLABORATOR_METHODS`,
-/// the service-layer half of [`COLLABORATOR_REFUSED_METHODS`] — dispatched
-/// through the real router into a real `Services` with **no caller bound**
-/// must answer `-32003 Forbidden` from the capability gate — never a
-/// successful early return ahead of a gate (the `agent.respondPermission`
-/// no-manager path was one, fixed and pinned by
-/// `unbound_respond_permission_is_forbidden_without_a_manager`) — unless the
-/// method is pinned by name in one of two goldens: its gate is conditional
-/// on something the minimal call omits — an optional scope argument or a
-/// live export session ([`CONDITIONALLY_GATED_AT_SERVICE_LAYER`], whose
-/// armed modes `armed_conditional_gates_are_forbidden_unbound` asserts
-/// separately) — or it has no service-layer gate at all
-/// ([`UNGATED_AT_SERVICE_LAYER`]).
-///
-/// The table below is params-only: it supplies the minimal *valid* arguments
-/// so each arm gets past `-32602` parsing and reaches the service method
-/// (the fixture workspace exists, so a lookup ordered before the gate still
-/// ends at the gate). It is derived from the catalog, so a new owner-only
-/// router method fails here until it is given a row — and then fails again
-/// until its service method is gated or it is named in
-/// [`UNGATED_AT_SERVICE_LAYER`] on purpose.
-///
-/// The remaining refused methods — the connection-task fast paths (`host.*`,
-/// `browser.*`, `forward.*`, `system.*`, `pairing.*`, `server.*`,
-/// `providers.setup.*`, `invite.inspect` / `invite.accept` /
-/// `invite.challenge` / `invite.prove`)
-/// and the subscription channels — have
-/// no `WorkspaceApi` method to gate; they are protected only by the
-/// transport allowlist in `conn::process_frame` (`-32003`) and stay out of
-/// this table by construction. That partition is asserted, not assumed.
-mod unbound_owner_only_methods {
-    use super::{COLLABORATOR_METHODS, ROUTER_METHODS};
-    use crate::router::handle_message;
-    use intent_core::{chief_workspace, AgentId, Error, WorkspaceApi as _, WorkspaceId};
-    use intent_services::Services;
-    use intent_store::Store;
-    use serde_json::{json, Value};
-    use std::collections::BTreeMap;
-    use std::fmt::Write as _;
-
-    /// How a [`CONDITIONALLY_GATED_AT_SERVICE_LAYER`] row's gate is armed.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum Arming {
-        /// `require_member` runs only when the optional `workspaceId` is
-        /// given.
-        WorkspaceId,
-        /// `require_agent_member` runs only when the optional `agentId` is
-        /// given.
-        AgentId,
-    }
-
-    /// Golden: owner-only router methods whose service-layer gate is
-    /// **conditional** on an optional scope argument, so the sweep's minimal
-    /// call never reaches it. Transfers have an unconditional actor gate.
-    /// Each row is `(method, unarmed outcome, what arms the gate)`. The
-    /// unarmed outcome is pinned here so the sweep sees it as classified,
-    /// not as ungated; the unarmed mode is owner-only by the transport
-    /// allowlist in `conn::process_frame` alone. Every armed mode is
-    /// asserted by [`armed_conditional_gates_are_forbidden_unbound`], which
-    /// arms the gate and requires `-32003`. A row leaves this list when its
-    /// gate stops being conditional (then it is simply `-32003` in the
-    /// sweep); making a gate unconditional is a capability-rule change and
-    /// not something this table decides.
-    const CONDITIONALLY_GATED_AT_SERVICE_LAYER: &[(&str, &str, Arming)] = &[
-        ("agent.completeOnce", "ok", Arming::WorkspaceId),
-        ("agent.enhancePrompt", "ok", Arming::WorkspaceId),
-        // Unscoped, the call proceeds to the worktree lookup (Internal here).
-        ("git.agentCommit", "-32603", Arming::AgentId),
-        ("rules.list", "ok", Arming::WorkspaceId),
-    ];
-
-    /// Golden: owner-only router methods whose service method has **no
-    /// service-layer gate at all**, with the outcome an unbound caller
-    /// observes today (`ok` or the error code). Each is owner-only by the
-    /// transport allowlist in `conn::process_frame` alone, and its unbound
-    /// behaviour is whatever the body does. Shrinking this list is the goal;
-    /// growing it needs a reason on the row. The failure message prints the
-    /// recomputed list.
-    const UNGATED_AT_SERVICE_LAYER: &[(&str, &str)] = &[
-        // No gate: daemon-wide per-agent memory read; no-manager early
-        // return `{ sampledAt: null, totalBytes: null, agents: [] }`.
-        ("agent.memoryUsage", "ok"),
-        // No gate: process-wide stack sampler.
-        ("debug.sampleStacks", "ok"),
-        // No gate: no-manager early return `{ running: false }`.
-        ("unsloth.status", "ok"),
-        // No gate: no-manager early return `{ stopped: false }`.
-        ("unsloth.stop", "ok"),
-        // No gate: proceeds to provider selection (Internal without an engine).
-        ("voice.transcribe", "-32603"),
-    ];
-
-    struct Fixture {
-        services: Services,
-        ws: WorkspaceId,
-        /// Swept on drop; every path the table hands out lives under it.
-        dir: tempfile::TempDir,
-    }
-
-    async fn fixture() -> Fixture {
-        let dir = tempfile::Builder::new()
-            .prefix("intentd-unbound-table-")
-            .tempdir()
-            .expect("tempdir");
-        let store = Store::open(&dir.path().join("svc.db"))
-            .await
-            .expect("open store");
-        let ws = WorkspaceId::new();
-        store
-            .insert_workspace(&intent_core::Workspace {
-                id: ws.clone(),
-                title: "WS".to_string(),
-                branch: "main".to_string(),
-                ..chief_workspace()
-            })
-            .await
-            .expect("insert workspace");
-        let services = Services::new(store)
-            .with_workspaces_root(dir.path().join("workspaces"))
-            .with_assets_root(dir.path().join("assets"));
-        Fixture { services, ws, dir }
-    }
-
-    /// Minimal valid params per owner-only router method. Values are inert
-    /// when a gate is missing: unknown ids, closed ports, empty edits, and
-    /// every path stays inside the fixture tempdir.
-    fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
-        let ws = f.ws.as_str();
-        let dir = f.dir.path().to_string_lossy().into_owned();
-        let gh = json!({ "owner": "o", "repo": "r" });
-        let gh_n = json!({ "owner": "o", "repo": "r", "number": 1 });
-        let sid = json!({ "serverId": "srv" });
-        let script = json!({ "workspaceId": ws, "scriptId": "s1" });
-        let term = json!({ "terminalId": "t1" });
-        vec![
-            (
-                "accept-changes.addRemote",
-                json!({ "workspaceId": ws, "remoteUrl": "u" }),
-            ),
-            (
-                "accept-changes.execute",
-                json!({ "workspaceId": ws, "action": "a" }),
-            ),
-            ("accept-changes.getStatus", json!({ "workspaceId": ws })),
-            (
-                "accept-changes.mergePR",
-                json!({ "workspaceId": ws, "prNumber": 1 }),
-            ),
-            (
-                "accept-changes.prepare",
-                json!({ "workspaceId": ws, "action": "a" }),
-            ),
-            (
-                "accept-changes.reconcile",
-                json!({"workspaceId":ws,"operationId":"held-operation","root":{"workspaceId":ws,"kind":"primary"}}),
-            ),
-            (
-                "accept-changes.release",
-                json!({"workspaceId":ws,"operationId":"held-operation","root":{"workspaceId":ws,"kind":"primary"}}),
-            ),
-            ("agent.cancelDelete", json!({ "agentId": "a1" })),
-            (
-                "agent.completeOnce",
-                json!({ "prompt": "p", "timeoutMs": 1 }),
-            ),
-            ("agent.create", json!({ "workspaceId": ws })),
-            (
-                "agent.delegate",
-                json!({ "workspaceId": ws, "taskNoteId": "t1" }),
-            ),
-            ("agent.delete", json!({ "agentId": "a1" })),
-            ("agent.diagnostics", json!({ "workspaceId": ws })),
-            (
-                "agent.enhancePrompt",
-                json!({ "prompt": "p", "timeoutMs": 1 }),
-            ),
-            ("agent.memoryUsage", json!({})),
-            (
-                "agent.replaceMessages",
-                json!({ "agentId": "a1", "messages": [] }),
-            ),
-            (
-                "agent.reportToParent",
-                json!({ "workspaceId": ws, "report": "r" }),
-            ),
-            (
-                "agent.resolveProposal",
-                json!({ "workspaceId": ws, "agentId": "a1", "proposalId": "p1", "outcome": "reject" }),
-            ),
-            (
-                "agent.wakeOrCreate",
-                json!({ "workspaceId": ws, "taskNoteId": "t1", "contextMessage": "c" }),
-            ),
-            ("debug.sampleStacks", json!({ "durationMs": 1 })),
-            ("file-tracking.getAgentLocks", json!({ "workspaceId": ws })),
-            ("file-tracking.getChanges", json!({ "workspaceId": ws })),
-            ("file-tracking.loadCommits", json!({ "workspaceId": ws })),
-            (
-                "file-tracking.stage",
-                json!({ "workspaceId": ws, "paths": [] }),
-            ),
-            (
-                "file-tracking.unstage",
-                json!({ "workspaceId": ws, "paths": [] }),
-            ),
-            (
-                "git.agentCommit",
-                json!({ "workspaceId": ws, "message": "m" }),
-            ),
-            (
-                "git.clone",
-                json!({ "url": "file:///nonexistent", "parentDir": dir }),
-            ),
-            ("github.authStatus", json!({})),
-            ("github.branches.list", gh.clone()),
-            ("github.branches.listCached", gh.clone()),
-            ("github.cancelAuth", json!({})),
-            ("github.connect", json!({})),
-            ("github.getReviewThreads", gh_n.clone()),
-            ("github.getUser", json!({})),
-            (
-                "github.identityProof.create",
-                json!({ "nonce": "n", "hostLabel": "h" }),
-            ),
-            ("github.identityProof.delete", json!({ "gistId": "g" })),
-            ("github.issues.get", gh_n.clone()),
-            ("github.issues.list", gh.clone()),
-            ("github.issues.search", gh.clone()),
-            ("github.listReviewComments", gh_n.clone()),
-            (
-                "github.pulls.create",
-                json!({ "owner": "o", "repo": "r", "title": "t", "body": "b", "head": "h", "base": "b" }),
-            ),
-            ("github.pulls.checks", gh_n.clone()),
-            ("github.pulls.files", gh_n.clone()),
-            ("github.pulls.reviews", gh_n.clone()),
-            ("github.pulls.get", gh_n.clone()),
-            ("github.pulls.list", gh.clone()),
-            ("github.pulls.merge", gh_n.clone()),
-            ("github.pulls.search", gh.clone()),
-            ("github.pulls.updateBranch", gh_n.clone()),
-            ("github.relatedRepos.list", gh.clone()),
-            (
-                "github.replyReviewComment",
-                json!({ "owner": "o", "repo": "r", "number": 1, "commentId": 1, "body": "b" }),
-            ),
-            ("github.repoConfig.get", gh.clone()),
-            ("github.repos.get", gh.clone()),
-            ("github.repos.list", json!({})),
-            ("github.repos.search", json!({ "query": "q" })),
-            ("github.resolveThread", json!({ "threadId": "t" })),
-            ("github.revoke", json!({})),
-            ("github.unresolveThread", json!({ "threadId": "t" })),
-            ("github.users.search", json!({ "query": "q" })),
-            ("hook.cancel", json!({ "workspaceId": ws, "hookId": "h1" })),
-            ("hook.runNow", json!({ "workspaceId": ws, "hookId": "h1" })),
-            ("host.executionContext", json!({})),
-            ("host.invite.list", json!({})),
-            (
-                "host.invite.searchAccounts",
-                json!({"provider":"github","query":"ab"}),
-            ),
-            ("host.invite.revoke", json!({ "inviteId": "missing" })),
-            ("host.members.list", json!({})),
-            ("host.members.remove", json!({"principalId":"missing"})),
-            ("linear.authStatus", json!({})),
-            (
-                "linear.createIssue",
-                json!({ "title": "t", "teamId": "team" }),
-            ),
-            ("linear.getIssue", json!({ "id": "i" })),
-            ("linear.listIssues", json!({})),
-            ("linear.listLabels", json!({})),
-            ("linear.listProjects", json!({})),
-            ("linear.listTeams", json!({})),
-            ("linear.listWorkflowStates", json!({})),
-            ("linear.searchIssues", json!({ "query": "q" })),
-            ("linear.updateIssue", json!({ "issueId": "i" })),
-            ("linear.viewer", json!({})),
-            ("mcp.oauth.delete", sid.clone()),
-            ("mcp.oauth.get", sid.clone()),
-            ("mcp.oauth.list", json!({})),
-            (
-                "mcp.oauth.set",
-                json!({ "serverId": "srv", "tokenBag": {} }),
-            ),
-            ("mcp.servers.create", json!({ "config": {} })),
-            ("mcp.servers.delete", sid.clone()),
-            ("mcp.servers.getStatus", sid.clone()),
-            ("mcp.servers.list", json!({})),
-            ("mcp.servers.restart", sid.clone()),
-            (
-                "mcp.servers.toggle",
-                json!({ "serverId": "srv", "enabled": false }),
-            ),
-            (
-                "mcp.servers.update",
-                json!({ "serverId": "srv", "config": {} }),
-            ),
-            (
-                "mcp.testConnection",
-                json!({ "url": "http://127.0.0.1:9/" }),
-            ),
-            (
-                "prMonitor.cancel",
-                json!({ "workspaceId": ws, "monitorId": "m1" }),
-            ),
-            (
-                "prMonitor.flush",
-                json!({ "workspaceId": ws, "monitorId": "m1" }),
-            ),
-            ("principal.list", json!({})),
-            ("repo.list", json!({})),
-            ("repo.remove", json!({ "path": dir })),
-            (
-                "repo.warmCache",
-                json!({ "githubUrl": "https://github.com/o/r" }),
-            ),
-            ("repoConfig.ensureDir", json!({ "workspaceId": ws })),
-            ("repoConfig.get", json!({ "workspaceId": ws })),
-            ("repoConfig.has", json!({ "workspaceId": ws })),
-            (
-                "repoConfig.save",
-                json!({ "workspaceId": ws, "config": {} }),
-            ),
-            ("rules.list", json!({})),
-            (
-                "rules.update",
-                json!({ "workspaceId": ws, "ruleType": "agents", "content": "" }),
-            ),
-            (
-                "sandbox.cow.discard",
-                json!({ "workspaceId": ws, "agentId": "a1" }),
-            ),
-            (
-                "sandbox.cow.merge",
-                json!({ "workspaceId": ws, "agentId": "a1" }),
-            ),
-            (
-                "script.archive",
-                json!({"workspaceId": ws, "scriptIds": ["s1"]}),
-            ),
-            (
-                "script.restore",
-                json!({"workspaceId": ws, "scriptIds": ["s1"]}),
-            ),
-            (
-                "script.create",
-                json!({ "workspaceId": ws, "name": "n", "command": "true", "mode": "command" }),
-            ),
-            ("script.list", json!({ "workspaceId": ws })),
-            ("script.get", script.clone()),
-            ("script.output", script.clone()),
-            ("script.remove", script.clone()),
-            ("script.restart", script.clone()),
-            ("script.run", script.clone()),
-            ("script.start", script.clone()),
-            ("script.status", script.clone()),
-            ("script.stop", script.clone()),
-            (
-                "scriptMonitor.cancel",
-                json!({ "workspaceId": ws, "monitorId": "m1" }),
-            ),
-            (
-                "scriptMonitor.cancelRun",
-                json!({ "workspaceId": ws, "monitorId": "m1" }),
-            ),
-            ("sentry.assignIssue", json!({ "id": "i" })),
-            ("sentry.authStatus", json!({})),
-            ("sentry.getIssue", json!({ "id": "i" })),
-            ("sentry.ignoreIssue", json!({ "id": "i" })),
-            ("sentry.listIssues", json!({})),
-            ("sentry.listProjects", json!({})),
-            ("sentry.resolveIssue", json!({ "id": "i" })),
-            ("sentry.searchIssues", json!({ "query": "q" })),
-            ("settings.get", json!({ "path": "model.defaultProvider" })),
-            ("settings.list", json!({})),
-            ("settings.reset", json!({ "path": "model.defaultProvider" })),
-            ("settings.update", json!({ "changes": {} })),
-            ("identity.authStatus", json!({"provider":"github"})),
-            (
-                "identity.cancelAuth",
-                json!({"provider":"github", "flowId":"f"}),
-            ),
-            ("identity.connect", json!({"provider":"github"})),
-            ("identity.getUser", json!({"provider":"github"})),
-            ("identity.revoke", json!({"provider":"github"})),
-            (
-                "identity.select",
-                json!({"provider":"github", "externalUserId":"1"}),
-            ),
-            ("sourceControl.authStatus", json!({ "provider": "github" })),
-            ("sourceControl.cancelAuth", json!({ "provider": "github" })),
-            ("sourceControl.connect", json!({ "provider": "github" })),
-            ("sourceControl.getUser", json!({ "provider": "github" })),
-            (
-                "sourceControl.identityProof.create",
-                json!({ "provider": "github", "nonce": "n", "hostLabel": "h" }),
-            ),
-            (
-                "sourceControl.identityProof.delete",
-                json!({ "provider": "github", "proofId": "g" }),
-            ),
-            ("sourceControl.revoke", json!({ "provider": "github" })),
-            ("specialist.create", json!({ "id": "s", "spec": {} })),
-            ("specialist.delete", json!({ "id": "s", "scope": "global" })),
-            (
-                "specialist.edit",
-                json!({ "id": "s", "spec": {}, "scope": "global" }),
-            ),
-            ("terminal.create", json!({ "workspaceId": ws })),
-            ("terminal.getBuffer", term.clone()),
-            ("terminal.kill", term.clone()),
-            ("terminal.list", json!({ "workspaceId": ws })),
-            (
-                "terminal.readOutput",
-                json!({ "workspaceId": ws, "terminalId": "t1" }),
-            ),
-            ("terminal.resize", term.clone()),
-            ("terminal.write", json!({ "terminalId": "t1", "data": "" })),
-            ("unsloth.status", json!({})),
-            ("unsloth.stop", json!({})),
-            ("voice.getWorkspaceVocabulary", json!({ "workspaceId": ws })),
-            ("voice.transcribe", json!({ "audio": "AAAA" })),
-            ("workspace.archive", json!({ "workspaceId": ws })),
-            ("workspace.cancelDelete", json!({ "workspaceId": ws })),
-            ("workspace.cleanup", json!({ "workspaceId": ws })),
-            (
-                "workspace.create",
-                json!({ "title": "t", "repositoryPath": format!("{dir}/missing-repo") }),
-            ),
-            ("workspace.delete", json!({ "workspaceId": ws })),
-            ("workspace.detectProjectType", json!({ "workspaceId": ws })),
-            ("workspace.diskUsage", json!({ "workspaceId": ws })),
-            ("workspace.duplicate", json!({ "workspaceId": ws })),
-            ("workspace.export.abort", json!({ "exportId": "e1" })),
-            ("workspace.export.finalize", json!({ "exportId": "e1" })),
-            (
-                "workspace.export.read",
-                json!({ "exportId": "e1", "seq": 0 }),
-            ),
-            ("workspace.export.start", json!({ "workspaceId": ws })),
-            ("workspace.findRepositories", json!({ "directory": dir })),
-            (
-                "workspace.generateSetupScript",
-                json!({ "workspaceId": ws }),
-            ),
-            ("workspace.getBrowserClient", json!({ "workspaceId": ws })),
-            ("workspace.getSetupScript", json!({ "workspaceId": ws })),
-            ("workspace.import.abort", json!({ "importId": "i1" })),
-            (
-                "workspace.import.begin",
-                json!({ "manifest": {}, "archiveSizeBytes": 1, "archiveSha256": "00" }),
-            ),
-            (
-                "workspace.import.chunk",
-                json!({ "importId": "i1", "seq": 0, "data": "" }),
-            ),
-            ("workspace.import.commit", json!({ "importId": "i1" })),
-            (
-                "workspace.initializeRepository",
-                json!({ "path": format!("{dir}/missing-repo") }),
-            ),
-            ("workspace.invite.list", json!({ "workspaceId": ws })),
-            (
-                "workspace.invite.revoke",
-                json!({ "workspaceId": ws, "inviteId": "inv" }),
-            ),
-            (
-                "workspace.members.add",
-                json!({ "workspaceId": ws, "principalId": "p" }),
-            ),
-            (
-                "workspace.members.remove",
-                json!({ "workspaceId": ws, "principalId": "p" }),
-            ),
-            ("workspace.restore", json!({ "workspaceId": ws })),
-            (
-                "workspace.saveSetupScript",
-                json!({ "workspaceId": ws, "script": "" }),
-            ),
-            (
-                "workspace.setAutoCommit",
-                json!({ "workspaceId": ws, "enabled": false }),
-            ),
-            (
-                "workspace.setBrowserClient",
-                json!({ "workspaceId": ws, "clientId": null }),
-            ),
-            ("workspace.transfer.plan", json!({ "workspaceId": ws })),
-            ("workspace.unarchive", json!({ "workspaceId": ws })),
-        ]
-    }
-
-    /// The derived universe: owner-only router methods, sorted.
-    fn owner_only_router_methods() -> Vec<&'static str> {
-        let allowed: std::collections::HashSet<&str> =
-            COLLABORATOR_METHODS.iter().map(|(m, _)| *m).collect();
-        ROUTER_METHODS
-            .iter()
-            .copied()
-            .filter(|m| !allowed.contains(m))
-            .collect()
-    }
-
-    /// `intent_services::capability::ASSERT_BOUND_CALLER_ENV`: armed, an
-    /// unbound capability gate aborts the process instead of answering
-    /// `-32003`, which is the very outcome this module observes.
-    const ASSERT_BOUND_CALLER_ENV: &str = "INTENTD_ASSERT_BOUND_CALLER";
-
-    /// CI's coverage jobs run the suite with [`ASSERT_BOUND_CALLER_ENV`]
-    /// set, so when it is, this re-runs `test` (a name in this module) in a
-    /// copy of this binary with the variable removed, asserts that it
-    /// passed, and answers `true` so the caller returns; unarmed (locally,
-    /// and inside that child) it answers `false` and the caller runs its
-    /// body inline. A re-exec rather than `remove_var`: the harness is
-    /// multi-threaded.
-    fn reran_unarmed(test: &str) -> bool {
-        if std::env::var_os(ASSERT_BOUND_CALLER_ENV).is_none() {
-            return false;
-        }
-        let exe = std::env::current_exe().expect("test binary");
-        let out = std::process::Command::new(exe)
-            .args([
-                "--exact",
-                &format!("catalog::tests::unbound_owner_only_methods::{test}"),
-                "--nocapture",
-            ])
-            .env_remove(ASSERT_BOUND_CALLER_ENV)
-            .output()
-            .expect("run unarmed child");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "unarmed `{test}`: {:?}\n{stdout}\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
-        true
-    }
-
-    /// One unbound dispatch through the real router; the outcome label is
-    /// `ok` or the JSON-RPC error code.
-    async fn dispatch_unbound(services: &Services, method: &str, params: &Value) -> String {
-        assert_eq!(
-            intent_core::current_caller(),
-            None,
-            "{method}: caller leaked"
-        );
-        let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-        let raw = handle_message(services, &frame.to_string())
-            .await
-            .expect("request gets a response");
-        let response: Value = serde_json::from_str(&raw).expect("response is JSON");
-        match response.get("error").and_then(|e| e["code"].as_i64()) {
-            Some(code) => code.to_string(),
-            None => "ok".to_string(),
-        }
-    }
-
-    #[tokio::test]
-    async fn every_owner_only_router_method_is_forbidden_unbound() {
-        if reran_unarmed("every_owner_only_router_method_is_forbidden_unbound") {
-            return;
-        }
-        let f = fixture().await;
-        let table: BTreeMap<&str, Value> = minimal_params(&f).into_iter().collect();
-        let universe = owner_only_router_methods();
-
-        // The table and the derived universe must match exactly, so a new
-        // owner-only router method cannot escape the sweep.
-        let missing: Vec<&str> = universe
-            .iter()
-            .copied()
-            .filter(|m| !table.contains_key(m))
-            .collect();
-        let stale: Vec<&str> = table
-            .keys()
-            .copied()
-            .filter(|m| !universe.contains(m))
-            .collect();
-        assert!(
-            missing.is_empty() && stale.is_empty(),
-            "owner-only router table drift — add a minimal-params row for each new \
-             method (missing: {missing:?}); drop rows for methods no longer owner-only \
-             or no longer routed (stale: {stale:?})"
-        );
-
-        let mut ungated: Vec<(String, String)> = Vec::new();
-        for method in &universe {
-            let outcome = dispatch_unbound(&f.services, method, &table[method]).await;
-            if outcome != "-32003" {
-                ungated.push(((*method).to_string(), outcome));
-            }
-        }
-        // The two goldens are disjoint and, merged by method, are exactly
-        // what the sweep may observe: a conditionally gated row's *unarmed*
-        // outcome and a genuinely ungated method's outcome.
-        let mut golden: BTreeMap<String, String> = BTreeMap::new();
-        for (m, o, _) in CONDITIONALLY_GATED_AT_SERVICE_LAYER {
-            assert!(
-                golden.insert((*m).to_string(), (*o).to_string()).is_none(),
-                "{m}: duplicated in CONDITIONALLY_GATED_AT_SERVICE_LAYER"
-            );
-        }
-        for (m, o) in UNGATED_AT_SERVICE_LAYER {
-            assert!(
-                golden.insert((*m).to_string(), (*o).to_string()).is_none(),
-                "{m}: named in both CONDITIONALLY_GATED_AT_SERVICE_LAYER and \
-                 UNGATED_AT_SERVICE_LAYER"
-            );
-        }
-        let golden: Vec<(String, String)> = golden.into_iter().collect();
-        if ungated != golden {
-            let mut msg = String::from(
-                "Unbound owner-only router methods not answering -32003 Forbidden drifted \
-                 from CONDITIONALLY_GATED_AT_SERVICE_LAYER ∪ UNGATED_AT_SERVICE_LAYER.\n\
-                 A `-32602` here usually means the table row is not valid enough to reach \
-                 the service method; an `ok` or other code means the service method \
-                 returns before its capability gate — move the gate first (see \
-                 `agent_respond_permission`), or name it in \
-                 CONDITIONALLY_GATED_AT_SERVICE_LAYER (gate conditional on an optional \
-                 argument or a live session; add its armed cell) or in \
-                 UNGATED_AT_SERVICE_LAYER (no gate) with a reason.\n\
-                 Recomputed (merged) golden:\n",
-            );
-            for (m, o) in &ungated {
-                let _ = writeln!(msg, "    (\"{m}\", \"{o}\"),");
-            }
-            panic!("{msg}");
-        }
-    }
-
-    /// One dispatch through the real router with the daemon caller bound;
-    /// the decoded response envelope.
-    async fn dispatch_as_daemon(services: &Services, method: &str, params: &Value) -> Value {
-        intent_core::with_caller(intent_core::Caller::Daemon, async {
-            let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-            let raw = handle_message(services, &frame.to_string())
-                .await
-                .expect("request gets a response");
-            serde_json::from_str::<Value>(&raw).expect("response is JSON")
-        })
-        .await
-    }
-
-    /// Drive the gated `workspace.export.start` as the daemon on the fixture
-    /// workspace (repo-less, so the build is a manifest and no bundle) and
-    /// wait for the session to seal: `workspace.export.read` answers
-    /// `-32602` while building and `ok` once Ready. Returns the `exportId`.
-    async fn ready_export(f: &Fixture) -> String {
-        let start = dispatch_as_daemon(
-            &f.services,
-            "workspace.export.start",
-            &json!({ "workspaceId": f.ws.as_str() }),
-        )
-        .await;
-        let export_id = start["result"]["exportId"]
-            .as_str()
-            .unwrap_or_else(|| panic!("daemon-bound workspace.export.start: {start}"))
-            .to_string();
-        let read = json!({ "exportId": export_id, "seq": 0 });
-        for _ in 0..400 {
-            let response = dispatch_as_daemon(&f.services, "workspace.export.read", &read).await;
-            match response.get("error") {
-                None => return export_id,
-                Some(e) if e["data"]["code"] == json!("not-found") => {
-                    panic!("export {export_id} failed to build: {response}")
-                }
-                Some(_) => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
-            }
-        }
-        panic!("export {export_id} did not become Ready");
-    }
-
-    /// Every armed mode of every [`CONDITIONALLY_GATED_AT_SERVICE_LAYER`]
-    /// row, through the real router into the same unbound `Services`, must
-    /// be `-32003`:
-    ///
-    /// - Scope arguments: the sweep's minimal params plus `workspaceId` /
-    ///   `agentId`. The gate runs before any lookup, so an unknown `agentId`
-    ///   is still `Forbidden` unbound, never `NotFound`.
-    /// - `workspace.export.finalize`: a Ready session (built by the daemon)
-    ///   with `finalStatusMessage` reaches the gated `update_workspace`, and
-    ///   with `archiveSource: true` the gated `archive_workspace`. Both
-    ///   mutations run before the session is retired, so the one session
-    ///   serves both cells and stays Ready after each refusal. The same
-    ///   session then pins the row's live unarmed mode: finalize with
-    ///   neither option runs no gated call, so unbound it is `ok` and
-    ///   retires the session (the next read is `-32602`). Gating that
-    ///   mode is a capability-rule change, out of this table's remit.
-    ///
-    /// `git.agentCommit` is the one row whose router arm cannot arm the gate:
-    /// it passes `agent_id = None` unconditionally (the wire shape has no
-    /// `agentId`; the MCP bridge is the only caller that supplies one). Both
-    /// halves are asserted — the wire call with an `agentId` keeps the
-    /// unscoped outcome, and the service method called directly with one is
-    /// `Forbidden` — so a router arm that starts forwarding `agentId` fails
-    /// here and moves the cell onto the router path.
-    #[tokio::test]
-    async fn ready_export_requires_bound_caller_without_finalize_options() {
-        if reran_unarmed("ready_export_requires_bound_caller_without_finalize_options") {
-            return;
-        }
-        let f = fixture().await;
-        let export_id = ready_export(&f).await;
-        for method in [
-            "workspace.export.read",
-            "workspace.export.abort",
-            "workspace.export.finalize",
-        ] {
-            let params = json!({"exportId":export_id,"seq":0});
-            assert_eq!(
-                dispatch_unbound(&f.services, method, &params).await,
-                "-32003"
-            );
-        }
-        let response = dispatch_as_daemon(
-            &f.services,
-            "workspace.export.read",
-            &json!({"exportId":export_id,"seq":0}),
-        )
-        .await;
-        assert!(response.get("error").is_none(), "{response}");
-    }
-
-    #[tokio::test]
-    async fn armed_conditional_gates_are_forbidden_unbound() {
-        if reran_unarmed("armed_conditional_gates_are_forbidden_unbound") {
-            return;
-        }
-        let f = fixture().await;
-        let table: BTreeMap<&str, Value> = minimal_params(&f).into_iter().collect();
-        for (method, unarmed, arming) in CONDITIONALLY_GATED_AT_SERVICE_LAYER {
-            let mut params = table[method].clone();
-            let (scope, scope_value) = match arming {
-                Arming::WorkspaceId => ("workspaceId", f.ws.as_str().to_string()),
-                Arming::AgentId => ("agentId", "a1".to_string()),
-            };
-            assert!(
-                params.get(scope).is_none(),
-                "{method}: minimal params already carry `{scope}`, so the sweep is not \
-                 exercising the unscoped call"
-            );
-            params[scope] = json!(scope_value);
-            let outcome = dispatch_unbound(&f.services, method, &params).await;
-            if *method == "git.agentCommit" {
-                assert_eq!(
-                    outcome, *unarmed,
-                    "git.agentCommit: the router arm now forwards `agentId` — assert \
-                     -32003 through the router here and drop the direct call"
-                );
-                continue;
-            }
-            assert_eq!(
-                outcome, "-32003",
-                "{method} with `{scope}` supplied must reach its capability gate unbound"
-            );
-        }
-
-        assert_eq!(intent_core::current_caller(), None, "caller leaked");
-        let direct = f
-            .services
-            .git_agent_commit(
-                f.ws.clone(),
-                "m".to_string(),
-                Some(AgentId::from("a1")),
-                None,
-                None,
-                false,
-                None,
-            )
-            .await;
-        assert!(
-            matches!(direct, Err(Error::Forbidden(_))),
-            "git_agent_commit with an agentId, unbound: {direct:?}"
-        );
-    }
-
-    /// Positive control for the table: the same real router + `Services`
-    /// answers a bound daemon caller on a gated method, so `-32003` above is
-    /// the missing binding and not the fixture.
-    #[tokio::test]
-    async fn bound_daemon_control_passes_a_gated_method() {
-        if reran_unarmed("bound_daemon_control_passes_a_gated_method") {
-            return;
-        }
-        let f = fixture().await;
-        let params = json!({ "workspaceId": f.ws.as_str() });
-        let unbound = dispatch_unbound(&f.services, "workspace.invite.list", &params).await;
-        assert_eq!(unbound, "-32003");
-        let bound = intent_core::with_caller(intent_core::Caller::Daemon, async {
-            let frame = json!({
-                "jsonrpc": "2.0", "id": 1,
-                "method": "workspace.invite.list", "params": params,
-            });
-            let raw = handle_message(&f.services, &frame.to_string())
-                .await
-                .expect("response");
-            serde_json::from_str::<Value>(&raw).expect("json")
-        })
-        .await;
-        assert!(
-            bound.get("error").is_none(),
-            "daemon-bound workspace.invite.list: {bound}"
-        );
-    }
-
-    /// Regression (PR #1877 review): `agent.respondPermission` returned
-    /// `Ok({ resolved: false })` from its no-manager early return *before*
-    /// the caller gate, so an unbound context saw a success. The gate now
-    /// runs first; with no runtime manager (this fixture) the unbound call is
-    /// `-32003`, while a bound daemon caller keeps the unresolved answer.
-    #[tokio::test]
-    async fn unbound_respond_permission_is_forbidden_without_a_manager() {
-        if reran_unarmed("unbound_respond_permission_is_forbidden_without_a_manager") {
-            return;
-        }
-        let f = fixture().await;
-        let params = json!({ "requestId": "req-1", "outcome": { "outcome": "cancelled" } });
-        let unbound = dispatch_unbound(&f.services, "agent.respondPermission", &params).await;
-        assert_eq!(unbound, "-32003");
-        let bound = intent_core::with_caller(intent_core::Caller::Daemon, async {
-            let frame = json!({
-                "jsonrpc": "2.0", "id": 1,
-                "method": "agent.respondPermission", "params": params,
-            });
-            let raw = handle_message(&f.services, &frame.to_string())
-                .await
-                .expect("response");
-            serde_json::from_str::<Value>(&raw).expect("json")
-        })
-        .await;
-        assert_eq!(
-            bound["result"],
-            json!({ "resolved": false }),
-            "daemon-bound agent.respondPermission: {bound}"
-        );
-    }
-}
-
 /// Freeze a separate member remainder; the guest golden remains unchanged.
 #[test]
 fn member_methods_and_administrator_remainder_are_classified() {
@@ -2498,6 +1838,9 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "agent.replaceMessages",
         "agent.reportToParent",
         "debug.sampleStacks",
+        "executor.list",
+        "executor.mint",
+        "executor.revoke",
         "github.authStatus",
         "github.cancelAuth",
         "github.connect",
@@ -2552,10 +1895,29 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "mcp.servers.update",
         "mcp.testConnection",
         "pairing.getInfo",
+        "plugin.install",
+        "plugin.list",
+        "plugin.toggle",
+        "plugin.uninstall",
+        "plugin.update",
+        "providers.profiles.create",
+        "providers.profiles.delete",
+        "providers.profiles.list",
+        "providers.profiles.reorder",
+        "providers.profiles.update",
+        "providers.profiles.updateDefault",
         "providers.setup.cancel",
         "providers.setup.login",
         "providers.setup.start",
         "providers.setup.status",
+        "remoteLinkTraffic.snapshot",
+        "remoteLinkTraffic.start",
+        "remoteLinkTraffic.stop",
+        "remoteMachines.add",
+        "remoteMachines.backendInfo",
+        "remoteMachines.list",
+        "remoteMachines.refresh",
+        "remoteMachines.remove",
         "repo.remove",
         "rules.update",
         "sentry.authStatus",
@@ -2569,16 +1931,19 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "sourceControl.cancelAuth",
         "sourceControl.connect",
         "sourceControl.getUser",
+        "sourceControl.gitlab.childGit.get",
+        "sourceControl.gitlab.childGit.set",
         "sourceControl.identityProof.create",
         "sourceControl.identityProof.delete",
+        "sourceControl.read.resolveKnownRepository",
         "sourceControl.revoke",
         "specialist.create",
         "specialist.delete",
         "specialist.edit",
         "system.gitCredential",
-        "system.importLegacy",
         "system.requestUpdate",
         "system.shutdown",
+        "system.startupStatus",
         "unsloth.status",
         "unsloth.stop",
     ];
@@ -2619,4 +1984,259 @@ fn removed_git_commit_is_not_advertised_or_authorized() {
     assert!(!super::collaborator_may_call("git.commit"));
     assert!(!super::collaborator_may_call("git.agentCommit"));
     assert!(super::member_may_call("git.agentCommit"));
+}
+
+// ---------------------------------------------------------------------------
+// Payload budget classification (PAYLOAD_CLASSES / SNAPSHOT_CHANNELS)
+// ---------------------------------------------------------------------------
+
+/// Router and fast-path methods: the set `PAYLOAD_CLASSES` must cover.
+fn payload_universe() -> BTreeSet<&'static str> {
+    ROUTER_METHODS
+        .iter()
+        .chain(FASTPATH_METHODS.iter())
+        .copied()
+        .collect()
+}
+
+/// The coverage problems of `classified` against `universe`, or `None`
+/// when every method is classified exactly once and nothing is stale.
+fn payload_classification_drift(universe: &BTreeSet<&str>, classified: &[&str]) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    let duplicates: BTreeSet<&str> = classified
+        .iter()
+        .copied()
+        .filter(|m| !seen.insert(*m))
+        .collect();
+    let unclassified: Vec<&str> = universe.difference(&seen).copied().collect();
+    let stale: Vec<&str> = seen.difference(universe).copied().collect();
+    if duplicates.is_empty() && unclassified.is_empty() && stale.is_empty() {
+        return None;
+    }
+    let mut msg = String::from(
+        "Payload classification drift: every method in ROUTER_METHODS and FASTPATH_METHODS must appear exactly once in catalog.rs PAYLOAD_CLASSES.\n",
+    );
+    if !unclassified.is_empty() {
+        let _ = writeln!(
+            msg,
+            "\nUnclassified — add a row to PAYLOAD_CLASSES (bounded / bulk / proxy / subscription / mutation) with a short reason:"
+        );
+        for m in &unclassified {
+            let _ = writeln!(msg, "  {m}");
+        }
+    }
+    if !duplicates.is_empty() {
+        let _ = writeln!(msg, "\nDuplicate — keep exactly one row for:");
+        for m in &duplicates {
+            let _ = writeln!(msg, "  {m}");
+        }
+    }
+    if !stale.is_empty() {
+        let _ = writeln!(
+            msg,
+            "\nStale — no longer a router or fast-path method; remove the row:"
+        );
+        for m in &stale {
+            let _ = writeln!(msg, "  {m}");
+        }
+    }
+    Some(msg)
+}
+
+#[test]
+fn payload_classes_cover_every_method_exactly_once() {
+    let classified: Vec<&str> = PAYLOAD_CLASSES.iter().map(|row| row.method).collect();
+    if let Some(msg) = payload_classification_drift(&payload_universe(), &classified) {
+        panic!("{msg}");
+    }
+}
+
+#[test]
+fn payload_classification_drift_reports_unclassified_duplicate_and_stale() {
+    let universe: BTreeSet<&str> = ["a.read", "b.write", "c.new"].into_iter().collect();
+    assert_eq!(
+        payload_classification_drift(&universe, &["a.read", "b.write", "c.new"]),
+        None
+    );
+    let msg = payload_classification_drift(&universe, &["a.read", "a.read", "b.write", "z.gone"])
+        .expect("drift must be reported");
+    assert!(
+        msg.contains("Unclassified") && msg.contains("  c.new"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("Duplicate") && msg.contains("  a.read"),
+        "{msg}"
+    );
+    assert!(msg.contains("Stale") && msg.contains("  z.gone"), "{msg}");
+}
+
+#[test]
+fn payload_classes_are_sorted_and_explained() {
+    let listed: Vec<&str> = PAYLOAD_CLASSES.iter().map(|row| row.method).collect();
+    let mut sorted = listed.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        listed, sorted,
+        "PAYLOAD_CLASSES must be sorted alphabetically by method"
+    );
+    for row in PAYLOAD_CLASSES {
+        assert!(
+            !row.reason.trim().is_empty(),
+            "PAYLOAD_CLASSES row {} has no reason — say what it returns or does",
+            row.method
+        );
+    }
+}
+
+#[test]
+fn payload_class_parameters_are_well_formed() {
+    const PROXY_NAMESPACES: &[&str] = &["github.", "linear.", "sentry.", "sourceControl."];
+    for row in PAYLOAD_CLASSES {
+        match row.class {
+            PayloadClass::BulkTransfer {
+                cap_param,
+                max_bytes,
+            } => {
+                assert!(
+                    max_bytes > READ_PAYLOAD_BUDGET_BYTES
+                        && max_bytes <= crate::MAX_OUTBOUND_MESSAGE_BYTES,
+                    "BulkTransfer {}: max_bytes {max_bytes} must exceed the read budget (else classify it BoundedRead) and fit the outbound frame cap",
+                    row.method
+                );
+                if let Some(param) = cap_param {
+                    assert!(
+                        !param.trim().is_empty(),
+                        "BulkTransfer {}: name the param that shrinks one response, or use None for a server-side bound",
+                        row.method
+                    );
+                }
+            }
+            PayloadClass::ExternalProxy { page_param } => {
+                assert!(
+                    PROXY_NAMESPACES.iter().any(|ns| row.method.starts_with(ns)),
+                    "ExternalProxy {} is not a GitHub, Linear, Sentry or source-control method",
+                    row.method
+                );
+                if let Some(param) = page_param {
+                    assert!(
+                        !param.trim().is_empty(),
+                        "ExternalProxy {}: page_param must name the clamped page-size param or be None",
+                        row.method
+                    );
+                }
+            }
+            PayloadClass::BoundedRead | PayloadClass::Subscription | PayloadClass::Mutation => {}
+        }
+    }
+}
+
+/// Regression: every bulk row's cap matches what its handler enforces, and
+/// only intentional downloads are bulk. `workspace.export.read`'s `seq`
+/// selects a chunk rather than sizing it. `terminal.getBuffer` must stay a
+/// `BoundedRead`: scrollback replay runs on every terminal open, so moving
+/// it to bulk would silently drop it from the payload sweep; so must
+/// `agent.getMessageBlock`, which pages under the read budget. Update this
+/// list together with the handler.
+#[test]
+fn bulk_transfer_caps_match_handlers() {
+    let chunk = intent_services::feature_api::feature_ports::IMPORT_MAX_CHUNK_BYTES;
+    let expected: BTreeSet<(&str, Option<&str>, usize)> = [
+        ("file.readChunk", Some("length"), chunk),
+        ("git.showFileChunk", Some("length"), chunk),
+        ("note.readAssetChunk", Some("length"), chunk),
+        ("workspace.export.read", None, chunk),
+    ]
+    .into_iter()
+    .collect();
+    let actual: BTreeSet<(&str, Option<&str>, usize)> = PAYLOAD_CLASSES
+        .iter()
+        .filter_map(|row| match row.class {
+            PayloadClass::BulkTransfer {
+                cap_param,
+                max_bytes,
+            } => Some((row.method, cap_param, max_bytes)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "BulkTransfer rows changed: check each cap against its handler and update this list"
+    );
+    let terminal = PAYLOAD_CLASSES
+        .iter()
+        .find(|row| row.method == "terminal.getBuffer")
+        .expect("terminal.getBuffer is classified");
+    assert_eq!(
+        terminal.class,
+        PayloadClass::BoundedRead,
+        "terminal.getBuffer is a normal operation (replay on every terminal open); keep it BoundedRead so the payload sweep covers it"
+    );
+    let block = PAYLOAD_CLASSES
+        .iter()
+        .find(|row| row.method == "agent.getMessageBlock")
+        .expect("agent.getMessageBlock is classified");
+    assert_eq!(
+        block.class,
+        PayloadClass::BoundedRead,
+        "agent.getMessageBlock pages each block under the read budget; keep it BoundedRead so the payload sweep covers it"
+    );
+}
+
+/// `*.subscribe` methods whose subscribe sends **no** seq-0 snapshot. Every
+/// other subscribe method must be in [`SNAPSHOT_CHANNELS`].
+const SNAPSHOT_FREE_SUBSCRIBE_METHODS: &[&str] = &[
+    // The event stream only tails live events; there is no initial state.
+    "events.subscribe",
+];
+
+#[test]
+fn snapshot_channels_list_every_snapshot_subscribe_method() {
+    let subscribe: BTreeSet<String> = client_callable_universe()
+        .into_iter()
+        .filter(|m| m.ends_with(".subscribe"))
+        .collect();
+    let listed: BTreeSet<String> = SNAPSHOT_CHANNELS
+        .iter()
+        .map(|(m, _)| *m)
+        .chain(SNAPSHOT_FREE_SUBSCRIBE_METHODS.iter().copied())
+        .map(str::to_string)
+        .collect();
+    let unclassified: Vec<_> = subscribe.difference(&listed).collect();
+    let stale: Vec<_> = listed.difference(&subscribe).collect();
+    assert!(
+        unclassified.is_empty() && stale.is_empty(),
+        "Snapshot channel drift.\n\
+         Unclassified subscribe methods {unclassified:?}: if the subscribe sends a seq-0 snapshot, add it to catalog.rs SNAPSHOT_CHANNELS with what the snapshot holds (the payload sweep subscribes to each); otherwise name it in SNAPSHOT_FREE_SUBSCRIBE_METHODS in catalog/tests.rs.\n\
+         Stale entries {stale:?}: no such subscribe method any more; remove them."
+    );
+}
+
+#[test]
+fn snapshot_channels_are_sorted_unique_and_explained() {
+    let listed: Vec<&str> = SNAPSHOT_CHANNELS.iter().map(|(m, _)| *m).collect();
+    let mut sorted = listed.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        listed, sorted,
+        "SNAPSHOT_CHANNELS must be sorted alphabetically with no duplicates"
+    );
+    for (method, note) in SNAPSHOT_CHANNELS {
+        assert!(
+            !note.trim().is_empty(),
+            "SNAPSHOT_CHANNELS {method} must say what its seq-0 snapshot holds"
+        );
+        assert!(
+            !SNAPSHOT_FREE_SUBSCRIBE_METHODS.contains(method),
+            "{method} is listed as both snapshot and snapshot-free"
+        );
+        if let Some(row) = PAYLOAD_CLASSES.iter().find(|row| row.method == *method) {
+            assert_eq!(
+                row.class,
+                PayloadClass::Subscription,
+                "{method} sends a seq-0 snapshot, so its PAYLOAD_CLASSES row must be Subscription"
+            );
+        }
+    }
 }

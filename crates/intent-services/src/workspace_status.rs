@@ -17,9 +17,12 @@
 //! emit `workspace:displayStatus-changed` or touch the baseline.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use intent_core::events::{WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_WAITING_CHANGED};
+use intent_core::events::{
+    WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED, WORKSPACE_DISPLAY_STATUS_CHANGED,
+    WORKSPACE_SCRIPTS_RUNNING_CHANGED, WORKSPACE_WAITING_CHANGED,
+};
 use intent_core::{
     now_iso, AgentId, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity,
     WorkspaceAttention, WorkspaceDisplayStatus, WorkspaceId, WorkspaceTaskStats,
@@ -58,6 +61,95 @@ pub(crate) type DisplayStatusCache = LastObservedCache<WorkspaceDisplayStatus>;
 
 /// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §5.1).
 pub(crate) type WaitingStatusCache = LastObservedCache<bool>;
+
+/// All recompute state for the orthogonal in-memory running flags
+/// `Workspace.scriptsRunning` and `Workspace.backgroundTasksRunning`, behind
+/// ONE `Arc` on `Services` (every extra `Services` field is copied into each
+/// future that captures a services clone, and deep agent-turn futures sit
+/// near the test thread's stack limit):
+///
+/// - `scripts` / `background_tasks`: one [`RunningFlagGate`] per flag;
+/// - `park` (tests only): see [`ScriptsRunningPark`].
+#[derive(Default)]
+pub(crate) struct ScriptsRunningState {
+    scripts: RunningFlagGate,
+    background_tasks: RunningFlagGate,
+    #[cfg(any(test, feature = "test-hooks"))]
+    park: Mutex<Option<Arc<ScriptsRunningPark>>>,
+}
+
+impl ScriptsRunningState {
+    fn gate(&self, flag: RunningFlag) -> &RunningFlagGate {
+        match flag {
+            RunningFlag::Scripts => &self.scripts,
+            RunningFlag::BackgroundTasks => &self.background_tasks,
+        }
+    }
+
+    /// Drop a deleted workspace's baselines and gates.
+    fn evict(&self, workspace_id: &WorkspaceId) {
+        self.scripts.evict(workspace_id);
+        self.background_tasks.evict(workspace_id);
+    }
+}
+
+/// One orthogonal in-memory running flag (PROTOCOL §5.1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunningFlag {
+    /// `Workspace.scriptsRunning`: a command-mode script run in flight.
+    Scripts,
+    /// `Workspace.backgroundTasksRunning`: a §5.5b worker still running.
+    BackgroundTasks,
+}
+
+/// The state behind one [`RunningFlag`]:
+///
+/// - `cache`: the last-observed value per workspace, the transition baseline
+///   for the flag's change event;
+/// - `locks`: the per-workspace ordering gate. The live read, baseline
+///   record and publication run under it, so concurrent recomputes for one
+///   workspace (two scripts, each holding only its own publication lock, or
+///   recomputes spawned from successive worker snapshots) cannot publish out
+///   of order. Different workspaces never contend.
+#[derive(Default)]
+struct RunningFlagGate {
+    cache: WaitingStatusCache,
+    locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl RunningFlagGate {
+    fn lock_for(&self, workspace_id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(workspace_id.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// Drop a deleted workspace's baseline and gate; a gate holder keeps its
+    /// own `Arc`.
+    fn evict(&self, workspace_id: &WorkspaceId) {
+        self.cache.evict(workspace_id);
+        self.locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(workspace_id);
+    }
+}
+
+/// Test seam: parks the next `scriptsRunning` recompute that observed a
+/// transition, after its first registry read and before its store await, so
+/// a test can interleave a newer script start (one-shot).
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+#[derive(Default)]
+pub struct ScriptsRunningPark {
+    /// Signaled by the parked recompute on entering the window.
+    pub entered: tokio::sync::Notify,
+    /// Held by the parked recompute until the test releases it.
+    pub release: tokio::sync::Notify,
+}
 
 struct CacheInner<T> {
     map: HashMap<WorkspaceId, T>,
@@ -187,7 +279,7 @@ impl Services {
     pub(crate) async fn enrich_display_status(
         &self,
         ws: &mut Workspace,
-        sessions: Option<&[intent_core::AgentSession]>,
+        sessions: Option<&[intent_store::AgentSessionSummary]>,
         unread: Option<bool>,
         external_prs: Option<WorkspaceExternalPrs<'_>>,
     ) {
@@ -201,7 +293,7 @@ impl Services {
     pub(crate) async fn enrich_display_status_with_snapshot(
         &self,
         ws: &mut Workspace,
-        sessions: Option<&[intent_core::AgentSession]>,
+        sessions: Option<&[intent_store::AgentSessionSummary]>,
         unread: Option<bool>,
         snapshot: Option<WorkspaceStatusSnapshot<'_>>,
     ) {
@@ -218,7 +310,7 @@ impl Services {
     async fn enrich_display_status_inner(
         &self,
         ws: &mut Workspace,
-        sessions: Option<&[intent_core::AgentSession]>,
+        sessions: Option<&[intent_store::AgentSessionSummary]>,
         unread: Option<bool>,
         external_prs: Option<WorkspaceExternalPrs<'_>>,
         snapshot: Option<WorkspaceStatusSnapshot<'_>>,
@@ -281,6 +373,13 @@ impl Services {
                 .seed(&ws.id, waiting, waiting_generation);
             waiting
         };
+        // `scriptsRunning` reads the in-memory script registry directly (no
+        // store I/O), so the served value is always live; the read also seeds
+        // the `workspace:scriptsRunning-changed` baseline.
+        ws.scripts_running = self.seed_running_flag(&ws.id, RunningFlag::Scripts);
+        // `backgroundTasksRunning` likewise reads the in-memory worker
+        // projections (§5.5b) and seeds its own transition baseline.
+        ws.background_tasks_running = self.seed_running_flag(&ws.id, RunningFlag::BackgroundTasks);
         // Pre-read generation snapshot: a `workspace.delete` eviction racing
         // the awaits below must not have this seed resurrect the baseline.
         let generation = self.last_display_statuses.generation();
@@ -428,7 +527,8 @@ impl Services {
     /// best-effort/fail-open like the probes it reuses (a store read
     /// failure reads `false`, never wedges list/get emission).
     pub(crate) async fn workspace_is_waiting(&self, workspace_id: &WorkspaceId) -> bool {
-        self.workspace_has_active_hooks(workspace_id).await
+        self.workspace_has_active_hooks_or_script_monitors(workspace_id)
+            .await
             || self.workspace_has_active_pr_monitors(workspace_id).await
             || self
                 .workspace_has_waiting_agent_subscriptions(workspace_id)
@@ -452,7 +552,7 @@ impl Services {
     /// baseline stale until the next transition. The activity read and cache
     /// insert have no await between them, so the window is negligible and
     /// self-heals on the next transition.
-    pub(crate) async fn maybe_emit_display_status_changed(&self, workspace_id: &WorkspaceId) {
+    pub async fn maybe_emit_display_status_changed(&self, workspace_id: &WorkspaceId) {
         // Pre-read generation snapshot: an eviction (workspace.delete)
         // landing between the store reads below and the cache write must
         // drop this compute rather than re-insert a baseline for the
@@ -526,7 +626,7 @@ impl Services {
     /// probe itself fails open to `false` on store errors, which the dedup
     /// baseline absorbs: a transient flap emits at most one pair of
     /// transitions, and the next recompute converges on truth.
-    pub(crate) async fn maybe_emit_waiting_changed(&self, workspace_id: &WorkspaceId) {
+    pub async fn maybe_emit_waiting_changed(&self, workspace_id: &WorkspaceId) {
         // Chief is a fixed virtual workspace synthesized on read
         // (`workspace.get` returns `chief_workspace()` before enrichment and
         // `workspace.list` excludes it), so its rows can never carry
@@ -573,6 +673,149 @@ impl Services {
     pub(crate) fn evict_display_status_baseline(&self, workspace_id: &WorkspaceId) {
         self.last_display_statuses.evict(workspace_id);
         self.last_waiting_statuses.evict(workspace_id);
+        self.scripts_running_state.evict(workspace_id);
+    }
+
+    /// Whether the workspace owns an active hook or an `active` script run
+    /// monitor (§5.8a) — two of the `waiting` signals, read in ONE statement
+    /// so `workspace.get` keeps its statement budget. Fails open to `false`
+    /// on a store error, like the PR-monitor probe.
+    pub(crate) async fn workspace_has_active_hooks_or_script_monitors(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> bool {
+        match self
+            .store
+            .workspaces_with_active_hooks_or_script_monitors(std::slice::from_ref(workspace_id))
+            .await
+        {
+            Ok(ids) => ids.contains(workspace_id),
+            Err(error) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    %error,
+                    "active hooks/script-monitors waiting lookup failed; reads as none"
+                );
+                false
+            }
+        }
+    }
+
+    /// The live value of `flag` for `workspace_id`: one in-memory read, no
+    /// store I/O.
+    fn read_running_flag(&self, workspace_id: &WorkspaceId, flag: RunningFlag) -> bool {
+        match flag {
+            RunningFlag::Scripts => self.workspace_scripts_running(workspace_id),
+            RunningFlag::BackgroundTasks => self
+                .agent_workers()
+                .workspace_has_running_workers(workspace_id),
+        }
+    }
+
+    /// Read `flag` live for an emit-path enrichment and seed its transition
+    /// baseline (a seed never emits).
+    fn seed_running_flag(&self, workspace_id: &WorkspaceId, flag: RunningFlag) -> bool {
+        let cache = &self.scripts_running_state.gate(flag).cache;
+        let generation = cache.generation();
+        let running = self.read_running_flag(workspace_id, flag);
+        cache.seed(workspace_id, running, generation);
+        running
+    }
+
+    /// Recompute `Workspace.scriptsRunning` and publish
+    /// `workspace:scriptsRunning-changed` iff it transitioned (PROTOCOL §5.1 /
+    /// §6.5). Called from the script lifecycle choke points (every
+    /// `script:state` / `script:changed` publication and definition
+    /// removal). A missing baseline reads as `false` — nothing runs before
+    /// the daemon's first script start — so the first run after a restart
+    /// still emits. Best-effort like [`Services::maybe_emit_waiting_changed`].
+    pub async fn maybe_emit_scripts_running_changed(&self, workspace_id: &WorkspaceId) {
+        self.maybe_emit_running_flag_changed(workspace_id, RunningFlag::Scripts)
+            .await;
+    }
+
+    /// Recompute `Workspace.backgroundTasksRunning` and publish
+    /// `workspace:backgroundTasksRunning-changed` iff it transitioned
+    /// (PROTOCOL §5.1 / §6.5). Called after every changed `WorkerSnapshot`
+    /// publication ([`Services::publish_workers_snapshot`]: generation
+    /// start, negotiation, session bind, accepted frame, disconnect and
+    /// release). A missing baseline reads as `false` (no worker survives a
+    /// daemon restart).
+    pub(crate) async fn maybe_emit_background_tasks_running_changed(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) {
+        self.maybe_emit_running_flag_changed(workspace_id, RunningFlag::BackgroundTasks)
+            .await;
+    }
+
+    /// Shared recompute-and-compare for one [`RunningFlag`]. The derivation
+    /// is one in-memory read; an unchanged value returns before any store
+    /// I/O. Serialize the read → record → publish sequence per workspace,
+    /// and re-read after the store await below, so a recompute that observed
+    /// an older state can never publish (or record) it after a newer one.
+    async fn maybe_emit_running_flag_changed(&self, workspace_id: &WorkspaceId, flag: RunningFlag) {
+        if workspace_id.is_chief() {
+            return;
+        }
+        let state = self.scripts_running_state.gate(flag);
+        let gate = state.lock_for(workspace_id);
+        let _serialized = gate.lock().await;
+        let generation = state.cache.generation();
+        let running = self.read_running_flag(workspace_id, flag);
+        if state.cache.get(workspace_id).unwrap_or(false) == running {
+            state.cache.seed(workspace_id, running, generation);
+            return;
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        if flag == RunningFlag::Scripts {
+            self.park_scripts_running_recompute().await;
+        }
+        // Deleted-workspace guard: never publish for (or seed a baseline of)
+        // a workspace whose row is gone.
+        if self.store.get_workspace(workspace_id).await.is_err() {
+            return;
+        }
+        let running = self.read_running_flag(workspace_id, flag);
+        state.cache.seed(workspace_id, false, generation);
+        let Some(transitioned) = state.cache.record(workspace_id, running, generation) else {
+            return;
+        };
+        if transitioned {
+            let event = match flag {
+                RunningFlag::Scripts => scripts_running_changed_event(workspace_id, running),
+                RunningFlag::BackgroundTasks => {
+                    background_tasks_running_changed_event(workspace_id, running)
+                }
+            };
+            publish_event(self.event_bus.as_ref(), event).await;
+        }
+    }
+
+    /// Arm [`ScriptsRunningPark`]: the next transitioning recompute parks.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn arm_scripts_running_park(&self) -> Arc<ScriptsRunningPark> {
+        let park = Arc::new(ScriptsRunningPark::default());
+        *self
+            .scripts_running_state
+            .park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(park.clone());
+        park
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    async fn park_scripts_running_recompute(&self) {
+        let park = self
+            .scripts_running_state
+            .park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(park) = park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
     }
 
     /// Recompute after a spec-body write. The spec's markdown gates
@@ -628,7 +871,7 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
         attention: WorkspaceAttention,
-        sessions: Option<&[intent_core::AgentSession]>,
+        sessions: Option<&[intent_store::AgentSessionSummary]>,
     ) -> AttentionSignals {
         self.workspace_attention_signals_with_legacy_holds(workspace_id, attention, sessions, None)
             .await
@@ -638,7 +881,7 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
         attention: WorkspaceAttention,
-        sessions: Option<&[intent_core::AgentSession]>,
+        sessions: Option<&[intent_store::AgentSessionSummary]>,
         legacy_question_holds: Option<&HashSet<AgentId>>,
     ) -> AttentionSignals {
         let mut signals = AttentionSignals {
@@ -646,7 +889,7 @@ impl Services {
             ..AttentionSignals::default()
         };
         let fetched;
-        let sessions: &[intent_core::AgentSession] = match sessions {
+        let sessions: &[intent_store::AgentSessionSummary] = match sessions {
             Some(sessions) => sessions,
             None => match self.store.list_agent_session_summaries(workspace_id).await {
                 Ok(list) => {
@@ -686,7 +929,7 @@ impl Services {
             }
         }
         if !signals.needs_attention {
-            for session in top_level {
+            for session in &top_level {
                 // The summaries already carry the session `metadata`, so a
                 // written pending-questions marker is decided right here with
                 // no extra store read (monorepo#3058) — same derivation as
@@ -707,6 +950,21 @@ impl Services {
                     signals.needs_attention = true;
                     break;
                 }
+            }
+        }
+        // An agent waiting on a secret request (PROTOCOL §5.56) needs the user
+        // too, once the request's card has been persisted (the turn-end drain
+        // — the same point a question raises it). Derived from the daemon's
+        // in-memory pending requests, so it ends when the request is answered
+        // or lost on restart, and a card dropped with a cancelled turn never
+        // strands the workspace.
+        if !signals.needs_attention {
+            if let Some(first) = top_level.first() {
+                let awaiting = self.secret_vault.agents_awaiting_user(&first.workspace_id);
+                signals.needs_attention = !awaiting.is_empty()
+                    && top_level
+                        .iter()
+                        .any(|session| awaiting.contains(&session.id));
             }
         }
         signals
@@ -878,7 +1136,12 @@ pub(crate) struct MonitorPrSignals {
 ///    is in the merge queue (not draft), `pr_ready` when the snapshot's full
 ///    merge-requirements checklist is clear and the PR is not draft, else
 ///    `pr_open` — so a workspace watching an open PR (including cross-repo)
-///    never falls through to `complete`/`idle`; a monitor whose PR the
+///    never falls through to `complete`/`idle`. Queue membership is read
+///    across every input of the rung: any open, non-draft PR in the merge
+///    queue — linked, pooled or monitored — yields `pr_queued` even when the
+///    PR the rung would otherwise pick reads ready/open (a workspace
+///    sequencing a cross-repo merge waits on the queue, not the user); a
+///    monitor whose PR the
 ///    workspace already holds as a fresher terminal copy contributes
 ///    nothing ([`terminal_pr_copies`]). When none of those carries
 ///    an open/draft entry but the workspace `prStatus` column is
@@ -1290,33 +1553,41 @@ fn rollup_over_pr_pool(
             .filter(is_open)
             .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
     });
+    // A PR sitting in the merge queue is beyond "ready" — the queue is
+    // handling it. The signal is the fold-persisted `isInMergeQueue`
+    // (GitHub's REST `mergeable_state` reads `"clean"` for a queued PR) or a
+    // host that does report `mergeable_state: "queued"`. Queue membership is
+    // read across EVERY step-4 input — the linked PR, any open pool entry,
+    // and the ACTIVE monitors — not just the PR picked below: a workspace
+    // whose own PR is mergeable while it sequences another PR through the
+    // queue is waiting on the queue, not on the user.
+    let queued_open = |pr: &PullRequestInfo| {
+        pr.status == PullRequestStatus::Open && pr.is_draft != Some(true) && pr_in_merge_queue(pr)
+    };
+    if monitor_prs.queued
+        || active_pr.is_some_and(queued_open)
+        || pull_requests.iter().any(queued_open)
+    {
+        return WorkspaceDisplayStatus::PrQueued;
+    }
     if let Some(pr) = open_pr {
         let draft = pr.status == PullRequestStatus::Draft || pr.is_draft == Some(true);
-        // A PR sitting in the merge queue is beyond "ready" — the queue is
-        // handling it. The signal is the fold-persisted `isInMergeQueue`
-        // (GitHub's REST `mergeable_state` reads `"clean"` for a queued PR)
-        // or a host that does report `mergeable_state: "queued"`.
-        let queued = pr_in_merge_queue(pr);
         // `mergeable` alone only rules out conflicts; only a "clean"
         // `mergeable_state` means the forge would actually accept the merge
         // (blocked/behind/dirty/unstable/unknown/absent all read `pr_open`).
         let clean = pr.mergeable == Some(true) && pr.mergeable_state.as_deref() == Some("clean");
-        return if queued && !draft {
-            WorkspaceDisplayStatus::PrQueued
-        } else if clean && !draft {
+        return if clean && !draft {
             WorkspaceDisplayStatus::PrReady
         } else {
             WorkspaceDisplayStatus::PrOpen
         };
     }
     // Agent-monitored PRs are the same rung as the linked open PR above: an
-    // ACTIVE monitor on an open PR reads `pr_queued`/`pr_ready`/`pr_open`
-    // even when the PR belongs to another repo and never enters the
-    // workspace linkage. A linked open PR wins first only because it carries
-    // richer data; the mapping is identical.
-    if monitor_prs.queued {
-        return WorkspaceDisplayStatus::PrQueued;
-    }
+    // ACTIVE monitor on an open PR reads `pr_ready`/`pr_open` (its queued
+    // signal is folded in above) even when the PR belongs to another repo
+    // and never enters the workspace linkage. A linked open PR wins first
+    // only because it carries richer readiness data; the mapping is
+    // identical.
     if monitor_prs.ready {
         return WorkspaceDisplayStatus::PrReady;
     }
@@ -1397,6 +1668,40 @@ fn waiting_changed_event(workspace_id: &WorkspaceId, waiting: bool) -> NewEvent 
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "waiting": waiting,
+        }),
+    }
+}
+
+fn scripts_running_changed_event(workspace_id: &WorkspaceId, scripts_running: bool) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_SCRIPTS_RUNNING_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "scriptsRunning": scripts_running,
+        }),
+    }
+}
+
+fn background_tasks_running_changed_event(workspace_id: &WorkspaceId, running: bool) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "backgroundTasksRunning": running,
         }),
     }
 }
@@ -2282,7 +2587,8 @@ mod display_status {
             ),
             WorkspaceDisplayStatus::InProgress
         );
-        // A linked open PR wins the shared rung even over a queued monitor.
+        // Queue membership is not "richer data" the linked PR owns: a queued
+        // monitor lifts a linked open PR to `pr_queued` too.
         let open = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
         assert_eq!(
             super::compute_display_status(
@@ -2296,8 +2602,99 @@ mod display_status {
                 queued,
                 None
             ),
-            WorkspaceDisplayStatus::PrOpen
+            WorkspaceDisplayStatus::PrQueued
         );
+    }
+
+    /// A workspace whose linked PR is mergeable while it watches another
+    /// PR (e.g. the intentd half of a cross-repo change) sitting in the
+    /// merge queue reads `pr_queued`, not `pr_ready`: the user already
+    /// approved the merges and the agent is waiting on the queue, so the
+    /// workspace must not surface as "needs you".
+    #[test]
+    fn queued_monitor_outranks_a_ready_linked_pr() {
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
+        ready.mergeable_state = Some("clean".into());
+        let queued_and_ready = MonitorPrSignals {
+            queued: true,
+            ..monitors(true, true, false)
+        };
+        for (active, pool) in [
+            (Some(&ready), &[][..]),
+            (None, std::slice::from_ref(&ready)),
+        ] {
+            assert_eq!(
+                super::compute_display_status(
+                    sig(false),
+                    false,
+                    active,
+                    pool,
+                    &[],
+                    None,
+                    None,
+                    queued_and_ready,
+                    Some(&stats(2, 2, 0))
+                ),
+                WorkspaceDisplayStatus::PrQueued
+            );
+        }
+        // Without the queued monitor the same workspace still reads ready.
+        assert_eq!(
+            super::compute_display_status(
+                sig(false),
+                false,
+                Some(&ready),
+                &[],
+                &[],
+                None,
+                None,
+                monitors(true, true, false),
+                None
+            ),
+            WorkspaceDisplayStatus::PrReady
+        );
+    }
+
+    /// An older open pool PR in the merge queue outranks a newer mergeable
+    /// one: the most-recently-updated pick chooses which PR's readiness to
+    /// show, but any queued open PR means the workspace is waiting.
+    #[test]
+    fn any_queued_open_pool_pr_is_pr_queued() {
+        let mut queued = pr(PullRequestStatus::Open, "2026-01-01T00:00:00Z");
+        queued.url = ROOT_PR_URL.to_string();
+        queued.is_in_merge_queue = Some(true);
+        let mut ready = pr(PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+        ready.mergeable = Some(true);
+        ready.mergeable_state = Some("clean".into());
+        let pool = [queued.clone(), ready.clone()];
+        assert_eq!(
+            compute_display_status(sig(false), false, None, &pool, None, None),
+            WorkspaceDisplayStatus::PrQueued
+        );
+        assert_eq!(
+            compute_display_status(sig(false), false, Some(&ready), &pool, None, None),
+            WorkspaceDisplayStatus::PrQueued
+        );
+        // A queued draft never counts, and a merged/closed queued copy is
+        // not open.
+        let mut draft = queued.clone();
+        draft.status = PullRequestStatus::Draft;
+        let mut merged = queued;
+        merged.status = PullRequestStatus::Merged;
+        for other in [draft, merged] {
+            assert_eq!(
+                compute_display_status(
+                    sig(false),
+                    false,
+                    Some(&ready),
+                    &[other, ready.clone()],
+                    None,
+                    None
+                ),
+                WorkspaceDisplayStatus::PrReady
+            );
+        }
     }
 
     /// Step 4 via monitors: an ACTIVE monitor on an open PR yields
@@ -3658,6 +4055,7 @@ mod workspace_needs_attention {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         }
     }
 
@@ -3679,7 +4077,7 @@ mod workspace_needs_attention {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        (Services::new(store), ws, tmp)
+        (Services::new_isolated(store), ws, tmp)
     }
 
     #[tokio::test]
@@ -3717,6 +4115,193 @@ mod workspace_needs_attention {
         assert!(s.needs_attention);
         assert!(s.blocked);
         assert!(!s.failed);
+    }
+
+    /// An idle top-level agent with a pending secret request needs the user
+    /// (PROTOCOL §5.56); answering it, or a sub-agent, does not count.
+    #[intent_test_macros::daemon_test]
+    async fn pending_secret_request_drives_needs_attention() {
+        let (svc, ws, _tmp) = setup().await;
+        let session = mk_session(&ws, "agent-secret");
+        svc.store.insert_agent_session(&session).await.unwrap();
+        let ticket = svc
+            .secret_request_op(ws.clone(), session.id.clone(), "KEY".into(), "tests".into())
+            .await
+            .unwrap();
+        let request_id = ticket["requestId"].as_str().unwrap().to_string();
+        assert!(
+            !signals(&svc, &ws).await.needs_attention,
+            "an unsurfaced card (still in the turn, or dropped) does not need the user"
+        );
+        svc.secret_vault
+            .mark_surfaced(&ws, &session.id, std::slice::from_ref(&request_id));
+        assert!(signals(&svc, &ws).await.needs_attention);
+
+        svc.secret_answer_op(
+            ws.clone(),
+            request_id,
+            crate::secret_requests::Outcome::Declined,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!signals(&svc, &ws).await.needs_attention);
+    }
+
+    /// `agent.dismissQuestions` on the carrying message declines its pending
+    /// secret requests (PROTOCOL §5.56), so the workspace stops needing the
+    /// user; a second dismissal finds nothing left to decline.
+    #[intent_test_macros::daemon_test]
+    async fn dismissing_a_message_declines_its_secret_requests() {
+        let (svc, ws, _tmp) = setup().await;
+        let session = mk_session(&ws, "agent-secret-dismiss");
+        svc.store.insert_agent_session(&session).await.unwrap();
+        let ticket = svc
+            .secret_request_op(ws.clone(), session.id.clone(), "KEY".into(), "tests".into())
+            .await
+            .unwrap();
+        let request_id = ticket["requestId"].as_str().unwrap().to_string();
+        let card = json!({ "requestId": request_id, "agentId": session.id.0, "name": "KEY", "reason": "tests" });
+        let content = json!([
+            { "type": "text", "text": "I need a key." },
+            { "type": "resource", "resource": {
+                "uri": format!("intent-secret-request://{request_id}"),
+                "name": "KEY",
+                "mimeType": intent_acp::mcp_server::SECRET_REQUEST_RESOURCE_MIME_TYPE,
+                "text": card.to_string(),
+            } },
+        ]);
+        let asked = svc
+            .store
+            .append_agent_message(&session.id, "assistant", &content, &now_iso())
+            .await
+            .unwrap();
+        svc.surface_secret_requests(
+            &ws,
+            &session.id,
+            &crate::secret_requests::secret_request_ids(&content),
+        )
+        .await;
+        assert!(signals(&svc, &ws).await.needs_attention);
+
+        svc.agent_dismiss_questions_op(ws.clone(), session.id.clone(), asked.id.clone())
+            .await
+            .unwrap();
+        assert!(!signals(&svc, &ws).await.needs_attention);
+        let listing = svc.secret_vault.list(&ws, &session.id);
+        assert!(listing.pending.is_empty());
+        assert_eq!(
+            listing.answered,
+            vec![(
+                request_id,
+                "KEY".to_string(),
+                crate::secret_requests::Outcome::Declined
+            )]
+        );
+        svc.agent_dismiss_questions_op(ws.clone(), session.id.clone(), asked.id)
+            .await
+            .unwrap();
+        assert_eq!(svc.secret_vault.list(&ws, &session.id).answered.len(), 1);
+    }
+
+    /// A planted secret value (PROTOCOL §5.56) reaches no agent-facing read
+    /// for the owning agent or a second agent in the same workspace, and no
+    /// file of the store; the provided notice (name only) does.
+    #[intent_test_macros::daemon_test]
+    async fn secret_value_never_reaches_agent_facing_reads() {
+        const SENTINEL: &str = "sentinel-sv-9Qk2-never-egress";
+        let (svc, ws, tmp) = setup().await;
+        let owner = mk_session(&ws, "agent-secret-owner");
+        let other = mk_session(&ws, "agent-secret-other");
+        svc.store.insert_agent_session(&owner).await.unwrap();
+        svc.store.insert_agent_session(&other).await.unwrap();
+        let ticket = svc
+            .secret_request_op(ws.clone(), owner.id.clone(), "KEY".into(), "tests".into())
+            .await
+            .unwrap();
+        svc.secret_answer_op(
+            ws.clone(),
+            ticket["requestId"].as_str().unwrap().to_string(),
+            crate::secret_requests::Outcome::Provided,
+            Some(zeroize::Zeroizing::new(SENTINEL.to_string())),
+        )
+        .await
+        .unwrap();
+
+        let mut reads =
+            vec![serde_json::to_string(&svc.agent_list(ws.clone()).await.unwrap()).unwrap()];
+        for agent in [&owner.id, &other.id] {
+            reads.push(
+                svc.agent_get_conversation(
+                    agent.clone(),
+                    None,
+                    Some(ws.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap()
+                .to_string(),
+            );
+            reads.push(
+                svc.secret_list_op(ws.clone(), agent.clone())
+                    .await
+                    .unwrap()
+                    .to_string(),
+            );
+            reads.push(
+                serde_json::to_string(
+                    &svc.store
+                        .get_agent_session_with_transcript(agent)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        reads.push(
+            svc.event_query(
+                ws.clone(),
+                intent_core::EventQueryParams {
+                    limit: Some(200),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .to_string(),
+        );
+        for read in &reads {
+            assert!(!read.contains(SENTINEL), "secret value leaked into: {read}");
+        }
+        assert!(
+            reads
+                .iter()
+                .any(|read| read.contains("The user provided secret KEY")),
+            "the provided notice reached the owner's transcript"
+        );
+        let mut dirs = vec![tmp.path.parent().unwrap().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let bytes =
+                    std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                assert!(
+                    !bytes
+                        .windows(SENTINEL.len())
+                        .any(|w| w == SENTINEL.as_bytes()),
+                    "secret value leaked into {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3916,7 +4501,7 @@ mod workspace_needs_attention {
     async fn question_marker_shapes_match_across_get_list_and_lite_snapshot() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let svc = Services::new(store.clone());
+        let svc = Services::new_isolated(store.clone());
         let cases = [
             ("absent", None, WorkspaceDisplayStatus::NeedsAttention),
             (
@@ -3960,9 +4545,12 @@ mod workspace_needs_attention {
             expected.push((ws, status));
         }
 
-        let listed = svc.list_workspaces(false).await.expect("workspace.list");
+        let listed = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .expect("workspace.list");
         let lite = svc
-            .list_workspaces_lite(false)
+            .list_workspaces_lite(intent_core::WorkspaceListFilter::ACTIVE)
             .await
             .expect("workspace.subscribe snapshot");
         for (ws, status) in expected {
@@ -4013,7 +4601,10 @@ mod workspace_needs_attention {
             "fixture must fail the batch tail read"
         );
 
-        let listed = svc.list_workspaces(false).await.expect("workspace.list");
+        let listed = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .expect("workspace.list");
         let listed_ws = listed
             .iter()
             .find(|workspace| workspace.id == ws)
@@ -4104,7 +4695,7 @@ mod workspace_needs_attention {
             .execute(svc.store.write_pool())
             .await
             .expect("drop agent_session table");
-        let sessions = vec![s];
+        let sessions = vec![intent_store::AgentSessionSummary::from_session(s)];
         let got = svc
             .workspace_attention_signals(&ws, WorkspaceAttention::None, Some(&sessions))
             .await;
@@ -4136,6 +4727,8 @@ mod workspace_needs_attention {
         cleared.metadata = Some(json!({
             (intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY): ""
         }));
+        let summary = intent_store::AgentSessionSummary::from_session;
+        let (pending, resolved, cleared) = (summary(pending), summary(resolved), summary(cleared));
 
         // No sessions/messages persisted at all: every derivation below runs
         // off the supplied summaries alone.
@@ -4194,7 +4787,7 @@ mod display_status_events {
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let bus = EventBus::new(store.clone());
-        let services = Services::new(store.clone()).with_event_bus(bus.clone());
+        let services = Services::new_isolated(store.clone()).with_event_bus(bus.clone());
         Harness {
             _tmp: tmp,
             store,
@@ -4241,15 +4834,19 @@ mod display_status_events {
     }
 
     async fn recv_one(sub: &mut Subscription) -> Value {
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         assert_eq!(batch.len(), 1, "expected exactly one event");
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
 
     async fn assert_silent(sub: &mut Subscription) {
+        // fixed-deadline: allow — stays under the 500ms idle debounce set by DebounceEnvGuard::new("500") below while outlasting the 100ms one
         let res = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(res.is_err(), "expected no displayStatus event: {res:?}");
     }
@@ -4425,7 +5022,10 @@ mod display_status_events {
             .expect("insert task");
 
         let mut sub = subscribe(&h);
-        let list = services.list_workspaces_lite(true).await.expect("lite");
+        let list = services
+            .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("lite");
         let row = list.iter().find(|w| w.id == h.ws).expect("row");
         assert!(row.display_status.is_some(), "lite row carries the status");
         assert_silent(&mut sub).await;
@@ -5173,7 +5773,11 @@ mod display_status_events {
             .clear_attention_request_if_present(&b.id, &h.ws)
             .await;
         assert_silent(&mut sub).await;
-        let reloaded = h.store.get_agent_session(&a.id).await.expect("reload A");
+        let reloaded = h
+            .store
+            .get_agent_session_with_transcript(&a.id)
+            .await
+            .expect("reload A");
         assert_eq!(
             reloaded.attention_request_kind.as_deref(),
             Some("discussion"),
@@ -5631,5 +6235,230 @@ mod display_status_events {
             ev["data"],
             json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
         );
+    }
+}
+
+/// `Workspace.backgroundTasksRunning` (PROTOCOL §5.1 / §6.5): the workspace
+/// roll-up of §5.5b worker observations, driven through the real worker
+/// projections and the `publish_workers_snapshot` choke point.
+#[cfg(test)]
+mod background_tasks_running_events {
+    use std::sync::Weak;
+    use std::time::Duration;
+
+    use intent_acp::workers::WorkerFrame;
+    use intent_core::events::WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED;
+    use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use crate::agent_workers::{AdapterIdentity, Scope, SUPPORTED_ADAPTERS};
+    use crate::tests::{workspace, TempDb};
+    use crate::{EventBus, Services};
+
+    struct Harness {
+        _tmp: TempDb,
+        services: Services,
+        ws: WorkspaceId,
+        agent: AgentId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new_isolated(store).with_event_bus(bus);
+        Harness {
+            _tmp: tmp,
+            services,
+            ws,
+            agent: AgentId::from("agent-bg"),
+        }
+    }
+
+    /// Start a supported, session-bound Claude generation for the agent and
+    /// publish its snapshot, like `begin_worker_generation` + negotiation.
+    fn begin(h: &Harness, generation: &str) {
+        let adapter = &SUPPORTED_ADAPTERS[1];
+        let snapshot = h.services.agent_workers().begin(
+            Scope {
+                workspace_id: h.ws.clone(),
+                agent_id: h.agent.clone(),
+                provider: adapter.provider.to_owned(),
+                acp_session_id: Some("session-bg".to_owned()),
+                connection_generation: Some(generation.to_owned()),
+            },
+            &AdapterIdentity {
+                name: Some(adapter.name.to_owned()),
+                version: Some(adapter.version.to_owned()),
+            },
+            true,
+            Weak::new(),
+        );
+        h.services.publish_workers_snapshot(snapshot);
+    }
+
+    fn ingest(h: &Harness, generation: &str, update: Value) {
+        let frame = WorkerFrame {
+            session_id: Some("session-bg".to_owned()),
+            update,
+            received_at_ms: 1000,
+        };
+        if let Some(snapshot) = h
+            .services
+            .agent_workers()
+            .ingest(&h.agent, generation, &frame)
+        {
+            h.services.publish_workers_snapshot(snapshot);
+        }
+    }
+
+    fn spawn(id: &str) -> Value {
+        json!({ "sessionUpdate": "async_task_spawned", "asyncTaskId": id, "taskType": "shell",
+                "name": "Run full spec in background", "canStop": true })
+    }
+
+    fn ended(id: &str, state: &str) -> Value {
+        json!({ "sessionUpdate": "async_task_state_update", "asyncTaskId": id, "state": state })
+    }
+
+    /// Persisted `backgroundTasksRunning` payloads, oldest-first.
+    async fn flag_events(h: &Harness) -> Vec<bool> {
+        let mut events = h
+            .services
+            .store()
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(h.ws.clone()),
+                event_types: vec![WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query flag events");
+        events.reverse();
+        events
+            .into_iter()
+            .map(|e| {
+                assert_eq!(e.data["workspaceId"], json!(h.ws.as_str()));
+                e.data["backgroundTasksRunning"]
+                    .as_bool()
+                    .expect("boolean payload")
+            })
+            .collect()
+    }
+
+    /// The recompute is spawned from the publication, so poll for it.
+    async fn await_flag_events(h: &Harness, expected: &[bool]) {
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
+        loop {
+            let seen = flag_events(h).await;
+            if seen == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "flag events never reached {expected:?}; last seen {seen:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn served(h: &Harness) -> bool {
+        let ws = WorkspaceApi::get_workspace(&h.services, h.ws.clone())
+            .await
+            .expect("get workspace");
+        let wire = serde_json::to_value(&ws).expect("serialize workspace");
+        assert_eq!(
+            wire.get("backgroundTasksRunning").is_some(),
+            ws.background_tasks_running,
+            "presence-detected on the wire: {wire}"
+        );
+        assert!(!ws.scripts_running, "a worker never moves scriptsRunning");
+        ws.background_tasks_running
+    }
+
+    /// A running background shell raises the flag with exactly one event;
+    /// unchanged recomputes stay silent; its end drops the flag.
+    #[intent_test_macros::daemon_test]
+    async fn background_tasks_running_tracks_worker_rows() {
+        let h = harness().await;
+        assert!(!served(&h).await, "no generation yet");
+        begin(&h, "gen-1");
+        assert!(!served(&h).await, "a generation without rows");
+
+        ingest(&h, "gen-1", spawn("task-1"));
+        await_flag_events(&h, &[true]).await;
+        assert!(served(&h).await, "background shell running");
+
+        // A second running row and a direct (awaited) recompute leave the
+        // flag raised and stay silent.
+        ingest(&h, "gen-1", spawn("task-2"));
+        ingest(&h, "gen-1", ended("task-2", "completed"));
+        h.services
+            .maybe_emit_background_tasks_running_changed(&h.ws)
+            .await;
+        assert_eq!(flag_events(&h).await, vec![true]);
+        assert!(served(&h).await, "task-1 still runs");
+
+        // Every recompute reads the live projections under the per-workspace
+        // gate, so the ones spawned for task-2 can only observe `true`
+        // (before task-1 ends) or match the `false` baseline (after): the
+        // exact final sequence proves no spurious transition was published.
+        ingest(&h, "gen-1", ended("task-1", "stopped"));
+        await_flag_events(&h, &[true, false]).await;
+        h.services
+            .maybe_emit_background_tasks_running_changed(&h.ws)
+            .await;
+        assert_eq!(flag_events(&h).await, vec![true, false]);
+        assert!(!served(&h).await, "every row ended");
+    }
+
+    /// A dropped provider connection or a released session cannot vouch
+    /// for its workers, so either drops the flag.
+    #[intent_test_macros::daemon_test]
+    async fn background_tasks_running_drops_on_disconnect_and_release() {
+        let h = harness().await;
+        begin(&h, "gen-1");
+        ingest(&h, "gen-1", spawn("task-1"));
+        await_flag_events(&h, &[true]).await;
+        if let Some(snapshot) = h.services.agent_workers().disconnect(&h.agent, "gen-1") {
+            h.services.publish_workers_snapshot(snapshot);
+        }
+        await_flag_events(&h, &[true, false]).await;
+        assert!(!served(&h).await, "disconnected");
+
+        begin(&h, "gen-2");
+        ingest(&h, "gen-2", spawn("task-1"));
+        await_flag_events(&h, &[true, false, true]).await;
+        if let Some(snapshot) = h.services.agent_workers().release(&h.agent) {
+            h.services.publish_workers_snapshot(snapshot);
+        }
+        await_flag_events(&h, &[true, false, true, false]).await;
+        assert!(!served(&h).await, "released");
+    }
+
+    /// Another workspace's worker never raises this workspace's flag.
+    #[intent_test_macros::daemon_test]
+    async fn background_tasks_running_is_scoped_per_workspace() {
+        let h = harness().await;
+        let other = WorkspaceId::new();
+        h.services
+            .store()
+            .insert_workspace(&workspace(&other))
+            .await
+            .expect("other ws");
+        let other_h = Harness {
+            _tmp: TempDb::new(),
+            services: h.services.clone(),
+            ws: other,
+            agent: AgentId::from("agent-other"),
+        };
+        begin(&other_h, "gen-1");
+        ingest(&other_h, "gen-1", spawn("task-1"));
+        await_flag_events(&other_h, &[true]).await;
+        assert!(!served(&h).await);
+        assert!(flag_events(&h).await.is_empty());
     }
 }

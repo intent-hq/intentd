@@ -324,3 +324,233 @@ fn budget_page_reminted_tokens_resume_at_first_excluded_row() {
         "no token at newest edge"
     );
 }
+
+#[test]
+fn clamp_page_limit_uses_default_and_bounds() {
+    assert_eq!(clamp_page_limit(None, 100, 200), 100);
+    assert_eq!(clamp_page_limit(Some(0), 100, 200), 1);
+    assert_eq!(clamp_page_limit(Some(-3), 100, 200), 1);
+    assert_eq!(clamp_page_limit(Some(150), 100, 200), 150);
+    assert_eq!(clamp_page_limit(Some(10_000), 100, 200), 200);
+}
+
+#[test]
+fn keyset_token_round_trips_and_rejects_garbage_or_other_scopes() {
+    let scope = json!(["workspace.list", true, false]);
+    let token = encode_keyset_token(&scope, "2026-01-01T00:00:00.000Z", "ws-1");
+    assert_eq!(
+        decode_keyset_token(&token, &scope).expect("decode"),
+        ("2026-01-01T00:00:00.000Z".to_string(), "ws-1".to_string())
+    );
+    let other = json!(["workspace.list", false, false]);
+    let empty_id = encode_keyset_token(&scope, "2026-01-01T00:00:00.000Z", "");
+    for (bad, against) in [
+        ("", &scope),
+        ("not json", &scope),
+        (encode_token(&json!({ "b": 3 })).as_str(), &scope),
+        (token.as_str(), &other),
+        (empty_id.as_str(), &scope),
+    ] {
+        assert!(
+            matches!(
+                decode_keyset_token(bad, against),
+                Err(intent_core::Error::InvalidParams(_))
+            ),
+            "{bad:?} must be rejected for {against}"
+        );
+    }
+}
+
+#[test]
+fn fit_rows_to_budget_keeps_a_prefix_and_never_empties() {
+    let rows: Vec<Value> = (0..10)
+        .map(|i| json!({ "i": i, "pad": "x".repeat(90) }))
+        .collect();
+    let one = serde_json::to_vec(&rows[0]).unwrap().len() + 1;
+    assert_eq!(fit_rows_to_budget(&rows, usize::MAX), 10);
+    assert_eq!(fit_rows_to_budget(&rows, 2 + one * 3), 3);
+    assert_eq!(
+        fit_rows_to_budget(&rows, 1),
+        1,
+        "one row is always admitted"
+    );
+    assert_eq!(fit_rows_to_budget::<Value>(&[], 1), 0);
+}
+
+#[test]
+fn page_queue_reply_walks_the_queue_in_order() {
+    let queue: Vec<Value> = (0..5)
+        .map(|i| json!({ "id": format!("m{i}"), "position": i }))
+        .collect();
+    let reply = json!({ "success": true, "queue": queue });
+    let first = page_queue_reply(reply.clone(), "a1", Some(2), None).expect("first");
+    assert_eq!(first["queue"].as_array().unwrap().len(), 2);
+    assert_eq!(first["queueLength"], 5);
+    let token = first["nextToken"].as_str().expect("token").to_string();
+    let second = page_queue_reply(reply.clone(), "a1", Some(2), Some(&token)).expect("second");
+    assert_eq!(second["queue"][0]["id"], "m2");
+    assert_eq!(
+        second["queue"][0]["position"], 2,
+        "whole-queue position kept"
+    );
+    let token = second["nextToken"].as_str().expect("token").to_string();
+    let last = page_queue_reply(reply.clone(), "a1", Some(2), Some(&token)).expect("last");
+    assert_eq!(last["queue"].as_array().unwrap().len(), 1);
+    assert_eq!(last["nextToken"], Value::Null);
+    assert!(matches!(
+        page_queue_reply(reply.clone(), "a1", None, Some("garbage")),
+        Err(intent_core::Error::InvalidParams(_))
+    ));
+    assert!(
+        matches!(
+            page_queue_reply(reply, "other-agent", None, Some(&token)),
+            Err(intent_core::Error::InvalidParams(_))
+        ),
+        "a token is scoped to its agent"
+    );
+}
+
+#[test]
+fn page_queue_reply_passes_a_refused_reply_through() {
+    let refused = json!({ "success": false, "refused": true, "queueLength": 3, "queue": [] });
+    let paged = page_queue_reply(refused, "a1", None, None).expect("refused");
+    assert_eq!(paged["refused"], true);
+    assert_eq!(paged["queueLength"], 3);
+    assert_eq!(paged["queue"], json!([]));
+    assert_eq!(paged["nextToken"], Value::Null);
+}
+
+#[test]
+fn page_queue_reply_stops_at_the_byte_budget() {
+    let big = "q".repeat(200 * 1024);
+    let queue: Vec<Value> = (0..4).map(|i| json!({ "id": i, "content": big })).collect();
+    let paged = page_queue_reply(
+        json!({ "success": true, "queue": queue }),
+        "a1",
+        Some(4),
+        None,
+    )
+    .expect("paged");
+    assert_eq!(
+        paged["queue"].as_array().unwrap().len(),
+        2,
+        "two 200 KiB entries fit 480,000 bytes"
+    );
+    assert!(paged["nextToken"].is_string());
+}
+
+#[test]
+fn tail_within_json_bytes_keeps_short_text_whole() {
+    assert_eq!(tail_within_json_bytes("a\nb", 100), ("a\nb", false));
+    assert_eq!(tail_within_json_bytes("", 0), ("", false));
+}
+
+#[test]
+fn tail_within_json_bytes_keeps_newest_whole_lines() {
+    let text = "first line\nsecond\nthird";
+    assert_eq!(tail_within_json_bytes(text, 14), ("second\nthird", true));
+    // A cut inside "second" drops the partial line.
+    assert_eq!(tail_within_json_bytes(text, 10), ("third", true));
+}
+
+#[test]
+fn tail_within_json_bytes_counts_escaped_size() {
+    // Each ESC serializes as `\u001b` (6 bytes) and each quote as `\"`.
+    let text = "\u{1b}\u{1b}\"\"";
+    let (tail, cut) = tail_within_json_bytes(text, 10);
+    assert!(cut);
+    assert_eq!(tail, "\u{1b}\"\"");
+    let escaped = serde_json::to_string(tail).unwrap();
+    assert!(escaped.len() - 2 <= 10, "{escaped}");
+}
+
+#[test]
+fn tail_within_json_bytes_cuts_on_char_boundaries_and_fits_the_budget() {
+    let text = "é".repeat(1000) + "\n" + &"🙂\t".repeat(2000);
+    for budget in [1, 7, 100, 4_097, 9_999] {
+        let (tail, cut) = tail_within_json_bytes(&text, budget);
+        assert!(cut);
+        assert!(text.ends_with(tail));
+        assert!(serde_json::to_string(tail).unwrap().len() - 2 <= budget);
+    }
+}
+
+#[test]
+fn paginate_text_lines_budgets_bytes_and_resumes_after_the_cut() {
+    let line = "x".repeat(200_000);
+    let text = format!("old\n{line}\n{line}\n{line}\n");
+    let env = paginate_text_lines(&text, Some(50), None);
+    let items = env["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "third 200 KB line must not fit the page");
+    assert!(serde_json::to_vec(&env).unwrap().len() <= OUTPUT_TAIL_MAX_JSON_BYTES + 100);
+    assert!(env.get("truncated").is_none());
+    let next = paginate_text_lines(&text, Some(50), env["nextToken"].as_str());
+    let older: Vec<&str> = next["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(older, vec![line.as_str(), "old"]);
+    assert!(next["nextToken"].is_null());
+}
+
+/// Walk every page newest→oldest and rebuild the lines: a page with
+/// `lineContinues: true` ends with the tail of a line whose earlier part is
+/// the next page's newest item.
+fn rebuild(mut page_at: impl FnMut(Option<&str>) -> Value) -> Vec<String> {
+    let mut newest_first: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut continues = false;
+    loop {
+        let page = page_at(token.as_deref());
+        let size = serde_json::to_vec(&page).unwrap().len();
+        assert!(
+            size <= OUTPUT_TAIL_MAX_JSON_BYTES + 100,
+            "page is {size} bytes"
+        );
+        for (n, item) in page["items"].as_array().unwrap().iter().enumerate() {
+            let item = item.as_str().unwrap();
+            if n == 0 && continues {
+                let last = newest_first.last_mut().unwrap();
+                *last = format!("{item}{last}");
+            } else {
+                newest_first.push(item.to_owned());
+            }
+        }
+        continues = page["lineContinues"] == true;
+        match page["nextToken"].as_str() {
+            Some(t) => token = Some(t.to_owned()),
+            None => break,
+        }
+    }
+    assert!(!continues, "last page cannot continue a line");
+    newest_first.reverse();
+    newest_first
+}
+
+#[test]
+fn paginate_text_lines_rebuilds_an_oversized_escape_heavy_line_exactly() {
+    let quotes = format!("{}é{}", "\"".repeat(500_000), "\\".repeat(300_000));
+    let text = format!("older\n{quotes}\nnewer\n");
+    let first = paginate_text_lines(&text, Some(50), None);
+    assert_eq!(first["items"], json!(["newer"]));
+    let second = paginate_text_lines(&text, Some(50), first["nextToken"].as_str());
+    assert_eq!(second["lineContinues"], true);
+    let lines = rebuild(|token| paginate_text_lines(&text, Some(50), token));
+    assert_eq!(lines, vec!["older".to_owned(), quotes, "newer".to_owned()]);
+}
+
+#[test]
+fn bound_row_omits_largest_fields_until_the_row_fits() {
+    let mut row =
+        json!({ "id": "s1", "name": "n", "command": "\\".repeat(300_000), "env": { "A": "b" } });
+    assert!(bound_row(&mut row, 480_000, &["id", "name"]));
+    assert!(row.get("command").is_none());
+    assert_eq!(row["commandOmitted"], true);
+    assert_eq!(row["commandBytes"], 300_000);
+    assert_eq!(row["env"]["A"], "b");
+    let mut small = json!({ "id": "s2", "command": "ls" });
+    assert!(!bound_row(&mut small, 480_000, &["id"]));
+    assert_eq!(small["command"], "ls");
+}

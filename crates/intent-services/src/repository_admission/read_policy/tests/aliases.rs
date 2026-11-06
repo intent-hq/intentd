@@ -118,7 +118,7 @@ async fn ordinary_github_aliases_need_neither_gitlab_readiness_nor_qualified_pol
                 .unwrap();
             auth.service.as_ref().clone()
         } else {
-            crate::Services::new(git.store.clone())
+            crate::Services::new_isolated(git.store.clone())
         }
         .with_source_control(Arc::new(crate::tests::pr::StubForge::default()));
         assert!(service.gitlab_repository_settled_connection().is_err());
@@ -207,10 +207,15 @@ async fn unresolved_or_unanchored_aliases_refuse_before_any_qualified_acquisitio
                 )
                 .await;
                 let error = json_result(&reply);
-                assert!(error
-                    .as_str()
-                    .unwrap()
-                    .contains(crate::repository_read_source::REFUSAL));
+                let expected = if matches!(mode, "missing-anchor" | "missing-request") {
+                    "Addressed review monitoring unavailable"
+                } else {
+                    crate::repository_read_source::REFUSAL
+                };
+                assert!(
+                    error.as_str().unwrap().contains(expected),
+                    "{mode}: {error}"
+                );
                 assert!(!reply.to_string().contains("private/hidden"));
                 assert!(!reply.to_string().contains(f.git.path.to_str().unwrap()));
                 assert!(!reply.to_string().contains("stored-pat"));
@@ -354,7 +359,7 @@ async fn both_aliases_use_original_tcp_response_admission_and_preserve_completed
             )))
             .await
             .unwrap();
-            let mut socket = tokio::net::TcpStream::connect(bridge.addr()).await.unwrap();
+            let mut socket = bridge.connect().await.unwrap();
             let code = format!("await ws.workspace.setStatusMessage('completed ordinary effect'); await ws.{namespace}.snapshot(4); return 'constant';");
             let request = crate::repository_read_source::tests::call(&code);
             socket
@@ -367,7 +372,7 @@ async fn both_aliases_use_original_tcp_response_admission_and_preserve_completed
             gate.release.add_permits(1);
             let mut line = String::new();
             tokio::time::timeout(
-                Duration::from_secs(10),
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
                 BufReader::new(socket).read_line(&mut line),
             )
             .await
@@ -427,7 +432,7 @@ async fn mixed_names_and_raw_dispatch_have_one_sixty_four_record_acquisition_bud
             }}
             return 'bounded success';"
         );
-        let reply = run_quota(&endpoint, &code, &control).await;
+        let reply = run_quota(endpoint, &code, &control).await;
         if count == 63 {
             assert!(reply.to_string().contains("bounded success"), "{reply}");
             let records = control.records.lock().unwrap();

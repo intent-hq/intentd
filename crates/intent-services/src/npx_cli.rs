@@ -118,14 +118,17 @@ fn run_npx_version_probe(npx: &Path) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
 
-    let mut child = Command::new(npx)
+    let mut command = Command::new(npx);
+    command
         .arg("--version")
         .env("PATH", intent_providers::enhanced_path(Some(npx)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    // Deliberately NOT demoted like agents: a tiny probe on a 3s budget gains
+    // the daemon nothing by yielding, and a CPU-starved probe would time out
+    // and mark a working npx unavailable.
+    let mut child = command.spawn().ok()?;
 
     let timeout = Duration::from_secs(3);
     let start = Instant::now();

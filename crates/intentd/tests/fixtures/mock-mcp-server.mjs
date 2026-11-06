@@ -7,7 +7,9 @@
 //   - `notifications/initialized`→ ignored (notification, no id)
 //   - `tools/list`               → two tools (so toolCount == 2)
 //   - `tools/call`               → text content `<name>:<args.input>` (echoes
-//                                  the requested tool + input deterministically)
+//                                  the requested tool + input deterministically);
+//                                  the unlisted `whoami` answers its pid, its
+//                                  $MOCK_MCP_SECRET and `args.input` as JSON
 //   - `ping`                     → empty result (health check)
 // Any other request id gets an empty result. Notifications are never answered.
 //
@@ -52,6 +54,21 @@ function respond(msg) {
       return { jsonrpc: '2.0', id: msg.id, result: { tools: TOOLS } };
     case 'tools/call': {
       const name = msg.params?.name ?? 'unknown';
+      // Unlisted: who runs this server, for the remote-agent proxy tests.
+      if (name === 'whoami') {
+        return {
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({ pid: process.pid, secret: process.env.MOCK_MCP_SECRET ?? null, input: msg.params?.arguments?.input ?? null }),
+              },
+            ],
+          },
+        };
+      }
       const input = msg.params?.arguments?.input ?? '';
       return {
         jsonrpc: '2.0',

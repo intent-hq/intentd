@@ -1,5 +1,5 @@
 //! Command-only identity contract: never spawn a daemon or inspect host credentials.
-mod common;
+use crate::common;
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -338,4 +338,79 @@ fn pty_wrapper_copies_complete_constructor_after_synthetic_overrides() {
     );
     assert_eq!(cmd.get_env("INTENTD_TCP_PORT"), Some(OsStr::new("0")));
     assert_eq!(cmd.get_env("FIXTURE"), Some(OsStr::new("keep-me")));
+}
+
+const RESUME: &str = common::RESUME_ON_START_TEST_DEFAULT_ENV;
+
+#[test]
+fn both_constructors_pin_resume_on_start_off() {
+    for fixed in [false, true] {
+        let dir = common::test_tempdir("serve-contract-resume-");
+        let cmd = fixture_command(dir.path(), fixed);
+        assert_eq!(
+            explicit_env(&cmd, RESUME),
+            EnvSetting::Set(OsStr::new("off"))
+        );
+    }
+}
+
+#[test]
+fn resume_opt_in_survives_a_later_identity_reset() {
+    let dir = common::test_tempdir("serve-contract-resume-opt-in-");
+    let mut cmd = fixture_command(dir.path(), false);
+    common::opt_into_resume_on_start(&mut cmd);
+    common::hermetic_fixture_identity(&mut cmd, dir.path());
+    assert_eq!(
+        explicit_env(&cmd, RESUME),
+        EnvSetting::Set(OsStr::new("on"))
+    );
+    assert_eq!(identity_contract(&cmd, dir.path()), Ok(()));
+}
+
+#[test]
+fn identity_reset_after_env_clear_restores_resume_off() {
+    let dir = common::test_tempdir("serve-contract-resume-clear-");
+    let mut cmd = fixture_command(dir.path(), false);
+    common::opt_into_resume_on_start(&mut cmd);
+    cmd.env_clear();
+    assert_eq!(explicit_env(&cmd, RESUME), EnvSetting::Inherited);
+    common::hermetic_fixture_identity(&mut cmd, dir.path());
+    assert_eq!(
+        explicit_env(&cmd, RESUME),
+        EnvSetting::Set(OsStr::new("off"))
+    );
+}
+
+#[test]
+fn identity_reset_repins_resume_after_an_explicit_removal() {
+    let dir = common::test_tempdir("serve-contract-resume-removed-");
+    let mut cmd = fixture_command(dir.path(), false);
+    cmd.env_remove(RESUME);
+    common::hermetic_fixture_identity(&mut cmd, dir.path());
+    assert_eq!(
+        explicit_env(&cmd, RESUME),
+        EnvSetting::Set(OsStr::new("off"))
+    );
+}
+
+#[test]
+fn harness_and_daemon_share_the_resume_seam_name() {
+    assert_eq!(
+        RESUME,
+        intent_core::settings_file::RESUME_ON_START_TEST_DEFAULT_ENV
+    );
+}
+
+#[test]
+fn pty_wrapper_always_pins_resume_off() {
+    let dir = common::test_tempdir("pty-resume-contract-");
+    for preset in [None, Some("auto"), Some("on")] {
+        let mut cmd = portable_pty::CommandBuilder::new("never-executed");
+        match preset {
+            Some(value) => cmd.env(RESUME, value),
+            None => cmd.env_remove(RESUME),
+        }
+        common::hermetic_pty_fixture_identity(&mut cmd, dir.path());
+        assert_eq!(cmd.get_env(RESUME), Some(OsStr::new("off")), "{preset:?}");
+    }
 }

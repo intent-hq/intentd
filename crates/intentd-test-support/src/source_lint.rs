@@ -43,6 +43,14 @@
 //! and a nonempty reason. Each lint supplies its own tag to
 //! [`markers_by_line`] and decides which line(s) it consults.
 //!
+//! Rules that look at tokens read them with [`tokenize`] (or
+//! [`Statement::tokens`] for one statement with source lines): identifiers,
+//! numbers, and punctuation with the [`MULTI_CHAR_PUNCT`] operators kept
+//! whole, each with char offsets, line, and bracket depth. Before it, five
+//! lints carried their own readers, and intent-hq/intentd#2822 needed nine
+//! review fixes to one of them (`&&` / `||` splitting, closure `||`
+//! detection, bracket matching) that the others never got.
+//!
 //! This module is test-only infrastructure: the crate is `publish = false`
 //! and reachable only as a `[dev-dependencies]` entry, so nothing here ever
 //! ships in the daemon.
@@ -510,8 +518,11 @@ pub fn skip_whitespace(chars: &[char], mut j: usize) -> usize {
     j
 }
 
-/// Index just past the delimiter group (`(…)` or `[…]`) opening at `j`.
-fn skip_group(chars: &[char], mut j: usize, open: char, close: char) -> usize {
+/// Index just past the delimiter group (`(…)`, `[…]`, or `{…}`) opening at
+/// `j`, given its `open` / `close` characters; `chars.len()` when it never
+/// closes.
+#[must_use]
+pub fn skip_group(chars: &[char], mut j: usize, open: char, close: char) -> usize {
     let mut depth = 0usize;
     while let Some(&c) = chars.get(j) {
         j += 1;
@@ -775,6 +786,287 @@ pub fn split_statements(text: &str) -> Vec<Statement> {
     out
 }
 
+/// Multi-character operators [`tokenize`] keeps whole, longest first so the
+/// longest match wins (`..=` before `..`, `<<=` before `<=`). The shifts
+/// `<<` / `>>` are deliberately absent: they stay two `<` / `>` tokens so the
+/// closers of nested generics (`Vec<Vec<u8>>`) count one by one, as a lint
+/// tracking angle depth needs; `<<=` / `>>=` are kept whole so a lone `=`
+/// token is always an assignment.
+pub const MULTI_CHAR_PUNCT: &[&str] = &[
+    "<<=", ">>=", "...", "..=", "::", "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "+=", "-=",
+    "*=", "/=", "%=", "^=", "&=", "|=", "..",
+];
+
+/// What kind of text a [`Token`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenKind {
+    /// An ASCII identifier or keyword: `[A-Za-z_][A-Za-z0-9_]*` (so `_`,
+    /// `self`, and `fn` are identifiers too).
+    Ident,
+    /// A numeric literal: a digit, then `[A-Za-z0-9_]*` (`1u8`, `0xff`,
+    /// `1_000`), plus one fractional part when a `.` is directly followed by
+    /// a digit (`1.5`, `2.0f64`) and the number does not follow a lone `.`
+    /// (a tuple index; `..` is a range, so `0.0..1.5` keeps `1.5`). `0..10` is `0`, `..`, `10`; `x.0.y` keeps `0` alone, and
+    /// `t.0.1` reads as `t`, `.`, `0`, `.`, `1`.
+    Number,
+    /// One of [`MULTI_CHAR_PUNCT`], or any other single non-whitespace
+    /// character (non-ASCII ones included).
+    Punct,
+}
+
+/// One token of blanked source, as [`tokenize`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub text: String,
+    /// Char index of the token's first character in the tokenized input.
+    pub start: usize,
+    /// Char index just past the token.
+    pub end: usize,
+    /// 1-based source line the token starts on.
+    pub line: usize,
+    /// How many `(` / `[` / `{` enclose the token. An opener and its closer
+    /// carry the depth outside them; a closer with nothing open stays at 0.
+    pub depth: usize,
+}
+
+impl Token {
+    /// Whether the token's text is exactly `text`.
+    #[must_use]
+    pub fn is(&self, text: &str) -> bool {
+        self.text == text
+    }
+
+    /// Whether the token is an identifier or keyword.
+    #[must_use]
+    pub fn is_ident(&self) -> bool {
+        self.kind == TokenKind::Ident
+    }
+
+    /// Whether the token is an identifier or a number (what a plain
+    /// `[A-Za-z0-9_]+` word scan would return).
+    #[must_use]
+    pub fn is_word(&self) -> bool {
+        self.kind != TokenKind::Punct
+    }
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// The one Rust token reader the source lints share. Reads blanked text (see
+/// [`lex`]: comments and literals already spaces, so nothing quoted can
+/// count) into identifiers, numbers, and punctuation, keeping every
+/// [`MULTI_CHAR_PUNCT`] operator whole and recording each token's char
+/// offsets, line, and bracket depth. `first_line` is the source line of
+/// `chars[0]`. Whitespace separates tokens and is dropped.
+///
+/// Not handled, by design: raw identifiers (`r#type` reads as `r`, `#`,
+/// `type`), exponent signs (`1e-5` reads as `1e`, `-`, `5`), and lifetimes —
+/// [`lex`] blanks a lifetime's `'`, so `'a` reads as the identifier `a`
+/// (check the raw source at `start - 1` when that matters).
+#[must_use]
+pub fn tokenize_from(chars: &[char], first_line: usize) -> Vec<Token> {
+    let mut out = Vec::new();
+    let mut line = first_line;
+    let mut depth = 0usize;
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        if c.is_whitespace() {
+            line += usize::from(c == '\n');
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let kind = if c.is_ascii_alphabetic() || c == '_' {
+            while chars.get(i).copied().is_some_and(is_word_char) {
+                i += 1;
+            }
+            TokenKind::Ident
+        } else if c.is_ascii_digit() {
+            while chars.get(i).copied().is_some_and(is_word_char) {
+                i += 1;
+            }
+            let tuple_index =
+                start > 0 && chars[start - 1] == '.' && (start < 2 || chars[start - 2] != '.');
+            if !tuple_index
+                && chars.get(i) == Some(&'.')
+                && chars.get(i + 1).is_some_and(char::is_ascii_digit)
+            {
+                i += 1;
+                while chars.get(i).copied().is_some_and(is_word_char) {
+                    i += 1;
+                }
+            }
+            TokenKind::Number
+        } else {
+            let rest = &chars[i..];
+            let width = MULTI_CHAR_PUNCT
+                .iter()
+                .find(|p| rest.len() >= p.len() && p.chars().zip(rest).all(|(a, b)| a == *b))
+                .map_or(1, |p| p.len());
+            i += width;
+            TokenKind::Punct
+        };
+        let text: String = chars[start..i].iter().collect();
+        let token_depth = match text.as_str() {
+            "(" | "[" | "{" => {
+                depth += 1;
+                depth - 1
+            }
+            ")" | "]" | "}" => {
+                depth = depth.saturating_sub(1);
+                depth
+            }
+            _ => depth,
+        };
+        out.push(Token {
+            kind,
+            text,
+            start,
+            end: i,
+            line,
+            depth: token_depth,
+        });
+    }
+    out
+}
+
+/// [`tokenize_from`] with `chars[0]` on line 1.
+#[must_use]
+pub fn tokenize(chars: &[char]) -> Vec<Token> {
+    tokenize_from(chars, 1)
+}
+
+/// [`tokenize`] over a `&str`; offsets are still char indices.
+#[must_use]
+pub fn tokenize_str(text: &str) -> Vec<Token> {
+    let chars: Vec<char> = text.chars().collect();
+    tokenize(&chars)
+}
+
+impl Statement {
+    /// The statement's tokens with source lines: [`Token::line`] is the line
+    /// in the file, and offsets are char indices into [`Statement::text`].
+    #[must_use]
+    pub fn tokens(&self) -> Vec<Token> {
+        let chars: Vec<char> = self.text.chars().collect();
+        let lead = chars
+            .iter()
+            .take_while(|c| c.is_whitespace())
+            .filter(|c| **c == '\n')
+            .count();
+        tokenize_from(&chars, self.line.saturating_sub(lead).max(1))
+    }
+}
+
+/// Index of the token closing the `(` / `[` / `{` token at `open`, counting
+/// only brackets of that kind; `None` when `open` is not an opener or never
+/// closes.
+#[must_use]
+pub fn matching_close(tokens: &[Token], open: usize) -> Option<usize> {
+    let (opener, closer) = match tokens.get(open)?.text.as_str() {
+        "(" => ("(", ")"),
+        "[" => ("[", "]"),
+        "{" => ("{", "}"),
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    for (i, t) in tokens.iter().enumerate().skip(open) {
+        if t.is(opener) {
+            depth += 1;
+        } else if t.is(closer) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// The closing delimiter matching an opening one, on blanked text.
+fn closing_of(open: char) -> Option<char> {
+    match open {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        _ => None,
+    }
+}
+
+/// Index of the delimiter closing the `(…)` / `[…]` / `{…}` group that opens
+/// at `open`, on blanked text (so a delimiter inside a comment or literal
+/// never counts): [`skip_group`] as an index into the text. Only the group's
+/// own delimiter pair is counted. `None` when `chars[open]` is not an opening
+/// delimiter or the group never closes.
+#[must_use]
+pub fn group_close(chars: &[char], open: usize) -> Option<usize> {
+    let open_c = *chars.get(open)?;
+    let close_c = closing_of(open_c)?;
+    let past = skip_group(chars, open, open_c, close_c);
+    let group = &chars[open..past];
+    let opens = group.iter().filter(|&&c| c == open_c).count();
+    let closes = group.iter().filter(|&&c| c == close_c).count();
+    (opens == closes).then(|| past - 1)
+}
+
+/// Index of the delimiter opening the group whose closing `)` / `]` / `}`
+/// sits at `close` — the reverse of [`group_close`].
+#[must_use]
+pub fn group_open(chars: &[char], close: usize) -> Option<usize> {
+    let close_c = *chars.get(close)?;
+    let open_c = ['(', '[', '{']
+        .into_iter()
+        .find(|&o| closing_of(o) == Some(close_c))?;
+    let mut depth = 0usize;
+    for k in (0..=close).rev() {
+        if chars[k] == close_c {
+            depth += 1;
+        } else if chars[k] == open_c {
+            depth -= 1;
+            if depth == 0 {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
+/// Maps char offsets to 1-based line numbers in O(log n) per lookup, so a
+/// lint reporting many offsets in a large file does not rescan it from the
+/// start for each one.
+#[derive(Debug, Clone)]
+pub struct LineIndex {
+    /// Char offset at which each line starts; `starts[0] == 0`.
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    /// Indexes the line starts of `chars` (blanked or not: blanking keeps
+    /// every newline).
+    #[must_use]
+    pub fn new(chars: &[char]) -> Self {
+        let starts = std::iter::once(0)
+            .chain(
+                chars
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &c)| c == '\n')
+                    .map(|(k, _)| k + 1),
+            )
+            .collect();
+        Self { starts }
+    }
+
+    /// 1-based line holding char offset `offset`.
+    #[must_use]
+    pub fn line(&self, offset: usize) -> usize {
+        self.starts.partition_point(|&start| start <= offset)
+    }
+}
+
 /// The cargo workspace root (the directory holding `Cargo.toml` and
 /// `crates/`), resolved from this crate's own manifest directory so every
 /// lint gets the same answer whichever crate it lives in.
@@ -869,6 +1161,591 @@ fn is_tests_dir(dir: &Path) -> bool {
     dir.file_name().is_some_and(|name| name == "tests")
 }
 
+/// Parses a per-file ratchet baseline (`fixed_sleep_lint`,
+/// `fixed_deadline_lint`, `elapsed_assert_lint`): `<path> <count>` per line,
+/// blank lines and `#` comments ignored, paths strictly increasing, counts
+/// positive. `what` names the counted hits in the zero-count error
+/// (`"fixed deadlines"`).
+///
+/// # Errors
+///
+/// A line that is not `<path> <count>`, a count that is not a positive
+/// number, or a path out of order or repeated.
+pub fn parse_count_baseline(
+    text: &str,
+    what: &str,
+) -> Result<std::collections::BTreeMap<String, usize>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut previous: Option<String> = None;
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let n = i + 1;
+        let (path, count) = line
+            .rsplit_once([' ', '\t'])
+            .ok_or_else(|| format!("line {n}: expected `<path> <count>`, got {raw:?}"))?;
+        let path = path.trim_end();
+        let count: usize = count
+            .parse()
+            .map_err(|_| format!("line {n}: count {count:?} is not a number"))?;
+        if count == 0 {
+            return Err(format!(
+                "line {n}: a file with no {what} has no entry; remove {raw:?}"
+            ));
+        }
+        if let Some(prev) = previous.as_deref().filter(|prev| *prev >= path) {
+            return Err(format!(
+                "line {n}: entries must be sorted by path and unique, but {path:?} follows {prev:?}"
+            ));
+        }
+        previous = Some(path.to_string());
+        out.insert(path.to_string(), count);
+    }
+    Ok(out)
+}
+
+// ---- per-crate ratchet baselines --------------------------------------------
+//
+// A ratchet lint keeps its grandfathered counts in one file per crate:
+// `<dir>/<crate>.txt` holds the entries for paths under `crates/<crate>/`, so
+// two PRs lowering different crates' entries never edit the same file and
+// cannot conflict. With one shared list, sorted neighbours from different
+// crates conflicted: four per-crate PRs (intentd#2945–#2948) were queued
+// together and two were rejected as unmergeable, rebased and re-run twice.
+// A union merge driver would not do: two adjacent deletions would restore
+// both lines.
+
+/// The crate owning workspace-relative `path`: `<crate>` of
+/// `crates/<crate>/…`, if `path` is under one.
+#[must_use]
+pub fn baseline_crate(path: &str) -> Option<&str> {
+    let (krate, rest) = path.strip_prefix("crates/")?.split_once('/')?;
+    (!krate.is_empty() && !rest.is_empty()).then_some(krate)
+}
+
+/// The per-crate file of baseline directory `dir` that holds `path`'s
+/// entry: `<dir>/<crate>.txt`. Every scanned path is under `crates/`; one
+/// that is not names `<dir>/<crate>.txt` literally.
+#[must_use]
+pub fn count_baseline_file(dir: &str, path: &str) -> String {
+    format!("{dir}/{}.txt", baseline_crate(path).unwrap_or("<crate>"))
+}
+
+/// Reads a per-crate ratchet baseline: every `<dir>/<crate>.txt` under
+/// `root`, each parsed by [`parse_count_baseline`], merged into one map keyed
+/// by workspace-relative path. A missing `dir` is an empty baseline (git
+/// keeps no empty directory, so a lint with nothing grandfathered has none).
+///
+/// # Errors
+///
+/// An unreadable `dir` or file; a directory entry that is not a
+/// `<crate>.txt` file; a parse error (prefixed with the file); an entry whose
+/// path is not under `crates/<crate>/` for its file's `<crate>`; or a file
+/// with no entries (delete it instead).
+pub fn read_count_baselines(
+    root: &Path,
+    dir: &str,
+    what: &str,
+) -> Result<std::collections::BTreeMap<String, usize>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for (krate, file) in count_baseline_files(root, dir)? {
+        let text = fs::read_to_string(root.join(&file)).map_err(|e| format!("read {file}: {e}"))?;
+        let entries = parse_count_baseline(&text, what).map_err(|e| format!("{file}: {e}"))?;
+        if entries.is_empty() {
+            return Err(format!(
+                "{file}: has no entries; delete the file once its last entry is gone"
+            ));
+        }
+        if let Some(path) = entries
+            .keys()
+            .find(|path| baseline_crate(path) != Some(krate.as_str()))
+        {
+            return Err(format!(
+                "{file}: {path:?} is not under crates/{krate}/; its entry belongs in {}",
+                count_baseline_file(dir, path)
+            ));
+        }
+        out.extend(entries);
+    }
+    Ok(out)
+}
+
+/// Rewrites the per-crate ratchet baseline `dir` under `root` to `counts`:
+/// one `<crate>.txt` per crate with a positive count, starting with `header`
+/// (`#` comment lines) and listing `<path> <count>` sorted by path; every
+/// other `<crate>.txt` there is removed, so a crate whose last entry went
+/// loses its file. Zero counts are dropped.
+///
+/// # Errors
+///
+/// A count for a path outside `crates/<crate>/`, or a failure to list
+/// `dir` or to write or remove a file.
+pub fn write_count_baselines(
+    root: &Path,
+    dir: &str,
+    header: &str,
+    counts: &std::collections::BTreeMap<String, usize>,
+) -> Result<(), String> {
+    let mut by_crate: std::collections::BTreeMap<&str, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (path, &count) in counts.iter().filter(|(_, &count)| count > 0) {
+        let krate = baseline_crate(path).ok_or_else(|| {
+            format!("{path:?} is not under crates/<crate>/; no baseline holds it")
+        })?;
+        by_crate
+            .entry(krate)
+            .or_default()
+            .push(format!("{path} {count}"));
+    }
+    for (krate, file) in count_baseline_files(root, dir)? {
+        if !by_crate.contains_key(krate.as_str()) {
+            fs::remove_file(root.join(&file)).map_err(|e| format!("remove {file}: {e}"))?;
+        }
+    }
+    if !by_crate.is_empty() {
+        fs::create_dir_all(root.join(dir)).map_err(|e| format!("create {dir}: {e}"))?;
+    }
+    for (krate, entries) in by_crate {
+        let file = format!("{dir}/{krate}.txt");
+        let lines: Vec<&str> = header
+            .lines()
+            .chain(entries.iter().map(String::as_str))
+            .collect();
+        fs::write(root.join(&file), lines.join("\n") + "\n")
+            .map_err(|e| format!("write {file}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// The `(crate, workspace-relative file)` pairs of baseline directory `dir`,
+/// sorted; none when `dir` does not exist.
+fn count_baseline_files(root: &Path, dir: &str) -> Result<Vec<(String, String)>, String> {
+    let entries = match fs::read_dir(root.join(dir)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read_dir {dir}: {e}")),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read_dir {dir}: {e}"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let krate = name
+            .strip_suffix(".txt")
+            .filter(|krate| !krate.is_empty() && entry.path().is_file())
+            .ok_or_else(|| {
+                format!("{dir}/{name}: a baseline directory holds only `<crate>.txt` files")
+            })?;
+        out.push((krate.to_string(), format!("{dir}/{name}")));
+    }
+    out.sort();
+    Ok(out)
+}
+
+// ---- test-code discovery ----------------------------------------------------
+//
+// Lints whose rule applies only to test code (`fixed_deadline_lint`,
+// `elapsed_assert_lint`) share one answer to "which text is test code":
+//
+// - every file under `crates/*/tests/`;
+// - inside `crates/*/src/`: files named `tests.rs` / `*_tests.rs`, anything
+//   under a `tests/` directory, files reached through a `#[cfg(test)] mod
+//   name;` declaration (and that module's directory, and any `mod` a test
+//   file declares in turn);
+// - every `#[cfg(test)]` or `#[cfg(all(…, test, …))]` item, plus
+//   `cfg(any(test, feature = "test-hooks"))` ones (the `test-hooks` feature
+//   never builds into production: scripts/check-test-hooks-feature.sh).
+//   Other `cfg(any(test, …))` items also build outside tests and are not
+//   test code.
+//
+// Limit: a `#[cfg(test)] mod x;` nested inside an inline `mod a { … }`
+// resolves as if declared at file level.
+
+/// Index past `token` at `j` (after whitespace), if it is there.
+fn expect_token(chars: &[char], j: usize, token: &str) -> Option<usize> {
+    let j = skip_whitespace(chars, j);
+    let len = token.chars().count();
+    (chars.len() >= j + len && chars[j..j + len].iter().copied().eq(token.chars()))
+        .then_some(j + len)
+}
+
+/// Overwrites `chars[start..end]` (newlines kept) with a padded
+/// `#[cfg(test)]`, so [`cfg_test_items`] finds the item.
+fn rewrite_as_cfg_test(chars: &mut [char], start: usize, end: usize) {
+    let mut replacement = "#[cfg(test)]".chars();
+    for c in chars[start..end].iter_mut().filter(|c| **c != '\n') {
+        *c = replacement.next().unwrap_or(' ');
+    }
+}
+
+/// Rewrites every `#[cfg(all(…, test, …))]` attribute in blanked `chars` to a
+/// padded `#[cfg(test)]` (length and newlines preserved). `any(…)` /
+/// `not(…)` predicates are left alone: they also compile outside tests.
+fn normalize_cfg_all_test(chars: &mut [char]) {
+    let mut i = 0;
+    while i < chars.len() {
+        let head = (chars[i] == '#')
+            .then(|| {
+                ["#", "[", "cfg", "(", "all", "("]
+                    .iter()
+                    .try_fold(i, |j, token| expect_token(chars, j, token))
+            })
+            .flatten();
+        let Some(args_start) = head else {
+            i += 1;
+            continue;
+        };
+        let args_end = skip_group(chars, args_start - 1, '(', ')');
+        let args: String = chars[args_start..args_end.saturating_sub(1)]
+            .iter()
+            .collect();
+        let mut depth = 0usize;
+        let mut has_test = false;
+        let mut current = String::new();
+        for c in args.chars().chain(std::iter::once(',')) {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    has_test |= current.trim() == "test";
+                    current.clear();
+                    continue;
+                }
+                _ => {}
+            }
+            current.push(c);
+        }
+        let Some(end) = [")", "]"]
+            .iter()
+            .try_fold(args_end, |j, token| expect_token(chars, j, token))
+        else {
+            i += 1;
+            continue;
+        };
+        if has_test {
+            rewrite_as_cfg_test(chars, i, end);
+        }
+        i = end;
+    }
+}
+
+/// Rewrites every `#[cfg(any(test, feature = "test-hooks"))]` attribute in
+/// blanked `chars` to a padded `#[cfg(test)]`. The feature name is blanked
+/// with the literal, so it is read from `literals`.
+fn normalize_cfg_test_hooks(chars: &mut [char], literals: &[Literal]) {
+    let mut i = 0;
+    while i < chars.len() {
+        let head = (chars[i] == '#')
+            .then(|| {
+                [
+                    "#", "[", "cfg", "(", "any", "(", "test", ",", "feature", "=",
+                ]
+                .iter()
+                .try_fold(i, |j, token| expect_token(chars, j, token))
+            })
+            .flatten();
+        let Some(after_eq) = head else {
+            i += 1;
+            continue;
+        };
+        // The blanked literal reads as whitespace, so find it by offset: the
+        // first literal at or after `=` with only whitespace before it.
+        let end = literals
+            .iter()
+            .find(|l| l.offset >= after_eq)
+            .filter(|l| chars[after_eq..l.offset].iter().all(|c| c.is_whitespace()))
+            .filter(|l| !l.raw && l.text == "test-hooks")
+            .and_then(|l| {
+                [")", ")", "]"]
+                    .iter()
+                    .try_fold(l.offset + l.text.chars().count() + 2, |k, token| {
+                        expect_token(chars, k, token)
+                    })
+            });
+        let Some(end) = end else {
+            i += 1;
+            continue;
+        };
+        rewrite_as_cfg_test(chars, i, end);
+        i = end;
+    }
+}
+
+/// Rewrites the test-only `cfg` forms [`cfg_test_items`] does not match —
+/// `#[cfg(all(…, test, …))]` and `#[cfg(any(test, feature = "test-hooks"))]`
+/// — in blanked `chars` to a padded `#[cfg(test)]` (length and newlines
+/// preserved), so those items count as test code too.
+pub fn normalize_test_cfgs(chars: &mut [char], literals: &[Literal]) {
+    normalize_cfg_all_test(chars);
+    normalize_cfg_test_hooks(chars, literals);
+}
+
+/// The identifier ending just before `j` (skipping whitespace back).
+fn ident_before(chars: &[char], j: usize) -> String {
+    let end = chars[..j]
+        .iter()
+        .rposition(|c| !c.is_whitespace())
+        .map_or(0, |p| p + 1);
+    let start = chars[..end]
+        .iter()
+        .rposition(|c| !is_word_char(*c))
+        .map_or(0, |p| p + 1);
+    chars[start..end].iter().collect()
+}
+
+/// Every plain `mod name;` declaration in blanked `chars`: the char range of
+/// the item (from after the previous `;` / `{` / `}` through its `;`, so it
+/// covers any `#[path = "…"]`) and the name.
+fn out_of_line_mods(chars: &[char]) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let at_word = is_word_char(chars[i]) && (i == 0 || !is_word_char(chars[i - 1]));
+        let Some((word, end)) = at_word.then(|| word_at(chars, i)).flatten() else {
+            i += 1;
+            continue;
+        };
+        if word == "mod" {
+            let name_at = skip_whitespace(chars, end);
+            if let Some((name, after)) = word_at(chars, name_at) {
+                if let Some(semi) = expect_token(chars, after, ";") {
+                    let start = chars[..i]
+                        .iter()
+                        .rposition(|c| matches!(c, ';' | '{' | '}'))
+                        .map_or(0, |b| b + 1);
+                    out.push((start, semi, name));
+                }
+            }
+        }
+        i = end;
+    }
+    out
+}
+
+/// The `#[path = "…"]` value inside `[start, end)` of blanked `chars`, if any.
+fn path_attr(chars: &[char], literals: &[Literal], start: usize, end: usize) -> Option<String> {
+    literals
+        .iter()
+        .filter(|lit| (start..end).contains(&lit.offset))
+        .find(|lit| {
+            let before = chars[..lit.offset]
+                .iter()
+                .rposition(|c| !c.is_whitespace())
+                .filter(|p| chars[*p] == '=');
+            before.is_some_and(|p| ident_before(chars, p) == "path")
+        })
+        .map(Literal::cooked)
+}
+
+/// A source file as a test-code lint scans it: comments and literals
+/// blanked, test-only `cfg` forms normalized, and the `#[cfg(test)]` items
+/// that make up its test code when the whole file is not.
+#[derive(Debug, Clone)]
+pub struct TestCodeText {
+    /// What [`lex`] found; `lexed.blanked` is before cfg normalization.
+    pub lexed: Lexed,
+    /// The blanked text with [`normalize_test_cfgs`] applied.
+    pub chars: Vec<char>,
+    /// Every `#[cfg(test)]` item of `chars`, in source order.
+    pub items: Vec<CfgTestItem>,
+    /// The whole file is test code.
+    pub whole: bool,
+}
+
+impl TestCodeText {
+    /// Prepares `src`; `whole` marks a file that is test code throughout.
+    #[must_use]
+    pub fn new(src: &str, whole: bool) -> Self {
+        let lexed = lex(src);
+        let mut chars: Vec<char> = lexed.blanked.chars().collect();
+        normalize_test_cfgs(&mut chars, &lexed.literals);
+        let items = cfg_test_items(&chars);
+        Self {
+            lexed,
+            chars,
+            items,
+            whole,
+        }
+    }
+
+    /// Whether the char at `offset` is test code.
+    #[must_use]
+    pub fn in_test(&self, offset: usize) -> bool {
+        self.whole
+            || self
+                .items
+                .iter()
+                .any(|item| (item.start..item.end).contains(&offset))
+    }
+
+    /// `(name, #[path] value)` per out-of-line module this file makes test
+    /// code: every `#[cfg(test)] mod name;`, plus every `mod name;` of a whole
+    /// test file.
+    #[must_use]
+    pub fn test_mods(&self) -> Vec<(String, Option<String>)> {
+        let literals = &self.lexed.literals;
+        let mut out: Vec<(String, Option<String>)> = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                let name = item.out_of_line_mod.clone()?;
+                Some((name, path_attr(&self.chars, literals, item.start, item.end)))
+            })
+            .collect();
+        if self.whole {
+            for (start, end, name) in out_of_line_mods(&self.chars) {
+                let entry = (name, path_attr(&self.chars, literals, start, end));
+                if !out.contains(&entry) {
+                    out.push(entry);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Test code by file-name convention under a crate's `src/` (`rel` is
+/// relative to that `src/`): `tests.rs`, `*_tests.rs`, or anything under a
+/// `tests/` directory.
+#[must_use]
+pub fn is_conventional_test_file(rel: &Path) -> bool {
+    let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name == "tests.rs"
+        || name.ends_with("_tests.rs")
+        || rel
+            .parent()
+            .is_some_and(|dir| dir.components().any(|c| c.as_os_str() == "tests"))
+}
+
+/// The files and directories a `#[cfg(test)] mod name;` (with an optional
+/// `#[path]` value) in `file` makes test code, resolved like rustc.
+#[must_use]
+pub fn test_mod_targets(file: &Path, name: &str, path: Option<&str>) -> Vec<PathBuf> {
+    let dir = file.parent().unwrap_or(Path::new(""));
+    if let Some(path) = path {
+        let target = dir.join(path);
+        return vec![target.with_extension(""), target];
+    }
+    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let base = if matches!(stem, "mod" | "lib" | "main") {
+        dir.to_path_buf()
+    } else {
+        dir.join(stem)
+    };
+    vec![base.join(format!("{name}.rs")), base.join(name)]
+}
+
+/// One Rust file under `crates/*/src/` or `crates/*/tests/`, as
+/// [`test_code_files`] classifies it.
+#[derive(Debug, Clone)]
+pub struct TestCodeFile {
+    /// Workspace-relative path with `/` separators.
+    pub rel: String,
+    /// The file's source text.
+    pub src: String,
+    /// The whole file is test code; otherwise only its `#[cfg(test)]` items
+    /// are (see [`TestCodeText::in_test`]).
+    pub whole: bool,
+}
+
+impl TestCodeFile {
+    /// The file prepared for a test-code rule.
+    #[must_use]
+    pub fn text(&self) -> TestCodeText {
+        TestCodeText::new(&self.src, self.whole)
+    }
+}
+
+/// Every `*.rs` file under every crate's `src/` and `tests/` below `root`,
+/// sorted by [`TestCodeFile::rel`], each marked whole when it is test code throughout (see the
+/// section comment above): `tests/` files and conventional `src/` test files
+/// start whole, then — until nothing changes — every `src/` file an
+/// out-of-line test module resolves to is promoted, including modules
+/// declared by a promoted file. Fail-fast like [`rust_files`].
+///
+/// # Panics
+///
+/// When `crates/` or any scanned directory or file cannot be read.
+#[must_use]
+pub fn test_code_files(root: &Path) -> Vec<TestCodeFile> {
+    let crates_dir = root.join("crates");
+    let mut krates: Vec<PathBuf> = fs::read_dir(&crates_dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", crates_dir.display()))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|e| panic!("read_dir {}: {e}", crates_dir.display()))
+                .path()
+        })
+        .filter(|path| path.is_dir())
+        .collect();
+    krates.sort();
+    let mut files: std::collections::BTreeMap<PathBuf, (String, bool)> =
+        std::collections::BTreeMap::new();
+    let read = |file: &Path| {
+        fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()))
+    };
+    for krate in &krates {
+        let tests = krate.join("tests");
+        if tests.is_dir() {
+            for file in rust_files(&tests) {
+                let src = read(&file);
+                files.insert(file, (src, true));
+            }
+        }
+        let src_dir = krate.join("src");
+        if src_dir.is_dir() {
+            for file in rust_files(&src_dir) {
+                let rel = file.strip_prefix(&src_dir).expect("under src");
+                let whole = is_conventional_test_file(rel);
+                let src = read(&file);
+                files.insert(file, (src, whole));
+            }
+        }
+    }
+    let mut targets: Vec<PathBuf> = Vec::new();
+    let mut expanded: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for (file, (src, whole)) in &mut files {
+            if !*whole && targets.iter().any(|target| file.starts_with(target)) {
+                *whole = true;
+                expanded.remove(file);
+            }
+            if !expanded.insert(file.clone()) {
+                continue;
+            }
+            for (name, path) in TestCodeText::new(src, *whole).test_mods() {
+                for target in test_mod_targets(file, &name, path.as_deref()) {
+                    if !targets.contains(&target) {
+                        targets.push(target);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut out: Vec<TestCodeFile> = files
+        .into_iter()
+        .map(|(file, (src, whole))| TestCodeFile {
+            rel: file
+                .strip_prefix(root)
+                .expect("under root")
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/"),
+            src,
+            whole,
+        })
+        .collect();
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
@@ -876,6 +1753,7 @@ mod tests {
 
     use super::*;
 
+    #[track_caller]
     fn line_of(src: &str, needle: &str) -> usize {
         let Some(index) = src.lines().position(|l| l.contains(needle)) else {
             panic!("fixture has no line containing {needle:?}")
@@ -1448,5 +2326,567 @@ let h = 8;
                 assert!(msg.contains(&tests.display().to_string()), "{msg}");
             }
         }
+    }
+
+    fn kinds_and_texts(text: &str) -> Vec<(TokenKind, String)> {
+        tokenize_str(text)
+            .into_iter()
+            .map(|t| (t.kind, t.text))
+            .collect()
+    }
+
+    fn texts(text: &str) -> Vec<String> {
+        tokenize_str(text).into_iter().map(|t| t.text).collect()
+    }
+
+    #[test]
+    fn tokenize_separates_identifiers_numbers_and_punctuation() {
+        use TokenKind::{Ident, Number, Punct};
+        let got = kinds_and_texts("let _x1 = 1u8 + 0xff_u32 * 1.5 - 2.0f64;");
+        let want = [
+            (Ident, "let"),
+            (Ident, "_x1"),
+            (Punct, "="),
+            (Number, "1u8"),
+            (Punct, "+"),
+            (Number, "0xff_u32"),
+            (Punct, "*"),
+            (Number, "1.5"),
+            (Punct, "-"),
+            (Number, "2.0f64"),
+            (Punct, ";"),
+        ];
+        assert_eq!(got, want.map(|(k, t)| (k, t.to_string())).to_vec());
+        assert_eq!(texts("0..10"), ["0", "..", "10"]);
+        assert_eq!(texts("0..=9"), ["0", "..=", "9"]);
+        assert_eq!(texts("x.0.y"), ["x", ".", "0", ".", "y"]);
+        assert_eq!(texts("t.0.1.data"), ["t", ".", "0", ".", "1", ".", "data"]);
+        assert_eq!(texts("x = 0.5"), ["x", "=", "0.5"]);
+        assert_eq!(texts("0.0..1.5"), ["0.0", "..", "1.5"]);
+        assert_eq!(texts("1.max(2)"), ["1", ".", "max", "(", "2", ")"]);
+        assert_eq!(texts("1e-5"), ["1e", "-", "5"]);
+        assert_eq!(texts("r#type"), ["r", "#", "type"]);
+        assert_eq!(kinds_and_texts("_")[0], (Ident, "_".to_string()));
+    }
+
+    #[test]
+    fn tokenize_keeps_every_multi_char_operator_whole() {
+        for op in MULTI_CHAR_PUNCT {
+            assert_eq!(texts(&format!("a {op} b")), ["a", op, "b"], "{op}");
+            assert_eq!(texts(&format!("a{op}b")), ["a", op, "b"], "{op} unspaced");
+        }
+        assert_eq!(texts("a..=b"), ["a", "..=", "b"]);
+        assert_eq!(texts("a<<=b"), ["a", "<<=", "b"]);
+        assert_eq!(texts("a ... b"), ["a", "...", "b"]);
+        assert_eq!(texts("A::B::C"), ["A", "::", "B", "::", "C"]);
+        assert_eq!(texts("A :: B"), ["A", "::", "B"]);
+        assert_eq!(texts("a & &b"), ["a", "&", "&", "b"]);
+        assert_eq!(texts("a | |b"), ["a", "|", "|", "b"]);
+    }
+
+    #[test]
+    fn tokenize_splits_shifts_so_generic_closers_count_one_by_one() {
+        assert_eq!(
+            texts("Vec<Vec<u8>>"),
+            ["Vec", "<", "Vec", "<", "u8", ">", ">"]
+        );
+        assert_eq!(texts("a << b >> c"), ["a", "<", "<", "b", ">", ">", "c"]);
+        // Longest match wins, as in rustc: a generic closer glued to `=` reads
+        // as `>>=`.
+        assert_eq!(
+            texts("let v: Vec<Vec<u8>>= x"),
+            ["let", "v", ":", "Vec", "<", "Vec", "<", "u8", ">>=", "x"]
+        );
+    }
+
+    #[test]
+    fn tokenize_reads_closure_bars_and_boolean_operators_alike() {
+        assert_eq!(texts("a || b && c"), ["a", "||", "b", "&&", "c"]);
+        assert_eq!(texts("let f = || x;"), ["let", "f", "=", "||", "x", ";"]);
+        assert_eq!(texts("move |a| a"), ["move", "|", "a", "|", "a"]);
+        assert_eq!(texts("&&x"), ["&&", "x"]);
+        assert_eq!(texts("a |= b"), ["a", "|=", "b"]);
+    }
+
+    #[test]
+    fn tokenize_tracks_bracket_depth() {
+        let toks = tokenize_str("f(a, [b, {c}]) ) d");
+        let depth: Vec<(&str, usize)> = toks.iter().map(|t| (t.text.as_str(), t.depth)).collect();
+        assert_eq!(
+            depth,
+            [
+                ("f", 0),
+                ("(", 0),
+                ("a", 1),
+                (",", 1),
+                ("[", 1),
+                ("b", 2),
+                (",", 2),
+                ("{", 2),
+                ("c", 3),
+                ("}", 2),
+                ("]", 1),
+                (")", 0),
+                (")", 0),
+                ("d", 0),
+            ]
+        );
+        assert!(tokenize_str(") ] } x").iter().all(|t| t.depth == 0));
+    }
+
+    #[test]
+    fn tokenize_records_char_offsets_and_lines() {
+        let text = "é a\n  ::b\n\n(c)";
+        let chars: Vec<char> = text.chars().collect();
+        let toks = tokenize(&chars);
+        let got: Vec<(&str, usize, usize, usize)> = toks
+            .iter()
+            .map(|t| (t.text.as_str(), t.start, t.end, t.line))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("é", 0, 1, 1),
+                ("a", 2, 3, 1),
+                ("::", 6, 8, 2),
+                ("b", 8, 9, 2),
+                ("(", 11, 12, 4),
+                ("c", 12, 13, 4),
+                (")", 13, 14, 4),
+            ]
+        );
+        for t in &toks {
+            assert_eq!(chars[t.start..t.end].iter().collect::<String>(), t.text);
+        }
+        assert_eq!(tokenize_from(&chars, 10)[4].line, 13);
+        assert_eq!(tokenize_str("é")[0].kind, TokenKind::Punct);
+    }
+
+    #[test]
+    fn tokenize_reads_blanked_source() {
+        let src = "fn f<'a>(x: &'a str) -> bool { x == \"a || b\" } // c && d\n";
+        let blanked = lex(src).blanked;
+        assert_eq!(
+            texts(&blanked),
+            [
+                "fn", "f", "<", "a", ">", "(", "x", ":", "&", "a", "str", ")", "->", "bool", "{",
+                "x", "==", "}",
+            ]
+        );
+    }
+
+    #[test]
+    fn statement_tokens_carry_source_lines() {
+        let src = "fn f() {\n    let a = b\n        && c;\n\n    g(\n      d)\n}\n";
+        let statements = split_statements(&lex(src).blanked);
+        let lines: Vec<Vec<(String, usize)>> = statements
+            .iter()
+            .map(|s| s.tokens().into_iter().map(|t| (t.text, t.line)).collect())
+            .collect();
+        let owned = |v: &[(&str, usize)]| {
+            v.iter()
+                .map(|(t, l)| ((*t).to_string(), *l))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            lines,
+            [
+                owned(&[("fn", 1), ("f", 1), ("(", 1), (")", 1)]),
+                owned(&[
+                    ("let", 2),
+                    ("a", 2),
+                    ("=", 2),
+                    ("b", 2),
+                    ("&&", 3),
+                    ("c", 3)
+                ]),
+                owned(&[("g", 5), ("(", 5), ("d", 6), (")", 6)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn matching_close_counts_only_the_opener_kind() {
+        let toks = tokenize_str("( a [ b ) ] ( c )");
+        assert_eq!(matching_close(&toks, 0), Some(4));
+        assert_eq!(matching_close(&toks, 2), Some(5));
+        assert_eq!(matching_close(&toks, 6), Some(8));
+        assert_eq!(matching_close(&toks, 1), None);
+        assert_eq!(matching_close(&tokenize_str("{ ( }"), 1), None);
+        assert_eq!(matching_close(&tokenize_str("{ { } }"), 0), Some(3));
+    }
+
+    #[test]
+    fn skip_group_ends_past_the_matching_closer() {
+        let chars: Vec<char> = "x(a(b)c)d".chars().collect();
+        assert_eq!(skip_group(&chars, 1, '(', ')'), 8);
+        let chars: Vec<char> = "{ a { } ".chars().collect();
+        assert_eq!(skip_group(&chars, 0, '{', '}'), chars.len());
+    }
+}
+
+#[cfg(test)]
+mod group_and_line_tests {
+    use super::*;
+
+    #[test]
+    fn group_close_and_open_match_their_own_pair_only() {
+        let chars: Vec<char> = "f(a[1], {b(2)}) [x]".chars().collect();
+        assert_eq!(group_close(&chars, 1), Some(14));
+        assert_eq!(group_close(&chars, 3), Some(5));
+        assert_eq!(group_close(&chars, 8), Some(13));
+        assert_eq!(group_open(&chars, 14), Some(1));
+        assert_eq!(group_open(&chars, 13), Some(8));
+        assert_eq!(group_open(&chars, 18), Some(16));
+        assert_eq!(group_close(&chars, 0), None, "`f` is not a delimiter");
+        let unclosed: Vec<char> = "{ (".chars().collect();
+        assert_eq!(group_close(&unclosed, 0), None);
+        let ends_on_inner_close: Vec<char> = "{ { }".chars().collect();
+        assert_eq!(group_close(&ends_on_inner_close, 0), None);
+    }
+
+    #[test]
+    fn line_index_maps_offsets_to_one_based_lines() {
+        let chars: Vec<char> = "ab\nc\n\nd".chars().collect();
+        let index = LineIndex::new(&chars);
+        let lines: Vec<usize> = (0..chars.len()).map(|k| index.line(k)).collect();
+        assert_eq!(lines, vec![1, 1, 1, 2, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_code_text_marks_cfg_test_items_and_out_of_line_test_mods() {
+        let src = "\
+fn production() {}
+
+#[cfg(test)]
+mod tests {
+    fn t() {}
+}
+
+#[cfg(test)]
+mod helpers;
+#[cfg(test)]
+#[path = \"thing/tests/extra.rs\"]
+mod extra;
+mod plain;
+";
+        let text = TestCodeText::new(src, false);
+        let offset = |needle: &str| {
+            let byte = src.find(needle).expect("needle");
+            src[..byte].chars().count()
+        };
+        assert!(!text.in_test(offset("production")));
+        assert!(text.in_test(offset("fn t()")));
+        assert_eq!(
+            text.test_mods(),
+            vec![
+                ("helpers".to_string(), None),
+                (
+                    "extra".to_string(),
+                    Some("thing/tests/extra.rs".to_string())
+                ),
+            ]
+        );
+        assert!(TestCodeText::new(src, true).in_test(offset("production")));
+    }
+
+    #[test]
+    fn test_only_cfg_forms_are_test_code_but_cfg_any_test_is_not() {
+        let src = "\
+#[cfg(all(test, unix))]
+fn a() {}
+#[cfg(all(
+    unix,
+    test
+))]
+fn b() {}
+#[cfg(any(test, feature = \"test-hooks\"))]
+fn c() {}
+#[cfg(any(test, feature = \"fixtures\"))]
+fn d() {}
+#[cfg(not(test))]
+fn e() {}
+#[cfg(all(testing, unix))]
+fn f() {}
+#[cfg(any(test, feature = r\"test-hooks\"))]
+fn g() {}
+";
+        let text = TestCodeText::new(src, false);
+        let in_test: Vec<&str> = ["a", "b", "c", "d", "e", "f", "g"]
+            .into_iter()
+            .filter(|name| {
+                let needle = format!("fn {name}()");
+                let byte = src.find(&needle).expect("needle");
+                text.in_test(src[..byte].chars().count())
+            })
+            .collect();
+        assert_eq!(in_test, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_whole_test_file_makes_its_out_of_line_modules_test_code() {
+        let src = "\
+mod helpers;
+#[path = \"shared/fixtures.rs\"]
+pub(crate) mod fixtures;
+mod inline { }
+use some::module;
+";
+        assert_eq!(
+            TestCodeText::new(src, true).test_mods(),
+            vec![
+                ("helpers".to_string(), None),
+                (
+                    "fixtures".to_string(),
+                    Some("shared/fixtures.rs".to_string())
+                ),
+            ]
+        );
+        assert_eq!(TestCodeText::new(src, false).test_mods(), vec![]);
+    }
+
+    #[test]
+    fn test_module_files_resolve_like_rustc() {
+        let lib = Path::new("crates/a/src/lib.rs");
+        assert_eq!(
+            test_mod_targets(lib, "helpers", None),
+            vec![
+                PathBuf::from("crates/a/src/helpers.rs"),
+                PathBuf::from("crates/a/src/helpers"),
+            ]
+        );
+        let file = Path::new("crates/a/src/store.rs");
+        assert_eq!(
+            test_mod_targets(file, "harness", None),
+            vec![
+                PathBuf::from("crates/a/src/store/harness.rs"),
+                PathBuf::from("crates/a/src/store/harness"),
+            ]
+        );
+        assert_eq!(
+            test_mod_targets(file, "x", Some("store/t/x.rs")),
+            vec![
+                PathBuf::from("crates/a/src/store/t/x"),
+                PathBuf::from("crates/a/src/store/t/x.rs"),
+            ]
+        );
+        assert_eq!(
+            test_mod_targets(Path::new("crates/a/src/bus_tests.rs"), "helpers", None),
+            vec![
+                PathBuf::from("crates/a/src/bus_tests/helpers.rs"),
+                PathBuf::from("crates/a/src/bus_tests/helpers"),
+            ]
+        );
+        for (rel, expected) in [
+            ("tests.rs", true),
+            ("a/tests.rs", true),
+            ("a/bus_tests.rs", true),
+            ("a/tests/mod.rs", true),
+            ("a/tests/b/c.rs", true),
+            ("a/latests.rs", false),
+            ("a/test_support.rs", false),
+            ("lib.rs", false),
+        ] {
+            assert_eq!(is_conventional_test_file(Path::new(rel)), expected, "{rel}");
+        }
+    }
+
+    #[test]
+    fn test_code_files_promote_test_modules_transitively() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let write = |rel: &str, body: &str| {
+            let path = root.path().join(rel);
+            fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            fs::write(path, body).expect("write");
+        };
+        write(
+            "crates/a/src/lib.rs",
+            "mod store;\n#[cfg(test)]\nmod harness;\n",
+        );
+        write("crates/a/src/store.rs", "fn prod() {}\n");
+        write("crates/a/src/harness.rs", "mod nested;\n");
+        write("crates/a/src/harness/nested.rs", "fn helper() {}\n");
+        write("crates/a/src/bus_tests.rs", "mod fixtures;\n");
+        write("crates/a/src/bus_tests/fixtures.rs", "fn f() {}\n");
+        write("crates/a/tests/e2e.rs", "fn t() {}\n");
+        write("crates/not-a-crate.txt", "");
+        let files: Vec<(String, bool)> = test_code_files(root.path())
+            .into_iter()
+            .map(|file| (file.rel, file.whole))
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                ("crates/a/src/bus_tests.rs".to_string(), true),
+                ("crates/a/src/bus_tests/fixtures.rs".to_string(), true),
+                ("crates/a/src/harness.rs".to_string(), true),
+                ("crates/a/src/harness/nested.rs".to_string(), true),
+                ("crates/a/src/lib.rs".to_string(), false),
+                ("crates/a/src/store.rs".to_string(), false),
+                ("crates/a/tests/e2e.rs".to_string(), true),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod count_baseline_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    const DIR: &str = "crates/lints/tests/baselines/demo";
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, body).expect("write");
+    }
+
+    fn counts(entries: &[(&str, usize)]) -> BTreeMap<String, usize> {
+        entries.iter().map(|&(p, n)| (p.to_string(), n)).collect()
+    }
+
+    #[test]
+    fn baseline_crate_names_the_crate_directory() {
+        assert_eq!(
+            baseline_crate("crates/intentd/tests/e2e.rs"),
+            Some("intentd")
+        );
+        assert_eq!(baseline_crate("crates/a/src/lib.rs"), Some("a"));
+        assert_eq!(baseline_crate("crates/a"), None);
+        assert_eq!(baseline_crate("crates/a/"), None);
+        assert_eq!(baseline_crate("crates//x.rs"), None);
+        assert_eq!(baseline_crate("scripts/x.rs"), None);
+        assert_eq!(
+            count_baseline_file(DIR, "crates/a/tests/x.rs"),
+            format!("{DIR}/a.txt")
+        );
+    }
+
+    #[test]
+    fn reads_one_file_per_crate_into_one_map() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            read_count_baselines(root.path(), DIR, "hits"),
+            Ok(BTreeMap::new()),
+            "a missing directory is an empty baseline"
+        );
+        write(
+            root.path(),
+            &format!("{DIR}/a.txt"),
+            "# header\ncrates/a/src/x.rs 1\ncrates/a/tests/y.rs 2\n",
+        );
+        write(
+            root.path(),
+            &format!("{DIR}/b-c.txt"),
+            "crates/b-c/tests/z.rs 3\n",
+        );
+        assert_eq!(
+            read_count_baselines(root.path(), DIR, "hits"),
+            Ok(counts(&[
+                ("crates/a/src/x.rs", 1),
+                ("crates/a/tests/y.rs", 2),
+                ("crates/b-c/tests/z.rs", 3),
+            ]))
+        );
+    }
+
+    #[test]
+    fn rejects_misplaced_empty_unsorted_and_foreign_files() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "a.txt",
+                "crates/b/tests/x.rs 1\n",
+                "a.txt: \"crates/b/tests/x.rs\" is not under crates/a/; its entry belongs in \
+                 crates/lints/tests/baselines/demo/b.txt",
+            ),
+            (
+                "a.txt",
+                "# only a header\n",
+                "a.txt: has no entries; delete the file",
+            ),
+            (
+                "a.txt",
+                "crates/a/tests/y.rs 1\ncrates/a/tests/x.rs 1\n",
+                "a.txt: line 2: entries must be sorted by path and unique",
+            ),
+            (
+                "a.txt",
+                "crates/a/tests/x.rs 0\n",
+                "a.txt: line 1: a file with no hits has no entry",
+            ),
+            (
+                "README.md",
+                "notes\n",
+                "README.md: a baseline directory holds only `<crate>.txt` files",
+            ),
+            (
+                ".txt",
+                "crates/a/tests/x.rs 1\n",
+                "/.txt: a baseline directory holds only `<crate>.txt` files",
+            ),
+        ];
+        for (name, body, expected) in cases {
+            let root = tempfile::tempdir().expect("tempdir");
+            write(root.path(), &format!("{DIR}/{name}"), body);
+            let err = read_count_baselines(root.path(), DIR, "hits").expect_err(name);
+            assert!(err.contains(expected), "{name}: {err:?} lacks {expected:?}");
+        }
+    }
+
+    #[test]
+    fn write_splits_by_crate_and_removes_emptied_files() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let header = "# Demo baseline.\n# Entries only ratchet down.";
+        write_count_baselines(
+            root.path(),
+            DIR,
+            header,
+            &counts(&[
+                ("crates/a/tests/y.rs", 2),
+                ("crates/a/src/x.rs", 1),
+                ("crates/b/tests/z.rs", 3),
+                ("crates/c/tests/clean.rs", 0),
+            ]),
+        )
+        .expect("write");
+        let read = |name: &str| fs::read_to_string(root.path().join(DIR).join(name)).ok();
+        assert_eq!(
+            read("a.txt").as_deref(),
+            Some("# Demo baseline.\n# Entries only ratchet down.\ncrates/a/src/x.rs 1\ncrates/a/tests/y.rs 2\n")
+        );
+        assert_eq!(
+            read("b.txt").as_deref(),
+            Some("# Demo baseline.\n# Entries only ratchet down.\ncrates/b/tests/z.rs 3\n")
+        );
+        assert_eq!(read("c.txt"), None, "a zero count writes no file");
+        assert_eq!(
+            read_count_baselines(root.path(), DIR, "hits"),
+            Ok(counts(&[
+                ("crates/a/src/x.rs", 1),
+                ("crates/a/tests/y.rs", 2),
+                ("crates/b/tests/z.rs", 3),
+            ]))
+        );
+
+        write_count_baselines(
+            root.path(),
+            DIR,
+            header,
+            &counts(&[("crates/a/src/x.rs", 1)]),
+        )
+        .expect("lower");
+        assert_eq!(
+            read("b.txt"),
+            None,
+            "a crate burnt down to zero loses its file"
+        );
+        assert_eq!(
+            read("a.txt").as_deref(),
+            Some("# Demo baseline.\n# Entries only ratchet down.\ncrates/a/src/x.rs 1\n")
+        );
+        let err = write_count_baselines(root.path(), DIR, header, &counts(&[("scripts/x.rs", 1)]))
+            .expect_err("outside crates/");
+        assert!(err.contains("not under crates/<crate>/"), "{err}");
     }
 }

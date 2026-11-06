@@ -13,8 +13,9 @@ pub use intent_core::{
 };
 
 pub use cow::{cow_clone, cow_probe, CowSupport, TEST_COW_CLONE_UNSUPPORTED_PATH_ENV};
-pub use local_changes::{local_changes, LocalChanges, MAX_UNPUSHED_COUNT};
+pub use local_changes::{head_reached_by, local_changes, LocalChanges, MAX_UNPUSHED_COUNT};
 
+pub mod attribution;
 pub mod auth;
 pub mod branches;
 pub mod checkpoint;
@@ -32,6 +33,7 @@ pub mod local_changes;
 pub mod ls_remote;
 pub mod native_checkout;
 pub mod native_push;
+pub mod node_git;
 pub mod pull;
 pub mod push;
 pub mod rebase;

@@ -38,6 +38,7 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn insert_note(&self, note: &Note) -> Result<()> {
+        self.prepare_task_events(&note.workspace_id).await;
         let mut conn = self
             .write_pool()
             .acquire()
@@ -59,7 +60,7 @@ impl Store {
     pub async fn list_notes(&self, workspace_id: &WorkspaceId) -> Result<Vec<Note>> {
         let sql =
             format!("SELECT {NOTE_COLUMNS} FROM note WHERE workspace_id = ? ORDER BY created_at");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -81,6 +82,24 @@ impl Store {
         workspace_id: &WorkspaceId,
         filter: Option<TaskStatus>,
     ) -> Result<TaskListResult> {
+        Ok(self
+            .list_workspace_tasks_keyed(workspace_id, filter)
+            .await?
+            .0)
+    }
+
+    /// [`Self::list_workspace_tasks`] plus each returned task's `created_at`
+    /// (same index as `tasks`), the sort key of the paged `task.list` and the
+    /// `task.subscribe` snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the query or projected metadata decoding fails.
+    pub async fn list_workspace_tasks_keyed(
+        &self,
+        workspace_id: &WorkspaceId,
+        filter: Option<TaskStatus>,
+    ) -> Result<(TaskListResult, Vec<String>)> {
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Summary {
@@ -92,7 +111,7 @@ impl Store {
 
         let filter = filter.map(|s| enum_to_db(&s)).transpose()?;
         let rows = sqlx::query(
-            "SELECT id, parent_id, json_extract(task_json, '$.status') AS status, \
+            "SELECT id, parent_id, created_at, json_extract(task_json, '$.status') AS status, \
              CASE WHEN id = 'spec' THEN content END AS spec_content, \
              CASE WHEN id != 'spec' AND (?2 IS NULL OR json_extract(task_json, '$.status') = ?2) \
              THEN json_object('title', title, 'updatedAt', updated_at, \
@@ -112,6 +131,7 @@ impl Store {
         let mut status_by_id = HashMap::new();
         let mut children = Vec::new();
         let mut tasks = Vec::new();
+        let mut keys = Vec::new();
         for row in &rows {
             let id: String = col(row, "id")?;
             let status: Option<String> = col(row, "status")?;
@@ -137,6 +157,7 @@ impl Store {
             if let Some(summary) = summary {
                 let summary: Summary = serde_json::from_str(&summary)
                     .map_err(|e| Error::Internal(format!("decode task summary failed: {e}")))?;
+                keys.push(col::<String>(row, "created_at")?);
                 tasks.push(WorkspaceTask {
                     id: NoteId::from(id),
                     title: if summary.title.is_empty() {
@@ -181,7 +202,7 @@ impl Store {
                 _ => stats.total += 1,
             }
         }
-        Ok(TaskListResult { tasks, stats })
+        Ok((TaskListResult { tasks, stats }, keys))
     }
 
     /// Test whether a workspace owns a note without hydrating its row.
@@ -250,7 +271,7 @@ impl Store {
             "SELECT workspace_id, MAX(updated_at) AS updated_at FROM note \
              WHERE workspace_id IN ({placeholders}) GROUP BY workspace_id"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
@@ -276,7 +297,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_notes(&self) -> Result<Vec<Note>> {
         let sql = format!("SELECT {NOTE_COLUMNS} FROM note ORDER BY created_at");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list all notes failed: {e}")))?;
@@ -298,7 +319,7 @@ impl Store {
     pub async fn get_note(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
         let sql = format!("SELECT {NOTE_COLUMNS} FROM note WHERE id = ? AND workspace_id = ?");
         let row = crate::with_read_retry(|| async {
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&id.0)
                 .bind(&workspace_id.0)
                 .fetch_optional(self.read_pool())
@@ -310,6 +331,27 @@ impl Store {
             Some(r) => map_note_row(&r),
             None => Err(Error::NotFound(format!("note {id}"))),
         }
+    }
+
+    /// Read the note metadata used by change events without loading its body.
+    /// The returned content is empty; emitters omit it from the wire projection.
+    ///
+    /// # Errors
+    /// Returns `NotFound` for an absent note, or a database/decoding error.
+    pub async fn get_note_metadata(&self, workspace_id: &WorkspaceId, id: &NoteId) -> Result<Note> {
+        let columns = NOTE_COLUMNS.replace(" content,", " '' AS content,");
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {columns} FROM note WHERE id = ? AND workspace_id = ?"
+        )))
+        .bind(id.as_str())
+        .bind(workspace_id.as_str())
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("get note metadata failed: {e}")))?;
+        row.as_ref()
+            .map(map_note_row)
+            .transpose()?
+            .ok_or_else(|| Error::NotFound(format!("note {id}")))
     }
 
     /// Update an existing note (full-row replace, except `id` and
@@ -326,11 +368,15 @@ impl Store {
     /// [`Store::update_note_metadata`] / [`Store::update_note_metadata_versioned`],
     /// which leave `content` alone. This method remains for fixtures.
     ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
-    pub async fn update_note(&self, note: &Note) -> Result<i64> {
-        self.update_note_versioned(note, None).await
+    pub async fn update_note(&self, lock: &crate::NoteWriteLock, note: &Note) -> Result<i64> {
+        self.update_note_versioned(lock, note, None).await
     }
 
     /// Update an existing note, optionally gating on `expected_version`
@@ -351,14 +397,20 @@ impl Store {
     /// [`Store::update_note_with_version`], which runs this same conditional
     /// UPDATE and the snapshot in one transaction.
     ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
     pub async fn update_note_versioned(
         &self,
+        lock: &crate::NoteWriteLock,
         note: &Note,
         expected_version: Option<i64>,
     ) -> Result<i64> {
+        lock.ensure_covers(self, note)?;
         self.exec_note_update(note, expected_version, NoteUpdateScope::FullRow)
             .await
     }
@@ -372,25 +424,38 @@ impl Store {
     /// content snapshot at or below it, which is the content the row still
     /// holds. Returns the post-write `rev`.
     ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store
+    /// like the content writers: a metadata write that bumped `rev` outside
+    /// the lane could land inside a laned writer's read→persist window, be
+    /// reverted by a whole-row writer's stale copy, or burn a gated writer's
+    /// bounded retries. Any other lock is refused with `Error::Internal`.
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
-    pub async fn update_note_metadata(&self, note: &Note) -> Result<i64> {
-        self.update_note_metadata_versioned(note, None).await
+    pub async fn update_note_metadata(
+        &self,
+        lock: &crate::NoteWriteLock,
+        note: &Note,
+    ) -> Result<i64> {
+        self.update_note_metadata_versioned(lock, note, None).await
     }
 
     /// [`Store::update_note_metadata`] optionally gated on `expected_version`,
     /// with the same conflict / not-found classification as
-    /// [`Store::update_note_versioned`].
+    /// [`Store::update_note_versioned`]. Takes `note`'s
+    /// [`NoteWriteLock`](crate::NoteWriteLock), like [`Store::update_note_metadata`].
     ///
     /// # Errors
     ///
     /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
     pub async fn update_note_metadata_versioned(
         &self,
+        lock: &crate::NoteWriteLock,
         note: &Note,
         expected_version: Option<i64>,
     ) -> Result<i64> {
+        lock.ensure_covers(self, note)?;
         self.exec_note_update(note, expected_version, NoteUpdateScope::Metadata)
             .await
     }
@@ -399,38 +464,28 @@ impl Store {
     /// note in the same workspace. The revision and session link are checked
     /// in one `SQLite` UPDATE, so a session-only relink cannot slip past the CAS.
     /// Returns None on a stale revision, missing note, or changed agent link.
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock), like
+    /// [`Store::update_note_metadata`].
     ///
     /// # Errors
     /// Returns `Error::Internal` if encoding or the database write fails.
     pub async fn update_note_metadata_if_agent_linked(
         &self,
+        lock: &crate::NoteWriteLock,
         note: &Note,
         expected_version: i64,
         agent_id: &AgentId,
     ) -> Result<Option<i64>> {
+        lock.ensure_covers(self, note)?;
+        self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
-        let result = async {
-            let revision = exec_update_note_with_link_guard(
-                &mut conn,
-                note,
-                Some(expected_version),
-                NoteUpdateScope::Metadata,
-                Some(agent_id),
-            )
-            .await?;
-            if revision.is_some() {
-                // Recovery metadata can omit the body. Finalize against the
-                // persisted source on the same writer as the guarded update.
-                crate::note_annotation_repo::rebuild_note_anchors(
-                    &mut conn,
-                    &note.workspace_id,
-                    &note.id,
-                    None,
-                )
-                .await?;
-            }
-            Ok(revision)
-        }
+        let result = exec_update_note_with_link_guard(
+            &mut conn,
+            note,
+            Some(expected_version),
+            NoteUpdateScope::Metadata,
+            Some(agent_id),
+        )
         .await;
         conn.finish(result, "commit linked note metadata update")
             .await
@@ -442,23 +497,9 @@ impl Store {
         expected_version: Option<i64>,
         scope: NoteUpdateScope,
     ) -> Result<i64> {
+        self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
-        let result = async {
-            let revision = exec_update_note(&mut conn, note, expected_version, scope).await?;
-            if revision.is_some() && scope == NoteUpdateScope::Metadata {
-                // Metadata inputs may deliberately omit the body. Resolve the
-                // persisted source on this same writer, after the final update.
-                crate::note_annotation_repo::rebuild_note_anchors(
-                    &mut conn,
-                    &note.workspace_id,
-                    &note.id,
-                    None,
-                )
-                .await?;
-            }
-            Ok(revision)
-        }
-        .await;
+        let result = exec_update_note(&mut conn, note, expected_version, scope).await;
         match conn.finish(result, "commit note update").await? {
             Some(rev) => Ok(rev),
             None => Err(self.note_update_miss(note).await),
@@ -507,19 +548,9 @@ impl Store {
         id: &NoteId,
         expected_version: Option<i64>,
     ) -> Result<()> {
+        self.prepare_task_events(workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
         let result = async {
-            // Retain only the IDs detached by the legacy same-workspace trigger.
-            // Immediate deletion has no grace-path child cardinality limit.
-            let child_ids: Vec<String> = sqlx::query_scalar(
-                "SELECT id FROM note WHERE workspace_id=? AND parent_id=? AND id!=? ORDER BY id",
-            )
-            .bind(workspace_id.as_str())
-            .bind(id.as_str())
-            .bind(id.as_str())
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("note delete children: {e}")))?;
             let res = match expected_version {
                 Some(rev) => {
                     sqlx::query("DELETE FROM note WHERE id = ? AND workspace_id = ? AND rev = ?")
@@ -537,18 +568,6 @@ impl Store {
                     .await
                     .map_err(|e| Error::Internal(format!("delete note failed: {e}")))?,
             };
-            if res.rows_affected() > 0 {
-                crate::note_page_index::rebuild_pending(&mut conn).await?;
-                for child in child_ids {
-                    crate::note_annotation_repo::rebuild_note_anchors(
-                        &mut conn,
-                        workspace_id,
-                        &NoteId::from(child),
-                        None,
-                    )
-                    .await?;
-                }
-            }
             Ok(res)
         }
         .await;
@@ -581,7 +600,7 @@ impl Store {
             "SELECT {NOTE_COLUMNS} FROM note WHERE workspace_id = ? AND task_json IS NOT NULL \
              ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -725,7 +744,7 @@ impl Store {
              FROM note WHERE workspace_id IN ({placeholders}) AND \
                 (id = 'spec' OR (task_json IS NOT NULL AND id != 'spec' AND parent_id = 'spec'))"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
@@ -806,6 +825,7 @@ impl Store {
         let workspace_id = workspace_id.clone();
 
         crate::with_write_txn_retry(|| async {
+            self.prepare_task_events(&workspace_id).await;
             let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 
             let body_result = async {
@@ -928,28 +948,18 @@ impl Store {
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| Error::Internal(format!("move spec comments failed: {e}")))?;
-                crate::note_page_index::rebuild_pending(&mut conn).await?;
-                // The direct children's parent update also invalidates their
-                // annotation heads. Finalize after every identity/root move.
-                let affected: Vec<String> = sqlx::query_scalar(
-                    "SELECT id FROM note WHERE workspace_id=? AND (id='spec' OR parent_id='spec') ORDER BY id",
-                ).bind(workspace_id.as_str()).fetch_all(&mut *conn).await
-                    .map_err(|e| Error::Internal(format!("read adopted note scopes: {e}")))?;
-                for id in affected {
-                    crate::note_annotation_repo::rebuild_note_anchors(&mut conn, &workspace_id, &NoteId(id), None).await?;
-                }
-
                 Ok(Some((NoteId(old_id), title)))
             }
             .await;
 
-            conn.finish(body_result, "commit adopt_spec tx failed").await
+            conn.finish(body_result, "commit adopt_spec tx failed")
+                .await
         })
         .await
     }
 }
 
-/// The one note INSERT statement and derived indexes, on a connection in an open
+/// The one note INSERT statement, on a connection in an open
 /// transaction alongside the initial version snapshot
 /// ([`Store::insert_note_with_version`]).
 pub(crate) async fn exec_insert_note(
@@ -964,7 +974,7 @@ pub(crate) async fn exec_insert_note(
         .map(encode_task_json)
         .transpose()?;
     let sql = format!("INSERT INTO note ({NOTE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&note.id.0)
         .bind(&note.workspace_id.0)
         .bind(&note.title)
@@ -983,7 +993,7 @@ pub(crate) async fn exec_insert_note(
         .execute(&mut *executor)
         .await
         .map_err(|e| Error::Internal(format!("insert note failed: {e}")))?;
-    crate::note_page_index::rebuild(executor, note, note.rev, true).await
+    Ok(())
 }
 
 /// Which columns a note UPDATE rewrites.
@@ -1045,7 +1055,7 @@ async fn exec_update_note_with_link_guard(
         );
     }
     sql.push_str(" RETURNING rev");
-    let mut query = sqlx::query(&sql).bind(&note.title);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&note.title);
     if scope == NoteUpdateScope::FullRow {
         query = query
             .bind(&note.content)
@@ -1073,12 +1083,7 @@ async fn exec_update_note_with_link_guard(
         .fetch_optional(&mut *executor)
         .await
         .map_err(|e| Error::Internal(format!("update note failed: {e}")))?;
-    let rev = row.as_ref().map(|r| col(r, "rev")).transpose()?;
-    if let Some(rev) = rev {
-        crate::note_page_index::rebuild(executor, note, rev, scope == NoteUpdateScope::FullRow)
-            .await?;
-    }
-    Ok(rev)
+    row.as_ref().map(|r| col(r, "rev")).transpose()
 }
 
 fn col<'r, T>(row: &'r SqliteRow, name: &str) -> Result<T>

@@ -27,6 +27,29 @@ pub(crate) enum Mutation {
     McpRestart(String),
 }
 
+/// Persistence finishes under the credential lease; publication stays with the
+/// same supervisor and original write while native retirement joins outside it.
+pub(crate) enum Completion {
+    Done(Value),
+    GitlabPat(
+        intent_sourcecontrol::GitlabHost,
+        Option<Arc<RepositoryWrite>>,
+    ),
+    GitlabRevoke(
+        intent_sourcecontrol::GitlabHost,
+        Option<Arc<RepositoryWrite>>,
+    ),
+}
+
+impl Mutation {
+    fn repository_write(&self) -> Option<Arc<RepositoryWrite>> {
+        match self {
+            Self::GitlabPat(_, _, write) | Self::GitlabRevoke(_, Some(Ok(write))) => write.clone(),
+            _ => None,
+        }
+    }
+}
+
 impl Services {
     /// Authorization happens at the original entry point, before admission.
     /// The registered supervisor retains per-account ownership even if its
@@ -58,7 +81,7 @@ impl Services {
                     }
                 }
             } else { None };
-            let gitlab_guard = if gitlab {
+            let mut gitlab_guard = if gitlab {
                 #[cfg(test)]
                 let mut polled = if matches!(mutation, Mutation::GitlabRevoke(..)) {
                     operation.gitlab_auth.lock().await.revoke_gate_polled.take()
@@ -80,10 +103,11 @@ impl Services {
             let _accounts = if github || gitlab { None } else {
                 Some(operation.settings_secret_gates.write(&["mcp.servers"]).await)
             };
+            let original_write = mutation.repository_write();
             let worker = operation.clone();
             let worker_guard = gitlab_guard.clone();
-            let mut worker = intent_core::spawn_daemon(intent_core::with_caller(caller,
-                intent_core::caller::with_wire_credential(credential, async move {
+            let mut worker = intent_core::spawn_daemon(intent_core::with_caller(caller.clone(),
+                intent_core::caller::with_wire_credential(credential.clone(), async move {
                     worker.execute_direct_secret_mutation(mutation, worker_guard).await
                 })
             ));
@@ -97,9 +121,34 @@ impl Services {
                 }
                 result = &mut worker => result,
             };
-            let result = joined.unwrap_or_else(|error| Err(Error::Internal(format!(
+            let mut result = joined.unwrap_or_else(|error| Err(Error::Internal(format!(
                 "credential operation failed: {error}; state may be unknown"
             ))));
+            if let Some(write) = original_write.as_ref().filter(|write| write.native_retirement_pending()) {
+                // The worker and its secret-store lease have settled. Retain
+                // logical mutation ownership, but release every primary gate
+                // clone before waiting for the independently driven join.
+                operation.secrets.finish_operation().await;
+                let completed = write.completed_source(operation.gitlab_secret_store.clone(),
+                    gitlab_guard.as_deref().unwrap().lease()).await;
+                drop(gitlab_guard.take());
+                if let Err(error) = write.join_native_retirement().await {
+                    if result.is_ok() { result = Err(error); }
+                }
+                gitlab_guard = Some(Arc::new(operation.gitlab_credential_gate.lock().await));
+                let current = write.check_completed_source(completed, operation.gitlab_secret_store.clone(),
+                    gitlab_guard.as_deref().unwrap().lease()).await;
+                if result.is_ok() {
+                    match current { Ok(()) => write.retry_native_settlement(), Err(error) => result = Err(error) }
+                }
+            }
+            let result = match result {
+                Ok(completion) => intent_core::with_caller(caller,
+                    intent_core::caller::with_wire_credential(credential,
+                        operation.complete_direct_secret_mutation(completion))).await,
+                Err(error) => Err(error),
+            };
+            drop(gitlab_guard);
             if let Err(error) = &result {
                 tracing::warn!(%error, "direct credential/config operation failed");
             }
@@ -119,25 +168,27 @@ impl Services {
         &self,
         mutation: Mutation,
         gitlab_guard: Option<Arc<GitlabCredentialGuard>>,
-    ) -> Result<Value> {
-        match mutation {
+    ) -> Result<Completion> {
+        let result = match mutation {
             Mutation::GithubRevoke => self.github_revoke_owned().await,
             Mutation::GitlabPat(host, token, write) => {
-                self.gitlab_pat_with_owner(
-                    host,
-                    token,
-                    gitlab_guard.as_deref().expect("GitLab owner lease"),
-                    write,
-                )
-                .await
+                return self
+                    .gitlab_pat_with_owner(
+                        host,
+                        token,
+                        gitlab_guard.as_deref().expect("GitLab owner lease"),
+                        write,
+                    )
+                    .await
             }
             Mutation::GitlabRevoke(host, write) => {
-                self.gitlab_revoke_with_owner(
-                    host,
-                    gitlab_guard.as_deref().expect("GitLab owner lease"),
-                    write,
-                )
-                .await
+                return self
+                    .gitlab_revoke_with_owner(
+                        host,
+                        gitlab_guard.as_deref().expect("GitLab owner lease"),
+                        write,
+                    )
+                    .await
             }
             Mutation::McpCreate(config) => self.mcp_servers_service().create(config).await,
             Mutation::McpUpdate(id, config) => self.mcp_servers_service().update(&id, config).await,
@@ -160,6 +211,24 @@ impl Services {
                 )
                 .await;
                 Ok(out)
+            }
+        };
+        result.map(Completion::Done)
+    }
+
+    async fn complete_direct_secret_mutation(&self, completion: Completion) -> Result<Value> {
+        match completion {
+            Completion::Done(value) => Ok(value),
+            Completion::GitlabPat(host, write) => self.publish_gitlab_pat(host, write).await,
+            Completion::GitlabRevoke(host, _write) => {
+                crate::source_control_auth_ops::publish_auth_changed(
+                    self.event_bus.as_ref(),
+                    crate::source_control_auth_ops::Provider::Gitlab,
+                    host.host(),
+                    "revoked",
+                )
+                .await;
+                Ok(json!({"ok":true}))
             }
         }
     }

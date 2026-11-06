@@ -20,6 +20,7 @@ fn ok_fetch(tag: &'static str) -> impl FnOnce() -> BoxFuture<'static, ModelFetch
             ModelFetchResult {
                 models: Some(rows(tag)),
                 warning: None,
+                warning_kind: None,
             }
         })
     }
@@ -31,6 +32,7 @@ fn failing_fetch() -> impl FnOnce() -> BoxFuture<'static, ModelFetchResult> {
             ModelFetchResult {
                 models: None,
                 warning: Some("probe failed".to_string()),
+                warning_kind: None,
             }
         })
     }
@@ -54,6 +56,7 @@ fn counting_fetch(
             ModelFetchResult {
                 models: Some(rows(tag)),
                 warning: None,
+                warning_kind: None,
             }
         })
     }
@@ -294,6 +297,7 @@ async fn background_refreshes_respect_global_concurrency_cap() {
                 ModelFetchResult {
                     models: Some(rows("refreshed")),
                     warning: None,
+                    warning_kind: None,
                 }
             })
         };
@@ -331,6 +335,7 @@ async fn aged_entry_empty_success_background_refresh_stores_nothing() {
             ModelFetchResult {
                 models: Some(vec![]),
                 warning: None,
+                warning_kind: None,
             }
         }) as BoxFuture<'static, ModelFetchResult>
     };
@@ -448,6 +453,7 @@ async fn empty_success_is_served_but_not_cached() {
             ModelFetchResult {
                 models: Some(Vec::new()),
                 warning: Some("gated".to_string()),
+                warning_kind: None,
             }
         })
     };
@@ -597,6 +603,7 @@ fn registry_covers_dynamic_providers() {
         "droid",
         "opencode",
         "grok",
+        "cursor",
         "unsloth",
     ] {
         assert!(source_for(provider).is_some(), "{provider} not registered");
@@ -667,6 +674,7 @@ async fn provider_fetch_failure_yields_stale_last_good_through_cache() {
             from_provider_fetch(crate::provider_models::ProviderModelsFetch {
                 models: None,
                 warning: Some("droid: droid binary not found".to_string()),
+                warning_kind: None,
             })
         })
     };
@@ -831,6 +839,7 @@ async fn only_the_leader_records_the_probe_outcome() {
         .set(ModelFetchResult {
             models: None,
             warning: Some("stale failure".to_string()),
+            warning_kind: None,
         })
         .is_ok());
     // Simulate the newer probe's success landing first.
@@ -1156,6 +1165,7 @@ async fn antigravity_inflight_and_negative_results_cannot_cross_executables() {
                 ModelFetchResult {
                     models: Some(rows("model-a")),
                     warning: None,
+                    warning_kind: None,
                 }
             })
         })
@@ -1186,6 +1196,7 @@ async fn antigravity_inflight_and_negative_results_cannot_cross_executables() {
 fn installed_selection(key: &str) -> super::InstalledSelection {
     super::InstalledSelection {
         observed: tokio::time::Instant::now(),
+        profile_key: None,
         key: key.into(),
         command: Err("must not start a CLI on a cached read".into()),
     }
@@ -1244,6 +1255,7 @@ async fn installed_cli_obsolete_inflight_probe_cannot_overwrite_or_serve_new_sou
                     ModelFetchResult {
                         models: Some(vec![serde_json::json!({"id":"old"})]),
                         warning: None,
+                        warning_kind: None,
                     }
                 })
             },
@@ -1291,6 +1303,7 @@ async fn installed_cli_failed_refresh_only_serves_same_runtime_and_auth_last_goo
             ModelFetchResult {
                 models: None,
                 warning: Some("offline".into()),
+                warning_kind: None,
             }
         }) as intent_core::BoxFuture<'static, ModelFetchResult>
     };
@@ -1335,7 +1348,7 @@ fn installed_cli_credential_file_rotation_rejects_last_good_account() {
     if let Ok(key) = std::env::var(CHILD) {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let root = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
-            let services = crate::Services::new(
+            let services = crate::Services::new_isolated(
                 intent_store::Store::open(&root.join("test.db"))
                     .await
                     .unwrap(),
@@ -1428,8 +1441,14 @@ fn installed_cli_credential_file_rotation_rejects_last_good_account() {
         );
         std::fs::write(bin.join("node"), launcher).unwrap();
         std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let claude = format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+            intent_providers::test_support::current_cli_version(
+                intent_providers::installed_cli::InstalledCli::Claude
+            )
+        );
         for (name, script) in [
-            ("claude", "#!/bin/sh\nprintf '2.0.0 (Claude Code)\\n'\n"),
+            ("claude", claude.as_str()),
             (
                 "npx",
                 r"#!/usr/bin/env node
@@ -1469,4 +1488,253 @@ require('readline').createInterface({input:process.stdin}).on('line',line=>{
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+fn profile_env(reference: &str, fingerprint: &str) -> Arc<intent_acp::ProfileEnv> {
+    Arc::new(intent_acp::ProfileEnv::new(
+        reference,
+        fingerprint,
+        Vec::new(),
+    ))
+}
+
+fn profile_selection(key: &str, profile: &intent_acp::ProfileEnv) -> super::InstalledSelection {
+    super::InstalledSelection {
+        profile_key: Some(profile.cache_key()),
+        ..installed_selection(key)
+    }
+}
+
+#[tokio::test]
+async fn profile_catalogs_never_cross_references_or_the_default() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let work = profile_env("codex@work", "f1");
+    let personal = profile_env("codex@personal", "f1");
+    for (reference, profile, model) in [
+        ("codex@work", &work, "work-model"),
+        ("codex@personal", &personal, "personal-model"),
+    ] {
+        let key = format!("installed-test:{reference}");
+        cache
+            .installed
+            .lock()
+            .unwrap()
+            .insert(reference.into(), profile_selection(&key, profile));
+        cache.test_store(
+            reference,
+            &key,
+            vec![serde_json::json!({ "id": model })],
+            ModelCatalogCache::now_ms(),
+        );
+    }
+    let resolved = cache
+        .resolve_installed_for("codex@work", Some(work.clone()), false)
+        .await;
+    assert_eq!(resolved.models.unwrap()[0]["id"], "work-model");
+    let resolved = cache
+        .resolve_installed_for("codex@personal", Some(personal.clone()), false)
+        .await;
+    assert_eq!(resolved.models.unwrap()[0]["id"], "personal-model");
+    // The Default configuration has its own (here empty) slot.
+    cache.installed.lock().unwrap().insert(
+        "codex".into(),
+        installed_selection("installed-test:default"),
+    );
+    let resolved = cache.resolve_installed("codex", false).await;
+    assert!(resolved.models.is_none());
+}
+
+#[test]
+fn installed_selection_is_reused_only_for_the_same_profile_settings() {
+    let now = tokio::time::Instant::now();
+    let earlier = now.checked_sub(std::time::Duration::from_secs(1)).unwrap();
+    let work = profile_env("codex@work", "f1");
+    let edited = profile_env("codex@work", "f2");
+    let prior = profile_selection("installed-test:work", &work);
+    let current = Some(work.cache_key());
+    assert!(super::reusable_selection(
+        &prior,
+        earlier,
+        false,
+        current.as_deref()
+    ));
+    assert!(!super::reusable_selection(
+        &prior,
+        earlier,
+        false,
+        Some(edited.cache_key()).as_deref()
+    ));
+    assert!(!super::reusable_selection(&prior, earlier, false, None));
+    assert!(!super::reusable_selection(
+        &installed_selection("installed-test:default"),
+        earlier,
+        false,
+        current.as_deref()
+    ));
+}
+
+fn failing_fetch_kind(
+    kind: ModelWarningKind,
+) -> impl FnOnce() -> BoxFuture<'static, ModelFetchResult> {
+    move || {
+        Box::pin(async move {
+            ModelFetchResult {
+                models: None,
+                warning: Some("probe failed".to_string()),
+                warning_kind: Some(kind),
+            }
+        })
+    }
+}
+
+#[test]
+fn warning_kind_wire_values_are_kebab_case() {
+    assert_eq!(ModelWarningKind::CliMissing.as_wire(), "cli-missing");
+    assert_eq!(
+        ModelWarningKind::PrerequisiteMissing.as_wire(),
+        "prerequisite-missing"
+    );
+    let mut out = json!({ "warning": "w" });
+    insert_warning_kind(&mut out, Some(ModelWarningKind::CliMissing));
+    assert_eq!(out["warningKind"], "cli-missing");
+    let mut out = json!({ "warning": "w" });
+    insert_warning_kind(&mut out, None);
+    assert!(out.get("warningKind").is_none());
+    // Never without a warning (PROTOCOL §5.30 "Warning kind").
+    let mut out = json!({ "models": [] });
+    insert_warning_kind(&mut out, Some(ModelWarningKind::CliMissing));
+    assert!(out.get("warningKind").is_none());
+}
+
+#[tokio::test]
+async fn failed_probe_kind_is_served_and_kept_in_negative_window() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let kind = ModelWarningKind::CliMissing;
+    let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch_kind(kind)).await;
+    assert!(r.models.is_none());
+    assert_eq!(r.warning_kind, Some(kind));
+    let r = resolve_with_cache(
+        &cache,
+        "p",
+        "v1",
+        false,
+        1_000 + NEG_TTL_MS - 1,
+        panicking_fetch(),
+    )
+    .await;
+    assert!(r.models.is_none());
+    assert_eq!(r.warning.as_deref(), Some("probe failed"));
+    assert_eq!(r.warning_kind, Some(kind));
+}
+
+#[tokio::test]
+async fn stale_fallback_carries_the_failure_kind() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let kind = ModelWarningKind::PrerequisiteMissing;
+    cache.store("p", "v1", rows("last-good"), 0);
+    let aged = STALE_MS + 10;
+    // Forced failure: last-good served stale with the failure's kind.
+    let r = resolve_with_cache(&cache, "p", "v1", true, aged, failing_fetch_kind(kind)).await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    assert_eq!(r.warning_kind, Some(kind));
+    // Aged entry re-served inside the negative window: same kind.
+    let r = resolve_with_cache(&cache, "p", "v1", false, aged + 1, panicking_fetch()).await;
+    assert_eq!(r.models, Some(rows("last-good")));
+    assert!(r.stale);
+    assert_eq!(r.warning_kind, Some(kind));
+}
+
+#[tokio::test]
+async fn generic_failure_and_background_refresh_notice_have_no_kind() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let r = resolve_with_cache(&cache, "p", "v1", false, 1_000, failing_fetch()).await;
+    assert!(r.warning.is_some());
+    assert_eq!(r.warning_kind, None);
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    cache.store("p", "v1", rows("last-good"), 0);
+    let r = resolve_with_cache(&cache, "p", "v1", false, STALE_MS + 10, ok_fetch("new")).await;
+    assert!(r.stale);
+    assert!(r.warning.is_some());
+    assert_eq!(r.warning_kind, None);
+}
+
+#[tokio::test]
+async fn installed_cli_command_error_kind_reaches_the_resolved_catalog() {
+    for kind in [
+        Some(ModelWarningKind::CliMissing),
+        Some(ModelWarningKind::PrerequisiteMissing),
+        None,
+    ] {
+        let cache = Arc::new(ModelCatalogCache::new(None));
+        let mut selection = installed_selection("installed-unavailable:codex");
+        selection.command = Err(crate::provider_models::CatalogUnavailable {
+            reason: "codex catalog unavailable".into(),
+            kind,
+        });
+        cache
+            .installed
+            .lock()
+            .unwrap()
+            .insert("codex".into(), selection);
+        let resolved = cache.resolve_installed("codex", false).await;
+        assert!(resolved.models.is_none());
+        assert_eq!(
+            resolved.warning.as_deref(),
+            Some("codex catalog unavailable")
+        );
+        assert_eq!(resolved.warning_kind, kind);
+    }
+}
+
+#[tokio::test]
+async fn a_changed_installed_cli_failure_is_not_served_the_old_cached_kind() {
+    // Installing Node.js fixes the npx prerequisite but the CLI is still
+    // missing: inside the 60s negative window the new cause must win.
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    for (kind, reason) in [
+        (ModelWarningKind::PrerequisiteMissing, "npx missing"),
+        (ModelWarningKind::CliMissing, "codex missing"),
+    ] {
+        cache.test_install_selection_error(
+            "codex",
+            crate::provider_models::CatalogUnavailable {
+                reason: reason.into(),
+                kind: Some(kind),
+            },
+        );
+        let resolved = cache.resolve_installed("codex", false).await;
+        assert_eq!(resolved.warning.as_deref(), Some(reason));
+        assert_eq!(resolved.warning_kind, Some(kind));
+    }
+}
+
+/// The Cursor catalog cache key follows the resolved `cursor-agent`, so a
+/// `providers.paths.cursor` change never serves another binary's rows.
+#[cfg(unix)]
+#[test]
+fn cursor_version_key_tracks_the_resolved_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let [a, b] = ["a", "b"].map(|name| {
+        let path = dir.path().join(name).join("cursor-agent");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    });
+    let key_a = super::CursorModelSource::resolve(a.to_str()).version_key;
+    let key_b = super::CursorModelSource::resolve(b.to_str()).version_key;
+    assert!(key_a.starts_with("cursor-executable-v1:"), "{key_a}");
+    assert_ne!(key_a, key_b);
+    assert_eq!(
+        key_a,
+        super::CursorModelSource::resolve(a.to_str()).version_key
+    );
+    assert_eq!(
+        super::CursorModelSource::resolve(a.to_str())
+            .binary
+            .as_deref(),
+        Some(a.as_path())
+    );
 }

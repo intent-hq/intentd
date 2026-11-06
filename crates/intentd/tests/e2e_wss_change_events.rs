@@ -10,10 +10,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,15 +34,14 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
     _data_dir_guard: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -49,7 +49,7 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", &format!("itd-wss-events-{prefix}-"))
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -68,7 +68,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -227,9 +227,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -253,7 +256,8 @@ async fn next_event<S>(ws: &mut WebSocketStream<S>, types: &[&str], secs: u64) -
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "timed out waiting for {types:?}");
@@ -927,7 +931,7 @@ async fn task_block_author_list_assign_flow_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": parent_id }),
     )
     .await;
-    let rows = tasks.as_array().expect("bare array");
+    let rows = tasks["tasks"].as_array().expect("tasks page");
     assert_eq!(rows.len(), 1, "rows: {tasks}");
     assert_eq!(rows[0]["text"], json!("Ship It"));
     assert_eq!(rows[0]["status"], json!("todo"));
@@ -1036,6 +1040,9 @@ async fn task_block_author_list_assign_flow_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": parent_id }),
     )
     .await;
+    // Bounded reads: `note.listTasks` answers one page `{ tasks, nextToken }`.
+    assert!(tasks["nextToken"].is_null(), "one page: {tasks}");
+    let tasks = &tasks["tasks"];
     assert_eq!(tasks[0]["status"], json!("in-progress"), "rows: {tasks}");
     assert_eq!(tasks[0]["taskNoteId"], json!(task_id));
 
@@ -1084,7 +1091,7 @@ async fn task_block_author_list_assign_flow_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": parent_id }),
     )
     .await;
-    assert_eq!(tasks[0]["status"], json!("done"), "rows: {tasks}");
+    assert_eq!(tasks["tasks"][0]["status"], json!("done"), "rows: {tasks}");
 }
 
 /// End-to-end `task:created` over WSS (docs/protocol/06-events.md §6.5): every path where a
@@ -1145,7 +1152,7 @@ async fn task_created_emitted_on_every_creation_path_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": parent_id }),
     )
     .await;
-    let child_id = tasks[0]["taskNoteId"]
+    let child_id = tasks["tasks"][0]["taskNoteId"]
         .as_str()
         .expect("linked task note id")
         .to_string();
@@ -1308,32 +1315,35 @@ async fn note_list_reseeds_missing_spec_over_wss() {
     // The reseed publishes exactly one `note:created`; drain the socket for a
     // short window and fail if a second one arrives. Non-matching frames
     // (heartbeats, other event types) are ignored.
-    let extra = timeout(Duration::from_millis(500), async {
-        loop {
-            match sub.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = match serde_json::from_str(&text) {
-                        Ok(x) => x,
-                        Err(_) => continue,
-                    };
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!("note:created")
-                    {
-                        return Some(v);
+    let extra = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        async {
+            loop {
+                match sub.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = match serde_json::from_str(&text) {
+                            Ok(x) => x,
+                            Err(_) => continue,
+                        };
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"] == json!("note:created")
+                        {
+                            return Some(v);
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    // Stream close / error during the "should be quiet" window is
+                    // not the condition this drain is guarding against; surface
+                    // it instead of spinning silently until the timeout.
+                    Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
+                    None => panic!("subscription socket closed during drain"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                // Stream close / error during the "should be quiet" window is
-                // not the condition this drain is guarding against; surface
-                // it instead of spinning silently until the timeout.
-                Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
-                None => panic!("subscription socket closed during drain"),
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(
         extra.is_err(),
@@ -1416,29 +1426,32 @@ async fn drain_extra<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    timeout(Duration::from_millis(window_ms), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = match serde_json::from_str(&text) {
-                        Ok(x) => x,
-                        Err(_) => continue,
-                    };
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!(event_type)
-                    {
-                        return v;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(window_ms)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = match serde_json::from_str(&text) {
+                            Ok(x) => x,
+                            Err(_) => continue,
+                        };
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"] == json!(event_type)
+                        {
+                            return v;
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
+                    None => panic!("subscription socket closed during drain"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
-                None => panic!("subscription socket closed during drain"),
             }
-        }
-    })
+        },
+    )
     .await
     .ok()
 }
@@ -1871,9 +1884,12 @@ async fn comment_add_echoes_note_rev_and_emits_note_updated_over_wss() {
     // Exactly one note:updated for the rewrite, with the §6.5 payload shape.
     let evt = next_event(&mut sub, &["note:updated"], 10).await;
     assert_eq!(evt["workspaceId"], ws_id.as_str());
+    let mut expected_note = read["note"].clone();
+    expected_note.as_object_mut().unwrap().remove("content");
+    expected_note["metadata"] = json!({});
     assert_eq!(
         evt["data"],
-        json!({ "noteId": note_id, "title": "Note", "action": "update" })
+        json!({ "noteId": note_id, "title": "Note", "action": "update", "note": expected_note })
     );
     let extra = drain_extra(&mut sub, "note:updated", 500).await;
     assert!(
@@ -2943,7 +2959,8 @@ async fn next_subscription_push<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Va
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(
@@ -4373,7 +4390,7 @@ async fn task_convert_blocks_relation_seeding_and_warnings_over_wss() {
         json!({ "workspaceId": ws_id, "noteId": parent_id }),
     )
     .await;
-    let rows = tasks.as_array().expect("bare array");
+    let rows = tasks["tasks"].as_array().expect("tasks page");
     assert_eq!(rows.len(), 2, "rows: {tasks}");
     for (i, row) in rows.iter().enumerate() {
         let child_id = row["taskNoteId"].as_str().expect("child id");
@@ -4438,7 +4455,8 @@ async fn task_convert_blocks_relation_seeding_and_warnings_over_wss() {
     // The re-seeded edge recomputes readiness again, triggered by the new
     // Beta child. Child deletions above may also have emitted recomputes;
     // scan past them to the relations-changed trigger.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     loop {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -4662,7 +4680,9 @@ async fn note_subscribe_slim_projection_bounds_snapshot_and_deltas() {
         &mut rpc,
         4,
         "note.setContent",
-        json!({ "workspaceId": ws_id, "noteId": giant_id, "content": big3 }),
+        // Bounded reads write guard: replacing a note larger than the read
+        // budget needs the writer's base size.
+        json!({ "workspaceId": ws_id, "noteId": giant_id, "content": big3, "baseContentBytes": 1_100_000 }),
     )
     .await;
     let updated = 'updated: loop {
@@ -4687,8 +4707,11 @@ async fn note_subscribe_slim_projection_bounds_snapshot_and_deltas() {
     );
     assert_eq!(updated["contentLength"].as_i64(), Some(1_100_000));
 
-    // Default (absent projection): full rows, complete content intact — the
-    // pre-8.2 wire shape for existing clients. Explicit "full" matches.
+    // Default (absent projection) and explicit "full": full rows, paged
+    // (bounded reads). The seq-0 snapshot is the first `note.list` page and
+    // fits the read budget; the rest comes from `note.list` with its
+    // `nextToken`, and a row over the budget is cut with the markers.
+    let mut page_id = 10;
     for (id, params) in [
         (1, json!({ "workspaceId": ws_id })),
         (2, json!({ "workspaceId": ws_id, "projection": "full" })),
@@ -4698,16 +4721,129 @@ async fn note_subscribe_slim_projection_bounds_snapshot_and_deltas() {
         assert!(res["subscriptionId"].is_string(), "sub: {res}");
         let push = next_subscription_push(&mut full_sub, 10).await;
         assert_eq!(push["kind"], json!("snapshot"), "push kind");
-        let snap = push["snapshot"].as_array().expect("snapshot array");
-        let giant = snap
+        let frame = serde_json::to_string(&push).expect("serialize");
+        assert!(
+            frame.len() < 500 * 1024,
+            "snapshot fits: {} bytes",
+            frame.len()
+        );
+        let mut rows: Vec<Value> = push["snapshot"].as_array().expect("snapshot array").clone();
+        let mut token = push["nextToken"].as_str().map(str::to_string);
+        while let Some(t) = token {
+            page_id += 1;
+            let page = wss_rpc(
+                &mut rpc,
+                page_id,
+                "note.list",
+                json!({ "workspaceId": ws_id, "nextToken": t }),
+            )
+            .await;
+            rows.extend(page["notes"].as_array().expect("notes").iter().cloned());
+            token = page["nextToken"].as_str().map(str::to_string);
+        }
+        let giant = rows
             .iter()
             .find(|n| n["id"] == json!(giant_id))
-            .expect("giant note in snapshot");
+            .expect("giant note listed");
         assert_eq!(
-            giant["content"].as_str().map(str::len),
-            Some(1_100_000),
-            "full snapshot keeps content"
+            giant["contentTruncated"],
+            json!(true),
+            "cut: {}",
+            giant["id"]
         );
-        assert!(giant.get("contentPreview").is_none(), "no preview: {giant}");
+        assert_eq!(giant["contentBytes"].as_u64(), Some(1_100_000));
+        assert!(giant.get("contentPreview").is_none(), "no preview");
     }
+}
+
+/// Complete task rows and count changes arrive over authenticated WSS without
+/// a follow-up note/task/workspace read.
+#[tokio::test]
+async fn task_push_complete_payloads_and_deletion_over_wss() {
+    let (daemon, port, cfg) = boot().await;
+    let socket = daemon.data_dir.join("intentd.sock");
+    let created = uds_rpc(
+        &socket,
+        1,
+        "workspace.create",
+        json!({
+            "title": "Task pushes", "branch": "main", "skipWorktree": true
+        }),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"].as_str().unwrap();
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let note = wss_rpc(&mut rpc, 2, "note.create", json!({
+        "workspaceId": ws_id, "title": "Pushed task", "content": "private body", "parentId": "spec"
+    })).await;
+    let note_id = note["note"]["id"].as_str().unwrap();
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(&mut sub, 3, "events.subscribe", json!({
+        "workspaceId": ws_id, "eventTypes": ["task:updated", "workspace:task-stats-changed", "note:updated", "note:deleted"]
+    })).await;
+    let response = wss_rpc_envelope(
+        &mut rpc,
+        4,
+        "task.markAsTask",
+        json!({
+            "workspaceId": ws_id, "noteId": note_id, "status": "not_started"
+        }),
+    )
+    .await;
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 4);
+    assert_eq!(response["result"]["ok"], true);
+    let metadata = next_event(&mut sub, &["note:updated"], 15).await;
+    assert_eq!(metadata["data"]["note"]["id"], note_id);
+    assert_eq!(
+        metadata["data"]["note"]["metadata"]["task"]["status"],
+        "not_started"
+    );
+    assert!(metadata["data"]["note"].get("content").is_none());
+    let event = next_event(&mut sub, &["task:updated"], 15).await;
+    assert_eq!(event["data"]["workspaceId"], ws_id);
+    let row = &event["data"]["tasks"][0];
+    assert_eq!(row["id"], note_id);
+    assert_eq!(row["title"], "Pushed task");
+    assert_eq!(row["status"], "not_started");
+    assert_eq!(row["parentId"], "spec");
+    assert_eq!(row["specLinked"], false);
+    assert!(row["updatedAt"].is_string());
+    assert_eq!(event["data"]["removedIds"], json!([]));
+    let event = next_event(&mut sub, &["workspace:task-stats-changed"], 15).await;
+    assert_eq!(
+        event["data"],
+        json!({"workspaceId": ws_id, "taskStats": {"total":1,"completed":0,"inProgress":0}})
+    );
+    wss_rpc(
+        &mut rpc,
+        5,
+        "task.updateNoteStatus",
+        json!({
+            "workspaceId": ws_id, "noteId": note_id, "status": "complete"
+        }),
+    )
+    .await;
+    let event = next_event(&mut sub, &["task:updated"], 15).await;
+    assert_eq!(event["data"]["tasks"][0]["status"], "complete");
+    let event = next_event(&mut sub, &["workspace:task-stats-changed"], 15).await;
+    assert_eq!(
+        event["data"]["taskStats"],
+        json!({"total":1,"completed":1,"inProgress":0})
+    );
+    wss_rpc(
+        &mut rpc,
+        6,
+        "note.delete",
+        json!({"workspaceId": ws_id, "noteId": note_id}),
+    )
+    .await;
+    let event = next_event(&mut sub, &["task:updated"], 15).await;
+    assert_eq!(event["data"]["tasks"], json!([]));
+    assert_eq!(event["data"]["removedIds"], json!([note_id]));
+    let event = next_event(&mut sub, &["workspace:task-stats-changed"], 15).await;
+    assert_eq!(
+        event["data"]["taskStats"],
+        json!({"total":0,"completed":0,"inProgress":0})
+    );
 }

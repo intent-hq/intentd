@@ -1,7 +1,7 @@
 //! Original listeners, private Store membership and managed cache on real UDS/WSS.
 //! Controlled provider only; checkout controls also use disposable Git and TLS peers.
 #![cfg(unix)]
-mod common;
+use crate::common;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{now_iso, Principal, PrincipalId, WorkspaceApi, WorkspaceId, WorkspaceRole};
 use intent_services::{EventBus, Services, SettingsRegistry};
@@ -25,7 +25,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
-const ACQUIRE: Duration = Duration::from_secs(5);
+fn acquire() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(5))
+}
 const TOKEN: &str = "cececececececececececececececececececececececececececececececece";
 const MEMBER: &str = "edededededededededededededededededededededededededededededededed";
 const GUEST: &str = "abababababababababababababababababababababababababababababababab";
@@ -105,7 +107,7 @@ impl Server {
                             let pause={let mut p=state.pause.lock().unwrap();if p.as_deref()==Some(route){p.take();true}else{false}};
                             if pause {state.entered.notify_one();state.release.notified().await;}
                             let body=reply.1.to_string();
-                            let next=state.next_pages.lock().unwrap().get(&path).map(|n|format!("X-Next-Page: {n}\r\n")).unwrap_or_default();
+                            let next={let pages=state.next_pages.lock().unwrap();pages.get(&path).or_else(||pages.get(route)).map(|n|format!("X-Next-Page: {n}\r\n")).unwrap_or_default()};
                             let head=format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{next}RateLimit-Remaining: 17\r\nRateLimit-Limit: 100\r\nRateLimit-Reset: 1900000000\r\nConnection: close\r\n\r\n",reply.0,body.len());
                             let _=stream.write_all(format!("{head}{body}").as_bytes()).await;
                         });
@@ -138,7 +140,7 @@ impl Server {
     async fn finish(mut self) {
         self.state.release.notify_waiters();
         self.stop.take().unwrap().send(()).unwrap();
-        tokio::time::timeout(ACQUIRE, self.task.take().unwrap())
+        tokio::time::timeout(acquire(), self.task.take().unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -298,13 +300,28 @@ impl Harness {
         Self::from_server(existing, Server::new().await).await
     }
     async fn from_server(existing: bool, server: Server) -> Self {
+        Self::with_control(existing, server, None).await
+    }
+    async fn with_control(
+        existing: bool,
+        server: Server,
+        control: Option<Arc<dyn intent_transport::SystemControl>>,
+    ) -> Self {
         let fixtures = vec![server.descriptor.clone()];
-        Self::with_fixtures(existing, server, fixtures).await
+        Self::with_fixtures_and_control(existing, server, fixtures, control).await
     }
     async fn with_fixtures(
         existing: bool,
         server: Server,
         fixtures: Vec<GitlabDescriptor>,
+    ) -> Self {
+        Self::with_fixtures_and_control(existing, server, fixtures, None).await
+    }
+    async fn with_fixtures_and_control(
+        existing: bool,
+        server: Server,
+        fixtures: Vec<GitlabDescriptor>,
+        control: Option<Arc<dyn intent_transport::SystemControl>>,
     ) -> Self {
         let dir = common::test_tempdir("itd-resource-wire-");
         let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
@@ -431,7 +448,7 @@ impl Harness {
                     bind_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
                     ..Default::default()
                 },
-                None,
+                control.clone(),
             )
             .unwrap(),
         );
@@ -439,12 +456,12 @@ impl Harness {
         let socket = dir.path().join("intentd.sock");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let listener = tokio::spawn(async move {
-            intent_transport::serve_uds(api, bus, &socket, None, async move {
+            intent_transport::serve_uds(api, bus, &socket, control, async move {
                 let _ = stopped.await;
             })
             .await
         });
-        tokio::time::timeout(ACQUIRE, async {
+        tokio::time::timeout(acquire(), async {
             loop {
                 if dir.path().join("intentd.sock").exists() {
                     break;
@@ -509,7 +526,7 @@ impl Harness {
     }
     async fn finish(mut self) {
         self.shutdown.take().unwrap().send(()).unwrap();
-        tokio::time::timeout(ACQUIRE, self.listener.take().unwrap())
+        tokio::time::timeout(acquire(), self.listener.take().unwrap())
             .await
             .unwrap()
             .unwrap()
@@ -550,7 +567,14 @@ struct Client {
 }
 impl Client {
     async fn next(&mut self) -> Value {
-        tokio::time::timeout(ACQUIRE, async {
+        self.try_next(acquire())
+            .await
+            .expect("no original frame within the acquire budget")
+    }
+    /// One frame, or `None` when none arrives within `budget`. Only call again
+    /// after `None` when nothing can have been partially read (a stalled peer).
+    async fn try_next(&mut self, budget: Duration) -> Option<Value> {
+        tokio::time::timeout(budget, async {
             loop {
                 match &mut self.socket {
                     Socket::Uds(s) => {
@@ -568,9 +592,48 @@ impl Client {
             }
         })
         .await
-        .unwrap()
+        .ok()
     }
     async fn rpc(&mut self, method: &str, params: Value) -> Value {
+        self.send(method, params).await;
+        loop {
+            let result = self.next().await;
+            eprintln!("resource original response {result}");
+            if result["id"] == self.id {
+                assert_eq!(result["jsonrpc"], "2.0");
+                return result;
+            }
+            self.notices.push(result);
+        }
+    }
+    /// [`Client::rpc`] that, when no frame arrives within `budget`, runs `probe`
+    /// and returns its report instead of a bare `Elapsed` (intent-hq/intent#8252).
+    /// The probe runs only on that failure path.
+    async fn try_rpc_probed(
+        &mut self,
+        method: &str,
+        params: Value,
+        budget: Duration,
+        probe: impl FnOnce() -> String,
+    ) -> Result<Value, String> {
+        self.send(method, params).await;
+        loop {
+            let Some(result) = self.try_next(budget).await else {
+                let report = probe();
+                return Err(format!(
+                    "no reply to {method} id {} within {budget:?}; {report}",
+                    self.id
+                ));
+            };
+            eprintln!("resource original response {result}");
+            if result["id"] == self.id {
+                assert_eq!(result["jsonrpc"], "2.0");
+                return Ok(result);
+            }
+            self.notices.push(result);
+        }
+    }
+    async fn send(&mut self, method: &str, params: Value) {
         self.id += 1;
         let request = json!({"jsonrpc":"2.0","id":self.id,"method":method,"params":params});
         eprintln!("resource original request {request}");
@@ -583,15 +646,6 @@ impl Client {
                 .unwrap(),
             Socket::Ws(s) => s.send(Message::Text(line.into())).await.unwrap(),
         }
-        loop {
-            let result = self.next().await;
-            eprintln!("resource original response {result}");
-            if result["id"] == self.id {
-                assert_eq!(result["jsonrpc"], "2.0");
-                return result;
-            }
-            self.notices.push(result);
-        }
     }
     async fn close(mut self) {
         match &mut self.socket {
@@ -600,6 +654,7 @@ impl Client {
         }
     }
 }
+#[track_caller]
 fn success(value: &Value) -> &Value {
     assert!(value.get("error").is_none(), "{value}");
     &value["result"]
@@ -773,3 +828,6 @@ async fn repository_resource_real_failure_classes_keep_original_wire_evidence() 
 
 #[path = "e2e_repository_resource_read/checkout.rs"]
 mod checkout;
+
+#[path = "e2e_repository_resource_read/pages.rs"]
+mod pages;

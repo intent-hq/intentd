@@ -3,7 +3,7 @@
 //! separate real TLS/WSS coverage in `e2e_wss_github_device_flow`.
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -146,7 +146,7 @@ async fn assert_private(data: &Path) {
 fn stop(daemon: &mut GuardedChild) {
     daemon.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
     let exit = daemon
-        .wait_with_timeout(Duration::from_secs(10))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
         .unwrap()
         .expect("owned graceful exit");
     eprintln!("private daemon pid={} original exit={exit}", daemon.id());
@@ -261,7 +261,7 @@ fn private_profile_refuses_insecure_before_store_or_socket_creation() {
         }
         let mut daemon = GuardedChild::spawn(&mut launch).unwrap();
         let exit = daemon
-            .wait_with_timeout(Duration::from_secs(10))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
             .unwrap()
             .expect("startup refusal");
         eprintln!("private insecure flag={flag} exit={exit}");

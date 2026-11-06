@@ -65,6 +65,10 @@ impl OriginalRepositoryCaller {
         self.credential.as_ref()
     }
 
+    pub(crate) fn is_admitted_local(&self) -> bool {
+        matches!(self.entry, RepositoryEntry::AdmittedLocal)
+    }
+
     pub(crate) async fn legacy_lease(&self) -> AdmissionResult<Option<CredentialLease>> {
         match self.credential.as_ref() {
             Some(WireCredential::Legacy { authority, .. }) => authority
@@ -179,6 +183,7 @@ impl RepositoryAuthorityFacts {
                 }
             },
             Caller::Agent { .. } | Caller::Daemon => self.internal_stages.contains(&stage),
+            Caller::Executor { .. } => false,
         }
     }
 

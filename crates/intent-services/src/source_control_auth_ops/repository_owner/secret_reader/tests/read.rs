@@ -7,6 +7,7 @@ use crate::repository_credentials::authority::{
     RepositoryCredentialTransport,
 };
 use crate::repository_credentials::read::{
+    RepositoryCollectionQuery, RepositoryCollectionReadOperation, RepositoryCollectionTarget,
     RepositoryReadOperation, RepositoryResponseAttribution, RepositoryResponseDisposition as D,
 };
 use crate::repository_credentials::{RepositoryCredentialAdmission, RepositoryCredentialUse};
@@ -14,6 +15,7 @@ use intent_core::{
     ExecutionScope, RepositoryProvider, RepositoryResourceKind, RepositoryTarget, ReviewTarget,
 };
 use intent_sourcecontrol::{error::ProviderFailureKind, Error as ScError, ProviderAvailability};
+use intentd_test_support::test_timeout;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -56,6 +58,7 @@ impl RepositoryAuthorityFence for InjectedFence {
 #[derive(Default)]
 struct Replies {
     statuses: Mutex<HashMap<String, u16>>,
+    next_pages: Mutex<HashMap<String, String>>,
     pause: Mutex<Option<String>>,
     entered: Notify,
     release: Notify,
@@ -158,7 +161,8 @@ impl ReadServer {
                         control.entered.notify_one();
                         control.release.notified().await;
                     }
-                    let body=if path==PROJECT {
+                    let body=if path.starts_with(&format!("{PROJECT}/merge_requests?")) || path.starts_with(&format!("{PROJECT}/issues?")) { json!([]) }
+                    else if path==PROJECT {
                         json!({"id":42,"path_with_namespace":"group/project",
                             "only_allow_merge_if_pipeline_succeeds":false,
                             "only_allow_merge_if_all_discussions_are_resolved":false})
@@ -178,7 +182,13 @@ impl ReadServer {
                     } else {
                         ""
                     };
-                    let response=format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRateLimit-Remaining: 23\r\nRateLimit-Reset: 4000000000\r\n{extra}Connection: close\r\n\r\n{body}",body.len());
+                    let next = control
+                        .next_pages
+                        .lock()
+                        .unwrap()
+                        .get(&path)
+                        .map_or_else(String::new, |next| format!("X-Next-Page: {next}\r\n"));
+                    let response=format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRateLimit-Remaining: 23\r\nRateLimit-Reset: 4000000000\r\n{extra}{next}Connection: close\r\n\r\n{body}",body.len());
                     let _ = socket.write_all(response.as_bytes()).await;
                 });
             }
@@ -200,7 +210,7 @@ impl ReadServer {
         *self.replies.pause.lock().unwrap() = Some(path.into());
     }
     async fn entered(&self) {
-        timeout(BUDGET, self.replies.entered.notified())
+        timeout(test_timeout(BUDGET), self.replies.entered.notified())
             .await
             .unwrap();
     }
@@ -305,6 +315,32 @@ impl ReadFixture {
         )
         .unwrap();
         (eligibility, operation, target)
+    }
+    fn collection(
+        &self,
+        server: &ReadServer,
+        query: RepositoryCollectionQuery,
+    ) -> (
+        RepositoryReadEligibility,
+        RepositoryCollectionReadOperation,
+        RepositoryCollectionTarget,
+    ) {
+        let admission = self.admission(server);
+        let eligibility = self
+            .auth
+            .service
+            .gitlab_repository_read_eligibility(&admission)
+            .unwrap();
+        let op = RepositoryCollectionReadOperation::new(
+            self.auth.service.repository_connection_directory(),
+            admission,
+            self.auth.service.gitlab_repository_secret_reader().unwrap(),
+            BUDGET,
+            query,
+        )
+        .unwrap();
+        let target = op.target().clone();
+        (eligibility, op, target)
     }
     async fn refresh(&self, server: &ReadServer) {
         refresh_original(&self.auth.service, &server.fixture.host)
@@ -879,9 +915,12 @@ async fn actual_file_read_cancellation_retains_lease_and_never_dispatches() {
         .unwrap();
     paused.resume();
     drop(
-        timeout(BUDGET, f.auth.service.gitlab_credential_gate.lock())
-            .await
-            .unwrap(),
+        timeout(
+            test_timeout(BUDGET),
+            f.auth.service.gitlab_credential_gate.lock(),
+        )
+        .await
+        .unwrap(),
     );
     assert_eq!(e.check(), Err(Error::Retired));
     assert_eq!(s.count(), 0);
@@ -1131,7 +1170,7 @@ async fn batch_reversed_directories_progress_with_all_owner_locks_held() {
         }));
     }
     for task in tasks {
-        timeout(BUDGET, task).await.unwrap().unwrap();
+        timeout(test_timeout(BUDGET), task).await.unwrap().unwrap();
     }
     assert_eq!(calls.load(Ordering::SeqCst), 8);
     assert_eq!(s.count(), 0);
@@ -1387,7 +1426,9 @@ impl SettledWritePause {
         Self { entered, released }
     }
     async fn entered(&self) {
-        timeout(BUDGET, self.entered.notified()).await.unwrap();
+        timeout(test_timeout(BUDGET), self.entered.notified())
+            .await
+            .unwrap();
     }
     fn resume(&self) {
         *self.released.0.lock().unwrap() = true;
@@ -1558,7 +1599,11 @@ async fn settled_pat_reservation_stays_ready_then_actual_effect_retires_old_fact
         Error::Mutating,
     );
     pause.resume();
-    timeout(BUDGET, write).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), write)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     settled_error(original.reobserve(), Error::Retired);
     let next = f.service.gitlab_repository_settled_connection().unwrap();
     assert_eq!(next.selected().binding.account.account_id, "43");
@@ -1595,7 +1640,11 @@ async fn settled_refresh_accepts_new_actual_proof_without_mutating_old_observati
         Error::Mutating,
     );
     s.fixture.control.release.notify_one();
-    timeout(BUDGET, refresh).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), refresh)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let next = original.reobserve().unwrap();
     let fresh_proof = next
         .owner
@@ -1979,7 +2028,11 @@ async fn settled_reobservation_never_reattributes_an_old_acquired_401() {
     f.refresh(&s).await;
     let next = original.reobserve().unwrap();
     s.resume();
-    let (result, quota, receipt) = timeout(BUDGET, call).await.unwrap().unwrap().into_parts();
+    let (result, quota, receipt) = timeout(test_timeout(BUDGET), call)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_parts();
     denial(&result, ProviderFailureKind::CredentialRejected, 401);
     assert_eq!(applied(&e, &receipt, &target).unwrap(), D::NotApplied);
     assert_eq!(quota.remaining, Some(23));
@@ -2016,11 +2069,11 @@ async fn settled_actual_ready_before_proof_publication_does_not_attest_a_snapsho
         let _ = locked.send(());
         let _ = hold.recv();
     });
-    timeout(BUDGET, ready).await.unwrap().unwrap();
+    timeout(test_timeout(BUDGET), ready).await.unwrap().unwrap();
     let service = f.auth.service.clone();
     let observation =
         tokio::task::spawn_blocking(move || service.gitlab_repository_settled_connection());
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             let config_held = matches!(
                 original.owner.settings.get().unwrap().config.try_lock(),
@@ -2035,7 +2088,7 @@ async fn settled_actual_ready_before_proof_publication_does_not_attest_a_snapsho
     .await
     .unwrap();
     pause.resume();
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             match original.owner.directory.binding() {
                 Ok(binding) => {
@@ -2053,10 +2106,17 @@ async fn settled_actual_ready_before_proof_publication_does_not_attest_a_snapsho
     drop(release);
     holder.join().unwrap();
     settled_error(
-        timeout(BUDGET, observation).await.unwrap().unwrap(),
+        timeout(test_timeout(BUDGET), observation)
+            .await
+            .unwrap()
+            .unwrap(),
         Error::Unverified,
     );
-    timeout(BUDGET, refresh).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), refresh)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let settled = original.reobserve().unwrap();
     assert!(settled.selected().secret_revision > original.selected().secret_revision);
     assert_eq!(settled.selected().binding, original.selected().binding);
@@ -2263,7 +2323,11 @@ async fn facts_reservation_then_actual_pat_replace_preserves_old_observation() {
     unready(&begun, Error::Mutating);
     assert_eq!(begun.descriptor(), Some(&s.descriptor));
     pause.resume();
-    timeout(BUDGET, write).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), write)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let next = connection_facts(&f.service);
     assert_eq!(
         next.settled()
@@ -2295,7 +2359,11 @@ async fn facts_oauth_refresh_reports_actual_mutation_and_new_settled_revision() 
     assert_eq!(pending.lifecycle(), Lifecycle::Mutating);
     unready(&pending, Error::Mutating);
     s.fixture.control.release.notify_one();
-    timeout(BUDGET, refresh).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), refresh)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let fresh = connection_facts(&f.auth.service);
     assert_eq!(
         fresh.settled().unwrap().selected().binding,
@@ -2358,12 +2426,15 @@ async fn facts_cancelled_pat_stays_unavailable_until_retained_owner_completes() 
     pause.resume();
     // Receiver cancellation does not cancel main's registered completion owner.
     // Join that real owner, including its publication and secret receipt tail.
-    timeout(BUDGET, f.service.shutdown_settings())
+    timeout(test_timeout(BUDGET), f.service.shutdown_settings())
         .await
         .unwrap();
-    let _gate = timeout(BUDGET, f.service.gitlab_credential_gate.lock())
-        .await
-        .unwrap();
+    let _gate = timeout(
+        test_timeout(BUDGET),
+        f.service.gitlab_credential_gate.lock(),
+    )
+    .await
+    .unwrap();
     let completed = connection_facts(&f.service);
     assert_eq!(completed.lifecycle(), Lifecycle::Ready);
     let next = completed.settled().unwrap();
@@ -2699,10 +2770,10 @@ async fn facts_actual_ready_before_proof_interval_is_not_settled() {
         let _ = locked.send(());
         let _ = hold.recv();
     });
-    timeout(BUDGET, ready).await.unwrap().unwrap();
+    timeout(test_timeout(BUDGET), ready).await.unwrap().unwrap();
     let service = f.auth.service.clone();
     let observation = tokio::task::spawn_blocking(move || connection_facts(&service));
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             if matches!(
                 original.owner.settings.get().unwrap().config.try_lock(),
@@ -2716,7 +2787,7 @@ async fn facts_actual_ready_before_proof_interval_is_not_settled() {
     .await
     .unwrap();
     pause.resume();
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             match original.owner.directory.binding() {
                 Ok(_) => break,
@@ -2730,10 +2801,17 @@ async fn facts_actual_ready_before_proof_interval_is_not_settled() {
     assert!(original.owner.evidence.published.lock().unwrap().is_none());
     drop(release);
     holder.join().unwrap();
-    let gap = timeout(BUDGET, observation).await.unwrap().unwrap();
+    let gap = timeout(test_timeout(BUDGET), observation)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(gap.lifecycle(), Lifecycle::Ready);
     unready(&gap, Error::Unverified);
-    timeout(BUDGET, refresh).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), refresh)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let next = connection_facts(&f.auth.service);
     assert!(
         next.settled().unwrap().selected().secret_revision > original.selected().secret_revision
@@ -2756,7 +2834,7 @@ async fn facts_disconnect_reservation_and_begun_effect_have_distinct_metadata() 
     let host = s.host.clone();
     let disconnect =
         intent_core::spawn_daemon(async move { service.gitlab_revoke_owned(host).await });
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             let facts = connection_facts(&f.service);
             if facts.preflight_pending() {
@@ -2780,7 +2858,11 @@ async fn facts_disconnect_reservation_and_begun_effect_have_distinct_metadata() 
     assert_eq!(begun.mutation(), Some(MutationKind::Disconnect));
     unready(&begun, Error::Mutating);
     pause.resume();
-    timeout(BUDGET, disconnect).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), disconnect)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let final_facts = connection_facts(&f.service);
     assert_eq!(final_facts.lifecycle(), Lifecycle::Disconnected);
     assert_eq!(final_facts.mutation(), None);
@@ -2961,7 +3043,7 @@ async fn hold_output_rank(original: Arc<RepositoryReadEligibility>, rank: usize)
         release: Some(release),
         worker: Some(worker),
     };
-    timeout(BUDGET, ready).await.unwrap().unwrap();
+    timeout(test_timeout(BUDGET), ready).await.unwrap().unwrap();
     held
 }
 
@@ -3027,7 +3109,7 @@ async fn optional_output_busy_optional_locks_never_delay_required_at_any_rank() 
         let admission =
             tokio::task::spawn_blocking(move || optional_choice(&[&good], Some(&captured)));
         // Required output must finish BEFORE releasing the additional busy lock.
-        let result = timeout(BUDGET, admission).await;
+        let result = timeout(test_timeout(BUDGET), admission).await;
         drop(held);
         assert!(!result.unwrap().unwrap().unwrap(), "rank {rank}");
         assert!(optional_only(Some(&facts)));
@@ -3134,7 +3216,7 @@ async fn optional_output_reversed_owner_and_directory_orders_make_progress() {
         }));
     }
     for task in work {
-        timeout(BUDGET, task).await.unwrap().unwrap();
+        timeout(test_timeout(BUDGET), task).await.unwrap().unwrap();
     }
     assert_eq!(s.count(), 0);
 }
@@ -3491,10 +3573,10 @@ async fn optional_output_ready_before_proof_cannot_reuse_old_settled_facts() {
         entered.send(()).unwrap();
         let _ = wait.recv();
     });
-    timeout(BUDGET, ready).await.unwrap().unwrap();
+    timeout(test_timeout(BUDGET), ready).await.unwrap().unwrap();
     let service = f.auth.service.clone();
     let observation = tokio::task::spawn_blocking(move || connection_facts(&service));
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             if matches!(
                 e.owner.settings.get().unwrap().config.try_lock(),
@@ -3508,7 +3590,7 @@ async fn optional_output_ready_before_proof_cannot_reuse_old_settled_facts() {
     .await
     .unwrap();
     pause.resume();
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             match e.owner.directory.binding() {
                 Ok(_) => break,
@@ -3524,10 +3606,17 @@ async fn optional_output_ready_before_proof_cannot_reuse_old_settled_facts() {
     assert!(!optional_only(Some(&original)));
     drop(release);
     holder.join().unwrap();
-    let gap = timeout(BUDGET, observation).await.unwrap().unwrap();
+    let gap = timeout(test_timeout(BUDGET), observation)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(gap.lifecycle(), Lifecycle::Ready);
     assert!(gap.settled().is_none());
-    timeout(BUDGET, refresh).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), refresh)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(!optional_choice(&[&e], Some(&gap)).unwrap());
     assert!(!optional_choice(&[&e], Some(&original)).unwrap());
     assert!(optional_choice(&[&e], Some(&connection_facts(&f.auth.service))).unwrap());
@@ -3558,12 +3647,15 @@ async fn optional_output_cancelled_auth_changes_only_after_retained_completion()
     );
     let requests = s.control.requests.lock().unwrap().len();
     pause.resume();
-    timeout(BUDGET, f.service.shutdown_settings())
+    timeout(test_timeout(BUDGET), f.service.shutdown_settings())
         .await
         .unwrap();
-    let _gate = timeout(BUDGET, f.service.gitlab_credential_gate.lock())
-        .await
-        .unwrap();
+    let _gate = timeout(
+        test_timeout(BUDGET),
+        f.service.gitlab_credential_gate.lock(),
+    )
+    .await
+    .unwrap();
     let completed = connection_facts(&f.service);
     assert_eq!(completed.lifecycle(), Lifecycle::Ready);
     assert_eq!(
@@ -3659,7 +3751,7 @@ async fn prompt_facts_busy_optional_lock_omits_before_release() {
         .unwrap();
         selected.unwrap()
     });
-    let result = timeout(BUDGET, admission).await;
+    let result = timeout(test_timeout(BUDGET), admission).await;
     drop(held);
     assert!(!result.unwrap().unwrap());
     RepositoryConnectionFacts::with_prompt_current(Some(&facts), |include| {
@@ -3777,7 +3869,7 @@ async fn native_facts_busy_optional_lock_omits_before_release() {
         .unwrap();
         selected.unwrap()
     });
-    let result = timeout(BUDGET, admission).await;
+    let result = timeout(test_timeout(BUDGET), admission).await;
     drop(held);
     assert!(!result.unwrap().unwrap());
     RepositoryConnectionFacts::with_native_context_current(Some(&facts), |include| {
@@ -3841,4 +3933,460 @@ async fn native_facts_callback_preserves_original_error_and_owned_effect_once() 
     assert_eq!(calls, 1);
     assert_eq!(output.as_deref(), Some(&42));
     assert_eq!(s.count(), 0);
+}
+
+fn collection_applied(
+    eligibility: &RepositoryReadEligibility,
+    receipt: &RepositoryResponseAttribution,
+    target: &RepositoryCollectionTarget,
+) -> Result<D> {
+    let mut result = None;
+    eligibility.with_collection_response(receipt, target, &mut |d| {
+        assert!(result.replace(d).is_none());
+        Ok(())
+    })?;
+    Ok(result.unwrap())
+}
+
+#[intent_test_macros::daemon_test]
+async fn collection_reads_have_real_project_targets_and_separate_lazy_response_evidence() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let (e, op, target) = f.collection(
+        &s,
+        RepositoryCollectionQuery::Reviews(intent_sourcecontrol::PrQuery::default()),
+    );
+    assert_eq!(target.repository().project_path, "group/project");
+    assert_eq!(target.kind(), RepositoryResourceKind::MergeRequest);
+    assert_eq!(s.count(), 0);
+    assert_eq!(f.authority.calls.load(Ordering::SeqCst), 0);
+    let (result, quota, receipt) = op.reviews().await.into_parts();
+    assert!(result.unwrap().items.is_empty());
+    assert_eq!(quota.remaining, Some(23));
+    assert_eq!(
+        collection_applied(&e, &receipt, &target).unwrap(),
+        D::NoDenial
+    );
+    let (issue_e, issue_op, issue_target) = f.collection(
+        &s,
+        RepositoryCollectionQuery::Issues(intent_sourcecontrol::IssueQuery::default()),
+    );
+    assert_eq!(issue_target.kind(), RepositoryResourceKind::Issue);
+    assert_eq!(
+        collection_applied(&issue_e, &receipt, &issue_target),
+        Err(Error::BoundaryMismatch)
+    );
+    let (result, _, issue_receipt) = issue_op.issues().await.into_parts();
+    assert!(result.unwrap().items.is_empty());
+    assert_eq!(
+        collection_applied(&issue_e, &issue_receipt, &issue_target).unwrap(),
+        D::NoDenial
+    );
+    let (changed, _, changed_target) = f.collection(
+        &s,
+        RepositoryCollectionQuery::Reviews(intent_sourcecontrol::PrQuery {
+            search: Some("another query".into()),
+            ..Default::default()
+        }),
+    );
+    assert_eq!(
+        collection_applied(&changed, &receipt, &changed_target),
+        Err(Error::BoundaryMismatch)
+    );
+    assert_eq!(s.count(), 2);
+    let (_, op, _) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+    assert!(op
+        .review_discussions(intent_sourcecontrol::PageParams::first(20))
+        .await
+        .into_parts()
+        .0
+        .unwrap()
+        .items
+        .is_empty());
+    assert_eq!(s.count(), 3);
+}
+
+#[intent_test_macros::daemon_test]
+async fn collection_wrong_kind_and_unadmitted_extra_project_never_dispatch() {
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let (_, op, _) = f.collection(
+        &s,
+        RepositoryCollectionQuery::Issues(intent_sourcecontrol::IssueQuery::default()),
+    );
+    assert!(matches!(
+        op.reviews().await.into_parts().0,
+        Err(ScError::AdmissionUnavailable(
+            intent_sourcecontrol::error::AdmissionUnavailable::BoundaryMismatch
+        ))
+    ));
+    let query = RepositoryCollectionQuery::Reviews(intent_sourcecontrol::PrQuery {
+        extra_repos: vec![intent_sourcecontrol::RepoRef {
+            owner: "other".into(),
+            name: "private".into(),
+        }],
+        ..Default::default()
+    });
+    assert!(matches!(
+        RepositoryCollectionReadOperation::new(
+            f.auth.service.repository_connection_directory(),
+            f.admission(&s),
+            f.auth.service.gitlab_repository_secret_reader().unwrap(),
+            BUDGET,
+            query
+        ),
+        Err(Error::BoundaryMismatch)
+    ));
+    assert_eq!(s.count(), 0);
+}
+
+#[intent_test_macros::daemon_test]
+async fn collection_current_denials_keep_the_real_error_quota_and_terminal_kind() {
+    for status in [401, 403, 404] {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, false).await;
+        let path = format!("{PROJECT}/merge_requests?scope=all&page=1&per_page=30");
+        s.status(&path, status);
+        let (e, op, target) = f.collection(
+            &s,
+            RepositoryCollectionQuery::Reviews(intent_sourcecontrol::PrQuery::default()),
+        );
+        let (result, quota, receipt) = op.reviews().await.into_parts();
+        denial(
+            &result,
+            if status == 401 {
+                ProviderFailureKind::CredentialRejected
+            } else {
+                ProviderFailureKind::ResourceDenied
+            },
+            status,
+        );
+        assert_eq!(quota.remaining, Some(23));
+        assert_eq!(
+            collection_applied(&e, &receipt, &target).unwrap(),
+            if status == 401 {
+                D::AcceptedCredentialRejection
+            } else {
+                D::CurrentResourceDenial
+            }
+        );
+        assert_eq!(s.count(), 1);
+        if status == 401 {
+            assert!(e.check().is_err());
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn collection_old_denials_after_actual_refresh_cannot_apply_to_successor() {
+    for status in [401, 403, 404] {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, true).await;
+        let path = format!("{PROJECT}/merge_requests?scope=all&page=1&per_page=30");
+        s.status(&path, status);
+        s.pause(&path);
+        let (e, op, target) = f.collection(
+            &s,
+            RepositoryCollectionQuery::Reviews(intent_sourcecontrol::PrQuery::default()),
+        );
+        let work = tokio::spawn(op.reviews());
+        s.entered().await;
+        f.refresh(&s).await;
+        s.resume();
+        let (result, quota, receipt) = work.await.unwrap().into_parts();
+        denial(
+            &result,
+            if status == 401 {
+                ProviderFailureKind::CredentialRejected
+            } else {
+                ProviderFailureKind::ResourceDenied
+            },
+            status,
+        );
+        assert_eq!(quota.remaining, Some(23));
+        assert_eq!(
+            collection_applied(&e, &receipt, &target).unwrap(),
+            D::NotApplied
+        );
+        e.check().unwrap();
+        assert_eq!(s.count(), 1);
+    }
+}
+
+async fn managed_page_cursor(
+    fixture: &ReadFixture,
+    server: &ReadServer,
+    mode: u8,
+    cursor: Option<String>,
+) -> intent_sourcecontrol::Result<Option<String>> {
+    match mode {
+        0 => {
+            let (_, operation, _) = fixture.collection(
+                server,
+                RepositoryCollectionQuery::Reviews(intent_sourcecontrol::PrQuery {
+                    cursor,
+                    ..Default::default()
+                }),
+            );
+            operation
+                .reviews()
+                .await
+                .into_parts()
+                .0
+                .map(|page| page.next_cursor)
+        }
+        1 => {
+            let (_, operation, _) = fixture.collection(
+                server,
+                RepositoryCollectionQuery::Issues(intent_sourcecontrol::IssueQuery {
+                    cursor,
+                    ..Default::default()
+                }),
+            );
+            operation
+                .issues()
+                .await
+                .into_parts()
+                .0
+                .map(|page| page.next_cursor)
+        }
+        _ => {
+            let (_, operation, _) = fixture.operation(server, RepositoryResourceKind::MergeRequest);
+            operation
+                .review_discussions(intent_sourcecontrol::PageParams { limit: 30, cursor })
+                .await
+                .into_parts()
+                .0
+                .map(|page| page.next_cursor)
+        }
+    }
+}
+
+async fn managed_cursor_refresh_and_replacement(mode: u8) {
+    let server = ReadServer::new().await;
+    let fixture = ReadFixture::new(&server, true).await;
+    let path = match mode {
+        0 => format!("{PROJECT}/merge_requests?scope=all&page=1&per_page=30"),
+        1 => format!("{PROJECT}/issues?scope=all&page=1&per_page=30"),
+        _ => format!("{MR}/discussions?page=1&per_page=30"),
+    };
+    server
+        .replies
+        .next_pages
+        .lock()
+        .unwrap()
+        .insert(path, "2".into());
+    let cursor = managed_page_cursor(&fixture, &server, mode, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let original = fixture.auth.request();
+    fixture.refresh(&server).await;
+    assert_eq!(fixture.auth.request().binding, original.binding);
+    assert!(fixture.auth.request().secret_revision > original.secret_revision);
+    assert_eq!(
+        managed_page_cursor(&fixture, &server, mode, Some(cursor.clone()))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(server.count(), 2);
+    fixture
+        .auth
+        .service
+        .gitlab_connect_pat(server.fixture.host.clone(), "pat-second".into())
+        .await
+        .unwrap();
+    assert_ne!(fixture.auth.request().binding, original.binding);
+    assert!(matches!(
+        managed_page_cursor(&fixture, &server, mode, Some(cursor.clone())).await,
+        Err(ScError::Config(_))
+    ));
+    assert_eq!(
+        server.count(),
+        2,
+        "old connection cursor must refuse before HTTP"
+    );
+    let fresh = managed_page_cursor(&fixture, &server, mode, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(fresh, cursor);
+    assert_eq!(server.count(), 3);
+}
+
+#[intent_test_macros::daemon_test]
+async fn managed_review_cursor_continues_refresh_but_not_account_replacement() {
+    managed_cursor_refresh_and_replacement(0).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn managed_issue_cursor_continues_refresh_but_not_account_replacement() {
+    managed_cursor_refresh_and_replacement(1).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn managed_discussion_cursor_continues_refresh_but_not_account_replacement() {
+    managed_cursor_refresh_and_replacement(2).await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn filtered_issue_collection_keeps_exact_filter_target_and_empty_page_evidence() {
+    use intent_sourcecontrol::{IssueInvolvement, IssueQuery};
+    let s = ReadServer::new().await;
+    let f = ReadFixture::new(&s, false).await;
+    let query = RepositoryCollectionQuery::FilteredIssues {
+        query: IssueQuery::default(),
+        involvement: IssueInvolvement::Created,
+    };
+    let first_path = format!("{PROJECT}/issues?scope=created_by_me&page=1&per_page=30");
+    s.replies
+        .next_pages
+        .lock()
+        .unwrap()
+        .insert(first_path, "2".into());
+    let (e, operation, target) = f.collection(&s, query);
+    assert_eq!(target.kind(), RepositoryResourceKind::Issue);
+    assert_eq!(s.count(), 0);
+    let (result, quota, receipt) = operation.issues().await.into_parts();
+    let page = result.unwrap();
+    assert!(page.items.is_empty());
+    let cursor = page.next_cursor.unwrap();
+    assert_eq!(quota.remaining, Some(23));
+    assert_eq!(
+        collection_applied(&e, &receipt, &target).unwrap(),
+        D::NoDenial
+    );
+    let (_, wrong, wrong_target) = f.collection(
+        &s,
+        RepositoryCollectionQuery::FilteredIssues {
+            query: IssueQuery {
+                cursor: Some(cursor.clone()),
+                ..IssueQuery::default()
+            },
+            involvement: IssueInvolvement::Assigned,
+        },
+    );
+    assert_eq!(
+        collection_applied(&e, &receipt, &wrong_target),
+        Err(Error::BoundaryMismatch)
+    );
+    assert!(matches!(
+        wrong.issues().await.into_parts().0,
+        Err(ScError::Config(_))
+    ));
+    assert_eq!(s.count(), 1);
+    let (_, next, _) = f.collection(
+        &s,
+        RepositoryCollectionQuery::FilteredIssues {
+            query: IssueQuery {
+                cursor: Some(cursor),
+                ..IssueQuery::default()
+            },
+            involvement: IssueInvolvement::Created,
+        },
+    );
+    assert!(next
+        .issues()
+        .await
+        .into_parts()
+        .0
+        .unwrap()
+        .next_cursor
+        .is_none());
+    assert_eq!(s.count(), 2);
+}
+
+#[intent_test_macros::daemon_test]
+async fn filtered_issue_denials_preserve_actual_error_quota_and_acquired_revision() {
+    use intent_sourcecontrol::{IssueInvolvement, IssueQuery};
+    for stale in [false, true] {
+        for status in [401, 403, 404] {
+            let s = ReadServer::new().await;
+            let f = ReadFixture::new(&s, stale).await;
+            let path = format!("{PROJECT}/issues?scope=assigned_to_me&page=1&per_page=30");
+            s.status(&path, status);
+            if stale {
+                s.pause(&path);
+            }
+            let (e, op, target) = f.collection(
+                &s,
+                RepositoryCollectionQuery::FilteredIssues {
+                    query: IssueQuery::default(),
+                    involvement: IssueInvolvement::Assigned,
+                },
+            );
+            let pending = tokio::spawn(op.issues());
+            if stale {
+                s.entered().await;
+                f.refresh(&s).await;
+                s.resume();
+            }
+            let (result, quota, receipt) = pending.await.unwrap().into_parts();
+            denial(
+                &result,
+                if status == 401 {
+                    ProviderFailureKind::CredentialRejected
+                } else {
+                    ProviderFailureKind::ResourceDenied
+                },
+                status,
+            );
+            assert_eq!(quota.remaining, Some(23));
+            assert_eq!(
+                collection_applied(&e, &receipt, &target).unwrap(),
+                if stale {
+                    D::NotApplied
+                } else if status == 401 {
+                    D::AcceptedCredentialRejection
+                } else {
+                    D::CurrentResourceDenial
+                }
+            );
+            assert_eq!(s.count(), 1);
+            if stale {
+                e.check().unwrap();
+            }
+        }
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn managed_complete_discussion_optional_errors_preserve_primary_and_actual_receipt() {
+    for (status, kind) in [
+        (403, ProviderFailureKind::OptionalRestricted),
+        (404, ProviderFailureKind::OptionalUnavailable),
+        (405, ProviderFailureKind::OptionalUnavailable),
+        (501, ProviderFailureKind::OptionalUnavailable),
+        (401, ProviderFailureKind::CredentialRejected),
+    ] {
+        let s = ReadServer::new().await;
+        let f = ReadFixture::new(&s, false).await;
+        let (_, primary, _) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+        assert!(primary.review_details().await.into_parts().0.is_ok());
+        s.status(&format!("{MR}/discussions?page=1&per_page=20"), status);
+        let (eligibility, operation, target) =
+            f.operation(&s, RepositoryResourceKind::MergeRequest);
+        let (result, quota, receipt) = operation
+            .review_discussions(intent_sourcecontrol::PageParams::first(20))
+            .await
+            .into_parts();
+        denial(&result, kind, status);
+        assert_eq!(quota.remaining, Some(23));
+        assert_eq!(
+            applied(&eligibility, &receipt, &target).unwrap(),
+            if status == 401 {
+                D::AcceptedCredentialRejection
+            } else {
+                D::NoDenial
+            }
+        );
+        if status == 401 {
+            assert!(eligibility.check().is_err());
+        } else {
+            eligibility.check().unwrap();
+            let (_, primary, _) = f.operation(&s, RepositoryResourceKind::MergeRequest);
+            assert!(primary.review_details().await.into_parts().0.is_ok());
+        }
+    }
 }

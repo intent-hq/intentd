@@ -199,6 +199,8 @@ pub(crate) struct RepositoryConnectionDirectory {
     epoch: Uuid,
     daemon_id: String,
     state: Mutex<State>,
+    pub(crate) native_contexts:
+        crate::repository_admission::lifecycle::native_allocation::NativeContextRetirements,
 }
 
 pub(crate) struct RepositoryCredentialAdmission {

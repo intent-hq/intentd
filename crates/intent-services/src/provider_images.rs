@@ -38,6 +38,35 @@ impl PreparedPrompt {
     }
 }
 
+/// Compare MIME essence, ignoring case and parameters from browser/file metadata.
+pub(crate) fn normalize_image_mime(mime: &str) -> String {
+    let mime = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
+    if mime == "image/jpg" {
+        "image/jpeg".into()
+    } else {
+        mime
+    }
+}
+
+/// Image formats accepted by the shared provider preparation path.
+/// Other attachment formats must be delivered as retrievable source files.
+pub(crate) fn supports_image_mime(mime: &str) -> bool {
+    [
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/gif",
+        "image/webp",
+    ]
+    .iter()
+    .any(|supported| mime.eq_ignore_ascii_case(supported))
+}
+
 /// Prepare all images together without exposing partially prepared prompts.
 pub(crate) async fn prepare_prompt_images(prompt: Vec<ContentBlock>) -> Result<Vec<ContentBlock>> {
     if !prompt

@@ -30,7 +30,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -88,6 +88,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-identity-")
 }
 
+#[track_caller]
 fn mock_identity_command(data_dir: &Path, env: &[(&str, &str)]) -> std::process::Command {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
@@ -303,9 +304,10 @@ impl Sink<Message> for PingOnlyWs {
 /// faster than any read timeout, the round-trip still gives up at its ONE
 /// absolute deadline instead of restarting the clock per frame (the
 /// pre-fix shape waited forever here and would trip the outer guard).
-/// Bounded from both sides: not before the deadline, and not long after it
-/// (`SLACK` absorbs scheduler jitter on a loaded host, nothing more).
-#[tokio::test]
+/// Bounded from both sides: not before the deadline, and not long after it.
+/// The clock is paused, so the pings and the deadline run on virtual time and
+/// `elapsed` is exact: a clock restarted per frame never reaches the deadline.
+#[tokio::test(start_paused = true)]
 async fn rpc_helper_gives_up_at_its_absolute_deadline_despite_continuous_pings() {
     const DEADLINE: Duration = Duration::from_millis(500);
     const SLACK: Duration = Duration::from_secs(2);
@@ -314,7 +316,7 @@ async fn rpc_helper_gives_up_at_its_absolute_deadline_despite_continuous_pings()
     };
     let started = tokio::time::Instant::now();
     let outcome = timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         rpc_within(&mut ws, DEADLINE, 1, "system.status", json!({})),
     )
     .await
@@ -329,6 +331,7 @@ async fn rpc_helper_gives_up_at_its_absolute_deadline_despite_continuous_pings()
         "gave up before the deadline: {elapsed:?}"
     );
     assert!(
+        // elapsed-assert: allow — paused tokio clock: the pings and the deadline run on virtual time, so elapsed is exact
         elapsed < DEADLINE + SLACK,
         "kept waiting well past the deadline: {elapsed:?}"
     );

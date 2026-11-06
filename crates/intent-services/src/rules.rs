@@ -237,7 +237,8 @@ fn enabled_override(overrides: &Map<String, Value>, rule_type: &str) -> Option<S
 ///
 /// PARITY NOTE: [`crate::agent_manager`]'s `DEFAULT_AGENT_TYPE = "interactive"`
 /// is an unknown instruction id, so tier 3 composes `common + workspace +
-/// workspace` via the reference's `fallbackToWorkspace` path. The FE file-watch
+/// workspace` via the reference's `fallbackToWorkspace` path (harness < 3.3;
+/// 3.3+ composes `common + workspace`, intent-hq/intent#5835). The FE file-watch
 /// cache-invalidation around the workspace file is intentionally not ported — the
 /// daemon re-resolves per spawn, so the file is always read fresh.
 ///
@@ -259,6 +260,7 @@ pub(crate) async fn get_specialization_rules(
         workspace_path,
         agent_type,
         agent_features,
+        false,
     )
     .await
 }
@@ -266,13 +268,16 @@ pub(crate) async fn get_specialization_rules(
 /// [`get_specialization_rules`] with an explicit tier-3 instruction set —
 /// the SESSION's pinned doctrine when called from [`assemble_system_prompt`]
 /// (H2): tier 1/2 user-supplied content is unversioned, only the bundled
-/// built-in comes from `set`.
+/// built-in comes from `set`. `plain_folder` (from
+/// [`crate::instructions::plain_folder_gated`]) swaps the bundled git and
+/// forge guidance for the plain-folder note.
 pub(crate) async fn get_specialization_rules_for(
     set: &'static crate::instructions::InstructionSet,
     store: &Store,
     workspace_path: Option<&Path>,
     agent_type: &str,
     agent_features: &intent_core::settings_file::AgentFeaturesSettings,
+    plain_folder: bool,
 ) -> String {
     // 1. User-settings override (highest precedence — settings win over file/bundled).
     let overrides = read_overrides(store).await;
@@ -293,7 +298,12 @@ pub(crate) async fn get_specialization_rules_for(
     }
     // 3. Bundled built-in (composed with common/workspace per the reference),
     // from the caller's pinned instruction set.
-    crate::instructions::get_instruction_with_common_for(set, agent_type, agent_features)
+    crate::instructions::get_instruction_with_common_in(
+        set,
+        agent_type,
+        agent_features,
+        plain_folder,
+    )
 }
 
 /// Specialist inputs for the spawn-prompt injection (PP-1, reference
@@ -320,7 +330,7 @@ pub(crate) struct SpecialistPromptInjection {
 /// actually running under.
 ///
 /// Hint matrix (per spec line 104-110):
-/// - Sandboxed implementor (`session.sandbox_path` present + specialist="implementor"):
+/// - Sandboxed agent (`session.sandbox_path` present):
 ///   isolation context block with sandbox path, branch, base commit, caches-warm
 ///   notice, branch-switching warning, and conflict-bounce resolution instructions.
 /// - Coordinator in CoW-enabled workspace (specialist="spec-writer" + workspace
@@ -331,7 +341,7 @@ pub(crate) fn build_isolation_hint(
     agent_session: Option<&intent_core::AgentSession>,
     specialist: Option<&SpecialistPromptInjection>,
 ) -> Option<String> {
-    // Determine if this agent is a sandboxed implementor
+    // Isolation follows the checkout, independently of the selected specialist.
     let is_sandboxed = agent_session
         .and_then(|s| s.sandbox_path.as_ref())
         .is_some();
@@ -344,8 +354,8 @@ pub(crate) fn build_isolation_hint(
     // calls resolve to the latest.
     let harness = session_harness_entry(agent_session).harness;
 
-    // Case 1: Sandboxed implementor — inject isolation context
-    if is_sandboxed && specialist_name.eq_ignore_ascii_case("implementor") {
+    // Case 1: Sandboxed agent — inject isolation context
+    if is_sandboxed {
         let session = agent_session?;
         let sandbox_path = session.sandbox_path.as_deref().unwrap_or("<sandbox-path>");
         let sandbox_branch = session.sandbox_branch.as_deref().unwrap_or("sb/<id>");
@@ -410,6 +420,20 @@ async fn build_rtk_instruction(
     Some(rtk_instruction_line(harness, &status.subcommands))
 }
 
+/// Append the provider's prompt-only note
+/// ([`intent_providers::ProviderConfig::system_prompt_note`]; Cursor's
+/// native-subagent restriction) to an assembled prompt. Other providers'
+/// prompts are returned unchanged.
+pub(crate) fn with_provider_prompt_note(
+    prompt: String,
+    provider: &intent_providers::ProviderConfig,
+) -> String {
+    match provider.system_prompt_note {
+        Some(note) => format!("{}\n\n{note}", prompt.trim_end()),
+        None => prompt,
+    }
+}
+
 /// Assemble the effective system prompt (the **internal** injection pipeline,
 /// §18.1) in documented precedence: base-system-prompt override →
 /// specialization rules (the 3-tier resolver: agent-type override → workspace
@@ -463,6 +487,72 @@ pub(crate) async fn assemble_system_prompt(
     agent_session: Option<&intent_core::AgentSession>,
     workspace_api_docs: Option<&str>,
 ) -> Option<String> {
+    assemble_system_prompt_layers(
+        store,
+        workspace_path,
+        agent_type,
+        specialist,
+        is_sub_agent,
+        auto_commit_enabled,
+        rtk_enabled,
+        agent_features,
+        workspace,
+        agent_session,
+        workspace_api_docs,
+        true,
+    )
+    .await
+}
+
+/// [`assemble_system_prompt`] for an agent that runs on another machine:
+/// the same layers without the skills catalog, whose paths are on this
+/// host and cannot be read there.
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn assemble_remote_system_prompt(
+    store: &Store,
+    workspace_path: Option<&Path>,
+    agent_type: &str,
+    specialist: Option<&SpecialistPromptInjection>,
+    is_sub_agent: bool,
+    auto_commit_enabled: bool,
+    rtk_enabled: bool,
+    agent_features: &intent_core::settings_file::AgentFeaturesSettings,
+    workspace: Option<&intent_core::Workspace>,
+    agent_session: Option<&intent_core::AgentSession>,
+    workspace_api_docs: Option<&str>,
+) -> Option<String> {
+    assemble_system_prompt_layers(
+        store,
+        workspace_path,
+        agent_type,
+        specialist,
+        is_sub_agent,
+        auto_commit_enabled,
+        rtk_enabled,
+        agent_features,
+        workspace,
+        agent_session,
+        workspace_api_docs,
+        false,
+    )
+    .await
+}
+
+#[expect(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+async fn assemble_system_prompt_layers(
+    store: &Store,
+    workspace_path: Option<&Path>,
+    agent_type: &str,
+    specialist: Option<&SpecialistPromptInjection>,
+    is_sub_agent: bool,
+    auto_commit_enabled: bool,
+    rtk_enabled: bool,
+    agent_features: &intent_core::settings_file::AgentFeaturesSettings,
+    workspace: Option<&intent_core::Workspace>,
+    agent_session: Option<&intent_core::AgentSession>,
+    workspace_api_docs: Option<&str>,
+    skills_catalog: bool,
+) -> Option<String> {
     // The session's pinned harness + doctrine (H2): a stamped session keeps
     // assembling the exact version it was created with; session-less calls
     // (previews, background one-shots) resolve to the latest.
@@ -473,6 +563,11 @@ pub(crate) async fn assemble_system_prompt(
         .or_else(|| workspace.map(|workspace| &workspace.id))
         .filter(|id| id.is_chief())
         .and(entry.doctrine.instructions.assistant);
+    // Plain-folder workspaces (§5.1) get no git, forge or PR guidance: the
+    // bundled common sections and the commit policy are replaced by the
+    // plain-folder note (latest harness only).
+    let plain_folder =
+        crate::instructions::plain_folder_gated(entry.doctrine.instructions, workspace);
     let overrides = read_overrides(store).await;
     let mut parts: Vec<String> = Vec::new();
     if let Some(c) = enabled_override(&overrides, "base-system-prompt") {
@@ -487,6 +582,7 @@ pub(crate) async fn assemble_system_prompt(
             workspace_path,
             agent_type,
             agent_features,
+            plain_folder,
         )
         .await;
         if !specialization.trim().is_empty() {
@@ -528,7 +624,7 @@ pub(crate) async fn assemble_system_prompt(
     // workspace path is available, discover and inject the skills catalog. Empty
     // catalog ⇒ no layer appended. Discovery failures degrade gracefully (log
     // warn, omit layer) — never fail prompt assembly.
-    if let Some(ws) = workspace {
+    if let Some(ws) = workspace.filter(|_| skills_catalog) {
         if let Some(repo_path) = crate::git_ops::worktree_path(ws) {
             match crate::skills::format_skills_catalog_for_prompt(&repo_path.to_string_lossy())
                 .await
@@ -574,7 +670,7 @@ pub(crate) async fn assemble_system_prompt(
     // The prompt no longer branches on the effective auto-commit state — the
     // OFF-state gate in `git_ops` and the auto-commit-on-idle subscriber
     // enforce the actual behavior.
-    if assistant.is_none() {
+    if assistant.is_none() && !plain_folder {
         parts.push(harness.commit_policy_clause());
     }
     // Mandatory-actions footer (reference layer 9 / `getMandatoryActionsFooter`,
@@ -613,7 +709,18 @@ pub(crate) async fn assemble_system_prompt(
         let effective_auto_commit =
             auto_commit_enabled && !agent_session.is_some_and(|s| s.skip_auto_commit);
         if assistant.is_none() {
-            parts.push(harness.suggested_next_steps_block(effective_auto_commit));
+            match entry
+                .doctrine
+                .instructions
+                .plain_folder
+                .filter(|_| plain_folder)
+            {
+                // Plain folders have no commits, branches or pull requests:
+                // their footer examples and wording say so (no auto-commit
+                // clause either).
+                Some(doctrine) => parts.push(doctrine.suggested_next_steps.to_string()),
+                None => parts.push(harness.suggested_next_steps_block(effective_auto_commit)),
+            }
         }
     }
     if parts.is_empty() {
@@ -738,6 +845,25 @@ impl<'a> RulesService<'a> {
 mod tests {
     use super::*;
     use intent_core::settings_file::AgentFeaturesSettings;
+
+    /// Cursor sessions get the prompt-only native-subagent restriction;
+    /// every other provider's prompt is unchanged.
+    #[test]
+    fn provider_prompt_note_reaches_cursor_only() {
+        let base = "## Base\n\nInstructions.\n".to_string();
+        for provider in intent_providers::ACP_PROVIDERS {
+            let out = with_provider_prompt_note(base.clone(), provider);
+            if provider.id == "cursor" {
+                assert!(out.starts_with("## Base\n\nInstructions."), "{out}");
+                assert!(
+                    out.ends_with(intent_providers::CURSOR_SUBAGENT_PROMPT_NOTE),
+                    "{out}"
+                );
+            } else {
+                assert_eq!(out, base, "{}", provider.id);
+            }
+        }
+    }
     use intent_core::Workspace;
     use intent_store::Store;
     use std::path::PathBuf;
@@ -772,49 +898,11 @@ mod tests {
             id: intent_core::WorkspaceId("test-ws".to_string()),
             title: "Test Workspace".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: intent_core::WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: intent_core::WorkspaceActivity::Idle,
-            attention: intent_core::WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
             path: Some(repo_path.to_string_lossy().to_string()),
             repository_path: Some(repo_path.to_string_lossy().to_string()),
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
     }
 
@@ -1197,6 +1285,7 @@ This is a test skill.
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
             is_background: false,
             metadata: None,
             created_at: ts.clone(),
@@ -1396,5 +1485,276 @@ This is a test skill.
             &AgentFeaturesSettings::default(),
         );
         assert!(with_defaults.contains(&expected_specialization));
+    }
+
+    /// Headings and API names a plain-folder prompt must never carry (Brief
+    /// Must 6): the git, forge and sibling-workspace guidance.
+    const PLAIN_FOLDER_ABSENT: &[&str] = &[
+        "## GitHub & Git Operations",
+        "## Commit Policy",
+        "## Follow-up Workspaces",
+        "## Link other workspaces",
+        "## Waiting on External Conditions",
+        "ws.git",
+        "ws.pr",
+        "ws.mr",
+        "proposeSibling",
+    ];
+
+    fn plain_folder_workspace(folder: &Path) -> Workspace {
+        Workspace {
+            branch: String::new(),
+            plain_folder: true,
+            ..make_test_workspace(folder)
+        }
+    }
+
+    async fn assembled(
+        store: &Store,
+        folder: &Path,
+        agent_type: &str,
+        is_sub_agent: bool,
+        workspace: &Workspace,
+    ) -> String {
+        assemble_system_prompt(
+            store,
+            Some(folder),
+            agent_type,
+            None,
+            is_sub_agent,
+            true,
+            false,
+            &AgentFeaturesSettings::default(),
+            Some(workspace),
+            None,
+            None,
+        )
+        .await
+        .expect("prompt")
+    }
+
+    #[tokio::test]
+    async fn plain_folder_prompt_has_no_git_guidance_and_carries_the_note() {
+        let temp_dir = TempDir::new().unwrap();
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+        let workspace = plain_folder_workspace(temp_dir.path());
+        for agent_type in ["interactive", "workspace", "workspace-agent", "task-loop"] {
+            for is_sub_agent in [false, true] {
+                let prompt = assembled(
+                    &store,
+                    temp_dir.path(),
+                    agent_type,
+                    is_sub_agent,
+                    &workspace,
+                )
+                .await;
+                let probe = prompt.replace("ws.primitive", "");
+                for absent in PLAIN_FOLDER_ABSENT {
+                    assert!(
+                        !probe.contains(absent),
+                        "{agent_type} (sub-agent {is_sub_agent}) still carries {absent:?}"
+                    );
+                }
+                for present in [
+                    "## Plain folder workspace",
+                    "no undo",
+                    "Confirm with the user before you delete files or rewrite many files",
+                    "Do not run `git init`",
+                    "## Delegating Tasks",
+                    "## Note Editing",
+                ] {
+                    assert!(
+                        prompt.contains(present),
+                        "{agent_type} (sub-agent {is_sub_agent}) lacks {present:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn git_workspace_prompt_keeps_git_guidance_and_has_no_plain_folder_note() {
+        let temp_dir = TempDir::new().unwrap();
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+        let workspace = make_test_workspace(temp_dir.path());
+        let prompt = assembled(&store, temp_dir.path(), "interactive", false, &workspace).await;
+        for present in [
+            "## GitHub & Git Operations",
+            "## Commit Policy",
+            "## Follow-up Workspaces",
+            "## Link other workspaces",
+            "## Waiting on External Conditions",
+        ] {
+            assert!(prompt.contains(present), "git workspace lacks {present:?}");
+        }
+        assert!(!prompt.contains("## Plain folder workspace"));
+        // The flag, not the folder contents or an empty branch, selects the
+        // mode: an otherwise identical row without `plainFolder` is a git
+        // workspace.
+        let unflagged = Workspace {
+            branch: String::new(),
+            ..make_test_workspace(temp_dir.path())
+        };
+        assert_eq!(
+            assembled(&store, temp_dir.path(), "interactive", false, &unflagged).await,
+            prompt
+        );
+    }
+
+    /// Words Intent-authored prompt text must never use in a plain-folder
+    /// workspace (Brief Must 6), matched case-insensitively as whole words.
+    const PLAIN_FOLDER_BANNED_WORDS: &[&str] = &[
+        "git",
+        "commit",
+        "commits",
+        "committing",
+        "branch",
+        "branches",
+        "pull request",
+        "pull requests",
+        "pr",
+        "prs",
+        "merge request",
+        "mr",
+        "merge",
+        "merging",
+        "push",
+    ];
+
+    /// Every banned whole word in `text`, with the line it appears on.
+    fn plain_folder_word_leaks(text: &str) -> Vec<String> {
+        let pattern = format!(
+            r"(?i)\b({})\b",
+            PLAIN_FOLDER_BANNED_WORDS
+                .iter()
+                .map(|w| regex::escape(w))
+                .collect::<Vec<_>>()
+                .join("|")
+        );
+        let re = regex::Regex::new(&pattern).unwrap();
+        text.lines()
+            .filter_map(|line| {
+                re.find(line)
+                    .map(|m| format!("{:?} in: {}", m.as_str(), line.trim()))
+            })
+            .collect()
+    }
+
+    struct NoApi;
+    impl intent_core::WorkspaceApi for NoApi {}
+
+    /// The full assembled prompt for a plain-folder workspace — every
+    /// Intent-authored layer (bundled doctrine, commit policy slot, the
+    /// condensed `workspace_api` reference, role reminder, questions and
+    /// suggested-next-steps footers) on the latest harness — never mentions
+    /// git, commits, branches, pull/merge requests, merging or pushing, for
+    /// every default role, the coordinator role, top-level and sub-agents and
+    /// both auto-commit states. User-supplied specialist prompts (Brief
+    /// Must 7) and provider-owned text are not part of the assembly here.
+    #[tokio::test]
+    async fn plain_folder_prompt_never_mentions_git_or_forge_words() {
+        let temp_dir = TempDir::new().unwrap();
+        let tmp_db = TempDb::new();
+        let store = Store::open(&tmp_db.path).await.unwrap();
+        let workspace = plain_folder_workspace(temp_dir.path());
+        let coordinator = SpecialistPromptInjection {
+            behavior_prompt: None,
+            specialist_name: Some("Coordinator".to_string()),
+            role_reminder: None,
+        };
+        let service = crate::specialists::SpecialistsService::new(
+            Some(temp_dir.path().join("user")),
+            Some(temp_dir.path().join("bundled")),
+        )
+        .with_embedded(crate::specialists::EMBEDDED_BUNDLED_V3_8);
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/specialists/v3.8");
+        let bundled: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+            .map(|path| {
+                let id = path.file_stem().unwrap().to_str().unwrap();
+                let (body, name, reminder) = service
+                    .resolve_prompt_injection_in(id, None, true)
+                    .expect("every v3.8 file must be in the bundled catalog");
+                SpecialistPromptInjection {
+                    behavior_prompt: body,
+                    specialist_name: Some(name),
+                    role_reminder: reminder,
+                }
+            })
+            .collect();
+        assert!(!bundled.is_empty());
+        let mut leaks = Vec::new();
+        for agent_type in [
+            "interactive",
+            "workspace",
+            "workspace-agent",
+            "task-loop",
+            "task-focused",
+            "task-debug",
+            "task-breakdown",
+            "debug",
+            "chat",
+        ] {
+            for specialist in [None, Some(&coordinator)]
+                .into_iter()
+                .chain(bundled.iter().map(Some))
+            {
+                for is_sub_agent in [false, true] {
+                    for auto_commit in [false, true] {
+                        let docs = intent_acp::WorkspaceMcpServer::new(
+                            std::sync::Arc::new(NoApi),
+                            workspace.id.clone(),
+                        )
+                        .with_sub_agent(is_sub_agent)
+                        .with_plain_folder(true)
+                        .condensed_workspace_api_description();
+                        let prompt = assemble_system_prompt(
+                            &store,
+                            Some(temp_dir.path()),
+                            agent_type,
+                            specialist,
+                            is_sub_agent,
+                            auto_commit,
+                            false,
+                            &AgentFeaturesSettings::default(),
+                            Some(&workspace),
+                            None,
+                            Some(&docs),
+                        )
+                        .await
+                        .expect("prompt");
+                        // The plain-folder note must name `git init` (Brief
+                        // Must 6); it is the one sanctioned mention.
+                        let note = crate::harness::latest_entry()
+                            .doctrine
+                            .instructions
+                            .plain_folder
+                            .expect("latest set gates plain folders")
+                            .note;
+                        assert_eq!(prompt.matches(note).count(), 1, "{agent_type}");
+                        if !is_sub_agent {
+                            assert!(prompt.contains("## Suggested Next Steps"), "{agent_type}");
+                        }
+                        let prompt = prompt.replace(note, "");
+                        for leak in plain_folder_word_leaks(&prompt) {
+                            let entry = format!("{agent_type}: {leak}");
+                            if !leaks.contains(&entry) {
+                                leaks.push(entry);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            leaks.is_empty(),
+            "{} leaks:\n{}",
+            leaks.len(),
+            leaks.join("\n")
+        );
     }
 }

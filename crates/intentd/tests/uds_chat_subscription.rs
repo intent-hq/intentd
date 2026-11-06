@@ -11,7 +11,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -60,10 +60,13 @@ async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: &str) {
 
 async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     let mut line = String::new();
-    let n = timeout(Duration::from_secs(2), reader.read_line(&mut line))
-        .await
-        .expect("timed out waiting for a frame")
-        .expect("read failed");
+    let n = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("timed out waiting for a frame")
+    .expect("read failed");
     assert!(n > 0, "connection closed unexpectedly");
     serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
 }
@@ -101,7 +104,7 @@ fn boot(
     // server is handed the same handle coerced to `Arc<dyn WorkspaceApi>`).
     let ws_root = common::hermetic_workspaces_root();
     let services = Arc::new(
-        Services::new(bus.store().clone())
+        Services::new_isolated(bus.store().clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
             .with_event_bus(bus.clone()),
@@ -1911,6 +1914,565 @@ async fn chat_subscription_self_heals_after_broadcast_lag_drops_turn_tail() {
     let next = read_json(&mut sub_reader).await;
     assert_eq!(next["params"]["kind"], "delta");
     assert_eq!(next["params"]["seq"], 3);
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// Single-row bound on the live paths (§5.5): mid-turn, the in-flight
+/// assistant message carries ~400 capped tool blocks (alone over the page
+/// budget) beside persisted rows that already fill a page. The seq-0
+/// `chat.subscribe` push and an `includeInProgress` `agent.getConversation`
+/// page both stay within the 500 KiB read budget: the live row is cut to fit
+/// with contiguous newest-last `bodyOmitted` stubs that keep their ids.
+#[intent_test_macros::daemon_test]
+async fn chat_live_turn_over_budget_is_cut_to_fit_read_payload_budget() {
+    use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+    use intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES;
+    let (socket, server, shutdown_tx, _tmp, bus, services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    let store = bus.store();
+    let text = "p".repeat(100 * 1024);
+    for i in 0..6 {
+        store
+            .append_agent_message(
+                &agent,
+                "user",
+                &json!([{ "type": "text", "id": format!("p{i}"), "text": text }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append persisted row");
+    }
+    let mid = Uuid::now_v7().to_string();
+    let capped = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 2);
+    let live_blocks: Vec<Value> = (0..400)
+        .map(|i| {
+            json!({ "type": "tool_result", "id": format!("{mid}:{i}"),
+                "tool_use_id": format!("tc-{i}"), "output": capped, "is_error": false })
+        })
+        .collect();
+    services.set_live_turn(&agent, &mid, live_blocks);
+    services.set_test_busy(&agent, true);
+
+    let check_live_row = |label: &str, row: &Value| {
+        let blocks = row["contentBlocks"].as_array().expect("live blocks");
+        assert_eq!(
+            blocks.len(),
+            400,
+            "{label}: every live block keeps its slot"
+        );
+        let first_stub = blocks
+            .iter()
+            .position(|b| b["bodyOmitted"] == true)
+            .unwrap_or_else(|| panic!("{label}: live row is cut to fit"));
+        for (i, b) in blocks.iter().enumerate() {
+            assert_eq!(b["id"], format!("{mid}:{i}"), "{label}: ids and order kept");
+            assert_eq!(
+                b["bodyOmitted"] == true,
+                i >= first_stub,
+                "{label}: one stub tail run"
+            );
+        }
+    };
+
+    for (id, extra) in [
+        (1, json!({})),
+        (2, json!({ "deltaEncoding": "incremental" })),
+    ] {
+        let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+        let mut sub_reader = tokio::io::BufReader::new(sub_read);
+        let mut params = json!({ "agentId": agent_id, "limit": 200 });
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        send(
+            &mut sub_write,
+            &serde_json::to_string(&json!({
+                "jsonrpc": "2.0", "id": id, "method": "chat.subscribe", "params": params
+            }))
+            .unwrap(),
+        )
+        .await;
+        let resp = read_json(&mut sub_reader).await;
+        assert_eq!(resp["id"], id);
+        let snap = read_json(&mut sub_reader).await;
+        assert_eq!(snap["params"]["kind"], "snapshot");
+        let frame = serde_json::to_string(&snap).unwrap().len();
+        assert!(
+            frame <= READ_PAYLOAD_BUDGET_BYTES,
+            "seq-0 push {frame} bytes exceeds {READ_PAYLOAD_BUDGET_BYTES}"
+        );
+        let messages = snap["params"]["snapshot"]["messages"].as_array().unwrap();
+        let live = messages.last().unwrap();
+        assert_eq!(live["id"], mid.as_str());
+        check_live_row("seq-0 snapshot", live);
+    }
+
+    send(
+        &mut rpc_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 12, "method": "agent.getConversation",
+            "params": { "agentId": agent_id, "limit": 10000, "includeInProgress": true }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let resp = read_json(&mut rpc_reader).await;
+    let frame = serde_json::to_string(&resp).unwrap().len();
+    assert!(
+        frame <= READ_PAYLOAD_BUDGET_BYTES,
+        "includeInProgress page {frame} bytes exceeds {READ_PAYLOAD_BUDGET_BYTES}"
+    );
+    let messages = resp["result"]["messages"].as_array().unwrap();
+    let live = messages.last().unwrap();
+    assert_eq!(live["inProgress"], true);
+    check_live_row("includeInProgress page", live);
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// The `contentBlocks` of message `id` in a messages array (`Null` if absent).
+fn blocks_of(messages: &[Value], id: &str) -> Value {
+    messages
+        .iter()
+        .find(|m| m["id"].as_str() == Some(id))
+        .map_or(Value::Null, |m| m["contentBlocks"].clone())
+}
+
+/// Read delta frames until `done` holds for the reduced transcript, asserting
+/// each frame's literal size against the read budget. Returns the frames.
+async fn read_bounded_deltas(
+    reader: &mut BufReader<OwnedReadHalf>,
+    reconstructed: &mut Vec<Value>,
+    done: impl Fn(&[Value]) -> bool,
+) -> Vec<Value> {
+    use intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES;
+    let mut frames = Vec::new();
+    while !done(reconstructed) {
+        let mut line = String::new();
+        let n = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("timed out waiting for a delta frame")
+        .expect("read failed");
+        assert!(n > 0, "connection closed unexpectedly");
+        let frame = line.trim_end();
+        assert!(
+            frame.len() <= READ_PAYLOAD_BUDGET_BYTES,
+            "delta frame {} bytes exceeds {READ_PAYLOAD_BUDGET_BYTES}",
+            frame.len()
+        );
+        let v: Value = serde_json::from_str(frame).expect("json frame");
+        assert_eq!(v["params"]["kind"], "delta");
+        apply_delta(reconstructed, &v["params"]["delta"]);
+        frames.push(v);
+        assert!(frames.len() <= 64, "too many frames");
+    }
+    frames
+}
+
+/// Single-message bound on the live delta paths (§7.1), in both delta
+/// encodings: (1) the end-of-turn reconcile for an assistant row of ~400
+/// capped tool blocks with metadata, and (2) an `agent:message` delta for a
+/// user row over the page budget, are split into frames that each fit the
+/// read budget, and the reduced transcript still equals a fresh
+/// `agent.getConversation` page.
+#[intent_test_macros::daemon_test]
+async fn chat_over_budget_row_deltas_fit_read_payload_budget() {
+    use intent_core::events::AGENT_MESSAGE;
+    use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+    let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let store = bus.store();
+    let mut rpc_id = 20;
+    for encoding in [None, Some("incremental")] {
+        rpc_id += 10;
+        let a = rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            rpc_id,
+            "agent.create",
+            json!({ "workspaceId": ws_id, "name": format!("A{rpc_id}") }),
+        )
+        .await;
+        let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+        let agent = AgentId::from(agent_id.as_str());
+
+        let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+        let mut sub_reader = tokio::io::BufReader::new(sub_read);
+        let mut params = json!({ "agentId": agent_id });
+        if let Some(e) = encoding {
+            params["deltaEncoding"] = json!(e);
+        }
+        send(
+            &mut sub_write,
+            &serde_json::to_string(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe", "params": params
+            }))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(read_json(&mut sub_reader).await["id"], 1);
+        let snap = read_json(&mut sub_reader).await;
+        let mut reconstructed: Vec<Value> = snap["params"]["snapshot"]["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+
+        // (1) End of a turn whose persisted assistant row is ~400 capped tool
+        // blocks plus metadata: the terminal reconcile is cut and split.
+        let mid = Uuid::now_v7().to_string();
+        let output = "o".repeat(SLIM_PROJECTION_BUDGET_BYTES * 2);
+        let blocks: Vec<Value> = (0..400)
+            .map(|i| {
+                json!({ "type": "tool_result", "id": format!("{mid}:{i}"),
+                    "tool_use_id": format!("tc-{i}"), "output": output, "is_error": false })
+            })
+            .collect();
+        store
+            .append_agent_message_with_id(
+                &agent,
+                &mid,
+                "assistant",
+                &json!(blocks),
+                Some(&json!({ "note": "m".repeat(512) })),
+                &now_iso(),
+            )
+            .await
+            .expect("append assistant row");
+        publish_stream(
+            &bus,
+            &ws_id,
+            &agent_id,
+            AGENT_STREAM_END,
+            json!({ "agentId": agent_id, "messageId": mid }),
+        )
+        .await;
+        let want = rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            rpc_id + 1,
+            "agent.getConversation",
+            json!({ "agentId": agent_id }),
+        )
+        .await["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let target = blocks_of(&want, &mid);
+        assert_eq!(target.as_array().map(Vec::len), Some(400));
+        let frames = read_bounded_deltas(&mut sub_reader, &mut reconstructed, |r| {
+            blocks_of(r, &mid) == target
+        })
+        .await;
+        assert!(
+            frames.len() > 1,
+            "the terminal reconcile was split ({encoding:?})"
+        );
+
+        // (2) A user row over the page budget arriving as `agent:message`.
+        let uid = Uuid::now_v7().to_string();
+        let user_blocks: Vec<Value> = (0..300)
+            .map(|i| json!({ "type": "text", "id": format!("{uid}:{i}"), "text": "u".repeat(1_900) }))
+            .collect();
+        store
+            .append_agent_message_with_id(
+                &agent,
+                &uid,
+                "user",
+                &json!(user_blocks),
+                Some(&json!({ "note": "n".repeat(512) })),
+                &now_iso(),
+            )
+            .await
+            .expect("append user row");
+        publish_stream(
+            &bus,
+            &ws_id,
+            &agent_id,
+            AGENT_MESSAGE,
+            json!({ "agentId": agent_id, "messageId": uid, "role": "user" }),
+        )
+        .await;
+        let want = rpc(
+            &mut rpc_write,
+            &mut rpc_reader,
+            rpc_id + 2,
+            "agent.getConversation",
+            json!({ "agentId": agent_id }),
+        )
+        .await["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let target = blocks_of(&want, &uid);
+        assert!(
+            target
+                .as_array()
+                .is_some_and(|b| b.iter().any(|b| b["bodyOmitted"] == true)),
+            "the user row is over the budget and served cut"
+        );
+        read_bounded_deltas(&mut sub_reader, &mut reconstructed, |r| {
+            blocks_of(r, &uid) == target
+        })
+        .await;
+    }
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// Full-mode live text past the page budget (§7.1): every chunk frame stays
+/// within the read budget, and once the accumulated text passes the budget
+/// the block carries the snapshot's preview shape (`textTruncated`,
+/// `textBytes`) instead of the whole text.
+#[intent_test_macros::daemon_test]
+async fn chat_full_mode_text_past_budget_sends_cut_marker() {
+    let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+            "params": { "agentId": agent_id }
+        }))
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(read_json(&mut sub_reader).await["id"], 1);
+    let _snap = read_json(&mut sub_reader).await;
+
+    let mid = Uuid::now_v7().to_string();
+    let piece = "t".repeat(64 * 1024);
+    let chunks = 10;
+    for _ in 0..chunks {
+        publish_stream(
+            &bus,
+            &ws_id,
+            &agent_id,
+            CHAT_STREAM_DELTA,
+            json!({ "agentId": agent_id, "content": piece, "messageId": mid,
+                "blockIndex": 0, "blockId": format!("{mid}:0"), "blockType": "text" }),
+        )
+        .await;
+    }
+    let total = piece.len() * chunks;
+    let mut reconstructed = Vec::new();
+    read_bounded_deltas(&mut sub_reader, &mut reconstructed, |r| {
+        r.iter()
+            .any(|m| m["contentBlocks"][0]["textBytes"].as_u64() == Some(total as u64))
+    })
+    .await;
+    let block = &reconstructed[0]["contentBlocks"][0];
+    assert_eq!(block["textTruncated"], true);
+    assert!(
+        block["text"].as_str().unwrap().len() < 4096,
+        "a preview, not the whole text"
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}
+
+/// Single-row bound on progressive history (§7.1, the app's default
+/// `historyDelivery: "progressive"`): with an over-budget 600 KB text row as
+/// the newest row (it lands in seq-0) and a ~300-block tool row before it,
+/// the seq-0 snapshot and every `history` frame stay within the read budget,
+/// the cut rows carry their markers, and every row is delivered.
+#[intent_test_macros::daemon_test]
+async fn chat_progressive_history_over_budget_rows_fit_read_payload_budget() {
+    use intent_core::SLIM_PROJECTION_BUDGET_BYTES;
+    use intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES;
+    let (socket, server, shutdown_tx, _tmp, bus, _services, _ws_root, _sock_dir) =
+        setup_with_bus().await;
+    let (rpc_read, mut rpc_write) = connect_retry(&socket).await.into_split();
+    let mut rpc_reader = tokio::io::BufReader::new(rpc_read);
+    let ws = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        10,
+        "workspace.create",
+        json!({ "title": "WS" }),
+    )
+    .await;
+    let ws_id = ws["workspace"]["id"].as_str().unwrap().to_string();
+    let a = rpc(
+        &mut rpc_write,
+        &mut rpc_reader,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "A1" }),
+    )
+    .await;
+    let agent_id = a["agent"]["id"].as_str().unwrap().to_string();
+    let agent = AgentId::from(agent_id.as_str());
+    let store = bus.store();
+
+    let small = Uuid::now_v7().to_string();
+    let tools = Uuid::now_v7().to_string();
+    let huge = Uuid::now_v7().to_string();
+    let output = "o".repeat(SLIM_PROJECTION_BUDGET_BYTES * 4);
+    let tool_blocks: Vec<Value> = (0..300)
+        .map(|i| {
+            json!({ "type": "tool_result", "id": format!("{tools}:{i}"),
+                "tool_use_id": format!("tc-{i}"), "output": output, "is_error": false })
+        })
+        .collect();
+    for (id, role, blocks) in [
+        (
+            &small,
+            "user",
+            json!([{ "type": "text", "id": format!("{small}:0"), "text": "hi" }]),
+        ),
+        (&tools, "assistant", json!(tool_blocks)),
+        (
+            &huge,
+            "assistant",
+            json!([{ "type": "text", "id": format!("{huge}:0"), "text": "z".repeat(600_000) }]),
+        ),
+    ] {
+        store
+            .append_agent_message_with_id(&agent, id, role, &blocks, None, &now_iso())
+            .await
+            .expect("append row");
+    }
+
+    let (sub_read, mut sub_write) = connect_retry(&socket).await.into_split();
+    let mut sub_reader = tokio::io::BufReader::new(sub_read);
+    send(
+        &mut sub_write,
+        &serde_json::to_string(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "chat.subscribe",
+            "params": { "agentId": agent_id, "limit": 20, "historyDelivery": "progressive" }
+        }))
+        .unwrap(),
+    )
+    .await;
+    let mut rows: Vec<Value> = Vec::new();
+    let mut saw_snapshot = false;
+    let mut complete = false;
+    for _ in 0..16 {
+        let mut line = String::new();
+        let n = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            sub_reader.read_line(&mut line),
+        )
+        .await
+        .expect("timed out waiting for a frame")
+        .expect("read failed");
+        assert!(n > 0, "connection closed unexpectedly");
+        let frame = line.trim_end();
+        assert!(
+            frame.len() <= READ_PAYLOAD_BUDGET_BYTES,
+            "frame {} bytes exceeds {READ_PAYLOAD_BUDGET_BYTES}",
+            frame.len()
+        );
+        let v: Value = serde_json::from_str(frame).expect("json frame");
+        if v["id"] == 1 {
+            continue;
+        }
+        match v["params"]["kind"].as_str() {
+            Some("snapshot") => {
+                saw_snapshot = true;
+                rows.extend(
+                    v["params"]["snapshot"]["messages"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+            }
+            Some("history") => {
+                let h = &v["params"]["history"];
+                if let Some(m) = h.get("message") {
+                    rows.push(m.clone());
+                }
+                if h["complete"] == true {
+                    complete = true;
+                    break;
+                }
+            }
+            other => panic!("unexpected frame kind {other:?}"),
+        }
+    }
+    assert!(saw_snapshot && complete, "progressive delivery completed");
+    let row = |id: &str| {
+        rows.iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("row {id} delivered"))
+    };
+    assert_eq!(rows.len(), 3, "every row delivered once");
+    assert_eq!(
+        rows[0]["id"],
+        huge.as_str(),
+        "the over-budget row is the seq-0 row"
+    );
+    assert_eq!(row(&huge)["contentBlocks"][0]["textTruncated"], true);
+    assert_eq!(row(&huge)["contentBlocks"][0]["textBytes"], 600_000);
+    let tool_out = row(&tools)["contentBlocks"].as_array().unwrap();
+    assert_eq!(tool_out.len(), 300);
+    assert!(tool_out.iter().any(|b| b["bodyOmitted"] == true));
+    assert_eq!(row(&small)["contentBlocks"][0]["text"], "hi");
 
     let _ = shutdown_tx.send(());
     let _ = server.await;

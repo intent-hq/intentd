@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Fast child-process contracts for the test-only caller policy (no Rust build)."""
 
+import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +13,10 @@ import unittest
 
 SCRIPTS = Path(__file__).resolve().parent
 WRAPPER = SCRIPTS / "with-test-policy.sh"
+_spec = importlib.util.spec_from_file_location("script_helpers", SCRIPTS / "script_helpers.py")
+script_helpers = importlib.util.module_from_spec(_spec)
+sys.dont_write_bytecode = True
+_spec.loader.exec_module(script_helpers)
 
 
 class PolicyTests(unittest.TestCase):
@@ -70,9 +74,9 @@ class PolicyTests(unittest.TestCase):
                         scripts, bin_dir = root / "scripts", root / "bin"
                         scripts.mkdir()
                         bin_dir.mkdir()
-                        shutil.copy(SCRIPTS / script, scripts)
-                        if WRAPPER.exists():
-                            shutil.copy(WRAPPER, scripts)
+                        # The script and every helper it calls (derived,
+                        # not hand-kept: intentd#2896).
+                        script_helpers.copy_into([script], scripts)
                         cargo = bin_dir / "cargo"
                         cargo.write_text(
                             f"#!{sys.executable} -S\n"
@@ -97,8 +101,11 @@ class PolicyTests(unittest.TestCase):
                         tests = [call for call in calls if "nextest" in call[0]]
                         self.assertEqual(len(tests), 1)
                         self.assertEqual(tests[0][1:], ["1", "3"])
-                        expected = ["llvm-cov", "--no-report", "nextest"]
-                        expected += (["--workspace"] if script == "coverage-all.sh" else ["-p", "intentd", "-E", "kind(test) and not binary(intentd) and not binary(auggie_context_e2e)"])
+                        # --max-fail=25: one merge-queue run lists every
+                        # failing test (intentd#2543 needed three runs), bounded
+                        # so a systemic break still stops early.
+                        expected = ["llvm-cov", "--no-report", "nextest", "--max-fail=25"]
+                        expected += (["--workspace"] if script == "coverage-all.sh" else ["-p", "intentd", "-E", "kind(test) and not binary(intentd) and not test(/^auggie_context_e2e::/)"])
                         self.assertEqual(tests[0][0], expected)
                         for args, policy, multiplier in calls:
                             if "nextest" not in args:
@@ -106,8 +113,8 @@ class PolicyTests(unittest.TestCase):
                         if child_exit:
                             self.assertEqual(len(calls), 2, "failed test must prevent reports")
                         else:
-                            self.assertIn(["llvm-cov", "report", "--lcov", "--output-path", "lcov.info"], [call[0] for call in calls])
-                            self.assertEqual(calls[-1][0], ["llvm-cov", "report", "--summary-only", "--fail-under-lines", "40"])
+                            self.assertIn(["llvm-cov", "report", "--failure-mode=all", "--lcov", "--output-path", "lcov.info"], [call[0] for call in calls])
+                            self.assertEqual(calls[-1][0], ["llvm-cov", "report", "--failure-mode=all", "--summary-only", "--fail-under-lines", "40"])
 
 
 if __name__ == "__main__":

@@ -8,10 +8,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,13 +31,12 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -44,7 +44,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-setmodel-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -61,7 +61,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -167,9 +167,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -334,8 +337,7 @@ async fn antigravity_catalog_override_change_and_restart_use_current_executable_
     )
     .await;
     drop(rpc);
-    daemon.child.kill().unwrap();
-    daemon.child.wait().unwrap();
+    daemon.child.kill_tree().unwrap();
     daemon.child = spawn_serve(&data_dir, "both", &env);
     assert!(await_uds(&socket).await);
     let status = common::await_wss_status(&socket).await;
@@ -744,6 +746,7 @@ async fn agent_set_model_triggers_respawn_over_wss() {
 }
 
 /// Startup warning data follows the installed CLI, never an adapter override.
+/// A confirmed-old CLI also reports the bundled CLI launches use instead.
 #[intent_test_macros::daemon_test]
 async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restricted_path() {
     use std::os::unix::fs::PermissionsExt;
@@ -760,6 +763,7 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
     .unwrap();
     std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
     let version_file = bin.join("codex.version");
+    // cli-fixture-version: allow — set-model against a confirmed-old Codex
     std::fs::write(&version_file, "codex-cli 0.114.0\n").unwrap();
     // The CLI is selected from inherited PATH, but its Node interpreter must
     // come from the same enhanced PATH used by the real adapter launch.
@@ -767,6 +771,24 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
     let tool_bin = data_dir.join("home/.local/bin");
     std::fs::create_dir_all(&tool_bin).unwrap();
     std::os::unix::fs::symlink(node, tool_bin.join("node")).unwrap();
+    let requirement = intent_providers::adapter_cli::requirement("codex").unwrap();
+    let bundled = requirement.bundled.clone().unwrap();
+    // Intent's managed copy, already installed so no npm runs. It reports an
+    // old version itself, so the test prompt fails before any adapter launch
+    // while proving the launch selected it instead of the installed CLI.
+    let bundled_dir = data_dir
+        .join("home/.local/share/intent/providers/bundled-cli/openai_codex")
+        .join(bundled.version.to_string());
+    std::fs::create_dir_all(bundled_dir.join("node_modules/.bin")).unwrap();
+    let bundled_codex = bundled_dir.join("node_modules/.bin/codex");
+    std::fs::write(
+        &bundled_codex,
+        // cli-fixture-version: allow — a bundled copy that is itself old
+        "#!/bin/sh\n[ \"$1\" = --version ] || exit 94\nprintf 'codex-cli 0.0.2\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&bundled_codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(bundled_dir.join(".intent-bundled-ready"), bundled.spec()).unwrap();
     let path = bin.to_string_lossy().into_owned();
     let home = data_dir.join("home").to_string_lossy().into_owned();
     let _daemon = Daemon {
@@ -792,11 +814,12 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
         client_config(status["result"]["fingerprint"].as_str().unwrap()),
     )
     .await;
-    let requirement = intent_providers::adapter_cli::requirement("codex").unwrap();
     let minimum = requirement.minimum.to_string();
     for (index, (version, expected)) in [
+        // cli-fixture-version: allow — old Codex versions in the set-model gate
         ("codex-cli 0.0.1", Some(false)),
         (minimum.as_str(), Some(true)),
+        // cli-fixture-version: allow — a far-newer Codex passes the set-model gate
         ("codex-cli 99.0.0", Some(true)),
         ("codex unknown build", None),
     ]
@@ -820,6 +843,13 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
         assert_eq!(row["cliMinimumVersion"], minimum);
         assert_eq!(row["cliVersionRange"], requirement.range);
         assert_eq!(row.get("cliVersionOk"), expected.map(Value::Bool).as_ref());
+        assert_eq!(
+            row.get("cliBundledVersion"),
+            (expected == Some(false))
+                .then(|| json!(bundled.version.to_string()))
+                .as_ref(),
+            "{row}"
+        );
         assert!(
             row.get("unavailableReason").is_none(),
             "discovery remains descriptive: {row}"
@@ -834,15 +864,27 @@ async fn wss_provider_cli_minimum_reports_old_supported_and_unknown_with_restric
             .await;
             assert_eq!(prompt["ok"], false, "{prompt}");
             let message = prompt["message"].as_str().unwrap();
-            assert!(message.contains(version), "{prompt}");
+            assert!(
+                // cli-fixture-version: allow — the error names the old bundled version
+                message.contains("codex-cli 0.0.2"),
+                "bundled CLI selected: {prompt}"
+            );
+            assert!(!message.contains(version), "{prompt}");
             assert!(message.contains(&minimum), "{prompt}");
             assert!(message.contains("Upgrade Codex"), "{prompt}");
         }
-        let no_minimum = providers
+        // Claude now derives a same-minor minimum from its pinned SDK; the
+        // host's own claude (if any) decides the verdict, so only the
+        // requirement itself is asserted.
+        let claude = providers
             .iter()
             .find(|row| row["id"] == "claude-code")
             .unwrap();
-        assert!(no_minimum.get("cliRequirement").is_none());
-        assert!(no_minimum.get("cliVersionOk").is_none());
+        let claude_requirement = intent_providers::adapter_cli::requirement("claude-code").unwrap();
+        assert_eq!(claude["cliCommand"], "claude");
+        assert_eq!(
+            claude["cliMinimumVersion"],
+            claude_requirement.minimum.to_string()
+        );
     }
 }

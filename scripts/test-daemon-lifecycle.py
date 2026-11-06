@@ -41,7 +41,7 @@ def main():
     if sitter is None or not sitter.is_file():
         raise RuntimeError("current build did not produce the sitter executable")
     env["INTENTD_TEST_SITTER_BIN"] = str(sitter)
-    require_passed(run(["cargo", "test", "--locked", "-p", "intentd", "--test", "e2e_detached_lifecycle", "lifecycle_capture_"], env), minimum=3)
+    require_passed(run(["cargo", "test", "--locked", "-p", "intentd", "--test", "suite_e2e", "e2e_detached_lifecycle::lifecycle_capture_"], env), minimum=3)
     require_passed(run(["cargo", "test", "--locked", "-p", "intentd-sitter", "--test", "cli_help"], env), minimum=2)
     require_passed(run(["cargo", "test", "--locked", "-p", "intentd-sitter", "--lib"], env))
     if os.name != "nt":
@@ -49,8 +49,8 @@ def main():
         require_passed(run(["cargo", "test", "--locked", "-p", "intentd-sitter", "--test", "supervisor_e2e", "background_start"], env))
     else:
         require_passed(run(["cargo", "test", "--locked", "-p", "intentd-sitter", "--lib", "--", "--exact", "windows::tests::restart_events_reject_foreign_identity_and_require_explicit_completion"], env))
-        require_passed(run(["cargo", "test", "--locked", "-p", "intentd", "--test", "e2e_detached_lifecycle", "windows_"], env))
-    require_passed(run(["cargo", "test", "--locked", "-p", "intentd", "--test", "e2e_detached_lifecycle", "--", "--ignored", "--exact", "detached_sitter_lifecycle_over_wss", "--nocapture"], env))
+        require_passed(run(["cargo", "test", "--locked", "-p", "intentd", "--test", "suite_e2e", "e2e_detached_lifecycle::windows_"], env))
+    require_passed(run(["cargo", "test", "--locked", "-p", "intentd", "--test", "suite_e2e", "--", "--ignored", "--exact", "e2e_detached_lifecycle::detached_sitter_lifecycle_over_wss", "--nocapture"], env))
 
 
 if __name__ == "__main__":

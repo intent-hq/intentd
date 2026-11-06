@@ -46,7 +46,7 @@ async fn setup() -> (TempDb, Services, WorkspaceId, TempDir, TempDir) {
         crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
             .expect("load registry"),
     );
-    let services = Services::new(store)
+    let services = Services::new_isolated(store)
         .with_settings_registry(registry)
         .with_specialist_dirs(
             Some(specialists_dir.path().to_path_buf()),
@@ -98,6 +98,10 @@ async fn delegate_with_no_explicit_model_resolves_configured_default_provider() 
     );
 
     let got = svc.agent_get_op(agent_id, None).await.expect("get");
+    assert_eq!(
+        got.metadata.specialist, None,
+        "omitted specialist creates a general agent"
+    );
     assert_eq!(
         got.provider.as_deref(),
         Some("mock"),
@@ -553,6 +557,7 @@ async fn batch_delegate_provider_top_level_inherited_and_per_entry_override_wins
                         provider: Some("typo-provider".into()),
                         reasoning_effort: None,
                         agent_instructions: None,
+                        placement: None,
                     }),
                 ]),
                 provider: Some("mock".into()),
@@ -689,7 +694,7 @@ fn enabled_gate_rejects_explicitly_disabled_providers() {
             .expect_err("disabled provider must be rejected");
         assert!(
             matches!(&err, intent_core::Error::InvalidParams(m)
-                if m.contains("not enabled") && m.contains("Settings > Agents")),
+                if m.contains("not enabled") && m.contains("Settings > Providers")),
             "distinct not-enabled rejection for {id}: {err:?}"
         );
     }

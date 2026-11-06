@@ -16,6 +16,9 @@ use super::*;
 use crate::context::{with_credential_context, ReadConnectionGuard};
 use crate::reverse::{PrimaryReverseRegistry, ReverseTransport};
 
+#[path = "monitor_hello_tests.rs"]
+mod monitor_hello_tests;
+
 tokio::task_local! {
     static FIXTURE_SCOPE: Arc<FixtureScope>;
 }
@@ -44,6 +47,9 @@ struct ScopeState {
     public_service_error: bool,
     sent: bool,
     kinds: Vec<RepositoryReadReplyKind>,
+    private_output: Option<Arc<std::sync::atomic::AtomicBool>>,
+    private_binding_fault: Option<String>,
+    private_binding_attempts: usize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -65,7 +71,57 @@ pub(crate) struct FixtureScope {
     fault: DeliveryFault,
 }
 
+struct FixturePrivateOutput {
+    frame: String,
+    live: Arc<std::sync::atomic::AtomicBool>,
+}
+impl intent_core::repository_request::RepositoryPrivateOutput for FixturePrivateOutput {
+    fn frame(&self) -> &str {
+        &self.frame
+    }
+    fn with_current(
+        &self,
+        action: &mut (dyn FnMut() -> intent_core::Result<()> + Send),
+    ) -> intent_core::Result<()> {
+        if !self.live.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Forbidden("original private output retired".into()));
+        }
+        action()
+    }
+}
 impl RepositoryReadRequestScope for FixtureScope {
+    fn bind_private_output(
+        &self,
+        frame: &str,
+    ) -> intent_core::Result<
+        Option<Arc<dyn intent_core::repository_request::RepositoryPrivateOutput>>,
+    > {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.private_binding_attempts += 1;
+        match state.private_binding_fault.as_deref() {
+            Some("refuse") => return Err(Error::Forbidden("private output unavailable".into())),
+            Some("panic") => {
+                drop(state);
+                panic!("private output binding panic")
+            }
+            _ => {}
+        }
+        let frame = if state.private_binding_fault.as_deref() == Some("mismatch") {
+            "wrong frame"
+        } else {
+            frame
+        };
+        Ok(state.private_output.clone().map(|live| {
+            Arc::new(FixturePrivateOutput {
+                frame: frame.to_owned(),
+                live,
+            }) as Arc<dyn intent_core::repository_request::RepositoryPrivateOutput>
+        }))
+    }
+
     fn scope<'a>(&'a self, body: BoxFuture<'a, ()>) -> BoxFuture<'a, ()> {
         // Fixture context clones share exact state, never reconstruct by RPC id.
         let captured = Arc::new(Self {
@@ -133,6 +189,7 @@ struct Cohort {
 }
 
 pub(crate) struct FixtureConnection {
+    monitor_hellos: Mutex<Vec<Arc<monitor_hello_tests::Hello>>>,
     checkout_frames: Mutex<Vec<intent_core::repository_checkout::CheckoutFrame>>,
     resource_frames: Mutex<Vec<intent_core::repository_request::RepositoryResourceFrame>>,
     review_frames: Mutex<Vec<intent_core::repository_request::NativeReviewFrame>>,
@@ -158,6 +215,15 @@ impl FixtureConnection {
 }
 
 impl RepositoryReadConnection for FixtureConnection {
+    fn review_monitoring_hello(
+        &self,
+        support: intent_core::review_monitor::ReviewMonitorRecipientSupport,
+    ) -> Option<Arc<dyn intent_core::repository_request::ReviewMonitorHello>> {
+        let hello = Arc::new(monitor_hello_tests::Hello::new(support));
+        self.monitor_hellos.lock().unwrap().push(hello.clone());
+        Some(hello)
+    }
+
     fn capture_checkout(
         &self,
         frame: &intent_core::repository_checkout::CheckoutFrame,
@@ -255,6 +321,16 @@ impl FixtureApi {
 }
 
 impl WorkspaceApi for FixtureApi {
+    fn upsert_client(
+        &self,
+        _client_id: ClientId,
+        _name: Option<String>,
+        _capabilities: Option<Value>,
+        _host: intent_core::ClientHostInfo,
+    ) -> BoxFuture<'_, intent_core::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn repository_checkout_repo_config(
         &self,
         q: intent_core::repository_checkout::CheckoutRepoConfigQuery,
@@ -381,6 +457,7 @@ impl WorkspaceApi for FixtureApi {
         entry: RepositoryWireEntry,
     ) -> Option<Arc<dyn RepositoryReadConnection>> {
         let connection = Arc::new(FixtureConnection {
+            monitor_hellos: Mutex::default(),
             checkout_frames: Mutex::new(Vec::new()),
             resource_frames: Mutex::new(Vec::new()),
             review_frames: Mutex::new(Vec::new()),
@@ -471,6 +548,11 @@ impl WorkspaceApi for FixtureApi {
                 );
                 let mut state = scope.state.lock().unwrap();
                 state.qualified = path != "ordinary";
+                if path.starts_with("private-output") {
+                    state.private_output = Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+                    state.private_binding_fault =
+                        path.strip_prefix("private-output-").map(str::to_owned);
+                }
                 state.public_service_error = path == "provider-error";
             }
             if let Some(gate) = &self.handler {
@@ -523,6 +605,7 @@ impl Harness {
             true,
             Some(caller.clone()),
             Some(credential.clone()),
+            None,
             async { ReadConnectionGuard::bind(api.as_ref(), RepositoryWireEntry::Bearer) },
         )
         .await;
@@ -550,6 +633,7 @@ impl Harness {
             true,
             Some(self.caller.clone()),
             Some(self.credential.clone()),
+            None,
             self.connection.run(async move {
                 let reverse = ReverseChannel::new(tx.priority_sender());
                 let registry = Arc::new(PrimaryReverseRegistry::new());
@@ -574,10 +658,13 @@ impl Harness {
     }
 
     async fn response(&mut self) -> Value {
-        let frame = tokio::time::timeout(Duration::from_secs(5), self.rx.recv_priority())
-            .await
-            .unwrap()
-            .unwrap();
+        let frame = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            self.rx.recv_priority(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         serde_json::from_str(&frame).unwrap()
     }
 
@@ -639,11 +726,14 @@ async fn original_retirement_prevents_the_prepared_private_response() {
 }
 
 async fn until(mut ready: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !ready() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !ready() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
 }
@@ -684,6 +774,7 @@ async fn unpolled_frame_and_pending_permission_drop_retire_escaped_original_scop
         true,
         Some(h.caller.clone()),
         Some(h.credential.clone()),
+        None,
         h.connection.run(async {
             let raw = request("private");
             let mut subs = ConnSubs::default();
@@ -775,6 +866,7 @@ async fn final_future_abort_releases_original_packet_permit_and_request() {
         true,
         Some(h.caller.clone()),
         Some(h.credential.clone()),
+        None,
         h.connection
             .run(async { crate::context::CapturedFrame::capture() }),
     )
@@ -973,11 +1065,14 @@ async fn actual_uds_binding_and_listener_shutdown_preserve_original_cohorts() {
             .write_all(format!("{}\n", request("private")).as_bytes())
             .await
             .unwrap();
-        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let line = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            lines.next_line(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&line).unwrap()["result"]["scoped"],
             true
@@ -1002,11 +1097,14 @@ async fn actual_uds_binding_and_listener_shutdown_preserve_original_cohorts() {
             .write_all(format!("{}\n", request(path)).as_bytes())
             .await
             .unwrap();
-        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let line = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            lines.next_line(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&line)
                 .unwrap()
@@ -1076,17 +1174,20 @@ async fn connect_wss(port: u16, certificate: &crate::TlsCertificate, token: &str
 async fn ws_response(socket: &mut TestWebSocket) -> Value {
     use futures::StreamExt as _;
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match socket.next().await.unwrap().unwrap() {
-                tokio_tungstenite::tungstenite::Message::Text(text) => {
-                    return serde_json::from_str(&text).unwrap()
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match socket.next().await.unwrap().unwrap() {
+                    tokio_tungstenite::tungstenite::Message::Text(text) => {
+                        return serde_json::from_str(&text).unwrap()
+                    }
+                    tokio_tungstenite::tungstenite::Message::Ping(_) => {}
+                    other => panic!("expected original response, got {other:?}"),
                 }
-                tokio_tungstenite::tungstenite::Message::Ping(_) => {}
-                other => panic!("expected original response, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap()
 }
@@ -1295,9 +1396,12 @@ async fn actual_wss_principal_revocation_drains_ordinary_reply_but_denies_held_p
         ))
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), handler.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        handler.entered.notified(),
+    )
+    .await
+    .unwrap();
     let original = api.connections.lock().unwrap()[0].clone();
     let scope = original.scopes.lock().unwrap()[0].clone();
     assert_eq!(
@@ -1324,9 +1428,12 @@ async fn actual_wss_principal_revocation_drains_ordinary_reply_but_denies_held_p
         ))
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), revoke_reply.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        revoke_reply.entered.notified(),
+    )
+    .await
+    .unwrap();
     until(|| original.is_closed()).await;
     assert!(scope.state.lock().unwrap().retired);
     revoke_reply.release.notify_one();
@@ -1552,7 +1659,7 @@ async fn native_review_consumed_packet_faults_never_replay_primitive_or_reply() 
 #[test]
 fn native_review_companion_capability_is_explicit_and_versioned() {
     let server = crate::client::server_json(false, "linux", "fixture", "fixture", None, true);
-    assert_eq!(server["protocolVersion"], "14.0");
+    assert_eq!(server["protocolVersion"], crate::protocol::PROTOCOL_VERSION);
     assert_eq!(server["capabilities"]["gitlabCheckout"], 1);
     assert_eq!(server["capabilities"]["gitlabCheckoutRepoConfig"], 1);
     assert_eq!(server["capabilities"]["gitlabCheckoutOwnerAvatar"], 1);
@@ -1713,4 +1820,221 @@ async fn checkout_config_private_reply_obeys_final_delivery_retirement() {
         }
         assert!(h.rx.priority.try_recv().is_err());
     }
+}
+
+#[tokio::test]
+async fn native_private_output_router_retains_original_owner_after_queueing() {
+    use tokio::io::AsyncReadExt;
+    for revoked in [false, true] {
+        let mut h = Harness::new(FixtureApi::default(), HostRole::Owner).await;
+        assert!(h.dispatch(&request("private-output")).await);
+        let frame = h.rx.recv_priority().await.unwrap();
+        assert!(
+            frame.is_private(),
+            "router must not flatten qualified output into a plain response"
+        );
+        let original = h.original();
+        let state = original.scopes.lock().unwrap()[0].state.clone();
+        assert!(
+            state.lock().unwrap().retired,
+            "short request is complete before final write"
+        );
+        let live = state.lock().unwrap().private_output.clone().unwrap();
+        if revoked {
+            live.store(false, std::sync::atomic::Ordering::Release);
+        }
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let result = frame.write_uds(&mut writer).await;
+        drop(writer);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        if revoked {
+            assert!(result.is_err());
+            assert!(bytes.is_empty());
+        } else {
+            result.unwrap();
+            let reply: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(reply["id"], 7);
+            assert_eq!(reply["result"]["private"], "original payload");
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_private_output_binding_failure_never_falls_back_to_plain_payload() {
+    for fault in ["refuse", "mismatch", "panic"] {
+        let mut h = Harness::new(FixtureApi::default(), HostRole::Owner).await;
+        assert!(
+            h.dispatch(&request(&format!("private-output-{fault}")))
+                .await
+        );
+        let response = h.response().await;
+        assert!(response.get("error").is_some());
+        assert!(response.get("result").is_none());
+        assert!(!response.to_string().contains("original payload"));
+        assert_eq!(h.limiter.available_permits(), Some(1));
+        assert_eq!(
+            h.original().scopes.lock().unwrap()[0]
+                .state
+                .lock()
+                .unwrap()
+                .private_binding_attempts,
+            1,
+            "binding fault must reach original handler"
+        );
+    }
+}
+
+/// Run one frame through `process_frame` on caller-owned connection state.
+async fn hello_frame(
+    h: &Harness,
+    api: &Arc<dyn WorkspaceApi>,
+    reverse: &ReverseChannel,
+    guard: &crate::reverse::PrimaryReverseGuard,
+    subs: &mut ConnSubs,
+    raw: &str,
+) -> bool {
+    with_credential_context(
+        true,
+        Some(h.caller.clone()),
+        Some(h.credential.clone()),
+        None,
+        process_frame(
+            raw, api, &h.bus, &h.tx, subs, reverse, guard, None, None, &mut None, false, &h.limiter,
+        ),
+    )
+    .await
+}
+
+/// A live role upgrade rebinds only through the connection's own successful
+/// hello ([`ConnSubs::hello`]): a demoted then re-promoted member hosts again
+/// under its reserved scoped id, while a connection whose only hello failed
+/// stays unbound through the same promotion (intent-hq/intent#8045).
+#[tokio::test]
+async fn role_upgrade_rebinds_only_a_successful_hello() {
+    let h = Harness::new(FixtureApi::default(), HostRole::Member).await;
+    let api: Arc<dyn WorkspaceApi> = h.api.clone();
+    let registry = PrimaryReverseRegistry::new();
+    let member = || {
+        ReverseChannel::new(h.tx.priority_sender())
+            .with_member_authority(api.clone(), Some(&h.caller))
+    };
+    let scoped = ClientId::from_string(format!("{}:dev-1", h.api.principal.as_str()));
+
+    let reverse = member();
+    let guard = registry.register(reverse.clone(), ReverseTransport::Wss);
+    let mut subs = ConnSubs::default();
+    let good = json!({"jsonrpc":"2.0","id":1,"method":"client.hello","params":{"clientId":"dev-1","capabilities":{"browserExec":true}}});
+    assert!(hello_frame(&h, &api, &reverse, &guard, &mut subs, &good.to_string()).await);
+    subs.apply_browser_authority(&reverse, &guard, false);
+    assert_eq!(guard.bound_client_id(), None, "demoted");
+    assert!(
+        registry.client_active(&scoped),
+        "still reserved while demoted"
+    );
+    subs.apply_browser_authority(&reverse, &guard, true);
+    assert_eq!(guard.bound_client_id(), Some(scoped.clone()), "re-promoted");
+
+    let other = member();
+    let other_guard = registry.register(other.clone(), ReverseTransport::Wss);
+    let mut other_subs = ConnSubs::default();
+    let bad = json!({"jsonrpc":"2.0","id":2,"method":"client.hello","params":{"clientId":42}});
+    assert!(
+        hello_frame(
+            &h,
+            &api,
+            &other,
+            &other_guard,
+            &mut other_subs,
+            &bad.to_string()
+        )
+        .await
+    );
+    other_subs.apply_browser_authority(&other, &other_guard, true);
+    assert_eq!(
+        other_guard.bound_client_id(),
+        None,
+        "no successful hello, nothing to bind"
+    );
+    assert_eq!(
+        registry
+            .live_clients()
+            .iter()
+            .map(|client| client.client_id.clone())
+            .collect::<Vec<_>>(),
+        vec![scoped],
+    );
+}
+
+/// intent-hq/intent#8045: a successful `client.hello` keeps its scoped
+/// `clientId` active in the reverse registry for the connection's life,
+/// bound or not — a connection unbound by a demotion (and later rebound by a
+/// role change without another hello) is never an absent host to the
+/// superseded-id tab rehome. A failed hello reserves nothing.
+#[tokio::test]
+async fn successful_hello_keeps_its_client_id_active_for_the_connection_life() {
+    let h = Harness::new(FixtureApi::default(), HostRole::Member).await;
+    let api: Arc<dyn WorkspaceApi> = h.api.clone();
+    let registry = PrimaryReverseRegistry::new();
+    let reverse = ReverseChannel::new(h.tx.priority_sender());
+    let guard = registry.register(reverse.clone(), ReverseTransport::Wss);
+    let mut subs = ConnSubs::default();
+    let scoped = ClientId::from_string(format!("{}:dev-1", h.api.principal.as_str()));
+    let bad = json!({"jsonrpc":"2.0","id":1,"method":"client.hello","params":{"clientId":42}});
+    assert!(hello_frame(&h, &api, &reverse, &guard, &mut subs, &bad.to_string()).await);
+    assert!(subs.hello.is_none(), "a failed hello reserves nothing");
+    assert_eq!(guard.bound_client_id(), None, "a failed hello cannot bind");
+
+    let good =
+        json!({"jsonrpc":"2.0","id":2,"method":"client.hello","params":{"clientId":"dev-1"}});
+    assert!(hello_frame(&h, &api, &reverse, &guard, &mut subs, &good.to_string()).await);
+    assert_eq!(
+        subs.hello.as_ref().map(|hello| hello.client_id().clone()),
+        Some(scoped.clone()),
+        "the scoped id is reserved and paired"
+    );
+    assert!(registry.client_active(&scoped), "hello'd and bound");
+    guard.unbind();
+    assert!(
+        registry.client_active(&scoped),
+        "still active while the connection lives, though unbound"
+    );
+    drop(subs);
+    assert!(
+        !registry.client_active(&scoped),
+        "released with the connection's state"
+    );
+
+    // A hello without `clientId` reserves the server-generated scoped id.
+    let mut h = h;
+    let mut subs = ConnSubs::default();
+    let minted = json!({"jsonrpc":"2.0","id":3,"method":"client.hello","params":{}});
+    assert!(hello_frame(&h, &api, &reverse, &guard, &mut subs, &minted.to_string()).await);
+    let mut response = h.response().await;
+    while response["id"] != json!(3) {
+        response = h.response().await;
+    }
+    let generated = ClientId::from_string(
+        response["result"]["clientId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("generated client id: {response}")),
+    );
+    assert!(
+        generated
+            .as_str()
+            .starts_with(&format!("{}:", h.api.principal.as_str())),
+        "{generated:?}"
+    );
+    assert_eq!(
+        subs.hello.as_ref().map(|hello| hello.client_id().clone()),
+        Some(generated.clone()),
+        "the generated id is reserved and paired"
+    );
+    guard.unbind();
+    assert!(
+        registry.client_active(&generated),
+        "a generated id stays active while the connection lives, though unbound"
+    );
+    drop(subs);
+    assert!(!registry.client_active(&generated));
 }

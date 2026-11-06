@@ -161,18 +161,35 @@ mod tests {
             stop: Arc::new(AtomicBool::new(true)),
             drain_deadline: None,
         };
-        let started = Instant::now();
         let mut buf = [0; 4];
-        loop {
-            // Every read has queued bytes: an escaped holder that continues
-            // writing must not turn graceful drain into another unbounded join.
-            peer.write_all(b"more").unwrap();
-            if reader.read(&mut buf).unwrap() == 0 {
-                break;
-            }
-            assert!(started.elapsed() < DRAIN_GRACE * 2, "drain did not stop");
-        }
-        assert!(started.elapsed() >= DRAIN_GRACE);
+        // Every read has queued bytes: an escaped holder that continues
+        // writing must not turn graceful drain into another unbounded join.
+        // Inside the drain window queued output still drains. The window is
+        // set directly, so no step has to finish within real DRAIN_GRACE.
+        reader.drain_deadline = Some(Instant::now() + DRAIN_GRACE * 1000);
+        peer.write_all(b"more").unwrap();
+        assert_eq!(reader.read(&mut buf).unwrap(), 4, "queued output drains");
+        assert_eq!(
+            reader.read(&mut buf).unwrap(),
+            0,
+            "nothing queued ends the drain"
+        );
+        // Once the window has passed, the drain ends even with output queued.
+        reader.drain_deadline = Some(Instant::now());
+        peer.write_all(b"more").unwrap();
+        assert_eq!(reader.read(&mut buf).unwrap(), 0, "drain did not stop");
+        // The first cancelled read opens one DRAIN_GRACE window, whatever it
+        // returns (a stalled runner may already see it expired).
+        reader.drain_deadline = None;
+        let before = Instant::now();
+        let _ = reader.read(&mut buf).unwrap();
+        let deadline = reader
+            .drain_deadline
+            .expect("cancelled read starts the drain");
+        assert!(
+            deadline >= before + DRAIN_GRACE && deadline <= Instant::now() + DRAIN_GRACE,
+            "the drain window is one DRAIN_GRACE from the first cancelled read"
+        );
     }
 
     /// Fill a real nonblocking descriptor before calling the Write adapter,
@@ -226,7 +243,7 @@ mod tests {
             tx.send(writer.write_all(b"blocked")).unwrap();
         });
         stop.store(true, Ordering::Release);
-        let result = rx.recv_timeout(Duration::from_secs(5));
+        let result = rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)));
         drop(peer);
         thread.join().unwrap();
         assert_eq!(

@@ -982,7 +982,10 @@ async fn missing_unverified_secret_authority_and_quota_are_distinct_local_outcom
     let ticket = test.acquire(&admission).await.unwrap();
     assert!(!format!("{ticket:?}").contains("token-old"));
     test.directory
-        .record_backoff(&ticket.stamp, Instant::now() + Duration::from_secs(60))
+        .record_backoff(
+            &ticket.stamp,
+            Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60)),
+        )
         .unwrap();
     test.refresh("updated");
     assert_eq!(
@@ -991,8 +994,10 @@ async fn missing_unverified_secret_authority_and_quota_are_distinct_local_outcom
     );
     let replacement = test.replace(test.verified.clone());
     assert_eq!(
-        test.directory
-            .record_backoff(&ticket.stamp, Instant::now() + Duration::from_secs(120)),
+        test.directory.record_backoff(
+            &ticket.stamp,
+            Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(120))
+        ),
         Ok(false)
     );
     assert_eq!(test.directory.binding().unwrap(), replacement);
@@ -1047,7 +1052,7 @@ async fn quota_during_refresh_preserves_longest_deadline_without_releasing_crede
         .reserve_mutation(RepositoryMutationKind::Refresh)
         .unwrap();
     test.directory.begin_mutation(&refresh).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(120));
     assert!(test
         .directory
         .record_backoff(&dispatched.stamp, deadline)
@@ -1100,7 +1105,8 @@ async fn quota_during_refresh_rejects_unknown_receipts_and_clears_after_compensa
             .reserve_mutation(RepositoryMutationKind::Refresh)
             .unwrap();
         test.directory.begin_mutation(&refresh).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline =
+            Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(120));
         assert!(test
             .directory
             .record_backoff(&dispatched.stamp, deadline)
@@ -1152,7 +1158,8 @@ async fn quota_during_refresh_cannot_contaminate_changed_account_descriptor_or_s
             .reserve_mutation(RepositoryMutationKind::Refresh)
             .unwrap();
         test.directory.begin_mutation(&refresh).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline =
+            Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(120));
         assert!(test
             .directory
             .record_backoff(&dispatched.stamp, deadline)
@@ -1230,7 +1237,7 @@ async fn quota_during_refresh_rejects_foreign_replaced_child_and_shutdown_stamps
         .reserve_mutation(RepositoryMutationKind::Refresh)
         .unwrap();
     test.directory.begin_mutation(&refresh).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(120));
     for stale in [&old.stamp, &foreign.stamp, &child.stamp] {
         assert!(!test.directory.record_backoff(stale, deadline).unwrap());
     }
@@ -1371,7 +1378,8 @@ fn completed_unverified_releases_only_its_replace_and_keeps_quota() {
     let test = Test::new();
     let binding = test.directory.binding().unwrap();
     test.directory.set_child_policy(&binding, true).unwrap();
-    let future = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let future = std::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(30));
     test.directory.lock().unwrap().backoff_until = Some(future);
     let old_revision = test.directory.lock().unwrap().secret_revision;
     let old = test

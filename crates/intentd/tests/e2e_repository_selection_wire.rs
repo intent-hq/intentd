@@ -1,7 +1,7 @@
 //! Original-socket selection intent through actual cold UDS/authenticated WSS.
 //! Disposable databases, empty roots and credentials; no Git or provider action.
 #![cfg(unix)]
-mod common;
+use crate::common;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
     now_iso, Principal, PrincipalId, WorkspaceGitRootId, WorkspaceId, WorkspaceRole,
@@ -165,7 +165,11 @@ impl Harness {
             .await
             .unwrap();
         drop(store);
-        std::fs::write(dir.path().join("config.toml"),"[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n[agents]\nresumeInterruptedOnStart = \"off\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n",
+        )
+        .unwrap();
         common::enable_ws_api(dir.path());
         let bins = dir.path().join("bin");
         std::fs::create_dir(&bins).unwrap();
@@ -332,10 +336,12 @@ impl Client {
         }
     }
 }
+#[track_caller]
 fn success(value: &Value) -> &Value {
     assert!(value.get("error").is_none(), "{value}");
     &value["result"]
 }
+#[track_caller]
 fn refused(value: &Value) {
     assert_eq!(value["error"]["code"], -32003, "{value}");
 }
@@ -407,6 +413,26 @@ async fn native_selection_cold_uds_wss_manager_permission_cas_and_receipts() {
         .save(h.query(), &edit, json!({"mode":"automatic"}))
         .await;
     assert_eq!(changed["error"]["code"], -32602);
+    assert!(
+        changed["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Selection command already claimed")),
+        "{changed}"
+    );
+    let malformed_name = local
+        .save(
+            h.query(),
+            &edit,
+            json!({"mode":"explicit-remote","remoteName":" unobserved-local-intent"}),
+        )
+        .await;
+    assert_eq!(malformed_name["error"]["code"], -32602);
+    assert!(
+        malformed_name["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Invalid repository remote name")),
+        "{malformed_name}"
+    );
     let exact_q = json!({"workspaceId":h.workspace,"gitRootId":h.registered});
     let exact = owner.capture(exact_q.clone()).await;
     refused(

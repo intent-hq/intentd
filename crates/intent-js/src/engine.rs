@@ -4,7 +4,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use rquickjs::{function::Async, AsyncContext, AsyncRuntime, CatchResultExt, Function, Promise};
+use rquickjs::{
+    function::Async, object::Property, Array, AsyncContext, AsyncRuntime, CatchResultExt, Ctx,
+    Function, IntoJs, Object, Promise, Value,
+};
 
 use crate::{
     EvalOptions, GuardedHostFn, HostAdmissionOutcome, HostCallId, HostFn, HostReply,
@@ -16,17 +19,101 @@ use crate::{
 /// user code could bypass the wrapper), rejects non-JSON-serializable arguments
 /// with a clear `TypeError`, and turns a `{ok:false, error}` frame back into a
 /// JS `Error`.
+///
+/// `JSON.stringify` silently turns non-finite numbers into `null` and drops
+/// functions and symbols, so a computed `NaN` option used to reach a binding
+/// as "absent" (intentd#2800). The replacer refuses those values, plus boxed
+/// primitives and `BigInt`, anywhere in the argument and names their path. It
+/// runs after `toJSON`, so `Date`s still serialize as strings, and `null` /
+/// `undefined` keep their usual JSON handling. Every global it relies on is
+/// captured before user code runs, so patching them cannot disable it.
 const HOST_BRIDGE_JS: &str = r#"
     (() => {
         const raw = globalThis.__hostRaw;
         delete globalThis.__hostRaw;
+        const stringify = JSON.stringify;
+        const apply = Reflect.apply;
+        const isArray = Array.isArray;
+        const isFinite = Number.isFinite;
+        const WM = WeakMap;
+        const wmGet = WeakMap.prototype.get;
+        const wmSet = WeakMap.prototype.set;
+        const reExec = RegExp.prototype.exec;
+        const toStr = String;
+        const identifier = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+        const boxes = [
+            ["Number", Number.prototype.valueOf],
+            ["String", String.prototype.valueOf],
+            ["Boolean", Boolean.prototype.valueOf],
+        ];
+        if (typeof BigInt === "function") boxes.push(["BigInt", BigInt.prototype.valueOf]);
+        if (typeof Symbol === "function") boxes.push(["Symbol", Symbol.prototype.valueOf]);
+
+        const boxedKind = (value) => {
+            for (let i = 0; i < boxes.length; i++) {
+                try {
+                    apply(boxes[i][1], value, []);
+                    return boxes[i][0];
+                } catch {}
+            }
+            return null;
+        };
+        const describe = (value) => {
+            switch (typeof value) {
+                case "number":
+                    return isFinite(value) ? null : toStr(value);
+                case "function":
+                    return "a function";
+                case "symbol":
+                    return "a symbol";
+                case "bigint":
+                    return "a BigInt";
+                case "object": {
+                    if (value === null) return null;
+                    const kind = boxedKind(value);
+                    return kind === null ? null : "a boxed " + kind;
+                }
+                default:
+                    return null;
+            }
+        };
+        const childPath = (parent, holder, key) => {
+            if (isArray(holder)) return parent + "[" + key + "]";
+            if (apply(reExec, identifier, [key]) !== null) return parent === "" ? key : parent + "." + key;
+            return parent + "[" + stringify(key) + "]";
+        };
+        const methodPrefix = (arg) => {
+            try {
+                if (arg !== null && typeof arg === "object" && typeof arg.method === "string") {
+                    return arg.method + ": ";
+                }
+            } catch {}
+            return "";
+        };
+        const encode = (arg) => {
+            const paths = new WM();
+            return stringify(arg, function (key, value) {
+                const parent = apply(wmGet, paths, [this]);
+                const path = parent === undefined ? "" : childPath(parent, this, key);
+                const problem = describe(value);
+                if (problem !== null) {
+                    throw new TypeError(
+                        "host(arg): " + methodPrefix(arg) + (path === "" ? "argument" : path) +
+                        " is " + problem + ", which JSON cannot represent"
+                    );
+                }
+                if (value !== null && typeof value === "object") apply(wmSet, paths, [value, path]);
+                return value;
+            });
+        };
+
         globalThis.host = async function host(arg) {
-            const stringified = JSON.stringify(arg === undefined ? null : arg);
+            const stringified = encode(arg === undefined ? null : arg);
             if (typeof stringified !== "string") {
                 throw new TypeError("host(arg): argument is not JSON-serializable");
             }
             const reply = await raw(stringified);
-            const frame = reply == null ? { ok: true, value: null } : JSON.parse(reply);
+            const frame = reply == null ? { ok: true, value: null } : reply;
             if (!frame.ok) {
                 throw new Error(String(frame.error ?? "host call failed"));
             }
@@ -219,17 +306,17 @@ fn bind_host(ctx: &rquickjs::Ctx<'_>, host: GuardedHostFn) -> rquickjs::Result<(
                             "ok": false,
                             "error": format!("engine: host received non-JSON argument: {e}"),
                         });
-                        return Ok::<String, rquickjs::Error>(frame.to_string());
+                        return Ok::<HostFrame, rquickjs::Error>(HostFrame(frame));
                     }
                 };
-                let encoded = match future.await {
+                let frame = match future.await {
                     HostReply::Ordinary(outcome) => encode_host_outcome(outcome),
                     HostReply::Guarded { outcome, admission } => {
                         // No encoding or JS is performed by the consuming action.
                         let packet = PreparedHostTransfer {
                             receipt: HostTransferReceipt(identity.clone()),
                             sender,
-                            encoded: encode_host_outcome(outcome),
+                            frame: encode_host_outcome(outcome),
                         };
                         let outcome = admission.admit(packet).await;
                         // Admission has finished and released its guards. Never
@@ -245,7 +332,7 @@ fn bind_host(ctx: &rquickjs::Ctx<'_>, host: GuardedHostFn) -> rquickjs::Result<(
                         }
                     }
                 };
-                Ok::<String, rquickjs::Error>(encoded)
+                Ok::<HostFrame, rquickjs::Error>(HostFrame(frame))
             }
         }),
     )?;
@@ -254,15 +341,137 @@ fn bind_host(ctx: &rquickjs::Ctx<'_>, host: GuardedHostFn) -> rquickjs::Result<(
     Ok(())
 }
 
-fn encode_host_outcome(outcome: Result<serde_json::Value, String>) -> String {
+/// A `{ok, value|error}` host frame on its way into JS.
+///
+/// The host's JSON value is built directly as JS values, so the script heap
+/// holds only the final strings and no JSON text is produced or re-parsed
+/// (numbers keep their exact `f64`, and there is no extra decoded copy or
+/// parser depth limit). Passing the JSON text and calling `JSON.parse` in
+/// JS held the reply text, its UTF-8 copy, and the parsed strings at once,
+/// which pushed multi-megabyte notes over the runtime memory limit
+/// (intent-hq/intent#7688).
+struct HostFrame(serde_json::Value);
+
+impl<'js> IntoJs<'js> for HostFrame {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let approx_len = approx_json_len(&self.0);
+        let built = json_to_js(ctx, &self.0).and_then(non_thenable);
+        drop(self.0);
+        match built {
+            Ok(value) => Ok(value),
+            Err(rquickjs::Error::Exception) => {
+                // Usually the memory limit. Drop the pending exception (the
+                // partial values were released as the build unwound) and
+                // reject with a bounded, actionable message instead.
+                let _ = ctx.catch();
+                error_frame(ctx, &oversized_reply_message(approx_len))
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Approximate payload size (string bytes plus a little per node) for the
+/// oversized-reply message; computed without allocating.
+fn approx_json_len(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(s) => s.len() + 2,
+        serde_json::Value::Array(items) => items.iter().map(approx_json_len).sum::<usize>() + 2,
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| k.len() + 3 + approx_json_len(v))
+            .sum::<usize>()
+            .saturating_add(2),
+        _ => 8,
+    }
+}
+
+fn oversized_reply_message(approx_len: usize) -> String {
+    format!(
+        "host reply (~{approx_len} bytes) does not fit in the script memory limit; \
+         if this call changes state it may already have been applied"
+    )
+}
+
+/// Give the private reply envelope a null prototype. The host function is
+/// async, so its result passes through promise resolution, which reads
+/// `.then`; with `Object.prototype` in the chain a script-installed `then`
+/// could intercept, replace, or stall the reply before the bridge sees it.
+/// Only the envelope is affected: the `value` inside keeps normal objects.
+fn non_thenable(envelope: Value<'_>) -> rquickjs::Result<Value<'_>> {
+    if let Some(obj) = envelope.as_object() {
+        obj.set_prototype(None)?;
+    }
+    Ok(envelope)
+}
+
+fn error_frame<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Result<Value<'js>> {
+    let obj = Object::new(ctx.clone())?;
+    obj.set_prototype(None)?;
+    define_own(&obj, "ok", Value::new_bool(ctx.clone(), false))?;
+    define_own(
+        &obj,
+        "error",
+        rquickjs::String::from_str(ctx.clone(), message)?.into_value(),
+    )?;
+    Ok(obj.into_value())
+}
+
+/// Define `key` as an own enumerable, writable, configurable data property,
+/// as `JSON.parse` does. Unlike `set`, this never runs setters a script may
+/// have installed on `Object.prototype` / `Array.prototype`.
+fn define_own<'js, K: rquickjs::IntoAtom<'js>>(
+    obj: &Object<'js>,
+    key: K,
+    value: Value<'js>,
+) -> rquickjs::Result<()> {
+    obj.prop(
+        key,
+        Property::from(value).writable().enumerable().configurable(),
+    )
+}
+
+/// Build `value` as JS values with `JSON.parse` semantics: object keys and
+/// array indexes are defined as own data properties (so `__proto__` stays a
+/// plain key and prototype setters never run), and
+/// numbers become JS numbers.
+fn json_to_js<'js>(ctx: &Ctx<'js>, value: &serde_json::Value) -> rquickjs::Result<Value<'js>> {
+    Ok(match value {
+        serde_json::Value::Null => Value::new_null(ctx.clone()),
+        serde_json::Value::Bool(b) => Value::new_bool(ctx.clone(), *b),
+        serde_json::Value::Number(n) => match n.as_i64().and_then(|i| i32::try_from(i).ok()) {
+            Some(i) => Value::new_int(ctx.clone(), i),
+            // `new_float`, not `new_number`: the latter folds whole doubles
+            // into ints, losing the sign of `-0.0` that `JSON.parse` keeps.
+            None => Value::new_float(ctx.clone(), n.as_f64().unwrap_or(f64::NAN)),
+        },
+        serde_json::Value::String(s) => rquickjs::String::from_str(ctx.clone(), s)?.into_value(),
+        serde_json::Value::Array(items) => {
+            let array = Array::new(ctx.clone())?;
+            for (idx, item) in items.iter().enumerate() {
+                let idx = u32::try_from(idx).map_err(|_| rquickjs::Error::Exception)?;
+                define_own(array.as_object(), idx, json_to_js(ctx, item)?)?;
+            }
+            array.into_value()
+        }
+        serde_json::Value::Object(map) => {
+            let obj = Object::new(ctx.clone())?;
+            for (key, item) in map {
+                define_own(&obj, key.as_str(), json_to_js(ctx, item)?)?;
+            }
+            obj.into_value()
+        }
+    })
+}
+
+fn encode_host_outcome(outcome: Result<serde_json::Value, String>) -> serde_json::Value {
     match outcome {
         Ok(v) => serde_json::json!({ "ok": true, "value": v }),
         Err(msg) => serde_json::json!({ "ok": false, "error": msg }),
     }
-    .to_string()
 }
 
-fn refused_host_reply() -> String {
+fn refused_host_reply() -> serde_json::Value {
     encode_host_outcome(Err("host reply admission refused".into()))
 }
 

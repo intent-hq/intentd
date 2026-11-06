@@ -14,7 +14,29 @@ here=$(cd "$(dirname "$0")" && pwd)
 script="$here/ci-lld-retry.sh"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-mkdir -p "$tmp/objs"
+mkdir -p "$tmp/objs" "$tmp/bin"
+
+# The wrapper's diagnostics print host-wide state: live processes, the kernel
+# log and, when set, the shared CARGO_TARGET_DIR. On a shared host another
+# process's command line can hold both `cargo` and `::error::`, which would
+# fail the "no ::error::" assertions below for reasons this suite does not
+# own. Stub pgrep and dmesg and drop CARGO_TARGET_DIR so that output is fixed
+# text; the pgrep stub logs its argv and prints a marker line, so scenario 2
+# still proves the wrapper asks for cargo/rustc processes and that the real
+# pgrep never ran.
+cat >"$tmp/bin/pgrep" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >>"$PGREP_CALLS"
+echo "4242 stub-cargo-process"
+STUB
+cat >"$tmp/bin/dmesg" <<'STUB'
+#!/usr/bin/env bash
+echo "stub kernel log line"
+STUB
+chmod +x "$tmp/bin/pgrep" "$tmp/bin/dmesg"
+unset CARGO_TARGET_DIR
+export PATH="$tmp/bin:$PATH" PGREP_CALLS="$tmp/pgrep-calls"
+: >"$PGREP_CALLS"
 
 # Fake cargo: appends one line per call to $CALLS; behaviour for call N is
 # read from $PLAN/N (missing = succeed). Each plan file holds an exit code
@@ -86,6 +108,9 @@ assert_contains "$tmp/out.s2" "missing object: $tmp/objs/intent_core-3f1a.rcgu.o
 assert_contains "$tmp/out.s2" "--- ls -la $tmp/objs" s2
 assert_contains "$tmp/out.s2" "neighbour.o" s2
 assert_contains "$tmp/out.s2" "--- pgrep -af 'cargo|rustc'" s2
+assert_contains "$tmp/out.s2" "4242 stub-cargo-process" s2
+[ "$(cat "$PGREP_CALLS")" = "-af cargo|rustc" ] || fail "s2: expected one 'pgrep -af cargo|rustc' call, got: $(cat "$PGREP_CALLS")"
+assert_contains "$tmp/out.s2" "stub kernel log line" s2
 assert_contains "$tmp/out.s2" "::warning::rust-lld could not open an object" s2
 assert_not_contains "$tmp/out.s2" "::error::" s2
 

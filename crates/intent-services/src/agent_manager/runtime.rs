@@ -41,7 +41,7 @@ impl RuntimeHandle {
         }
     }
 
-    #[cfg(test)]
+    /// A runtime with no local resources: a remote agent's, or a test's.
     pub(super) fn custom(runtime: Arc<Runtime<'static>>) -> Self {
         Self {
             runtime,
@@ -103,6 +103,10 @@ pub(super) struct LocalResources {
     pub(super) _rules_config: Option<TempConfigFile>,
     pub(super) _pi_extension: Option<PiExtensionDelivery>,
     pub(super) npx_launch_dir: Option<NpxLaunchDir>,
+    /// The launch's private temp folder (`TMPDIR` / `TMP` / `TEMP`); moves
+    /// with the child into [`DetachedChild`] and is removed after the tree
+    /// is killed.
+    pub(super) agent_tmp_dir: Option<intent_core::AgentTempDir>,
     pub(super) preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
     pub(super) cleanup_lease: Option<tokio::sync::oneshot::Sender<()>>,
     #[cfg(test)]
@@ -334,6 +338,11 @@ pub(super) struct DetachedChild {
     pub(super) spawn_pid: Option<u32>,
     /// `None` once moved into the owned cleanup task.
     pub(super) npx_launch_dir: Option<NpxLaunchDir>,
+    /// `None` once moved into the owned cleanup task. Unlike the launch dir
+    /// it is never retained: it is not the tree's cwd, may hold large files,
+    /// and is removed once the kill finishes (or with the cleanup future,
+    /// whichever comes first; the startup sweep reclaims any leak).
+    pub(super) agent_tmp_dir: Option<intent_core::AgentTempDir>,
     pub(super) preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
     pub(super) cleanup_lease: Option<tokio::sync::oneshot::Sender<()>>,
     #[cfg(test)]
@@ -354,6 +363,7 @@ impl DetachedChild {
             child: Some(child),
             spawn_pid: resources.child_pid,
             npx_launch_dir: resources.npx_launch_dir.take(),
+            agent_tmp_dir: resources.agent_tmp_dir.take(),
             preparation_guard: resources.preparation_guard.take(),
             cleanup_lease: resources.cleanup_lease.take(),
             #[cfg(test)]
@@ -379,6 +389,7 @@ impl DetachedChild {
         #[cfg(test)]
         let services = self.cleanup_services.take();
         let launch_dir = RetainUnlessSwept(self.npx_launch_dir.take());
+        let agent_tmp_dir = self.agent_tmp_dir.take();
         // Retain the exclusion if the runtime disappears or tree exit cannot
         // be confirmed, just as the live launch directory is retained.
         let preparation_guard = self
@@ -396,7 +407,9 @@ impl DetachedChild {
             if let Some(services) = services {
                 services.hold_periodic_commit("physical-cleanup").await;
             }
-            if kill_child_tree(child, spawn_pid).await {
+            let exited = kill_child_tree(child, spawn_pid).await;
+            drop(agent_tmp_dir);
+            if exited {
                 launch_dir.remove();
                 if let Some(guard) = preparation_guard {
                     drop(std::mem::ManuallyDrop::into_inner(guard));
@@ -413,6 +426,7 @@ impl DetachedChild {
         let mut trees = Vec::with_capacity(children.len());
         let mut leases = Vec::with_capacity(children.len());
         let mut launch_dirs = Vec::with_capacity(children.len());
+        let mut agent_tmp_dirs = Vec::with_capacity(children.len());
         for mut detached in children {
             // Foreground npm exclusions require confirmed tree exit. Run
             // those owned sweeps concurrently; preserve the shared batch
@@ -428,21 +442,25 @@ impl DetachedChild {
                 trees.push((child, detached.spawn_pid));
             }
             launch_dirs.push(RetainUnlessSwept(detached.npx_launch_dir.take()));
+            agent_tmp_dirs.push(detached.agent_tmp_dir.take());
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let _ = spawn_owned_cleanup(&runtime, async move {
+        let sweep = async move {
             let _leases = leases;
             kill_child_trees(trees).await;
+            drop(agent_tmp_dirs);
             for cleanup in guarded {
                 let _ = cleanup.await;
             }
             for dir in launch_dirs {
                 dir.remove();
             }
-        })
-        .await;
+        };
+        #[cfg(all(test, unix))]
+        let sweep = super::term_grace_gate::inherit(sweep);
+        let _ = spawn_owned_cleanup(&runtime, sweep).await;
     }
 }
 

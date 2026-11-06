@@ -4,19 +4,24 @@
 # invoked directly. Requested gate targets run together in one root make when
 # this checkout is that submodule, so their shared prerequisite ordering and
 # command-line variables (RESUME=1,
-# GATE_FORCE=1, BASE=<ref>, DRY_RUN=1, ARGS=...) reach the root make through
+# GATE_FORCE=1, BASE=<ref>, DRY_RUN=1, ARGS=..., E='<filterset>', COUNT=N, LOAD=1) reach the root make through
 # MAKEFLAGS. In a standalone clone the same targets exit 2 and name the
 # monorepo command. Unknown targets keep make's ordinary "No rule" failure.
+#
+# The local targets need neither cargo nor the monorepo: test-release-scripts
+# runs the scripts/test-* commands of ci.yml's release-scripts job, skipping
+# suites that need CI-only tooling (scripts/release-scripts-local.py), and
+# lint-workflows runs the pinned actionlint like ci.yml's release-scripts job.
 
 MONOREPO_ROOT := ../..
-FORWARDED_TARGETS := check test test-changed gate list-tests coverage-changed fmt clippy lint-sources
+FORWARDED_TARGETS := check test test-changed test-select test-stress gate list-tests coverage-changed fmt clippy check-windows check-macos lint-sources
 
 # Forward only to the intent monorepo: an unrelated Makefile two levels up
 # must not be mistaken for it, so ../../.gitmodules has to name this path.
 MONOREPO_PRESENT := $(and $(wildcard $(MONOREPO_ROOT)/Makefile),$(shell grep -Eqs '^[[:space:]]*path[[:space:]]*=[[:space:]]*packages/intentd[[:space:]]*$$' $(MONOREPO_ROOT)/.gitmodules && echo yes))
 
 .DEFAULT_GOAL := help
-.PHONY: help $(FORWARDED_TARGETS)
+.PHONY: help test-release-scripts lint-workflows $(FORWARDED_TARGETS)
 
 help:
 	@echo "intentd Makefile: forwards the Rust gate targets to the intent monorepo root Makefile."
@@ -25,8 +30,21 @@ help:
 	@echo ""
 	@echo "Requested targets run together in 'make -C $(MONOREPO_ROOT) <targets>' in the monorepo's"
 	@echo "packages/intentd submodule ($(MONOREPO_ROOT)/Makefile exists and $(MONOREPO_ROOT)/.gitmodules"
-	@echo "names packages/intentd); RESUME=1, GATE_FORCE=1, BASE=<ref>, DRY_RUN=1 and ARGS=..."
-	@echo "pass through. In a standalone clone the targets exit 2 and name the monorepo command."
+	@echo "names packages/intentd); RESUME=1, GATE_FORCE=1, BASE=<ref>, DRY_RUN=1, ARGS=... and"
+	@echo "E='<nextest filterset>' (test-select, test-stress) and COUNT=N LOAD=1 (test-stress) pass through."
+	@echo "In a standalone clone the targets exit 2 and name the monorepo command."
+	@echo ""
+	@echo "Local targets:"
+	@echo "  test-release-scripts — run ci.yml's release-scripts job tests, skipping suites"
+	@echo "    that need CI-only tooling (exit 1 only on a real failure)."
+	@echo "  lint-workflows — run the pinned actionlint with shellcheck over .github/workflows,"
+	@echo "    as ci.yml's release-scripts job does (needs actionlint + shellcheck)."
+
+test-release-scripts:
+	python3 scripts/release-scripts-local.py
+
+lint-workflows:
+	@bash scripts/lint-workflows.sh
 
 ifneq ($(MONOREPO_PRESENT),)
 # One shared prerequisite preserves MAKECMDGOALS and deduplicates root work,

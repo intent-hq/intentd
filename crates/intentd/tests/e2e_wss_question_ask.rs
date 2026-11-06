@@ -24,10 +24,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,14 +66,13 @@ A: (skipped)";
 
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
@@ -84,7 +84,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-qask-")
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -99,7 +99,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -209,9 +209,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -235,9 +238,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -307,9 +313,7 @@ fn read_prompt_log(path: &Path) -> Vec<(u64, String)> {
 /// Pre-seed the daemon's `SQLite` store with a regular (NON-chief) workspace —
 /// the daemon opens the same data dir on launch.
 async fn seed_workspace_only(data_dir: &Path, repository_path: Option<&Path>) -> String {
-    use intent_core::{
-        now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    };
+    use intent_core::{now_iso, Workspace, WorkspaceId};
     use intent_store::Store;
     let db_path = data_dir.join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
@@ -320,49 +324,12 @@ async fn seed_workspace_only(data_dir: &Path, repository_path: Option<&Path>) ->
             id: ws.clone(),
             title: "QASK-E2E".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
             repository_path: repository_path.map(|path| path.to_string_lossy().into_owned()),
             repository_owner: repository_path.map(|_| "intent-hq".to_string()),
             repository_name: repository_path.map(|_| "intentd".to_string()),
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         })
         .await
         .expect("insert ws");
@@ -722,7 +689,7 @@ async fn workspace_sibling_proposal_round_trip_over_wss() {
     let proposal_code = r#"return await ws.workspace.proposeSibling({
         title: "Focused follow-up",
         initialPrompt: "Implement only the focused follow-up and run its tests.",
-        specialist: "implementor"
+        specialist: "developer"
     });"#;
     let behavior = json!({
         "rules": [{
@@ -836,9 +803,10 @@ async fn workspace_sibling_proposal_round_trip_over_wss() {
 /// pending; turn 2 applies it by proposalId with
 /// `ws.workspace.applyProposal(id, { userRequested: true })`. Asserts the
 /// tool result shape, that the created workspace is served by
-/// `workspace.list` / `workspace.get` under the proposal's title, and that
-/// the proposal moved from `pendingProposals` to `proposalResolutions =
-/// applied` on both the `agent:updated` event and `agent.get`.
+/// `workspace.list` / `workspace.get` under the proposal's title, that its
+/// `workspace:created` event carries the proposal `origin`, and that the
+/// proposal moved from `pendingProposals` to `proposalResolutions = applied`
+/// on both the `agent:updated` event and `agent.get`.
 #[tokio::test]
 async fn workspace_apply_proposal_round_trip_over_wss() {
     let Some(script) = gate("WSS workspace.applyProposal E2E") else {
@@ -882,13 +850,16 @@ async fn workspace_apply_proposal_round_trip_over_wss() {
     let ws_id = seed_workspace_only(&data_dir, Some(&repo_path)).await;
     let propose_marker = "PROPOSE_THEN_APPLY_E2E_T1";
     let apply_marker = "APPLY_PROPOSAL_E2E_T2";
-    let proposal_id = "Create workspace: Applied follow-up";
+    // The agent applies by the card title: follow-up cards carry a unique
+    // `applyToolCallId`, and applyProposal still resolves one pending card by
+    // its `preview.title`.
+    let proposal_title = "Create workspace: Applied follow-up";
     let proposal_code = r#"return await ws.workspace.proposeSibling({
         title: "Applied follow-up",
         initialPrompt: "Implement the applied follow-up end to end."
     });"#;
     let apply_code = format!(
-        "return await ws.workspace.applyProposal({proposal_id:?}, {{ userRequested: true }});"
+        "return await ws.workspace.applyProposal({proposal_title:?}, {{ userRequested: true }});"
     );
     let behavior = json!({
         "rules": [{
@@ -939,6 +910,16 @@ async fn workspace_apply_proposal_round_trip_over_wss() {
         json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
     )
     .await;
+    // Global subscriber: the created workspace mints its own id, so its
+    // `workspace:created` is outside the proposer-scoped subscription above.
+    let mut created_sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut created_sub,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:created"] }),
+    )
+    .await;
     let mut rpc = connect_ws(port, cfg).await;
     // Plain-JSON tool bodies so the persisted tool_result can be parsed, and
     // the mock as the default provider so the created workspace's initial
@@ -977,6 +958,14 @@ async fn workspace_apply_proposal_round_trip_over_wss() {
     let end_data = await_stream_end(&mut sub, &agent_id).await;
     let propose_message_id = end_data["messageId"].as_str().expect("turn messageId");
     let lite = wss_rpc(&mut rpc, 12, "agent.get", json!({ "agentId": agent_id })).await;
+    let proposal_id = lite["agent"]["metadata"]["pendingProposals"][0]["proposalId"]
+        .as_str()
+        .expect("pending proposal id")
+        .to_string();
+    assert!(
+        proposal_id.starts_with("workspace-create-"),
+        "follow-up cards carry a unique id: {proposal_id}"
+    );
     assert_eq!(
         lite["agent"]["metadata"]["pendingProposals"],
         json!([{ "proposalId": proposal_id, "messageId": propose_message_id }]),
@@ -1075,13 +1064,37 @@ async fn workspace_apply_proposal_round_trip_over_wss() {
         "{got}"
     );
 
-    // 3. The proposal moved from pending to resolved=applied: live event
+    // 3. `workspace:created` names its provenance (§6.5 `data.origin`) so
+    //    clients can open the new workspace beside the proposing one.
+    let created_event = loop {
+        let frame = wss_event(&mut created_sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "workspace:created" && ev["data"]["workspaceId"] == created_ws_id {
+            break ev["data"].clone();
+        }
+    };
+    assert_eq!(
+        created_event["origin"],
+        json!({
+            "kind": "proposal",
+            "proposalId": proposal_id,
+            "agentId": agent_id,
+            "sourceWorkspaceId": ws_id,
+        }),
+        "{created_event}"
+    );
+    assert!(
+        got["workspace"].get("origin").is_none(),
+        "origin is event-only, never a workspace field: {got}"
+    );
+
+    // 4. The proposal moved from pending to resolved=applied: live event
     //    during turn 2, and the agent.get projection afterwards.
     let update = resolve_update.expect("agent:updated with proposalResolutions during turn 2");
     assert_eq!(update["pendingProposals"], json!([]), "{update}");
     assert_eq!(
         update["proposalResolutions"],
-        json!({ proposal_id: "applied" }),
+        json!({ proposal_id.as_str(): "applied" }),
         "{update}"
     );
     let lite = wss_rpc(&mut rpc, 17, "agent.get", json!({ "agentId": agent_id })).await;
@@ -1092,8 +1105,13 @@ async fn workspace_apply_proposal_round_trip_over_wss() {
     );
     assert_eq!(
         lite["agent"]["metadata"]["proposalResolutions"],
-        json!({ proposal_id: "applied" }),
+        json!({ proposal_id.as_str(): "applied" }),
         "resolution served on agent.get: {lite}"
+    );
+    assert_eq!(
+        lite["agent"]["metadata"]["proposalCreatedWorkspaces"],
+        json!({ proposal_id.as_str(): created_ws_id }),
+        "the applied card links its created workspace: {lite}"
     );
 }
 
@@ -1237,13 +1255,21 @@ async fn pending_proposals_projection_over_wss() {
     let turn_message_id = end_data["messageId"].as_str().expect("turn messageId");
 
     // 1. The live event carried the list: one entry, identity from the
-    //    proposal's `preview.title` (no applyToolCallId on workspace-create
-    //    proposals), messageId naming this turn's persisted assistant row.
+    //    proposal's unique `applyToolCallId`, messageId naming this turn's
+    //    persisted assistant row.
     let update = pending_update.expect("agent:updated with pendingProposals was emitted");
+    let proposal_id = update["pendingProposals"][0]["proposalId"]
+        .as_str()
+        .expect("pending proposal id")
+        .to_string();
+    assert!(
+        proposal_id.starts_with("workspace-create-"),
+        "follow-up cards carry a unique id: {proposal_id}"
+    );
     assert_eq!(
         update["pendingProposals"],
         json!([{
-            "proposalId": "Create workspace: Pending projection",
+            "proposalId": proposal_id,
             "messageId": turn_message_id,
         }]),
         "live event payload: {update}"
@@ -1279,8 +1305,12 @@ async fn pending_proposals_projection_over_wss() {
     let proposal: Value =
         serde_json::from_str(block["resource"]["text"].as_str().unwrap()).unwrap();
     assert_eq!(
-        proposal["preview"]["title"], "Create workspace: Pending projection",
+        proposal["applyToolCallId"], proposal_id,
         "recovered proposal identity matches the pending entry"
+    );
+    assert_eq!(
+        proposal["preview"]["title"],
+        "Create workspace: Pending projection"
     );
 
     // 4. `agent.resolveProposal` (dismissed): the response envelope carries
@@ -1288,7 +1318,6 @@ async fn pending_proposals_projection_over_wss() {
     //    the resolution persists (event + `agent.get` projection), and the
     //    dismissal notice reaches the model as a system-origin user row
     //    carrying the `proposal_resolved` messageMetadata.
-    let proposal_id = "Create workspace: Pending projection";
     let resolved = wss_rpc(
         &mut rpc,
         14,
@@ -1320,7 +1349,7 @@ async fn pending_proposals_projection_over_wss() {
     assert_eq!(resolve_update["pendingProposals"], json!([]));
     assert_eq!(
         resolve_update["proposalResolutions"],
-        json!({ proposal_id: "dismissed" })
+        json!({ proposal_id.as_str(): "dismissed" })
     );
 
     // Idempotent re-resolution over the wire: success echoing the persisted
@@ -1359,7 +1388,7 @@ async fn pending_proposals_projection_over_wss() {
     );
     assert_eq!(
         lite["agent"]["metadata"]["proposalResolutions"],
-        json!({ proposal_id: "dismissed" }),
+        json!({ proposal_id.as_str(): "dismissed" }),
         "resolution served on agent.get: {lite}"
     );
     let conversation = wss_rpc(
@@ -1377,7 +1406,7 @@ async fn pending_proposals_projection_over_wss() {
             m["role"] == "user"
                 && m["metadata"]["type"] == "proposal_resolved"
                 && m["metadata"]["outcome"] == "dismissed"
-                && m["metadata"]["proposalId"] == proposal_id
+                && m["metadata"]["proposalId"] == proposal_id.as_str()
         })
         .unwrap_or_else(|| panic!("dismissal notice persisted: {conversation:#}"))
         .clone();
@@ -1388,6 +1417,260 @@ async fn pending_proposals_projection_over_wss() {
              without applying it."
         ),
         "notice names the proposal: {notice_text}"
+    );
+}
+
+/// `workspace.create { origin }` over WSS (PROTOCOL §5.1 "Proposal origin",
+/// intent-hq/intent#8086): a client applying a `proposeSibling` card passes
+/// the card's identity, and the daemon resolves the proposal itself — the
+/// response is the ordinary create result, `workspace:created` echoes the
+/// provenance with the daemon-derived `sourceWorkspaceId`, `agent:updated`
+/// moves the entry to `proposalResolutions`, and the proposing agent gets
+/// the `proposal_resolved` notice naming the created workspace, with no
+/// client-side `agent.resolveProposal`.
+#[tokio::test]
+async fn workspace_create_with_proposal_origin_resolves_over_wss() {
+    let Some(script) = gate("WSS workspace.create origin E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let repo_path = data_dir.join("source-repository");
+    assert!(Command::new("git")
+        .args(["init", "-b", "main"])
+        .arg(&repo_path)
+        .status()
+        .expect("run git init")
+        .success());
+    for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com")] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["config", key, value])
+            .status()
+            .expect("run git config")
+            .success());
+    }
+    std::fs::write(repo_path.join("README.md"), "origin test\n").unwrap();
+    for args in [&["add", "README.md"][..], &["commit", "-m", "initial"][..]] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(args)
+            .status()
+            .expect("run git")
+            .success());
+    }
+
+    let ws_id = seed_workspace_only(&data_dir, Some(&repo_path)).await;
+    let marker = "PROPOSE_FOR_ORIGIN_E2E";
+    let proposal_code = r#"return await ws.workspace.proposeSibling({
+        title: "Origin follow-up",
+        initialPrompt: "Verify the workspace.create origin end to end."
+    });"#;
+    let behavior = json!({
+        "rules": [{
+            "ifPromptContains": marker,
+            "toolCall": {
+                "name": "workspace_api",
+                "arguments": { "code": proposal_code, "summary": "propose sibling workspace" }
+            },
+            "response": "Proposal filed.",
+            "emitToolBlocks": true
+        }],
+        "response": "plain response"
+    })
+    .to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(status["result"]["port"].as_u64().expect("port")).unwrap();
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    // The created workspace mints its own id, outside the scoped
+    // subscription above.
+    let mut created_sub = connect_ws(port, cfg.clone()).await;
+    wss_rpc(
+        &mut created_sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:created"] }),
+    )
+    .await;
+    let mut rpc = connect_ws(port, cfg).await;
+    // The created workspace's initial agent (the proposal names none) plans
+    // against the mock provider.
+    let settings = wss_rpc(
+        &mut rpc,
+        3,
+        "settings.update",
+        json!({ "changes": [{ "path": "model.defaultProvider", "value": "mock" }] }),
+    )
+    .await;
+    assert_eq!(settings["applied"][0]["value"], json!("mock"), "{settings}");
+
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "OriginProposer", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": marker }),
+    )
+    .await;
+    assert_eq!(sent["success"], true);
+    let end_data = await_stream_end(&mut sub, &agent_id).await;
+    let turn_message_id = end_data["messageId"].as_str().expect("turn messageId");
+
+    // Recover the card exactly as a client does: from the carrier message.
+    let conversation = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let carrier = conversation["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|m| m["id"] == turn_message_id)
+        .unwrap_or_else(|| panic!("carrier message persisted: {conversation:#}"));
+    let block = carrier["contentBlocks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|b| b["type"] == "resource" && b["resource"]["mimeType"] == PROPOSAL_MIME)
+        .unwrap_or_else(|| panic!("proposal resource on the carrier: {carrier:#}"));
+    let proposal: Value =
+        serde_json::from_str(block["resource"]["text"].as_str().unwrap()).unwrap();
+    let proposal_id = proposal["applyToolCallId"].as_str().unwrap().to_string();
+    assert!(
+        proposal_id.starts_with("workspace-create-"),
+        "{proposal_id}"
+    );
+    assert_eq!(
+        proposal["preview"]["title"],
+        "Create workspace: Origin follow-up"
+    );
+
+    // Card Apply: the proposal's create params plus `origin`.
+    let mut params = proposal["payload"]["params"].clone();
+    params["origin"] = json!({
+        "kind": "proposal",
+        "agentId": agent_id,
+        "proposalId": proposal_id,
+        "sourceWorkspaceId": "ws-forged",
+    });
+    let result = wss_rpc(&mut rpc, 20, "workspace.create", params).await;
+    let created_ws_id = result["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace.id in result: {result}"))
+        .to_string();
+    assert_eq!(result["workspace"]["title"], "Origin follow-up", "{result}");
+    assert!(
+        result["workspace"].get("origin").is_none(),
+        "origin is never a workspace field: {result}"
+    );
+    // The result tells the client the daemon handled the card, so it must
+    // not fall back to its own agent.resolveProposal.
+    assert_eq!(
+        result["proposalOrigin"],
+        json!({ "proposalId": proposal_id, "outcome": "applied" }),
+        "{result}"
+    );
+
+    // `workspace:created` echoes the provenance; the source is derived.
+    let created_event = loop {
+        let frame = wss_event(&mut created_sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "workspace:created" && ev["data"]["workspaceId"] == created_ws_id {
+            break ev["data"].clone();
+        }
+    };
+    assert_eq!(
+        created_event["origin"],
+        json!({
+            "kind": "proposal",
+            "proposalId": proposal_id,
+            "agentId": agent_id,
+            "sourceWorkspaceId": ws_id,
+        }),
+        "{created_event}"
+    );
+
+    // The daemon resolved the card: `agent:updated` carries the outcome,
+    // then the notice turn runs to its stream:end.
+    let resolve_update = loop {
+        let frame = wss_event(&mut sub, 30).await;
+        let ev = &frame["params"]["event"];
+        if ev["data"]["agentId"].as_str() == Some(agent_id.as_str())
+            && ev["type"] == "agent:updated"
+            && ev["data"].get("proposalResolutions").is_some()
+        {
+            break ev["data"].clone();
+        }
+    };
+    assert_eq!(
+        resolve_update["pendingProposals"],
+        json!([]),
+        "{resolve_update}"
+    );
+    assert_eq!(
+        resolve_update["proposalResolutions"],
+        json!({ proposal_id.as_str(): "applied" }),
+        "{resolve_update}"
+    );
+    await_stream_end(&mut sub, &agent_id).await;
+    let conversation = wss_rpc(
+        &mut rpc,
+        21,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let notices: Vec<&str> = conversation["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["role"] == "user" && m["metadata"]["type"] == "proposal_resolved")
+        .map(|m| m["contentBlocks"][0]["text"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        notices,
+        vec![format!(
+            "User applied the proposal 'Create workspace: Origin follow-up'. Created workspace {created_ws_id}."
+        )],
+        "exactly one applied notice: {conversation:#}"
     );
 }
 
@@ -1418,7 +1701,7 @@ fn mcp_config_files(data_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Extract the bridge `--connect <addr>` from a generated MCP config file.
-fn bridge_addr_from_config(path: &Path) -> String {
+fn bridge_addr_from_config(path: &Path) -> (String, String) {
     let cfg: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("read mcp config"))
         .expect("parse mcp config");
     let args = cfg["mcpServers"]["workspace-mcp"]["args"]
@@ -1428,7 +1711,14 @@ fn bridge_addr_from_config(path: &Path) -> String {
         .iter()
         .position(|a| a == "--connect")
         .expect("--connect flag in bridge args");
-    args[idx + 1].as_str().expect("bridge addr").to_string()
+    let token = cfg["mcpServers"]["workspace-mcp"]["env"]["INTENTD_MCP_BRIDGE_TOKEN"]
+        .as_str()
+        .expect("bridge secret in workspace-mcp env")
+        .to_string();
+    (
+        args[idx + 1].as_str().expect("bridge addr").to_string(),
+        token,
+    )
 }
 
 struct BridgeClient {
@@ -1438,12 +1728,21 @@ struct BridgeClient {
 }
 
 impl BridgeClient {
-    async fn connect(addr: &str) -> Self {
+    async fn connect((addr, token): &(String, String)) -> Self {
         use tokio::io::BufReader;
-        let stream = timeout(Duration::from_secs(10), TcpStream::connect(addr))
-            .await
-            .expect("bridge connect timeout")
-            .expect("bridge connect");
+        let mut stream = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            TcpStream::connect(addr),
+        )
+        .await
+        .expect("bridge connect timeout")
+        .expect("bridge connect");
+        tokio::io::AsyncWriteExt::write_all(
+            &mut stream,
+            format!("intentd-mcp-bridge-auth {token}\n").as_bytes(),
+        )
+        .await
+        .expect("bridge auth");
         let (r, w) = stream.into_split();
         let mut c = BridgeClient {
             reader: BufReader::new(r),
@@ -1470,10 +1769,13 @@ impl BridgeClient {
         let mut buf = String::new();
         loop {
             buf.clear();
-            let n = timeout(Duration::from_secs(30), self.reader.read_line(&mut buf))
-                .await
-                .expect("bridge read timeout")
-                .expect("bridge read");
+            let n = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(30)),
+                self.reader.read_line(&mut buf),
+            )
+            .await
+            .expect("bridge read timeout")
+            .expect("bridge read");
             assert!(n > 0, "bridge closed while waiting for response");
             let v: Value = match serde_json::from_str(buf.trim()) {
                 Ok(v) => v,

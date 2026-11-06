@@ -9,8 +9,8 @@ use intent_core::{
     NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
     NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
     ReadAssetResult, RepoConfig, Result, ScriptCreateParams, ScriptMode, TaskUpdateResult,
-    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate,
-    WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    Workspace, WorkspaceApi, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary,
+    WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use serde_json::Value;
 
@@ -18,109 +18,9 @@ use super::handle_message;
 
 struct FakeApi;
 
-#[tokio::test]
-async fn annotation_pages_select_strict_scopes_and_bound_frames_without_legacy_fallback() {
-    use intent_core::note_annotation::{AnnotationMethod, AnnotationReadRequest};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    struct AnnotationApi(AtomicUsize);
-    impl WorkspaceApi for AnnotationApi {
-        fn get_note_annotation_page(
-            &self,
-            method: AnnotationMethod,
-            request: AnnotationReadRequest,
-            _rpc_id: Value,
-        ) -> BoxFuture<'_, Result<Value>> {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move {
-                match request.note_id.as_str() {
-                    "error" => Err(Error::Internal("private annotation".repeat(8192))),
-                    "large" => Ok(serde_json::json!({"private":"x".repeat(8192)})),
-                    _ => Ok(serde_json::json!({"kind":format!("{method:?}")})),
-                }
-            })
-        }
-        fn get_note_page(
-            &self,
-            _workspace: WorkspaceId,
-            _note: NoteId,
-            _request: intent_core::note_page::NotePageRequest,
-            _rpc_id: Value,
-        ) -> BoxFuture<'_, Result<Value>> {
-            Box::pin(async { Ok(serde_json::json!({"kind":"sourceFallback"})) })
-        }
-    }
-    let api = AnnotationApi(AtomicUsize::new(0));
-    let base = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"comment.list",
-        "params":{"backendId":"backend","workspaceId":"workspace","noteId":"note",
-        "noteInstanceId":"instance","sourceRevision":"revision",
-        "page":{"kind":"comments","maxWireBytes":4096}}});
-    for (method, kind, expected) in [
-        ("comment.list", "comments", "Comments"),
-        ("comment.getThread", "replies", "Replies"),
-        ("note.lineAttribution.load", "attribution", "Attribution"),
-        ("note.get", "context", "Context"),
-    ] {
-        let mut request = base.clone();
-        request["method"] = method.into();
-        request["params"]["page"]["kind"] = kind.into();
-        if kind == "replies" {
-            request["params"]["threadId"] = "thread".into();
-        }
-        if kind == "context" {
-            request["params"]["page"]["contextRef"] = "na1:ref".into();
-            request["params"]["commentRevision"] = "epoch".into();
-        }
-        let frame = handle_message(&api, &request.to_string()).await.unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&frame).unwrap()["result"]["kind"],
-            expected
-        );
-    }
-    assert_eq!(api.0.load(Ordering::Relaxed), 4);
-    let invalid = [
-        ("page", Value::Null),
-        ("page", serde_json::json!({"kind":"source"})),
-        ("includeComments", Value::Bool(true)),
-        ("commentRevision", Value::Null),
-        ("unknown", Value::Bool(true)),
-        ("workspaceId", Value::String("x".repeat(70_000))),
-    ];
-    for (field, value) in invalid {
-        let mut request = base.clone();
-        request["params"][field] = value;
-        let frame = handle_message(&api, &request.to_string()).await.unwrap();
-        assert!(frame.len() <= 4096);
-        assert!(serde_json::from_str::<Value>(&frame).unwrap()["error"].is_object());
-    }
-    let mut context = base.clone();
-    context["method"] = "note.get".into();
-    context["params"]["page"] =
-        serde_json::json!({"kind":"context","contextRef":"na1:missing-epoch"});
-    let frame = handle_message(&api, &context.to_string()).await.unwrap();
-    assert!(serde_json::from_str::<Value>(&frame).unwrap()["error"].is_object());
-    assert!(!frame.contains("sourceFallback"));
-    for id in [
-        Value::Null,
-        serde_json::json!("x".repeat(65)),
-        serde_json::json!(9_007_199_254_740_992_u64),
-    ] {
-        let mut request = base.clone();
-        request["id"] = id;
-        let frame = handle_message(&api, &request.to_string()).await.unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&frame).unwrap()["id"],
-            Value::Null
-        );
-    }
-    assert_eq!(api.0.load(Ordering::Relaxed), 4);
-    for note in ["large", "error"] {
-        let mut request = base.clone();
-        request["params"]["noteId"] = note.into();
-        let frame = handle_message(&api, &request.to_string()).await.unwrap();
-        assert!(frame.len() <= 4096);
-        assert!(serde_json::from_str::<Value>(&frame).unwrap()["error"].is_object());
-        assert!(!frame.contains("private"));
-    }
+/// `big:<n>` names a fake object of size `n` in the bounded-read tests.
+fn big_len(name: &str) -> Option<usize> {
+    name.strip_prefix("big:")?.parse().ok()
 }
 
 #[test]
@@ -183,49 +83,9 @@ fn sample_ws() -> Workspace {
         id: WorkspaceId::from("ws-1"),
         title: "WS One".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: "t0".to_string(),
         updated_at: "t0".to_string(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -286,16 +146,42 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn list_workspaces(&self, _include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
-        Box::pin(async { Ok(vec![sample_ws()]) })
+    fn list_workspaces(
+        &self,
+        filter: intent_core::WorkspaceListFilter,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+        // A retired row stands in for the store: present only when the
+        // caller opted in with `includeRetired`.
+        Box::pin(async move {
+            let mut rows = vec![sample_ws()];
+            if filter.include_retired {
+                let mut retired = ws_with(&WorkspaceId::from("ws-retired"));
+                retired.status = WorkspaceStatus::Retired;
+                retired.archived = true;
+                retired.retired_at = Some("2026-10-22T00:00:00Z".to_string());
+                rows.push(retired);
+            }
+            Ok(rows)
+        })
     }
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         Box::pin(async move {
             if id.as_str() == "missing" {
                 return Err(Error::NotFound("workspace".to_string()));
             }
+            if id.as_str() == "ws-plain" {
+                return Ok(Workspace {
+                    branch: String::new(),
+                    worktree_path: None,
+                    plain_folder: true,
+                    ..ws_with(&id)
+                });
+            }
             Ok(ws_with(&id))
         })
+    }
+    fn is_plain_folder_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, bool> {
+        Box::pin(async move { id.as_str() == "ws-plain" })
     }
     fn workspace_disk_usage(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
@@ -397,6 +283,9 @@ impl WorkspaceApi for FakeApi {
             Ok(intent_core::WorkspaceCreateResult {
                 workspace: ws,
                 initial_agent: None,
+                proposal_origin: None,
+                notice: None,
+                initial_agent_launch_failure: None,
             })
         })
     }
@@ -497,6 +386,23 @@ impl WorkspaceApi for FakeApi {
             Ok(ws)
         })
     }
+    fn retire_workspace(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        assert!(caller_agent_id.is_none(), "router passes no caller agent");
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            let mut ws = ws_with(&id);
+            ws.status = WorkspaceStatus::Retired;
+            ws.archived = true;
+            ws.retired_at = Some("2026-10-22T00:00:00Z".to_string());
+            Ok(ws)
+        })
+    }
     fn unarchive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         Box::pin(async move {
             if id.as_str() == "missing" {
@@ -536,6 +442,32 @@ impl WorkspaceApi for FakeApi {
                 format!("{directory}/repo-a"),
                 format!("{directory}/repo-b"),
             ])
+        })
+    }
+    fn find_workspaces_by_pull_request(
+        &self,
+        url: String,
+        include_retired: bool,
+    ) -> BoxFuture<'_, Result<Vec<intent_core::PullRequestWorkspace>>> {
+        Box::pin(async move {
+            if !url.contains("/pull/") {
+                return Err(Error::InvalidParams("url is not a pull-request URL".into()));
+            }
+            let mut rows = vec![intent_core::PullRequestWorkspace {
+                id: WorkspaceId("ws-1".into()),
+                title: url,
+                archived: true,
+                linked_at: "2026-10-18T04:40:00.000Z".into(),
+            }];
+            if include_retired {
+                rows.push(intent_core::PullRequestWorkspace {
+                    id: WorkspaceId("ws-retired".into()),
+                    title: "retired".into(),
+                    archived: true,
+                    linked_at: "2026-10-17T04:40:00.000Z".into(),
+                });
+            }
+            Ok(rows)
         })
     }
     fn initialize_repository(&self, path: String) -> BoxFuture<'_, Result<()>> {
@@ -582,6 +514,9 @@ impl WorkspaceApi for FakeApi {
                 return Err(Error::NotFound("note".to_string()));
             }
             let mut note = sample_note(&workspace_id);
+            if note_id.as_str() == "huge" {
+                note.content = "x".repeat(600 * 1024);
+            }
             note.id = note_id;
             Ok(note)
         })
@@ -819,13 +754,70 @@ impl WorkspaceApi for FakeApi {
         _workspace_id: WorkspaceId,
         asset: String,
     ) -> BoxFuture<'_, Result<ReadAssetResult>> {
+        // `big:<n>` serves `n` base64 quads (3n decoded bytes).
         Box::pin(async move {
+            let data = big_len(&asset).map_or_else(|| "AAAA".to_string(), |n| "QUJD".repeat(n));
             Ok(ReadAssetResult {
                 asset_id: asset,
                 mime_type: "image/png".to_string(),
-                data: "AAAA".to_string(),
+                data,
                 size_kb: 1,
             })
+        })
+    }
+
+    fn read_asset_chunk(
+        &self,
+        _workspace_id: WorkspaceId,
+        asset: String,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            Ok(serde_json::json!({
+                "assetId": asset,
+                "mimeType": "image/png",
+                "content": format!("b64:{asset}:{offset}:{length}"),
+                "bytesRead": length,
+                "size": 1000u64,
+            }))
+        })
+    }
+
+    fn git_show_file(
+        &self,
+        _workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        // `big:<n>` serves `n` bytes of text; anything else echoes its args.
+        Box::pin(async move {
+            let scope = git_root_id.map(|id| format!("{id}:")).unwrap_or_default();
+            let content = big_len(&file_path).map_or_else(
+                || format!("{scope}{file_path}@{git_ref}"),
+                |n| "x".repeat(n),
+            );
+            Ok(serde_json::json!({ "content": content }))
+        })
+    }
+
+    fn git_show_file_chunk(
+        &self,
+        _workspace_id: WorkspaceId,
+        file_path: String,
+        git_ref: String,
+        git_root_id: Option<intent_core::WorkspaceGitRootId>,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            let scope = git_root_id.map(|id| format!("{id}:")).unwrap_or_default();
+            Ok(serde_json::json!({
+                "content": format!("b64:{scope}{file_path}@{git_ref}:{offset}:{length}"),
+                "bytesRead": length,
+                "size": 1000u64,
+            }))
         })
     }
 
@@ -1699,11 +1691,12 @@ impl WorkspaceApi for FakeApi {
         limit: Option<i64>,
         include_archived: bool,
         request_id: Option<String>,
+        next_token: Option<String>,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let request_id = request_id.unwrap_or_else(|| "srch-minted".to_string());
             Ok(
-                serde_json::json!({ "requestId": request_id, "matches": [], "workspaceId":workspace_id, "preferWorkspaceId":prefer_workspace_id, "limit":limit, "includeArchived":include_archived, "indexed":true }),
+                serde_json::json!({ "requestId": request_id, "matches": [], "workspaceId":workspace_id, "preferWorkspaceId":prefer_workspace_id, "limit":limit, "includeArchived":include_archived, "indexed":true, "nextToken":next_token }),
             )
         })
     }
@@ -1806,6 +1799,9 @@ impl WorkspaceApi for FakeApi {
         // Echo a bare string so the wire test can assert file.read is NOT
         // wrapped in an object.
         Box::pin(async move {
+            if let Some(n) = big_len(&path) {
+                return Ok(Value::String("x".repeat(n)));
+            }
             let scope = git_root_id.map(|id| format!("{id}:")).unwrap_or_default();
             Ok(Value::String(format!(
                 "{}:{scope}{path}",
@@ -1995,11 +1991,13 @@ impl WorkspaceApi for FakeApi {
     fn cross_workspace_list_siblings(
         &self,
         workspace_id: WorkspaceId,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!([{
                 "id": "sib-1", "title": "Untitled", "branch": "b", "status": "Active",
                 "createdAt": "t0", "updatedAt": "t1", "caller": workspace_id.as_str(),
+                "includeRetired": include_retired,
             }]))
         })
     }
@@ -2022,9 +2020,13 @@ impl WorkspaceApi for FakeApi {
         _workspace_id: WorkspaceId,
         target_workspace_id: WorkspaceId,
         note_id: NoteId,
+        window: intent_core::note_read_bounds::LineWindow,
+        bounded_default: bool,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!({
+                "window": [window.start_line, window.max_lines, window.start_offset],
+                "boundedDefault": bounded_default,
                 "id": note_id.as_str(), "title": "t", "content": "c",
                 "numberedContent": "   1 | c", "sourceWorkspaceId": target_workspace_id.as_str(),
                 "sourceWorkspaceTitle": "T", "branch": "b", "lineCount": 1,
@@ -2723,6 +2725,115 @@ async fn workspace_create_base_ref_unresolvable_maps_to_minus_32602_with_data() 
     );
 }
 
+#[test]
+fn placement_unavailable_maps_to_the_documented_error() {
+    // The first `errors` case of monorepo
+    // docs/protocol/fixtures/nodes/platform-routing.json.
+    use intent_core::nodes::{NodeArch, NodeOs};
+    use intent_core::placement::{AgentPlatform, PlatformAvailability};
+    let failure = PlatformAvailability::new(
+        [AgentPlatform {
+            os: NodeOs::Linux,
+            arch: NodeArch::X86_64,
+        }],
+        [],
+        "2026-10-01T00:00:00Z".into(),
+    )
+    .unavailable(serde_json::from_str(r#"{"arch":"x86_64"}"#).unwrap());
+    let rpc = super::domain_to_rpc(intent_core::Error::PlacementUnavailable(Box::new(failure)));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.message,
+        "No capacity for x86_64; available: none; supported: linux/x86_64"
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "placement-unavailable",
+            "requested": { "arch": "x86_64" },
+            "reason": "no-capacity",
+            "availablePlatforms": [],
+            "supportedPlatforms": [{ "os": "linux", "arch": "x86_64" }],
+            "availableOs": [],
+            "retryable": true,
+            "observedAt": "2026-10-01T00:00:00Z"
+        })
+    );
+}
+
+#[test]
+fn model_unavailable_and_machine_update_required_map_to_their_error_data() {
+    use intent_core::machines::{MachineUpdateRequired, ModelUnavailable, UpdateSide};
+    let model = ModelUnavailable::new("claude", "opus", [], false);
+    let rpc = super::domain_to_rpc(intent_core::Error::ModelUnavailable(Box::new(model)));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.message,
+        "Model \"opus\" (claude) isn't available: no machine is exposed to this backend."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "model-unavailable",
+            "provider": "claude",
+            "model": "opus",
+            "machines": [],
+            "retryable": false
+        })
+    );
+
+    let update = MachineUpdateRequired {
+        machine_name: "mac-mini".into(),
+        machine_version: "0.11.0".into(),
+        backend_version: "0.12.0".into(),
+        update: UpdateSide::Machine,
+        hint: None,
+        reason: None,
+    };
+    let rpc = super::domain_to_rpc(intent_core::Error::MachineUpdateRequired(Box::new(update)));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.message,
+        "Update Intent on mac-mini (it runs 0.11.0; this backend needs 0.12.0 or newer)."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "machine-update-required",
+            "machineVersion": "0.11.0",
+            "backendVersion": "0.12.0",
+            "update": "machine"
+        })
+    );
+}
+
+#[tokio::test]
+async fn base_refresh_failed_maps_to_documented_envelope() {
+    let rpc = super::domain_to_rpc(intent_core::Error::BaseRefreshFailed(Box::new(
+        intent_core::BaseRefreshFailure {
+            category: intent_core::BaseRefreshErrorCategory::AuthRequired,
+            detail: "git@github.com: Permission denied (publickey).".to_string(),
+            base_ref: "main".to_string(),
+            remote: "origin".to_string(),
+        },
+    )));
+    assert_eq!(rpc.code, -32603);
+    assert_eq!(
+        rpc.message,
+        "Couldn't update main from origin: git@github.com: Permission denied (publickey)."
+    );
+    assert_eq!(
+        rpc.data.expect("structured data"),
+        serde_json::json!({
+            "code": "base-refresh-failed",
+            "category": "auth-required",
+            "detail": "git@github.com: Permission denied (publickey).",
+            "baseRef": "main",
+            "remote": "origin",
+        })
+    );
+}
+
 #[tokio::test]
 async fn clone_failed_maps_to_structured_error_data() {
     // A classified clone failure (clone failure taxonomy, PROTOCOL §9.1;
@@ -3414,6 +3525,356 @@ async fn agent_cancel_delete_returns_cancelled_flag() {
     assert_eq!(err_code(&v), -32602, "{v}");
 }
 
+/// `workspace.list` returns retired workspaces only with an explicit
+/// `includeRetired: true` — `includeArchived: true` alone never includes
+/// them — and rejects a non-boolean `includeRetired` (§5.1).
+#[tokio::test]
+async fn workspace_list_include_retired_is_opt_in() {
+    let ids = |v: &Value| -> Vec<String> {
+        v["result"]["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    for params in [
+        "{}",
+        r#"{"includeArchived":true}"#,
+        r#"{"includeRetired":false}"#,
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.list","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert!(
+            !ids(&v).contains(&"ws-retired".to_string()),
+            "{params}: {v}"
+        );
+    }
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list","params":{"includeRetired":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(ids(&v).contains(&"ws-retired".to_string()), "{v}");
+    let retired = v["result"]["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["id"] == "ws-retired")
+        .unwrap();
+    assert_eq!(retired["status"], "Retired");
+    assert_eq!(retired["retiredAt"], "2026-10-22T00:00:00Z");
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list","params":{"includeRetired":"yes"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602, "{v}");
+    assert_eq!(v["error"]["data"]["code"], "invalid-params", "{v}");
+}
+
+/// `workspace.findByPullRequest` and `crossWorkspace.listSiblings` pass
+/// `includeRetired` through (default false) and reject a non-boolean.
+#[tokio::test]
+async fn find_by_pull_request_and_list_siblings_include_retired_is_opt_in() {
+    let pr = "https://github.com/o/r/pull/7";
+    let v = call(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.findByPullRequest","params":{{"url":"{pr}"}}}}"#
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"]["workspaces"].as_array().unwrap().len(),
+        1,
+        "{v}"
+    );
+    let v = call(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.findByPullRequest","params":{{"url":"{pr}","includeRetired":true}}}}"#
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["workspaces"][1]["id"], "ws-retired", "{v}");
+    let v = call(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.findByPullRequest","params":{{"url":"{pr}","includeRetired":1}}}}"#
+    ))
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602, "{v}");
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listSiblings","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"][0]["includeRetired"], false, "{v}");
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listSiblings","params":{"workspaceId":"ws-1","includeRetired":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"][0]["includeRetired"], true, "{v}");
+}
+
+/// Every raw-RPC `includeRetired` surface treats only omission as `false`:
+/// any supplied non-boolean — `null` included — is `-32602`
+/// `invalid-params` (PROTOCOL §5.1).
+#[tokio::test]
+async fn include_retired_rejects_null_and_non_booleans_on_every_rpc_surface() {
+    let pr = "https://github.com/o/r/pull/7";
+    for bad in ["null", r#""true""#, "1"] {
+        for (method, base) in [
+            ("workspace.list", String::new()),
+            ("workspace.findByPullRequest", format!(r#""url":"{pr}","#)),
+            (
+                "crossWorkspace.listSiblings",
+                r#""workspaceId":"ws-1","#.to_string(),
+            ),
+        ] {
+            let v = call(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{{base}"includeRetired":{bad}}}}}"#
+            ))
+            .await
+            .unwrap();
+            assert_eq!(err_code(&v), -32602, "{method} {bad}: {v}");
+            assert_eq!(
+                v["error"]["data"]["code"], "invalid-params",
+                "{method} {bad}: {v}"
+            );
+        }
+    }
+}
+
+/// `workspace.retire` returns the updated `workspace` record, and an
+/// unknown id is the standard `not-found`.
+#[tokio::test]
+async fn workspace_retire_returns_workspace() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.retire","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["workspace"]["id"], "ws-1", "{v}");
+    assert_eq!(v["result"]["workspace"]["status"], "Retired", "{v}");
+    assert_eq!(v["result"]["workspace"]["archived"], true, "{v}");
+    assert!(v["result"]["workspace"]["retiredAt"].is_string(), "{v}");
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace.retire","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602, "{v}");
+    assert_eq!(v["error"]["data"]["code"], "not-found", "{v}");
+    let v = call(r#"{"jsonrpc":"2.0","id":3,"method":"workspace.retire","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602, "{v}");
+}
+
+/// [`Error::WorkspaceRetired`] surfaces as `-32602` with
+/// `error.data = { code: "workspace-retired", workspaceId }`.
+#[test]
+fn workspace_retired_error_maps_to_machine_readable_code() {
+    let rpc = super::domain_to_rpc(Error::WorkspaceRetired {
+        workspace_id: "ws-1".to_string(),
+    });
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "workspace-retired", "workspaceId": "ws-1" }))
+    );
+    assert!(rpc.message.contains("retired"), "{}", rpc.message);
+
+    let rpc = super::domain_to_rpc(Error::RetireUnsupported {
+        workspace_id: "ws-1".to_string(),
+        checkout_mode: Some(intent_core::CheckoutMode::Cow),
+        plain_folder: false,
+    });
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "retire-unsupported", "checkoutMode": "cow" }))
+    );
+    let rpc = super::domain_to_rpc(Error::RetireUnsupported {
+        workspace_id: "ws-1".to_string(),
+        checkout_mode: None,
+        plain_folder: false,
+    });
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "retire-unsupported" }))
+    );
+    let rpc = super::domain_to_rpc(Error::RetireUnsupported {
+        workspace_id: "ws-1".to_string(),
+        checkout_mode: None,
+        plain_folder: true,
+    });
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "retire-unsupported", "plainFolder": true }))
+    );
+    assert_eq!(
+        rpc.message,
+        "workspace.retire is not available in plain-folder workspaces"
+    );
+}
+
+/// An operation needing git or a forge on a plain-folder workspace (§5.1)
+/// carries `plain-folder-unsupported` with the refused operation.
+#[test]
+fn plain_folder_unsupported_maps_to_machine_readable_code() {
+    let rpc = super::domain_to_rpc(Error::PlainFolderUnsupported {
+        operation: "workspace.duplicate",
+    });
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({
+            "code": "plain-folder-unsupported",
+            "operation": "workspace.duplicate",
+        }))
+    );
+    assert_eq!(
+        rpc.message,
+        "workspace.duplicate is not available in plain-folder workspaces"
+    );
+}
+
+/// Plain-folder create rejections (§5.1 "Plain-folder workspaces") carry the
+/// documented machine-readable `error.data`.
+#[test]
+fn plain_folder_errors_map_to_machine_readable_codes() {
+    let rpc = super::domain_to_rpc(Error::PlainFolderInvalidParams(
+        "isNewRepo cannot be combined with plainFolder".to_string(),
+    ));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "invalid-params" }))
+    );
+    assert!(rpc.message.contains("isNewRepo"), "{}", rpc.message);
+
+    let rpc = super::domain_to_rpc(Error::PlainFolderPathRejected(Box::new(
+        intent_core::PlainFolderPathRejection {
+            reason: intent_core::PlainFolderPathReason::InsideGitRepo,
+            path: "/home/u/repo/docs".to_string(),
+            repository_root: Some("/home/u/repo".to_string()),
+        },
+    )));
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({
+            "code": "plain-folder-path-rejected",
+            "reason": "inside-git-repo",
+            "path": "/home/u/repo/docs",
+            "repositoryRoot": "/home/u/repo",
+        }))
+    );
+    assert!(rpc.message.contains("/home/u/repo"), "{}", rpc.message);
+
+    for (reason, wire) in [
+        (
+            intent_core::PlainFolderPathReason::InsideWorkspacesRoot,
+            "inside-workspaces-root",
+        ),
+        (
+            intent_core::PlainFolderPathReason::ContainsWorkspacesRoot,
+            "contains-workspaces-root",
+        ),
+        (
+            intent_core::PlainFolderPathReason::NotADirectory,
+            "not-a-directory",
+        ),
+        (
+            intent_core::PlainFolderPathReason::ParentMissing,
+            "parent-missing",
+        ),
+    ] {
+        let rpc = super::domain_to_rpc(Error::PlainFolderPathRejected(Box::new(
+            intent_core::PlainFolderPathRejection {
+                reason,
+                path: "/p".to_string(),
+                repository_root: None,
+            },
+        )));
+        assert_eq!(
+            rpc.data,
+            Some(serde_json::json!({
+                "code": "plain-folder-path-rejected", "reason": wire, "path": "/p",
+            })),
+            "{wire}"
+        );
+    }
+}
+
+/// Explicit git and accept-changes mutations on a plain-folder workspace
+/// (§5.1) are refused at the front door with `plain-folder-unsupported`
+/// naming the method; the same call on a git workspace still dispatches.
+#[tokio::test]
+async fn plain_folder_git_mutations_are_refused_at_the_front_door() {
+    for (method, extra) in [
+        ("git.stage", r#","paths":["a.txt"]"#),
+        ("git.push", ""),
+        ("git.createBranch", r#","branchName":"topic""#),
+        (
+            "accept-changes.addRemote",
+            r#","remoteUrl":"https://github.com/o/r.git""#,
+        ),
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{"workspaceId":"ws-plain"{extra}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{method}: {v}");
+        assert_eq!(
+            v["error"]["data"],
+            serde_json::json!({ "code": "plain-folder-unsupported", "operation": method }),
+            "{method}"
+        );
+        assert_eq!(
+            v["error"]["message"],
+            serde_json::json!(format!(
+                "{method} is not available in plain-folder workspaces"
+            ))
+        );
+    }
+    let ok = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.stage","params":{"workspaceId":"ws-1","paths":["a.txt"]}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(ok.get("error").is_none(), "{ok}");
+}
+
+/// `workspace.update` never writes `plainFolder` (§5.1): the key is refused
+/// with `-32602 { code: "invalid-params" }`.
+#[tokio::test]
+async fn workspace_update_rejects_plain_folder() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.update","params":{"workspaceId":"ws-1","plainFolder":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602);
+    assert_eq!(
+        v["error"]["data"]["code"],
+        serde_json::json!("invalid-params")
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("plainFolder")),
+        "{v}"
+    );
+}
+
 /// `workspace.archive` and `workspace.unarchive` return the updated
 /// `workspace` record (§5.1) — a `{success:true}` shape would force a
 /// follow-up `workspace.get` on the FE. The `archived` flag flips through
@@ -3573,6 +4034,41 @@ async fn workspace_find_repositories_returns_repositories_array() {
 }
 
 #[tokio::test]
+async fn workspace_find_by_pull_request_passes_url_and_serves_camel_case_rows() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.findByPullRequest","params":{"url":"https://github.com/o/r/pull/7"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "workspaces": [{
+            "id": "ws-1",
+            "title": "https://github.com/o/r/pull/7",
+            "archived": true,
+            "linkedAt": "2026-10-18T04:40:00.000Z",
+        }] })
+    );
+}
+
+#[tokio::test]
+async fn workspace_find_by_pull_request_bad_or_missing_url_is_invalid_params() {
+    for params in [
+        r"{}",
+        r#"{"url":7}"#,
+        r#"{"url":"https://github.com/o/r/issues/7"}"#,
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.findByPullRequest","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "{params}");
+        assert_eq!(v["error"]["data"]["code"], "invalid-params", "{params}");
+    }
+}
+
+#[tokio::test]
 async fn workspace_find_repositories_missing_directory_is_minus_32602() {
     let v = call(r#"{"jsonrpc":"2.0","id":1,"method":"workspace.findRepositories","params":{}}"#)
         .await
@@ -3718,14 +4214,139 @@ async fn note_add_returns_bare_result_object() {
 }
 
 #[tokio::test]
-async fn note_list_tasks_returns_bare_array() {
+async fn note_list_tasks_returns_a_page() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"note.listTasks","params":{"workspaceId":"ws-1","noteId":"n1"}}"#,
     )
     .await
     .unwrap();
-    assert!(v["result"].is_array());
-    assert_eq!(v["result"][0]["status"], serde_json::json!("todo"));
+    assert!(v["result"]["tasks"].is_array());
+    assert_eq!(v["result"]["tasks"][0]["status"], serde_json::json!("todo"));
+    assert_eq!(v["result"]["nextToken"], Value::Null);
+}
+
+/// Bounded reads write guard: a whole-content write to a note whose default
+/// read is cut needs `baseContentBytes`; small notes and guarded writes pass.
+#[tokio::test]
+async fn whole_content_writes_to_a_cut_note_need_base_content_bytes() {
+    for msg in [
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.setContent","params":{"workspaceId":"ws-1","noteId":"huge","content":"short"}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.update","params":{"workspaceId":"ws-1","noteId":"huge","content":"short"}}"#,
+    ] {
+        let v = call(msg).await.unwrap();
+        assert_eq!(err_code(&v), -32602, "{msg}: {v}");
+        assert_eq!(v["error"]["data"]["code"], "content-base-required", "{msg}");
+        assert_eq!(v["error"]["data"]["contentBytes"], 600 * 1024, "{msg}");
+    }
+    // A metadata-only update and a write to a small note are not guarded.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.update","params":{"workspaceId":"ws-1","noteId":"huge","title":"T"}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v.get("error").is_none(), "{v}");
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.update","params":{"workspaceId":"ws-1","noteId":"n1","content":"short"}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(v.get("error").is_none(), "{v}");
+}
+
+/// A default `note.get` of a note over the read budget is cut with the
+/// truncated-read markers.
+#[tokio::test]
+async fn note_get_cuts_a_note_over_the_budget() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.get","params":{"workspaceId":"ws-1","noteId":"huge"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["note"]["contentTruncated"], true, "{v}");
+    assert_eq!(v["result"]["note"]["contentBytes"], 600 * 1024);
+    assert!(serde_json::to_string(&v).unwrap().len() < 500 * 1024);
+}
+
+/// The cut `note.get` row carries `nextContentOffset`; following it with
+/// `contentOffset` reads the rest, so the whole note is recoverable.
+#[tokio::test]
+async fn note_get_content_cursor_reads_the_rest_of_a_cut_note() {
+    let mut content = String::new();
+    let mut offset: Option<u64> = None;
+    for _ in 0..10 {
+        let params = match offset {
+            Some(o) => format!(r#""workspaceId":"ws-1","noteId":"huge","contentOffset":{o}"#),
+            None => r#""workspaceId":"ws-1","noteId":"huge""#.to_string(),
+        };
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"note.get","params":{{{params}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert!(serde_json::to_string(&v).unwrap().len() < 500 * 1024);
+        let note = &v["result"]["note"];
+        assert_eq!(
+            note["contentOffset"].as_u64(),
+            Some(offset.unwrap_or(0)),
+            "{v}"
+        );
+        content.push_str(note["content"].as_str().unwrap());
+        match note["nextContentOffset"].as_u64() {
+            Some(next) => offset = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(content, "x".repeat(600 * 1024));
+}
+
+/// A `contentOffset` that is not a positive integer inside the content is
+/// `-32602`.
+#[tokio::test]
+async fn note_get_rejects_a_bad_content_offset() {
+    for bad in ["0", "-1", "\"5\"", "614400", "999999999"] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"note.get","params":{{"workspaceId":"ws-1","noteId":"huge","contentOffset":{bad}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(err_code(&v), -32602, "contentOffset={bad}: {v}");
+    }
+}
+
+/// Bounded reads (§5.2): list reads page by default; `limit` must be a
+/// positive integer, `nextToken` a non-empty string minted for this list.
+#[tokio::test]
+async fn list_reads_validate_paging_params() {
+    for method in [
+        r#""note.list","params":{"workspaceId":"ws-1""#,
+        r#""note.listTasks","params":{"workspaceId":"ws-1","noteId":"n1""#,
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":{method}}}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(v["result"]["nextToken"], Value::Null, "{method}: {v}");
+        for (param, message) in [
+            (r#""limit":0"#, "limit must be a positive integer"),
+            (r#""limit":"5""#, "limit must be a positive integer"),
+            (r#""nextToken":"""#, "nextToken must be a non-empty string"),
+            (r#""nextToken":7"#, "nextToken must be a non-empty string"),
+            (r#""nextToken":"garbage""#, "invalid nextToken"),
+        ] {
+            let v = call(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":{method},{param}}}}}"#
+            ))
+            .await
+            .unwrap();
+            assert_eq!(err_code(&v), -32602, "{method} {param}: {v}");
+            assert_eq!(
+                v["error"]["message"],
+                serde_json::json!(message),
+                "{method} {param}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -5707,13 +6328,13 @@ async fn search_notes_routes_filters_and_null_defaults() {
     for (params, expected) in [
         (
             serde_json::json!({"query":"body", "workspaceId":"hard", "preferWorkspaceId":"soft",
-            "limit":0,"includeArchived":false,"requestId":"notes"}),
-            serde_json::json!({"workspaceId":"hard","preferWorkspaceId":"soft","limit":0,"includeArchived":false}),
+            "limit":0,"includeArchived":false,"requestId":"notes","nextToken":"page-2"}),
+            serde_json::json!({"workspaceId":"hard","preferWorkspaceId":"soft","limit":0,"includeArchived":false,"nextToken":"page-2"}),
         ),
         (
             serde_json::json!({"query":"body","workspaceId":null,"preferWorkspaceId":null,
-            "limit":null,"includeArchived":null,"requestId":null}),
-            serde_json::json!({"workspaceId":null,"preferWorkspaceId":null,"limit":null,"includeArchived":true}),
+            "limit":null,"includeArchived":null,"requestId":null,"nextToken":null}),
+            serde_json::json!({"workspaceId":null,"preferWorkspaceId":null,"limit":null,"includeArchived":true,"nextToken":null}),
         ),
         (
             serde_json::json!({"query":"body"}),
@@ -5739,6 +6360,7 @@ async fn search_notes_rejects_invalid_optional_params() {
         ("workspaceId", serde_json::json!("")),
         ("preferWorkspaceId", serde_json::json!(false)),
         ("requestId", serde_json::json!([])),
+        ("nextToken", serde_json::json!(7)),
         ("includeArchived", serde_json::json!("false")),
         ("limit", serde_json::json!(-1)),
         ("limit", serde_json::json!(1.5)),
@@ -6246,6 +6868,29 @@ async fn cross_workspace_methods_require_params() {
     .await
     .unwrap();
     assert_eq!(err_code(&v), -32602);
+
+    // readNote line window: positive integers flow through; others → -32602.
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.readNote","params":{"workspaceId":"ws-1","targetWorkspaceId":"ws-2","noteId":"n9","startLine":3,"maxLines":20,"startOffset":7}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["window"], serde_json::json!([3, 20, 7]));
+    assert_eq!(v["result"]["boundedDefault"], serde_json::json!(true));
+    for bad in ["0", "-1", "1.5", "\"2\"", "true"] {
+        for key in ["startLine", "maxLines", "startOffset"] {
+            let v = call(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.readNote","params":{{"workspaceId":"ws-1","targetWorkspaceId":"ws-2","noteId":"n9","{key}":{bad}}}}}"#
+            ))
+            .await
+            .unwrap();
+            assert_eq!(err_code(&v), -32602, "{key}={bad}");
+            assert_eq!(
+                v["error"]["message"],
+                serde_json::json!(format!("{key} must be a positive integer"))
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -7994,31 +8639,339 @@ async fn invitation_account_search_routes_and_rejects_malformed_params() {
     }
 }
 
-#[tokio::test]
-async fn paginated_viewing_does_not_dispatch_retired_edit_operations() {
-    let api = FakeApi;
-    for method in [
-        "note.applySplices",
-        "note.operationStatus",
-        "note.operation.begin",
-        "note.operation.append",
-        "note.operation.seal",
-        "note.operation.commit",
-        "note.operation.cancel",
-        "note.operation.read",
-    ] {
-        let raw = handle_message(
-            &api,
-            &serde_json::json!({
-                "jsonrpc":"2.0", "id":7, "method":method,
-                "params":{"workspaceId":"w","noteId":"n"}
+/// `script.get` (§5.8 bounded reads): a definition whose `command` is over
+/// the read budget is served in parts (`commandOffset` in,
+/// `nextCommandOffset` out) that rebuild it exactly; bad offsets fail
+/// `-32602`.
+mod script_get_paging {
+    use intent_core::{BoxFuture, Result, WorkspaceApi, WorkspaceId};
+    use serde_json::{json, Value};
+
+    use super::super::handle_message;
+
+    struct BigScript(String);
+
+    impl WorkspaceApi for BigScript {
+        fn script_get(&self, _: WorkspaceId, id: String) -> BoxFuture<'_, Result<Value>> {
+            let command = self.0.clone();
+            Box::pin(async move {
+                Ok(json!({ "id": id, "name": "big", "mode": "command", "command": command }))
             })
-            .to_string(),
-        )
+        }
+    }
+
+    async fn call(api: &BigScript, offset: Option<Value>) -> (Value, usize) {
+        let mut params = json!({ "workspaceId": "ws-1", "scriptId": "s-1" });
+        if let Some(offset) = offset {
+            params["commandOffset"] = offset;
+        }
+        let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "script.get", "params": params })
+            .to_string();
+        let out = handle_message(api, &msg).await.expect("response");
+        (serde_json::from_str(&out).unwrap(), out.len())
+    }
+
+    #[tokio::test]
+    async fn an_oversized_command_is_rebuilt_exactly_across_parts() {
+        let command = format!(
+            "echo '{}' # {}",
+            "\"".repeat(300_001),
+            "é😀\\".repeat(90_000)
+        );
+        let api = BigScript(command.clone());
+        let mut rebuilt = String::new();
+        let mut offset: Option<u64> = None;
+        let mut parts = 0;
+        loop {
+            let (v, frame) = call(&api, offset.map(Value::from)).await;
+            assert!(frame < 500 * 1024, "frame is {frame} bytes");
+            let row = &v["result"];
+            assert_eq!(row["commandTruncated"], true);
+            assert_eq!(row["commandBytes"], command.len());
+            assert_eq!(row["commandOffset"], offset.unwrap_or(0));
+            rebuilt.push_str(row["command"].as_str().unwrap());
+            parts += 1;
+            match row["nextCommandOffset"].as_u64() {
+                Some(next) => offset = Some(next),
+                None => break,
+            }
+        }
+        assert!(parts >= 3, "{parts} parts");
+        assert_eq!(rebuilt, command);
+    }
+
+    #[tokio::test]
+    async fn a_small_command_is_unchanged() {
+        let api = BigScript("make test".into());
+        let (v, _) = call(&api, None).await;
+        assert_eq!(v["result"]["command"], "make test");
+        assert!(v["result"].get("commandTruncated").is_none());
+    }
+
+    #[tokio::test]
+    async fn bad_command_offsets_are_invalid_params() {
+        let api = BigScript("aé".into());
+        for bad in [
+            json!(0),
+            json!(-1),
+            json!("1"),
+            json!(1.5),
+            json!(2),
+            json!(3),
+            json!(9),
+        ] {
+            let (v, _) = call(&api, Some(bad.clone())).await;
+            assert_eq!(v["error"]["code"], json!(-32602), "commandOffset {bad}");
+        }
+        let (v, _) = call(&api, Some(json!(1))).await;
+        assert_eq!(v["result"]["command"], "é");
+        assert_eq!(v["result"]["nextCommandOffset"], Value::Null);
+    }
+}
+
+/// Capped whole-object reads: the legacy shape when it fits, `too-large`
+/// without `maxBytes`, and a truncated reply with `maxBytes`.
+#[tokio::test]
+async fn whole_object_reads_are_bounded() {
+    let cap = 480_000_usize;
+    let req = |method: &str, params: Value| {
+        serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+            .to_string()
+    };
+    let big = format!("big:{cap}");
+
+    // file.read: bare string when it fits.
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": "a.txt" }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"], "ws-1:a.txt");
+    // Over the cap without maxBytes: too-large (or the whole object when the
+    // switch serves it), never a shortened string.
+    let refuse = crate::router::REFUSE_OVER_CAP_WITHOUT_MAX_BYTES;
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": big }),
+    ))
+    .await
+    .unwrap();
+    if refuse {
+        assert_eq!(v["error"]["code"], -32602, "{v:.200}");
+        assert_eq!(v["error"]["data"]["code"], "too-large");
+        assert_eq!(v["error"]["data"]["totalBytes"], cap);
+        assert_eq!(v["error"]["data"]["maxBytes"], cap);
+        assert_eq!(v["error"]["data"]["chunkMethod"], "file.readChunk");
+    } else {
+        assert_eq!(
+            v["result"],
+            serde_json::json!("x".repeat(cap)),
+            "whole file"
+        );
+    }
+    // With maxBytes: an object with truncated and totalBytes.
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": big, "maxBytes": 10_000 }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["truncated"], true, "{v}");
+    assert_eq!(v["result"]["totalBytes"], cap);
+    assert_eq!(
+        v["result"]["content"].as_str().map(str::len),
+        Some(10_000 - 2)
+    );
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": "a.txt", "maxBytes": 10_000 }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "content": "ws-1:a.txt", "truncated": false, "totalBytes": 10 })
+    );
+    let v = call(&req(
+        "file.read",
+        serde_json::json!({ "workspaceId": "ws-1", "path": "a.txt", "maxBytes": 0 }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["error"]["code"], -32602);
+    assert_eq!(v["error"]["message"], "maxBytes must be a positive integer");
+
+    // git.showFile: { content } when it fits, the same bound otherwise.
+    let v = call(&req(
+        "git.showFile",
+        serde_json::json!({ "workspaceId": "ws-1", "filePath": "a.rs", "ref": "HEAD" }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"], serde_json::json!({ "content": "a.rs@HEAD" }));
+    let v = call(&req(
+        "git.showFile",
+        serde_json::json!({ "workspaceId": "ws-1", "filePath": big, "ref": "HEAD" }),
+    ))
+    .await
+    .unwrap();
+    if refuse {
+        assert_eq!(v["error"]["data"]["code"], "too-large", "{v:.200}");
+        assert_eq!(v["error"]["data"]["chunkMethod"], "git.showFileChunk");
+    } else {
+        assert_eq!(
+            v["result"],
+            serde_json::json!({ "content": "x".repeat(cap) }),
+            "whole blob"
+        );
+    }
+    let v = call(&req(
+        "git.showFile",
+        serde_json::json!({ "workspaceId": "ws-1", "filePath": big, "ref": "HEAD", "maxBytes": 999_999 }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["truncated"], true, "{v}");
+    assert_eq!(v["result"]["totalBytes"], cap);
+    assert_eq!(v["result"]["content"].as_str().map(str::len), Some(cap - 2));
+    assert!(v.to_string().len() < 512_000);
+
+    // note.readAsset: whole, or without its bytes.
+    let v = call(&req(
+        "note.readAsset",
+        serde_json::json!({ "workspaceId": "ws-1", "asset": "a.png" }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["data"], "AAAA");
+    assert!(v["result"].get("truncated").is_none());
+    let big_asset = format!("big:{}", cap / 4);
+    let v = call(&req(
+        "note.readAsset",
+        serde_json::json!({ "workspaceId": "ws-1", "asset": big_asset }),
+    ))
+    .await
+    .unwrap();
+    if refuse {
+        assert_eq!(v["error"]["data"]["code"], "too-large", "{v:.200}");
+        assert_eq!(v["error"]["data"]["totalBytes"], cap / 4 * 3);
+        assert_eq!(v["error"]["data"]["chunkMethod"], "note.readAssetChunk");
+    } else {
+        assert_eq!(
+            v["result"]["data"],
+            serde_json::json!("QUJD".repeat(cap / 4)),
+            "whole asset"
+        );
+        assert!(v["result"].get("truncated").is_none());
+    }
+    let v = call(&req(
+        "note.readAsset",
+        serde_json::json!({ "workspaceId": "ws-1", "asset": big_asset, "maxBytes": cap }),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["data"], "", "{v}");
+    assert_eq!(v["result"]["truncated"], true);
+    assert_eq!(v["result"]["totalBytes"], cap / 4 * 3);
+}
+
+#[tokio::test]
+async fn chunk_reads_route_offset_length_and_selector() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"git.showFileChunk","params":{"workspaceId":"ws-1","filePath":"a.rs","ref":":0","gitRootId":"root-1","offset":8,"length":16}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"],
+        serde_json::json!({ "content": "b64:root-1:a.rs@:0:8:16", "bytesRead": 16, "size": 1000u64 })
+    );
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"note.readAssetChunk","params":{"workspaceId":"ws-1","asset":"a.png","offset":4,"length":2}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["content"], "b64:a.png:4:2");
+    assert_eq!(v["result"]["mimeType"], "image/png");
+    for (method, params) in [
+        (
+            "git.showFileChunk",
+            r#"{"workspaceId":"ws-1","filePath":"a","ref":"HEAD","length":1}"#,
+        ),
+        (
+            "git.showFileChunk",
+            r#"{"workspaceId":"ws-1","filePath":"a","ref":"HEAD","offset":0}"#,
+        ),
+        (
+            "note.readAssetChunk",
+            r#"{"workspaceId":"ws-1","asset":"a","length":1}"#,
+        ),
+        (
+            "note.readAssetChunk",
+            r#"{"workspaceId":"ws-1","asset":"a","offset":0}"#,
+        ),
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#
+        ))
         .await
         .unwrap();
-        let response: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(response["id"], 7);
-        assert_eq!(err_code(&response), -32601, "{method}: {response}");
+        assert_eq!(v["error"]["code"], -32602, "{method} {params}: {v}");
     }
+}
+
+#[test]
+fn git_diff_max_bytes_parses_the_opt_in_and_rejects_bad_values() {
+    use super::git_diff_max_bytes;
+    use serde_json::json;
+    let p = |v: Value| v.as_object().cloned().unwrap();
+    // Absent: the service applies the default (maximum) budget.
+    assert!(matches!(git_diff_max_bytes(&p(json!({}))), Ok(None)));
+    assert!(matches!(
+        git_diff_max_bytes(&p(json!({ "maxBytes": null }))),
+        Ok(None)
+    ));
+    assert!(matches!(
+        git_diff_max_bytes(&p(json!({ "maxBytes": 100_000 }))),
+        Ok(Some(100_000))
+    ));
+    for bad in [json!(0), json!(-1), json!("big"), json!(1.5)] {
+        let Err(err) = git_diff_max_bytes(&p(json!({ "maxBytes": bad }))) else {
+            panic!("maxBytes {bad} must be rejected");
+        };
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("maxBytes must be a positive integer"));
+    }
+}
+
+#[tokio::test]
+async fn git_diffs_rejects_malformed_max_bytes() {
+    for method in ["git.diffs", "git.branchDiff"] {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": method,
+            "params": { "workspaceId": WorkspaceId::new().as_str(), "baseRef": "main", "maxBytes": "x" },
+        });
+        let resp = handle_message(&FakeApi, &req.to_string()).await.unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], -32602, "{method}: {v}");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("maxBytes"),
+            "{method}: {v}"
+        );
+    }
+}
+
+/// `remoteAuthor` is daemon-owned: a `script.create` param carrying it is
+/// refused `-32602 remote-script-author-readonly` from any caller.
+#[test]
+fn script_create_refuses_a_remote_author_param() {
+    let params = serde_json::json!({
+        "workspaceId": "ws", "name": "n", "command": "true", "mode": "command",
+        "remoteAuthor": { "agentId": "a", "nodeId": "n" },
+    });
+    let error = super::parse_script_create(params.as_object().unwrap()).unwrap_err();
+    let text = format!("{error:?}");
+    assert!(text.contains("remote-script-author-readonly"), "{text}");
+    assert!(text.contains("-32602"), "{text}");
 }

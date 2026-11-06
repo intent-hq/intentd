@@ -48,6 +48,12 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard cap on a caller-supplied tool-call timeout, kept below the 60s hook
 /// budget so a forwarded call always resolves within one hook run.
 const TOOL_TIMEOUT_CAP: Duration = Duration::from_secs(55);
+/// The built-in workspace server's name, never given to a user server.
+const RESERVED_SERVER_NAME: &str = "workspace-mcp";
+/// Bound on a remote agent's proxied `tools/call` (nodeProtocol 11), longer
+/// than [`TOOL_TIMEOUT_CAP`]: it is the provider's own call, not a hook run.
+const PROXY_TOOL_TIMEOUT: Duration =
+    intent_core::remote_launch::workspace_api::MCP_PROXY_CALL_TIMEOUT;
 /// `Accept` header required by MCP streamable HTTP (the server may answer a
 /// POST with either a plain JSON body or an SSE stream).
 const HTTP_ACCEPT: &str = "application/json, text/event-stream";
@@ -291,6 +297,66 @@ pub(crate) async fn read_configs(secrets: &AsyncSecretStore) -> Map<String, Valu
     }
 }
 
+/// The user's configs plus the servers of enabled plugins (Agent Plugins,
+/// `plugin:<plugin>/<server>` ids). Plugin entries are derived on every read and
+/// never persisted; a user server keeps its name when a plugin server clashes.
+/// A plugin server listed in `disabled` (`mcp.disabledServers`) reads as
+/// `enabled: false`, the way a switched-off user server does.
+pub(crate) async fn read_all_configs(
+    secrets: &AsyncSecretStore,
+    disabled: &[String],
+) -> Map<String, Value> {
+    let mut configs = read_configs(secrets).await;
+    let plugin_configs = tokio::task::spawn_blocking(|| {
+        let plugins = crate::plugins::enabled_user_plugins();
+        crate::plugins::ensure_data_dirs(&plugins);
+        let exe = std::env::current_exe().unwrap_or_else(|_| "intentd".into());
+        let (launcher, path) =
+            intent_acp::normalize_spaced_bridge_command(&exe, std::env::var_os("PATH").as_deref());
+        let env = path.map(|p| ("PATH".to_string(), p)).into_iter().collect();
+        crate::plugins::mcp_configs(&plugins, &launcher, &env)
+    })
+    .await
+    .unwrap_or_default();
+    let taken: std::collections::HashSet<String> = configs
+        .values()
+        .filter_map(|c| c.get("name").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    for (id, mut config) in plugin_configs {
+        if disabled.contains(&id) {
+            config["enabled"] = json!(false);
+        }
+        let name = config
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if taken.contains(name) || configs.contains_key(&id) {
+            tracing::warn!(server = %id, name, "plugin MCP server name is taken; skipping");
+            continue;
+        }
+        configs.insert(id, config);
+    }
+    configs
+}
+
+/// Refuse a definition change on a plugin-provided server or a reserved id.
+fn reject_plugin_server(server_id: &str) -> Result<()> {
+    if !server_id.starts_with(crate::plugins::MCP_ID_PREFIX) {
+        return Ok(());
+    }
+    Err(Error::InvalidParams(
+        match crate::plugins::mcp_id_plugin(server_id) {
+            Some(plugin) => {
+                format!("mcp server {server_id} comes from plugin `{plugin}`; change the plugin instead")
+            }
+            None => format!(
+                "mcp server ids starting with `{}` are reserved",
+                crate::plugins::MCP_ID_PREFIX
+            ),
+        },
+    ))
+}
+
 /// Persist the configured external servers back to the sensitive secret.
 async fn write_configs(secrets: &AsyncSecretStore, map: &Map<String, Value>) -> Result<()> {
     let raw = serde_json::to_string(&Value::Object(map.clone()))
@@ -440,6 +506,17 @@ impl McpHub {
             .unwrap()
             .get(id)
             .map_or_else(|| status_stopped(id), |rs| rs.status.clone())
+    }
+
+    /// The definitions of every tracked server, keyed by id.
+    fn tracked_configs(&self) -> HashMap<String, Value> {
+        self.inner
+            .servers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, rs)| (id.clone(), rs.config.clone()))
+            .collect()
     }
 
     /// Remove + reap `id` without emitting a `stopped` event (used before a
@@ -770,6 +847,25 @@ impl McpHub {
         self.forward(server_id, "tools/call", params, timeout).await
     }
 
+    /// Forward `tools/call` for a remote agent's provider, bounded by
+    /// [`PROXY_TOOL_TIMEOUT`] instead of the `ws.mcp` cap.
+    pub(crate) async fn proxy_call_tool(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+        args: Value,
+    ) -> Result<Value> {
+        let params = json!({ "name": tool_name, "arguments": args });
+        self.forward(server_id, "tools/call", params, PROXY_TOOL_TIMEOUT)
+            .await
+    }
+
+    /// Whether the hub can take a tool request for `server_id` now; `false`
+    /// when it is not running (another refusal, such as `sse`, passes).
+    fn is_running(&self, server_id: &str) -> bool {
+        !matches!(self.tool_target(server_id), Err(Error::NotFound(_)))
+    }
+
     /// Forward one tool request to the server's transport. stdio reuses the
     /// live [`Connection`], and a request abandoned on timeout is followed by
     /// an MCP `notifications/cancelled` naming its id so the server can stop
@@ -1047,7 +1143,7 @@ pub(crate) fn same_origin(a: &str, b: &str) -> bool {
 /// The configured `url` of the saved external server `server_id`, when one
 /// exists (§5.22.2 OAuth-injection guard).
 pub(crate) async fn config_url(secrets: &AsyncSecretStore, server_id: &str) -> Option<String> {
-    read_configs(secrets)
+    read_all_configs(secrets, &[])
         .await
         .get(server_id)?
         .get("url")
@@ -1553,7 +1649,7 @@ impl<'a> McpServersService<'a> {
 
     /// Fetch one stored config by id, or `NotFound`.
     async fn require_config(&self, server_id: &str) -> Result<Value> {
-        read_configs(self.secrets)
+        read_all_configs(self.secrets, &disabled_servers(&self.effective()))
             .await
             .remove(server_id)
             .ok_or_else(|| Error::NotFound(format!("mcp server not found: {server_id}")))
@@ -1596,7 +1692,7 @@ impl<'a> McpServersService<'a> {
     /// disable layered over the global setting (global disable wins; the
     /// workspace layer only narrows an otherwise-enabled server).
     pub(crate) async fn list(&self, workspace_id: Option<&str>) -> Result<Value> {
-        let configs = read_configs(self.secrets).await;
+        let configs = read_all_configs(self.secrets, &disabled_servers(&self.effective())).await;
         let mut servers: Vec<Value> = configs.values().map(redact_config).collect();
         servers.sort_by_key(config_id);
         if workspace_id.is_some() {
@@ -1618,6 +1714,7 @@ impl<'a> McpServersService<'a> {
         let normalized = normalize_config(config, None)?;
         reject_redacted_secrets(&normalized)?;
         let id = config_id(&normalized);
+        reject_plugin_server(&id)?;
         let mut configs = read_configs(self.secrets).await;
         if configs.contains_key(&id) {
             return Err(Error::InvalidParams(format!(
@@ -1638,6 +1735,7 @@ impl<'a> McpServersService<'a> {
     /// an omitted key is deleted. The merged config is what gets persisted
     /// and handed to the hub restart.
     pub(crate) async fn update(&self, server_id: &str, config: Value) -> Result<Value> {
+        reject_plugin_server(server_id)?;
         let mut configs = read_configs(self.secrets).await;
         let Some(stored) = configs.get(server_id) else {
             return Err(Error::NotFound(format!(
@@ -1664,6 +1762,7 @@ impl<'a> McpServersService<'a> {
 
     /// `mcp.servers.delete` → stop + remove a definition; `{ success: true }`.
     pub(crate) async fn delete(&self, server_id: &str) -> Result<Value> {
+        reject_plugin_server(server_id)?;
         let mut configs = read_configs(self.secrets).await;
         if configs.remove(server_id).is_none() {
             return Err(Error::NotFound(format!(
@@ -1712,9 +1811,13 @@ impl<'a> McpServersService<'a> {
         if let Some(obj) = config.as_object_mut() {
             obj.insert("enabled".into(), json!(enabled));
         }
-        let mut configs = read_configs(self.secrets).await;
-        configs.insert(server_id.to_string(), config.clone());
-        write_configs(self.secrets, &configs).await?;
+        // A plugin server's definition is derived; only `mcp.disabledServers`
+        // records its switch.
+        if crate::plugins::mcp_id_plugin(server_id).is_none() {
+            let mut configs = read_configs(self.secrets).await;
+            configs.insert(server_id.to_string(), config.clone());
+            write_configs(self.secrets, &configs).await?;
+        }
 
         let settings = self.effective();
         let mut disabled = disabled_servers(&settings);
@@ -1764,7 +1867,7 @@ impl<'a> McpServersService<'a> {
         if self.hub.background_stopping() || !enable_user_servers(&self.effective()) {
             return;
         }
-        let ids: Vec<String> = read_configs(self.secrets)
+        let ids: Vec<String> = read_all_configs(self.secrets, &disabled_servers(&self.effective()))
             .await
             .keys()
             .map(String::from)
@@ -1807,12 +1910,45 @@ impl<'a> McpServersService<'a> {
         if !enable_user_servers(&settings) || disabled_servers(&settings).iter().any(|d| d == id) {
             return None;
         }
-        let config = read_configs(self.secrets).await.remove(id)?;
+        let config = read_all_configs(self.secrets, &disabled_servers(&self.effective()))
+            .await
+            .remove(id)?;
         config
             .get("enabled")
             .and_then(Value::as_bool)
             .unwrap_or(false)
             .then_some(config)
+    }
+
+    /// Bring the hub in line with the installed plugins after a plugin change:
+    /// stop servers that are gone or no longer eligible, start new ones, and
+    /// restart changed ones. `refresh` restarts every server of that plugin
+    /// even when its definition is unchanged (its files may have changed).
+    pub(crate) async fn sync_plugin_servers(&self, refresh: Option<&str>) {
+        if self.hub.background_stopping() {
+            return;
+        }
+        let tracked = self.hub.tracked_configs();
+        let configs = read_all_configs(self.secrets, &disabled_servers(&self.effective())).await;
+        let mut ids: Vec<&String> = tracked
+            .keys()
+            .chain(configs.keys())
+            .filter(|id| crate::plugins::mcp_id_plugin(id).is_some())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        for id in ids {
+            let forced = refresh.is_some() && crate::plugins::mcp_id_plugin(id) == refresh;
+            match (self.eligible_config(id).await, tracked.get(id)) {
+                (None, Some(_)) => {
+                    self.hub.stop(id).await;
+                }
+                (Some(config), current) if forced || current != Some(&config) => {
+                    self.hub.start(config, true).await;
+                }
+                _ => {}
+            }
+        }
     }
 
     // -- agent surface (`ws.mcp.*` — bridge/hooks, no wire method) -----------
@@ -1827,6 +1963,13 @@ impl<'a> McpServersService<'a> {
                 "mcp: disabled in settings (agentFeatures.mcpTools = false)".to_string(),
             ));
         }
+        Self::require_user_servers(settings)
+    }
+
+    /// The `mcp.enableUserServers` master switch alone: the gate on the
+    /// servers a provider gets, which `agentFeatures.mcpTools` (the
+    /// `ws.mcp` toggle) does not gate.
+    fn require_user_servers(settings: SettingsFile) -> Result<SettingsFile> {
         if !enable_user_servers(&settings) {
             return Err(Error::InvalidParams(
                 "mcp: user servers disabled in settings (mcp.enableUserServers = false)"
@@ -1847,6 +1990,19 @@ impl<'a> McpServersService<'a> {
         server_id: &str,
     ) -> Result<()> {
         let settings = self.require_agent_mcp()?;
+        self.require_enabled_server(settings, workspace_id, server_id)
+            .await
+            .map(|_| ())
+    }
+
+    /// The per-server half of [`Self::require_agent_server`]; the server's
+    /// config when it passes.
+    async fn require_enabled_server(
+        &self,
+        settings: SettingsFile,
+        workspace_id: Option<&str>,
+        server_id: &str,
+    ) -> Result<Value> {
         let config = self.require_config(server_id).await?;
         let enabled = config
             .get("enabled")
@@ -1862,7 +2018,105 @@ impl<'a> McpServersService<'a> {
                 "mcp server {server_id} is disabled for this workspace"
             )));
         }
-        Ok(())
+        Ok(config)
+    }
+
+    /// The user MCP servers a remote agent of `workspace_id` gets proxied to
+    /// this hub (nodeProtocol 11): the servers a local agent's spawn merges
+    /// (`mcp.enableUserServers` on, `enabled`, not in `mcp.disabledServers`,
+    /// a usable `command` or `url`, not the reserved `workspace-mcp`), less
+    /// those disabled for the workspace and `sse` ones (the hub calls no
+    /// tools over `sse`), sorted by name; on a repeated name
+    /// the last config wins, as at a local spawn. Names and ids only.
+    pub(crate) async fn remote_proxies(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<intent_core::node_link::McpProxy>> {
+        let settings = self.effective();
+        if !enable_user_servers(&settings) {
+            return Ok(Vec::new());
+        }
+        let disabled = disabled_servers(&settings);
+        let ws_disabled = self.workspace_disabled_ids(Some(workspace_id)).await?;
+        let mut named = std::collections::BTreeMap::new();
+        for (id, config) in &read_configs(self.secrets).await {
+            let Some(obj) = config.as_object() else {
+                continue;
+            };
+            let text = |key: &str| {
+                obj.get(key)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+            };
+            // The hub calls no tools over `sse`, so it is not offered.
+            let usable = match text("transport").unwrap_or("stdio") {
+                "http" => text("url").is_some(),
+                "sse" => false,
+                _ => text("command").is_some(),
+            };
+            if !usable
+                || !obj.get("enabled").and_then(Value::as_bool).unwrap_or(false)
+                || disabled.contains(id)
+                || ws_disabled.contains(id)
+            {
+                continue;
+            }
+            let name = text("name").unwrap_or(id.as_str());
+            if name == RESERVED_SERVER_NAME {
+                continue;
+            }
+            named.insert(name.to_owned(), id.clone());
+        }
+        Ok(named
+            .into_iter()
+            .map(|(name, server_id)| intent_core::node_link::McpProxy { name, server_id })
+            .collect())
+    }
+
+    /// The gates on a remote agent's proxied request to `server_id`: the
+    /// launch's server gates read again (not `agentFeatures.mcpTools`), then
+    /// the hub must be running it. The server's display name when it passes.
+    async fn require_proxy_server(&self, workspace_id: &str, server_id: &str) -> Result<String> {
+        let settings = Self::require_user_servers(self.effective())?;
+        let config = self
+            .require_enabled_server(settings, Some(workspace_id), server_id)
+            .await?;
+        let name = config
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(server_id)
+            .to_owned();
+        if !self.hub.is_running(server_id) {
+            return Err(Error::InvalidParams(format!(
+                "mcp-proxy-unavailable: MCP server {name} is not running on the backend. Start it in Settings → MCP servers."
+            )));
+        }
+        Ok(name)
+    }
+
+    /// A remote agent's proxied `tools/list`: the raw MCP result.
+    pub(crate) async fn proxy_list_tools(
+        &self,
+        workspace_id: &str,
+        server_id: &str,
+    ) -> Result<Value> {
+        self.require_proxy_server(workspace_id, server_id).await?;
+        self.hub.list_tools(server_id).await
+    }
+
+    /// A remote agent's proxied `tools/call`, bounded by
+    /// [`PROXY_TOOL_TIMEOUT`]: the raw MCP result and the server's name.
+    pub(crate) async fn proxy_call_tool(
+        &self,
+        workspace_id: &str,
+        server_id: &str,
+        tool_name: &str,
+        args: Value,
+    ) -> Result<(Value, String)> {
+        let name = self.require_proxy_server(workspace_id, server_id).await?;
+        let result = self.hub.proxy_call_tool(server_id, tool_name, args).await?;
+        Ok((result, name))
     }
 
     /// `ws.mcp.listServers`: every configured server projected to a
@@ -1875,7 +2129,7 @@ impl<'a> McpServersService<'a> {
     pub(crate) async fn agent_list_servers(&self, workspace_id: Option<&str>) -> Result<Value> {
         self.require_agent_mcp()?;
         let ws_disabled = self.workspace_disabled_ids(workspace_id).await?;
-        let configs = read_configs(self.secrets).await;
+        let configs = read_all_configs(self.secrets, &disabled_servers(&self.effective())).await;
         let mut servers: Vec<Value> = configs
             .values()
             .map(|config| {
@@ -2419,17 +2673,23 @@ for line in sys.stdin:
             starts.push(tokio::spawn(
                 async move { worker.start(config, true).await },
             ));
-            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (stream, _) = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let (read, write) = stream.into_split();
             let mut reader = tokio::io::BufReader::new(read);
             let mut line = String::new();
-            tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                reader.read_line(&mut line),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let pids: Vec<i32> = line
                 .split_whitespace()
                 .map(|pid| pid.parse().unwrap())
@@ -2444,34 +2704,42 @@ for line in sys.stdin:
         // B registers while A is still positively held in initialize.
         controls[1].write_all(b"x").await.unwrap();
         let second = starts.pop().unwrap();
-        let second_status = tokio::time::timeout(Duration::from_secs(5), second)
-            .await
-            .unwrap()
-            .unwrap();
+        let second_status = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            second,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(second_status["state"], "running");
         assert_eq!(hub.status("overlap")["pid"], cleanup.0[2]);
         controls[0].write_all(b"x").await.unwrap();
-        let first_status = tokio::time::timeout(Duration::from_secs(5), starts.pop().unwrap())
-            .await
-            .unwrap()
-            .unwrap();
+        let first_status = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            starts.pop().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(first_status["state"], "running");
         hub.begin_background_shutdown();
         hub.shutdown().await;
-        let settled = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if cleanup
-                    .0
-                    .iter()
-                    .all(|pid| kill(Pid::from_raw(*pid), None) == Err(nix::errno::Errno::ESRCH))
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .is_ok();
+        let settled =
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(1)),
+                async {
+                    loop {
+                        if cleanup.0.iter().all(|pid| {
+                            kill(Pid::from_raw(*pid), None) == Err(nix::errno::Errno::ESRCH)
+                        }) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                },
+            )
+            .await
+            .is_ok();
         assert!(
             settled,
             "overlapping MCP starts discarded a child or descendant before reap"
@@ -2520,10 +2788,13 @@ for line in sys.stdin:
         let mut monitor = hub.spawn_health_monitor_with_interval(Duration::from_millis(1));
         let mut reader = tokio::io::BufReader::new(read);
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            reader.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let request: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(request["method"], "ping");
         let response = json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32603,"message":"controlled ping failure"}});
@@ -2531,9 +2802,12 @@ for line in sys.stdin:
             .write_all(format!("{response}\n").as_bytes())
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), park.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            park.entered.notified(),
+        )
+        .await
+        .unwrap();
         assert!(!hub
             .inner
             .servers
@@ -2549,10 +2823,13 @@ for line in sys.stdin:
         .await;
         assert!(pending, "health monitor discarded a removed child");
         park.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), monitor)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            monitor,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         hub.shutdown().await;
         assert_eq!(
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None),
@@ -2590,10 +2867,13 @@ for line in sys.stdin:
         hub.begin_background_shutdown();
         svc(None, &secrets, &hub).start_enabled().await;
         let monitor = hub.spawn_health_monitor();
-        tokio::time::timeout(Duration::from_secs(1), monitor)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            monitor,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         hub.shutdown().await;
         bus.shutdown().await.unwrap();
         assert!(store
@@ -2634,10 +2914,13 @@ for line in sys.stdin:
         let status = status_value("s1", "running", Some(7), Some(2), None, Some(99));
         h.publish_status(&status).await;
 
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         assert_eq!(batch.len(), 1);
         let ev = &batch[0];
         assert_eq!(ev.event_type, MCP_SERVERS_STATUS_CHANGED);
@@ -3436,6 +3719,100 @@ for line in sys.stdin:
         }
     }
 
+    /// Remote parity S4: a remote agent's provider is offered the servers a
+    /// local agent's spawn merges, less those disabled for its workspace;
+    /// names and ids only, sorted by name.
+    #[tokio::test]
+    async fn remote_proxies_are_a_local_agents_servers_less_the_workspace_disabled() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let (_tmp, store, ws_id) = store_with_workspace().await;
+        reg.apply(&[("mcp.disabledServers".to_string(), json!(["g"]))])
+            .unwrap();
+        let s = svc_with_store(Some(&reg), &secrets, &h, &store);
+        for config in [
+            json!({ "id": "a", "name": "Zed", "transport": "stdio", "command": "x", "enabled": true }),
+            json!({ "id": "b", "name": "Off", "transport": "stdio", "command": "x", "enabled": false }),
+            json!({ "id": "g", "name": "Global", "transport": "stdio", "command": "x", "enabled": true }),
+            json!({ "id": "w", "name": "Here", "transport": "stdio", "command": "x", "enabled": true }),
+            json!({ "id": "r", "name": "workspace-mcp", "transport": "stdio", "command": "x", "enabled": true }),
+            json!({ "id": "h", "name": "Alpha", "transport": "http", "url": "http://127.0.0.1:9/mcp", "enabled": true }),
+            json!({ "id": "s", "name": "Streamed", "transport": "sse", "url": "http://127.0.0.1:9/sse", "enabled": true }),
+        ] {
+            s.create(config).await.unwrap();
+        }
+        s.toggle_workspace(&ws_id, "w", false).await.unwrap();
+        let proxies = s.remote_proxies(&ws_id).await.unwrap();
+        let pairs: Vec<(&str, &str)> = proxies
+            .iter()
+            .map(|p| (p.name.as_str(), p.server_id.as_str()))
+            .collect();
+        assert_eq!(pairs, [("Alpha", "h"), ("Zed", "a")]);
+        // Another workspace still gets the workspace-disabled one.
+        let elsewhere = s.remote_proxies("ws-other").await.unwrap();
+        assert!(elsewhere.iter().any(|p| p.server_id == "w"));
+        reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
+            .unwrap();
+        assert!(s.remote_proxies(&ws_id).await.unwrap().is_empty());
+    }
+
+    /// A provider's proxied request is not gated by `agentFeatures.mcpTools`
+    /// (the `ws.mcp` toggle; a local provider gets its servers regardless),
+    /// but keeps every server gate, read per call, and names a server the
+    /// hub is not running.
+    #[tokio::test]
+    async fn proxied_requests_keep_the_server_gates_but_not_the_ws_mcp_toggle() {
+        let (reg, _cfg) = temp_registry();
+        let secrets = mem_async();
+        let h = McpHub::new();
+        let (_tmp, store, ws_id) = store_with_workspace().await;
+        reg.apply(&[("agentFeatures.mcpTools".to_string(), json!(false))])
+            .unwrap();
+        let s = svc_with_store(Some(&reg), &secrets, &h, &store);
+        for config in [
+            json!({ "id": "a", "name": "Alpha", "transport": "stdio", "command": "x", "enabled": true }),
+            json!({ "id": "b", "transport": "stdio", "command": "x", "enabled": false }),
+            json!({ "id": "w", "transport": "stdio", "command": "x", "enabled": true }),
+        ] {
+            s.create(config).await.unwrap();
+        }
+        s.toggle_workspace(&ws_id, "w", false).await.unwrap();
+        let error = s
+            .proxy_list_tools(&ws_id, "a")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("mcp-proxy-unavailable: MCP server Alpha is not running on the backend. Start it in Settings → MCP servers."),
+            "{error}"
+        );
+        let error = s
+            .proxy_call_tool(&ws_id, "b", "t", json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mcp server b is disabled"), "{error}");
+        let error = s
+            .proxy_list_tools(&ws_id, "w")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("disabled for this workspace"), "{error}");
+        assert!(matches!(
+            s.proxy_list_tools(&ws_id, "nope").await.unwrap_err(),
+            Error::NotFound(_)
+        ));
+        reg.apply(&[("mcp.enableUserServers".to_string(), json!(false))])
+            .unwrap();
+        let error = s
+            .proxy_list_tools(&ws_id, "a")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mcp.enableUserServers"), "{error}");
+    }
+
     #[tokio::test]
     async fn agent_surface_rejected_when_mcp_tools_toggle_off() {
         let (reg, _cfg) = temp_registry();
@@ -3676,19 +4053,25 @@ for line in sys.stdin:
         let status = h.start(remote_cfg("r-flip", "http", &url), true).await;
         assert_eq!(status["state"], json!("running"));
         // Drain the `running` event.
-        let _ = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("running event")
-            .expect("subscription open");
+        let _ = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("running event")
+        .expect("subscription open");
 
         guard.abort(); // stub gone → next probe fails
         let _ = guard.await; // listener provably dropped before the re-probe
         h.health_tick().await;
         assert_eq!(h.status("r-flip")["state"], json!("error"));
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("error event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("error event delivered")
+        .expect("subscription open");
         let data = serde_json::to_value(&batch[0].data).unwrap();
         assert_eq!(data["serverId"], json!("r-flip"));
         assert_eq!(data["status"]["state"], json!("error"));
@@ -3709,10 +4092,13 @@ for line in sys.stdin:
 
         let started = h.start(remote_cfg("r-same", "http", &url), true).await;
         assert_eq!(started["state"], json!("running"));
-        let _ = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("running event")
-            .expect("subscription open");
+        let _ = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("running event")
+        .expect("subscription open");
         let started_at = started["startedAt"].clone();
 
         h.health_tick().await;
@@ -3721,9 +4107,12 @@ for line in sys.stdin:
         assert_eq!(now["state"], json!("running"));
         assert_eq!(now["startedAt"], started_at);
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), sub.recv())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(300)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event on an unchanged state"
         );
     }
@@ -4122,7 +4511,9 @@ for line in sys.stdin:
         });
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(200))
+            .timeout(intentd_test_support::test_timeout(Duration::from_millis(
+                200,
+            )))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
@@ -4313,9 +4704,12 @@ for line in sys.stdin:
         assert_eq!(result["content"][0]["text"], json!("ok"));
         // An answered call is followed by nothing — no stray cancel.
         let mut extra = String::new();
-        let quiet = tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut extra))
-            .await
-            .is_err();
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            reader.read_line(&mut extra),
+        )
+        .await
+        .is_err();
         assert!(quiet, "unexpected line after the answered call: {extra}");
     }
 
@@ -4727,14 +5121,16 @@ for line in sys.stdin:
         assert_eq!(scrub_url("not a url"), "<configured url>");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn http_tool_session_request_bound_tracks_caller_timeout() {
         // The session's per-request client timeout must be the caller's
         // timeout, not the fixed 10s HANDSHAKE_TIMEOUT — otherwise a slow
         // HTTP tool silently caps at ~10s regardless of `timeoutMs`. A
         // never-answering listener + a short session timeout proves the
         // request bound follows the parameter: with the old fixed bound this
-        // would take the full 10s.
+        // would take the full 10s. The clock is paused, so the request timer
+        // fires as soon as the runtime idles and `elapsed` is the virtual
+        // time to the first timer that ended the session.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let hold = tokio::spawn(async move {
@@ -4757,7 +5153,8 @@ for line in sys.stdin:
         let msg = format!("{err}");
         assert!(msg.contains("timed out"), "got: {msg}");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            // elapsed-assert: allow — paused tokio clock: the elapsed time is virtual, so it names the timer that fired, not host speed
+            started.elapsed() < HANDSHAKE_TIMEOUT,
             "request bound did not track the caller timeout: {:?}",
             started.elapsed()
         );
@@ -4776,7 +5173,9 @@ for line in sys.stdin:
             }
         });
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(100))
+            .timeout(intentd_test_support::test_timeout(Duration::from_millis(
+                100,
+            )))
             .build()
             .unwrap();
         let e = client.post(&url).send().await.unwrap_err();

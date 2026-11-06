@@ -2,23 +2,21 @@
 //!
 //! Drives real MCP tool invocations through the `workspace_api` tool with the
 //! mock-acp-agent.mjs fixture, asserting:
-//! - ws.app.workspaces.list returns user workspaces (never __chief__)
+//! - ws.app.workspaces.list returns user workspaces (never __chief__), and
+//!   ws.app.workspaces.search finds one by title
 //! - ws.app.agents.list returns agent metadata
 //! - ws.app.proposal.show persists application/vnd.intent.proposal+json resource
 //! - Non-chief workspace agents are gated from ws.app.*
 //!
 //! Pattern: reuses the harness from `e2e_mock_agent_workspace_api_bindings.rs`.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use intent_acp::{EventSink, SpawnOptions};
-use intent_core::{
-    now_iso, AgentId, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus, CHIEF_WORKSPACE_ID,
-};
+use intent_core::{now_iso, AgentId, Workspace, WorkspaceApi, WorkspaceId, CHIEF_WORKSPACE_ID};
 use intent_providers::ProviderConfig;
 use intent_services::{AgentManager, BusEventSink, EventBus, Services, SubscriptionFilter};
 use intent_store::Store;
@@ -30,49 +28,11 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>, title: &str) ->
         id: id.clone(),
         title: title.to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
         path: path.as_ref().map(|p| p.to_string_lossy().to_string()),
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
         worktree_path: path.map(|p| p.to_string_lossy().to_string()),
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -105,7 +65,7 @@ async fn chief_agent_ws_app_workspaces_list() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
@@ -159,7 +119,8 @@ async fn chief_agent_ws_app_workspaces_list() {
     // Call ws.app.workspaces.list via MCP
     let js = r"
         const result = await ws.app.workspaces.list({});
-        return { workspaces: result };
+        const found = await ws.app.workspaces.search('indigo');
+        return { workspaces: result, found };
     ";
 
     let behavior = json!({
@@ -268,6 +229,14 @@ async fn chief_agent_ws_app_workspaces_list() {
             .any(|w| w["id"] == json!(CHIEF_WORKSPACE_ID)),
         "Expected __chief__ to be excluded from list"
     );
+    // ws.app.workspaces.search reaches the daemon through the same bridge.
+    let found = output_json["found"]["matches"]
+        .as_array()
+        .expect("search matches");
+    assert_eq!(found.len(), 1, "{}", output_json["found"]);
+    assert_eq!(found[0]["id"], json!(ws2.as_str()));
+    assert_eq!(found[0]["matchedOn"], json!(["title"]));
+    assert!(found[0]["markdownLink"].is_string(), "{}", found[0]);
 
     manager.shutdown().await;
 }
@@ -284,7 +253,7 @@ async fn chief_agent_ws_app_proposal_resource_persisted() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
@@ -455,7 +424,7 @@ async fn chief_agent_ws_app_proposal_lifted_from_collapsed_output() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
@@ -626,7 +595,7 @@ async fn chief_agent_ws_app_proposal_attached_from_garbled_output() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
@@ -800,7 +769,7 @@ async fn chief_agent_ws_app_proposal_attached_when_js_discards_envelope() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
@@ -976,7 +945,7 @@ async fn chief_agent_ws_app_proposal_attached_on_auggie_shaped_tool_call() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());
@@ -1081,7 +1050,8 @@ async fn chief_agent_ws_app_proposal_attached_on_auggie_shaped_tool_call() {
     // The completed `agent:tool:call` event: recorded as the daemon's own
     // `workspace_api` tool (not the prose summary) and carrying the claimed
     // batch + the materialized proposal block ids.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
     let mut completed = None;
     while completed.is_none() {
         let batch = tokio::time::timeout_at(deadline, tool_events.recv())
@@ -1203,7 +1173,7 @@ async fn non_chief_agent_ws_app_gating_error() {
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_workspaces_root(ws_root.path().to_path_buf())
         .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
         .with_event_bus(bus.clone());

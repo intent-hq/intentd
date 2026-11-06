@@ -9,7 +9,10 @@
 //! changes, a merge is pending (scoped commits are refused mid-merge,
 //! monorepo#4223), the session opted out via `skip_auto_commit`, or the
 //! `agent:idle` finish reason is non-normal (`error`/`cancelled`/
-//! `provider_stopped`/`refusal`).
+//! `provider_stopped`/`refusal`), or the workspace is a plain folder
+//! (§5.1, no git features). A checkout folder that is missing on disk
+//! skips the commit with one transition warning instead of one per idle
+//! (intent-hq/intent#7183, [`crate::worktree_presence`]).
 //!
 //! Commit-message generation is bounded by [`GENERATION_TIMEOUT_MS`] and,
 //! after a timeout, skipped for the workspace for [`GENERATION_COOLDOWN_MS`]
@@ -257,7 +260,7 @@ impl Services {
         }
         // Load the idle session. A best-effort lookup: a missing session (e.g.,
         // racing delete) is not an auto-commit error — just log and skip.
-        let session = match self.store().get_agent_session(&agent_id).await {
+        let session = match self.store().get_agent_session_summary(&agent_id).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!(
@@ -282,7 +285,20 @@ impl Services {
         // (worktreePath → repositoryPath), so skipping here would be the
         // only thing blocking auto-commit for them.
         let worktree_path = match self.store().get_workspace(&session.workspace_id).await {
+            // Plain folders have no git features (§5.1): never commit, even
+            // when the folder later gained a `.git`.
+            Ok(ws) if ws.plain_folder => {
+                tracing::debug!(
+                    agent = %agent_id.0,
+                    workspace = %session.workspace_id.0,
+                    "auto-commit skipped: plain-folder workspace"
+                );
+                return;
+            }
             Ok(ws) => {
+                if ws.checkout_mode.is_some() {
+                    self.worktree_presence.mark_git(&ws.id);
+                }
                 if let Some(p) = ws.effective_path().map(PathBuf::from) {
                     p
                 } else {
@@ -304,6 +320,17 @@ impl Services {
                 return;
             }
         };
+
+        // A checkout deleted or unmounted outside Intent (intent-hq/intent#7183):
+        // skip before generation and `git_agent_commit`. The presence map logs
+        // one warning on the transition, so repeated wakes into such a
+        // workspace stay quiet, and the first idle after it reappears resumes.
+        if !self
+            .worktree_presence
+            .observe(&session.workspace_id, &worktree_path)
+        {
+            return;
+        }
 
         let linked_note_id = session.task_note_id.clone();
         // Attempt LLM generation; fall back to deterministic subject on any failure.

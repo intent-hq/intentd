@@ -155,26 +155,29 @@ async fn subscribe_identity(h: &Harness) -> Ws {
 }
 
 pub(super) async fn identity_event(ws: &mut Ws, wanted: &str) -> Value {
-    timeout(Duration::from_secs(20), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(t))) => {
-                    let v: Value = serde_json::from_str(&t).unwrap();
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "identity:auth-changed"
-                        && v["params"]["event"]["data"]["status"] == wanted
-                    {
-                        assert_eq!(v["jsonrpc"], "2.0");
-                        return v["params"]["event"]["data"].clone();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) => {
+                        let v: Value = serde_json::from_str(&t).unwrap();
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "identity:auth-changed"
+                            && v["params"]["event"]["data"]["status"] == wanted
+                        {
+                            assert_eq!(v["jsonrpc"], "2.0");
+                            return v["params"]["event"]["data"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        ws.send(Message::Pong(p)).await.unwrap();
+                    }
+                    _ => {}
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    ws.send(Message::Pong(p)).await.unwrap();
-                }
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await
     .expect("identity event")
 }
@@ -506,19 +509,22 @@ async fn collaboration_select_cannot_overtake_newer_explicit_choice_and_emits_id
     state.release_user.notify_one();
     let v = old.await.unwrap();
     assert_eq!(v["error"]["data"]["code"], "identity-mismatch", "{v}");
-    let event = timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(Ok(Message::Text(t))) = sub.next().await {
-                let v: Value = serde_json::from_str(&t).unwrap();
-                if v["method"] == "events.event"
-                    && v["params"]["event"]["type"] == "principal:identity-changed"
-                {
-                    assert_eq!(v["jsonrpc"], "2.0");
-                    break v["params"]["event"]["data"].clone();
+    let event = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Some(Ok(Message::Text(t))) = sub.next().await {
+                    let v: Value = serde_json::from_str(&t).unwrap();
+                    if v["method"] == "events.event"
+                        && v["params"]["event"]["type"] == "principal:identity-changed"
+                    {
+                        assert_eq!(v["jsonrpc"], "2.0");
+                        break v["params"]["event"]["data"].clone();
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("selection event");
     assert_eq!(event["principalId"], selected["result"]["principal"]["id"]);

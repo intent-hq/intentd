@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/note_write_lock_clone.rs:2:5
+  |
+1 | fn forbidden(lock: &intent_store::NoteWriteLock) -> intent_store::NoteWriteLock {
+  |                                                     --------------------------- expected `NoteWriteLock` because of return type
+2 |     lock.clone()
+  |     ^^^^^^^^^^^^ expected `NoteWriteLock`, found `&NoteWriteLock`
+  |
+note: `NoteWriteLock` does not implement `Clone`, so `&NoteWriteLock` was cloned instead
+ --> tests/ui/note_write_lock_clone.rs:2:5
+  |
+2 |     lock.clone()
+  |     ^^^^

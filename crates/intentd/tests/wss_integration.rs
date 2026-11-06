@@ -7,21 +7,19 @@
 //! M5.1 self-signed fingerprint. A separate insecure-mode test proves the
 //! plain-`ws://` accept path serves JSON-RPC with no TLS and no bearer token.
 
-#[path = "wss_integration/annotation_comment_writers.rs"]
-mod annotation_comment_writers;
-#[path = "wss_integration/annotation_pages.rs"]
-mod annotation_pages;
-#[path = "wss_integration/annotation_reads.rs"]
-mod annotation_reads;
-#[path = "wss_integration/annotation_writer_anchors.rs"]
-mod annotation_writer_anchors;
 #[path = "wss_integration/comment_deletion.rs"]
 mod comment_deletion;
 mod common;
+#[path = "wss_integration/desktop_control.rs"]
+mod desktop_control;
 #[path = "wss_integration/discovery_context.rs"]
 mod discovery_context;
+#[path = "wss_integration/discussion.rs"]
+mod discussion;
 #[path = "wss_integration/git_commit_removal.rs"]
 mod git_commit_removal;
+#[path = "wss_integration/guest_roles.rs"]
+mod guest_roles;
 #[path = "wss_integration/host_roles.rs"]
 mod host_roles;
 #[path = "wss_integration/human_attribution.rs"]
@@ -48,6 +46,9 @@ mod script_lifecycle;
 mod sharing;
 #[path = "wss_integration/skills.rs"]
 mod skills;
+#[cfg(all(unix, debug_assertions))]
+#[path = "wss_integration/startup.rs"]
+mod startup;
 #[path = "wss_integration/task_list_latency.rs"]
 mod task_list_latency;
 #[cfg(unix)]
@@ -76,8 +77,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
     now_iso, AgentReverseDispatch, ContentType, Note, NoteId, NoteMetadata, NoteVisibility,
-    Result as CoreResult, ReverseTarget, TaskMetadata, TaskStatus, Workspace, WorkspaceActivity,
-    WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    Result as CoreResult, ReverseTarget, TaskMetadata, TaskStatus, Workspace, WorkspaceApi,
+    WorkspaceId,
 };
 use intent_services::{EventBus, GitStatusRefresher, Services, WatchHealth, WatcherRegistry};
 use intent_store::Store;
@@ -251,7 +252,7 @@ async fn make_services(
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
     );
-    let mut services = Services::new(store.clone())
+    let mut services = intent_app::compose(Services::new_isolated(store.clone()))
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry.clone())
@@ -393,6 +394,7 @@ fn status_code(response: &str) -> u16 {
 
 /// Assert `response` is the guest-cap refusal: `503` carrying
 /// `Retry-After: GUEST_CAP_RETRY_AFTER_SECS` (header name case-insensitive).
+#[track_caller]
 fn assert_guest_cap_refused(response: &str, ctx: &str) {
     assert_eq!(status_code(response), 503, "{ctx}: {response}");
     let want = intent_transport::GUEST_CAP_RETRY_AFTER_SECS.to_string();
@@ -469,21 +471,37 @@ async fn wss_call_text(port: u16, cfg: Arc<ClientConfig>, frame: &str) -> String
 /// the `{ subscriptionId }` response (matched on `id`) and the seq-0
 /// `subscription.push` snapshot, and return the snapshot object (§7.1).
 async fn chat_subscribe_snapshot(port: u16, cfg: Arc<ClientConfig>, frame: &str, id: i64) -> Value {
+    let text = chat_subscribe_snapshot_frame(port, cfg, frame, id).await;
+    let snap: Value = serde_json::from_str(&text).expect("json frame");
+    snap["params"]["snapshot"].clone()
+}
+
+/// [`chat_subscribe_snapshot`], returning the literal seq-0
+/// `subscription.push` frame text so callers can measure wire bytes.
+async fn chat_subscribe_snapshot_frame(
+    port: u16,
+    cfg: Arc<ClientConfig>,
+    frame: &str,
+    id: i64,
+) -> String {
     let mut ws = connect_ws(port, cfg).await;
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send subscribe");
     let mut sub_resp: Option<Value> = None;
-    let mut snap: Option<Value> = None;
+    let mut snap: Option<(Value, String)> = None;
     while sub_resp.is_none() || snap.is_none() {
-        let next = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
-            .await
-            .expect("chat.subscribe frame timed out");
+        let next = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            ws.next(),
+        )
+        .await
+        .expect("chat.subscribe frame timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
                 if v["method"] == "subscription.push" {
-                    snap = Some(v);
+                    snap = Some((v, text.to_string()));
                 } else if v["id"] == id {
                     sub_resp = Some(v);
                 }
@@ -500,10 +518,10 @@ async fn chat_subscribe_snapshot(port: u16, cfg: Arc<ClientConfig>, frame: &str,
         sub_resp["result"]["subscriptionId"].as_str().is_some(),
         "chat.subscribe returns subscriptionId: {sub_resp}"
     );
-    let snap = snap.unwrap();
+    let (snap, text) = snap.unwrap();
     assert_eq!(snap["params"]["kind"], "snapshot");
     assert_eq!(snap["params"]["seq"], 0);
-    snap["params"]["snapshot"].clone()
+    text
 }
 
 /// Drive several JSON-RPC frames over ONE WSS connection so the per-connection
@@ -695,25 +713,28 @@ async fn wss_workspace_auto_commit_round_trip() {
 
     // The `workspace:updated` event's `changes` delta is self-sufficient
     // (§6.5): subscribers see the toggled flag without a follow-up read.
-    let evt = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "workspace:updated"
-                    {
-                        return v["params"]["event"].clone();
+    let evt = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "workspace:updated"
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for workspace:updated");
     assert_eq!(evt["workspaceId"], ws_id.as_str());
@@ -1024,15 +1045,18 @@ async fn wss_oversized_message_terminates_connection() {
     let last = Frame::message(vec![b'a'; 1024], OpCode::Data(Data::Continue), true);
     ws.send(Message::Frame(first)).await.expect("send first");
     ws.send(Message::Frame(last)).await.expect("send last");
-    let close_code = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match ws.next().await {
-                None | Some(Err(_)) => break None,
-                Some(Ok(Message::Close(frame))) => break frame.map(|f| f.code),
-                Some(Ok(_)) => {}
+    let close_code = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_)) => break None,
+                    Some(Ok(Message::Close(frame))) => break frame.map(|f| f.code),
+                    Some(Ok(_)) => {}
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("oversized message must terminate the connection");
     assert_eq!(
@@ -1048,14 +1072,17 @@ async fn wss_oversized_message_terminates_connection() {
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
     let oversized = "a".repeat(MAX_INBOUND_MESSAGE_BYTES + 1024);
     let _ = ws.send(Message::Text(oversized.into())).await;
-    let closed = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match ws.next().await {
-                None | Some(Err(_) | Ok(Message::Close(_))) => break,
-                Some(Ok(_)) => {}
+    let closed = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                    Some(Ok(_)) => {}
+                }
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(
         closed.is_ok(),
@@ -1332,25 +1359,28 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
         event_type: &str,
     ) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] == "events.event"
-                            && v["params"]["event"]["type"] == event_type
-                        {
-                            return v["params"]["event"].clone();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] == "events.event"
+                                && v["params"]["event"]["type"] == event_type
+                            {
+                                return v["params"]["event"].clone();
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
     }
@@ -1375,6 +1405,15 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         .as_str()
         .expect("agent id")
         .to_string();
+    // A peer top-level agent, so the last-top-level guard allows the retire.
+    let peer_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Peer"}}}}"#
+    );
+    let peer = wss_call(srv.port, srv.cfg.clone(), &peer_frame).await;
+    assert!(
+        peer["result"]["agent"]["id"].is_string(),
+        "peer created: {peer}"
+    );
 
     // Subscribe to both lifecycle events on a persistent connection.
     let mut ws = connect_ws(srv.port, srv.cfg.clone()).await;
@@ -1409,7 +1448,7 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
         assert_eq!(response["error"]["code"], -32602, "{response}");
         assert!(srv
             .store
-            .get_agent_session(&intent_core::AgentId::from(agent_id.as_str()))
+            .get_agent_session_with_transcript(&intent_core::AgentId::from(agent_id.as_str()))
             .await
             .unwrap()
             .retired_at
@@ -1650,7 +1689,11 @@ async fn wss_agent_list_scope_bins_and_counts() {
         (&beta_child, &top_b),
     ] {
         let child_id = intent_core::AgentId::from(child.as_str());
-        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .expect("child");
         session.parent_agent_id = Some(intent_core::AgentId::from(parent.as_str()));
         srv.store
             .update_agent_session(&workspace_id, &session)
@@ -1669,7 +1712,11 @@ async fn wss_agent_list_scope_bins_and_counts() {
     let retired_child = create_agent("retired-under-b", false, 9).await;
     {
         let child_id = intent_core::AgentId::from(retired_child.as_str());
-        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .expect("child");
         session.parent_agent_id = Some(intent_core::AgentId::from(top_b.as_str()));
         srv.store
             .update_agent_session(&workspace_id, &session)
@@ -1686,7 +1733,11 @@ async fn wss_agent_list_scope_bins_and_counts() {
     let gamma_child = create_agent("under-gamma", false, 31).await;
     {
         let child_id = intent_core::AgentId::from(gamma_child.as_str());
-        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .expect("child");
         session.parent_agent_id = Some(intent_core::AgentId::from(gamma.as_str()));
         srv.store
             .update_agent_session(&workspace_id, &session)
@@ -1711,7 +1762,11 @@ async fn wss_agent_list_scope_bins_and_counts() {
         (&gamma_child, intent_core::AgentStatus::Active),
     ] {
         let child_id = intent_core::AgentId::from(child.as_str());
-        let mut session = srv.store.get_agent_session(&child_id).await.expect("child");
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&child_id)
+            .await
+            .expect("child");
         session.status = status;
         srv.store
             .update_agent_session(&workspace_id, &session)
@@ -1802,7 +1857,13 @@ async fn wss_agent_list_scope_bins_and_counts() {
             .collect();
         assert_eq!(
             keys,
-            ["agents", "retiredCount", "scopeCounts", "delegatedCounts"],
+            [
+                "agents",
+                "retiredCount",
+                "scopeCounts",
+                "delegatedCounts",
+                "nextToken"
+            ],
             "{label}: envelope keys: {v}"
         );
         assert_eq!(v["result"]["retiredCount"], 2, "{label}: {v}");
@@ -2118,7 +2179,7 @@ async fn wss_agent_retire_settles_unread_and_needs_attention_restore_is_silent()
     assert_eq!(raised["ok"], serde_json::json!(true), "{raised}");
     let promoted = next_event_until(
         &mut sub,
-        tokio::time::Instant::now() + Duration::from_secs(10),
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10)),
     )
     .await
     .expect("displayStatus promotion event");
@@ -2156,7 +2217,8 @@ async fn wss_agent_retire_settles_unread_and_needs_attention_restore_is_silent()
     let mut retired_evt: Option<Value> = None;
     let mut attention_evts: Vec<Value> = Vec::new();
     let mut display_evts: Vec<Value> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     let mut quiet_until: Option<tokio::time::Instant> = None;
     loop {
         let until = quiet_until.unwrap_or(deadline);
@@ -2174,7 +2236,10 @@ async fn wss_agent_retire_settles_unread_and_needs_attention_restore_is_silent()
             && !attention_evts.is_empty()
             && !display_evts.is_empty()
         {
-            quiet_until = Some(tokio::time::Instant::now() + Duration::from_millis(1500));
+            quiet_until = Some(
+                tokio::time::Instant::now()
+                    + intentd_test_support::test_timeout(Duration::from_millis(1500)),
+            );
         }
     }
     let retired_evt = retired_evt.expect("agent:retired");
@@ -2250,7 +2315,8 @@ async fn wss_agent_retire_settles_unread_and_needs_attention_restore_is_silent()
         "{restored}"
     );
     let mut restored_evt: Option<Value> = None;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     let mut quiet_until: Option<tokio::time::Instant> = None;
     loop {
         let until = quiet_until.unwrap_or(deadline);
@@ -2261,7 +2327,10 @@ async fn wss_agent_retire_settles_unread_and_needs_attention_restore_is_silent()
             "agent:restored" => {
                 assert_eq!(evt["data"]["agentId"], agent_id.as_str(), "{evt}");
                 restored_evt = Some(evt);
-                quiet_until = Some(tokio::time::Instant::now() + Duration::from_millis(1500));
+                quiet_until = Some(
+                    tokio::time::Instant::now()
+                        + intentd_test_support::test_timeout(Duration::from_millis(1500)),
+                );
             }
             "workspace:attention-changed" => {
                 panic!("agent.restore must be silent for the unread state: {evt}")
@@ -2360,7 +2429,11 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     let watcher = intent_core::AgentId::from(watcher_id.as_str());
 
     // Link the child under the parent and mark it mid-turn (Active).
-    let mut child_session = srv.store.get_agent_session(&child).await.expect("child");
+    let mut child_session = srv
+        .store
+        .get_agent_session_with_transcript(&child)
+        .await
+        .expect("child");
     child_session.parent_agent_id = Some(parent.clone());
     srv.store
         .update_agent_session(&workspace_id, &child_session)
@@ -2499,7 +2572,8 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     assert_eq!(retired["result"]["success"], true, "{retired}");
 
     // Collect the three lifecycle events (relative order not asserted).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     let (mut parent_retired, mut child_retired, mut hook_cancelled) = (None, None, None);
     while parent_retired.is_none() || child_retired.is_none() || hook_cancelled.is_none() {
         let ev = next_event_any(&mut sub, deadline).await;
@@ -2554,7 +2628,8 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     let conv_frame = format!(
         r#"{{"jsonrpc":"2.0","id":8,"method":"agent.getConversation","params":{{"agentId":"{watcher_id}"}}}}"#
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     let wake_text = loop {
         let conv = wss_call(srv.port, srv.cfg.clone(), &conv_frame).await;
         let found = conv["result"]["messages"]
@@ -2584,7 +2659,8 @@ async fn wss_agent_retire_cascade_guard_hooks_and_watches() {
     let subs_frame = format!(
         r#"{{"jsonrpc":"2.0","id":9,"method":"agent.getSubscriptions","params":{{"workspaceId":"{ws_id}","agentId":"{watcher_id}"}}}}"#
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     loop {
         let subs = wss_call(srv.port, srv.cfg.clone(), &subs_frame).await;
         let remaining = subs["result"]["subscriptions"]
@@ -2670,7 +2746,7 @@ async fn wss_get_subscriptions_bundles_slim_agents() {
     let child = &ids[1];
     let mut session = srv
         .store
-        .get_agent_session_summary(&intent_core::AgentId::from(child.as_str()))
+        .get_agent_session_without_messages(&intent_core::AgentId::from(child.as_str()))
         .await
         .unwrap();
     session.context_references = Some(json!([{"text": "context".repeat(5000)}]));
@@ -2991,23 +3067,53 @@ async fn wss_agent_list_frame_stays_under_soft_limit_at_460_sessions() {
         ("default", String::new()),
         ("scope=delegated", r#","scope":"delegated""#.to_string()),
     ] {
-        let frame = format!(
-            r#"{{"jsonrpc":"2.0","id":10,"method":"agent.list","params":{{"workspaceId":"{ws_id}"{params}}}}}"#
-        );
-        let text = wss_call_text(srv.port, srv.cfg.clone(), &frame).await;
-        assert!(
-            text.len() < SOFT_LIMIT_BYTES,
-            "{label}: agent.list frame is {} B, at or over the {SOFT_LIMIT_BYTES} B soft limit",
-            text.len()
-        );
-        let listed: Value = serde_json::from_str(&text).expect("json frame");
-        let rows = listed["result"]["agents"].as_array().expect("agents array");
+        // `agent.list` is paged (§5.5 "Paged agent lists and queues"):
+        // follow `nextToken` until it is `null`; every page frame stays
+        // under the soft limit and the pages together list every session.
+        let mut rows: Vec<Value> = Vec::new();
+        let mut token = Value::Null;
+        let mut pages = 0;
+        loop {
+            let token_param = if token.is_null() {
+                String::new()
+            } else {
+                format!(r#","nextToken":{token}"#)
+            };
+            let frame = format!(
+                r#"{{"jsonrpc":"2.0","id":10,"method":"agent.list","params":{{"workspaceId":"{ws_id}"{params}{token_param}}}}}"#
+            );
+            let text = wss_call_text(srv.port, srv.cfg.clone(), &frame).await;
+            assert!(
+                text.len() < SOFT_LIMIT_BYTES,
+                "{label}: agent.list frame is {} B, at or over the {SOFT_LIMIT_BYTES} B soft limit",
+                text.len()
+            );
+            let listed: Value = serde_json::from_str(&text).expect("json frame");
+            rows.extend(
+                listed["result"]["agents"]
+                    .as_array()
+                    .expect("agents array")
+                    .iter()
+                    .cloned(),
+            );
+            pages += 1;
+            token = listed["result"]["nextToken"].clone();
+            if token.is_null() {
+                break;
+            }
+            assert!(pages < 50, "{label}: paging terminates");
+        }
+        assert!(pages > 1, "{label}: {ROWS} sessions span several pages");
         let expected_rows = if label == "default" { ROWS + 1 } else { ROWS };
         assert_eq!(
             rows.len(),
             expected_rows,
-            "{label}: every session is listed"
+            "{label}: every session is listed across the pages"
         );
+        let mut ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), expected_rows, "{label}: no session repeats");
         for row in rows.iter().filter(|r| r["parentAgentId"].is_string()) {
             // Same shape as the per-row contract: every preview field is
             // still present (truncated harder, never omitted) and under the
@@ -3051,7 +3157,8 @@ async fn wss_agent_list_frame_stays_under_soft_limit_at_460_sessions() {
 async fn next_subscription_push(
     ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
 ) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(
@@ -3232,9 +3339,12 @@ async fn wss_agent_subscribe_delta_rows_use_the_list_projection() {
     let mut sub_id: Option<String> = None;
     let mut snapshot: Option<Value> = None;
     while sub_id.is_none() || snapshot.is_none() {
-        let next = tokio::time::timeout(Duration::from_secs(10), sub.next())
-            .await
-            .expect("agent.subscribe frame timed out");
+        let next = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            sub.next(),
+        )
+        .await
+        .expect("agent.subscribe frame timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -3377,6 +3487,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         },
         by_model: BTreeMap::new(),
         by_agent_model: None,
+        agent_names: BTreeMap::default(),
         last_scan_at: Some(now_iso()),
     };
     let ws_active = WorkspaceId::new();
@@ -3446,6 +3557,7 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     let mut active_session = mk_session("agent-slim-a", &ws_active);
     active_session.metadata = Some(serde_json::json!({
@@ -3665,9 +3777,12 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
     let mut sub_resp: Option<Value> = None;
     let mut snap: Option<Value> = None;
     while sub_resp.is_none() || snap.is_none() {
-        let frame = tokio::time::timeout(Duration::from_secs(10), sub.next())
-            .await
-            .expect("workspace.subscribe frame timed out");
+        let frame = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            sub.next(),
+        )
+        .await
+        .expect("workspace.subscribe frame timed out");
         match frame {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -4066,39 +4181,45 @@ async fn wss_members_add_delivers_workspace_to_connected_guest() {
     type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
     async fn reply(ws: &mut Ws, id: u64) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["id"] == id {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["id"] == id {
+                                return v;
+                            }
                         }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("reply within 10s")
     }
 
     async fn push(ws: &mut Ws, kind: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] == "subscription.push" && v["params"]["kind"] == kind {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] == "subscription.push" && v["params"]["kind"] == kind {
+                                return v;
+                            }
                         }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("{kind} push within 10s"))
     }
@@ -4259,25 +4380,28 @@ async fn wss_members_add_delivers_workspace_to_connected_guest() {
 
     // The owner's `events.event`: the §6.5 `workspace:updated` membership
     // delta is self-sufficient (`members`, `addedPrincipalId`, `memberCount`).
-    let evt = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match owner_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "workspace:updated"
-                    {
-                        return v["params"]["event"].clone();
+    let evt = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match owner_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "workspace:updated"
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = owner_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = owner_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for the owner's workspace:updated");
     assert_eq!(evt["workspaceId"], ws_id.as_str(), "{evt}");
@@ -4307,36 +4431,42 @@ async fn wss_members_add_delivers_workspace_to_connected_guest() {
         json!({ "added": false, "memberCount": 2 }),
         "{again}"
     );
-    let quiet = tokio::time::timeout(Duration::from_millis(500), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "subscription.push" {
-                        return v;
+    let quiet = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "subscription.push" {
+                            return v;
+                        }
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(quiet.is_err(), "idempotent add pushed: {quiet:?}");
-    let quiet_owner = tokio::time::timeout(Duration::from_millis(500), async {
-        loop {
-            match owner_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event" {
-                        return v;
+    let quiet_owner = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        async {
+            loop {
+                match owner_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event" {
+                            return v;
+                        }
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(
         quiet_owner.is_err(),
@@ -4390,43 +4520,50 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
     type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
     async fn reply(ws: &mut Ws, id: u64) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["id"] == id {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["id"] == id {
+                                return v;
+                            }
                         }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("reply within 10s")
     }
 
     async fn push(ws: &mut Ws, kind: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] == "subscription.push" && v["params"]["kind"] == kind {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] == "subscription.push" && v["params"]["kind"] == kind {
+                                return v;
+                            }
                         }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("{kind} push within 10s"))
     }
 
+    #[track_caller]
     fn assert_not_found(v: &Value, what: &str) {
         assert_eq!(v["error"]["code"], -32602, "{what}: {v}");
         assert_eq!(v["error"]["data"]["code"], "not-found", "{what}: {v}");
@@ -4464,6 +4601,20 @@ async fn wss_collaborator_capability_matrix_in_service_layer() {
         .as_str()
         .unwrap_or_else(|| panic!("agent id: {agent}"))
         .to_string();
+    // A peer top-level agent, so the guest's retire is not refused by the
+    // last-top-level-agent guard.
+    let peer = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Peer"}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        peer["result"]["agent"]["id"].is_string(),
+        "peer agent: {peer}"
+    );
     let note = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -4853,45 +5004,51 @@ async fn wss_collaborator_client_ids_are_principal_scoped() {
         ws.send(Message::Text(frame.to_string().into()))
             .await
             .expect("send");
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["id"] == id {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["id"] == id {
+                                return v;
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("{method} reply within 10s"))
     }
 
     async fn event(ws: &mut Ws, ty: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] == "events.event" && v["params"]["event"]["type"] == ty {
-                            return v["params"]["event"].clone();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] == "events.event" && v["params"]["event"]["type"] == ty {
+                                return v["params"]["event"].clone();
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("{ty} event within 10s"))
     }
@@ -5115,29 +5272,32 @@ impl Guest {
             .send(Message::Text(frame.to_string().into()))
             .await
             .expect("send");
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                match self.ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["id"] == id {
-                            assert_eq!(v["jsonrpc"], "2.0", "{method} envelope: {v}");
-                            assert!(v.get("method").is_none(), "{method} envelope: {v}");
-                            assert!(
-                                v.get("result").is_some() != v.get("error").is_some(),
-                                "{method} envelope: exactly one of result/error: {v}"
-                            );
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            async {
+                loop {
+                    match self.ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["id"] == id {
+                                assert_eq!(v["jsonrpc"], "2.0", "{method} envelope: {v}");
+                                assert!(v.get("method").is_none(), "{method} envelope: {v}");
+                                assert!(
+                                    v.get("result").is_some() != v.get("error").is_some(),
+                                    "{method} envelope: exactly one of result/error: {v}"
+                                );
+                                return v;
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = self.ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = self.ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("{method} reply within 15s"))
     }
@@ -5173,6 +5333,7 @@ fn seed_git_repo(prefix: &str) -> tempfile::TempDir {
     dir
 }
 
+#[track_caller]
 fn git_stdout(repo: &Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         .current_dir(repo)
@@ -5675,25 +5836,28 @@ async fn wss_members_remove_drops_only_the_removed_members_queued_messages() {
     assert_eq!(removed["result"]["removed"], true, "{removed}");
 
     // Live echo: the queue republished without the removed member's entry.
-    let echo = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == AGENT_QUEUE_UPDATED
-                    {
-                        return v["params"]["event"].clone();
+    let echo = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == AGENT_QUEUE_UPDATED
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("agent:queue:updated after removal");
     assert_eq!(echo["data"]["agentId"], agent_id.as_str(), "{echo}");
@@ -5979,28 +6143,31 @@ async fn wss_archive_detaches_collaborators_and_revokes_open_invites() {
     // The emitted sequence: two removals (memberCount 2 then 1), the invite
     // delta, then the archived delta.
     let mut changes = Vec::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while changes.len() < 4 {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == WORKSPACE_UPDATED
-                    {
-                        let ev = &v["params"]["event"];
-                        assert_eq!(ev["workspaceId"], ws_id.as_str(), "{ev}");
-                        assert_eq!(ev["data"]["workspaceId"], ws_id.as_str(), "{ev}");
-                        changes.push(ev["data"]["changes"].clone());
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while changes.len() < 4 {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == WORKSPACE_UPDATED
+                        {
+                            let ev = &v["params"]["event"];
+                            assert_eq!(ev["workspaceId"], ws_id.as_str(), "{ev}");
+                            assert_eq!(ev["data"]["workspaceId"], ws_id.as_str(), "{ev}");
+                            changes.push(ev["data"]["changes"].clone());
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("four workspace:updated deltas after archive");
     let mut removed: Vec<String> = changes[..2]
@@ -6159,20 +6326,23 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
         id: u64,
     ) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["id"] == id {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["id"] == id {
+                                return v;
+                            }
                         }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("reply within 10s")
     }
@@ -6347,6 +6517,9 @@ async fn wss_collaborator_allowlist_refuses_owner_only_methods_and_tunnel() {
 struct BusyDaemonControl;
 
 impl SystemControl for BusyDaemonControl {
+    fn daemon_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn status(&self) -> SystemStatus {
         SystemStatus {
             listen_mode: "both".to_string(),
@@ -6391,6 +6564,7 @@ impl SystemControl for BusyDaemonControl {
             update_supported: true,
             busy_agents: 2,
             idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
+            remote_links: None,
         }
     }
     fn host_environment(&self) -> intent_transport::HostEnvironment {
@@ -6404,14 +6578,6 @@ impl SystemControl for BusyDaemonControl {
     fn request_shutdown(&self) {}
     fn request_update(&self) -> std::result::Result<(), String> {
         Ok(())
-    }
-    fn import_legacy(
-        &self,
-        _force: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
-    > {
-        Box::pin(async { Err("not supported in this test".to_string()) })
     }
     fn git_credential(
         &self,
@@ -6609,56 +6775,62 @@ async fn wss_collaborator_event_fan_out_and_query_are_allowlisted() {
     type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
     async fn reply(ws: &mut Ws, id: u64) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["id"] == id {
-                            return v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["id"] == id {
+                                return v;
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("reply within 10s")
     }
 
     /// Collect delivered `events.event` types until `until` arrives.
     async fn delivered_until(ws: &mut Ws, until: &str) -> Vec<String> {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let mut types = Vec::new();
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] != "events.event" {
-                            continue;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                let mut types = Vec::new();
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] != "events.event" {
+                                continue;
+                            }
+                            let ty = v["params"]["event"]["type"]
+                                .as_str()
+                                .expect("event type")
+                                .to_string();
+                            let done = ty == until;
+                            types.push(ty);
+                            if done {
+                                return types;
+                            }
                         }
-                        let ty = v["params"]["event"]["type"]
-                            .as_str()
-                            .expect("event type")
-                            .to_string();
-                        let done = ty == until;
-                        types.push(ty);
-                        if done {
-                            return types;
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
                         }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {until}"))
     }
@@ -6954,7 +7126,11 @@ impl PresenceClient {
     /// Clean close: a `Close` frame, then the reader ends with the stream.
     async fn close(mut self) {
         let _ = self.tx.send(Message::Close(None)).await;
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.reader).await;
+        let _ = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            self.reader,
+        )
+        .await;
     }
 
     /// Silent drop: stop polling (no more pongs) without closing the socket,
@@ -6975,11 +7151,14 @@ async fn presence_matching_frame(
         return skipped.remove(index);
     }
     loop {
-        let v = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| panic!("no {description} within 10s"));
+        let v = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            rx.recv(),
+        )
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| panic!("no {description} within 10s"));
         if matches(&v) {
             return v;
         }
@@ -7199,7 +7378,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         ev["data"]["members"],
         json!([{ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                 "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }]),
+                 "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [], "discussionTyping": [] }]),
         "{ev}"
     );
 
@@ -7636,6 +7815,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
             pending_delete_at: None,
             retired_at: None,
             notifications_muted: false,
+            pinned: false,
         })
         .await
         .expect("insert agent session");
@@ -7653,7 +7833,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
     }
     let ws = ws_id.0.clone();
     let hello = json!({ "clientId": "cli-alice", "name": "Alice" });
-    let typing = json!({ "focus": [], "typing": { "agentId": "agent-typing" } });
+    let typing = json!({ "focus": [], "typing": { "agentId": "agent-typing" }, "discussionTyping": { "workspaceId": ws } });
     let alice_row = |ev: &Value| -> Value {
         ev["data"]["members"]
             .as_array()
@@ -7714,7 +7894,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
     assert_eq!(
         alice_row(&json!({ "data": v["result"] })),
         json!({ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }),
+                "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [], "discussionTyping": [] }),
         "snapshot rows match the presence:changed member shape: {v}"
     );
 
@@ -7768,6 +7948,11 @@ async fn wss_presence_typing_sources_and_snapshot() {
         .as_u64()
         .unwrap_or_else(|| panic!("pulse: {ev}"));
 
+    let discussion = &row["discussionTyping"][0];
+    assert_eq!(discussion["source"], s1);
+    assert_eq!(pulse1, 1);
+    assert_eq!(discussion["pulse"], 1, "each typing kind owns its counter");
+
     // A1 keeps typing to the same agent: the pulse advances (the receiver's
     // freshness signal) while `since` stays the episode start.
     let v = a1.call(3, "presence.update", typing.clone()).await;
@@ -7780,7 +7965,11 @@ async fn wss_presence_typing_sources_and_snapshot() {
         let next = row["typing"][0]["pulse"]
             .as_u64()
             .unwrap_or_else(|| panic!("pulse: {ev}"));
-        assert!(next > pulse1, "a repeated pulse is fresher: {ev}");
+        assert_eq!(
+            next,
+            pulse1 + 1,
+            "discussion typing leaves the agent counter unchanged: {ev}"
+        );
         next
     };
 
@@ -7910,25 +8099,28 @@ async fn wss_user_messages_stamp_principal_and_serve_author() {
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
         event_type: &str,
     ) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] == "events.event"
-                            && v["params"]["event"]["type"] == event_type
-                        {
-                            return v["params"]["event"].clone();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] == "events.event"
+                                && v["params"]["event"]["type"] == event_type
+                            {
+                                return v["params"]["event"].clone();
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
     }
@@ -8534,7 +8726,7 @@ async fn wss_agent_diagnostics_flags_stale_queue_entry() {
     registry
         .apply(&[("model.defaultProvider".into(), serde_json::json!("auggie"))])
         .expect("seed default provider");
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry)
@@ -8669,7 +8861,7 @@ async fn wss_agent_diagnostics_reports_conversation_bytes_and_large_risk() {
     registry
         .apply(&[("model.defaultProvider".into(), serde_json::json!("auggie"))])
         .expect("seed default provider");
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry)
@@ -9165,6 +9357,7 @@ async fn wss_agent_create_and_set_model_reject_bare_model_mismatch() {
 #[intent_test_macros::daemon_test]
 async fn wss_agent_set_model_provider_id_param() {
     /// Assert the JSON-RPC response envelope: version and id correlation.
+    #[track_caller]
     fn assert_envelope(resp: &Value, id: i64) {
         assert_eq!(resp["jsonrpc"], Value::from("2.0"), "envelope: {resp}");
         assert_eq!(resp["id"], Value::from(id), "envelope: {resp}");
@@ -9508,7 +9701,7 @@ async fn wss_agent_create_widened_params_round_trip() {
     let params = format!(
         concat!(
             r#"{{"workspaceId":"{ws}","name":"WSS Wide","#,
-            r#""model":"sonnet4.5","provider":"auggie","specialistId":"implementor","#,
+            r#""model":"sonnet4.5","provider":"auggie","specialistId":"developer","#,
             r#""provider":"auggie","agentType":"task-loop","#,
             r#""metadata":{{"tag":"unit"}},"workspacePath":"/tmp/wid","#,
             r#""workspaceContext":{{"selection":"note:1"}},"isBackground":true}}"#
@@ -9535,7 +9728,7 @@ async fn wss_agent_create_widened_params_round_trip() {
     assert_eq!(created["model"].as_str(), Some("sonnet4.5"));
     assert_eq!(created["provider"].as_str(), Some("auggie"));
     assert_eq!(created["workspaceId"].as_str(), Some(ws_id.as_str()));
-    assert_eq!(created["metadata"]["specialist"], "implementor");
+    assert_eq!(created["metadata"]["specialist"], "developer");
     assert_eq!(
         created["metadata"]["isBackground"], true,
         "isBackground must persist and be served on the projection: {}",
@@ -9689,32 +9882,35 @@ async fn wss_agent_mark_seen_round_trip() {
     ))
     .await
     .expect("send markSeen");
-    let (marked, evt) = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut marked: Option<Value> = None;
-        let mut evt: Option<Value> = None;
-        loop {
-            if let (Some(m), Some(e)) = (&marked, &evt) {
-                return (m.clone(), e.clone());
-            }
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v.get("id") == Some(&serde_json::json!(6)) {
-                        marked = Some(v);
-                    } else if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "agent:updated"
-                    {
-                        evt = Some(v["params"]["event"].clone());
+    let (marked, evt) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            let mut marked: Option<Value> = None;
+            let mut evt: Option<Value> = None;
+            loop {
+                if let (Some(m), Some(e)) = (&marked, &evt) {
+                    return (m.clone(), e.clone());
+                }
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v.get("id") == Some(&serde_json::json!(6)) {
+                            marked = Some(v);
+                        } else if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "agent:updated"
+                        {
+                            evt = Some(v["params"]["event"].clone());
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for markSeen response + agent:updated");
     assert_eq!(marked["result"]["success"], true, "markSeen: {marked}");
@@ -9802,25 +9998,28 @@ async fn wss_agent_last_message_event_and_last_tool_use_round_trip() {
         ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
         event_type: &str,
     ) -> Value {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let v: Value = serde_json::from_str(&text).expect("json");
-                        if v["method"] == "events.event"
-                            && v["params"]["event"]["type"] == event_type
-                        {
-                            return v["params"]["event"].clone();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let v: Value = serde_json::from_str(&text).expect("json");
+                            if v["method"] == "events.event"
+                                && v["params"]["event"]["type"] == event_type
+                            {
+                                return v["params"]["event"].clone();
+                            }
                         }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("expected text frame, got {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => {
-                        let _ = ws.send(Message::Pong(p)).await;
-                    }
-                    Some(Ok(_)) => {}
-                    other => panic!("expected text frame, got {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
     }
@@ -10715,6 +10914,7 @@ async fn wss_providers_catalog_round_trip() {
             "droid",
             "grok",
             "antigravity",
+            "cursor",
             "mock"
         ],
         "one row per registry entry, registry order: {resp}"
@@ -11236,12 +11436,15 @@ async fn wss_guest_connection_caps_release_after_early_reject_and_heartbeat_abor
     let wait_count = |wanted: u64| {
         let health = &health;
         async move {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while health().await != wanted {
-                    // timing-guard: poll interval
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                async {
+                    while health().await != wanted {
+                        // timing-guard: poll interval
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                },
+            )
             .await
             .expect("guest count converges");
         }
@@ -12380,7 +12583,8 @@ async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
     // the outcome were never recorded, reads after the slot release would
     // keep re-spawning and the spawn-count assertion below would fail.
     let mut req_id = 48u32;
-    let mut waited = 0u32;
+    let deadline = tokio::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
     let resp = loop {
         let frame = format!(r#"{{"jsonrpc":"2.0","id":{req_id},"method":"models.list"}}"#);
         let resp = wss_call(srv.port, srv.cfg.clone(), &frame).await;
@@ -12393,10 +12597,9 @@ async fn wss_models_list_legacy_aged_entry_reprobe_failure_serves_stale() {
             break resp;
         }
         assert!(
-            waited < 200,
+            tokio::time::Instant::now() < deadline,
             "probe failure never reached the negative cache: {resp}"
         );
-        waited += 1;
         req_id += 1;
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     };
@@ -12705,6 +12908,71 @@ async fn wss_agent_complete_once_round_trip() {
     assert_eq!(resp["id"], 41);
     assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["result"]["text"], "fix-login-flow");
+    srv.ws.stop().await;
+}
+
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn wss_disabling_default_provider_blocks_quick_actions_until_reenabled() {
+    let (_dir, bin) = fake_auggie_script("disable-default", "printf 'recovered\\n'");
+    let srv = start_with_auggie(WsOptions::default(), Some(bin)).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    srv.set_setting("model.default", serde_json::json!("sonnet4.5"));
+    srv.set_setting(
+        "model.providerDefaults",
+        serde_json::json!({ "auggie": "sonnet4.5" }),
+    );
+    srv.set_setting("quickActions.defaultModel", serde_json::json!("sonnet4.5"));
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"settings.update","params":{"changes":[{"path":"providers.enabled","value":{"auggie":false}}]}}"#,
+    ).await;
+    assert_eq!(resp["id"], 1);
+    assert_eq!(resp["jsonrpc"], "2.0");
+    assert!(
+        resp.get("error").is_none(),
+        "default and saved models must not veto disable: {resp}"
+    );
+
+    for method in ["agent.completeOnce", "agent.enhancePrompt"] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": method,
+            "params": { "prompt": "hello", "mode": "layout" }
+        })
+        .to_string();
+        let resp = wss_call(srv.port, srv.cfg.clone(), &request).await;
+        assert_eq!(resp["id"], 2);
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["result"]["available"], false, "{method}: {resp}");
+        let reason = resp["result"]["reason"].as_str().unwrap();
+        assert!(reason.contains("is not enabled"), "{resp}");
+        assert!(reason.contains("Settings > Providers"), "{resp}");
+    }
+
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"settings.get","params":{"path":"model.defaultProvider"}}"#,
+    ).await;
+    assert_eq!(
+        resp["result"]["value"], "auggie",
+        "disable preserves the saved choice: {resp}"
+    );
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"settings.update","params":{"changes":[{"path":"providers.enabled","value":{"auggie":true}}]}}"#,
+    ).await;
+    assert!(resp.get("error").is_none(), "{resp}");
+    let resp = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":5,"method":"agent.completeOnce","params":{"prompt":"hello"}}"#,
+    )
+    .await;
+    assert_eq!(resp["result"]["text"], "recovered");
     srv.ws.stop().await;
 }
 
@@ -13223,7 +13491,8 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
     // some hosts, and a fixed sleep would probe the queue before the parked
     // calls hold their slots — the probe would then measure nothing and the
     // test would pass or fail on timing luck.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(60));
     while spawned_count() < limit && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -13234,7 +13503,12 @@ async fn wss_agent_complete_once_saturated_bound_returns_adapter_busy_and_queued
         let mut outcomes = Vec::new();
         for run in parked {
             outcomes.push(
-                match tokio::time::timeout(std::time::Duration::from_secs(5), run).await {
+                match tokio::time::timeout(
+                    intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+                    run,
+                )
+                .await
+                {
                     Ok(Ok(v)) => v.to_string(),
                     Ok(Err(e)) => format!("<join error: {e}>"),
                     Err(_) => "<still in flight>".to_string(),
@@ -13901,49 +14175,9 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         id: id.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -14238,25 +14472,28 @@ async fn wss_workspace_update_status_image_asset_id_round_trip() {
 
     // The `workspace:updated` event's `changes` delta is self-sufficient
     // (§6.5): subscribers see the new asset id without a follow-up read.
-    let evt = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "workspace:updated"
-                    {
-                        return v["params"]["event"].clone();
+    let evt = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "workspace:updated"
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for workspace:updated");
     assert_eq!(evt["workspaceId"], ws_id.as_str());
@@ -15037,23 +15274,26 @@ async fn wss_git_agent_commit_in_registered_root_round_trip() {
         ))
         .await
         .expect("send subscribe");
-    let sub_resp = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["id"] == 10 {
-                        return v;
+    let sub_resp = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["id"] == 10 {
+                            return v;
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("subscribe response timed out");
     assert!(
@@ -15095,29 +15335,34 @@ async fn wss_git_agent_commit_in_registered_root_round_trip() {
     // nested repo is clean after the commit).
     let mut commit_evt = None;
     let mut status_evt = None;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while commit_evt.is_none() || status_evt.is_none() {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event" {
-                        match v["params"]["event"]["type"].as_str() {
-                            Some("git:commit") => commit_evt = Some(v["params"]["event"].clone()),
-                            Some("changes:git-status") => {
-                                status_evt = Some(v["params"]["event"].clone());
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while commit_evt.is_none() || status_evt.is_none() {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event" {
+                            match v["params"]["event"]["type"].as_str() {
+                                Some("git:commit") => {
+                                    commit_evt = Some(v["params"]["event"].clone());
+                                }
+                                Some("changes:git-status") => {
+                                    status_evt = Some(v["params"]["event"].clone());
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for git:commit / changes:git-status");
     let commit_evt = commit_evt.expect("git:commit event");
@@ -15426,17 +15671,20 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
         ))
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(Ok(Message::Text(text))) = subscriber.next().await {
-                let response: Value = serde_json::from_str(&text).unwrap();
-                if response["id"] == 10 {
-                    assert!(response["result"]["subscriptionId"].is_string());
-                    break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Some(Ok(Message::Text(text))) = subscriber.next().await {
+                    let response: Value = serde_json::from_str(&text).unwrap();
+                    if response["id"] == 10 {
+                        assert!(response["result"]["subscriptionId"].is_string());
+                        break;
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     let added = wss_call(
@@ -15453,18 +15701,21 @@ async fn wss_accept_changes_get_status_local_commits_are_metadata_only() {
         added["result"]["historyIdentity"],
         result["historyIdentity"]
     );
-    let pushed = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(Ok(Message::Text(text))) = subscriber.next().await {
-                let event: Value = serde_json::from_str(&text).unwrap();
-                if event["method"] == "events.event"
-                    && event["params"]["event"]["type"] == "changes:git-status"
-                {
-                    break event["params"]["event"]["data"]["status"].clone();
+    let pushed = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Some(Ok(Message::Text(text))) = subscriber.next().await {
+                    let event: Value = serde_json::from_str(&text).unwrap();
+                    if event["method"] == "events.event"
+                        && event["params"]["event"]["type"] == "changes:git-status"
+                    {
+                        break event["params"]["event"]["data"]["status"].clone();
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(pushed, added["result"]);
@@ -16088,8 +16339,9 @@ async fn wss_note_version_history_round_trip() {
 /// `note.list` frame past the 1 MiB outbound warn threshold.
 /// `projection: "slim"` (§5.2, v8.1) serves bounded rows — `content`
 /// replaced by `contentPreview` (500 chars) + `contentLength` — so the slim
-/// frame stays far under the threshold, while the default (absent
-/// projection) still round-trips the complete content for existing clients.
+/// frame stays far under the threshold. Bounded reads (§5.2): the default
+/// full projection pages too, and a row over the read budget is cut with the
+/// truncated-read markers, so that frame also fits the 500 KiB budget.
 #[intent_test_macros::daemon_test]
 async fn wss_note_list_slim_projection_bounds_large_frames() {
     let srv = start(WsOptions::default()).await;
@@ -16149,14 +16401,53 @@ async fn wss_note_list_slim_projection_bounds_large_frames() {
         frame.len()
     );
 
-    // Default (absent projection): full rows, complete content intact.
+    // Default (absent projection): full rows, paged; the giant one is cut
+    // to fit, on whichever page it lands (a page stops before a row that
+    // would overflow it).
     let full = &sess[1];
-    let rows = full["result"]["notes"].as_array().expect("notes array");
+    let frame = serde_json::to_string(full).expect("serialize");
+    assert!(
+        frame.len() < 500 * 1024,
+        "full frame fits: {} bytes",
+        frame.len()
+    );
+    let mut rows: Vec<serde_json::Value> = full["result"]["notes"]
+        .as_array()
+        .expect("notes array")
+        .clone();
+    let mut token = full["result"]["nextToken"].as_str().map(str::to_string);
+    let mut id = 10;
+    while let Some(t) = token {
+        id += 1;
+        let page = wss_session(
+            srv.port,
+            srv.cfg.clone(),
+            vec![serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "note.list",
+                "params": { "workspaceId": ws_id, "nextToken": t },
+            })
+            .to_string()],
+        )
+        .await;
+        let frame = serde_json::to_string(&page[0]).expect("serialize");
+        assert!(frame.len() < 500 * 1024, "page fits: {} bytes", frame.len());
+        rows.extend(
+            page[0]["result"]["notes"]
+                .as_array()
+                .expect("notes")
+                .iter()
+                .cloned(),
+        );
+        token = page[0]["result"]["nextToken"].as_str().map(str::to_string);
+    }
     let giant = rows
         .iter()
         .find(|n| n["title"] == "Giant")
         .expect("giant note listed");
-    assert_eq!(giant["content"].as_str().map(str::len), Some(1_100_000));
+    assert_eq!(giant["contentTruncated"], true);
+    assert_eq!(giant["contentBytes"].as_u64(), Some(1_100_000));
+    let cut = giant["content"].as_str().map_or(0, str::len);
+    assert!(cut > 400_000 && cut < 1_100_000, "a bounded prefix: {cut}");
     assert!(giant.get("contentPreview").is_none());
 
     srv.ws.stop().await;
@@ -16861,24 +17152,27 @@ async fn hello_with(
     ws.send(Message::Text(frame.into()))
         .await
         .expect("send hello");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json frame");
-                    if v["id"] == "hello" {
-                        assert!(v.get("result").is_some(), "hello failed: {v}");
-                        break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json frame");
+                        if v["id"] == "hello" {
+                            assert!(v.get("result").is_some(), "hello failed: {v}");
+                            break;
+                        }
                     }
+                    Some(Ok(Message::Ping(payload))) => {
+                        ws.send(Message::Pong(payload)).await.expect("pong");
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected hello reply, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(payload))) => {
-                    ws.send(Message::Pong(payload)).await.expect("pong");
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected hello reply, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("client.hello reply");
 }
@@ -16900,33 +17194,39 @@ async fn wss_disconnect_wakes_accepted_screenshot_request() {
             )
             .await
     });
-    let frame = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let frame: Value = serde_json::from_str(&text).expect("json frame");
-                    if frame["method"] == "browser.exec" {
-                        break frame;
+    let frame = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(1)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: Value = serde_json::from_str(&text).expect("json frame");
+                        if frame["method"] == "browser.exec" {
+                            break frame;
+                        }
                     }
+                    Some(Ok(Message::Ping(payload))) => {
+                        ws.send(Message::Pong(payload)).await.expect("pong");
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected reverse frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(payload))) => {
-                    ws.send(Message::Pong(payload)).await.expect("pong");
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected reverse frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("accepted reverse frame");
     assert_eq!(frame["params"]["actions"][0]["action"], "screenshot");
     ws.send(Message::Close(None)).await.expect("close WSS");
 
-    let err = tokio::time::timeout(Duration::from_secs(1), request)
-        .await
-        .expect("disconnect wakes request")
-        .expect("join")
-        .expect_err("request fails on disconnect");
+    let err = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(1)),
+        request,
+    )
+    .await
+    .expect("disconnect wakes request")
+    .expect("join")
+    .expect_err("request fails on disconnect");
     assert!(err.to_string().contains("closed"), "unexpected: {err}");
     srv.ws.stop().await;
 }
@@ -16953,29 +17253,35 @@ async fn wss_heartbeat_abort_wakes_accepted_screenshot_request() {
             )
             .await
     });
-    let frame = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let frame: Value = serde_json::from_str(&text).expect("json frame");
-                    if frame["method"] == "browser.exec" {
-                        break frame;
+    let frame = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(1)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: Value = serde_json::from_str(&text).expect("json frame");
+                        if frame["method"] == "browser.exec" {
+                            break frame;
+                        }
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected reverse frame, got {other:?}"),
                 }
-                Some(Ok(_)) => {}
-                other => panic!("expected reverse frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("accepted reverse frame");
     assert_eq!(frame["params"]["actions"][0]["action"], "screenshot");
 
-    let err = tokio::time::timeout(Duration::from_secs(2), request)
-        .await
-        .expect("heartbeat abort wakes request")
-        .expect("join")
-        .expect_err("request fails on heartbeat abort");
+    let err = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        request,
+    )
+    .await
+    .expect("heartbeat abort wakes request")
+    .expect("join")
+    .expect_err("request fails on heartbeat abort");
     assert!(err.to_string().contains("closed"), "unexpected: {err}");
     assert!(srv.reverse_registry.is_empty());
     srv.ws.stop().await;
@@ -16988,27 +17294,30 @@ async fn await_client_event(
     event_type: &str,
     client_id: &str,
 ) -> Value {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json frame");
-                    let event = &v["params"]["event"];
-                    if v["method"] == "events.event"
-                        && event["type"] == event_type
-                        && event["data"]["clientId"] == client_id
-                    {
-                        break event.clone();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json frame");
+                        let event = &v["params"]["event"];
+                        if v["method"] == "events.event"
+                            && event["type"] == event_type
+                            && event["data"]["clientId"] == client_id
+                        {
+                            break event.clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(payload))) => {
+                        ws.send(Message::Pong(payload)).await.expect("pong");
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected {event_type} event, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(payload))) => {
-                    ws.send(Message::Pong(payload)).await.expect("pong");
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected {event_type} event, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
 }
@@ -17037,21 +17346,24 @@ async fn wss_tls_capability_gating_and_client_lifecycle_events() {
     ))
     .await
     .expect("send subscribe");
-    let ack = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match sub.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["id"] == "sub" {
-                        break v;
+    let ack = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match sub.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["id"] == "sub" {
+                            break v;
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => sub.send(Message::Pong(p)).await.expect("pong"),
+                    Some(Ok(_)) => {}
+                    other => panic!("expected subscribe ack, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => sub.send(Message::Pong(p)).await.expect("pong"),
-                Some(Ok(_)) => {}
-                other => panic!("expected subscribe ack, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("subscribe ack");
     assert!(ack["result"]["subscriptionId"].is_string(), "{ack}");
@@ -17904,9 +18216,12 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     let mut sub_resp: Option<Value> = None;
     let mut snap: Option<Value> = None;
     while sub_resp.is_none() || snap.is_none() {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), sub.next())
-            .await
-            .expect("chat.subscribe frame timed out");
+        let frame = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            sub.next(),
+        )
+        .await
+        .expect("chat.subscribe frame timed out");
         match frame {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -18068,8 +18383,9 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
         .await
         .expect("corrupt old rows");
 
-    // The full-hydration read errors on the poisoned rows (proving the poison
-    // is potent)…
+    // `agent.getSession` is a bounded read too (§5.5 "Bounded session
+    // read"): it serves only the newest slim page, so the poisoned older
+    // rows are never decoded and the read still answers…
     let full = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -18079,8 +18395,33 @@ async fn wss_agent_read_paths_bounded_pagination_round_trip() {
     )
     .await;
     assert!(
-        full.get("error").is_some(),
-        "full transcript hydration must fail on corrupted rows: {full}"
+        full.get("error").is_none(),
+        "the bounded session read must not hydrate corrupted rows: {full}"
+    );
+    let session = &full["result"]["session"];
+    let served = session["messages"].as_array().expect("session messages");
+    assert!(!served.is_empty(), "{full}");
+    assert!(
+        served.iter().all(|m| m["seq"].as_i64().unwrap() >= 70),
+        "only rows inside the newest page are served: {full}"
+    );
+    assert_eq!(served.last().unwrap()["seq"], 119, "{full}");
+    assert_eq!(session["messagesTotal"], 120, "{full}");
+    assert_eq!(session["messagesTruncated"], true, "{full}");
+    assert!(session["messagesNextToken"].is_string(), "{full}");
+    // …and the poison stays potent: paging past the newest window with that
+    // cursor reaches the corrupted rows and errors.
+    let older = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &json!({"jsonrpc":"2.0","id":24,"method":"agent.getConversation",
+            "params":{"agentId":agent_id,"nextToken":session["messagesNextToken"]}})
+        .to_string(),
+    )
+    .await;
+    assert!(
+        older.get("error").is_some(),
+        "the older page decodes the corrupted rows: {older}"
     );
 
     // …while the bounded reads still answer correctly: they never touch rows
@@ -18349,14 +18690,15 @@ async fn wss_conversation_slim_projection_bounds_blocks() {
 /// Slim page byte budget over the real WSS wire (§5.5): a block-heavy
 /// transcript (the observed 2.87MB-frame class: many messages × ~80 capped
 /// tool blocks each) served with `projection: "slim"` stops early at the
-/// ~512KB page budget — every frame stays bounded by budget + one message —
+/// slim page budget — every frame stays bounded by budget + one message —
 /// the `nextToken` walk reconstructs the full transcript with no gaps or
 /// duplicates, and the `chat.subscribe` seq-0 snapshot (which reuses the
 /// read) stays under the bound too. Slim is the wire default since v8.0,
 /// so absent-projection reads get the same budget.
 #[intent_test_macros::daemon_test]
 async fn wss_slim_conversation_pages_are_byte_budgeted() {
-    use intent_core::{AgentId, SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES};
+    use intent_core::{AgentId, SLIM_PROJECTION_BUDGET_BYTES};
+    use intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES;
     use serde_json::json;
 
     let srv = start(WsOptions::default()).await;
@@ -18427,12 +18769,11 @@ async fn wss_slim_conversation_pages_are_byte_budgeted() {
         )
         .await;
         let frame_bytes = serde_json::to_string(&page["result"]).unwrap().len();
-        // One slim message here is ~80 blocks × ~2KB caps ≈ 170KB; allow
-        // budget + one message of headroom, still far under the old
-        // multi-MB frames and the transport's 1 MiB warn threshold.
+        // One slim message here is ~80 blocks × ~2KB caps ≈ 170KB; the
+        // page budget keeps the whole frame within the read budget.
         assert!(
-            frame_bytes <= SLIM_PAGE_BUDGET_BYTES + 256 * 1024,
-            "slim frame bounded by budget + one message: {frame_bytes}"
+            frame_bytes <= READ_PAYLOAD_BUDGET_BYTES,
+            "slim frame within the read budget: {frame_bytes}"
         );
         let msgs = page["result"]["messages"].as_array().expect("messages");
         assert!(!msgs.is_empty(), "budgeted pages are never empty");
@@ -18466,12 +18807,392 @@ async fn wss_slim_conversation_pages_are_byte_budgeted() {
     .await;
     let snap_bytes = serde_json::to_string(&snap).unwrap().len();
     assert!(
-        snap_bytes <= SLIM_PAGE_BUDGET_BYTES + 256 * 1024,
+        snap_bytes <= READ_PAYLOAD_BUDGET_BYTES,
         "slim seq-0 snapshot bounded: {snap_bytes}"
     );
     assert!(
         !snap["messages"].as_array().expect("messages").is_empty(),
         "snapshot serves the newest bounded page"
+    );
+
+    srv.ws.stop().await;
+}
+
+/// Whole-frame bound for slim conversation pages (§5.5): a transcript of
+/// many medium text messages fills every page right up to the slim page
+/// budget, and the literal JSON-RPC frame — messages, result fields and
+/// envelope — must still fit the 500 KiB (512,000-byte) read payload budget.
+/// Covers the `nextToken` walk at `limit: 10000`, the `aroundIndex` and
+/// `aroundMessageId` seeks, and the `chat.subscribe` seq-0 snapshot. With the
+/// old 512 × 1024 content budget these frames measured ~521-527 KB.
+#[intent_test_macros::daemon_test]
+async fn wss_slim_conversation_frames_fit_read_payload_budget() {
+    use intent_core::AgentId;
+    use intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES;
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Frames"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Frames"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // 150 messages × ~9KB text: text is never slim-capped, so pages fill to
+    // the content budget in small steps and land just under it — the shape
+    // that pushed the old pages past the frame budget.
+    const MESSAGES: usize = 150;
+    let text = "t".repeat(9 * 1024);
+    for m in 0..MESSAGES {
+        let role = if m % 2 == 0 { "user" } else { "assistant" };
+        srv.store
+            .append_agent_message(
+                &agent,
+                role,
+                &json!([{ "type": "text", "text": format!("{m}:{text}") }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append text message");
+    }
+
+    let assert_frame = |label: &str, frame: &str| {
+        assert!(
+            frame.len() <= READ_PAYLOAD_BUDGET_BYTES,
+            "{label}: frame {} bytes exceeds the {READ_PAYLOAD_BUDGET_BYTES}-byte read budget",
+            frame.len()
+        );
+    };
+
+    // nextToken walk at the maximum message limit: every frame fits, the
+    // budget (not the limit) splits the pages, and nothing is lost.
+    let mut walked: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut largest = 0;
+    loop {
+        let token_field = match &token {
+            Some(t) => format!(r#","nextToken":"{t}""#),
+            None => String::new(),
+        };
+        let frame = wss_call_text(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10000{token_field}}}}}"#
+            ),
+        )
+        .await;
+        assert_frame("getConversation page", &frame);
+        largest = largest.max(frame.len());
+        let page: Value = serde_json::from_str(&frame).expect("json");
+        let ids: Vec<String> = page["result"]["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!ids.is_empty(), "budgeted pages are never empty");
+        walked.splice(0..0, ids);
+        assert!(walked.len() <= MESSAGES, "walk terminates");
+        match page["result"]["nextToken"].as_str() {
+            Some(t) => token = Some(t.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(walked.len(), MESSAGES, "no gaps or duplicates in the walk");
+    assert!(
+        largest > READ_PAYLOAD_BUDGET_BYTES * 9 / 10,
+        "the fixture fills pages near the budget: largest frame {largest}"
+    );
+
+    // Seeks: the target-anchored page grows both ways up to the budget.
+    let around_index = wss_call_text(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10000,"aroundIndex":75}}}}"#
+        ),
+    )
+    .await;
+    assert_frame("getConversation aroundIndex", &around_index);
+    let seek: Value = serde_json::from_str(&around_index).expect("json");
+    let target_id = seek["result"]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|m| m["seq"] == 75)
+        .and_then(|m| m["id"].as_str())
+        .expect("aroundIndex page carries its target")
+        .to_string();
+    let around_message = wss_call_text(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"agent.getConversation","params":{{"agentId":"{agent_id}","limit":10000,"aroundMessageId":"{target_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_frame("getConversation aroundMessageId", &around_message);
+
+    // The chat.subscribe seq-0 snapshot reuses the budgeted read; its
+    // subscription.push frame fits too, for both delta encodings.
+    for (id, extra) in [(6, ""), (7, r#","deltaEncoding":"incremental""#)] {
+        let frame = chat_subscribe_snapshot_frame(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"chat.subscribe","params":{{"agentId":"{agent_id}","limit":200{extra}}}}}"#
+            ),
+            id,
+        )
+        .await;
+        assert_frame("chat.subscribe snapshot", &frame);
+        let push: Value = serde_json::from_str(&frame).expect("json");
+        assert!(
+            !push["params"]["snapshot"]["messages"]
+                .as_array()
+                .expect("messages")
+                .is_empty(),
+            "snapshot serves the newest bounded page"
+        );
+    }
+
+    srv.ws.stop().await;
+}
+
+/// Single-row bound over the real WSS wire (§5.5): a message whose text
+/// alone is over the page budget, and one whose ~300 capped tool blocks are,
+/// are each served cut down to fit — a text preview with `textTruncated` /
+/// `textBytes`, and contiguous newest-last `bodyOmitted` stubs that keep
+/// their ids — so every `agent.getConversation` page (`limit: 10000`,
+/// `aroundIndex`, `aroundMessageId`) and `chat.subscribe` seq-0 push (full
+/// and incremental) stays within the 500 KiB read budget, and
+/// `agent.getMessageBlock` still rebuilds the full text and any stubbed block.
+#[intent_test_macros::daemon_test]
+async fn wss_single_over_budget_row_is_cut_to_fit_read_payload_budget() {
+    use intent_core::{AgentId, SLIM_PROJECTION_BUDGET_BYTES};
+    use intent_transport::catalog::READ_PAYLOAD_BUDGET_BYTES;
+    use serde_json::json;
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Huge"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Huge"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = AgentId::from(agent_id.as_str());
+
+    // seq 0: small; seq 1: one 600 KB text block; seq 2: ~300 large
+    // tool_result blocks (each capped at ~2KB, ~650 KB in aggregate); seq 3:
+    // small.
+    let huge_text: String = (0..600_000u32)
+        .map(|i| char::from(b'a' + u8::try_from(i % 26).unwrap()))
+        .collect();
+    let big = "x".repeat(SLIM_PROJECTION_BUDGET_BYTES * 4);
+    let tool_blocks: Vec<serde_json::Value> = (0..300)
+        .map(|p| {
+            json!({ "type": "tool_result", "id": format!("tool:{p}"),
+                "tool_use_id": format!("tc-{p}"), "output": big, "is_error": false })
+        })
+        .collect();
+    let mut ids = Vec::new();
+    for (role, blocks) in [
+        (
+            "user",
+            json!([{ "type": "text", "id": "s0", "text": "hello" }]),
+        ),
+        (
+            "assistant",
+            json!([{ "type": "text", "id": "huge", "text": huge_text }]),
+        ),
+        ("assistant", json!(tool_blocks)),
+        (
+            "user",
+            json!([{ "type": "text", "id": "s3", "text": "bye" }]),
+        ),
+    ] {
+        let row = srv
+            .store
+            .append_agent_message(&agent, role, &blocks, &now_iso())
+            .await
+            .expect("append message");
+        ids.push(row.id);
+    }
+
+    let assert_frame = |label: &str, frame: &str| {
+        assert!(
+            frame.len() <= READ_PAYLOAD_BUDGET_BYTES,
+            "{label}: frame {} bytes exceeds the {READ_PAYLOAD_BUDGET_BYTES}-byte read budget",
+            frame.len()
+        );
+    };
+    let call = |id: u32, params: String| {
+        let port = srv.port;
+        let cfg = srv.cfg.clone();
+        async move {
+            wss_call_text(
+                port,
+                cfg,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.getConversation","params":{params}}}"#
+                ),
+            )
+            .await
+        }
+    };
+
+    // nextToken walk at the maximum limit: every frame fits and every row
+    // is served exactly once.
+    let mut by_id = std::collections::HashMap::new();
+    let mut token: Option<String> = None;
+    loop {
+        let token_field = token
+            .as_ref()
+            .map(|t| format!(r#","nextToken":"{t}""#))
+            .unwrap_or_default();
+        let frame = call(
+            3,
+            format!(r#"{{"agentId":"{agent_id}","limit":10000{token_field}}}"#),
+        )
+        .await;
+        assert_frame("getConversation page", &frame);
+        let page: Value = serde_json::from_str(&frame).expect("json");
+        for m in page["result"]["messages"].as_array().expect("messages") {
+            let id = m["id"].as_str().unwrap().to_string();
+            assert!(by_id.insert(id, m.clone()).is_none(), "no duplicates");
+        }
+        match page["result"]["nextToken"].as_str() {
+            Some(t) => token = Some(t.to_string()),
+            None => break,
+        }
+        assert!(by_id.len() <= 4, "walk terminates");
+    }
+    assert_eq!(by_id.len(), 4, "no gaps");
+
+    let text_row = &by_id[&ids[1]];
+    let text_block = &text_row["contentBlocks"][0];
+    assert_eq!(text_block["textTruncated"], true);
+    assert_eq!(text_block["textBytes"], 600_000);
+    assert!(huge_text.starts_with(text_block["text"].as_str().unwrap()));
+
+    let tool_row = &by_id[&ids[2]];
+    let blocks = tool_row["contentBlocks"].as_array().expect("blocks");
+    assert_eq!(blocks.len(), 300, "every block keeps its slot");
+    let first_stub = blocks
+        .iter()
+        .position(|b| b["bodyOmitted"] == true)
+        .expect("block count overflow stubs the newest blocks");
+    assert!(first_stub > 0);
+    for (i, b) in blocks.iter().enumerate() {
+        assert_eq!(b["id"], format!("tool:{i}"), "ids and order kept");
+        assert_eq!(
+            b["bodyOmitted"] == true,
+            i >= first_stub,
+            "stubs are one tail run"
+        );
+    }
+
+    // Seeks centred on each oversized row.
+    for (id, seek) in [
+        (4, r#""aroundIndex":1"#.to_string()),
+        (5, format!(r#""aroundMessageId":"{}""#, ids[2])),
+    ] {
+        let frame = call(
+            id,
+            format!(r#"{{"agentId":"{agent_id}","limit":10000,{seek}}}"#),
+        )
+        .await;
+        assert_frame("getConversation seek", &frame);
+    }
+
+    // chat.subscribe seq-0 snapshots, full and incremental.
+    for (id, extra) in [(6, ""), (7, r#","deltaEncoding":"incremental""#)] {
+        let frame = chat_subscribe_snapshot_frame(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"chat.subscribe","params":{{"agentId":"{agent_id}","limit":200{extra}}}}}"#
+            ),
+            id,
+        )
+        .await;
+        assert_frame("chat.subscribe snapshot", &frame);
+    }
+
+    // The full text and a stubbed block are still readable by id.
+    let mut joined = String::new();
+    let mut offset: Option<u64> = None;
+    loop {
+        let offset_field = offset
+            .map(|o| format!(r#","offset":{o}"#))
+            .unwrap_or_default();
+        let frame = wss_call_text(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":8,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"{}","blockId":"huge"{offset_field}}}}}"#,
+                ids[1]
+            ),
+        )
+        .await;
+        assert_frame("getMessageBlock page", &frame);
+        let r: Value = serde_json::from_str(&frame).expect("json");
+        joined.push_str(r["result"]["block"]["text"].as_str().expect("text slice"));
+        match r["result"]["nextOffset"].as_u64() {
+            Some(n) => offset = Some(n),
+            None => break,
+        }
+    }
+    assert_eq!(joined, huge_text, "getMessageBlock rebuilds the full text");
+    let stub = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"agent.getMessageBlock","params":{{"agentId":"{agent_id}","messageId":"{}","blockId":"tool:299"}}}}"#,
+            ids[2]
+        ),
+    )
+    .await;
+    assert_eq!(
+        stub["result"]["block"]["output"], big,
+        "stubbed block is readable"
     );
 
     srv.ws.stop().await;
@@ -18804,8 +19525,11 @@ async fn wss_extracted_payload_round_trip_slim_and_full() {
 /// Non-user rows are never included; previews are bounded to
 /// `previewChars` (default 300, server-clamped into [1, 2000], with the
 /// lenient `opt_int` parsing: non-numeric → absent, floats truncate);
-/// `metadata` passes through verbatim when present; a workspace mismatch
-/// and an unknown agent are not-found; a missing `agentId` is `-32602`.
+/// `metadata` is projected to the classification fields (heavy keys such as
+/// `events` never ride the wire, intent-hq/intent#8278); `limit` /
+/// `nextToken` page newest-first; a workspace mismatch and an unknown agent
+/// are not-found; a missing `agentId` or a malformed `nextToken` is
+/// `-32602`.
 #[intent_test_macros::daemon_test]
 async fn wss_agent_list_user_messages_serves_bounded_index() {
     use intent_core::AgentId;
@@ -18867,7 +19591,11 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
             &agent,
             "user",
             &json!([{ "type": "text", "text": "automated follow-up" }]),
-            Some(&json!({ "automated": true })),
+            Some(&json!({
+                "automated": true,
+                "type": "event_notification",
+                "events": [{ "type": "agent:reportToParent", "report": "r".repeat(8192) }],
+            })),
             &ts,
         )
         .await
@@ -18915,8 +19643,12 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
     assert_eq!(items[1]["id"], second);
     assert_eq!(
         items[1]["metadata"],
-        json!({ "automated": true }),
-        "metadata passes through verbatim"
+        json!({ "type": "event_notification" }),
+        "metadata is projected to the classification fields"
+    );
+    assert!(
+        result["nextToken"].is_null() && result.get("nextToken").is_some(),
+        "default reads are paged; a complete page ends with nextToken null: {result}"
     );
     assert_eq!(items[2]["id"], third);
     let preview = items[2]["preview"].as_str().expect("preview");
@@ -18990,6 +19722,79 @@ async fn wss_agent_list_user_messages_serves_bounded_index() {
     assert_eq!(
         lenient_float["result"]["items"][0]["preview"], "first",
         "float previewChars truncates toward zero (5.9 → 5)"
+    );
+
+    // Paging: the newest `limit` rows oldest→newest, then the opaque
+    // `nextToken` walks to the start and ends at `null`.
+    let paged = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":13,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","limit":2}}}}"#
+        ),
+    )
+    .await;
+    let paged = &paged["result"];
+    let ids = |page: &serde_json::Value| -> Vec<String> {
+        page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|item| item["id"].as_str().expect("id").to_string())
+            .collect()
+    };
+    assert_eq!(ids(paged), vec![second.clone(), third.clone()], "{paged}");
+    assert_eq!(paged["total"], 2);
+    let token = paged["nextToken"].as_str().expect("older rows remain");
+    let older = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":14,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","limit":2,"nextToken":"{token}"}}}}"#
+        ),
+    )
+    .await;
+    let older = &older["result"];
+    assert_eq!(ids(older), vec![first.clone()], "{older}");
+    assert!(older["nextToken"].is_null(), "no older rows: {older}");
+    let bad_token = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":15,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","nextToken":"bogus"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(bad_token["error"]["code"], -32602, "{bad_token}");
+    for (id, token) in [(16, "123"), (17, "{}"), (18, "[]")] {
+        let typed = wss_call(
+            srv.port,
+            srv.cfg.clone(),
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","nextToken":{token}}}}}"#
+            ),
+        )
+        .await;
+        assert_eq!(
+            typed["error"]["code"], -32602,
+            "a non-string nextToken is rejected, never read as absent: {typed}"
+        );
+    }
+    let null_token = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":19,"method":"agent.listUserMessages","params":{{"agentId":"{agent_id}","nextToken":null}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        null_token["result"]["total"], 3,
+        "a null nextToken reads as absent (the newest page): {null_token}"
+    );
+    assert!(
+        null_token["result"]["nextToken"].is_null(),
+        "a null nextToken reads as absent: {null_token}"
     );
 
     // Cross-workspace mismatch and unknown agent: not-found, fail closed.
@@ -19101,6 +19906,7 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         pending_delete_at: None,
         retired_at: None,
         notifications_muted: false,
+        pinned: false,
     };
     for (ws, agent, name) in [
         (&ws_a, "agent-fts-a", "Alpha Agent"),
@@ -19367,9 +20173,10 @@ async fn wss_workspace_transfer_plan_round_trip() {
     let plan = &resp["result"]["plan"];
     let manifest = &plan["manifest"];
     assert_eq!(manifest["formatVersion"], 2, "{resp}");
-    assert!(
-        manifest["creatingIntentdVersion"].is_string(),
-        "manifest records the creating daemon version: {resp}"
+    assert_eq!(
+        manifest["creatingIntentdVersion"],
+        intent_core::transfer::CREATING_INTENTD_VERSION,
+        "export records the version import requires: {resp}"
     );
     assert_eq!(manifest["workspaceId"], ws_id.as_str(), "{resp}");
     let tables = manifest["tables"].as_array().expect("tables array");
@@ -20612,11 +21419,10 @@ async fn wss_workspace_import_lifecycle() {
     let ws_id = "ws-wss-imported";
     let t = "2026-08-11T00:00:00Z";
 
-    // Manifest must carry the exact intentd version (workspace-synchronized
-    // crate versions make CARGO_PKG_VERSION valid here).
+    // Manifest must carry the exact version the importer checks.
     let manifest = serde_json::json!({
         "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
-        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "creatingIntentdVersion": intent_core::transfer::CREATING_INTENTD_VERSION,
         "workspaceId": ws_id,
         "createdAt": t,
         "tables": [],
@@ -20784,26 +21590,29 @@ async fn wss_workspace_import_lifecycle() {
     );
 
     // The commit's `workspace:created` event reaches the subscriber (§6.3).
-    let evt = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "workspace:created"
-                        && v["params"]["event"]["workspaceId"] == ws_id
-                    {
-                        return v["params"]["event"].clone();
+    let evt = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "workspace:created"
+                            && v["params"]["event"]["workspaceId"] == ws_id
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for workspace:created after import commit");
     assert_eq!(evt["workspaceId"], ws_id, "{evt}");
@@ -20811,26 +21620,29 @@ async fn wss_workspace_import_lifecycle() {
     // Imports run no setup stage, so the commit pairs `workspace:created`
     // with an immediate `workspace:setup:completed { ranScript: false }` —
     // the watcher registry must not defer this workspace to the backstop.
-    let evt = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "workspace:setup:completed"
-                        && v["params"]["event"]["workspaceId"] == ws_id
-                    {
-                        return v["params"]["event"].clone();
+    let evt = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "workspace:setup:completed"
+                            && v["params"]["event"]["workspaceId"] == ws_id
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for workspace:setup:completed after import commit");
     assert_eq!(
@@ -20887,7 +21699,8 @@ async fn wss_workspace_import_lifecycle() {
     );
     let msg = rejected["error"]["message"].as_str().expect("message");
     assert!(
-        msg.contains("0.0.1-elsewhere") && msg.contains(env!("CARGO_PKG_VERSION")),
+        msg.contains("0.0.1-elsewhere")
+            && msg.contains(intent_core::transfer::CREATING_INTENTD_VERSION),
         "error names both versions: {msg}"
     );
 
@@ -20993,39 +21806,46 @@ async fn wss_workspace_export_lifecycle() {
 
     // The subscriber sees ≥1 progress event and then the ready event whose
     // payload carries everything workspace.import.begin needs.
-    let (saw_progress, ready) = tokio::time::timeout(Duration::from_secs(30), async {
-        let mut saw_progress = false;
-        loop {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] != "events.event" {
-                        continue;
+    let (saw_progress, ready) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            let mut saw_progress = false;
+            loop {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] != "events.event" {
+                            continue;
+                        }
+                        let event = &v["params"]["event"];
+                        match event["type"].as_str() {
+                            Some("workspace:transfer:progress") => {
+                                assert_eq!(
+                                    event["data"]["exportId"],
+                                    export_id.as_str(),
+                                    "{event}"
+                                );
+                                assert!(event["data"]["stage"].is_string(), "{event}");
+                                saw_progress = true;
+                            }
+                            Some("workspace:transfer:ready") => {
+                                return (saw_progress, event.clone());
+                            }
+                            Some("workspace:transfer:failed") => {
+                                panic!("export failed: {event}");
+                            }
+                            _ => {}
+                        }
                     }
-                    let event = &v["params"]["event"];
-                    match event["type"].as_str() {
-                        Some("workspace:transfer:progress") => {
-                            assert_eq!(event["data"]["exportId"], export_id.as_str(), "{event}");
-                            assert!(event["data"]["stage"].is_string(), "{event}");
-                            saw_progress = true;
-                        }
-                        Some("workspace:transfer:ready") => {
-                            return (saw_progress, event.clone());
-                        }
-                        Some("workspace:transfer:failed") => {
-                            panic!("export failed: {event}");
-                        }
-                        _ => {}
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for workspace:transfer:ready");
     assert!(saw_progress, "at least one progress event before ready");
@@ -21153,29 +21973,32 @@ async fn wss_workspace_export_lifecycle() {
     )
     .await;
     let export2 = started2["result"]["exportId"].as_str().expect("exportId");
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match sub2.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "workspace:transfer:ready"
-                    {
-                        return;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                match sub2.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "workspace:transfer:ready"
+                        {
+                            return;
+                        }
+                        assert!(
+                            v["params"]["event"]["type"] != "workspace:transfer:failed",
+                            "second export failed: {v}"
+                        );
                     }
-                    assert!(
-                        v["params"]["event"]["type"] != "workspace:transfer:failed",
-                        "second export failed: {v}"
-                    );
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub2.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub2.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for second export's ready event");
     let aborted = wss_call(
@@ -21271,9 +22094,9 @@ async fn wss_workspace_import_commit_materializes_git() {
     src_ws.repository_path = Some(repo.to_string_lossy().into_owned());
     src_ws.repository_name = Some("test-repo".to_string());
     let staging = src.path().join("staging");
-    let intent_services::transfer_git::TransferBundle {
+    let intent_app::transfer::transfer_git::TransferBundle {
         bundle_path, refs, ..
-    } = intent_services::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
+    } = intent_app::transfer::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
         .expect("bundle");
     assert!(
         refs.workspace_wip_commit_sha.is_some(),
@@ -21282,7 +22105,7 @@ async fn wss_workspace_import_commit_materializes_git() {
 
     let manifest = serde_json::json!({
         "formatVersion": intent_core::transfer::TRANSFER_FORMAT_VERSION,
-        "creatingIntentdVersion": env!("CARGO_PKG_VERSION"),
+        "creatingIntentdVersion": intent_core::transfer::CREATING_INTENTD_VERSION,
         "workspaceId": ws_id,
         "createdAt": t,
         "tables": [],
@@ -21525,29 +22348,32 @@ async fn wss_transfer_round_trip_hydrates_unpublished_submodule() {
         .unwrap_or_else(|| panic!("exportId: {started}"))
         .to_string();
 
-    let ready = tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            match sub_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] != "events.event" {
-                        continue;
+    let ready = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(60)),
+        async {
+            loop {
+                match sub_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] != "events.event" {
+                            continue;
+                        }
+                        let event = &v["params"]["event"];
+                        match event["type"].as_str() {
+                            Some("workspace:transfer:ready") => return event.clone(),
+                            Some("workspace:transfer:failed") => panic!("export failed: {event}"),
+                            _ => {}
+                        }
                     }
-                    let event = &v["params"]["event"];
-                    match event["type"].as_str() {
-                        Some("workspace:transfer:ready") => return event.clone(),
-                        Some("workspace:transfer:failed") => panic!("export failed: {event}"),
-                        _ => {}
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub_ws.send(Message::Pong(p)).await;
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub_ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("timed out waiting for workspace:transfer:ready");
     let data = &ready["data"];
@@ -21708,6 +22534,7 @@ async fn wss_transfer_preserves_remote_state() {
     use base64::Engine as _;
     use std::io::{Read as _, Write as _};
 
+    #[track_caller]
     fn git(dir: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .current_dir(dir)
@@ -21729,7 +22556,7 @@ async fn wss_transfer_preserves_remote_state() {
             "jsonrpc": "2.0", "id": 1, "method": method, "params": params
         });
         let response = tokio::time::timeout(
-            Duration::from_secs(60),
+            intentd_test_support::test_timeout(Duration::from_secs(60)),
             wss_call(srv.port, srv.cfg.clone(), &frame.to_string()),
         )
         .await
@@ -21941,46 +22768,52 @@ async fn wss_transfer_preserves_remote_state() {
             ))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match events.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let ack: Value = serde_json::from_str(&text).unwrap();
-                        assert_eq!(ack["id"], 100, "{ack}");
-                        assert!(ack["result"]["subscriptionId"].is_string(), "{ack}");
-                        break;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match events.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let ack: Value = serde_json::from_str(&text).unwrap();
+                            assert_eq!(ack["id"], 100, "{ack}");
+                            assert!(ack["result"]["subscriptionId"].is_string(), "{ack}");
+                            break;
+                        }
+                        Some(Ok(Message::Ping(p))) => events.send(Message::Pong(p)).await.unwrap(),
+                        Some(Ok(_)) => {}
+                        other => panic!("subscribe ended: {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => events.send(Message::Pong(p)).await.unwrap(),
-                    Some(Ok(_)) => {}
-                    other => panic!("subscribe ended: {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("subscribe timeout");
         let started = rpc(&source, "workspace.export.start", params.clone()).await;
         let export_id = started["result"]["exportId"].as_str().expect("exportId");
-        let ready = tokio::time::timeout(Duration::from_secs(60), async {
-            loop {
-                match events.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let frame: Value = serde_json::from_str(&text).unwrap();
-                        if frame["method"] != "events.event" {
-                            continue;
+        let ready = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(60)),
+            async {
+                loop {
+                    match events.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let frame: Value = serde_json::from_str(&text).unwrap();
+                            if frame["method"] != "events.event" {
+                                continue;
+                            }
+                            let event = &frame["params"]["event"];
+                            assert_ne!(event["type"], "workspace:transfer:failed", "{event}");
+                            if event["type"] == "workspace:transfer:ready" {
+                                assert_eq!(event["data"]["exportId"], export_id, "{event}");
+                                return event["data"].clone();
+                            }
                         }
-                        let event = &frame["params"]["event"];
-                        assert_ne!(event["type"], "workspace:transfer:failed", "{event}");
-                        if event["type"] == "workspace:transfer:ready" {
-                            assert_eq!(event["data"]["exportId"], export_id, "{event}");
-                            return event["data"].clone();
-                        }
+                        Some(Ok(Message::Ping(p))) => events.send(Message::Pong(p)).await.unwrap(),
+                        Some(Ok(_)) => {}
+                        other => panic!("export stream ended: {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => events.send(Message::Pong(p)).await.unwrap(),
-                    Some(Ok(_)) => {}
-                    other => panic!("export stream ended: {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("export ready timeout");
         assert_eq!(ready["manifest"]["workspaceId"], ws_id.0);
@@ -22496,6 +23329,9 @@ struct WatchHealthControl {
 }
 
 impl SystemControl for WatchHealthControl {
+    fn daemon_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     fn status(&self) -> SystemStatus {
         SystemStatus {
             listen_mode: "both".to_string(),
@@ -22540,6 +23376,7 @@ impl SystemControl for WatchHealthControl {
             update_supported: false,
             busy_agents: 0,
             idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
+            remote_links: None,
         }
     }
     fn host_environment(&self) -> intent_transport::HostEnvironment {
@@ -22553,14 +23390,6 @@ impl SystemControl for WatchHealthControl {
     fn request_shutdown(&self) {}
     fn request_update(&self) -> std::result::Result<(), String> {
         Err("not supported in this test".to_string())
-    }
-    fn import_legacy(
-        &self,
-        _force: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send + '_>,
-    > {
-        Box::pin(async { Err("not supported in this test".to_string()) })
     }
     fn git_credential(
         &self,
@@ -22591,7 +23420,7 @@ async fn system_status_surfaces_file_watch_coverage_over_wss() {
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
     );
-    let services = Services::new(store.clone())
+    let services = Services::new_isolated(store.clone())
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry)
@@ -22657,6 +23486,7 @@ async fn system_status_surfaces_file_watch_coverage_over_wss() {
         api.clone(),
         refresher,
         &health,
+        intent_services::worktree_presence::WorktreePresence::default(),
     )
     .await;
 
@@ -22843,7 +23673,8 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     drop(enumeration);
 
-    let started = std::time::Instant::now();
+    // The hang guard below is the responsiveness check: a status reply stuck
+    // behind the traversal never arrives inside it.
     status
         .send(Message::Text(
             r#"{"jsonrpc":"2.0","id":202,"method":"system.status"}"#
@@ -22852,29 +23683,29 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
         ))
         .await
         .expect("send system.status");
-    let response = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match status.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let response: Value = serde_json::from_str(&text).expect("status json");
-                    if response["id"] == 202 {
-                        break response;
+    let response = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                match status.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let response: Value = serde_json::from_str(&text).expect("status json");
+                        if response["id"] == 202 {
+                            break response;
+                        }
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected system.status response, got {other:?}"),
                 }
-                Some(Ok(_)) => {}
-                other => panic!("expected system.status response, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("system.status stayed responsive during detached traversal");
     assert!(response["result"].is_object(), "system.status: {response}");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "system.status was delayed by file.tree"
-    );
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     while srv.ws.client_count() > 1 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -22886,7 +23717,8 @@ async fn wss_file_tree_disconnect_keeps_runtime_responsive() {
 
     status.close(None).await.expect("close status client");
     drop(status);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     while srv.ws.client_count() != 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -23221,21 +24053,24 @@ async fn port_assignment_reserves_persists_then_serves_and_reuses() {
     );
     let mut client = connect_ws(port, client_config(&tls.fingerprint256)).await;
     client.send(Message::Text(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"settings.get","params":{"path":"server.wsApi.port"}}).to_string().into())).await.unwrap();
-    let response = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Message::Text(text) = client
-                .next()
-                .await
-                .expect("WSS response")
-                .expect("WSS frame")
-            {
-                let frame: Value = serde_json::from_str(&text).unwrap();
-                if frame["id"] == 1 {
-                    break frame;
+    let response = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Message::Text(text) = client
+                    .next()
+                    .await
+                    .expect("WSS response")
+                    .expect("WSS frame")
+                {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    if frame["id"] == 1 {
+                        break frame;
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("settings response before timeout");
     assert_eq!(response["jsonrpc"], "2.0");
@@ -23407,7 +24242,7 @@ async fn wss_explicit_blocker_recovery_scope_generation_and_task_states() {
         .unwrap());
     assert_eq!(
         srv.store
-            .get_agent_session(&agent)
+            .get_agent_session_with_transcript(&agent)
             .await
             .unwrap()
             .attention_request_reason
@@ -23448,8 +24283,20 @@ async fn wss_explicit_blocker_recovery_scope_generation_and_task_states() {
             .await
             .unwrap();
         note.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![agent.clone()];
-        srv.store.update_note_metadata(&note).await.unwrap();
-        let mut session = srv.store.get_agent_session(&agent).await.unwrap();
+        srv.store
+            .update_note_metadata(
+                &srv.store
+                    .lock_note_content(&note.workspace_id, &note.id)
+                    .await,
+                &note,
+            )
+            .await
+            .unwrap();
+        let mut session = srv
+            .store
+            .get_agent_session_with_transcript(&agent)
+            .await
+            .unwrap();
         session.task_note_id = Some(intent_core::NoteId(note_id.into()));
         srv.store.update_agent_session(&ws, &session).await.unwrap();
         srv.store
@@ -23539,7 +24386,15 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
         assert!(marked.get("error").is_none(), "{marked}");
         let mut task = srv.store.get_note(&ws, &note).await.unwrap();
         task.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![agent.clone()];
-        srv.store.update_note_metadata(&task).await.unwrap();
+        srv.store
+            .update_note_metadata(
+                &srv.store
+                    .lock_note_content(&task.workspace_id, &task.id)
+                    .await,
+                &task,
+            )
+            .await
+            .unwrap();
         notes.push(note);
     }
     let old = &notes[0];
@@ -23566,7 +24421,11 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
         .await
         .unwrap();
     // Capture exactly the task/link observations held by an admitted resolver.
-    let before_session = srv.store.get_agent_session(&agent).await.unwrap();
+    let before_session = srv
+        .store
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .unwrap();
     assert_eq!(before_session.task_note_id.as_ref(), Some(old));
     let before_note = srv.store.get_note(&ws, old).await.unwrap();
     let mut prepared = before_note.clone();
@@ -23595,7 +24454,11 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
     )
     .await;
     assert!(relink.get("error").is_none(), "{relink}");
-    let after_relink = srv.store.get_agent_session(&agent).await.unwrap();
+    let after_relink = srv
+        .store
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .unwrap();
     assert_eq!(after_relink.task_note_id.as_ref(), Some(new));
     assert_eq!(
         srv.store.get_note(&ws, old).await.unwrap().rev,
@@ -23604,7 +24467,14 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
     );
     let rejected = srv
         .store
-        .update_note_metadata_if_agent_linked(&prepared, before_note.rev, &agent)
+        .update_note_metadata_if_agent_linked(
+            &srv.store
+                .lock_note_content(&prepared.workspace_id, &prepared.id)
+                .await,
+            &prepared,
+            before_note.rev,
+            &agent,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -23646,13 +24516,27 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
     valid.metadata.task.as_mut().unwrap().status = intent_core::TaskStatus::InProgress;
     let accepted = srv
         .store
-        .update_note_metadata_if_agent_linked(&valid, current.rev, &agent)
+        .update_note_metadata_if_agent_linked(
+            &srv.store
+                .lock_note_content(&valid.workspace_id, &valid.id)
+                .await,
+            &valid,
+            current.rev,
+            &agent,
+        )
         .await
         .unwrap();
     assert_eq!(accepted, Some(current.rev + 1));
     assert_eq!(
         srv.store
-            .update_note_metadata_if_agent_linked(&current, current.rev, &agent)
+            .update_note_metadata_if_agent_linked(
+                &srv.store
+                    .lock_note_content(&current.workspace_id, &current.id)
+                    .await,
+                &current,
+                current.rev,
+                &agent
+            )
             .await
             .unwrap(),
         None

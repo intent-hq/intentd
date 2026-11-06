@@ -13,7 +13,7 @@ pub(crate) const SCRUBBED_ENV_VARS: &[&str] = &["npm_config_prefix"];
 
 /// Build an environment-removal list for [`intent_pty::SpawnSpec`], excluding
 /// keys present in the explicit environment overlay.
-pub(crate) fn scrubbed_env_vars_except(overlay: &[(String, String)]) -> Vec<String> {
+pub fn scrubbed_env_vars_except(overlay: &[(String, String)]) -> Vec<String> {
     SCRUBBED_ENV_VARS
         .iter()
         .copied()
@@ -22,9 +22,58 @@ pub(crate) fn scrubbed_env_vars_except(overlay: &[(String, String)]) -> Vec<Stri
         .collect()
 }
 
+/// The environment overlay for a saved-script shell: `FORCE_COLOR/TERM`,
+/// `PAGER=cat` + `GIT_PAGER=cat` (the PTY has no keyboard), the enhanced
+/// PATH, the commit-identity `GIT_*` vars resolved from `cwd`'s repository,
+/// then the script's own `env` last, in order, so it can override. Shared by
+/// home runs (`script_ops`) and a remote agent's machine runs, so a script
+/// gets the same environment wherever it runs.
+pub fn saved_script_env_overlay<'a>(
+    cwd: Option<&std::path::Path>,
+    script_env: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("FORCE_COLOR".to_string(), "1".to_string()),
+        ("TERM".to_string(), "xterm-256color".to_string()),
+        ("PAGER".to_string(), "cat".to_string()),
+        ("GIT_PAGER".to_string(), "cat".to_string()),
+    ];
+    if let Some(path) = enhanced_shell_path() {
+        env.push(("PATH".to_string(), path));
+    }
+    env.extend(intent_git::identity::commit_identity_env(cwd));
+    env.extend(
+        script_env
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
+    env
+}
+
+/// The enhanced PATH for a spawned shell: the canonical de-duplicated,
+/// order-preserving dir list (current PATH first, then essential system dirs
+/// and node/version-manager locations). `None` when no dirs resolve.
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn enhanced_shell_path() -> Option<String> {
+    let dirs = intent_context::discovery::enhanced_path_dirs();
+    if dirs.is_empty() {
+        return None;
+    }
+    std::env::join_paths(dirs)
+        .ok()
+        .map(|joined| joined.to_string_lossy().into_owned())
+}
+
 /// The default shell for daemon-spawned terminals and scripts, resolved from
 /// the host platform and environment.
-pub(crate) fn default_shell() -> String {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn default_shell() -> String {
     default_shell_for(
         cfg!(windows),
         std::env::var("SHELL").ok().as_deref(),
@@ -59,7 +108,11 @@ fn default_shell_for(
 /// Build argv for running `command` under `shell` (platform-aware `-c` /
 /// PowerShell `-Command` / `cmd /c`). Shared by saved-script runs and ACP
 /// `terminal/create` when a provider sets `terminal_requires_shell`.
-pub(crate) fn shell_args(shell: &str, command: &str) -> Vec<String> {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn shell_args(shell: &str, command: &str) -> Vec<String> {
     shell_args_for(shell, command, cfg!(windows))
 }
 
@@ -108,7 +161,7 @@ pub(crate) fn shell_args_for(shell: &str, command: &str, is_windows: bool) -> Ve
 /// wanted, e.g. Grok's `/bin/bash -lc '…'`). Windows keeps the native-shell
 /// resolution (PowerShell `-Command` / `cmd /c`) since `/bin/sh` doesn't exist
 /// there.
-pub(crate) fn shell_true_invocation(command: &str, args: &[String]) -> (String, Vec<String>) {
+pub fn shell_true_invocation(command: &str, args: &[String]) -> (String, Vec<String>) {
     let shell = if cfg!(windows) {
         default_shell()
     } else {

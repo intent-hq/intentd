@@ -6,7 +6,11 @@
 //! enabled, the agent owns at least one tracked change at the `unstaged` or
 //! `staged` stage, and the agent is actively working (running a turn, or its
 //! linked task note is not `complete`/`cancelled`). Locked file paths are the
-//! union of the locked agents' unstaged/staged tracked-change paths.
+//! union of the locked agents' unstaged/staged tracked-change paths that git
+//! still reports as changes (intent-hq/intent#7266): a path the worktree
+//! status no longer lists — committed, reverted, ignored, deleted — is not a
+//! file a user could stage, so it neither locks nor makes its agent locked.
+//! Sandboxed (copy-on-write) agents' paths are not judged against the worktree.
 //!
 //! The snapshot is served on demand via `file-tracking.getAgentLocks`
 //! (PROTOCOL §5.19) and pushed as the self-sufficient `changes:agent-locks`
@@ -14,7 +18,7 @@
 //! status, auto-commit policy, or tracked-change churn events — yields a
 //! snapshot that differs from the last one published for that workspace.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use intent_core::events::{
@@ -23,7 +27,7 @@ use intent_core::events::{
     CHANGES_METRICS_CHANGED, SETTINGS_CHANGED, TASK_STATUS_CHANGED, WORKSPACE_UPDATED,
 };
 use intent_core::{now_iso, AgentSession, AgentStatus, TaskStatus, WorkspaceId};
-use intent_store::NewEvent;
+use intent_store::{AgentSessionSummary, NewEvent};
 
 use crate::events::SubscriptionFilter;
 use crate::{publish_event, system_actor, Services};
@@ -143,17 +147,39 @@ impl Services {
         else {
             return empty;
         };
-        let by_id: HashMap<&str, &AgentSession> =
+        let by_id: HashMap<&str, &AgentSessionSummary> =
             sessions.iter().map(|s| (s.id.as_str(), s)).collect();
-        let mut locked_agent_ids: BTreeSet<String> = BTreeSet::new();
-        let mut locked_file_paths: BTreeSet<String> = BTreeSet::new();
-        for (agent_id, paths) in &paths_by_agent {
+        let mut active: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (agent_id, paths) in paths_by_agent {
             let Some(session) = by_id.get(agent_id.as_str()) else {
                 continue;
             };
             if is_actively_working(self, session).await {
-                locked_agent_ids.insert(agent_id.clone());
-                locked_file_paths.extend(paths.iter().cloned());
+                active.insert(agent_id, paths);
+            }
+        }
+        // Keep only paths git still reports as changes. A sandboxed (copy-on-write)
+        // agent's paths live in its sandbox, not in the workspace worktree,
+        // so the worktree status cannot judge them; they stay as recorded.
+        let judged: BTreeMap<&String, &BTreeSet<String>> = active
+            .iter()
+            .filter(|(id, _)| {
+                by_id
+                    .get(id.as_str())
+                    .is_some_and(|s| s.sandbox_path.is_none())
+            })
+            .collect();
+        let lockable = self.lockable_paths(workspace_id, &judged).await;
+        let judged_ids: HashSet<String> = judged.keys().map(|id| (*id).clone()).collect();
+        let mut locked_agent_ids: BTreeSet<String> = BTreeSet::new();
+        let mut locked_file_paths: BTreeSet<String> = BTreeSet::new();
+        for (agent_id, mut paths) in active {
+            if let Some(lockable) = lockable.as_ref().filter(|_| judged_ids.contains(&agent_id)) {
+                paths.retain(|p| lockable.contains(p));
+            }
+            if !paths.is_empty() {
+                locked_agent_ids.insert(agent_id);
+                locked_file_paths.extend(paths);
             }
         }
         AgentLockSnapshot {
@@ -163,16 +189,50 @@ impl Services {
         }
     }
 
+    /// The subset of the given tracked paths that are still changes git would
+    /// stage, judged against the **cached** worktree status (no scan when the
+    /// cache is warm) by [`intent_git::attribution::lockable_paths`]. `None`
+    /// (no filtering, the pre-#7266 behaviour) when the workspace has no local
+    /// worktree or its status cannot be read.
+    async fn lockable_paths(
+        &self,
+        workspace_id: &WorkspaceId,
+        paths_by_agent: &BTreeMap<&String, &BTreeSet<String>>,
+    ) -> Option<HashSet<String>> {
+        if paths_by_agent.is_empty() {
+            return None;
+        }
+        let ws = self.store().get_workspace(workspace_id).await.ok()?;
+        if ws.is_remote {
+            return None;
+        }
+        let worktree = crate::git_ops::worktree_path(&ws)?;
+        let status = self.scan_git_status(&worktree, false).await.ok()?;
+        let candidates: Vec<String> = paths_by_agent
+            .values()
+            .flat_map(|paths| paths.iter().cloned())
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            intent_git::attribution::lockable_paths(&worktree, &status.files, &candidates)
+        })
+        .await
+        .ok()
+    }
+
     /// Recompute `workspace_id`'s lock snapshot and publish
     /// `changes:agent-locks` iff it differs from `last` (the previously
-    /// published snapshot, if any). Returns the fresh snapshot.
+    /// published snapshot, if any). Returns the fresh snapshot. Plain-folder
+    /// workspaces emit no `changes:*` events (§5.1), so nothing is published
+    /// for them.
     pub(crate) async fn refresh_agent_locks(
         &self,
         workspace_id: &WorkspaceId,
         last: Option<&AgentLockSnapshot>,
     ) -> AgentLockSnapshot {
         let snap = self.compute_agent_locks(workspace_id).await;
-        if last != Some(&snap) {
+        if last != Some(&snap) && !self.is_plain_folder(workspace_id).await {
             publish_event(
                 self.event_bus.as_ref(),
                 changes_agent_locks_event(workspace_id, &snap),
@@ -260,7 +320,11 @@ impl Services {
                     }
                 }
                 if all_workspaces {
-                    if let Ok(list) = services.store().list_workspaces(false).await {
+                    if let Ok(list) = services
+                        .store()
+                        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+                        .await
+                    {
                         dirty.extend(list.into_iter().map(|w| w.id.as_str().to_string()));
                     }
                 }
@@ -278,4 +342,4 @@ impl Services {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

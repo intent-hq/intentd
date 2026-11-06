@@ -23,9 +23,12 @@ impl Hold {
         self.release.acquire().await.unwrap().forget();
     }
     async fn reached(&self) {
-        tokio::time::timeout(Duration::from_secs(10), self.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            self.entered.notified(),
+        )
+        .await
+        .unwrap();
     }
 }
 
@@ -202,7 +205,7 @@ async fn actual_tcp_response_runs_the_same_real_aggregate_after_host_transfer() 
         intent_acp::mcp_bridge::serve_workspace_mcp_tcp(Arc::new(controlled(&f, control.clone())))
             .await
             .unwrap();
-    let mut socket = tokio::net::TcpStream::connect(bridge.addr()).await.unwrap();
+    let mut socket = bridge.connect().await.unwrap();
     let request = crate::repository_read_source::tests::call("return await ws.pr.snapshot(4);");
     socket
         .write_all(format!("{request}\n").as_bytes())
@@ -213,7 +216,7 @@ async fn actual_tcp_response_runs_the_same_real_aggregate_after_host_transfer() 
     gate.release.add_permits(1);
     let mut reply = String::new();
     tokio::time::timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         BufReader::new(socket).read_line(&mut reply),
     )
     .await
@@ -256,7 +259,7 @@ async fn artifact_start_admits_one_original_job_before_io_and_response_revalidat
         let folder = f.git.dir.path().join("tool-outputs");
         assert!(!folder.exists(), "no private I/O inside admission");
         tokio::time::timeout(
-            Duration::from_secs(2),
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
             f.auth
                 .service
                 .worktree_locks
@@ -292,28 +295,25 @@ async fn artifact_start_admits_one_original_job_before_io_and_response_revalidat
     }
 }
 
-// This control fills one real acquisition ledger. Give that one request the
-// existing workspace API's 30-second evaluation budget instead of the shared
-// 10-second single-read harness guard; all ordinary refusal controls keep it.
-async fn run_quota(
-    server: &WorkspaceMcpServer,
-    code: &str,
-    control: &Control,
-) -> serde_json::Value {
-    let started = std::time::Instant::now();
-    let result = tokio::time::timeout(
-        Duration::from_secs(30),
+// These controls fill one real acquisition ledger with 63/64 snapshot calls
+// under the shared quota script budget (test_support::quota_script), which
+// fails loudly if a run reaches that budget: the 63/64 outcome must come from
+// the ledger, never from the timer.
+async fn run_quota(server: WorkspaceMcpServer, code: &str, control: &Control) -> serde_json::Value {
+    use crate::test_support::quota_script;
+    let server = quota_script::budget(server);
+    let result = quota_script::guard(
+        "read-policy-quota",
+        server.workspace_api_timeout(),
         server.handle_message(&crate::repository_read_source::tests::call(code)),
     )
     .await;
     eprintln!(
-        "quota result_ready={} elapsed_ms={} records={} events={:?}",
-        result.is_ok(),
-        started.elapsed().as_millis(),
+        "quota records={} events={:?}",
         control.records.lock().unwrap().len(),
         control.events.lock().unwrap()
     );
-    result.unwrap().unwrap()
+    result.unwrap()
 }
 
 #[intent_test_macros::daemon_test]
@@ -325,7 +325,7 @@ async fn original_ledger_counts_cache_hits_and_lazy_read_at_sixty_four_and_sixty
         let code = format!(
             "for (let i=0;i<{count};i++) {{ await ws.pr.snapshot(4); }} return 'bounded success';"
         );
-        let reply = run_quota(&controlled(&f, control.clone()), &code, &control).await;
+        let reply = run_quota(controlled(&f, control.clone()), &code, &control).await;
         assert_eq!(
             reply.to_string().contains("bounded success"),
             count == 63,
@@ -406,7 +406,7 @@ async fn source_changes_after_host_disclosure_reject_constant_output_without_reb
             _ => f.owner.retirement().retire(),
         }
         if let Some(pending) = pending {
-            pending.settle_confirmed();
+            pending.settle_confirmed().await.unwrap();
         }
         gate.release.add_permits(1);
         let reply = task.await.unwrap();
@@ -497,18 +497,21 @@ async fn original_claimed_workspace_timer_cannot_be_canceled_or_deliver_old_read
             .schedule_workspace_delete(f.git.workspace.id.clone(), 0)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while f
-                .auth
-                .service
-                .pending_workspace_deletes
-                .deadline(&PendingDeleteSubject::Workspace(f.git.workspace.id.clone()))
-                .unwrap()
-                .is_some()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                while f
+                    .auth
+                    .service
+                    .pending_workspace_deletes
+                    .deadline(&PendingDeleteSubject::Workspace(f.git.workspace.id.clone()))
+                    .unwrap()
+                    .is_some()
+                {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .unwrap();
         assert!(!f
@@ -525,18 +528,21 @@ async fn original_claimed_workspace_timer_cannot_be_canceled_or_deliver_old_read
         .unwrap()
         .to_string()
         .contains("Private result delivery refused"));
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while f
-            .auth
-            .service
-            .store
-            .get_workspace(&f.git.workspace.id)
-            .await
-            .is_ok()
-        {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while f
+                .auth
+                .service
+                .store
+                .get_workspace(&f.git.workspace.id)
+                .await
+                .is_ok()
+            {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
 }
@@ -636,7 +642,7 @@ async fn original_artifact_cancellation_and_failed_io_do_not_become_replacement_
             assert!(!folder.exists());
         }
         tokio::time::timeout(
-            Duration::from_secs(2),
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
             f.auth
                 .service
                 .worktree_locks

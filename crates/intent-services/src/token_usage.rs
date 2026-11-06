@@ -134,6 +134,27 @@ pub(crate) fn aggregate_token_usage(tallies: &[AgentTokenTally]) -> TokenUsage {
     usage
 }
 
+/// Build `TokenUsage::agent_names` (§5.23): one entry per agent whose
+/// `by_agent_id` bucket reports usage (any non-zero counter or a cost) and
+/// whose session name is non-empty after trimming. The recompute seeds a
+/// (possibly all-zero) bucket for every session, so the usage check — not
+/// key presence — keeps names for usage-less sessions off the wire.
+pub(crate) fn agent_names<'a>(
+    by_agent_id: &BTreeMap<String, TokenUsageTotals>,
+    sessions: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> BTreeMap<String, String> {
+    sessions
+        .into_iter()
+        .filter_map(|(agent_id, name)| {
+            let name = name.trim();
+            let has_usage = by_agent_id
+                .get(agent_id)
+                .is_some_and(|totals| *totals != TokenUsageTotals::default());
+            (!name.is_empty() && has_usage).then(|| (agent_id.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
 /// Map one end-of-turn ACP `Usage` report into [`TokenUsageTotals`].
 ///
 /// **Report semantics are provider-keyed** (intent-hq/intent#3794, #3795):

@@ -5,7 +5,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,7 +77,8 @@ async fn rpc(
 /// Read frames until we see the expected `events.event` notification for
 /// `line-attribution:updated`, ignoring other pushed events (e.g. `note:*`).
 async fn next_line_attribution_event(reader: &mut BufReader<OwnedReadHalf>) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(
@@ -114,7 +115,7 @@ fn boot(
     let socket = sock_dir.path().join("uds.sock");
     let ws_root = common::hermetic_workspaces_root();
     let services: Arc<dyn intent_core::WorkspaceApi> = Arc::new(
-        Services::new(bus.store().clone())
+        Services::new_isolated(bus.store().clone())
             .with_workspaces_root(ws_root.path().to_path_buf())
             .with_event_bus(bus.clone()),
     );

@@ -290,6 +290,46 @@ pub async fn prompt_with_guidance(
     }
 }
 
+/// Send a whole prompt only through its retained original admission. Unlike
+/// optional guidance, refusal sends no base prompt. The caller must bind the
+/// admission to the actual destination connection and session before calling.
+///
+/// # Errors
+/// Preserves ordinary prompt response/idle errors and refuses an unadmitted
+/// whole prompt without sending any replacement content.
+pub async fn prompt_with_required_admission(
+    conn: &Connection,
+    session_id: &str,
+    prompt: Vec<ContentBlock>,
+    activity: &ActivityTracker,
+    admission: Box<dyn crate::transport::AcpPromptAdmission>,
+) -> AcpResult<PromptOutcome> {
+    let request = PromptRequest::new(SessionId::new(session_id), prompt);
+    let params = admission.required_params(serde_json::to_value(&request)?)?;
+    let idle_window = prompt_idle_timeout();
+    let req_fut =
+        conn.request_required_prompt(params, admission, Duration::from_secs(24 * 60 * 60));
+    tokio::pin!(req_fut);
+    loop {
+        tokio::select! {
+            res = &mut req_fut => {
+                let response: PromptResponse = serde_json::from_value(res?)
+                    .map_err(|e| AcpError::Protocol(format!("invalid session/prompt response: {e}")))?;
+                return Ok(PromptOutcome {
+                    stop_reason: response.stop_reason,
+                    usage: response.usage,
+                    meta: response.meta,
+                });
+            }
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                if Duration::from_millis(activity.idle_ms()) >= idle_window {
+                    return Err(AcpError::PromptIdleTimeout(idle_window));
+                }
+            }
+        }
+    }
+}
+
 /// `session/prompt` with the user content blocks → drives a turn; the agent
 /// streams `session/update`s then returns a [`PromptOutcome`] carrying the
 /// [`StopReason`] and optional end-of-turn usage snapshot (§6.5).
@@ -508,6 +548,11 @@ pub struct MappedToolCall {
     pub output: Option<Value>,
     /// `data.status`: one of started|completed|error.
     pub status: &'static str,
+    /// PROTOCOL §5.5b: a backgrounded-marker update that supplied no explicit
+    /// `status`. Its genuine fields keep their ordinary processing, but the
+    /// tool keeps the status it already has: the marker must never reopen a
+    /// completed or failed tool as `started`.
+    pub keeps_status: bool,
 }
 
 /// Map a `session/update` to a [`MappedUpdate`], or `None` when the variant has
@@ -621,6 +666,142 @@ fn unwrap_codex_mcp_input(raw_input: Option<&Value>) -> Option<(Value, String)> 
     Some((Value::Object(unwrapped), format!("{server}_{tool}")))
 }
 
+/// Cursor delivers MCP tool calls as
+/// `{ "providerIdentifier": "<server>", "toolName": "<tool>", "args": {…} }`
+/// (captured from cursor-agent 2026.11.05-86047df; the tool-call title is
+/// `"<server>: <tool>"`, which the `<name>: …` split would mis-read as the
+/// server name). Hoist `args` and name the call `{server}_{tool}`, like
+/// [`unwrap_codex_mcp_input`]. Requires exactly these keys (`args` optional).
+fn unwrap_cursor_mcp_input(raw_input: Option<&Value>) -> Option<(Value, String)> {
+    let obj = raw_input?.as_object()?;
+    if obj
+        .keys()
+        .any(|k| !matches!(k.as_str(), "providerIdentifier" | "toolName" | "args"))
+    {
+        return None;
+    }
+    let server = obj.get("providerIdentifier")?.as_str()?;
+    let tool = obj.get("toolName")?.as_str()?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    let args = match obj.get("args") {
+        None | Some(Value::Null) => Value::Object(serde_json::Map::new()),
+        Some(Value::Object(args)) => Value::Object(args.clone()),
+        Some(_) => return None,
+    };
+    Some((args, format!("{server}_{tool}")))
+}
+
+/// Cursor's native tool shapes (cursor-agent 2026.11.05-86047df,
+/// `tool-call-presentation.ts` `summarizeToolCall` / `extractToolCallInput`;
+/// shell and task frames also captured live). Each rule requires the exact
+/// `raw_input` key set Cursor emits plus its title form, so other
+/// providers' shapes never match.
+fn derive_cursor_tool_name(title: &str, obj: &serde_json::Map<String, Value>) -> Option<String> {
+    let keys = |expected: &[&str]| {
+        obj.len() == expected.len() && expected.iter().all(|k| obj.contains_key(*k))
+    };
+    // `_toolName`-tagged tools (`task`, `updateTodos`, `askQuestion`,
+    // `createPlan`, `generateImage`, `generateVideo`).
+    if let Some(name) = obj.get("_toolName").and_then(Value::as_str) {
+        // The native subagent tool renders as "Subagent" in the timeline.
+        if name == "task" {
+            return Some("Subagent".to_string());
+        }
+        if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Some(name.to_string());
+        }
+    }
+    if keys(&["command"]) {
+        let command = obj.get("command")?.as_str()?;
+        let quoted = format!("`{}`", command.replace('`', "\\`"));
+        return (title == quoted || title == "Terminal").then(|| "bash".to_string());
+    }
+    if keys(&["path"]) {
+        let path = obj.get("path")?.as_str()?;
+        // Cursor backticks the path in edit/delete/list titles; a read title
+        // shows the (cwd-relative) path plus an optional line range.
+        let shown_path = |shown: &str| {
+            !shown.is_empty() && (path == shown || path.ends_with(&format!("/{shown}")))
+        };
+        let backticked = |verb: &str| {
+            title
+                .strip_prefix(verb)
+                .and_then(|rest| rest.strip_prefix('`'))
+                .and_then(|rest| rest.split_once('`'))
+                .is_some_and(|(shown, _)| shown_path(shown))
+        };
+        let name = if title == "Edit File" || backticked("Edit ") {
+            "edit"
+        } else if title == "Delete File" || backticked("Delete ") {
+            "delete"
+        } else if backticked("List the ") {
+            "ls"
+        } else if title.strip_prefix("Read ").is_some_and(|rest| {
+            rest.ends_with(')') && shown_path(rest.split(" (").next().unwrap_or(rest))
+        }) {
+            "read"
+        } else {
+            return None;
+        };
+        return Some(name.to_string());
+    }
+    if keys(&["pattern", "path"]) && title.starts_with("grep") {
+        return Some("grep".to_string());
+    }
+    if keys(&["pattern"]) && title.starts_with("Find") {
+        return Some("glob".to_string());
+    }
+    if keys(&["query"]) && (title.starts_with("Search: ") || title == "Codebase Search") {
+        return Some("codebase-search".to_string());
+    }
+    if keys(&["searchTerm"]) && title.starts_with("Web Search") {
+        return Some("web-search".to_string());
+    }
+    if keys(&["paths"]) && title.starts_with("Read Lints") {
+        return Some("read-lints".to_string());
+    }
+    None
+}
+
+/// Cursor-only naming pass, applied by the service layer after the generic
+/// mapping for sessions whose provider is Cursor (the generic rules never
+/// see these shapes, so other providers map exactly as before). Unwraps
+/// Cursor's MCP input (`{ providerIdentifier, toolName, args }`) and names
+/// its native tools ([`derive_cursor_tool_name`]). A name the callback
+/// routes already resolved to `workspace_api` is kept.
+pub fn apply_cursor_tool_names(call: &mut MappedToolCall) {
+    if call.tool_name == "workspace_api" && call.name_authoritative {
+        return;
+    }
+    if let Some((input, rewritten)) = unwrap_cursor_mcp_input(Some(&call.input)) {
+        let (name, _) = derive_tool_name_inner(&rewritten, Some(&input), false);
+        call.input = input;
+        call.tool_kind = refine_tool_kind(call.tool_kind, &name);
+        call.tool_name = name;
+        call.name_authoritative = true;
+        return;
+    }
+    if let Some(name) = call
+        .input
+        .as_object()
+        .and_then(|obj| derive_cursor_tool_name(&call.title, obj))
+    {
+        call.tool_kind = refine_tool_kind(call.tool_kind, &name);
+        call.tool_name = name;
+    }
+}
+
+/// Re-apply [`tool_kind_word`]'s name-based overrides (git / note /
+/// retrieval) after a rename, keeping the ACP-kind-derived word otherwise.
+fn refine_tool_kind(current: &'static str, name: &str) -> &'static str {
+    match tool_kind_word(ToolKind::Other, name) {
+        "other" => current,
+        word => word,
+    }
+}
+
 /// Resolve the mapped `input` and tool name for a tool call. When the codex
 /// nested-MCP shape is detected ([`unwrap_codex_mcp_input`]) the arguments
 /// are hoisted to the top level and the rewritten `{server}_{tool}` name is
@@ -687,6 +868,7 @@ fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
         input,
         output: tool_call.raw_output.clone(),
         status: tool_status_word(tool_call.status),
+        keeps_status: false,
         tool_name,
         name_authoritative,
         title,
@@ -703,6 +885,11 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
         tool_kind: tool_kind_word(fields.kind.unwrap_or_default(), &tool_name),
         // A bare progress update (no status) is still mid-flight → "started".
         status: fields.status.map_or("started", tool_status_word),
+        keeps_status: fields.status.is_none()
+            && update
+                .meta
+                .as_ref()
+                .is_some_and(crate::workers::meta_is_backgrounded),
         tool_call_id: update.tool_call_id.0.to_string(),
         input,
         output: fields.raw_output.clone(),
@@ -1073,8 +1260,8 @@ mod prompt_guidance_tests {
         let (mut replies, read) = tokio::io::duplex(4096);
         let conn = Connection::new(input, read, None, ConnectionHooks::default());
         let blocks: Vec<ContentBlock> = serde_json::from_value(json!([
-            {"type":"text","text":"original user block"},
-            {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png"}
+            {"type":"text","text":"original user block","_meta":{"fixture":"original text metadata"}},
+            {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png","_meta":{"fixture":"original attachment metadata"}}
         ]))
         .unwrap();
         let activity = ActivityTracker::new();
@@ -1158,8 +1345,8 @@ mod prompt_guidance_tests {
         assert_eq!(
             frame["params"]["prompt"],
             json!([
-                {"type":"text","text":"original user block"},
-                {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png"},
+                {"type":"text","text":"original user block","_meta":{"fixture":"original text metadata"}},
+                {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png","_meta":{"fixture":"original attachment metadata"}},
                 {"type":"text","text":"optional inert text"}
             ])
         );

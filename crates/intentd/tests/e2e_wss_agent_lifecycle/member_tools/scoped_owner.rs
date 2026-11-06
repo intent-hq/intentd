@@ -18,14 +18,17 @@ async fn person_connection(
 async fn guest_permission_event(
     socket: &mut WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
 ) -> Value {
-    timeout(Duration::from_secs(15), async {
-        loop {
-            let event = wss_event(socket, 15).await;
-            if event["params"]["event"]["type"] != "workspace:updated" {
-                return event;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                let event = wss_event(socket, 15).await;
+                if event["params"]["event"]["type"] != "workspace:updated" {
+                    return event;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("guest permission event")
 }
@@ -193,7 +196,15 @@ async fn permission_recovery(routed: bool) {
     let refused =
         wss_rpc_envelope(&mut ordinary, 2, "agent.respondPermission", answer.clone()).await;
     assert_eq!(refused["error"]["code"], -32003, "{refused}");
-    let refused = wss_rpc_envelope(&mut guest, 6, "script.list", json!({"workspaceId":ws})).await;
+    let scripts = wss_rpc(&mut guest, 6, "script.list", json!({"workspaceId":ws})).await;
+    assert_eq!(scripts["scripts"], json!([]), "{scripts}");
+    let refused = wss_rpc_envelope(
+        &mut guest,
+        16,
+        "script.create",
+        json!({"workspaceId":ws,"name":"Forbidden script","command":"true","mode":"command"}),
+    )
+    .await;
     assert_eq!(refused["error"]["code"], -32003, "{refused}");
 
     store
@@ -203,6 +214,8 @@ async fn permission_recovery(routed: bool) {
     let row = wss_rpc(&mut guest, 7, "workspace.get", json!({"workspaceId":ws})).await;
     assert_eq!(row["workspace"]["canManage"], false);
     assert_eq!(row["workspace"]["myRole"], "collaborator");
+    let refused = wss_rpc_envelope(&mut guest, 17, "script.list", json!({"workspaceId":ws})).await;
+    assert_eq!(refused["error"]["code"], -32003, "{refused}");
     assert_eq!(
         wss_rpc(&mut guest, 8, "agent.pendingPermissions", json!({})).await["requests"],
         json!([])
@@ -250,18 +263,21 @@ async fn permission_recovery(routed: bool) {
     )
     .await;
     for events_socket in [&mut guest_events, &mut ordinary_events] {
-        timeout(Duration::from_secs(15), async {
-            loop {
-                let event = wss_event(events_socket, 15).await;
-                assert_eq!(
-                    event["params"]["event"]["type"], "workspace:updated",
-                    "guest received a member-only event: {event}"
-                );
-                if event.to_string().contains("Permission event barrier") {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            async {
+                loop {
+                    let event = wss_event(events_socket, 15).await;
+                    assert_eq!(
+                        event["params"]["event"]["type"], "workspace:updated",
+                        "guest received a member-only event: {event}"
+                    );
+                    if event.to_string().contains("Permission event barrier") {
+                        break;
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("visible lifecycle barrier");
     }
@@ -302,17 +318,20 @@ async fn permission_recovery(routed: bool) {
         );
     }
     wss_rpc(&mut guest, 13, "principal.revokeSelf", json!({})).await;
-    timeout(Duration::from_secs(15), async {
-        loop {
-            match guest_events.next().await {
-                None | Some(Ok(Message::Close(_)) | Err(_)) => break,
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = guest_events.send(Message::Pong(p)).await;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                match guest_events.next().await {
+                    None | Some(Ok(Message::Close(_)) | Err(_)) => break,
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = guest_events.send(Message::Pong(p)).await;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await
     .expect("revocation closes the already-admitted guest socket");
     let tls = tls_connect(port, cfg).await;

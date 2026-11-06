@@ -17,11 +17,12 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
+use crate::common::uds_exchange::uds_rpc;
 
-use std::os::unix::process::CommandExt;
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +33,7 @@ use rustls::{ClientConfig, DigitallySignedStruct};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
@@ -48,7 +49,7 @@ fn temp_data_dir() -> tempfile::TempDir {
 async fn await_uds(socket: &Path) -> bool {
     timeout(common::daemon_startup_timeout(), async {
         loop {
-            if UnixStream::connect(socket).await.is_ok() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -56,26 +57,6 @@ async fn await_uds(socket: &Path) -> bool {
     })
     .await
     .is_ok()
-}
-
-async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let stream = UnixStream::connect(socket).await.expect("connect uds");
-    let (read_half, mut write_half) = stream.into_split();
-    let mut line = serde_json::to_string(
-        &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
-    )
-    .unwrap();
-    line.push('\n');
-    write_half.write_all(line.as_bytes()).await.unwrap();
-    write_half.flush().await.unwrap();
-    let mut reader = BufReader::new(read_half);
-    let mut buf = String::new();
-    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
-        .await
-        .expect("uds rpc timed out")
-        .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
 }
 
 #[derive(Debug)]
@@ -173,9 +154,12 @@ async fn wss_rpc(
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -194,7 +178,22 @@ async fn wss_rpc(
     }
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: bool) -> Child {
+fn spawn_serve(
+    data_dir: &Path,
+    listen: &str,
+    env: &[(&str, &str)],
+    resume_all: bool,
+) -> GuardedChild {
+    spawn_serve_with(data_dir, listen, env, resume_all, false)
+}
+
+fn spawn_serve_with(
+    data_dir: &Path,
+    listen: &str,
+    env: &[(&str, &str)],
+    resume_all: bool,
+    opt_in: bool,
+) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -216,89 +215,38 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: 
     for (k, v) in env {
         cmd.env(k, v);
     }
+    if opt_in {
+        common::opt_into_resume_on_start(&mut cmd);
+    }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    // Spawn in its own process group (pgid == child pid) so killing the daemon on
-    // test panic/failure also kills spawned Node.js ACP mock providers via killpg.
-    #[cfg(unix)]
-    cmd.process_group(0);
-    cmd.spawn().expect("spawn intentd serve")
+    // GuardedChild: the daemon gets its own process group, killed on drop, panic
+    // or test-process death. ACP providers start their own groups (intent-acp),
+    // so this does not reach them.
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
         title: "RESUME-ALL-E2E".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
-        diff_summary: None,
+        ..Default::default()
     }
 }
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kill the whole process group FIRST (daemon + any Node.js ACP provider
-        // children) BEFORE wait(), so children are reaped before they get reparented.
-        // The daemon was spawned with process_group(0), making it the group leader.
-        #[cfg(unix)]
-        {
-            use nix::sys::signal::{self, Signal};
-            use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id().cast_signed());
-            let _ = signal::killpg(pid, Signal::SIGKILL);
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
+        // Kills the daemon's process group (ACP providers run in their own groups).
+        let _ = self.child.kill_tree();
         // On test panic, print data-dir path + daemon log tail for diagnosability
         if std::thread::panicking() {
             eprintln!("\n=== DAEMON CLEANUP (test panicked) ===");
@@ -469,7 +417,8 @@ async fn serve_resume_all_auto_resumes_interrupted_agents() {
     // Poll agent.get to wait for the agent to complete its turn and reach idle
     eprintln!("Polling agent.get until agent is idle (bounded to 30s)...");
     let mut agent_is_idle = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while tokio::time::Instant::now() < deadline {
         let agent_result = wss_rpc(
             &mut ws,
@@ -680,7 +629,8 @@ async fn setting_on_resumes_without_resume_all_flag() {
     eprintln!("Phase 4: Poll agent status to confirm turn completion");
     eprintln!("Polling agent.get until agent is idle (bounded to 30s)...");
     let mut agent_is_idle = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while tokio::time::Instant::now() < deadline {
         let agent_result = wss_rpc(
             &mut ws,
@@ -748,14 +698,8 @@ impl RecoveryFixture {
                 created["result"]["agent"]["id"].as_str().unwrap(),
             ));
         }
-        let setting = uds_rpc(
-            &socket,
-            2,
-            "settings.update",
-            json!({"changes": [{"path": "agents.resumeInterruptedOnStart", "value": "off"}]}),
-        )
-        .await;
-        assert!(setting["error"].is_null(), "{setting}");
+        // No explicit resume setting: hermetic daemons pin resume-on-start
+        // off, so `start(false)` proves the pin and `start_opted_in` the opt-in.
         drop(daemon);
         for agent in &agents {
             store
@@ -776,6 +720,19 @@ impl RecoveryFixture {
     }
 
     fn start_mode(&self, resume: bool, mode: &str) -> (Daemon, tokio::net::UnixListener) {
+        self.start_with(resume, mode, false)
+    }
+
+    fn start_opted_in(&self) -> (Daemon, tokio::net::UnixListener) {
+        self.start_with(false, "both", true)
+    }
+
+    fn start_with(
+        &self,
+        resume: bool,
+        mode: &str,
+        opt_in: bool,
+    ) -> (Daemon, tokio::net::UnixListener) {
         let data_dir = self.root.path();
         let gate_path = data_dir.join("recovery-gate.sock");
         let gate = tokio::net::UnixListener::bind(&gate_path).unwrap();
@@ -789,7 +746,7 @@ impl RecoveryFixture {
         ];
         (
             Daemon {
-                child: spawn_serve(data_dir, mode, &env, resume),
+                child: spawn_serve_with(data_dir, mode, &env, resume, opt_in),
                 data_dir: data_dir.to_owned(),
             },
             gate,
@@ -834,17 +791,20 @@ async fn startup_recovery_serves_rpcs_while_sweep_is_held() {
         .await
         .expect("sweep reached gate")
         .unwrap();
-    timeout(Duration::from_secs(5), async {
-        let mut ws = fixture.wss().await;
-        let pending = wss_rpc(&mut ws, 1, "agent.listInterrupted", json!({})).await;
-        assert_eq!(
-            pending["agents"],
-            json!([]),
-            "automatic candidates must not flash in the manual recovery dialog"
-        );
-        let workspaces = wss_rpc(&mut ws, 2, "workspace.list", json!({})).await;
-        assert!(workspaces.is_object());
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            let mut ws = fixture.wss().await;
+            let pending = wss_rpc(&mut ws, 1, "agent.listInterrupted", json!({})).await;
+            assert_eq!(
+                pending["agents"],
+                json!([]),
+                "automatic candidates must not flash in the manual recovery dialog"
+            );
+            let workspaces = wss_rpc(&mut ws, 2, "workspace.list", json!({})).await;
+            assert!(workspaces.is_object());
+        },
+    )
     .await
     .expect("UDS and authenticated WSS RPCs must finish before releasing recovery");
     assert_eq!(
@@ -863,6 +823,8 @@ async fn startup_recovery_serves_rpcs_while_sweep_is_held() {
     fixture.store.close().await;
 }
 
+/// No flag and no `config.toml` value: the hermetic launcher's `off` pin
+/// replaces the display-dependent `auto` default, on every host.
 #[tokio::test]
 async fn startup_recovery_disabled_keeps_candidates_visible() {
     let fixture = RecoveryFixture::new().await;
@@ -872,6 +834,49 @@ async fn startup_recovery_disabled_keeps_candidates_visible() {
     assert_eq!(pending["agents"].as_array().unwrap().len(), 2);
     let log = std::fs::read_to_string(fixture.root.path().join("daemon.log")).unwrap();
     assert!(!log.contains("resume-on-start: resuming interrupted agents"));
+    let decision = log
+        .lines()
+        .find(|line| line.contains("startup interrupted-agent resume decision"))
+        .expect("startup logs its resume decision");
+    assert!(
+        decision.contains("setting=\"off\"")
+            && decision.contains("test_default_applied=true")
+            && decision.contains("resume=false"),
+        "{decision}"
+    );
+    fixture.store.close().await;
+}
+
+/// `common::opt_into_resume_on_start` restores the startup sweep without
+/// `--resume-all` or a `config.toml` value, regardless of display.
+#[tokio::test]
+async fn startup_recovery_opt_in_resumes_without_flag_or_setting() {
+    let fixture = RecoveryFixture::new().await;
+    let (_daemon, gate) = fixture.start_opted_in();
+    let (mut release, _) = timeout(common::daemon_startup_timeout(), gate.accept())
+        .await
+        .expect("opted-in sweep reached gate")
+        .unwrap();
+    release.write_u8(1).await.unwrap();
+    wait_for_sweep(fixture.root.path()).await;
+    assert!(fixture
+        .store
+        .list_interrupted_agents()
+        .await
+        .unwrap()
+        .is_empty());
+    let log = std::fs::read_to_string(fixture.root.path().join("daemon.log")).unwrap();
+    let decision = log
+        .lines()
+        .find(|line| line.contains("startup interrupted-agent resume decision"))
+        .expect("startup logs its resume decision");
+    assert!(
+        decision.contains("resume_all=false")
+            && decision.contains("setting=\"on\"")
+            && decision.contains("test_default_applied=true")
+            && decision.contains("resume=true"),
+        "{decision}"
+    );
     fixture.store.close().await;
 }
 
@@ -896,7 +901,11 @@ async fn startup_recovery_manual_resolution_wins_before_automatic_claim() {
     release.write_u8(1).await.unwrap();
     wait_for_sweep(fixture.root.path()).await;
     for (i, id) in fixture.agents.iter().enumerate() {
-        let session = fixture.store.get_agent_session(id).await.unwrap();
+        let session = fixture
+            .store
+            .get_agent_session_with_transcript(id)
+            .await
+            .unwrap();
         assert_eq!(
             session.messages.iter().filter(|m| m.role == "user").count(),
             usize::from(i == 0),
@@ -946,7 +955,7 @@ async fn startup_recovery_shutdown_releases_unclaimed_candidates() {
     for agent in &fixture.agents {
         assert!(fixture
             .store
-            .get_agent_session(agent)
+            .get_agent_session_with_transcript(agent)
             .await
             .unwrap()
             .messages
@@ -974,27 +983,30 @@ async fn startup_recovery_insecure_ws_serves_while_sweep_is_held() {
         .await
         .unwrap()
         .unwrap();
-    timeout(Duration::from_secs(5), async {
-        let socket = fixture.root.path().join("intentd.sock");
-        assert!(await_uds(&socket).await);
-        let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
-        let port = status["result"]["port"].as_u64().unwrap();
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            let socket = fixture.root.path().join("intentd.sock");
+            assert!(await_uds(&socket).await);
+            let status = uds_rpc(&socket, 1, "system.status", json!({})).await;
+            let port = status["result"]["port"].as_u64().unwrap();
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+                .await
+                .unwrap();
+            ws.send(Message::Text(
+                json!({"jsonrpc":"2.0", "id": 2, "method":"agent.listInterrupted", "params":{}})
+                    .to_string()
+                    .into(),
+            ))
             .await
             .unwrap();
-        ws.send(Message::Text(
-            json!({"jsonrpc":"2.0", "id": 2, "method":"agent.listInterrupted", "params":{}})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
-        let frame = ws.next().await.unwrap().unwrap();
-        let value: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
-        assert_eq!(value["jsonrpc"], "2.0");
-        assert_eq!(value["id"], 2);
-        assert_eq!(value["result"]["agents"], json!([]));
-    })
+            let frame = ws.next().await.unwrap().unwrap();
+            let value: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(value["jsonrpc"], "2.0");
+            assert_eq!(value["id"], 2);
+            assert_eq!(value["result"]["agents"], json!([]));
+        },
+    )
     .await
     .expect("insecure WS and UDS ready before recovery release");
     release.write_u8(1).await.unwrap();
@@ -1019,7 +1031,7 @@ async fn startup_recovery_failure_can_be_retried_on_the_same_connection() {
     );
     let workspace = fixture
         .store
-        .get_agent_session(id)
+        .get_agent_session_with_transcript(id)
         .await
         .unwrap()
         .workspace_id;
@@ -1031,22 +1043,25 @@ async fn startup_recovery_failure_can_be_retried_on_the_same_connection() {
     )
     .await;
     release.write_u8(1).await.unwrap();
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let frame = ws.next().await.unwrap().unwrap();
-            if let Message::Text(text) = frame {
-                let frame: Value = serde_json::from_str(&text).unwrap();
-                let event = &frame["params"]["event"];
-                if event["type"] == "agent:updated"
-                    && event["data"]["startupRecoveryFailed"] == true
-                {
-                    assert_eq!(event["data"]["agentId"], json!(id));
-                    assert_eq!(event["workspaceId"], json!(workspace));
-                    break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let frame = ws.next().await.unwrap().unwrap();
+                if let Message::Text(text) = frame {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    let event = &frame["params"]["event"];
+                    if event["type"] == "agent:updated"
+                        && event["data"]["startupRecoveryFailed"] == true
+                    {
+                        assert_eq!(event["data"]["agentId"], json!(id));
+                        assert_eq!(event["workspaceId"], json!(workspace));
+                        break;
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("failed recovery must notify the already connected client");
     let pending = wss_rpc(&mut ws, 2, "agent.listInterrupted", json!({})).await;
@@ -1078,7 +1093,7 @@ async fn startup_completion_recovery_serves_wss_before_waking_parents() {
         let child = &fixture.agents[1];
         let mut session = fixture
             .store
-            .get_agent_session_summary(child)
+            .get_agent_session_without_messages(child)
             .await
             .unwrap();
         let workspace = session.workspace_id.clone();
@@ -1272,7 +1287,7 @@ async fn startup_completion_recovery_serves_wss_before_waking_parents() {
         .expect("completion delivered after release");
         let messages = fixture
             .store
-            .get_agent_session(parent)
+            .get_agent_session_with_transcript(parent)
             .await
             .unwrap()
             .messages;

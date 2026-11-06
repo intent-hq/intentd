@@ -31,15 +31,18 @@ async fn approved_ten_rpc_names_are_absent_over_uds_and_owner_wss() {
         .await
         .expect("serve isolated UDS");
     });
-    let stream = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut poll = tokio::time::interval(Duration::from_millis(10));
-        loop {
-            poll.tick().await;
-            if let Ok(stream) = UnixStream::connect(&socket).await {
-                break stream;
+    let stream = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            let mut poll = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                poll.tick().await;
+                if let Ok(stream) = UnixStream::connect(&socket).await {
+                    break stream;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("isolated UDS ready");
     let (read, mut write) = stream.into_split();

@@ -29,6 +29,12 @@
 //! - **grok** — `grok models` parsed via
 //!   [`intent_providers::parse_grok_models_command_output`] (the exit code is
 //!   never trusted).
+//! - **cursor** — `cursor-agent models` parsed via
+//!   [`intent_providers::cursor::parse_cursor_models_command_output`]: model
+//!   rows ⇒ `true`, the explicit "Authentication required" error ⇒ `false`,
+//!   else unknown. Covers a stored login and `CURSOR_API_KEY` alike (the
+//!   stored login wins when both exist) and, unlike an ACP probe, starts no
+//!   chat in the user's Cursor history.
 //! - **pi** — ACP probe via the pinned pi-acp npx adapter, gated on the `pi`
 //!   CLI being installed: non-empty model list ⇒ `true`; an empty list or an
 //!   auth-required error ⇒ `false`; else unknown.
@@ -68,6 +74,7 @@ pub(crate) const AUTH_PROBE_PROVIDERS: &[&str] = &[
     "grok",
     "pi",
     "antigravity",
+    "cursor",
 ];
 
 /// Timeout for one CLI auth probe (`auth status` / `login status` /
@@ -103,7 +110,7 @@ pub enum CliAuthProbe {
 impl CliAuthProbe {
     /// The wire mapping for `host.providerAuthStatus`:
     /// `authenticated: true | false | null`.
-    fn auth_status(self) -> Option<bool> {
+    pub(crate) fn auth_status(self) -> Option<bool> {
         match self {
             CliAuthProbe::Authenticated => Some(true),
             CliAuthProbe::NotAuthenticated => Some(false),
@@ -158,6 +165,10 @@ impl AuthIdentity {
 struct AuthVerdict {
     authenticated: Option<bool>,
     identity: Option<AuthIdentity>,
+    /// Optional human-readable status text for the wire entry
+    /// (`statusNote`). Cursor only: says the stored login is in use when
+    /// `CURSOR_API_KEY` is also set.
+    status_note: Option<String>,
 }
 
 impl AuthVerdict {
@@ -167,6 +178,7 @@ impl AuthVerdict {
         Self {
             authenticated,
             identity: None,
+            status_note: None,
         }
     }
 }
@@ -196,9 +208,74 @@ pub async fn check_provider_auth_cli(
     program: &OsStr,
     auth_check_args: &[&str],
 ) -> CliAuthProbe {
+    check_provider_auth_cli_in(provider_id, program, auth_check_args, None).await
+}
+
+/// The login-shell credential capture a profile-less launch gap-fills
+/// (`intent_acp` `build_command`). The first capture can block on the
+/// login shell, so it runs off the async executor; a failure is empty.
+async fn captured_credential_env() -> &'static std::collections::BTreeMap<String, String> {
+    static EMPTY: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    tokio::task::spawn_blocking(intent_core::path_utils::login_shell_credential_env)
+        .await
+        .unwrap_or(&EMPTY)
+}
+
+/// Gap-fill `captured` into a probe the way a profile-less launch does:
+/// a variable the daemon's own environment sets is never overridden.
+/// SECURITY: the values are secrets — never log them.
+fn gap_fill_credentials(
+    cmd: &mut tokio::process::Command,
+    captured: &std::collections::BTreeMap<String, String>,
+) {
+    for (key, value) in captured {
+        if std::env::var_os(key).is_none() {
+            cmd.env(key, value);
+        }
+    }
+}
+
+/// [`check_provider_auth_cli`], optionally under a resolved installed
+/// context (a named profile): the probe then runs with exactly that
+/// context's environment, as its launches do. Without one it runs with the
+/// environment a profile-less launch gets: the daemon's own, gap-filled
+/// with the captured login-shell credentials.
+async fn check_provider_auth_cli_in(
+    provider_id: &str,
+    program: &OsStr,
+    auth_check_args: &[&str],
+    context: Option<&crate::installed_cli::InstalledContext>,
+) -> CliAuthProbe {
+    let captured = if context.is_none() && provider_id != "claude-code" {
+        captured_credential_env().await
+    } else {
+        static EMPTY: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        &EMPTY
+    };
+    check_provider_auth_cli_with(provider_id, program, auth_check_args, context, captured).await
+}
+
+/// [`check_provider_auth_cli_in`] with the captured credentials given
+/// (the test seam). claude-code applies its own allow-listed merge.
+async fn check_provider_auth_cli_with(
+    provider_id: &str,
+    program: &OsStr,
+    auth_check_args: &[&str],
+    context: Option<&crate::installed_cli::InstalledContext>,
+    captured: &std::collections::BTreeMap<String, String>,
+) -> CliAuthProbe {
+    let probe_command = |program: &OsStr| {
+        let mut cmd = probe_command(program);
+        match context {
+            Some(context) => context.apply(&mut cmd),
+            None => gap_fill_credentials(&mut cmd, captured),
+        }
+        cmd
+    };
     match provider_id {
         "claude-code" => {
-            check_claude_code_auth_cli(program, auth_check_args)
+            check_claude_code_auth_cli(program, auth_check_args, context)
                 .await
                 .probe
         }
@@ -221,6 +298,19 @@ pub async fn check_provider_auth_cli(
                 }
                 Ok(Err(_)) => CliAuthProbe::Failed,
                 Err(_) => CliAuthProbe::TimedOut,
+            }
+        }
+        "cursor" => {
+            let mut cmd = probe_command(program);
+            cmd.args(auth_check_args);
+            match crate::cursor_cli::run_cursor_cli(cmd, CLI_AUTH_TIMEOUT).await {
+                Some(output) if could_not_run(output.status) => CliAuthProbe::Failed,
+                Some(output) => cursor_probe_outcome(
+                    &String::from_utf8_lossy(&output.stdout),
+                    &String::from_utf8_lossy(&output.stderr),
+                    output.status.success(),
+                ),
+                None => CliAuthProbe::TimedOut,
             }
         }
         "opencode" => {
@@ -276,8 +366,41 @@ struct ClaudeCliStatus {
 /// identity fields are dropped, and inconclusive outcomes never carry
 /// identity. The shared wrapper discards the identity so `intentd doctor`
 /// keeps its verdict-only view.
-async fn check_claude_code_auth_cli(program: &OsStr, auth_check_args: &[&str]) -> ClaudeCliStatus {
-    let mut cmd = probe_command(program);
+async fn check_claude_code_auth_cli(
+    program: &OsStr,
+    auth_check_args: &[&str],
+    context: Option<&crate::installed_cli::InstalledContext>,
+) -> ClaudeCliStatus {
+    // Services/GUI launches may inherit no shell credentials. Use the same
+    // cached shell inputs and provider allow-list as installed Claude launches;
+    // inherited values (including empty or non-Unicode ones) still win. The
+    // first shell capture can block, so keep it off the async executor. A
+    // resolved context (a named profile) already carries those inputs with
+    // the profile applied over them, so it replaces this merge entirely.
+    let program = program.to_owned();
+    let context = context.cloned();
+    let Ok(mut cmd) = tokio::task::spawn_blocking(move || {
+        let mut cmd = probe_command(&program);
+        if let Some(context) = context {
+            context.apply(&mut cmd);
+            return cmd;
+        }
+        for (key, value) in intent_core::path_utils::login_shell_credential_env() {
+            if intent_providers::installed_cli::InstalledCli::Claude.accepts_env(key)
+                && std::env::var_os(key).is_none()
+            {
+                cmd.env(key, value);
+            }
+        }
+        cmd
+    })
+    .await
+    else {
+        return ClaudeCliStatus {
+            probe: CliAuthProbe::Failed,
+            identity: None,
+        };
+    };
     cmd.args(auth_check_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -401,6 +524,54 @@ fn grok_probe_outcome(
     }
 }
 
+/// Map one `cursor-agent models` run to a probe outcome. Never log the
+/// output: it lists the account's models.
+fn cursor_probe_outcome(stdout: &str, stderr: &str, exit_success: bool) -> CliAuthProbe {
+    let parsed =
+        intent_providers::cursor::parse_cursor_models_command_output(stdout, stderr, exit_success);
+    match parsed.authenticated {
+        Some(true) => CliAuthProbe::Authenticated,
+        Some(false) => CliAuthProbe::NotAuthenticated,
+        None if exit_success => CliAuthProbe::StatusUnknown,
+        None => CliAuthProbe::Failed,
+    }
+}
+
+/// Signed-in Cursor status text when both credentials exist.
+pub(crate) const CURSOR_STORED_LOGIN_IN_USE_NOTE: &str =
+    "Using the stored Cursor login. CURSOR_API_KEY is also set; Cursor uses the stored login while it exists.";
+
+/// The Cursor `statusNote` for a signed-in account: when `CURSOR_API_KEY`
+/// reaches the CLI (daemon env or captured login-shell env) and `cursor-agent
+/// status --format json` reports a stored access token, say the stored login
+/// is in use. Any probe failure omits the note.
+async fn cursor_stored_login_note(program: &OsStr) -> Option<String> {
+    let captured = captured_credential_env().await;
+    let key_present = std::env::var_os("CURSOR_API_KEY").is_some_and(|v| !v.is_empty())
+        || captured
+            .get("CURSOR_API_KEY")
+            .is_some_and(|v| !v.is_empty());
+    if !key_present {
+        return None;
+    }
+    let mut cmd = probe_command(program);
+    gap_fill_credentials(&mut cmd, captured);
+    cmd.args(["status", "--format", "json"]);
+    let output = crate::cursor_cli::run_cursor_cli(cmd, CLI_AUTH_TIMEOUT).await?;
+    cursor_status_note(true, &String::from_utf8_lossy(&output.stdout))
+}
+
+/// Pure seam for [`cursor_stored_login_note`]: a note only when the key is
+/// present and the status JSON reports a stored access token. Never log the
+/// payload (it carries the account email).
+fn cursor_status_note(key_present: bool, status_json: &str) -> Option<String> {
+    let stored = serde_json::from_str::<Value>(&intent_providers::cursor::strip_ansi(status_json))
+        .ok()?
+        .get("hasAccessToken")
+        .and_then(Value::as_bool)?;
+    (key_present && stored).then(|| CURSOR_STORED_LOGIN_IN_USE_NOTE.to_string())
+}
+
 /// Timeout for the opencode readiness probe (`opencode models` can be slower
 /// than a simple auth-file read; parity with the FE's 10s budget).
 const OPENCODE_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -433,8 +604,47 @@ async fn probe_provider(
     provider_id: &'static str,
     program: std::ffi::OsString,
     override_path: Option<&str>,
+    profile: Option<Arc<intent_acp::ProfileEnv>>,
 ) -> AuthVerdict {
+    // A named profile probes exactly what its launches run: the installed
+    // CLI under the profile's resolved context. Default keeps today's path.
+    let context = match (
+        &profile,
+        intent_providers::installed_cli::InstalledCli::for_provider(provider_id),
+    ) {
+        (Some(profile), Some(cli)) => {
+            match crate::installed_cli::InstalledContext::discover_for(cli, Some(profile.clone()))
+                .await
+            {
+                Ok(context) => Some(context),
+                Err(_) => return AuthVerdict::default(),
+            }
+        }
+        (Some(_), None) => return AuthVerdict::default(),
+        (None, _) => None,
+    };
+    let program = context
+        .as_ref()
+        .map_or(program, |c| c.runtime.path().as_os_str().to_owned());
     match provider_id {
+        "cursor" => {
+            let args = intent_providers::find_provider(provider_id)
+                .and_then(|cfg| cfg.auth_check_args)
+                .unwrap_or_default();
+            let authenticated = check_provider_auth_cli_in(provider_id, &program, args, None)
+                .await
+                .auth_status();
+            let status_note = if authenticated == Some(true) {
+                cursor_stored_login_note(&program).await
+            } else {
+                None
+            };
+            AuthVerdict {
+                authenticated,
+                identity: None,
+                status_note,
+            }
+        }
         "auggie" | "codex" | "opencode" | "grok" => {
             let args = intent_providers::find_provider(provider_id)
                 .and_then(|cfg| cfg.auth_check_args)
@@ -443,7 +653,7 @@ async fn probe_provider(
                 return AuthVerdict::default();
             }
             AuthVerdict::plain(
-                check_provider_auth_cli(provider_id, &program, args)
+                check_provider_auth_cli_in(provider_id, &program, args, context.as_ref())
                     .await
                     .auth_status(),
             )
@@ -455,18 +665,19 @@ async fn probe_provider(
             if args.is_empty() {
                 return AuthVerdict::default();
             }
-            let status = check_claude_code_auth_cli(&program, args).await;
+            let status = check_claude_code_auth_cli(&program, args, context.as_ref()).await;
             let authenticated = claude_code_auth_verdict(status.probe, move || {
                 let adapter_override =
                     intent_providers::find_provider(provider_id).and_then(|cfg| {
                         intent_providers::resolve_npx_only_override(cfg, override_path)
                     });
-                crate::provider_models::probe_claude_code_auth(adapter_override)
+                crate::provider_models::probe_claude_code_auth(adapter_override, profile)
             })
             .await;
             AuthVerdict {
                 authenticated,
                 identity: status.identity,
+                status_note: None,
             }
         }
         "droid" => {
@@ -572,6 +783,7 @@ fn resolve_probe_binary(
         "grok" => "grok",
         "pi" => "pi",
         "antigravity" => "antigravity-acp",
+        "cursor" => intent_providers::cursor::CURSOR_COMMAND,
         _ => return None,
     };
     let override_applies =
@@ -588,14 +800,14 @@ fn resolve_probe_binary(
 /// single-flight slot so concurrent status calls share one probe. In-memory
 /// only — a daemon restart re-probes.
 struct AuthStatusCache {
-    entries: Mutex<HashMap<&'static str, (Instant, AuthVerdict)>>,
-    inflight: Mutex<HashMap<&'static str, Arc<OnceCell<AuthVerdict>>>>,
+    entries: Mutex<HashMap<String, (Instant, AuthVerdict)>>,
+    inflight: Mutex<HashMap<String, Arc<OnceCell<AuthVerdict>>>>,
     /// Per-provider runtime-demotion counter ([`AuthStatusCache::demote`]).
     /// A probe captures the counter when it starts and its store is dropped
     /// if a demotion landed in between ([`AuthStatusCache::store_probe`]),
     /// so an already-in-flight probe's older verdict cannot overwrite the
     /// authoritative runtime auth failure (PR #1650 review).
-    demotions: Mutex<HashMap<&'static str, u64>>,
+    demotions: Mutex<HashMap<String, u64>>,
 }
 
 impl AuthStatusCache {
@@ -608,16 +820,21 @@ impl AuthStatusCache {
     }
 
     fn fresh(&self, provider_id: &str) -> Option<AuthVerdict> {
-        let entries = self.entries.lock().expect("auth cache poisoned");
-        let (at, verdict) = entries.get(provider_id)?;
-        (at.elapsed() < AUTH_CACHE_TTL).then(|| verdict.clone())
+        self.fresh_entry(provider_id).map(|(_, verdict)| verdict)
     }
 
-    fn store(&self, provider_id: &'static str, verdict: AuthVerdict) {
+    /// [`AuthStatusCache::fresh`] with the instant the verdict was stored.
+    fn fresh_entry(&self, provider_id: &str) -> Option<(Instant, AuthVerdict)> {
+        let entries = self.entries.lock().expect("auth cache poisoned");
+        let (at, verdict) = entries.get(provider_id)?;
+        (at.elapsed() < AUTH_CACHE_TTL).then(|| (*at, verdict.clone()))
+    }
+
+    fn store(&self, provider_id: &str, verdict: AuthVerdict) {
         self.entries
             .lock()
             .expect("auth cache poisoned")
-            .insert(provider_id, (Instant::now(), verdict));
+            .insert(provider_id.to_owned(), (Instant::now(), verdict));
     }
 
     /// The provider's current demotion counter — captured by a probe before
@@ -643,12 +860,7 @@ impl AuthStatusCache {
     /// when superseded — the authoritative cached verdict that displaced it,
     /// so joined `providerAuthStatus` responses never expose a stale verdict
     /// (or identity metadata) that a mid-flight demotion just cleared.
-    fn store_probe(
-        &self,
-        provider_id: &'static str,
-        verdict: AuthVerdict,
-        epoch: u64,
-    ) -> AuthVerdict {
+    fn store_probe(&self, provider_id: &str, verdict: AuthVerdict, epoch: u64) -> AuthVerdict {
         let demotions = self.demotions.lock().expect("auth demotions poisoned");
         if demotions.get(provider_id).copied().unwrap_or(0) != epoch {
             tracing::debug!(
@@ -667,9 +879,9 @@ impl AuthStatusCache {
     /// this one. Any cached identity is cleared — the runtime auth failure
     /// invalidates probe-time identity metadata. Lock order: demotions →
     /// entries (see [`AuthStatusCache::store_probe`]).
-    fn demote(&self, provider_id: &'static str) {
+    fn demote(&self, provider_id: &str) {
         let mut demotions = self.demotions.lock().expect("auth demotions poisoned");
-        *demotions.entry(provider_id).or_insert(0) += 1;
+        *demotions.entry(provider_id.to_owned()).or_insert(0) += 1;
         self.store(provider_id, AuthVerdict::plain(Some(false)));
     }
 
@@ -683,24 +895,25 @@ impl AuthStatusCache {
     /// reports no identity of its own, and an expired entry's identity may
     /// belong to a previous account (CLI account switch), so it is never
     /// revived past the TTL.
-    fn promote(&self, provider_id: &'static str) {
+    fn promote(&self, provider_id: &str) {
         let mut demotions = self.demotions.lock().expect("auth demotions poisoned");
-        *demotions.entry(provider_id).or_insert(0) += 1;
-        let identity = self.fresh(provider_id).and_then(|verdict| verdict.identity);
+        *demotions.entry(provider_id.to_owned()).or_insert(0) += 1;
+        let prior = self.fresh(provider_id);
         self.store(
             provider_id,
             AuthVerdict {
                 authenticated: Some(true),
-                identity,
+                identity: prior.as_ref().and_then(|verdict| verdict.identity.clone()),
+                status_note: prior.and_then(|verdict| verdict.status_note),
             },
         );
     }
 
-    fn join_inflight(&self, provider_id: &'static str) -> Arc<OnceCell<AuthVerdict>> {
+    fn join_inflight(&self, provider_id: &str) -> Arc<OnceCell<AuthVerdict>> {
         self.inflight
             .lock()
             .expect("auth inflight poisoned")
-            .entry(provider_id)
+            .entry(provider_id.to_owned())
             .or_default()
             .clone()
     }
@@ -729,8 +942,24 @@ fn cache() -> &'static AuthStatusCache {
 /// the id that actually runs, not the persisted alias — otherwise an
 /// alias-backed demotion is a no-op and alias-backed creates stay permissive
 /// (PR #1650 review). Known catalog ids map to themselves.
-fn auth_cache_key(provider_id: &str) -> &'static str {
-    intent_providers::provider_config(provider_id).id
+///
+/// A named profile reference has no base-keyed verdict (`None`): its verdict
+/// lives under [`profile_auth_cache_key`], so a profile's outcome never
+/// demotes, promotes or stands in for the base's Default configuration, and
+/// vice versa (PROTOCOL §5.54).
+fn auth_cache_key(provider_id: &str) -> Option<&'static str> {
+    if crate::provider_profiles::is_qualified_ref(provider_id) {
+        return None;
+    }
+    Some(intent_providers::provider_config(provider_id).id)
+}
+
+/// Whether `provider_id` is a base provider whose Default configuration can
+/// carry saved environment overrides (PROTOCOL §5.54), so its auth status
+/// and test prompt run through the services layer with that overlay.
+#[must_use]
+pub fn supports_default_overrides(provider_id: &str) -> bool {
+    crate::provider_profiles::is_default_config_ref(provider_id)
 }
 
 /// Read-only view of one provider's *fresh* cached auth verdict:
@@ -745,7 +974,7 @@ fn auth_cache_key(provider_id: &str) -> &'static str {
 /// influences the gate — it is wire-only enrichment.
 pub(crate) fn cached_auth_verdict(provider_id: &str) -> Option<bool> {
     cache()
-        .fresh(auth_cache_key(provider_id))
+        .fresh(auth_cache_key(provider_id)?)
         .and_then(|verdict| verdict.authenticated)
 }
 
@@ -758,18 +987,28 @@ pub(crate) fn cached_auth_verdict(provider_id: &str) -> Option<bool> {
 /// so the two surfaces stay word-for-word consistent.
 pub(crate) fn not_authenticated_message(provider_id: &str) -> String {
     let display = intent_providers::provider_config(provider_id).display_name;
-    let login_cmd = intent_providers::login_command(provider_id);
-    let caveat = if provider_id == "claude-code" {
-        " Note: signing into the Claude desktop app does not carry over to the CLI — run \
-         \"claude\" in a terminal, then \"/login\"."
-    } else {
-        ""
+    let login_cmd =
+        intent_providers::login_command(intent_providers::base_provider_id(provider_id));
+    let caveat = match intent_providers::base_provider_id(provider_id) {
+        "claude-code" => {
+            " Note: signing into the Claude desktop app does not carry over to the CLI — run \
+             \"claude\" in a terminal, then \"/login\"."
+        }
+        "cursor" => CURSOR_CREDENTIALS_NOTE,
+        _ => "",
     };
     format!(
         "provider \"{provider_id}\" ({display}) is not authenticated — run \
          \"{login_cmd}\" in a terminal, then retry.{caveat}"
     )
 }
+
+/// How Cursor picks credentials, appended to its not-authenticated message:
+/// `cursor-agent` also accepts `CURSOR_API_KEY`, but a stored login wins
+/// over the key when both exist.
+pub(crate) const CURSOR_CREDENTIALS_NOTE: &str =
+    " Cursor also accepts a CURSOR_API_KEY in the daemon's environment; when both exist, \
+     the stored \"cursor-agent login\" wins over the key.";
 
 /// Demote one provider's cached auth verdict to a hard `false` after the
 /// runtime observed an authoritative auth-required error from its adapter
@@ -782,7 +1021,9 @@ pub(crate) fn not_authenticated_message(provider_id: &str) -> String {
 /// overwrite this authoritative `false`, and clears any cached identity
 /// metadata with it.
 pub(crate) fn demote_auth_verdict(provider_id: &str) {
-    cache().demote(auth_cache_key(provider_id));
+    if let Some(key) = auth_cache_key(provider_id) {
+        cache().demote(key);
+    }
 }
 
 /// Promote one provider's cached auth verdict to a hard `true` after the
@@ -795,15 +1036,90 @@ pub(crate) fn demote_auth_verdict(provider_id: &str) {
 /// this authoritative `true`. Cached identity metadata is preserved on the
 /// refreshed entry.
 pub(crate) fn promote_auth_verdict(provider_id: &str) {
-    cache().promote(auth_cache_key(provider_id));
+    if let Some(key) = auth_cache_key(provider_id) {
+        cache().promote(key);
+    }
 }
 
 /// Test seam: plant a verdict in the process-wide auth cache so gate tests
 /// are deterministic without spawning probes. Seed `None` to restore the
 /// permissive cached-unknown state.
-#[cfg(test)]
-pub(crate) fn seed_auth_verdict_for_tests(provider_id: &'static str, value: Option<bool>) {
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn seed_auth_verdict_for_tests(provider_id: &'static str, value: Option<bool>) {
     cache().store(provider_id, AuthVerdict::plain(value));
+}
+
+/// Whether an ACP failure is the provider refusing to work until it is
+/// signed in: the same classification a local session's runtime auth
+/// failure uses.
+#[must_use]
+pub fn is_auth_required(error: &intent_acp::AcpError) -> bool {
+    crate::agent_session::is_acp_auth_required(error)
+}
+
+/// A provider's default account (the machine's own environment, no
+/// profile), as its sign-in probe last reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DefaultSignIn {
+    /// `Some(true)` signed in, `Some(false)` signed out, `None` when the
+    /// provider has no probe, is not installed or the probe was
+    /// inconclusive.
+    pub signed_in: Option<bool>,
+    /// When the verdict was observed; `None` when it was not cached.
+    pub probed_at: Option<Instant>,
+}
+
+/// The default account's sign-in for `provider_id`, from the same cached,
+/// single-flighted probe as `host.providerAuthStatus` (probed again once
+/// its cache entry is older than the TTL). `override_path` is the
+/// provider's `providers.paths` entry, as a launch resolves it. A provider
+/// without a probe is unknown.
+pub async fn default_sign_in(provider_id: &str, override_path: Option<String>) -> DefaultSignIn {
+    let Some(id) = AUTH_PROBE_PROVIDERS
+        .iter()
+        .copied()
+        .find(|id| *id == provider_id)
+    else {
+        return DefaultSignIn::default();
+    };
+    let verdict = resolve_auth_status(id, false, override_path).await;
+    let sign_in = match cache().fresh_entry(id) {
+        Some((at, cached)) => DefaultSignIn {
+            signed_in: cached.authenticated,
+            probed_at: Some(at),
+        },
+        None => DefaultSignIn {
+            signed_in: verdict.authenticated,
+            probed_at: None,
+        },
+    };
+    default_account_sign_in(id, sign_in)
+}
+
+/// Providers whose sign-in probe runs an ACP adapter without the
+/// login-shell credentials a profile-less launch gap-fills, so a daemon
+/// started outside a login shell can see a signed-out account that its
+/// launches would find signed in.
+const PROBES_WITHOUT_LAUNCH_ENV: &[&str] = &["droid", "pi", "antigravity"];
+
+/// What a probe says about the default account a launch uses: a signed-out
+/// verdict from a probe without the launch's environment is only `unknown`,
+/// so placement does not skip a machine on it.
+fn default_account_sign_in(provider_id: &str, mut sign_in: DefaultSignIn) -> DefaultSignIn {
+    if PROBES_WITHOUT_LAUNCH_ENV.contains(&provider_id) && sign_in.signed_in == Some(false) {
+        sign_in.signed_in = None;
+    }
+    sign_in
+}
+
+/// Test seam: make one provider's cached verdict `by` older, so a test
+/// can step past the TTL without waiting.
+#[cfg(all(test, unix))]
+fn age_cached_verdict_for_tests(provider_id: &str, by: Duration) {
+    let mut entries = cache().entries.lock().expect("auth cache poisoned");
+    if let Some((at, _)) = entries.get_mut(provider_id) {
+        *at = at.checked_sub(by).expect("instant in range");
+    }
 }
 
 /// Resolve one provider's auth status through the cache: non-forced reads
@@ -828,7 +1144,19 @@ async fn resolve_auth_status(
     let Some(program) = resolve_probe_binary(provider_id, override_path.as_deref()) else {
         return AuthVerdict::default();
     };
-    let cell = cache().join_inflight(provider_id);
+    resolve_cached(provider_id, async {
+        probe_provider(provider_id, program, override_path.as_deref(), None).await
+    })
+    .await
+}
+
+/// Run `probe` single-flighted under cache key `key` and store its outcome
+/// unless a runtime demotion/promotion of the same key superseded it.
+async fn resolve_cached<F>(key: &str, probe: F) -> AuthVerdict
+where
+    F: std::future::Future<Output = AuthVerdict>,
+{
+    let cell = cache().join_inflight(key);
     let verdict = cell
         .get_or_init(|| async {
             // Captured before the probe runs: a runtime demotion landing
@@ -837,14 +1165,73 @@ async fn resolve_auth_status(
             // authoritative hard `false` (PR #1650 review), and hands back
             // the superseding cached verdict so every joined caller serves
             // the authoritative outcome, not the stale probe result.
-            let epoch = cache().demotion_epoch(provider_id);
-            let verdict = probe_provider(provider_id, program, override_path.as_deref()).await;
-            cache().store_probe(provider_id, verdict, epoch)
+            let epoch = cache().demotion_epoch(key);
+            let verdict = probe.await;
+            cache().store_probe(key, verdict, epoch)
         })
         .await
         .clone();
-    cache().finish_inflight(provider_id, &cell);
+    cache().finish_inflight(key, &cell);
     verdict
+}
+
+/// Auth-cache key of a named profile: its reference plus the saved settings
+/// fingerprint, so a verdict never crosses profiles, the Default
+/// configuration, or a saved edit (PROTOCOL §5.54).
+pub(crate) fn profile_auth_cache_key(profile: &intent_acp::ProfileEnv) -> String {
+    profile.cache_key()
+}
+
+/// [`promote_auth_verdict`] for one profile's saved settings only.
+pub(crate) fn promote_profile_auth_verdict(profile: &intent_acp::ProfileEnv) {
+    cache().promote(&profile_auth_cache_key(profile));
+}
+
+/// [`demote_auth_verdict`] for one profile's saved settings only.
+pub(crate) fn demote_profile_auth_verdict(profile: &intent_acp::ProfileEnv) {
+    cache().demote(&profile_auth_cache_key(profile));
+}
+
+/// The fresh cached verdict of one profile's saved settings (see
+/// [`cached_auth_verdict`]); never consults the base provider's verdict.
+pub(crate) fn cached_profile_auth_verdict(profile: &intent_acp::ProfileEnv) -> Option<bool> {
+    cache()
+        .fresh(&profile_auth_cache_key(profile))
+        .and_then(|verdict| verdict.authenticated)
+}
+
+/// Auth status of a named profile (Codex or Claude Code), probed with the
+/// profile's resolved installed context — the same environment its model
+/// probes, one-shot calls and persistent launches use — and cached under
+/// [`profile_auth_cache_key`]. A missing installation is unknown. Returns the
+/// wire entry `{ id: providerRef, authenticated, identity? }`.
+pub(crate) async fn profile_auth_status(
+    profile: Arc<intent_acp::ProfileEnv>,
+    force: bool,
+    override_path: Option<String>,
+) -> Value {
+    let reference = profile.provider_ref().to_owned();
+    let key = profile_auth_cache_key(&profile);
+    let cached = if force { None } else { cache().fresh(&key) };
+    let verdict = match cached {
+        Some(cached) => cached,
+        None => {
+            match intent_providers::find_provider(intent_providers::base_provider_id(&reference))
+                .map(|provider| provider.id)
+                .and_then(|base| {
+                    resolve_probe_binary(base, override_path.as_deref()).map(|bin| (base, bin))
+                }) {
+                Some((base, program)) => {
+                    resolve_cached(&key, async {
+                        probe_provider(base, program, override_path.as_deref(), Some(profile)).await
+                    })
+                    .await
+                }
+                None => AuthVerdict::default(),
+            }
+        }
+    };
+    auth_status_entry(&reference, &verdict)
 }
 
 /// `host.providerAuthStatus` (§5.14): probe auth status for every probe-able
@@ -910,6 +1297,9 @@ fn auth_status_entry(id: &str, verdict: &AuthVerdict) -> Value {
     let mut entry = json!({ "id": id, "authenticated": verdict.authenticated });
     if let Some(identity) = &verdict.identity {
         entry["identity"] = identity.to_json();
+    }
+    if let Some(note) = &verdict.status_note {
+        entry["statusNote"] = json!(note);
     }
     entry
 }
@@ -985,6 +1375,78 @@ mod tests {
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
             let probe =
                 check_provider_auth_cli("auggie", stub.as_os_str(), &["token", "print"]).await;
+            assert_eq!(probe, expected, "stub {name}");
+        }
+    }
+
+    /// `cursor-agent models` decides Cursor auth from its output: model rows
+    /// (stored login, or `CURSOR_API_KEY` alone) ⇒ authenticated; the
+    /// explicit "Authentication required" error ⇒ not authenticated; a run
+    /// that listed nothing is unknown, a crash is a failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_probe_parses_models_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("cursor-models");
+        let args = intent_providers::find_provider("cursor")
+            .unwrap()
+            .auth_check_args
+            .unwrap();
+        assert_eq!(args, &["models"]);
+        let signed_in = "printf 'Available models\\n\\nauto - Auto (current, default)\\ngpt-5.2 - GPT-5.2\\n'; exit 0";
+        let signed_out = "echo \"Error: Authentication required. Run 'agent login', pass --api-key/--auth-token, or set CURSOR_API_KEY/CURSOR_AUTH_TOKEN.\" >&2; exit 1";
+        let key_only =
+            format!("if [ -n \"$CURSOR_API_KEY\" ]; then {signed_in}; else {signed_out}; fi");
+        for (name, body, captured, expected) in [
+            (
+                "signed-in",
+                signed_in.to_string(),
+                None,
+                CliAuthProbe::Authenticated,
+            ),
+            (
+                "signed-out",
+                signed_out.to_string(),
+                None,
+                CliAuthProbe::NotAuthenticated,
+            ),
+            (
+                "empty",
+                "printf 'Available models\\n'; exit 0".into(),
+                None,
+                CliAuthProbe::StatusUnknown,
+            ),
+            (
+                "crash",
+                "echo boom >&2; exit 3".into(),
+                None,
+                CliAuthProbe::Failed,
+            ),
+            (
+                "key-only-without-key",
+                key_only.clone(),
+                None,
+                CliAuthProbe::NotAuthenticated,
+            ),
+            (
+                "key-only-with-key",
+                key_only,
+                Some("crsr-test-key"),
+                CliAuthProbe::Authenticated,
+            ),
+        ] {
+            let stub = dir.path().join(name);
+            std::fs::write(&stub, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if std::env::var_os("CURSOR_API_KEY").is_some() && captured.is_none() {
+                continue;
+            }
+            let captured: std::collections::BTreeMap<String, String> = captured
+                .map(|key| [("CURSOR_API_KEY".to_string(), key.to_string())].into())
+                .unwrap_or_default();
+            let probe =
+                check_provider_auth_cli_with("cursor", stub.as_os_str(), args, None, &captured)
+                    .await;
             assert_eq!(probe, expected, "stub {name}");
         }
     }
@@ -1140,7 +1602,7 @@ mod tests {
             )
             .unwrap();
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let status = check_claude_code_auth_cli(stub.as_os_str(), args).await;
+            let status = check_claude_code_auth_cli(stub.as_os_str(), args, None).await;
             assert_eq!(status.probe, *probe, "case {index}");
             assert_eq!(status.identity, *identity, "case {index}");
         }
@@ -1303,11 +1765,16 @@ case "$*" in
   --version)
     [ "$CLAUDE_CODE_EXECUTABLE" = "$0" ] || exit 91
     printf 'version\n' >> "$HOME/cli-calls"
-    printf '2.1.0 (Claude Code)\n' ;;
+    printf '%s\n' '@CURRENT@' ;;
   *) exit 92 ;;
 esac
 "#
-                .to_owned(),
+                .replace(
+                    "@CURRENT@",
+                    &intent_providers::test_support::current_cli_version(
+                        intent_providers::installed_cli::InstalledCli::Claude,
+                    ),
+                ),
             ),
             (
                 "npx",
@@ -1356,7 +1823,7 @@ while IFS= read -r unexpected; do exit 95; done
             .stderr(Stdio::from(log));
         let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
         let status = child
-            .wait_with_timeout(Duration::from_secs(60))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(60)))
             .unwrap()
             .expect("isolated auth wiring test timed out");
         assert!(
@@ -1394,6 +1861,7 @@ while IFS= read -r unexpected; do exit 95; done
                 "claude-code",
                 claude.clone().into_os_string(),
                 override_path,
+                None,
             )
             .await;
             assert_eq!(verdict.authenticated, Some(logged_in));
@@ -1403,7 +1871,8 @@ while IFS= read -r unexpected; do exit 95; done
             );
         }
         std::fs::write(root.join("auth-reply"), "{}").unwrap();
-        let verdict = probe_provider("claude-code", claude.into_os_string(), override_path).await;
+        let verdict =
+            probe_provider("claude-code", claude.into_os_string(), override_path, None).await;
         assert_eq!(verdict.authenticated, Some(false));
         assert!(verdict.identity.is_none());
         assert_eq!(
@@ -1466,6 +1935,138 @@ while IFS= read -r unexpected; do exit 95; done
 
     /// A fresh RAII temp dir; removed on drop (including on panic). Set
     /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
+    /// The default account's sign-in is probed once and served from the
+    /// cache, with the instant it was observed, until the entry is older
+    /// than the TTL; then the next read probes again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_sign_in_serves_the_cached_probe_until_the_ttl_then_probes_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("default-sign-in");
+        let calls = dir.path().join("calls");
+        let stub = dir.path().join("opencode");
+        let write_stub = |body: &str| {
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\n[ \"$*\" = 'models' ] || exit 64\necho x >> '{}'\n{body}\n",
+                    calls.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let probes = || {
+            std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let path = Some(stub.to_str().unwrap().to_owned());
+        write_stub("echo openai/gpt-5");
+
+        let first = default_sign_in("opencode", path.clone()).await;
+        assert_eq!(first.signed_in, Some(true));
+        let probed_at = first.probed_at.expect("a probed verdict is cached");
+        assert_eq!(probes(), 1);
+
+        // Within the TTL: the cached verdict, without spawning the CLI.
+        write_stub("exit 1");
+        let cached = default_sign_in("opencode", path.clone()).await;
+        assert_eq!(cached, first);
+        assert_eq!(probes(), 1);
+
+        // Past the TTL: probed again, with a newer observation.
+        age_cached_verdict_for_tests("opencode", AUTH_CACHE_TTL);
+        let again = default_sign_in("opencode", path).await;
+        assert_eq!(again.signed_in, Some(false));
+        assert!(again.probed_at.expect("cached") > probed_at.checked_sub(AUTH_CACHE_TTL).unwrap());
+        assert_eq!(probes(), 2);
+    }
+
+    /// droid, pi and antigravity probe without the login-shell credentials
+    /// a launch gets, so their signed-out verdict reads as unknown for the
+    /// default account; a signed-in one stands, and other providers keep
+    /// theirs.
+    #[tokio::test]
+    async fn default_sign_in_does_not_trust_signed_out_from_probes_without_the_launch_env() {
+        for id in ["droid", "pi", "antigravity"] {
+            let prior = cache().fresh(id);
+            cache().store(id, AuthVerdict::plain(Some(false)));
+            let sign_in = default_sign_in(id, None).await;
+            assert_eq!(sign_in.signed_in, None, "{id}");
+            assert!(sign_in.probed_at.is_some(), "{id}: still an observation");
+            cache().store(id, AuthVerdict::plain(Some(true)));
+            assert_eq!(
+                default_sign_in(id, None).await.signed_in,
+                Some(true),
+                "{id}"
+            );
+            cache().store(id, prior.unwrap_or_default());
+        }
+        let probed = DefaultSignIn {
+            signed_in: Some(false),
+            probed_at: None,
+        };
+        for id in ["claude-code", "codex", "opencode", "grok", "auggie"] {
+            assert_eq!(default_account_sign_in(id, probed), probed, "{id}");
+        }
+    }
+
+    /// A provider without a sign-in probe is unknown and never cached.
+    #[tokio::test]
+    async fn default_sign_in_without_a_probe_is_unknown() {
+        for id in ["mock", "unsloth", "not-a-provider"] {
+            assert_eq!(
+                default_sign_in(id, None).await,
+                DefaultSignIn::default(),
+                "{id}"
+            );
+        }
+    }
+
+    /// A daemon started outside a login shell (a GUI app or service) sees
+    /// a CLI's credential location only through the captured login-shell
+    /// environment, which a profile-less launch gap-fills; the default
+    /// probe sees the same account.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_cli_probe_sees_the_login_shell_credentials_a_launch_gets() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("CODEX_HOME").is_some() {
+            eprintln!("skipping: CODEX_HOME is set in the test environment");
+            return;
+        }
+        let dir = unique_temp_dir("shell-codex-home");
+        let home = dir.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("auth.json"), "{}").unwrap();
+        let stub = dir.path().join("codex");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n[ \"$*\" = 'login status' ] || exit 64\n[ -n \"$CODEX_HOME\" ] && [ -f \"$CODEX_HOME/auth.json\" ]\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let args = &["login", "status"];
+        let shell_only = std::collections::BTreeMap::from([(
+            "CODEX_HOME".to_owned(),
+            home.to_str().unwrap().to_owned(),
+        )]);
+        let probe =
+            check_provider_auth_cli_with("codex", stub.as_os_str(), args, None, &shell_only).await;
+        assert_eq!(probe, CliAuthProbe::Authenticated);
+        let without = check_provider_auth_cli_with(
+            "codex",
+            stub.as_os_str(),
+            args,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .await;
+        assert_eq!(without, CliAuthProbe::NotAuthenticated);
+    }
+
     fn unique_temp_dir(tag: &str) -> tempfile::TempDir {
         let mut dir = tempfile::Builder::new()
             .prefix(&format!("intent-provider-auth-{tag}-"))
@@ -1505,7 +2106,7 @@ while IFS= read -r unexpected; do exit 95; done
     #[test]
     fn valid_override_resolves_install_gate() {
         let dir = unique_temp_dir("valid-override");
-        for provider in ["droid", "antigravity"] {
+        for provider in ["droid", "antigravity", "cursor"] {
             let bin = dir.path().join(provider);
             make_executable(&bin);
             let resolved = resolve_probe_binary(provider, Some(bin.to_str().unwrap()));
@@ -1606,10 +2207,28 @@ while IFS= read -r unexpected; do exit 95; done
         // parallel tests could observe through the gate.
         let fallback = intent_providers::provider_config("acp").id;
         for alias in ["acp", "augment", "default", "not-a-provider"] {
-            assert_eq!(auth_cache_key(alias), fallback, "{alias}");
+            assert_eq!(auth_cache_key(alias), Some(fallback), "{alias}");
         }
-        assert_eq!(auth_cache_key("pi"), "pi");
-        assert_eq!(auth_cache_key("claude-code"), "claude-code");
+        assert_eq!(auth_cache_key("pi"), Some("pi"));
+        assert_eq!(auth_cache_key("claude-code"), Some("claude-code"));
+    }
+
+    /// A profile reference never reads, demotes or promotes the base
+    /// provider's Default verdict (PROTOCOL §5.54): the runtime auth-failure
+    /// path and the create gate key profiles separately.
+    #[test]
+    fn profile_references_never_touch_the_base_default_verdict() {
+        let prior = cache().fresh("pi");
+        cache().store("pi", AuthVerdict::plain(Some(true)));
+        for reference in ["codex@xwork", "claude-code@xwork", "codex@BAD"] {
+            assert_eq!(auth_cache_key(reference), None, "{reference}");
+            assert_eq!(cached_auth_verdict(reference), None, "{reference}");
+            demote_auth_verdict(reference);
+            promote_auth_verdict(reference);
+        }
+        assert_eq!(cached_auth_verdict("pi"), Some(true));
+        cache().store("pi", prior.unwrap_or_default());
+        assert!(not_authenticated_message("claude-code@xwork").contains("desktop app"));
     }
 
     /// A probe already in flight when a runtime demotion lands must not
@@ -1684,7 +2303,7 @@ while IFS= read -r unexpected; do exit 95; done
             .checked_sub(AUTH_CACHE_TTL + Duration::from_secs(1))
             .expect("test clock predates process start");
         cache().entries.lock().expect("auth cache poisoned").insert(
-            "test-identity-expired-promote",
+            "test-identity-expired-promote".into(),
             (
                 expired_at,
                 AuthVerdict {
@@ -1694,6 +2313,7 @@ while IFS= read -r unexpected; do exit 95; done
                         org_name: Some("Old Org".into()),
                         subscription_type: Some("max".into()),
                     }),
+                    status_note: None,
                 },
             ),
         );
@@ -1722,6 +2342,7 @@ while IFS= read -r unexpected; do exit 95; done
             AuthVerdict {
                 authenticated: Some(true),
                 identity: Some(identity.clone()),
+                status_note: None,
             },
         );
         cache().demote("test-identity-demote");
@@ -1735,6 +2356,7 @@ while IFS= read -r unexpected; do exit 95; done
             AuthVerdict {
                 authenticated: Some(false),
                 identity: Some(identity.clone()),
+                status_note: None,
             },
         );
         cache().promote("test-identity-promote");
@@ -1743,8 +2365,42 @@ while IFS= read -r unexpected; do exit 95; done
             Some(AuthVerdict {
                 authenticated: Some(true),
                 identity: Some(identity),
+                status_note: None,
             })
         );
+    }
+
+    /// Mixed Cursor credentials: with `CURSOR_API_KEY` set and a stored
+    /// login (`status --format json` → `hasAccessToken: true`), the signed-in
+    /// entry says the stored login is in use; otherwise no note.
+    #[test]
+    fn cursor_status_note_names_the_stored_login_only_in_the_mixed_case() {
+        let stored = r#"{"status":"authenticated","isAuthenticated":true,"hasAccessToken":true,"hasRefreshToken":true}"#;
+        let key_only =
+            r#"{"status":"authenticated","isAuthenticated":true,"hasAccessToken":false}"#;
+        assert_eq!(
+            cursor_status_note(true, stored).as_deref(),
+            Some(CURSOR_STORED_LOGIN_IN_USE_NOTE)
+        );
+        assert_eq!(cursor_status_note(false, stored), None);
+        assert_eq!(cursor_status_note(true, key_only), None);
+        assert_eq!(cursor_status_note(true, "not json"), None);
+        let entry = auth_status_entry(
+            "cursor",
+            &AuthVerdict {
+                authenticated: Some(true),
+                identity: None,
+                status_note: cursor_status_note(true, stored),
+            },
+        );
+        assert_eq!(
+            entry,
+            json!({ "id": "cursor", "authenticated": true, "statusNote": CURSOR_STORED_LOGIN_IN_USE_NOTE })
+        );
+        assert!(entry["statusNote"]
+            .as_str()
+            .unwrap()
+            .contains("stored Cursor login"));
     }
 
     /// The wire entry carries the additive `identity` object only when the
@@ -1764,6 +2420,7 @@ while IFS= read -r unexpected; do exit 95; done
                 org_name: None,
                 subscription_type: None,
             }),
+            status_note: None,
         };
         assert_eq!(
             auth_status_entry("claude-code", &partial),
@@ -1796,5 +2453,152 @@ while IFS= read -r unexpected; do exit 95; done
             "{droid}"
         );
         assert!(!droid.contains("desktop app"), "{droid}");
+        assert!(!droid.contains("CURSOR_API_KEY"), "{droid}");
+
+        let cursor = not_authenticated_message("cursor");
+        assert!(cursor.contains("\"cursor-agent login\""), "{cursor}");
+        assert!(cursor.contains("CURSOR_API_KEY"), "{cursor}");
+        assert!(cursor.contains("stored"), "{cursor}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Named provider profiles (PROTOCOL §5.54)
+    // -----------------------------------------------------------------------
+
+    fn profile(
+        reference: &str,
+        fingerprint: &str,
+        entries: &[(&str, Option<&str>)],
+    ) -> Arc<intent_acp::ProfileEnv> {
+        Arc::new(intent_acp::ProfileEnv::new(
+            reference,
+            fingerprint,
+            entries
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.map(str::to_owned)))
+                .collect(),
+        ))
+    }
+
+    /// An installed-CLI fixture whose auth answer depends only on the probe
+    /// environment, never on the developer's real account.
+    #[cfg(unix)]
+    fn fixture_context(
+        cli: intent_providers::installed_cli::InstalledCli,
+        root: &std::path::Path,
+        auth_script: &str,
+        profile: Arc<intent_acp::ProfileEnv>,
+    ) -> crate::installed_cli::InstalledContext {
+        let context = crate::installed_cli::test_context_in(cli, root);
+        std::fs::write(context.runtime.path(), auth_script).unwrap();
+        context.with_profile(Some(profile))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_profile_auth_probe_uses_the_profile_environment() {
+        use intent_providers::installed_cli::InstalledCli;
+        let script = "#!/bin/sh\nif [ \"$ANTHROPIC_API_KEY\" = work ]; then printf '%s\\n' '{\"loggedIn\":true,\"email\":\"work@example.invalid\"}'; else printf '%s\\n' '{\"loggedIn\":false}'; fi\n";
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let work = fixture_context(
+            InstalledCli::Claude,
+            dirs[0].path(),
+            script,
+            profile(
+                "claude-code@work",
+                "f1",
+                &[("ANTHROPIC_API_KEY", Some("work"))],
+            ),
+        );
+        let personal = fixture_context(
+            InstalledCli::Claude,
+            dirs[1].path(),
+            script,
+            profile("claude-code@personal", "f1", &[("ANTHROPIC_API_KEY", None)]),
+        );
+        let args = intent_providers::find_provider("claude-code")
+            .and_then(|cfg| cfg.auth_check_args)
+            .unwrap();
+        let (w, p) = tokio::join!(
+            check_claude_code_auth_cli(work.runtime.path().as_os_str(), args, Some(&work)),
+            check_claude_code_auth_cli(personal.runtime.path().as_os_str(), args, Some(&personal)),
+        );
+        assert_eq!(w.probe, CliAuthProbe::Authenticated);
+        assert_eq!(
+            w.identity.and_then(|i| i.email).as_deref(),
+            Some("work@example.invalid")
+        );
+        assert_eq!(p.probe, CliAuthProbe::NotAuthenticated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_profile_auth_probe_reads_the_profile_account_home() {
+        use intent_providers::installed_cli::InstalledCli;
+        let root = tempfile::tempdir().unwrap();
+        let (work_home, personal_home) = (root.path().join("work"), root.path().join("personal"));
+        std::fs::create_dir_all(&work_home).unwrap();
+        std::fs::create_dir_all(&personal_home).unwrap();
+        std::fs::write(work_home.join("auth.json"), "{}").unwrap();
+        let script = "#!/bin/sh\n[ -f \"$CODEX_HOME/auth.json\" ]\n";
+        let args = intent_providers::find_provider("codex")
+            .and_then(|cfg| cfg.auth_check_args)
+            .unwrap();
+        for (home, expected) in [
+            (&work_home, CliAuthProbe::Authenticated),
+            (&personal_home, CliAuthProbe::NotAuthenticated),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let context = fixture_context(
+                InstalledCli::Codex,
+                dir.path(),
+                script,
+                profile(
+                    "codex@p",
+                    "f1",
+                    &[("CODEX_HOME", Some(home.to_str().unwrap()))],
+                ),
+            );
+            let probe = check_provider_auth_cli_in(
+                "codex",
+                context.runtime.path().as_os_str(),
+                args,
+                Some(&context),
+            )
+            .await;
+            assert_eq!(probe, expected, "{}", home.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_auth_verdicts_never_cross_profiles_default_or_edits() {
+        let work = profile("codex@xwork", "f1", &[]);
+        let edited = profile("codex@xwork", "f2", &[]);
+        let personal = profile("codex@xpersonal", "f1", &[]);
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = |value: bool| {
+            let probes = probes.clone();
+            async move {
+                probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                AuthVerdict::plain(Some(value))
+            }
+        };
+        let w = resolve_cached(&profile_auth_cache_key(&work), probe(true)).await;
+        assert_eq!(w.authenticated, Some(true));
+        assert_eq!(cached_profile_auth_verdict(&work), Some(true));
+        assert_eq!(cached_profile_auth_verdict(&edited), None);
+        assert_eq!(cached_profile_auth_verdict(&personal), None);
+        let p = resolve_cached(&profile_auth_cache_key(&personal), probe(false)).await;
+        assert_eq!(p.authenticated, Some(false));
+        // A failure of one profile neither demotes nor authenticates another,
+        // and neither touches the base provider's Default verdict.
+        assert_eq!(cached_profile_auth_verdict(&work), Some(true));
+        cache().demote(&profile_auth_cache_key(&personal));
+        assert_eq!(cached_profile_auth_verdict(&work), Some(true));
+        assert_ne!(
+            Some(profile_auth_cache_key(&work).as_str()),
+            auth_cache_key("codex")
+        );
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

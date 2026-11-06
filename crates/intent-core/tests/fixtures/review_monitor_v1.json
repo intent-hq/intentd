@@ -1,0 +1,241 @@
+{
+  "requests": [
+    {
+      "prNumber": 17
+    },
+    {
+      "prNumber": 17,
+      "repo": "Owner/Repo"
+    },
+    {
+      "prNumber": 17,
+      "gitRootId": "registered-root"
+    },
+    {
+      "prNumber": 17,
+      "target": {
+        "repository": {
+          "provider": "gitlab",
+          "instanceBaseUrl": "https://forge.example:8443/install",
+          "projectPath": "Team/Sub/Project"
+        },
+        "kind": "merge-request",
+        "number": 17
+      }
+    },
+    {
+      "prNumber": 17,
+      "target": {
+        "repository": {
+          "provider": "github",
+          "instanceBaseUrl": "https://github.com",
+          "projectPath": "Owner/Repo"
+        },
+        "kind": "pull-request",
+        "number": 17
+      }
+    }
+  ],
+  "binding": {
+    "scope": {
+      "daemonId": "daemon-a",
+      "authorityScopeId": "original-authority",
+      "authorityGeneration": "18446744073709551615"
+    },
+    "connection": {
+      "connectionId": "gitlab-configured",
+      "accountId": "original-account",
+      "connectionGeneration": "18446744073709551615"
+    },
+    "resource": {
+      "repository": {
+        "provider": "gitlab",
+        "instanceBaseUrl": "https://forge.example:8443/install",
+        "projectPath": "Team/Sub/Project"
+      },
+      "kind": "merge-request",
+      "number": 17
+    }
+  },
+  "extensions": [
+    {},
+    {
+      "resource": {
+        "repository": {
+          "provider": "gitlab",
+          "instanceBaseUrl": "https://forge.example:8443/install",
+          "projectPath": "Team/Sub/Project"
+        },
+        "kind": "merge-request",
+        "number": 17
+      },
+      "monitorAvailability": {
+        "state": "available"
+      }
+    },
+    {
+      "monitorAvailability": {
+        "state": "unresolved",
+        "reason": "missing-provenance"
+      }
+    },
+    {
+      "resource": {
+        "repository": {
+          "provider": "gitlab",
+          "instanceBaseUrl": "https://forge.example:8443/install",
+          "projectPath": "Team/Sub/Project"
+        },
+        "kind": "merge-request",
+        "number": 17
+      },
+      "monitorAvailability": {
+        "state": "pending"
+      }
+    },
+    {
+      "resource": {
+        "repository": {
+          "provider": "gitlab",
+          "instanceBaseUrl": "https://forge.example:8443/install",
+          "projectPath": "Team/Sub/Project"
+        },
+        "kind": "merge-request",
+        "number": 17
+      },
+      "monitorAvailability": {
+        "state": "reconnect-required"
+      }
+    },
+    {
+      "resource": {
+        "repository": {
+          "provider": "gitlab",
+          "instanceBaseUrl": "https://forge.example:8443/install",
+          "projectPath": "Team/Sub/Project"
+        },
+        "kind": "merge-request",
+        "number": 17
+      },
+      "monitorAvailability": {
+        "state": "restricted"
+      }
+    },
+    {
+      "resource": {
+        "repository": {
+          "provider": "gitlab",
+          "instanceBaseUrl": "https://forge.example:8443/install",
+          "projectPath": "Team/Sub/Project"
+        },
+        "kind": "merge-request",
+        "number": 17
+      },
+      "monitorAvailability": {
+        "state": "disabled"
+      }
+    },
+    {
+      "resource": {
+        "repository": {
+          "provider": "gitlab",
+          "instanceBaseUrl": "https://forge.example:8443/install",
+          "projectPath": "Team/Sub/Project"
+        },
+        "kind": "merge-request",
+        "number": 17
+      },
+      "monitorAvailability": {
+        "state": "unsupported"
+      }
+    },
+    {
+      "resource": {
+        "repository": {
+          "provider": "gitlab",
+          "instanceBaseUrl": "https://forge.example:8443/install",
+          "projectPath": "Team/Sub/Project"
+        },
+        "kind": "merge-request",
+        "number": 17
+      },
+      "monitorAvailability": {
+        "state": "unavailable"
+      }
+    },
+    {
+      "resource": {
+        "repository": {
+          "provider": "gitlab",
+          "instanceBaseUrl": "https://forge.example:8443/install",
+          "projectPath": "Team/Sub/Project"
+        },
+        "kind": "merge-request",
+        "number": 17
+      },
+      "monitorAvailability": {
+        "state": "unknown"
+      }
+    },
+    {
+      "resource": {
+        "repository": {
+          "provider": "gitlab",
+          "instanceBaseUrl": "https://forge.example:8443/install",
+          "projectPath": "Team/Sub/Project"
+        },
+        "kind": "merge-request",
+        "number": 17
+      },
+      "monitorAvailability": {
+        "state": "backoff",
+        "retryAt": "2026-10-09T15:00:00Z"
+      }
+    }
+  ],
+  "event": {
+    "workspaceId": "workspace",
+    "agentId": "owner",
+    "monitorId": "monitor-17",
+    "repo": "Team/Sub/Project",
+    "prNumber": 17,
+    "state": "active",
+    "changes": [
+      "checks changed"
+    ],
+    "resource": {
+      "repository": {
+        "provider": "gitlab",
+        "instanceBaseUrl": "https://forge.example:8443/install",
+        "projectPath": "Team/Sub/Project"
+      },
+      "kind": "merge-request",
+      "number": 17
+    },
+    "monitorAvailability": {
+      "state": "available"
+    }
+  },
+  "wake": {
+    "type": "pr_monitor_wake",
+    "monitorId": "monitor-17",
+    "repo": "Team/Sub/Project",
+    "prNumber": 17,
+    "reason": "changed",
+    "resource": {
+      "repository": {
+        "provider": "gitlab",
+        "instanceBaseUrl": "https://forge.example:8443/install",
+        "projectPath": "Team/Sub/Project"
+      },
+      "kind": "merge-request",
+      "number": 17
+    },
+    "monitorAvailability": {
+      "state": "backoff",
+      "retryAt": "2026-10-09T15:00:00Z"
+    },
+    "url": "https://forge.example:8443/install/Team/Sub/Project/-/merge_requests/17",
+    "pausedUntil": "2026-10-09T15:00:00Z"
+  }
+}

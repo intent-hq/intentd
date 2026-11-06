@@ -396,7 +396,9 @@ class CleanupTests(unittest.TestCase):
 
 class LifecycleCleanupTests(CleanupTests):
     # Run every existing ownership, lock, symlink and real-Cargo race proof
-    # against the lifecycle root as well as the original build root.
+    # against the lifecycle root as well as the original build root. The
+    # lifecycle and Services runtime roots are retired (their proofs moved into
+    # ci.yml's `build` job) and stay eligible only to reclaim stale profiles.
     target_name = 'daemon-lifecycle-macos'
 
     def test_both_roots_are_validated_before_any_deletion(self):
@@ -424,6 +426,16 @@ class LifecycleCleanupTests(CleanupTests):
 
     def test_only_exact_lifecycle_root_is_eligible(self):
         unknown = self.root.with_name('daemon-lifecycle-macos-other')
+        self.root.rename(unknown)
+        self.assertEqual(self.run_cleanup(False)['candidates'], [])
+        self.assertTrue((unknown / 'aarch64-apple-darwin/debug/deps/old.rmeta').exists())
+
+
+class ServicesRuntimeCleanupTests(CleanupTests):
+    target_name = 'macos-services-runtime-aarch64-apple-darwin'
+
+    def test_only_exact_services_runtime_root_is_eligible(self):
+        unknown = self.root.with_name(self.target_name + '-other')
         self.root.rename(unknown)
         self.assertEqual(self.run_cleanup(False)['candidates'], [])
         self.assertTrue((unknown / 'aarch64-apple-darwin/debug/deps/old.rmeta').exists())

@@ -31,6 +31,40 @@ pub enum RepositoryReadReplyKind {
 
 /// One original authenticated connection, independent of client and RPC ids.
 pub trait RepositoryReadConnection: Send + Sync {
+    /// Capture owner-only policy or local-helper work before the original
+    /// frame's first await. Unsupported service owners fail closed.
+    fn capture_child_git(
+        &self,
+        _frame: &crate::gitlab_child_git::GitlabChildGitFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        None
+    }
+
+    /// Replace this physical connection's monitor consumer declaration before
+    /// processing a hello. The receipt remains inactive until the successful
+    /// hello response has been accepted by the original transport. Unsupported
+    /// service implementations provide no receipt. This never grants access to
+    /// repository data or upgrades another socket with the same client id.
+    fn review_monitoring_hello(
+        &self,
+        _support: crate::review_monitor::ReviewMonitorRecipientSupport,
+    ) -> Option<Arc<dyn ReviewMonitorHello>> {
+        None
+    }
+    /// Capture this socket's current acknowledged monitor recipient before a
+    /// subscription is queued. The recipient must independently authorize each
+    /// original workspace/account; compatibility alone grants no private data.
+    fn capture_monitor_events(&self) -> Option<Arc<dyn RepositoryMonitorEventRecipient>> {
+        None
+    }
+
+    /// Freeze one acknowledged physical recipient for the existing chat
+    /// subscription. It supplies context and final-output fences, not access.
+    /// Unsupported owners keep ordinary history withholding.
+    fn capture_monitor_history(&self) -> Option<Arc<dyn RepositoryMonitorHistoryRecipient>> {
+        None
+    }
+
     /// Pre-workspace host authority, captured on this original native socket.
     fn capture_checkout(
         &self,
@@ -99,8 +133,82 @@ pub trait RepositoryReadConnection: Send + Sync {
     }
 }
 
+/// Transport-owned completion of one original connection hello. A later hello
+/// or connection retirement must permanently invalidate an earlier receipt.
+pub trait ReviewMonitorHello: Send + Sync {
+    /// Called only after a successful response is queued on the original
+    /// connection. Failure and notification-only hellos never acknowledge.
+    fn acknowledge(&self);
+
+    /// Permanently withdraw this hello when its physical source retires.
+    fn retire(&self);
+}
+
+/// One immutable native output and its retained original admission. This is an
+/// in-process owner, never reconstructed from JSON, client ids or message tags.
+/// Each transport write attempt runs synchronously inside its current fences;
+/// pending I/O must release those fences before awaiting readiness again.
+pub trait RepositoryPrivateOutput: Send + Sync {
+    fn frame(&self) -> &str;
+    fn with_current(&self, action: &mut (dyn FnMut() -> Result<()> + Send)) -> Result<()>;
+}
+
+/// Original physical recipient for one native chat history subscription.
+/// Every private read independently reauthorizes its saved original account;
+/// these in-process receipts are never reconstructed from public metadata.
+pub trait RepositoryMonitorHistoryRecipient: Send + Sync {
+    fn scope<'a>(&'a self, body: BoxFuture<'a, ()>) -> BoxFuture<'a, ()>;
+
+    /// Bind the immutable frame to this subscription and all original private
+    /// reads retained in its current snapshot generation. Final socket writes
+    /// must use this owner, including frames already queued at retirement.
+    fn bind_output(&self, frame: String) -> Arc<dyn RepositoryPrivateOutput>;
+
+    /// A replacement snapshot discards earlier accumulated chat state. Existing
+    /// outputs keep their original fences; reset never revives them.
+    fn begin_generation(&self);
+
+    /// Join subscription retirement before unsubscribe/replacement completes.
+    fn retire(&self);
+}
+
+/// Retained original publisher authority for a private lifecycle envelope.
+/// This is never constructed from event metadata or a serialized account id.
+pub trait RepositoryMonitorEventSource: Send + Sync {
+    fn with_current(&self, action: &mut (dyn FnMut() -> Result<()> + Send)) -> Result<()>;
+}
+
+/// An original native subscription. Implementations join fresh recipient
+/// authorization with the publisher's retained authority and return immutable
+/// final-write ownership. Unsupported or retired recipients refuse the whole
+/// envelope. The existing events.event wire shape remains unchanged.
+pub trait RepositoryMonitorEventRecipient: Send + Sync {
+    /// Join original subscription retirement before unsubscribe or replacement
+    /// completes. Queued outputs must fail their next final-write admission.
+    fn retire(&self);
+
+    fn project<'a>(
+        &'a self,
+        event: &'a crate::Event,
+        binding: Option<&'a crate::review_monitor::ReviewMonitorBinding>,
+        source: Arc<dyn RepositoryMonitorEventSource>,
+        subscription_id: &'a str,
+    ) -> BoxFuture<'a, Result<Arc<dyn RepositoryPrivateOutput>>>;
+}
+
 /// An original request's scope, kept until its final response handling finishes.
 pub trait RepositoryReadRequestScope: Send + Sync {
+    /// Retain the original admission for an immutable encoded private response.
+    /// Ordinary owners return None. A qualified owner must return an owner or
+    /// refuse; errors must never downgrade its response to ordinary output.
+    /// This runs before queue admission and may not perform async work or I/O.
+    fn bind_private_output(
+        &self,
+        _frame: &str,
+    ) -> Result<Option<Arc<dyn RepositoryPrivateOutput>>> {
+        Ok(None)
+    }
+
     /// Restore the concrete owner's private context and run `body` exactly once.
     /// This must not turn an absent or retired capture into a later owner.
     fn scope<'a>(&'a self, body: BoxFuture<'a, ()>) -> BoxFuture<'a, ()>;
@@ -839,7 +947,7 @@ pub struct RepositoryResourceBoundQuery {
     pub read_lifetime_id: String,
 }
 
-fn resource_lifetime<'de, D: serde::Deserializer<'de>>(
+pub(crate) fn resource_lifetime<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<String, D::Error> {
     let value = <String as serde::Deserialize>::deserialize(d)?;
@@ -862,7 +970,7 @@ pub struct RepositoryResourceDetailQuery {
     pub refresh: bool,
 }
 
-fn resource_target<'de, D: serde::Deserializer<'de>>(
+pub(crate) fn resource_target<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<crate::ReviewTarget, D::Error> {
     #[derive(serde::Deserialize)]
@@ -907,14 +1015,43 @@ pub enum RepositoryResourceFrame {
     Capture(RepositoryResourceQuery),
     Detail(RepositoryResourceDetailQuery),
     Release(RepositoryResourceBoundQuery),
+    CaptureScoped(crate::repository_resource_pages::RepositoryScopedCaptureQuery),
+    ResolveKnown(crate::repository_resource_pages::RepositoryKnownQuery),
+    DetailScoped(crate::repository_resource_pages::RepositoryScopedDetailQuery),
+    ReleaseScoped(crate::repository_resource_pages::RepositoryScopedBoundQuery),
+    List(crate::repository_resource_pages::RepositoryResourceListQuery),
+    Discussions(crate::repository_resource_pages::RepositoryDiscussionsQuery),
 }
 impl RepositoryResourceFrame {
     #[must_use]
-    pub fn workspace_id(&self) -> &crate::WorkspaceId {
+    pub fn context(&self) -> crate::repository_resource_pages::RepositoryReadContext {
+        use crate::repository_resource_pages::RepositoryReadContext as Context;
         match self {
-            Self::Capture(q) => &q.workspace_id,
-            Self::Detail(q) => &q.workspace_id,
-            Self::Release(q) => &q.workspace_id,
+            Self::Capture(q) => Context::Workspace {
+                workspace_id: q.workspace_id.clone(),
+            },
+            Self::Detail(q) => Context::Workspace {
+                workspace_id: q.workspace_id.clone(),
+            },
+            Self::Release(q) => Context::Workspace {
+                workspace_id: q.workspace_id.clone(),
+            },
+            Self::CaptureScoped(q) => q.context.clone(),
+            Self::ResolveKnown(q) => q.context.clone(),
+            Self::DetailScoped(q) => q.context.clone(),
+            Self::ReleaseScoped(q) => q.context.clone(),
+            Self::List(q) => q.context.clone(),
+            Self::Discussions(q) => q.context.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn resource_target(&self) -> Option<&crate::ReviewTarget> {
+        match self {
+            Self::Detail(q) => Some(&q.target),
+            Self::DetailScoped(q) => Some(&q.target),
+            Self::Discussions(q) => Some(&q.target),
+            _ => None,
         }
     }
 }
@@ -999,4 +1136,14 @@ pub struct RepositoryResourceRetired {
 
 pub trait RepositoryResourceRetirements: Send {
     fn next(&mut self) -> BoxFuture<'_, Option<RepositoryResourceRetired>>;
+
+    fn next_event(
+        &mut self,
+    ) -> BoxFuture<'_, Option<crate::repository_resource_pages::RepositoryResourceEvent>> {
+        Box::pin(async move {
+            self.next()
+                .await
+                .map(crate::repository_resource_pages::RepositoryResourceEvent::Retired)
+        })
+    }
 }

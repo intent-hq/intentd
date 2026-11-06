@@ -22,6 +22,7 @@ fn registry_first_provider_and_lookups() {
             "droid",
             "grok",
             "antigravity",
+            "cursor",
             "mock"
         ]
     );
@@ -49,6 +50,46 @@ fn legacy_alias_lookup_retains_unknown_provider_distinction() {
     for unknown in ["", "nope", "pi-typo"] {
         assert!(find_provider_or_legacy_alias(unknown).is_none());
     }
+}
+
+/// A well-formed profile reference names its base provider's static
+/// configuration (never the auggie fallback); `find_provider` stays strict so
+/// front doors cannot mistake a reference for a registered id.
+#[test]
+fn profile_references_resolve_to_their_base_configuration() {
+    assert_eq!(
+        split_profile_ref("codex@p3k9x2m4q7t1a"),
+        Some(("codex", "p3k9x2m4q7t1a"))
+    );
+    assert_eq!(
+        split_profile_ref("claude-code@work-1"),
+        Some(("claude-code", "work-1"))
+    );
+    for reference in ["codex@p1", "claude-code@p1"] {
+        let base = base_provider_id(reference);
+        assert_eq!(provider_config(reference).id, base);
+        assert_eq!(find_provider_or_legacy_alias(reference).unwrap().id, base);
+        assert!(find_provider(reference).is_none(), "{reference}");
+    }
+    for malformed in [
+        "codex",
+        "codex@",
+        "codex@P1",
+        "codex@-p1",
+        "codex@p1@p2",
+        "codex@ p1",
+        " codex@p1",
+        "Codex@p1",
+        "auggie@p1",
+        "acp@p1",
+        "grok@p1",
+        "codex@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        assert!(split_profile_ref(malformed).is_none(), "{malformed}");
+        assert_eq!(base_provider_id(malformed), malformed);
+    }
+    assert!(find_provider_or_legacy_alias("auggie@p1").is_none());
+    assert_eq!(base_provider_id("codex"), "codex");
 }
 
 #[test]
@@ -105,7 +146,16 @@ fn legacy_alias_metadata_is_the_reverse_of_the_strict_resolver() {
 
 #[test]
 fn claude_agent_acp_pin_is_single_sourced() {
-    assert!(!CLAUDE_AGENT_ACP_VERSION.is_empty());
+    // An exact stable pin (three numeric parts, no range or tag): the
+    // auto-pin-acp-adapters workflow only ever writes such a version.
+    let parts: Vec<&str> = CLAUDE_AGENT_ACP_VERSION.split('.').collect();
+    assert_eq!(parts.len(), 3, "{CLAUDE_AGENT_ACP_VERSION}");
+    assert!(
+        parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+        "{CLAUDE_AGENT_ACP_VERSION}"
+    );
     assert_eq!(
         CLAUDE_AGENT_ACP_NPX_PACKAGE,
         format!("@agentclientprotocol/claude-agent-acp@{CLAUDE_AGENT_ACP_VERSION}")
@@ -303,7 +353,14 @@ fn cortex_and_droid_gate_on_enable_env_vars() {
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn session_mcp_servers_partition() {
-    let opted_in = ["claude-code", "codex", "droid", "grok", "antigravity"];
+    let opted_in = [
+        "claude-code",
+        "codex",
+        "droid",
+        "grok",
+        "antigravity",
+        "cursor",
+    ];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -322,7 +379,7 @@ fn session_mcp_servers_partition() {
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn config_option_model_partition() {
-    let opted_in = ["claude-code", "codex", "pi", "antigravity"];
+    let opted_in = ["claude-code", "codex", "pi", "antigravity", "cursor"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -1128,6 +1185,7 @@ fn disableable_and_always_enabled_partition_registry() {
             "droid",
             "grok",
             "antigravity",
+            "cursor",
             "mock"
         ]
     );
@@ -1792,20 +1850,66 @@ fn only_grok_requires_terminal_shell_by_default() {
     }
 }
 
+/// Cursor's registry entry (spec §3): a Node launcher in ACP mode, the
+/// workspace bridge over session `mcpServers`, the system prompt on the
+/// first fresh turn, the model as a config option, polite `session/cancel`
+/// (no kill on interrupt), disableable, and no ACP `authenticate` (it would
+/// start a browser login on a signed-out host).
 #[test]
-fn provider_access_token_kinds_match_adapter_environment() {
-    for (id, kind, env) in [
-        ("claude-code", "claudeSetupToken", "CLAUDE_CODE_OAUTH_TOKEN"),
-        ("codex", "codexAccessToken", "CODEX_ACCESS_TOKEN"),
-    ] {
-        let token = find_provider(id).unwrap().access_token().unwrap();
-        assert_eq!(token.kind.wire_name(), kind);
-        assert_eq!(token.kind.env_var(), env);
-        assert_eq!(token.setting_path, format!("providers.{id}.accessToken"));
+fn cursor_registry_entry() {
+    let p = find_provider("cursor").expect("cursor registered");
+    assert_eq!(p.display_name, "Cursor");
+    assert_eq!(p.short_name, "Cursor");
+    assert_eq!(p.command, "cursor-agent");
+    assert_eq!(p.base_args, &["acp"]);
+    assert_eq!(p.runtime, ProviderRuntime::Node);
+    assert!(p.supports_session_mcp_servers);
+    assert!(!p.supports_mcp_config);
+    assert_eq!(p.injection_mechanism, InjectionMechanism::FirstTurnPrepend);
+    assert!(p.supports_config_option_model);
+    assert!(!p.supports_set_model);
+    assert!(p.model_flag.is_none());
+    assert!(!p.config_option_model_strips_effort);
+    assert!(!p.kills_child_on_interrupt, "cancel rides session/cancel");
+    assert!(p.can_be_disabled);
+    assert!(!p.supports_authenticate);
+    assert!(p.supports_test_prompt);
+    assert!(p.auto_allow_once);
+    assert!(!p.requests_agent_workers);
+    assert!(p.requires_env_var.is_none() && p.requires_feature_code.is_none());
+    assert_eq!(p.auth_check_args, Some(&["models"][..]));
+    assert!(p.npx_only_package.is_none() && p.fallback_npx_package.is_none());
+    assert_eq!(login_command("cursor"), "cursor-agent login");
+    assert!(is_provider_authentication_error(
+        "cursor",
+        "Authentication required. Please run 'agent login' first"
+    ));
+}
+
+/// Only Cursor answers auto-approved prompts with `allow_once`: its
+/// `allow-always` writes into the user's Cursor config.
+#[test]
+fn auto_allow_once_partition() {
+    for id in all_provider_ids() {
+        assert_eq!(
+            find_provider(id).unwrap().auto_allow_once,
+            id == "cursor",
+            "{id}"
+        );
     }
-    for provider in ACP_PROVIDERS {
-        if !matches!(provider.id, "claude-code" | "codex") {
-            assert_eq!(provider.access_token(), None);
-        }
+}
+
+/// Only Cursor carries a prompt-only provider note (its native-subagent
+/// restriction).
+#[test]
+fn system_prompt_note_partition() {
+    for id in all_provider_ids() {
+        let note = find_provider(id).unwrap().system_prompt_note;
+        assert_eq!(note.is_some(), id == "cursor", "{id}");
     }
+    let note = find_provider("cursor").unwrap().system_prompt_note.unwrap();
+    assert!(
+        note.contains("Task") && note.contains("ws.agent.delegate"),
+        "{note}"
+    );
 }

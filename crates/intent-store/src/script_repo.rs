@@ -15,7 +15,7 @@ use sqlx::Row;
 use crate::{enum_from_db, enum_to_db, Store};
 
 const SCRIPT_COLUMNS: &str = "id, workspace_id, name, command, cwd, env, mode, category, \
-    source, auto_start, created_at, updated_at, purpose, archived_at, last_run";
+    source, auto_start, created_at, updated_at, purpose, archived_at, last_run, remote_author";
 
 impl Store {
     /// Whether this workspace has ever held a script definition. Unlike row
@@ -72,10 +72,10 @@ impl Store {
 
     async fn upsert_script_with_scope(&self, s: &Script, scoped: bool) -> Result<()> {
         let sql = format!(
-            "INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,? \
+            "INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? \
              WHERE ? = 0 OR NOT EXISTS (SELECT 1 FROM script WHERE id = ? AND workspace_id != ?)"
         );
-        let result = sqlx::query(&sql)
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&s.id)
             .bind(&s.workspace_id)
             .bind(&s.name)
@@ -97,6 +97,7 @@ impl Store {
                     .transpose()
                     .map_err(|e| Error::Internal(format!("encode script result failed: {e}")))?,
             )
+            .bind(remote_author_to_db(s)?)
             .bind(scoped)
             .bind(&s.id)
             .bind(&s.workspace_id)
@@ -157,11 +158,12 @@ impl Store {
         initialize_workspace: Option<&WorkspaceId>,
     ) -> Result<bool> {
         // Per-row bind count derived from SCRIPT_COLUMNS so the placeholder
-        // row and chunk math cannot drift if the persisted set changes.
-        // 2048 rows × 12 binds = 24576, well under the 32766 cap; one chunk
+        // row and chunk math cannot drift if the persisted set changes: each
+        // statement stays under SQLite's 32766-variable cap, and one chunk
         // covers any plausible repo config, so the statement count stays flat.
-        const ROWS_PER_STATEMENT: usize = 2048;
+        const MAX_BINDS_PER_STATEMENT: usize = 32_000;
         let binds_per_row = SCRIPT_COLUMNS.split(',').count();
+        let rows_per_statement = MAX_BINDS_PER_STATEMENT / binds_per_row;
         let row = format!("({})", vec!["?"; binds_per_row].join(","));
         let mut tx = self
             .write_pool()
@@ -183,11 +185,11 @@ impl Store {
                 return Ok(false);
             }
         }
-        for chunk in scripts.chunks(ROWS_PER_STATEMENT) {
+        for chunk in scripts.chunks(rows_per_statement) {
             let placeholders = vec![row.as_str(); chunk.len()].join(",");
             let sql =
                 format!("INSERT OR REPLACE INTO script ({SCRIPT_COLUMNS}) VALUES {placeholders}");
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for s in chunk {
                 query = query
                     .bind(&s.id)
@@ -212,7 +214,8 @@ impl Store {
                             .map_err(|e| {
                                 Error::Internal(format!("encode script result failed: {e}"))
                             })?,
-                    );
+                    )
+                    .bind(remote_author_to_db(s)?);
             }
             query
                 .execute(&mut *tx)
@@ -273,7 +276,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_scripts(&self) -> Result<Vec<Script>> {
         let sql = format!("SELECT {SCRIPT_COLUMNS} FROM script ORDER BY created_at, id");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list scripts failed: {e}")))?;
@@ -287,7 +290,7 @@ impl Store {
         let sql = format!(
             "SELECT {SCRIPT_COLUMNS} FROM script WHERE archived_at IS NULL ORDER BY created_at,id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
@@ -298,7 +301,7 @@ impl Store {
     /// Returns database or decoding errors.
     pub async fn get_active_script(&self, ws: &WorkspaceId, id: &str) -> Result<Option<Script>> {
         let sql=format!("SELECT {SCRIPT_COLUMNS} FROM script WHERE workspace_id=? AND id=? AND archived_at IS NULL");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(ws.as_str())
             .bind(id)
             .fetch_optional(self.read_pool())
@@ -317,7 +320,7 @@ impl Store {
         id: &str,
     ) -> Result<Option<Script>> {
         let sql = format!("SELECT {SCRIPT_COLUMNS} FROM script WHERE id = ? AND workspace_id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .bind(&workspace_id.0)
             .fetch_optional(self.read_pool())
@@ -502,6 +505,17 @@ fn env_from_db(s: Option<String>) -> Result<Option<BTreeMap<String, String>>> {
     .transpose()
 }
 
+/// Encode the optional `remote_author` JSON TEXT column.
+fn remote_author_to_db(s: &Script) -> Result<Option<String>> {
+    s.remote_author
+        .as_ref()
+        .map(|remote_author| {
+            serde_json::to_string(remote_author)
+                .map_err(|e| Error::Internal(format!("encode script remoteAuthor failed: {e}")))
+        })
+        .transpose()
+}
+
 fn map_script_row(r: &SqliteRow) -> Result<Script> {
     let col = |name: &str| -> Result<Option<String>> {
         r.try_get::<Option<String>, _>(name)
@@ -529,5 +543,9 @@ fn map_script_row(r: &SqliteRow) -> Result<Script> {
             .map(|v| v != 0),
         created_at: r.get("created_at"),
         updated_at: col("updated_at")?,
+        remote_author: col("remote_author")?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|e| Error::Internal(format!("decode script remoteAuthor failed: {e}")))?,
     })
 }
