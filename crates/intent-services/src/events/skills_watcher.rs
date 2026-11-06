@@ -286,6 +286,7 @@ fn get_user_skill_roots() -> Vec<PathBuf> {
         roots.push(crate::skills::claude_config_dir(&home).join("skills"));
         roots.push(home.join(".intent").join("skills"));
         roots.push(home.join(".augment").join("skills"));
+        roots.push(home.join(".intent").join("plugins"));
     } else if let Some(config) =
         std::env::var_os("CLAUDE_CONFIG_DIR").filter(|path| !path.is_empty())
     {

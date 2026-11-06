@@ -20579,6 +20579,59 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn plugin_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("plugin.list")?;
+            plugins::ops::list().await
+        })
+    }
+
+    fn plugin_install(&self, source: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("plugin.install")?;
+            let out = plugins::ops::install(source).await?;
+            self.mcp_servers_service().sync_plugin_servers(None).await;
+            Ok(out)
+        })
+    }
+
+    fn plugin_update(&self, name: String) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("plugin.update")?;
+            let out = plugins::ops::update(name.clone()).await?;
+            self.mcp_servers_service()
+                .sync_plugin_servers(Some(&name))
+                .await;
+            Ok(out)
+        })
+    }
+
+    fn plugin_uninstall(
+        &self,
+        name: String,
+        keep_data: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("plugin.uninstall")?;
+            let out = plugins::ops::uninstall(name, keep_data).await?;
+            self.mcp_servers_service().sync_plugin_servers(None).await;
+            Ok(out)
+        })
+    }
+
+    fn plugin_toggle(
+        &self,
+        name: String,
+        enabled: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            Self::require_administrator("plugin.toggle")?;
+            let out = plugins::ops::toggle(name, enabled).await?;
+            self.mcp_servers_service().sync_plugin_servers(None).await;
+            Ok(out)
+        })
+    }
+
     fn mcp_servers_restart(&self, server_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("mcp.serversRestart")?;
@@ -39471,6 +39524,7 @@ pub mod event {}
 mod instructions;
 mod mcp_oauth;
 mod mcp_servers;
+mod plugins;
 mod rules;
 pub mod skills;
 mod specialists;

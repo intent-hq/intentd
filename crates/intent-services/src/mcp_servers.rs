@@ -297,6 +297,66 @@ pub(crate) async fn read_configs(secrets: &AsyncSecretStore) -> Map<String, Valu
     }
 }
 
+/// The user's configs plus the servers of enabled plugins (Agent Plugins,
+/// `plugin:<plugin>/<server>` ids). Plugin entries are derived on every read and
+/// never persisted; a user server keeps its name when a plugin server clashes.
+/// A plugin server listed in `disabled` (`mcp.disabledServers`) reads as
+/// `enabled: false`, the way a switched-off user server does.
+pub(crate) async fn read_all_configs(
+    secrets: &AsyncSecretStore,
+    disabled: &[String],
+) -> Map<String, Value> {
+    let mut configs = read_configs(secrets).await;
+    let plugin_configs = tokio::task::spawn_blocking(|| {
+        let plugins = crate::plugins::enabled_user_plugins();
+        crate::plugins::ensure_data_dirs(&plugins);
+        let exe = std::env::current_exe().unwrap_or_else(|_| "intentd".into());
+        let (launcher, path) =
+            intent_acp::normalize_spaced_bridge_command(&exe, std::env::var_os("PATH").as_deref());
+        let env = path.map(|p| ("PATH".to_string(), p)).into_iter().collect();
+        crate::plugins::mcp_configs(&plugins, &launcher, &env)
+    })
+    .await
+    .unwrap_or_default();
+    let taken: std::collections::HashSet<String> = configs
+        .values()
+        .filter_map(|c| c.get("name").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    for (id, mut config) in plugin_configs {
+        if disabled.contains(&id) {
+            config["enabled"] = json!(false);
+        }
+        let name = config
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if taken.contains(name) || configs.contains_key(&id) {
+            tracing::warn!(server = %id, name, "plugin MCP server name is taken; skipping");
+            continue;
+        }
+        configs.insert(id, config);
+    }
+    configs
+}
+
+/// Refuse a definition change on a plugin-provided server or a reserved id.
+fn reject_plugin_server(server_id: &str) -> Result<()> {
+    if !server_id.starts_with(crate::plugins::MCP_ID_PREFIX) {
+        return Ok(());
+    }
+    Err(Error::InvalidParams(
+        match crate::plugins::mcp_id_plugin(server_id) {
+            Some(plugin) => {
+                format!("mcp server {server_id} comes from plugin `{plugin}`; change the plugin instead")
+            }
+            None => format!(
+                "mcp server ids starting with `{}` are reserved",
+                crate::plugins::MCP_ID_PREFIX
+            ),
+        },
+    ))
+}
+
 /// Persist the configured external servers back to the sensitive secret.
 async fn write_configs(secrets: &AsyncSecretStore, map: &Map<String, Value>) -> Result<()> {
     let raw = serde_json::to_string(&Value::Object(map.clone()))
@@ -446,6 +506,17 @@ impl McpHub {
             .unwrap()
             .get(id)
             .map_or_else(|| status_stopped(id), |rs| rs.status.clone())
+    }
+
+    /// The definitions of every tracked server, keyed by id.
+    fn tracked_configs(&self) -> HashMap<String, Value> {
+        self.inner
+            .servers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, rs)| (id.clone(), rs.config.clone()))
+            .collect()
     }
 
     /// Remove + reap `id` without emitting a `stopped` event (used before a
@@ -1072,7 +1143,7 @@ pub(crate) fn same_origin(a: &str, b: &str) -> bool {
 /// The configured `url` of the saved external server `server_id`, when one
 /// exists (§5.22.2 OAuth-injection guard).
 pub(crate) async fn config_url(secrets: &AsyncSecretStore, server_id: &str) -> Option<String> {
-    read_configs(secrets)
+    read_all_configs(secrets, &[])
         .await
         .get(server_id)?
         .get("url")
@@ -1578,7 +1649,7 @@ impl<'a> McpServersService<'a> {
 
     /// Fetch one stored config by id, or `NotFound`.
     async fn require_config(&self, server_id: &str) -> Result<Value> {
-        read_configs(self.secrets)
+        read_all_configs(self.secrets, &disabled_servers(&self.effective()))
             .await
             .remove(server_id)
             .ok_or_else(|| Error::NotFound(format!("mcp server not found: {server_id}")))
@@ -1621,7 +1692,7 @@ impl<'a> McpServersService<'a> {
     /// disable layered over the global setting (global disable wins; the
     /// workspace layer only narrows an otherwise-enabled server).
     pub(crate) async fn list(&self, workspace_id: Option<&str>) -> Result<Value> {
-        let configs = read_configs(self.secrets).await;
+        let configs = read_all_configs(self.secrets, &disabled_servers(&self.effective())).await;
         let mut servers: Vec<Value> = configs.values().map(redact_config).collect();
         servers.sort_by_key(config_id);
         if workspace_id.is_some() {
@@ -1643,6 +1714,7 @@ impl<'a> McpServersService<'a> {
         let normalized = normalize_config(config, None)?;
         reject_redacted_secrets(&normalized)?;
         let id = config_id(&normalized);
+        reject_plugin_server(&id)?;
         let mut configs = read_configs(self.secrets).await;
         if configs.contains_key(&id) {
             return Err(Error::InvalidParams(format!(
@@ -1663,6 +1735,7 @@ impl<'a> McpServersService<'a> {
     /// an omitted key is deleted. The merged config is what gets persisted
     /// and handed to the hub restart.
     pub(crate) async fn update(&self, server_id: &str, config: Value) -> Result<Value> {
+        reject_plugin_server(server_id)?;
         let mut configs = read_configs(self.secrets).await;
         let Some(stored) = configs.get(server_id) else {
             return Err(Error::NotFound(format!(
@@ -1689,6 +1762,7 @@ impl<'a> McpServersService<'a> {
 
     /// `mcp.servers.delete` → stop + remove a definition; `{ success: true }`.
     pub(crate) async fn delete(&self, server_id: &str) -> Result<Value> {
+        reject_plugin_server(server_id)?;
         let mut configs = read_configs(self.secrets).await;
         if configs.remove(server_id).is_none() {
             return Err(Error::NotFound(format!(
@@ -1737,9 +1811,13 @@ impl<'a> McpServersService<'a> {
         if let Some(obj) = config.as_object_mut() {
             obj.insert("enabled".into(), json!(enabled));
         }
-        let mut configs = read_configs(self.secrets).await;
-        configs.insert(server_id.to_string(), config.clone());
-        write_configs(self.secrets, &configs).await?;
+        // A plugin server's definition is derived; only `mcp.disabledServers`
+        // records its switch.
+        if crate::plugins::mcp_id_plugin(server_id).is_none() {
+            let mut configs = read_configs(self.secrets).await;
+            configs.insert(server_id.to_string(), config.clone());
+            write_configs(self.secrets, &configs).await?;
+        }
 
         let settings = self.effective();
         let mut disabled = disabled_servers(&settings);
@@ -1789,7 +1867,7 @@ impl<'a> McpServersService<'a> {
         if self.hub.background_stopping() || !enable_user_servers(&self.effective()) {
             return;
         }
-        let ids: Vec<String> = read_configs(self.secrets)
+        let ids: Vec<String> = read_all_configs(self.secrets, &disabled_servers(&self.effective()))
             .await
             .keys()
             .map(String::from)
@@ -1832,12 +1910,45 @@ impl<'a> McpServersService<'a> {
         if !enable_user_servers(&settings) || disabled_servers(&settings).iter().any(|d| d == id) {
             return None;
         }
-        let config = read_configs(self.secrets).await.remove(id)?;
+        let config = read_all_configs(self.secrets, &disabled_servers(&self.effective()))
+            .await
+            .remove(id)?;
         config
             .get("enabled")
             .and_then(Value::as_bool)
             .unwrap_or(false)
             .then_some(config)
+    }
+
+    /// Bring the hub in line with the installed plugins after a plugin change:
+    /// stop servers that are gone or no longer eligible, start new ones, and
+    /// restart changed ones. `refresh` restarts every server of that plugin
+    /// even when its definition is unchanged (its files may have changed).
+    pub(crate) async fn sync_plugin_servers(&self, refresh: Option<&str>) {
+        if self.hub.background_stopping() {
+            return;
+        }
+        let tracked = self.hub.tracked_configs();
+        let configs = read_all_configs(self.secrets, &disabled_servers(&self.effective())).await;
+        let mut ids: Vec<&String> = tracked
+            .keys()
+            .chain(configs.keys())
+            .filter(|id| crate::plugins::mcp_id_plugin(id).is_some())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        for id in ids {
+            let forced = refresh.is_some() && crate::plugins::mcp_id_plugin(id) == refresh;
+            match (self.eligible_config(id).await, tracked.get(id)) {
+                (None, Some(_)) => {
+                    self.hub.stop(id).await;
+                }
+                (Some(config), current) if forced || current != Some(&config) => {
+                    self.hub.start(config, true).await;
+                }
+                _ => {}
+            }
+        }
     }
 
     // -- agent surface (`ws.mcp.*` — bridge/hooks, no wire method) -----------
@@ -2018,7 +2129,7 @@ impl<'a> McpServersService<'a> {
     pub(crate) async fn agent_list_servers(&self, workspace_id: Option<&str>) -> Result<Value> {
         self.require_agent_mcp()?;
         let ws_disabled = self.workspace_disabled_ids(workspace_id).await?;
-        let configs = read_configs(self.secrets).await;
+        let configs = read_all_configs(self.secrets, &disabled_servers(&self.effective())).await;
         let mut servers: Vec<Value> = configs
             .values()
             .map(|config| {

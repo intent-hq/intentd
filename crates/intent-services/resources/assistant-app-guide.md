@@ -195,7 +195,7 @@ Open Settings and use these sidebar labels (English labels shown):
 | Input and shortcuts | Voice dictation and keyboard shortcuts | `/settings?tab=input#keyboard-shortcuts` |
 | Agent defaults | Global instructions and agent features | `/settings?tab=agent-behavior#global-instructions` |
 | Providers | AI coding CLIs and default model | `/settings?tab=providers#providers` |
-| Connections | Integrations and MCP servers | `/settings?tab=connections#integrations` |
+| Connections | Integrations, MCP servers and plugins | `/settings?tab=connections#integrations` |
 | Machines | Local machine, connected backend and saved remote connections | `/settings?tab=devices#devices` |
 | Mobile | Intent Mobile pairing and Remote Access | `/settings?tab=mobile#mobile` |
 | Workspace setup | Git, shell, and workspace defaults | `/settings?tab=setup#git-workspace` |
@@ -226,6 +226,10 @@ For MCP configuration, open **Connections → MCP servers**; its reference route
 Check the provider's official setup instructions before choosing a URL or local command. Creation connects by default; `enabled: false` saves a disabled server. For edits, read the full configuration first and preserve redacted credential placeholders; omitted keys are removed. When MCP is enabled, saving edits to an enabled server reconnects with the saved settings. Preserve its enabled value unless asked to change it. Check the returned status: saved does not mean connected. For `auth_required`, direct the user to the existing sign-in flow in **Connections → MCP servers**; keep tokens out of chat. Disabled MCP and connection errors must be reported as such.
 
 A failed local server start or restart reports `error` with `lastError`. Fix its configuration and retry; the failure remains visible until the server is stopped or another start replaces it.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/plugins.rs; packages/intentd/crates/intent-services/src/plugins/ops.rs; packages/cloudlands-fe/src/lib/components/settings/{PluginsSettings.svelte,plugins/PluginList.svelte}. -->
+
+Plugins follow the [Agent Plugins](https://agent-plugins.org/specification) format: a folder with `plugin.json`, optional `skills/` and an optional `mcp.json`. Install one once in **Connections → Plugins** from a folder path or a git URL, and every agent gets it on any provider. Its skills appear as `<plugin>:<skill>`. Its MCP servers appear in **Connections → MCP servers** as `<plugin>-<server>`, labelled with the plugin; they work like the user's own servers (status, sign-in, switches, `ws.app.mcp` reads) but can only be changed by updating or removing the plugin. Changes reach new agents only. The row shows warnings for parts that were skipped, and **Update** fetches the source again. The Assistant cannot install plugins for the user yet: send the user to that page.
 
 ## Mac update availability
 

@@ -4347,7 +4347,11 @@ impl AgentManager {
         if !crate::mcp_servers::enable_user_servers(&settings) {
             return Ok(());
         }
-        let configs = crate::mcp_servers::read_configs(&self.services.secrets).await;
+        let configs = crate::mcp_servers::read_all_configs(
+            &self.services.secrets,
+            &crate::mcp_servers::disabled_servers(&settings),
+        )
+        .await;
         if configs.is_empty() {
             return Ok(());
         }

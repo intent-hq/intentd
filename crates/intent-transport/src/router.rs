@@ -6031,6 +6031,31 @@ async fn dispatch(
                 Err(e) => Err(domain_to_rpc(e)),
             }
         }
+        "plugin.list" => api.plugin_list().await.map_err(domain_to_rpc),
+        "plugin.install" => {
+            let source = require_str_param(params, "source")?;
+            plugin_result(api.plugin_install(source).await)
+        }
+        "plugin.update" => {
+            let name = require_str_param(params, "name")?;
+            plugin_result(api.plugin_update(name).await)
+        }
+        "plugin.uninstall" => {
+            let name = require_str_param(params, "name")?;
+            let keep_data = params
+                .get("keepData")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            plugin_result(api.plugin_uninstall(name, keep_data).await)
+        }
+        "plugin.toggle" => {
+            let name = require_str_param(params, "name")?;
+            let enabled = params
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| invalid_params("enabled is required"))?;
+            plugin_result(api.plugin_toggle(name, enabled).await)
+        }
         "mcp.servers.restart" => {
             let server_id = require_str_param(params, "serverId")?;
             match api.mcp_servers_restart(server_id).await {
@@ -6237,6 +6262,15 @@ async fn remote_link_traffic(
     api.remote_link_traffic(method, Value::Object(params.clone()))
         .await
         .map_err(domain_to_rpc)
+}
+
+fn plugin_result(result: intent_core::Result<Value>) -> Result<Value, RpcErr> {
+    match result {
+        Ok(v) => Ok(v),
+        Err(Error::InvalidParams(m)) => Err(invalid_params(m)),
+        Err(Error::NotFound(m)) => Err(not_found(m)),
+        Err(e) => Err(domain_to_rpc(e)),
+    }
 }
 
 fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {
