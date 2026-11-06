@@ -173,8 +173,7 @@ enum Command {
     },
     /// Offline repair of the derived search indexes (note and chat-message
     /// full-text search) that `intentd doctor` reports as damaged; a damaged
-    /// index makes writes fail with "database disk image is malformed"
-    /// (code 267). Requires intentd to be stopped. Checks the database
+    /// index makes writes fail with a database corruption error (code 267). Requires intentd to be stopped. Checks the database
     /// read-only first and changes nothing when its schema version differs
     /// from this build, when the check finds damage outside the search
     /// indexes, or when no index is damaged. Otherwise copies the database and

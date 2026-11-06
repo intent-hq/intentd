@@ -39,8 +39,8 @@ pub(crate) fn print_problems(report: &IntegrityReport, data_dir: &Path, severity
     for index in report.damaged_indexes() {
         println!(
             "  [WARN] the {} ({}) is damaged. It holds only derived data, so the \
-             underlying rows are intact, but writes that update it fail with \
-             \"database disk image is malformed\" (code 267) until it is rebuilt.",
+             underlying rows are intact, but writes that update it fail with a \
+             database corruption error (code 267) until it is rebuilt.",
             index.description(),
             index.table()
         );

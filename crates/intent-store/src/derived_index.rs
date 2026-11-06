@@ -3,9 +3,10 @@
 //!
 //! `note_fts` (0141) and `agent_message_fts` (0074) are contentless FTS5
 //! tables maintained by triggers on `note` / `agent_message`. When one is
-//! damaged, every write that fires its trigger fails with
-//! `(code: 267) database disk image is malformed` (`SQLITE_CORRUPT_VTAB`),
-//! even though the canonical rows are intact. Because the indexes hold only
+//! damaged, every write that fires its trigger fails with `(code: 267)`
+//! (`SQLITE_CORRUPT_VTAB`; "database disk image is malformed" before `SQLite`
+//! 3.51, "fts5: corruption on page ..." since), even though the canonical
+//! rows are intact. Because the indexes hold only
 //! derived data, rebuilding them from the canonical tables loses nothing.
 //!
 //! [`check_integrity`] is read-only (safe under `query_only`, e.g. from
@@ -165,6 +166,15 @@ pub(crate) async fn attribute(
     if let Some(name) = word_after(message, "FTS5 table main.") {
         let index = DerivedIndex::owning(&name);
         return (Some(name), index);
+    }
+    // FTS5 corruption as SQLite 3.51+ words it, from xIntegrity or a read:
+    // `fts5: corruption found reading blob 137438953473 from table "note_fts"`,
+    // `fts5: corruption on page 1, segment 12, table "note_fts"`.
+    if message.starts_with("fts5:") {
+        if let Some(name) = word_after(message, "table \"") {
+            let index = DerivedIndex::owning(&name);
+            return (Some(name), index);
+        }
     }
     // B-tree damage: "Tree 23 page 45 cell 3: ...".
     if let Some(root) = word_after(message, "Tree ").and_then(|n| n.parse::<i64>().ok()) {
