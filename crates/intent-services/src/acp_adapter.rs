@@ -419,6 +419,7 @@ impl AcpAdapterCommand {
             program: npx,
             args: vec![
                 NPX_NO_WORKSPACES_ARG.to_string(),
+                intent_acp::npx_cache::NPX_SAVE_ARG.to_string(),
                 "-y".to_string(),
                 package.to_string(),
             ],
@@ -851,13 +852,15 @@ pub(crate) async fn spawn_adapter_in(
         }
         cmd
     };
-    spawn_admitted_adapter(cmd, slot, preparation_guard).map_err(SpawnError::Spawn)
+    spawn_admitted_adapter(cmd, slot, preparation_guard)
+        .await
+        .map_err(SpawnError::Spawn)
 }
 
 /// The spawn itself, once a slot is held. Split out so the bound and the
 /// process plumbing stay separately readable; `slot` is moved into the
 /// returned adapter and released with it.
-fn spawn_admitted_adapter(
+async fn spawn_admitted_adapter(
     cmd: &AcpAdapterCommand,
     slot: OwnedSemaphorePermit,
     preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
@@ -878,6 +881,22 @@ fn spawn_admitted_adapter(
     let mut command = cmd.command_in(&process_cwd);
     if let Some(installed) = &cmd.installed {
         installed.apply(&mut command);
+    }
+
+    let npx_package = cmd.args.iter().find(|arg| {
+        cmd.via_npx
+            && intent_providers::ACP_PROVIDERS.iter().any(|provider| {
+                provider.npx_only_package == Some(arg.as_str())
+                    || provider.fallback_npx_package == Some(arg.as_str())
+            })
+    });
+    if let Some(package) = npx_package {
+        let environment = if cmd.installed.is_some() {
+            intent_acp::npx_cache::CommandEnvironment::Complete
+        } else {
+            intent_acp::npx_cache::CommandEnvironment::Inherit
+        };
+        intent_acp::npx_cache::repair_npx_cache(&command, package, environment).await;
     }
 
     let mut child = command
@@ -1607,6 +1626,7 @@ exit 0
             cmd.args,
             [
                 NPX_NO_WORKSPACES_ARG,
+                intent_acp::npx_cache::NPX_SAVE_ARG,
                 "-y",
                 "codex-acp@1.2.3",
                 "--model",

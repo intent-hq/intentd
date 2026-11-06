@@ -4069,13 +4069,14 @@ impl AgentManager {
                     Error::Internal("installed CLI cleanup still owns the launch directory".into())
                 })?;
                 context.apply_selection(&mut prepared.command);
+                prepared.mark_environment_complete();
                 Ok::<_, Error>(prepared)
             })
             .await
             .map_err(|_| Error::Internal("installed CLI preparation task failed".into()))??;
-            intent_acp::spawn::spawn_prepared_provider(&spawn_opts, prepared, hooks)
+            intent_acp::spawn::spawn_prepared_provider(&spawn_opts, prepared, hooks).await
         } else {
-            spawn_provider(&spawn_opts, hooks)
+            spawn_provider(&spawn_opts, hooks).await
         }
         .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
         let (child, connection, npx_launch_dir, agent_tmp_dir) = spawned.into_parts();
@@ -23919,9 +23920,10 @@ mod rebuild_spawn_opts_tests {
         assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
         let args = intent_acp::spawn::build_args(&rebuilt);
         assert_eq!(args[0], intent_acp::spawn::NPX_NO_WORKSPACES_ARG);
-        assert_eq!(args[1], "-y");
+        assert_eq!(args[1], intent_acp::npx_cache::NPX_SAVE_ARG);
+        assert_eq!(args[2], "-y");
         assert_eq!(
-            args[2],
+            args[3],
             provider.npx_only_package.expect("codex is npx-only")
         );
     }

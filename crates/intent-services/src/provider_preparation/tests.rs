@@ -178,7 +178,7 @@ async fn preparation_runs_metadata_only_with_launch_isolation() {
         assert!(!cwd.exists());
         let args = std::fs::read_to_string(dir.path().join(id).join("report")).unwrap();
         let expected = format!(
-            "--workspaces=false\n--yes\n--ignore-scripts\n--package={}\n--\nnode\n",
+            "--workspaces=false\n--save=true\n--yes\n--ignore-scripts\n--package={}\n--\nnode\n",
             find_provider(id).unwrap().npx_only_package.unwrap()
         );
         assert!(args.starts_with(&expected), "{args}");

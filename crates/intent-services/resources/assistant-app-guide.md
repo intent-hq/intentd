@@ -316,6 +316,13 @@ put in the chat: Intent holds it in daemon memory and passes it only to that age
 dropped when the daemon restarts, the agent is deleted or retired, or its workspace
 is archived; the agent then has to ask again.
 
+**Provider setup.** On macOS and Linux, Intent restores missing npm adapter-cache metadata
+when the installed adapter matches its pinned version. Retry **Let's go** after an
+app update if onboarding stopped on a missing cache `package.json`. Other setup
+errors still need their own diagnosis; do not ask users to clear their entire npm cache.
+
+<!-- Sources: packages/intentd/crates/intent-acp/src/npx_cache.rs; packages/intentd/crates/intent-acp/src/spawn.rs; packages/intentd/crates/intent-services/src/{acp_adapter,provider_preparation}.rs. -->
+
 **Disable a provider.** In **Settings → Providers**, choose **Disable** from its
 ⋯ menu, including for the default provider or one used by saved models or
 specialists. Saved selections remain intact. A turn already running can finish;
