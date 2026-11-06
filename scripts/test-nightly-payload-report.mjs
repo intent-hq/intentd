@@ -284,6 +284,16 @@ describe('run analysis', () => {
     assert.equal(plan.items[0].kind, 'infrastructure');
     assert.match(plan.incidents[0], /No result for large_state_fixture_full_scale_build_time/);
   });
+  it('names a failed setup step ahead of the skipped sweep it caused', () => {
+    // A crates.io outage that outlasts the fetch retries (intent-hq/intent#8585).
+    const data = source({ testOutcome: 'skipped' });
+    data.jobs[0].conclusion = 'failure';
+    data.jobs[0].steps.unshift({ name: 'Fetch locked crates', conclusion: 'failure' });
+    const plan = analyzeRun(data);
+    assert.equal(plan.items.length, 1);
+    assert.equal(plan.items[0].kind, 'infrastructure');
+    assert.match(plan.incidents[0], /Setup, recording or upload step failed: Fetch locked crates/);
+  });
   it('suppresses individual issues for widespread failures', () => {
     const problems = Array.from({ length: 26 }, (_, i) => `NEW OFFENDER m${i}.read default: 600000 bytes > 512000 budget — x`);
     const plan = analyzeRun(failing(problems));

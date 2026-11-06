@@ -46,6 +46,13 @@ jobs:
       CARGO_INCREMENTAL: 0
       INTENTD_ASSERT_BOUND_CALLER: "1"
       INTENTD_LARGE_STATE_SCALE: full
+      # crates.io resilience, matching ci.yml: run 41963501305's first
+      # `cargo test` died on "curl failed: [16] Error in the HTTP2 framing
+      # layer" (serde_with), so the fixture test never ran
+      # (intent-hq/intent#8585). scripts/test-ci-cargo-network.py keeps these
+      # and the fetch step below in place.
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_NET_RETRY: "10"
     steps:
       - uses: actions/setup-python@v6
         with:
@@ -80,6 +87,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
+      # Download the locked crates with backoff, so a crates.io blip fails
+      # this setup step (reported as an incident) instead of a test.
+      - name: Fetch locked crates
+        run: python3 -I -B scripts/fetch-locked-crates.py
       # Both ignored full-scale tests, every time; the log is the reporter's
       # evidence, so the step keeps going after the first failure and fails
       # at the end if either did.
