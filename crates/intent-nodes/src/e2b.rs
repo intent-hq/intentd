@@ -20,7 +20,7 @@ pub use client::{
 pub use envd::{
     OutputChunk, ProcessEvent, ProcessExit, ProcessOutput, ProcessSpec, ProcessStream, ENVD_PORT,
 };
-pub use error::E2bError;
+pub use error::{E2bError, QuotaLimit};
 pub use secret::{load_api_key, SecretString, API_KEY_ACCOUNT};
 
 #[cfg(test)]

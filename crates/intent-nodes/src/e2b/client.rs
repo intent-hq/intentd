@@ -420,8 +420,21 @@ impl E2bClient {
             let retry_budget_left = attempt < self.config.max_rate_limit_retries;
             let retry_after = retry_after(&response);
             if status == StatusCode::TOO_MANY_REQUESTS {
+                let body = read_error(response).await;
+                let message = self.scrub(&body.message, secrets);
+                let error_code = body.error_code;
+                if is_concurrency_limit(&message, error_code.as_deref()) {
+                    return Err(E2bError::ConcurrencyLimit {
+                        error_code,
+                        message,
+                    });
+                }
                 if !retry_budget_left {
-                    return Err(E2bError::RateLimited { retry_after });
+                    return Err(E2bError::RateLimited {
+                        retry_after,
+                        error_code,
+                        message,
+                    });
                 }
                 attempt += 1;
                 let wait = retry_after.unwrap_or(self.config.default_retry_wait);
@@ -468,11 +481,10 @@ impl E2bClient {
             .get("should-retry")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<bool>().ok());
-        let bytes = response.bytes().await.unwrap_or_default();
-        let (message, error_code) = match serde_json::from_slice::<ErrorBody>(&bytes) {
-            Ok(body) => (body.message.unwrap_or_default(), body.error_code),
-            Err(_) => (String::from_utf8_lossy(&bytes).trim().to_string(), None),
-        };
+        let ErrorText {
+            message,
+            error_code,
+        } = read_error(response).await;
         let message = self.scrub(&message, secrets);
         let code = error_code.as_deref().unwrap_or("");
         match status {
@@ -510,6 +522,34 @@ impl E2bClient {
             .collect();
         scrub(message, &all)
     }
+}
+
+struct ErrorText {
+    message: String,
+    error_code: Option<String>,
+}
+
+/// The `message` and `error_code` of an error body, or its raw text.
+async fn read_error(response: Response) -> ErrorText {
+    let bytes = response.bytes().await.unwrap_or_default();
+    match serde_json::from_slice::<ErrorBody>(&bytes) {
+        Ok(body) => ErrorText {
+            message: body.message.unwrap_or_default(),
+            error_code: body.error_code,
+        },
+        Err(_) => ErrorText {
+            message: String::from_utf8_lossy(&bytes).trim().to_string(),
+            error_code: None,
+        },
+    }
+}
+
+/// E2B answers 429 for its API rate limit and for the plan's concurrent
+/// sandbox limit. It documents no code for the second, so match its code or
+/// message ("maximum number of concurrent E2B sandboxes").
+fn is_concurrency_limit(message: &str, error_code: Option<&str>) -> bool {
+    error_code.is_some_and(|c| c.contains("concurren"))
+        || message.to_ascii_lowercase().contains("concurrent")
 }
 
 /// Replace every secret in `message`, then bound its length.

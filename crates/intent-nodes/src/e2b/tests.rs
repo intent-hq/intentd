@@ -201,10 +201,12 @@ async fn rate_limit_gives_up_after_the_retry_budget() {
     client.config.max_rate_limit_retries = 2;
     let err = client.set_timeout("sbx1", 60).await.unwrap_err();
     assert!(
-        matches!(err, E2bError::RateLimited { retry_after: Some(d) } if d == Duration::ZERO),
+        matches!(&err, E2bError::RateLimited { retry_after: Some(d), message, .. } if *d == Duration::ZERO && message == "slow down"),
         "{err:?}"
     );
     assert_eq!(server.requests().len(), 3);
+    assert_eq!(err.quota_limit(), Some(QuotaLimit::Rate));
+    assert_eq!(QuotaLimit::Rate.as_str(), "rate");
 }
 
 #[tokio::test]
@@ -941,4 +943,60 @@ async fn process_start_waits_for_headers_only_up_to_the_request_timeout() {
     .unwrap_err();
     assert!(matches!(err, E2bError::Transport(_)), "{err:?}");
     assert!(!err.is_retryable(), "the command may have started");
+}
+
+const CONCURRENCY_MESSAGE: &str = "You have reached the maximum number of concurrent E2B sandboxes (20). If you need more, please contact us at 'https://e2b.dev/docs/getting-help'";
+
+#[tokio::test]
+async fn concurrency_429_fails_at_once_and_releases_the_create_gate() {
+    let server = FakeServer::start(vec![
+        Reply::error(429, "", &format!("{CONCURRENCY_MESSAGE} key {KEY}"))
+            .with_header("retry-after", "30"),
+        Reply::json(201, &sandbox_body("sbx2")),
+    ])
+    .await;
+    let mut client = client(&server);
+    client.config.create_spacing = Duration::ZERO;
+    let first = create_request();
+    let mut second = create_request();
+    second.idempotency_key = Some("intent-b1-p2".into());
+    let (first, second) = tokio::time::timeout(hang_guard(), async {
+        tokio::join!(client.create(&first), client.create(&second))
+    })
+    .await
+    .expect("a concurrency refusal is not retried");
+    let err = first.unwrap_err();
+    assert!(
+        matches!(&err, E2bError::ConcurrencyLimit { message, .. } if message.contains("maximum number of concurrent")),
+        "{err:?}"
+    );
+    assert_eq!(err.quota_limit(), Some(QuotaLimit::Concurrency));
+    assert_eq!(QuotaLimit::Concurrency.as_str(), "concurrency");
+    assert!(!err.is_retryable());
+    assert_no_secrets(&format!("{err} {err:?}"));
+    assert_eq!(second.unwrap().sandbox_id, "sbx2");
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn concurrency_429_is_recognized_by_error_code() {
+    let server = FakeServer::start(vec![Reply::error(
+        429,
+        "concurrent_sandbox_limit_reached",
+        "limit",
+    )])
+    .await;
+    let err = client(&server).connect("sbx1", 60).await.unwrap_err();
+    assert!(
+        matches!(&err, E2bError::ConcurrencyLimit { error_code: Some(c), .. } if c == "concurrent_sandbox_limit_reached"),
+        "{err:?}"
+    );
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn non_quota_errors_have_no_quota_limit() {
+    let server = FakeServer::start(vec![Reply::error(404, "", "gone")]).await;
+    let err = client(&server).pause("sbx1").await.unwrap_err();
+    assert_eq!(err.quota_limit(), None);
 }

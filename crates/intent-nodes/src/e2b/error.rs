@@ -9,9 +9,21 @@ pub enum E2bError {
     NotConfigured,
     #[error("could not read the E2B API key: {0}")]
     SecretStore(String),
-    /// The retry budget ran out while E2B kept answering 429.
-    #[error("E2B rate limit reached")]
-    RateLimited { retry_after: Option<Duration> },
+    /// The retry budget ran out while E2B kept answering 429 for its API
+    /// rate limit. Maps to `cloud-quota` with limit `rate`.
+    #[error("E2B rate limit reached: {message}")]
+    RateLimited {
+        retry_after: Option<Duration>,
+        error_code: Option<String>,
+        message: String,
+    },
+    /// 429 for the plan's concurrent-sandbox limit. Not retried: it lasts until
+    /// a sandbox stops. Maps to `cloud-quota` with limit `concurrency`.
+    #[error("E2B concurrent sandbox limit reached: {message}")]
+    ConcurrencyLimit {
+        error_code: Option<String>,
+        message: String,
+    },
     /// E2B kept no outcome for this idempotency key and did not run the create
     /// again. A sandbox may exist: look it up by metadata before a new create.
     #[error(
@@ -55,7 +67,34 @@ pub enum E2bError {
     Process { code: String, message: String },
 }
 
+/// Which E2B plan limit refused a call (`CloudQuotaData.limit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaLimit {
+    Concurrency,
+    Rate,
+}
+
+impl QuotaLimit {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Concurrency => "concurrency",
+            Self::Rate => "rate",
+        }
+    }
+}
+
 impl E2bError {
+    /// The plan limit behind a quota refusal, for a `cloud-quota` error.
+    #[must_use]
+    pub fn quota_limit(&self) -> Option<QuotaLimit> {
+        match self {
+            Self::ConcurrencyLimit { .. } => Some(QuotaLimit::Concurrency),
+            Self::RateLimited { .. } => Some(QuotaLimit::Rate),
+            _ => None,
+        }
+    }
+
     /// Whether the same call may succeed later without a change.
     #[must_use]
     pub fn is_retryable(&self) -> bool {

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use super::E2bError;
 
 /// Secret-store account that holds the backend's E2B API key.
-pub const API_KEY_ACCOUNT: &str = "e2b.apiKey";
+pub const API_KEY_ACCOUNT: &str = "cloudMachines.e2b.apiKey";
 
 /// Bounded wait for a secret-store read, like the other token loaders.
 const SECRET_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
