@@ -5469,7 +5469,7 @@ pub(crate) async fn rebuild_agent_message_search(conn: &mut sqlx::SqliteConnecti
          SELECT m.rowid, {MESSAGE_FTS_TEXT_SQL} FROM agent_message m \
          WHERE m.role IN ('user', 'assistant')"
     );
-    sqlx::query(&backfill)
+    sqlx::query(sqlx::AssertSqlSafe(backfill.as_str()))
         .execute(&mut *conn)
         .await
         .map_err(|e| Error::Internal(format!("fts rebuild backfill failed: {e}")))?;

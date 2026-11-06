@@ -58,9 +58,9 @@ async fn seeded(tmp: &TempDb) -> (Store, WorkspaceId, Vec<Note>) {
 /// Overwrite the FTS5 segment pages of `table` with zeroes, the way lost or
 /// torn WAL frames leave an index whose structure points at garbage.
 async fn damage(store: &Store, table: &str) {
-    let damaged = sqlx::query(&format!(
+    let damaged = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {table}_data SET block = zeroblob(length(block)) WHERE id > 10"
-    ))
+    )))
     .execute(store.write_pool())
     .await
     .unwrap()
