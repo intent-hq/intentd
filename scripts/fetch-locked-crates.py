@@ -20,7 +20,9 @@ Run: python3 -I -B scripts/fetch-locked-crates.py
 """
 from pathlib import Path
 import os
+import re
 import subprocess
+import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,10 +73,23 @@ def fetch_dependencies(root, env, attempts=FETCH_ATTEMPTS, sleep=time.sleep,
 
 
 def install_toolchain(root, env, attempts=TOOLCHAIN_ATTEMPTS, sleep=time.sleep):
-    """Let rustup install the rust-toolchain.toml channel outside the fetch timeouts."""
+    """Let rustup install the rust-toolchain.toml channel outside the fetch timeouts.
+
+    A runner can hold a partially installed copy of the channel. rustup then
+    fails the same way on every attempt ("detected conflict: 'bin/cargo-clippy'",
+    job 127971760436; 'bin/cargo-fmt' in intent-hq/intent#1274), so a conflict
+    uninstalls the channel and the next attempt installs it from scratch.
+    """
     for attempt in range(1, attempts + 1):
-        if subprocess.run(['cargo', '--version'], cwd=root, env=env).returncode == 0:
+        result = subprocess.run(['cargo', '--version'], cwd=root, env=env, stderr=subprocess.PIPE, text=True)
+        sys.stderr.write(result.stderr)
+        if result.returncode == 0:
             return
+        if 'detected conflict' in result.stderr:
+            toml = (Path(root) / 'rust-toolchain.toml').read_text()
+            channel = re.search(r'^\s*channel\s*=\s*"([^"]+)"', toml, re.M).group(1)
+            print(f'removing the partially installed {channel} toolchain before retrying', flush=True)
+            subprocess.run(['rustup', 'toolchain', 'uninstall', channel], cwd=root, env=env)
         if attempt < attempts:
             sleep(5 * 2 ** (attempt - 1))
     raise SystemExit(f'FAIL: installing the pinned Rust toolchain (`cargo --version`) failed {attempts} times; '
