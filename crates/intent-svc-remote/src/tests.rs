@@ -2387,6 +2387,16 @@ mod final_stops {
     /// next settles nothing (review of intentd#3098).
     #[tokio::test]
     async fn an_ack_in_flight_when_its_final_stop_expires_settles_nothing() {
+        ack_in_flight_at_expiry(false).await;
+    }
+
+    /// The same below nodeProtocol 9, where the ack would start the grace.
+    #[tokio::test]
+    async fn a_legacy_ack_in_flight_when_its_final_stop_expires_settles_nothing() {
+        ack_in_flight_at_expiry(true).await;
+    }
+
+    async fn ack_in_flight_at_expiry(legacy: bool) {
         let backend = Backend::new().await;
         let mut machine = backend.machine().await;
         backend.expose(&mut machine).await.shutdown();
@@ -2395,14 +2405,27 @@ mod final_stops {
         quick.clock = clock.clone();
         // One send stays in flight until the ack: no resend times it out.
         quick.stop_resend = Backoff::new(wait(), wait());
+        // Only this test's explicit load expires the stop.
+        quick.final_stop_check = Duration::from_secs(3600);
         let node = backend.bare_with(&machine, quick).await;
         let agent = placed(&backend, &node, &machine).await;
         node.connect().await.unwrap();
         let mut link = machine.accept().await;
         bound(&node).await;
-        let stop_id = node.final_stop(&agent, FinalStopReason::AgentDeleted).await;
-        assert_eq!(final_stop_for(&mut link, &agent).await, stop_id);
         let shared = node.shared_ref();
+        if legacy {
+            shared.set_protocol_for_test(intent_core::node_link::FINAL_STOP_PROTOCOL - 1);
+        }
+        let stop_id = node.final_stop(&agent, FinalStopReason::AgentDeleted).await;
+        let sent = link
+            .expect(|frame| match frame {
+                LinkFrame::Stop {
+                    agent_id, stop_id, ..
+                } if agent_id == agent => Some(stop_id),
+                _ => None,
+            })
+            .await;
+        assert_eq!(sent, stop_id);
         assert!(shared.resending_for_test(stop_id), "the ack is awaited");
 
         // The bound passes before the ack: the expiry drops and settles it.
@@ -2420,7 +2443,11 @@ mod final_stops {
         assert_eq!(shared.final_settles_for_test(), vec![agent.clone()]);
 
         // The ack the send awaited arrives: its resender handles it and ends.
-        ack_final(&link, stop_id, &agent, FinalPush::Pushed).await;
+        if legacy {
+            link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        } else {
+            ack_final(&link, stop_id, &agent, FinalPush::Pushed).await;
+        }
         tokio::time::timeout(wait(), async {
             while shared.resending_for_test(stop_id) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2433,6 +2460,78 @@ mod final_stops {
             vec![agent.clone()],
             "the expiry settled it; the late ack must not settle it again"
         );
+        assert!(!shared.in_grace_for_test(stop_id), "no grace after expiry");
+        node.shutdown();
+    }
+
+    /// A load can list a final stop's record just before its ack drops it
+    /// (at once, or after the grace below nodeProtocol 9): the stop is
+    /// settled, so that load queues it again for nothing, and below 9 its
+    /// second ack would settle it again (review of intentd#3102).
+    #[tokio::test]
+    async fn a_load_listed_before_the_ack_dropped_the_record_queues_nothing() {
+        stale_listing_after_ack(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_load_listed_before_the_grace_dropped_the_record_queues_nothing() {
+        stale_listing_after_ack(true).await;
+    }
+
+    async fn stale_listing_after_ack(legacy: bool) {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        backend.expose(&mut machine).await.shutdown();
+        let mut quick = tuning();
+        quick.final_stop_check = Duration::from_secs(3600);
+        let node = backend.bare_with(&machine, quick).await;
+        let agent = placed(&backend, &node, &machine).await;
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        bound(&node).await;
+        let shared = node.shared_ref();
+        if legacy {
+            shared.set_protocol_for_test(intent_core::node_link::FINAL_STOP_PROTOCOL - 1);
+        }
+        let stop_id = node.final_stop(&agent, FinalStopReason::AgentDeleted).await;
+        let sent = link
+            .expect(|frame| match frame {
+                LinkFrame::Stop {
+                    agent_id, stop_id, ..
+                } if agent_id == agent => Some(stop_id),
+                _ => None,
+            })
+            .await;
+        assert_eq!(sent, stop_id);
+        // A load lists the record before the ack's drop.
+        let listed = shared.list_final_stops_for_test().await;
+        assert_eq!(listed.len(), 1);
+        if legacy {
+            link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+        } else {
+            ack_final(&link, stop_id, &agent, FinalPush::Pushed).await;
+        }
+        let store = backend.store().clone();
+        until("the record is dropped and the grace is over", || {
+            let store = store.clone();
+            let agent = agent.clone();
+            let in_grace = shared.in_grace_for_test(stop_id);
+            let resending = shared.resending_for_test(stop_id);
+            Box::pin(async move {
+                !in_grace && !resending && store.get_final_stop(&agent).await.unwrap().is_none()
+            })
+        })
+        .await;
+        assert_eq!(shared.final_settles_for_test(), vec![agent.clone()]);
+        assert!(!shared.has_pending_stops());
+
+        // That load goes on with its earlier listing.
+        shared.settle_listed_for_test(listed).await;
+        assert!(
+            !shared.has_pending_stops(),
+            "a settled stop is not queued again"
+        );
+        assert_eq!(shared.final_settles_for_test(), vec![agent.clone()]);
         node.shutdown();
     }
 
