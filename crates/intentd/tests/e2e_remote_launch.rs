@@ -787,7 +787,10 @@ async fn remote_hooks_questions_and_client_calls(
     assert_eq!(kept["k"]["dispatched"], false, "{kept}");
     assert_eq!(kept["k"]["hook"]["name"], "remote quiet", "{kept}");
     assert_eq!(kept["k"]["hook"]["agentId"], agent_id, "{kept}");
-    assert_eq!(kept["c"]["hook"]["hookId"], kept["k"]["hook"]["hookId"], "{kept}");
+    assert_eq!(
+        kept["c"]["hook"]["hookId"], kept["k"]["hook"]["hookId"],
+        "{kept}"
+    );
     assert_eq!(kept["c"]["hook"]["state"], "cancelled", "{kept}");
 
     let scheduled = wsapi_turn(

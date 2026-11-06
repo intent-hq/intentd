@@ -1147,3 +1147,61 @@ async fn secret_env_is_refused_on_an_older_link() {
     );
     assert!(!refused.1.contains("canary-machine-secret"), "{refused:?}");
 }
+
+/// Head lists a remote agent's git roots relative to its checkout; the
+/// machine makes each one absolute in the agent's checkout and reads its
+/// branch there. A row head already made absolute (an older backend) and
+/// a non-list answer pass through (intent-hq/intent#8692).
+#[tokio::test]
+async fn git_roots_from_head_are_resolved_in_the_agents_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let module = work.join("a/b");
+    std::fs::create_dir_all(&module).unwrap();
+    git(&module, &["init", "--quiet", "-b", "topic"]);
+    git(
+        &module,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "b",
+        ],
+    );
+    let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
+    let head = HeadLink::default();
+    head.set(node_end);
+    let server = server(&agent(), &workspace(), &work, &gates(), head).unwrap();
+    let answering = tokio::spawn(async move {
+        while let Some(event) = head_end.events.recv().await {
+            if let LinkEvent::Request(request) = event {
+                request
+                    .respond(LinkOutcome::Ok(json!([
+                        { "id": "r-1", "path": "a/b", "source": "auto" },
+                        { "id": "r-2", "path": "/backend/ws/c", "branch": "main" },
+                    ])))
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    let roots = ok_json(call(&server, "return JSON.stringify(await ws.git.listRoots());").await);
+    assert_eq!(
+        roots,
+        json!([
+            {
+                "id": "r-1",
+                "path": module.to_string_lossy(),
+                "source": "auto",
+                "branch": "topic",
+            },
+            { "id": "r-2", "path": "/backend/ws/c", "branch": "main" },
+        ])
+    );
+    answering.abort();
+}

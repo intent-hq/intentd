@@ -124,6 +124,7 @@ pub(super) async fn serve(
         head,
         timeout: MCP_PROXY_LINK_TIMEOUT,
         setup_status: None,
+        checkout: None,
     };
     for proxy in &gates.mcp_proxies {
         // Head never names the reserved server; a proxy must not shadow it.
@@ -221,6 +222,7 @@ fn server_with_setup(
         head,
         timeout: DEFAULT_TIMEOUT,
         setup_status: setup_status.map(Arc::new),
+        checkout: Some(Arc::new(worktree.to_path_buf())),
     };
     let api = Arc::new(NodeApi {
         workspace_id: workspace_id.clone(),
@@ -257,6 +259,7 @@ async fn described_server(
         head: head.clone(),
         timeout: DEFAULT_TIMEOUT,
         setup_status: None,
+        checkout: None,
     }
     .placement_help()
     .await;
@@ -268,6 +271,37 @@ async fn described_server(
 
 /// The forwarded call whose `setupStatus` the machine replaces.
 const DETAILS_METHOD: &str = "workspace.details";
+
+/// The forwarded call whose roots the machine resolves in the checkout.
+const GIT_ROOTS_METHOD: &str = "git.listRoots";
+
+/// Head's `git.listRoots` rows with each relative `path` made absolute in
+/// `checkout`, with that repository's branch read there. Absolute paths (an
+/// older backend's) and a non-list answer are left as they are.
+fn resolve_roots(checkout: &Path, mut roots: Value) -> Value {
+    for row in roots.as_array_mut().into_iter().flatten() {
+        let Some(fields) = row.as_object_mut() else {
+            continue;
+        };
+        let Some(rel) = fields
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| Path::new(path).is_relative())
+        else {
+            continue;
+        };
+        let path = checkout.join(rel);
+        fields.insert(
+            "path".to_owned(),
+            Value::String(path.to_string_lossy().into_owned()),
+        );
+        match intent_git::status::current_branch_at(&path) {
+            Some(branch) => fields.insert("branch".to_owned(), Value::String(branch)),
+            None => fields.remove("branch"),
+        };
+    }
+    roots
+}
 
 /// How long the node waits for head to answer its own policy read.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -286,6 +320,9 @@ struct Router {
     /// The agent's checkout's setup status, shown as `setupStatus` in
     /// `workspace.details` (nodeProtocol 10) instead of head's worktree's.
     setup_status: Option<Arc<Value>>,
+    /// The agent's checkout, where the git roots head lists relative to it
+    /// are resolved.
+    checkout: Option<Arc<PathBuf>>,
 }
 
 impl HostFrameRouter for Router {
@@ -352,6 +389,7 @@ impl Router {
             .setup_status
             .clone()
             .filter(|_| method == DETAILS_METHOD);
+        let roots_in = self.checkout.clone().filter(|_| method == GIT_ROOTS_METHOD);
         async move {
             let link = link.ok_or_else(|| {
                 "node-link-unavailable: head is not connected to this node; try again shortly"
@@ -367,6 +405,12 @@ impl Router {
                         value.as_object_mut(),
                     ) {
                         details.insert("setupStatus".to_owned(), (*status).clone());
+                    }
+                    if let Some(checkout) = roots_in {
+                        value =
+                            tokio::task::spawn_blocking(move || resolve_roots(&checkout, value))
+                                .await
+                                .map_err(|error| format!("git.listRoots: {error}"))?;
                     }
                     Ok(value)
                 }
