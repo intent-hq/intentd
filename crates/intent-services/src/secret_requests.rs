@@ -57,6 +57,10 @@ pub(crate) const CODE_UNAVAILABLE: &str = "secret-unavailable";
 
 /// Validate a secret name: 1–64 characters of `A`–`Z`, `0`–`9` and `_`,
 /// starting with a letter. Never trimmed or case-folded.
+///
+/// # Errors
+///
+/// The agent-facing message for an invalid name.
 pub fn validate_secret_name(name: &str) -> std::result::Result<(), String> {
     let mut chars = name.chars();
     let valid = name.len() <= MAX_NAME_LEN
@@ -388,23 +392,26 @@ impl SecretVault {
     }
 
     /// Put a claimed request back as pending (its value did not arrive).
-    pub(crate) fn release(&self, claim: Claim) {
+    /// Returns `false`, changing nothing, when the agent's entry was
+    /// cleared meanwhile (agent deleted or retired, workspace archived or
+    /// deleted).
+    pub(crate) fn release(&self, claim: Claim) -> bool {
         let mut state = self.lock();
-        state
-            .requests
-            .insert(claim.pending.request_id.clone(), claim.key.clone());
-        state
-            .agents
-            .entry(claim.key)
-            .or_default()
-            .pending
-            .push(claim.pending);
+        let Some(entry) = state.agents.get_mut(&claim.key) else {
+            return false;
+        };
+        let request_id = claim.pending.request_id.clone();
+        entry.pending.push(claim.pending);
+        state.requests.insert(request_id, claim.key);
+        true
     }
 
-    /// Record a claimed request as answered with `outcome`; no value is kept.
-    pub(crate) fn settle(&self, claim: Claim, outcome: Outcome) -> Answer {
+    /// Record a claimed request as answered with `outcome`; no value is
+    /// kept. `None`, changing nothing, when the agent's entry was cleared
+    /// meanwhile.
+    pub(crate) fn settle(&self, claim: Claim, outcome: Outcome) -> Option<Answer> {
         let mut state = self.lock();
-        let entry = state.agents.entry(claim.key.clone()).or_default();
+        let entry = state.agents.get_mut(&claim.key)?;
         if entry.answered.len() >= MAX_ANSWERED_PER_AGENT {
             entry.answered.pop_front();
         }
@@ -413,10 +420,10 @@ impl SecretVault {
             name: claim.pending.name.clone(),
             outcome,
         });
-        Answer {
+        Some(Answer {
             agent_id: claim.key.1,
             name: claim.pending.name,
-        }
+        })
     }
 
     /// Names-only listing of one agent's entry.
@@ -877,17 +884,14 @@ impl Services {
                 .remote_launch()
                 .machine_secret(self, &agent_id, MachineSecretOp::List)
                 .await;
-            listing["secrets"] = match answer {
-                MachineSecretAnswer::Names(names) => {
-                    json!(names
-                        .iter()
-                        .map(|name| json!({ "name": name }))
-                        .collect::<Vec<_>>())
-                }
-                _ => {
-                    listing["secretsUnavailable"] = json!(MACHINE_OFFLINE);
-                    json!([])
-                }
+            listing["secrets"] = if let MachineSecretAnswer::Names(names) = answer {
+                json!(names
+                    .iter()
+                    .map(|name| json!({ "name": name }))
+                    .collect::<Vec<_>>())
+            } else {
+                listing["secretsUnavailable"] = json!(MACHINE_OFFLINE);
+                json!([])
             };
         }
         Ok(listing)
@@ -910,7 +914,7 @@ impl Services {
     /// Drop every secret the remote agents of `workspace_id` hold on their
     /// machines (archive): a forget for each, in the background, queued
     /// while a machine is away.
-    pub(crate) async fn forget_remote_secrets_in(&self, workspace_id: &WorkspaceId) {
+    pub(crate) fn forget_remote_secrets_in(&self, workspace_id: &WorkspaceId) {
         let svc = self.clone();
         let workspace_id = workspace_id.clone();
         intent_core::spawn_daemon(
@@ -1085,13 +1089,30 @@ impl Services {
             )
             .await;
         if answer == MachineSecretAnswer::Stored {
-            return Ok(self.secret_vault.settle(claim, Outcome::Provided));
+            if let Some(answer) = self.secret_vault.settle(claim, Outcome::Provided) {
+                return Ok(answer);
+            }
+        } else {
+            tracing::info!(agent = %agent_id, request = %request_id, ?answer, "secret request: the value did not reach the agent's machine");
+            if self.secret_vault.release(claim) {
+                self.forget_on_machine(agent_id, name);
+                return Err(Error::SecretRequest {
+                    code: CODE_DELIVERY_FAILED,
+                    message: "secret-delivery-failed: couldn't deliver the secret to this agent's machine: it is offline or needs an update. Try again when it is online.".into(),
+                });
+            }
         }
-        tracing::info!(agent = %agent_id, request = %request_id, ?answer, "secret request: the value did not reach the agent's machine");
-        self.secret_vault.release(claim);
-        // The machine may have stored the value without confirming it: it
-        // must not keep a value for a request that is still pending. In the
-        // background, so an offline machine does not hold the call longer.
+        // The agent or its workspace ended while the value travelled: the
+        // request is gone, and the machine must not keep the value.
+        self.forget_on_machine(agent_id, name);
+        Err(unknown_request(request_id))
+    }
+
+    /// Ask `agent_id`'s machine to forget `name`, in the background (an
+    /// offline machine must not hold the caller): a value the machine
+    /// stored without confirming it, or for a request that ended, is not
+    /// kept.
+    fn forget_on_machine(&self, agent_id: &AgentId, name: String) {
         let svc = self.clone();
         let agent_id = agent_id.clone();
         intent_core::spawn_daemon(async move {
@@ -1104,10 +1125,6 @@ impl Services {
                 )
                 .await;
         });
-        Err(Error::SecretRequest {
-            code: CODE_DELIVERY_FAILED,
-            message: "secret-delivery-failed: couldn't deliver the secret to this agent's machine: it is offline or needs an update. Try again when it is online.".into(),
-        })
     }
 
     /// Turn-end hook: the persisted assistant message carries these

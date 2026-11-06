@@ -40700,7 +40700,7 @@ impl Services {
                 // request in the workspace (§5.56); unarchive starts empty.
                 this.secret_vault.clear_workspace(&id);
                 // Its remote agents' secrets are on their machines.
-                this.forget_remote_secrets_in(&id).await;
+                this.forget_remote_secrets_in(&id);
                 // Cancel every active background hook in the workspace: task
                 // aborted, state persisted to `cancelled`, `hook:cancelled`
                 // emitted — silently per hook. Unarchive does NOT resurrect

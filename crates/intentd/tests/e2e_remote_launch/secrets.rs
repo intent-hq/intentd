@@ -162,10 +162,14 @@ async fn a_remote_agents_secret_stays_on_its_machine() {
     assert!(listed.get("secretsUnavailable").is_none(), "{listed}");
 
     // The owner's host.exec on the machine gets the value, redacted.
-    let want: String = Sha256::digest(SECRET_VALUE.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let want =
+        Sha256::digest(SECRET_VALUE.as_bytes())
+            .iter()
+            .fold(String::new(), |mut hex, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            });
     let reply = wsapi_turn(
         &mut rpc_ws,
         &mut events,

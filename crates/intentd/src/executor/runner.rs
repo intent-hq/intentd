@@ -197,6 +197,9 @@ struct Inner {
 struct HeadSession {
     session: Option<String>,
     lease_agents: HashSet<AgentId>,
+    /// Agents that ended here for good (a final stop or the bind sweep): a
+    /// `secretPut` still in flight for one is refused.
+    ended: HashSet<AgentId>,
 }
 
 #[derive(Default)]
@@ -790,6 +793,16 @@ impl Runner {
         head.lease_agents = lease_agents.iter().cloned().collect();
     }
 
+    /// `agent_id` ended here for good: drop its secrets and refuse any
+    /// later `secretPut` for it.
+    fn end_secrets(&self, agent_id: &AgentId) {
+        let mut head = lock(&self.inner.head_session);
+        head.ended.insert(agent_id.clone());
+        head.lease_agents.remove(agent_id);
+        drop(head);
+        self.inner.head.secrets().forget(agent_id, None);
+    }
+
     /// Apply one secret frame and build its reply; `None` for any other
     /// frame. Never logs or returns a value.
     pub(super) fn secret_frame(
@@ -819,10 +832,12 @@ impl Runner {
             error: None,
             ..failed("")
         };
-        let on_lease = lock(&self.inner.head_session)
-            .lease_agents
-            .contains(&agent_id)
-            || lock(&self.inner.state).workspaces.contains_key(&agent_id);
+        let on_lease = {
+            let head = lock(&self.inner.head_session);
+            !head.ended.contains(&agent_id)
+                && (head.lease_agents.contains(&agent_id)
+                    || lock(&self.inner.state).workspaces.contains_key(&agent_id))
+        };
         let secrets = self.inner.head.secrets();
         Some(match frame {
             LinkFrame::SecretPut(_) if !on_lease => failed(SECRET_AGENT_NOT_ON_LEASE),
@@ -1898,8 +1913,9 @@ impl Runner {
                         finished,
                         result: None,
                     };
-                    // The agent ends for good: its secrets go first.
-                    runner.inner.head.secrets().forget(&agent_id, None);
+                    // The agent ends for good: its secrets go first, and a
+                    // put still on its way is refused.
+                    runner.end_secrets(&agent_id);
                     // The agent's script runs end first, so nothing still
                     // writes to its checkout while it is pushed and removed.
                     if !runner.inner.scripts.stop_agent(&agent_id).await {
@@ -2150,7 +2166,7 @@ impl Runner {
             self.inner.swept.notify_waiters();
             // The backend no longer records the agent: nothing may use its
             // secrets.
-            self.inner.head.secrets().forget(&agent_id, None);
+            self.end_secrets(&agent_id);
             match removed {
                 Ok(()) => {
                     tracing::info!(agent = %agent_id, "node: removed the checkout of an agent its backend no longer records");

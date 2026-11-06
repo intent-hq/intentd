@@ -23,6 +23,8 @@ struct SecretsPort {
     puts: Mutex<Vec<MachineSecretAnswer>>,
     list: MachineSecretAnswer,
     forget: MachineSecretAnswer,
+    /// End the agent (as a delete or archive does) while a `Put` travels.
+    end_during_put: std::sync::atomic::AtomicBool,
     sent: Mutex<Vec<String>>,
 }
 
@@ -61,10 +63,17 @@ impl RemoteLaunchPort for SecretsPort {
     }
     fn machine_secret<'a>(
         &'a self,
-        _svc: &'a Services,
-        _agent_id: &'a AgentId,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
         op: MachineSecretOp,
     ) -> BoxFuture<'a, MachineSecretAnswer> {
+        if self
+            .end_during_put
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && matches!(op, MachineSecretOp::Put { .. })
+        {
+            svc.secret_vault.clear_agent(agent_id);
+        }
         let (sent, answer) = match &op {
             MachineSecretOp::Put { name, value } => {
                 assert_eq!(value.as_str(), VALUE);
@@ -94,6 +103,7 @@ async fn fixture(
         puts: Mutex::new(puts),
         list,
         forget,
+        end_during_put: std::sync::atomic::AtomicBool::new(false),
         sent: Mutex::new(Vec::new()),
     });
     let svc = svc.with_remote_launch_port(port.clone());
@@ -225,4 +235,42 @@ async fn list_and_forget_without_the_machine() {
         forgot,
         serde_json::json!({ "ok": true, "forgotten": false, "deferred": true })
     );
+}
+
+/// The agent ends (deleted, retired, workspace archived) while its value
+/// travels: the request is not brought back, the call fails as unknown, and
+/// the machine is asked to forget the name.
+#[tokio::test]
+async fn an_agent_that_ends_during_delivery_keeps_nothing() {
+    let (_tmp, svc, ws, id, port) = fixture(
+        vec![MachineSecretAnswer::Stored],
+        MachineSecretAnswer::Offline,
+        MachineSecretAnswer::Forgotten(true),
+    )
+    .await;
+    port.end_during_put
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let ticket = svc.secret_vault.request(&ws, &id, "API_KEY").unwrap();
+    let failed = provide(&svc, &ws, &ticket.request_id).await.unwrap_err();
+    assert!(
+        matches!(&failed, Error::SecretRequest { code, .. } if *code == super::CODE_REQUEST_UNKNOWN),
+        "{failed:?}"
+    );
+    assert!(svc
+        .secret_vault
+        .pending_owner(&ws, &ticket.request_id)
+        .is_none());
+    let listed = svc.secret_vault.list(&ws, &id);
+    assert!(
+        listed.pending.is_empty() && listed.answered.is_empty(),
+        "{listed:?}"
+    );
+    let forgot = "forget Some(\"API_KEY\")".to_owned();
+    for _ in 0..1000 {
+        if port.sent.lock().unwrap().contains(&forgot) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(port.sent.lock().unwrap().contains(&forgot));
 }

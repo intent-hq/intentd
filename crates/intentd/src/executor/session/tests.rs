@@ -358,7 +358,7 @@ async fn secret_frames_hold_values_for_leased_agents_until_the_backend_restarts(
     let b = binding(1, "lease-1");
     let a1 = AgentId::from("a1");
     let held = |agent: &AgentId| h.runner.head_link().secrets().names(agent);
-    h.runner.adopt_head(Some("hs-1"), &[a1.clone()]);
+    h.runner.adopt_head(Some("hs-1"), std::slice::from_ref(&a1));
 
     let stored = reply(apply_secret(&h.runner, &b, OPEN, put(1, "a1", "API_KEY")).await);
     assert_eq!(stored.outcome, SecretOutcome::Ok, "{stored:?}");
@@ -395,13 +395,13 @@ async fn secret_frames_hold_values_for_leased_agents_until_the_backend_restarts(
     );
     assert_eq!(held(&a1), ["API_KEY"]);
 
-    h.runner.adopt_head(Some("hs-1"), &[a1.clone()]);
+    h.runner.adopt_head(Some("hs-1"), std::slice::from_ref(&a1));
     assert_eq!(
         held(&a1),
         ["API_KEY"],
         "a reconnect of the same backend keeps them"
     );
-    h.runner.adopt_head(Some("hs-2"), &[a1.clone()]);
+    h.runner.adopt_head(Some("hs-2"), std::slice::from_ref(&a1));
     assert!(held(&a1).is_empty(), "a restarted backend drops them");
 
     reply(apply_secret(&h.runner, &b, OPEN, put(6, "a1", "API_KEY")).await);
@@ -427,4 +427,11 @@ async fn secret_frames_hold_values_for_leased_agents_until_the_backend_restarts(
         held(&a1).is_empty(),
         "a final stop drops the agent's secrets"
     );
+    let late = reply(apply_secret(&h.runner, &b, OPEN, put(10, "a1", "API_KEY")).await);
+    assert_eq!(
+        late.error.as_deref(),
+        Some("agent-not-on-lease"),
+        "a put still on its way after the final stop is refused"
+    );
+    assert!(held(&a1).is_empty());
 }

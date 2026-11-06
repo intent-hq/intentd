@@ -301,6 +301,10 @@ pub(crate) struct Shared {
     /// 14): sent after the next bind. Memory only; a backend restart drops
     /// them, and its new `headSession` drops the values on the machine.
     secret_forgets: Mutex<Vec<(AgentId, Option<String>)>>,
+    /// One secret operation at a time per agent, the bind's flush of its
+    /// queued forgets included, so a queued forget never lands after a
+    /// newer `secretPut`.
+    secret_locks: Mutex<HashMap<AgentId, Arc<tokio::sync::Mutex<()>>>>,
     ingested: Mutex<NodeCounter>,
     /// Each agent's checkout and setup output tail (nodeProtocol 10).
     setup_outputs: Mutex<HashMap<AgentId, SetupTail>>,
@@ -723,21 +727,20 @@ impl Shared {
     /// each stop once.
     fn resend_queued(self: &Arc<Self>, link: &NodeLink) {
         if link.protocol() >= SECRETS_PROTOCOL {
-            let forgets: Vec<_> = lock(&self.secret_forgets).drain(..).collect();
-            if !forgets.is_empty() {
+            let mut agents: Vec<AgentId> = lock(&self.secret_forgets)
+                .iter()
+                .map(|(agent_id, _)| agent_id.clone())
+                .collect();
+            agents.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            agents.dedup();
+            for agent_id in agents {
+                let shared = self.clone();
                 let link = link.clone();
-                // caller-binding: allow — sends the secret forgets queued while the machine was away
+                // caller-binding: allow — sends one agent's secret forgets queued while the machine was away
                 tokio::spawn(async move {
-                    for (agent_id, name) in forgets {
-                        let frame = LinkFrame::SecretForget(SecretForget {
-                            request_id: LinkId::new_v4(),
-                            agent_id,
-                            name,
-                        });
-                        if let Err(error) = link.send(&frame).await {
-                            tracing::warn!(%error, "remote machine: a queued secret forget was not sent");
-                        }
-                    }
+                    let serial = shared.secret_lock(&agent_id);
+                    let _serial = serial.lock().await;
+                    shared.flush_secret_forgets(&link, &agent_id, None).await;
                 });
             }
         }
@@ -748,6 +751,50 @@ impl Shared {
             // caller-binding: allow — resends one queued stop on its link until acknowledged
             tokio::spawn(async move { shared.resend(link, agent_id, stop_id).await });
         }
+    }
+
+    /// The lock that runs `agent_id`'s secret operations one at a time.
+    fn secret_lock(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        lock(&self.secret_locks)
+            .entry(agent_id.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// Send `agent_id`'s queued secret forgets on `link`, in order, under
+    /// its secret lock; those of the name `superseded` (a `secretPut` about
+    /// to replace it) are dropped instead. Whatever cannot be sent stays
+    /// queued. Returns whether all were sent.
+    async fn flush_secret_forgets(
+        &self,
+        link: &NodeLink,
+        agent_id: &AgentId,
+        superseded: Option<&str>,
+    ) -> bool {
+        let mut mine: std::collections::VecDeque<_> = {
+            let mut queued = lock(&self.secret_forgets);
+            let (mine, rest): (Vec<_>, Vec<_>) =
+                queued.drain(..).partition(|(agent, _)| agent == agent_id);
+            *queued = rest;
+            mine.into_iter()
+                .filter(|(_, name)| superseded.is_none() || name.as_deref() != superseded)
+                .collect()
+        };
+        while let Some((agent_id, name)) = mine.pop_front() {
+            let frame = LinkFrame::SecretForget(SecretForget {
+                request_id: LinkId::new_v4(),
+                agent_id: agent_id.clone(),
+                name: name.clone(),
+            });
+            if let Err(error) = link.send(&frame).await {
+                tracing::warn!(%error, "remote machine: a queued secret forget was not sent");
+                let mut queued = lock(&self.secret_forgets);
+                queued.push((agent_id, name));
+                queued.extend(mine);
+                return false;
+            }
+        }
+        true
     }
 
     /// Send stop `stop_id` on `link` and resend it after 5 s, doubling to
@@ -1243,6 +1290,7 @@ impl RemoteNode {
             push_waiters: Mutex::new(HashMap::new()),
             secret_waiters: Mutex::new(HashMap::new()),
             secret_forgets: Mutex::new(Vec::new()),
+            secret_locks: Mutex::new(HashMap::new()),
             ingested: Mutex::new(acked),
             demand,
             shutdown: watch::channel(false).0,
@@ -1435,6 +1483,10 @@ impl RemoteNode {
         op: MachineSecretOp,
         wait: Duration,
     ) -> MachineSecretAnswer {
+        // Every secret operation of the agent, and the bind's flush of its
+        // queued forgets, run one at a time.
+        let serial = self.shared.secret_lock(agent_id);
+        let _serial = serial.lock().await;
         let request_id = LinkId::new_v4();
         let forget = match &op {
             MachineSecretOp::Forget { name } => Some(name.clone()),
@@ -1467,29 +1519,17 @@ impl RemoteNode {
             if self.connect().await.is_err() || self.shared.protocol() < SECRETS_PROTOCOL {
                 return None;
             }
-            if let Some(name) = &put_name {
-                // A queued forget must never wipe this newer value: drop the
-                // agent's queued forgets of the same name, send its others
-                // first.
-                let earlier: Vec<_> = {
-                    let mut queued = lock(&self.shared.secret_forgets);
-                    let (mine, rest): (Vec<_>, Vec<_>) =
-                        queued.drain(..).partition(|(agent, _)| agent == agent_id);
-                    *queued = rest;
-                    mine.into_iter()
-                        .filter(|(_, forget)| forget.as_ref() != Some(name))
-                        .collect()
-                };
-                for (agent_id, name) in earlier {
-                    let forget = LinkFrame::SecretForget(SecretForget {
-                        request_id: LinkId::new_v4(),
-                        agent_id,
-                        name,
-                    });
-                    self.shared.send(&forget).await.ok()?;
-                }
+            let link = self.shared.current_link()?;
+            // A queued forget must never wipe a newer value: the agent's
+            // queued forgets go first, those of a name being put are dropped.
+            if !self
+                .shared
+                .flush_secret_forgets(&link, agent_id, put_name.as_deref())
+                .await
+            {
+                return None;
             }
-            self.shared.send(&frame).await.ok()?;
+            link.send(&frame).await.ok()?;
             rx.await.ok()
         };
         let reply = tokio::time::timeout(wait, ask).await.ok().flatten();
