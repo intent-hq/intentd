@@ -2323,6 +2323,7 @@ version = "0.11.139"
 dependencies = [
  "base64 0.23.1",
  "intent-core",
+ "intentd-test-support",
  "reqwest",
  "serde",
  "serde_json",

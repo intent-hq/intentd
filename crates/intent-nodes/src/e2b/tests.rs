@@ -12,6 +12,10 @@ const KEY: &str = "e2b_test_key_0123456789abcdef";
 const ENVD_TOKEN: &str = "envd-token-secret-value";
 const TRAFFIC_TOKEN: &str = "traffic-token-secret-value";
 
+fn hang_guard() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(60))
+}
+
 fn client(server: &FakeServer) -> E2bClient {
     E2bClient::new(
         SecretString::new(KEY),
@@ -212,9 +216,11 @@ async fn rate_limit_wait_is_capped() {
     .await;
     let mut client = client(&server);
     client.config.max_retry_wait = Duration::from_millis(50);
-    let started = Instant::now();
-    client.set_timeout("sbx1", 60).await.unwrap();
-    assert!(started.elapsed() < Duration::from_secs(5));
+    // Hang guard: an uncapped wait would sleep for the hour E2B asked for.
+    tokio::time::timeout(hang_guard(), client.set_timeout("sbx1", 60))
+        .await
+        .expect("the retry wait is capped")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -919,16 +925,20 @@ async fn default_spec_lets_envd_choose_the_user() {
 
 #[tokio::test]
 async fn process_start_waits_for_headers_only_up_to_the_request_timeout() {
-    let server =
-        FakeServer::start(vec![Reply::status(200).with_delay(Duration::from_secs(5))]).await;
+    let server = FakeServer::start(vec![
+        Reply::status(200).with_delay(Duration::from_secs(3600))
+    ])
+    .await;
     let mut client = client(&server);
     client.config.request_timeout = Duration::from_millis(100);
-    let started = Instant::now();
-    let err = client
-        .start_process(&sandbox(), &ProcessSpec::new("/bin/true"))
-        .await
-        .unwrap_err();
-    assert!(started.elapsed() < Duration::from_secs(3));
+    // Hang guard: an unbounded header wait would wait for the hour-long delay.
+    let err = tokio::time::timeout(
+        hang_guard(),
+        client.start_process(&sandbox(), &ProcessSpec::new("/bin/true")),
+    )
+    .await
+    .expect("the header wait is bounded")
+    .unwrap_err();
     assert!(matches!(err, E2bError::Transport(_)), "{err:?}");
     assert!(!err.is_retryable(), "the command may have started");
 }

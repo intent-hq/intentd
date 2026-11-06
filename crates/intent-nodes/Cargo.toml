@@ -17,6 +17,7 @@ base64 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+intentd-test-support = { path = "../intentd-test-support" }
 tokio.workspace = true
 tempfile = "3"
 
