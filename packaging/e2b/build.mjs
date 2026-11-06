@@ -1,19 +1,21 @@
 #!/usr/bin/env node
-// Builds intent-node:<tag> on E2B for one workflow event (see plan() in
+// Builds intent-node-<size>:<tag> on E2B for one workflow event (see plan() in
 // intent-node.mjs) and, for release builds, makes the template public.
-// Env: E2B_API_KEY plus the plan inputs (EVENT_NAME, RUN_*, INPUT_*, PR_NUMBER,
-// LATEST_RELEASE_TAG). Writes skip/version/ref/names to $GITHUB_OUTPUT.
+// Env: E2B_API_KEY, SIZE, ENABLED_SIZES (optional comma list) plus the plan
+// inputs (EVENT_NAME, RUN_*, INPUT_*, PR_NUMBER, LATEST_RELEASE_TAG).
+// Writes skip/version/ref/names to $GITHUB_OUTPUT.
 import { appendFileSync } from 'node:fs';
 import { Template, defaultBuildLogger } from 'e2b';
 import {
-  BUILD_RESOURCES,
-  TEMPLATE_NAME,
   archiveUrl,
   defineTemplate,
+  enabledSizes,
   parseSha256,
+  parseSize,
   plan,
   publishTemplate,
   redact,
+  templateName,
 } from './intent-node.mjs';
 
 function output(values) {
@@ -32,6 +34,12 @@ async function fetchSha256(version) {
 async function main() {
   const apiKey = process.env.E2B_API_KEY;
   if (!apiKey) throw new Error('E2B_API_KEY is not set');
+  const size = parseSize(process.env.SIZE);
+  if (!enabledSizes(process.env.ENABLED_SIZES).includes(size.id)) {
+    console.log(`::notice::Skipping ${templateName(size.id)}: not in E2B_TEMPLATE_SIZES`);
+    output({ skip: 'true' });
+    return;
+  }
   const target = plan(process.env);
   if (target.skip) {
     console.log(`::notice::Skipping the intent-node template: ${target.skip}`);
@@ -39,16 +47,18 @@ async function main() {
     return;
   }
   const sha256 = await fetchSha256(target.version);
-  console.log(`Building ${TEMPLATE_NAME} for intentd ${target.version} with tags ${target.tags.join(', ')}`);
-  const info = await Template.build(defineTemplate(Template, { version: target.version, sha256 }), TEMPLATE_NAME, {
-    ...BUILD_RESOURCES,
+  const name = templateName(size.id);
+  console.log(`Building ${name} (${size.cpuCount} vCPU, ${size.memoryMB} MiB) for intentd ${target.version} with tags ${target.tags.join(', ')}`);
+  const info = await Template.build(defineTemplate(Template, { version: target.version, sha256 }), name, {
+    cpuCount: size.cpuCount,
+    memoryMB: size.memoryMB,
     tags: target.tags,
     apiKey,
     onBuildLogs: defaultBuildLogger(),
   });
   console.log(`Built template ${info.templateId} build ${info.buildId}`);
   const names = target.publish ? await publishTemplate({ templateId: info.templateId, apiKey }) : [info.name];
-  output({ skip: 'false', version: target.version, ref: `${TEMPLATE_NAME}:${target.tags[0]}`, names: names.join(',') });
+  output({ skip: 'false', version: target.version, ref: `${name}:${target.tags[0]}`, names: names.join(',') });
 }
 
 main().catch(error => {

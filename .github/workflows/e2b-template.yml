@@ -1,14 +1,19 @@
-# Builds and smoke-tests the intent-node E2B template (packaging/e2b), which
-# the backend starts cloud sandboxes from.
+# Builds and smoke-tests the intent-node E2B templates (packaging/e2b), which
+# the backend starts cloud sandboxes from. E2B fixes vCPU and RAM at build
+# time, so there is one template per size, built in parallel matrix legs:
+# intent-node-2x4 (2 vCPU / 4 GiB), intent-node-4x8 (4 vCPU / 8 GiB, the
+# default) and intent-node-8x16 (8 vCPU / 16 GiB). E2B Hobby caps sandboxes at
+# 8 GiB, so 8x16 needs E2B Pro; a Hobby team sets the E2B_TEMPLATE_SIZES
+# repository variable (for example "2x4,4x8") to skip it.
 #
 # - After each successful Release run (the alpha publish, including the
 #   intentd-releases mirror the template downloads from): build
-#   intent-node:<version>, move intent-node:latest, make the template public,
-#   then smoke-test the new tag.
+#   intent-node-<size>:<version>, move its latest tag, make the template
+#   public, then smoke-test the new tag.
 # - By hand (workflow_dispatch): the same for any published version; `latest`
 #   moves only when asked.
 # - On pull requests that touch the template: build a private
-#   intent-node:pr-<number> from the newest release and smoke-test it.
+#   intent-node-<size>:pr-<number> from the newest release and smoke-test it.
 #
 # Fail-soft: without the E2B_API_KEY secret (an E2B team API key) every job
 # logs a warning and succeeds. The key is passed only through env and is
@@ -26,7 +31,7 @@ on:
         required: true
         type: string
       latest:
-        description: Also move the intent-node:latest tag
+        description: Also move the latest tag of each intent-node-<size> template
         required: false
         default: false
         type: boolean
@@ -51,6 +56,10 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        size: ['2x4', '4x8', '8x16']
     steps:
       # The key itself goes only to the build and smoke steps.
       - name: Check for the E2B_API_KEY secret
@@ -59,7 +68,7 @@ jobs:
           HAS_KEY: ${{ secrets.E2B_API_KEY != '' }}
         run: |
           if [ "$HAS_KEY" != true ]; then
-            echo "::warning::E2B_API_KEY secret is not set; skipping the intent-node E2B template build"
+            echo "::warning::E2B_API_KEY secret is not set; skipping the intent-node-${{ matrix.size }} E2B template build"
             echo "present=false" >> "$GITHUB_OUTPUT"
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
@@ -97,6 +106,8 @@ jobs:
         working-directory: packaging/e2b
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          SIZE: ${{ matrix.size }}
+          ENABLED_SIZES: ${{ vars.E2B_TEMPLATE_SIZES }}
           EVENT_NAME: ${{ github.event_name }}
           RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
@@ -112,9 +123,10 @@ jobs:
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
           REF: ${{ steps.build.outputs.ref }}
+          SIZE: ${{ matrix.size }}
           VERSION: ${{ steps.build.outputs.version }}
           NAMES: ${{ steps.build.outputs.names }}
         run: |
-          node smoke.mjs "$REF" "$VERSION"
-          echo "### intent-node template" >> "$GITHUB_STEP_SUMMARY"
+          node smoke.mjs "$REF" "$VERSION" "$SIZE"
+          echo "### intent-node-$SIZE template" >> "$GITHUB_STEP_SUMMARY"
           echo "Built and smoke-tested \`$REF\` (intentd $VERSION); names: \`$NAMES\`." >> "$GITHUB_STEP_SUMMARY"

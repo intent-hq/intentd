@@ -7,16 +7,20 @@ import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
-  TEMPLATE_NAME,
+  DEFAULT_SIZE,
+  SIZES,
   archiveUrl,
   defineTemplate,
+  enabledSizes,
   installIntentdCommand,
   parseSha256,
+  parseSize,
   parseVersion,
   plan,
   publishTemplate,
   redact,
   smokeChecks,
+  templateName,
   verifySmoke,
 } from '../packaging/e2b/intent-node.mjs';
 
@@ -35,6 +39,26 @@ function recorder() {
   });
   return { calls, Template: () => builder };
 }
+
+describe('sizes', () => {
+  it('offers 2x4, 4x8 (default) and 8x16, one template each', () => {
+    assert.deepEqual(SIZES.map(size => [size.id, size.cpuCount, size.memoryMB]), [
+      ['2x4', 2, 4096], ['4x8', 4, 8192], ['8x16', 8, 16384],
+    ]);
+    assert.equal(DEFAULT_SIZE, '4x8');
+    assert.deepEqual(SIZES.map(size => templateName(size.id)), ['intent-node-2x4', 'intent-node-4x8', 'intent-node-8x16']);
+  });
+  it('rejects unknown sizes', () => {
+    assert.equal(parseSize('8x16').memoryMB, 16384);
+    for (const bad of ['', '16x32', '4X8', '4x8;id']) assert.throws(() => parseSize(bad), /unknown template size/, bad);
+  });
+  it('builds every size unless E2B_TEMPLATE_SIZES narrows the list', () => {
+    assert.deepEqual(enabledSizes(undefined), ['2x4', '4x8', '8x16']);
+    assert.deepEqual(enabledSizes(''), ['2x4', '4x8', '8x16']);
+    assert.deepEqual(enabledSizes(' 2x4, 4x8 '), ['2x4', '4x8']);
+    assert.throws(() => enabledSizes('2x4,16x32'), /unknown template size/);
+  });
+});
 
 describe('parseVersion', () => {
   it('accepts plain and v-prefixed release versions', () => {
@@ -115,15 +139,21 @@ describe('defineTemplate', () => {
 });
 
 describe('smoke', () => {
-  const outputs = { version: 'intentd 0.11.139\n', idle: '' };
-  it('passes when the version matches and no intentd runs', () => {
-    assert.deepEqual(verifySmoke('0.11.139', outputs), []);
+  const outputs = { version: 'intentd 0.11.139\n', idle: '', cpus: '4\n', memKb: '8000000\n' };
+  it('passes when the version and size match and no intentd runs', () => {
+    assert.deepEqual(verifySmoke('0.11.139', '4x8', outputs), []);
   });
   it('reports a version mismatch and a running daemon', () => {
-    const problems = verifySmoke('0.11.139', { version: 'intentd 0.11.138\n', idle: '123\n' });
+    const problems = verifySmoke('0.11.139', '4x8', { ...outputs, version: 'intentd 0.11.138\n', idle: '123\n' });
     assert.equal(problems.length, 2);
     assert.match(problems.join('\n'), /0\.11\.138/);
     assert.match(problems.join('\n'), /running/);
+  });
+  it('reports a sandbox smaller than its size', () => {
+    const problems = verifySmoke('0.11.139', '8x16', outputs);
+    assert.equal(problems.length, 2);
+    assert.match(problems.join('\n'), /4 vCPU, expected 8/);
+    assert.match(problems.join('\n'), /MiB of RAM, expected about 16384/);
   });
   it('checks every tool the template promises', () => {
     const tools = smokeChecks().tools.join(' ');
@@ -182,9 +212,11 @@ describe('workflow contract', () => {
   it('queues release builds instead of dropping them', () => {
     assert.match(workflow, /cancel-in-progress: false\n\s+queue: max/);
   });
-  it('builds the template it then smoke-tests', () => {
-    assert.equal(TEMPLATE_NAME, 'intent-node');
+  it('builds and smoke-tests every size in parallel legs', () => {
+    assert.match(workflow, /fail-fast: false\n\s+matrix:\n\s+size: \['2x4', '4x8', '8x16'\]/);
+    assert.match(workflow, /SIZE: \$\{\{ matrix\.size \}\}/);
+    assert.match(workflow, /ENABLED_SIZES: \$\{\{ vars\.E2B_TEMPLATE_SIZES \}\}/);
     assert.match(workflow, /node build\.mjs/);
-    assert.match(workflow, /node smoke\.mjs/);
+    assert.match(workflow, /node smoke\.mjs "\$REF" "\$VERSION" "\$SIZE"/);
   });
 });

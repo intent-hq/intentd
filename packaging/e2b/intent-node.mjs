@@ -1,6 +1,7 @@
-// The intent-node E2B template: a Debian sandbox image with intentd, its
-// tailcat sidecar, git tooling, Node LTS and the provider CLIs. The backend
-// starts sandboxes from intent-node:<intentd version> and starts intentd
+// The intent-node E2B templates: a Debian sandbox image with intentd, its
+// tailcat sidecar, git tooling, Node LTS and the provider CLIs, built once per
+// sandbox size (E2B fixes vCPU and RAM at build time). The backend starts
+// sandboxes from intent-node-<size>:<intentd version> and starts intentd
 // itself after create, so the template has no start or ready command: E2B
 // snapshots the start command's processes, which would give every sandbox the
 // same daemon id, TLS key and tailcat key.
@@ -8,12 +9,19 @@
 // This module has no dependencies so scripts/test-e2b-template.mjs can run it
 // offline; build.mjs and smoke.mjs pass in the e2b SDK.
 
-export const TEMPLATE_NAME = 'intent-node';
+export const TEMPLATE_PREFIX = 'intent-node';
 export const BASE_IMAGE = 'node:24-bookworm';
 export const ARCHIVE_TARGET = 'x86_64-unknown-linux-musl';
 export const RELEASES_REPO = 'intent-hq/intentd-releases';
 export const INSTALL_DIR = '/opt/intentd';
-export const BUILD_RESOURCES = { cpuCount: 2, memoryMB: 4096 };
+// E2B Hobby caps sandboxes at 8 GiB, so 8x16 needs E2B Pro; a Hobby team
+// narrows the list with the E2B_TEMPLATE_SIZES repository variable.
+export const SIZES = [
+  { id: '2x4', cpuCount: 2, memoryMB: 4096 },
+  { id: '4x8', cpuCount: 4, memoryMB: 8192 },
+  { id: '8x16', cpuCount: 8, memoryMB: 16384 },
+];
+export const DEFAULT_SIZE = '4x8';
 export const API_URL = 'https://api.e2b.app';
 
 // Bump these by hand; each change rebuilds the npm layer.
@@ -37,6 +45,22 @@ export const APT_PACKAGES = [
   'ripgrep',
   'xz-utils',
 ];
+
+export function parseSize(id) {
+  const size = SIZES.find(candidate => candidate.id === id);
+  if (!size) throw new Error(`unknown template size ${JSON.stringify(id)} (known: ${SIZES.map(s => s.id).join(', ')})`);
+  return size;
+}
+
+export function templateName(sizeId) {
+  return `${TEMPLATE_PREFIX}-${parseSize(sizeId).id}`;
+}
+
+// Sizes to build: a comma list (the E2B_TEMPLATE_SIZES variable), or all.
+export function enabledSizes(list) {
+  const ids = String(list ?? '').split(',').map(id => id.trim()).filter(Boolean);
+  return ids.length ? ids.map(id => parseSize(id).id) : SIZES.map(size => size.id);
+}
 
 const VERSION = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)$/;
 
@@ -119,13 +143,22 @@ export function smokeChecks() {
     tools: ['intentd', 'tailcat', 'git', 'git-lfs', 'gh', 'rg', 'node', 'pnpm', 'python3', 'cc', 'make', 'claude', 'codex'],
     version: 'intentd --version',
     idle: 'pgrep -x intentd || true',
+    cpus: 'nproc',
+    memKb: "awk '/^MemTotal:/ { print $2 }' /proc/meminfo",
   };
 }
 
-export function verifySmoke(version, outputs) {
+// The guest kernel keeps some RAM for itself, so MemTotal is a bit under the
+// allocation; 85% still tells the sizes apart.
+export function verifySmoke(version, sizeId, outputs) {
+  const size = parseSize(sizeId);
   const problems = [];
   const reported = outputs.version.trim();
   if (reported !== `intentd ${version}`) problems.push(`intentd --version printed ${JSON.stringify(reported)}, expected "intentd ${version}"`);
+  const cpus = Number(outputs.cpus.trim());
+  if (cpus !== size.cpuCount) problems.push(`the sandbox has ${cpus} vCPU, expected ${size.cpuCount}`);
+  const memMiB = Math.round(Number(outputs.memKb.trim()) / 1024);
+  if (!(memMiB >= size.memoryMB * 0.85)) problems.push(`the sandbox has ${memMiB} MiB of RAM, expected about ${size.memoryMB}`);
   if (outputs.idle.trim()) problems.push(`intentd is already running in a fresh sandbox (pid ${outputs.idle.trim()}); the template must not start it`);
   return problems;
 }
@@ -135,7 +168,7 @@ export function redact(text, secret) {
   return secret ? value.split(secret).join('[redacted]') : value;
 }
 
-// Makes the template visible to every E2B team as <team-slug>/intent-node.
+// Makes the template visible to every E2B team as <team-slug>/<name>.
 // Returns the names E2B reports for it.
 export async function publishTemplate({ templateId, apiKey, fetch = globalThis.fetch, apiUrl = API_URL }) {
   const response = await fetch(`${apiUrl}/v2/templates/${encodeURIComponent(templateId)}`, {
