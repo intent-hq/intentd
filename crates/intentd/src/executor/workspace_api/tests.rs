@@ -424,10 +424,12 @@ async fn file_get_attachment_fetches_a_large_file_in_pieces() {
     let file: Vec<u8> = (0..2 * chunk + 123)
         .map(|i| u8::try_from(i % 251).unwrap())
         .collect();
-    let digest: String = Sha256::digest(&file)
+    let digest = Sha256::digest(&file)
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+        .fold(String::new(), |mut hex, byte| {
+            let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+            hex
+        });
     let dir = tempfile::tempdir().unwrap();
     let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
     let head = HeadLink::default();

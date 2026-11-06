@@ -1158,7 +1158,10 @@ fn oversized_prompt_images() -> (String, Value) {
 
 /// `bytes` as lowercase hex.
 fn lower_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    bytes.iter().fold(String::new(), |mut hex, byte| {
+        let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+        hex
+    })
 }
 
 /// A `wsapi:` reply's returned value: the agent returns `JSON.stringify(…)`,
