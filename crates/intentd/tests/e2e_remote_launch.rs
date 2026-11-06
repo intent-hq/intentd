@@ -2283,30 +2283,20 @@ async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
         "backend only\n"
     );
 
-    // The workspace's git roots, registered by a local agent: the remote
-    // agent lists only its carried submodules, at their paths in its
-    // checkout, and not the repository outside it (intent-hq/intent#8692).
-    let local = ok(
-        &mut rpc_ws,
-        200,
-        "agent.create",
-        json!({ "workspaceId": ws_id, "name": "Local", "model": "default", "provider": "mock" }),
+    // The workspace's git roots on the backend: the remote agent lists only
+    // its carried submodules, at their paths in its checkout, and not the
+    // repository outside it (intent-hq/intent#8692).
+    seed_git_roots(
+        &scratch.path().join("head"),
+        &ws_id,
+        &[
+            repo.join("a"),
+            repo.join("a/b"),
+            repo.join("c"),
+            c_url.clone(),
+        ],
     )
     .await;
-    let local_id = local["agent"]["id"].as_str().unwrap().to_owned();
-    let registered = wsapi_turn(
-        &mut rpc_ws,
-        &mut events,
-        (&ws_id, &local_id),
-        &format!(
-            r#"wsapi for (const p of ["a", "a/b", "c", {outside:?}]) await ws.git.registerRoot(p); return JSON.stringify({{ marker: "turn-roots", n: (await ws.git.listRoots()).length }});"#,
-            outside = c_url.to_str().unwrap(),
-        ),
-        "turn-roots",
-        210,
-    )
-    .await;
-    assert_eq!(wsapi_value(&registered)["n"], 4, "{registered}");
     let listed = wsapi_turn(
         &mut rpc_ws,
         &mut events,
@@ -2378,6 +2368,39 @@ async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
     // The backend's own checkouts are untouched.
     assert_eq!(heads(&repo), backend_heads);
     assert!(!repo.join("c/edit.txt").exists());
+}
+
+/// Register `paths` as `ws_id`'s secondary git roots in the backend's store.
+async fn seed_git_roots(data_dir: &Path, ws_id: &str, paths: &[std::path::PathBuf]) {
+    use intent_core::{now_iso, WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource};
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store");
+    let ts = now_iso();
+    for path in paths {
+        store
+            .upsert_workspace_git_root(&WorkspaceGitRoot {
+                id: WorkspaceGitRootId::new(),
+                workspace_id: intent_core::WorkspaceId::from(ws_id),
+                path: std::fs::canonicalize(path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                source: WorkspaceGitRootSource::Auto,
+                repo_owner: None,
+                repo_name: None,
+                registered_by_agent_ids: vec![],
+                registered_commit_sha: None,
+                pr_number: None,
+                pr_url: None,
+                pr_status: None,
+                pull_requests: None,
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+            })
+            .await
+            .expect("insert git root");
+    }
 }
 
 /// Create a remote agent named `name` on the exposed machine, retrying
