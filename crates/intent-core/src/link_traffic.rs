@@ -410,7 +410,7 @@ impl LinkTraffic {
                 truncated: payloads && bytes > self.limits.max_payload_bytes,
             }
         } else {
-            Body::Full(Box::new(frame.clone()))
+            Body::Full(Box::new(masked_copy(frame)))
         };
         let captured = Captured {
             at: OffsetDateTime::now_utc(),
@@ -590,6 +590,18 @@ fn render(captured: &Captured, payloads: bool, max_payload_bytes: usize) -> Draf
     }
 }
 
+/// `frame` as the capture keeps it: an agent secret's value never enters
+/// the queue.
+fn masked_copy(frame: &LinkFrame) -> LinkFrame {
+    match frame {
+        LinkFrame::SecretPut(put) => LinkFrame::SecretPut(crate::node_link::SecretPut {
+            value: crate::node_link::SecretValue::from(MASK),
+            ..put.clone()
+        }),
+        other => other.clone(),
+    }
+}
+
 /// The parts of `frame` a record shows without its payload: the type, the
 /// ids and the fields [`summarize`] reads, never a prompt, params body,
 /// result, journal body or launch configuration.
@@ -735,6 +747,30 @@ fn light_frame(frame: &LinkFrame) -> Value {
         }),
         LinkFrame::PushWipReply(reply) => json!({
             "type": "pushWipReply",
+            "requestId": reply.request_id,
+            "agentId": agent(&reply.agent_id),
+            "outcome": reply.outcome,
+            "error": reply.error.as_deref().map(field),
+        }),
+        LinkFrame::SecretPut(put) => json!({
+            "type": "secretPut",
+            "requestId": put.request_id,
+            "agentId": agent(&put.agent_id),
+            "name": field(&put.name),
+        }),
+        LinkFrame::SecretForget(forget) => json!({
+            "type": "secretForget",
+            "requestId": forget.request_id,
+            "agentId": agent(&forget.agent_id),
+            "name": forget.name.as_deref().map(field),
+        }),
+        LinkFrame::SecretList(list) => json!({
+            "type": "secretList",
+            "requestId": list.request_id,
+            "agentId": agent(&list.agent_id),
+        }),
+        LinkFrame::SecretReply(reply) => json!({
+            "type": "secretReply",
             "requestId": reply.request_id,
             "agentId": agent(&reply.agent_id),
             "outcome": reply.outcome,

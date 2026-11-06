@@ -25,8 +25,9 @@ use tokio::time::Instant;
 use intent_core::machines::RemoteMachineState;
 use intent_core::node_link::{
     JournalBody, LaunchCommand, LinkFrame, LinkId, LinkOutcome, LinkRpcError, LinkWelcome,
-    MachineCapabilities, MachineSkill, PushWipRequest, PushWipResult, SetupState, SkillsQuery,
-    StopId, StopOutcome, FINAL_STOP_PROTOCOL, SKILLS_PROTOCOL,
+    MachineCapabilities, MachineSkill, PushWipRequest, PushWipResult, SecretForget, SecretList,
+    SecretOutcome, SecretPut, SecretReply, SetupState, SkillsQuery, StopId, StopOutcome,
+    FINAL_STOP_PROTOCOL, SECRETS_PROTOCOL, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::{AgentPlatform, PlatformAvailability};
@@ -34,7 +35,9 @@ use intent_core::remote_launch::{
     EffectiveIsolation, PlacementError, RemoteSetupState, RemoteSetupStatus,
 };
 use intent_core::{AgentId, Error, Result, WorkspaceId};
-use intent_services::feature_api::feature_ports::MachineSkills;
+use intent_services::feature_api::feature_ports::{
+    MachineSecretAnswer, MachineSecretOp, MachineSkills,
+};
 use intent_services::feature_api::Services;
 use intent_store::Store;
 use intent_transport::node_link::{
@@ -291,6 +294,17 @@ pub(crate) struct Shared {
     /// Waiting for the machine's `pushWipReply`, by request id
     /// (nodeProtocol 13).
     push_waiters: Mutex<HashMap<intent_core::node_link::LinkId, oneshot::Sender<PushWipResult>>>,
+    /// Waiting for the machine's `secretReply`, by request id
+    /// (nodeProtocol 14).
+    secret_waiters: Mutex<HashMap<LinkId, oneshot::Sender<SecretReply>>>,
+    /// Secret forgets for a machine that was not connected (nodeProtocol
+    /// 14): sent after the next bind. Memory only; a backend restart drops
+    /// them, and its new `headSession` drops the values on the machine.
+    secret_forgets: Mutex<Vec<(AgentId, Option<String>)>>,
+    /// One secret operation at a time per agent, the bind's flush of its
+    /// queued forgets included, so a queued forget never lands after a
+    /// newer `secretPut`.
+    secret_locks: Mutex<HashMap<AgentId, Arc<tokio::sync::Mutex<()>>>>,
     ingested: Mutex<NodeCounter>,
     /// Each agent's checkout and setup output tail (nodeProtocol 10).
     setup_outputs: Mutex<HashMap<AgentId, SetupTail>>,
@@ -387,6 +401,7 @@ impl Shared {
             || !lock(&self.capability_waiters).is_empty()
             || !lock(&self.skills_waiters).is_empty()
             || !lock(&self.push_waiters).is_empty()
+            || !lock(&self.secret_waiters).is_empty()
             || (self
                 .survivors_unclaimed
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -711,12 +726,80 @@ impl Shared {
     /// link); a stop queued later starts its own resender. One link resends
     /// each stop once.
     fn resend_queued(self: &Arc<Self>, link: &NodeLink) {
+        if link.protocol() >= SECRETS_PROTOCOL {
+            let mut agents: Vec<AgentId> = lock(&self.secret_forgets)
+                .iter()
+                .map(|(agent_id, _)| agent_id.clone())
+                .collect();
+            agents.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            agents.dedup();
+            for agent_id in agents {
+                let shared = self.clone();
+                let link = link.clone();
+                // caller-binding: allow — sends one agent's secret forgets queued while the machine was away
+                tokio::spawn(async move {
+                    let serial = shared.secret_lock(&agent_id);
+                    let _serial = serial.lock().await;
+                    shared.flush_secret_forgets(&link, &agent_id, None).await;
+                });
+            }
+        }
         for (agent_id, queued) in self.queued_stops() {
             let stop_id = queued.stop_id;
             let shared = self.clone();
             let link = link.clone();
             // caller-binding: allow — resends one queued stop on its link until acknowledged
             tokio::spawn(async move { shared.resend(link, agent_id, stop_id).await });
+        }
+    }
+
+    /// The lock that runs `agent_id`'s secret operations one at a time.
+    fn secret_lock(&self, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        lock(&self.secret_locks)
+            .entry(agent_id.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// Send `agent_id`'s queued secret forgets on `link`, in order, under
+    /// its secret lock; those of the name `superseded` (a `secretPut` about
+    /// to replace it) are dropped instead. A forget leaves the queue only
+    /// once it is sent, so a cancelled flush loses none. Returns whether all
+    /// were sent.
+    async fn flush_secret_forgets(
+        &self,
+        link: &NodeLink,
+        agent_id: &AgentId,
+        superseded: Option<&str>,
+    ) -> bool {
+        if let Some(name) = superseded {
+            lock(&self.secret_forgets)
+                .retain(|(agent, forget)| agent != agent_id || forget.as_deref() != Some(name));
+        }
+        loop {
+            let Some(name) = lock(&self.secret_forgets)
+                .iter()
+                .find(|(agent, _)| agent == agent_id)
+                .map(|(_, name)| name.clone())
+            else {
+                return true;
+            };
+            let frame = LinkFrame::SecretForget(SecretForget {
+                request_id: LinkId::new_v4(),
+                agent_id: agent_id.clone(),
+                name: name.clone(),
+            });
+            if let Err(error) = link.send(&frame).await {
+                tracing::warn!(%error, "remote machine: a queued secret forget was not sent");
+                return false;
+            }
+            let mut queued = lock(&self.secret_forgets);
+            if let Some(at) = queued
+                .iter()
+                .position(|(agent, forget)| agent == agent_id && *forget == name)
+            {
+                queued.remove(at);
+            }
         }
     }
 
@@ -1211,6 +1294,9 @@ impl RemoteNode {
             capability_waiters: Mutex::new(Vec::new()),
             skills_waiters: Mutex::new(HashMap::new()),
             push_waiters: Mutex::new(HashMap::new()),
+            secret_waiters: Mutex::new(HashMap::new()),
+            secret_forgets: Mutex::new(Vec::new()),
+            secret_locks: Mutex::new(HashMap::new()),
             ingested: Mutex::new(acked),
             demand,
             shutdown: watch::channel(false).0,
@@ -1391,6 +1477,88 @@ impl RemoteNode {
         // On failure, drop this request so it no longer holds the link.
         lock(&self.shared.capability_waiters).retain(|waiter| !waiter.is_closed());
         reply
+    }
+
+    /// Send one secret frame for `agent_id` (nodeProtocol 14, node-link.md
+    /// § Secrets on the machine), connecting on demand, and wait for the
+    /// machine's answer; one deadline of `wait` for both. A forget that
+    /// gets no answer is queued for the next bind.
+    pub(crate) async fn machine_secret(
+        &self,
+        agent_id: &AgentId,
+        op: MachineSecretOp,
+        wait: Duration,
+    ) -> MachineSecretAnswer {
+        // Every secret operation of the agent, and the bind's flush of its
+        // queued forgets, run one at a time.
+        let serial = self.shared.secret_lock(agent_id);
+        let _serial = serial.lock().await;
+        let request_id = LinkId::new_v4();
+        let forget = match &op {
+            MachineSecretOp::Forget { name } => Some(name.clone()),
+            MachineSecretOp::Put { .. } | MachineSecretOp::List => None,
+        };
+        let frame = match op {
+            MachineSecretOp::Put { name, value } => LinkFrame::SecretPut(SecretPut {
+                request_id,
+                agent_id: agent_id.clone(),
+                name,
+                value: value.into(),
+            }),
+            MachineSecretOp::Forget { name } => LinkFrame::SecretForget(SecretForget {
+                request_id,
+                agent_id: agent_id.clone(),
+                name,
+            }),
+            MachineSecretOp::List => LinkFrame::SecretList(SecretList {
+                request_id,
+                agent_id: agent_id.clone(),
+            }),
+        };
+        let (tx, rx) = oneshot::channel();
+        lock(&self.shared.secret_waiters).insert(request_id, tx);
+        let put_name = match &frame {
+            LinkFrame::SecretPut(put) => Some(put.name.clone()),
+            _ => None,
+        };
+        let ask = async {
+            if self.connect().await.is_err() || self.shared.protocol() < SECRETS_PROTOCOL {
+                return None;
+            }
+            let link = self.shared.current_link()?;
+            // A queued forget must never wipe a newer value: the agent's
+            // queued forgets go first, those of a name being put are dropped.
+            if !self
+                .shared
+                .flush_secret_forgets(&link, agent_id, put_name.as_deref())
+                .await
+            {
+                return None;
+            }
+            link.send(&frame).await.ok()?;
+            rx.await.ok()
+        };
+        let reply = tokio::time::timeout(wait, ask).await.ok().flatten();
+        lock(&self.shared.secret_waiters).remove(&request_id);
+        // The value's only copy on this side: wiped now.
+        drop(frame);
+        let Some(reply) = reply else {
+            if let Some(name) = forget {
+                lock(&self.shared.secret_forgets).push((agent_id.clone(), name));
+                return MachineSecretAnswer::Queued;
+            }
+            return MachineSecretAnswer::Offline;
+        };
+        match (reply.outcome, forget, reply.names) {
+            (SecretOutcome::Failed, _, _) => {
+                MachineSecretAnswer::Failed(reply.error.unwrap_or_else(|| "failed".to_owned()))
+            }
+            (SecretOutcome::Ok, Some(_), _) => {
+                MachineSecretAnswer::Forgotten(reply.forgotten.unwrap_or(false))
+            }
+            (SecretOutcome::Ok, None, Some(names)) => MachineSecretAnswer::Names(names),
+            (SecretOutcome::Ok, None, None) => MachineSecretAnswer::Stored,
+        }
     }
 
     /// Ask the machine to push `agent_id`'s checkout now (`pushWip`,
@@ -1652,6 +1820,7 @@ async fn run(
                 lock(&shared.capability_waiters).clear();
                 lock(&shared.skills_waiters).clear();
                 lock(&shared.push_waiters).clear();
+                lock(&shared.secret_waiters).clear();
                 retry = shared.wants_link();
                 if retry {
                     let delay = match failure {
@@ -1709,6 +1878,7 @@ async fn run(
             lock(&shared.capability_waiters).clear();
             lock(&shared.skills_waiters).clear();
             lock(&shared.push_waiters).clear();
+            lock(&shared.secret_waiters).clear();
             shared.announce().await;
             retry = shared.wants_link();
             if retry {
@@ -1780,6 +1950,7 @@ async fn run(
         lock(&shared.capability_waiters).clear();
         lock(&shared.skills_waiters).clear();
         lock(&shared.push_waiters).clear();
+        lock(&shared.secret_waiters).clear();
         // The machine stops this binding's scripts when its link closes.
         shared
             .machine_runs_lost("remote-script-lost: the machine disconnected")
@@ -1892,6 +2063,12 @@ async fn serve(
                     }
                     LinkEvent::Frame(LinkFrame::PushWipReply(reply)) => {
                         if let Some(waiter) = lock(&shared.push_waiters).remove(&reply.request_id) {
+                            let _ = waiter.send(reply);
+                        }
+                    }
+                    LinkEvent::Frame(LinkFrame::SecretReply(reply)) => {
+                        if let Some(waiter) = lock(&shared.secret_waiters).remove(&reply.request_id)
+                        {
                             let _ = waiter.send(reply);
                         }
                     }

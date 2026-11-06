@@ -147,6 +147,9 @@ pub const FORWARDED_METHODS: &[&str] = &[
     "terminal.list",
     "terminal.readOutput",
     "app.question.ask",
+    "secret.request",
+    "secret.list",
+    "secret.forget",
 ];
 
 /// Why secondary git roots (`git.registerRoot`, `git.unregisterRoot`, a
@@ -201,9 +204,30 @@ pub fn forward_min_protocol(method: &str) -> u32 {
         crate::node_link::SCRIPT_PROTOCOL
     } else if method == MCP_PROXY_LIST_TOOLS_METHOD || method == MCP_PROXY_CALL_TOOL_METHOD {
         crate::node_link::MCP_PROXY_PROTOCOL
+    } else if method.starts_with("secret.") {
+        crate::node_link::SECRETS_PROTOCOL
     } else {
         crate::node_link::NODE_LINK_PROTOCOLS.min
     }
+}
+
+/// The error a forwarded `method` fails with on a link older than its
+/// [`forward_min_protocol`].
+#[must_use]
+pub fn forward_refusal(method: &str) -> String {
+    let min = forward_min_protocol(method);
+    let feature = if method.starts_with("secret.") {
+        "agent secrets on the machine"
+    } else if min == crate::node_link::MCP_PROXY_PROTOCOL {
+        "MCP server proxies"
+    } else if min == crate::node_link::SCRIPT_PROTOCOL {
+        "saved-script support"
+    } else {
+        "a newer node link"
+    };
+    format!(
+        "{UNSUPPORTED_CODE}: `{method}` needs {feature} on both this machine and the backend (node-link protocol {min}); update Intent on both"
+    )
 }
 
 /// The error a refused frame fails with.
@@ -219,7 +243,7 @@ pub fn unsupported_message(method: &str) -> String {
         return GIT_ROOTS_MESSAGE.to_owned();
     }
     format!(
-        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet (ws.{namespace}.* is not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.app.question.ask, ws.git.listRoots, ws.terminal.list and readOutput, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
+        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet (ws.{namespace}.* is not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.app.question.ask, ws.secret (node-link protocol 14), ws.git.listRoots, ws.terminal.list and readOutput, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
         FORWARDED_NAMESPACES
             .iter()
             .filter(|namespace| **namespace != "mr")
@@ -426,8 +450,9 @@ mod tests {
     #[test]
     fn everything_else_is_refused_by_name() {
         for method in [
-            "secret.request",
             "search.query",
+            "secret.provide",
+            "secret.dismiss",
             COMMIT_POLICY_METHOD,
             ATTACHMENTS_METHOD,
             ATTACHMENT_DATA_METHOD,
@@ -437,14 +462,14 @@ mod tests {
         ] {
             assert_eq!(route(method), Route::Unsupported, "{method:?}");
         }
-        let message = unsupported_message("secret.request");
+        let message = unsupported_message("search.query");
         assert!(
             message.starts_with(
-                "remote-agent-unsupported: `secret.request` is not supported on remote agents yet"
+                "remote-agent-unsupported: `search.query` is not supported on remote agents yet"
             ),
             "{message}"
         );
-        assert!(message.contains("ws.secret.* is"), "{message}");
+        assert!(message.contains("ws.search.* is"), "{message}");
         for forwarded in [
             "ws.script",
             "ws.primitive",
@@ -457,10 +482,35 @@ mod tests {
             "ws.app.question.ask",
             "ws.git.listRoots",
             "ws.terminal.list",
+            "ws.secret",
             "ws.workspace calls (details",
             "archive",
         ] {
             assert!(message.contains(forwarded), "{forwarded}: {message}");
         }
+    }
+
+    /// S5 of the remote-agent parity design: a remote agent's secret
+    /// requests, list and forget run on head as the agent (the values stay
+    /// on its machine), only on a nodeProtocol 14 link; the refusal on an
+    /// older one asks to update Intent on both.
+    #[test]
+    fn secret_calls_are_forwarded_on_protocol_14() {
+        for method in ["secret.request", "secret.list", "secret.forget"] {
+            assert_eq!(route(method), Route::Forward, "{method}");
+            assert_eq!(
+                forward_min_protocol(method),
+                crate::node_link::SECRETS_PROTOCOL,
+                "{method}"
+            );
+            let refused = forward_refusal(method);
+            assert!(
+                refused.starts_with("remote-agent-unsupported: `"),
+                "{refused}"
+            );
+            assert!(refused.contains("node-link protocol 14"), "{refused}");
+            assert!(refused.contains("secrets"), "{refused}");
+        }
+        assert!(forward_refusal("script.run").contains("saved-script"));
     }
 }

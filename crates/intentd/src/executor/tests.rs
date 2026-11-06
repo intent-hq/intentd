@@ -443,6 +443,7 @@ fn hello_from(head: &str, generation: u64, lease: &str, acked: u64) -> LinkHello
         },
         acked_seq: NodeCounter(acked),
         lease_agents: Vec::new(),
+        head_session: None,
     }
 }
 

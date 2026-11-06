@@ -33,6 +33,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::common;
 
+mod secrets;
 mod sub_agents;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
@@ -1285,6 +1286,16 @@ async fn start_backend_on(
 ) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String) {
     std::fs::create_dir_all(data_dir.join("workspaces")).unwrap();
     let ws_id = seed_workspace_on(data_dir, repo, worktree).await;
+    let (guard, port, cfg) = serve_backend(data_dir, env).await;
+    (guard, port, cfg, ws_id)
+}
+
+/// Start the backend's `intentd serve` on `data_dir` (seeded or from an
+/// earlier run: a restart keeps its store and its fixed WSS port).
+async fn serve_backend(
+    data_dir: &Path,
+    env: &[(&str, &str)],
+) -> (common::DaemonGuard, u16, Arc<ClientConfig>) {
     common::enable_ws_api(data_dir);
     let mut serve = common::hermetic_serve_command(data_dir);
     serve
@@ -1304,7 +1315,7 @@ async fn start_backend_on(
     let status = common::await_wss_status(&data_dir.join("intentd.sock")).await;
     let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
     let cfg = client_config(status["result"]["fingerprint"].as_str().unwrap());
-    (guard, port, cfg, ws_id)
+    (guard, port, cfg)
 }
 
 /// `remoteMachines.add` params for `machine`, named `name`.

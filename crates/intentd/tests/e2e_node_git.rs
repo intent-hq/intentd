@@ -340,6 +340,7 @@ impl Fixture {
                 binding: binding.clone(),
                 acked_seq: NodeCounter(0),
                 lease_agents: Vec::new(),
+                head_session: None,
             },
         )
         .await

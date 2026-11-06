@@ -2450,3 +2450,104 @@ async fn an_unsolicited_capabilities_report_replaces_the_recorded_one() {
     wait_for(vec!["mock".to_owned()]).await;
     node.shutdown();
 }
+
+/// nodeProtocol 14 (node-link.md § Secrets on the machine): forgets queued
+/// while the machine was away go out before a later `secretPut` of the same
+/// agent (one of the name being put may be dropped instead), so a queued
+/// forget never wipes the newer, confirmed value.
+#[tokio::test]
+async fn a_queued_secret_forget_never_lands_after_a_newer_put() {
+    use intent_core::node_link::{SecretOutcome, SecretReply, SecretValue};
+    use intent_services::feature_api::feature_ports::{MachineSecretAnswer, MachineSecretOp};
+    let backend = Backend::new().await;
+    let mut machine = Machine::start(&backend.id().await).await;
+    backend.expose(&mut machine).await.shutdown();
+    machine.stop().await;
+    let node = backend.bare(&machine).await;
+    let agent = AgentId::new();
+    for name in ["API_KEY", "OTHER"] {
+        let forget = MachineSecretOp::Forget {
+            name: Some(name.to_owned()),
+        };
+        assert_eq!(
+            node.machine_secret(&agent, forget, Duration::from_millis(300))
+                .await,
+            MachineSecretAnswer::Queued
+        );
+    }
+
+    machine.restart().await;
+    let putting = {
+        let node = node.clone();
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            let put = MachineSecretOp::Put {
+                name: "API_KEY".into(),
+                value: SecretValue::from("v-new").into_inner(),
+            };
+            node.machine_secret(&agent, put, wait()).await
+        })
+    };
+    let mut link = machine.accept().await;
+    let mut forgets = Vec::new();
+    let put_id = link
+        .expect(|frame| match frame {
+            LinkFrame::SecretForget(forget) => {
+                forgets.push(forget.name);
+                None
+            }
+            LinkFrame::SecretPut(put) => Some(put.request_id),
+            _ => None,
+        })
+        .await;
+    // The bind may flush the queue before the put takes the agent's turn
+    // (then both forgets go first); either way nothing follows the put.
+    assert!(forgets.contains(&Some("OTHER".to_owned())), "{forgets:?}");
+    let reply = |request_id, names| {
+        LinkFrame::SecretReply(SecretReply {
+            request_id,
+            agent_id: agent.clone(),
+            outcome: SecretOutcome::Ok,
+            names,
+            forgotten: None,
+            error: None,
+        })
+    };
+    link.link.send(&reply(put_id, None)).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(wait(), putting)
+            .await
+            .unwrap()
+            .unwrap(),
+        MachineSecretAnswer::Stored
+    );
+
+    // The superseded forget never follows: the next secret frame is a list.
+    let listing = {
+        let node = node.clone();
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            node.machine_secret(&agent, MachineSecretOp::List, wait())
+                .await
+        })
+    };
+    let list_id = link
+        .expect(|frame| match frame {
+            LinkFrame::SecretForget(forget) => panic!("a superseded forget was sent: {forget:?}"),
+            LinkFrame::SecretList(list) => Some(list.request_id),
+            _ => None,
+        })
+        .await;
+    link.link
+        .send(&reply(list_id, Some(vec!["API_KEY".into()])))
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(wait(), listing)
+            .await
+            .unwrap()
+            .unwrap(),
+        MachineSecretAnswer::Names(vec!["API_KEY".into()])
+    );
+    node.shutdown();
+}

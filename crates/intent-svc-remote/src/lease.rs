@@ -17,6 +17,14 @@ use intent_store::Store;
 
 use crate::machine::MachineTarget;
 
+/// This backend process's `hello.headSession` (nodeProtocol 14): picked
+/// once per start, so a machine drops the agent secrets it held for the
+/// previous process.
+pub(crate) fn head_session() -> &'static str {
+    static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SESSION.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
 /// The hello of a probe: binds `owner`'s binding at `generation` with no
 /// journal acked yet (a new credential's journal is empty).
 pub(crate) fn probe_hello(owner: &LeaseOwner, generation: NodeCounter) -> LinkHello {
@@ -31,6 +39,7 @@ pub(crate) fn probe_hello(owner: &LeaseOwner, generation: NodeCounter) -> LinkHe
         },
         acked_seq: NodeCounter(0),
         lease_agents: Vec::new(),
+        head_session: Some(head_session().to_owned()),
     }
 }
 
@@ -217,6 +226,7 @@ impl HeadLease {
             },
             acked_seq: acked,
             lease_agents,
+            head_session: Some(head_session().to_owned()),
         })
     }
 

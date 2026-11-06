@@ -71,16 +71,24 @@ fn is_false(value: &bool) -> bool {
 /// the prepared checkout ([`PREPARED_CHECKOUT_PROTOCOL`]); 11 adds the
 /// user MCP server proxies ([`MCP_PROXY_PROTOCOL`]); 12 adds the machine's
 /// skills ([`SKILLS_PROTOCOL`]); 13 adds sub-agent checkouts
-/// ([`SHARED_CHECKOUT_PROTOCOL`]); each keeps everything the one before
+/// ([`SHARED_CHECKOUT_PROTOCOL`]); 14 adds agent secrets held on the
+/// machine ([`SECRETS_PROTOCOL`]); each keeps everything the one before
 /// has. Neither 6 nor the single-node 5 ever
 /// shipped, and a protocol-6 peer cannot confirm a stop, so this build
-/// speaks 7 to 13: a backend never takes a stop as confirmed by a machine
+/// speaks 7 to 14: a backend never takes a stop as confirmed by a machine
 /// that cannot acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 13 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 14 };
+
+/// The first protocol with agent secrets held on the machine:
+/// [`LinkHello::head_session`] and the [`LinkFrame::SecretPut`] /
+/// [`LinkFrame::SecretForget`] / [`LinkFrame::SecretList`] /
+/// [`LinkFrame::SecretReply`] frames. Neither side sends them on a link that
+/// negotiated less, and a remote agent there has no `ws.secret`.
+pub const SECRETS_PROTOCOL: u32 = 14;
 
 /// The first protocol with the user MCP server proxies:
 /// [`LaunchCommand::mcp_proxies`] and the internal `mcp.proxy.*` frames.
@@ -158,11 +166,12 @@ impl std::fmt::Display for ProtocolRange {
 /// to the machine on `/node/link`, by their wire `type` tag: binding,
 /// liveness, agent control, journal acks, the capabilities request,
 /// responses to the machine's forwarded `workspace.call` requests, and
-/// starting and stopping script runs (protocol 8), and the skills query
-/// (protocol 12). Nothing else is admitted
+/// starting and stopping script runs (protocol 8), the skills query
+/// (protocol 12), the push request (protocol 13) and the agent secret
+/// frames (protocol 14). Nothing else is admitted
 /// from an executor credential; the machine-to-backend frames (`welcome`,
 /// `journal`, `replayComplete`, `request`, `capabilitiesReply`, `stopAck`,
-/// `scriptStarted`, `scriptOutput`, `scriptExited`, `skillsReply`) and
+/// `scriptStarted`, `scriptOutput`, `scriptExited`, `skillsReply`, `secretReply`) and
 /// `cancelRequest` are
 /// refused. Git sessions use the
 /// separate `/node/git` connection, admitted per binding. Sorted;
@@ -180,6 +189,9 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "response",
     "scriptStart",
     "scriptStop",
+    "secretForget",
+    "secretList",
+    "secretPut",
     "skills",
     "stop",
 ];
@@ -264,6 +276,11 @@ pub struct LinkHello {
     /// this backend's agents that is neither listed nor running.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lease_agents: Vec<AgentId>,
+    /// nodeProtocol 14: picked once per backend process start. The machine
+    /// drops every agent secret it holds for this credential when a hello
+    /// brings a different (or no) session: a backend restart ends them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_session: Option<String>,
 }
 
 /// The node's reply to an accepted [`LinkHello`]: the negotiated protocol
@@ -463,6 +480,123 @@ pub struct PushWipResult {
     pub request_id: LinkId,
     pub agent_id: AgentId,
     pub outcome: FinalPush,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A secret value on the link (nodeProtocol 14): wiped from memory when
+/// dropped, never rendered by `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretValue(zeroize::Zeroizing<String>);
+
+impl Serialize for SecretValue {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretValue {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|value| Self(zeroize::Zeroizing::new(value)))
+    }
+}
+
+impl SecretValue {
+    /// The value.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// The value, moved into a wiping buffer.
+    #[must_use]
+    pub fn into_inner(self) -> zeroize::Zeroizing<String> {
+        self.0
+    }
+}
+
+impl From<&str> for SecretValue {
+    fn from(value: &str) -> Self {
+        Self(zeroize::Zeroizing::new(value.to_owned()))
+    }
+}
+
+impl From<zeroize::Zeroizing<String>> for SecretValue {
+    fn from(value: zeroize::Zeroizing<String>) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"***\"")
+    }
+}
+
+/// Backend to machine (nodeProtocol 14): hold `value` as `agent_id`'s
+/// secret `name`, replacing a held one. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretPut {
+    pub request_id: LinkId,
+    pub agent_id: AgentId,
+    pub name: String,
+    pub value: SecretValue,
+}
+
+/// Backend to machine (nodeProtocol 14): drop `agent_id`'s secret `name`,
+/// or all of its secrets without one. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretForget {
+    pub request_id: LinkId,
+    pub agent_id: AgentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Backend to machine (nodeProtocol 14): the names `agent_id` holds. The
+/// body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretList {
+    pub request_id: LinkId,
+    pub agent_id: AgentId,
+}
+
+/// How a secret frame ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SecretOutcome {
+    Ok,
+    Failed,
+}
+
+/// `secretReply.error` for an agent that is not on the binding's lease.
+pub const SECRET_AGENT_NOT_ON_LEASE: &str = "agent-not-on-lease";
+/// `secretReply.error` for an invalid name or value.
+pub const SECRET_INVALID_PARAMS: &str = "invalid-params";
+
+/// Machine to backend (nodeProtocol 14): the one answer to a secret frame.
+/// Never carries a value. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretReply {
+    pub request_id: LinkId,
+    pub agent_id: AgentId,
+    pub outcome: SecretOutcome,
+    /// `secretList`: the held names, sorted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub names: Option<Vec<String>>,
+    /// `secretForget`: whether anything was dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forgotten: Option<bool>,
+    /// With [`SecretOutcome::Failed`]: a fixed code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -811,6 +945,14 @@ pub enum LinkFrame {
     PushWip(PushWipRequest),
     /// Machine to backend (nodeProtocol 13): the answer to a `pushWip`.
     PushWipReply(PushWipResult),
+    /// Backend to machine (nodeProtocol 14): hold an agent's secret.
+    SecretPut(SecretPut),
+    /// Backend to machine (nodeProtocol 14): drop an agent's secrets.
+    SecretForget(SecretForget),
+    /// Backend to machine (nodeProtocol 14): list an agent's secret names.
+    SecretList(SecretList),
+    /// Machine to backend (nodeProtocol 14): the answer to a secret frame.
+    SecretReply(SecretReply),
 }
 
 /// A chunk of an agent's checkout progress and setup output, `seq`
@@ -856,7 +998,11 @@ impl LinkFrame {
             | Self::Skills(_)
             | Self::SkillsReply(_)
             | Self::PushWip(_)
-            | Self::PushWipReply(_) => LinkChannel::Control,
+            | Self::PushWipReply(_)
+            | Self::SecretPut(_)
+            | Self::SecretForget(_)
+            | Self::SecretList(_)
+            | Self::SecretReply(_) => LinkChannel::Control,
             Self::Journal(_) | Self::Ack { .. } | Self::ReplayComplete { .. } => {
                 LinkChannel::Journal
             }
@@ -878,6 +1024,10 @@ impl LinkFrame {
         match self {
             Self::Launch(command) if command.checkout_of.is_some() => SHARED_CHECKOUT_PROTOCOL,
             Self::PushWip(_) | Self::PushWipReply(_) => SHARED_CHECKOUT_PROTOCOL,
+            Self::SecretPut(_)
+            | Self::SecretForget(_)
+            | Self::SecretList(_)
+            | Self::SecretReply(_) => SECRETS_PROTOCOL,
             Self::Launch(command) if !command.mcp_proxies.is_empty() => MCP_PROXY_PROTOCOL,
             Self::Launch(command) if command.checkout.is_some() => PREPARED_CHECKOUT_PROTOCOL,
             Self::SetupOutput(_) => PREPARED_CHECKOUT_PROTOCOL,
@@ -916,7 +1066,10 @@ impl LinkFrame {
             | Self::ScriptStart(_)
             | Self::ScriptStop(_)
             | Self::Skills(_)
-            | Self::PushWip(_) => true,
+            | Self::PushWip(_)
+            | Self::SecretPut(_)
+            | Self::SecretForget(_)
+            | Self::SecretList(_) => true,
             Self::Welcome(_)
             | Self::Journal(_)
             | Self::ReplayComplete { .. }
@@ -929,7 +1082,8 @@ impl LinkFrame {
             | Self::ScriptExited(_)
             | Self::SetupOutput(_)
             | Self::SkillsReply(_)
-            | Self::PushWipReply(_) => false,
+            | Self::PushWipReply(_)
+            | Self::SecretReply(_) => false,
         }
     }
 
@@ -953,9 +1107,24 @@ impl LinkFrame {
     /// [`Error::InvalidParams`] for an oversized or malformed frame.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         check_frame_size(bytes.len())?;
-        serde_json::from_slice(bytes)
-            .map_err(|e| Error::InvalidParams(format!("node-link-frame-invalid: {e}")))
+        serde_json::from_slice(bytes).map_err(|e| {
+            // A malformed secret frame may carry a value anywhere: its
+            // error names only the frame type.
+            if carries_secret(bytes) {
+                Error::InvalidParams("node-link-frame-invalid: malformed secret frame".into())
+            } else {
+                Error::InvalidParams(format!("node-link-frame-invalid: {e}"))
+            }
+        })
     }
+}
+
+/// Whether undecodable `bytes` may be a secret frame (any mention of one
+/// counts, so a value is never echoed by mistake).
+fn carries_secret(bytes: &[u8]) -> bool {
+    bytes
+        .windows(b"secret".len())
+        .any(|w| w.eq_ignore_ascii_case(b"secret"))
 }
 
 fn check_frame_size(len: usize) -> Result<()> {

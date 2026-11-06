@@ -330,3 +330,119 @@ async fn a_current_stop_yields_an_acknowledgement_for_its_own_id() {
         })
     );
 }
+
+fn put(request: u128, agent: &str, name: &str) -> LinkFrame {
+    LinkFrame::SecretPut(intent_core::node_link::SecretPut {
+        request_id: intent_core::node_link::LinkId::from_u128(request),
+        agent_id: AgentId::from(agent),
+        name: name.into(),
+        value: intent_core::node_link::SecretValue::from("canary-session-secret"),
+    })
+}
+
+fn reply(frame: Option<LinkFrame>) -> intent_core::node_link::SecretReply {
+    match frame {
+        Some(LinkFrame::SecretReply(reply)) => reply,
+        other => panic!("expected a secretReply, got {other:?}"),
+    }
+}
+
+/// nodeProtocol 14 (node-link.md § Secrets on the machine): secret frames
+/// hold, list and drop a value only for an agent on the binding's lease; a
+/// replaced session changes nothing; a backend restart (a new
+/// `headSession`) drops every value, and a final stop the agent's own.
+#[tokio::test]
+async fn secret_frames_hold_values_for_leased_agents_until_the_backend_restarts() {
+    use intent_core::node_link::{SecretForget, SecretList, SecretOutcome};
+    let h = harness();
+    let b = binding(1, "lease-1");
+    let a1 = AgentId::from("a1");
+    let held = |agent: &AgentId| h.runner.head_link().secrets().names(agent);
+    h.runner.adopt_head(Some("hs-1"), std::slice::from_ref(&a1));
+
+    let stored = reply(apply_secret(&h.runner, &b, OPEN, put(1, "a1", "API_KEY")).await);
+    assert_eq!(stored.outcome, SecretOutcome::Ok, "{stored:?}");
+    assert_eq!(held(&a1), ["API_KEY"]);
+
+    let stranger = reply(apply_secret(&h.runner, &b, OPEN, put(2, "a-stranger", "API_KEY")).await);
+    assert_eq!(stranger.outcome, SecretOutcome::Failed);
+    assert_eq!(stranger.error.as_deref(), Some("agent-not-on-lease"));
+    assert!(held(&AgentId::from("a-stranger")).is_empty());
+
+    let invalid = reply(apply_secret(&h.runner, &b, OPEN, put(3, "a1", "lower")).await);
+    assert_eq!(invalid.error.as_deref(), Some("invalid-params"));
+    assert!(!format!("{invalid:?}").contains("canary-session-secret"));
+
+    let listed = reply(
+        apply_secret(
+            &h.runner,
+            &b,
+            OPEN,
+            LinkFrame::SecretList(SecretList {
+                request_id: intent_core::node_link::LinkId::from_u128(4),
+                agent_id: a1.clone(),
+            }),
+        )
+        .await,
+    );
+    assert_eq!(listed.names, Some(vec!["API_KEY".to_owned()]));
+
+    assert!(
+        apply_secret(&h.runner, &b, || true, put(5, "a1", "OTHER"))
+            .await
+            .is_none(),
+        "a closed session answers and holds nothing"
+    );
+    assert_eq!(held(&a1), ["API_KEY"]);
+
+    h.runner.adopt_head(Some("hs-1"), std::slice::from_ref(&a1));
+    assert_eq!(
+        held(&a1),
+        ["API_KEY"],
+        "a reconnect of the same backend keeps them"
+    );
+    h.runner.adopt_head(Some("hs-2"), std::slice::from_ref(&a1));
+    assert!(held(&a1).is_empty(), "a restarted backend drops them");
+
+    reply(apply_secret(&h.runner, &b, OPEN, put(6, "a1", "API_KEY")).await);
+    let forget = |request: u128| {
+        LinkFrame::SecretForget(SecretForget {
+            request_id: intent_core::node_link::LinkId::from_u128(request),
+            agent_id: a1.clone(),
+            name: Some("API_KEY".into()),
+        })
+    };
+    assert_eq!(
+        reply(apply_secret(&h.runner, &b, OPEN, forget(7)).await).forgotten,
+        Some(true)
+    );
+    assert_eq!(
+        reply(apply_secret(&h.runner, &b, OPEN, forget(8)).await).forgotten,
+        Some(false)
+    );
+
+    reply(apply_secret(&h.runner, &b, OPEN, put(9, "a1", "API_KEY")).await);
+    h.runner.final_stop(&a1).await;
+    assert!(
+        held(&a1).is_empty(),
+        "a final stop drops the agent's secrets"
+    );
+    let late = reply(apply_secret(&h.runner, &b, OPEN, put(10, "a1", "API_KEY")).await);
+    assert_eq!(
+        late.error.as_deref(),
+        Some("agent-not-on-lease"),
+        "a put still on its way after the final stop is refused"
+    );
+    assert!(held(&a1).is_empty());
+
+    // A restored agent keeps its id: its launch lets it hold secrets again.
+    h.runner
+        .launch(match launch("a1") {
+            LinkFrame::Launch(command) => command,
+            _ => unreachable!(),
+        })
+        .await;
+    h.runner.adopt_head(Some("hs-2"), std::slice::from_ref(&a1));
+    let again = reply(apply_secret(&h.runner, &b, OPEN, put(11, "a1", "API_KEY")).await);
+    assert_eq!(again.outcome, SecretOutcome::Ok, "{again:?}");
+}

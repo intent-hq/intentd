@@ -226,7 +226,7 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
         HeadLink::default(),
     )
     .unwrap();
-    for code in [r#"return await host({ method: "secret.list", args: {} });"#] {
+    for code in [r#"return await host({ method: "secret.provide", args: {} });"#] {
         let (failed, text) = call(&server, code).await;
         assert!(failed, "{code}: {text}");
         assert!(
@@ -1062,4 +1062,88 @@ async fn proxied_user_mcp_servers_ride_session_new_and_call_head() {
         u128::from(frame.timeout_ms),
         MCP_PROXY_LINK_TIMEOUT.as_millis()
     );
+}
+
+/// [`gates`] with secret requests on (they default to off).
+fn secret_gates() -> Gates {
+    let features = AgentFeaturesSettings {
+        secret_requests: true,
+        host_exec: true,
+        ..AgentFeaturesSettings::default()
+    };
+    Gates {
+        agent_features: serde_json::to_value(features).unwrap(),
+        ..gates()
+    }
+}
+
+const SECRET_EXEC: &str = r#"return JSON.stringify(await ws.host.exec({ command: "sh", args: ["-c", "printf 'k=%s' \"$API_KEY\""], secretEnv: ["API_KEY"] }));"#;
+
+/// nodeProtocol 14: a remote agent's `secretEnv` resolves from the secrets
+/// it holds on this machine, with the value redacted from the output, and
+/// another agent on the same machine never reaches them.
+#[tokio::test]
+async fn secret_env_uses_only_the_agents_own_secrets_on_the_machine() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node_end, _head_end, _served) = bound_link(dir.path()).await;
+    let head = HeadLink::default();
+    head.set(node_end);
+    head.secrets().put(
+        &agent(),
+        "API_KEY".into(),
+        zeroize::Zeroizing::new("canary-machine-secret".into()),
+    );
+    let owner = server(
+        &agent(),
+        &workspace(),
+        dir.path(),
+        &secret_gates(),
+        head.clone(),
+    )
+    .unwrap();
+    let ran = ok_json(call(&owner, SECRET_EXEC).await);
+    assert_eq!(ran["exitCode"], json!(0), "{ran}");
+    assert_eq!(ran["stdout"], "k=[secret:API_KEY]", "{ran}");
+
+    let other = AgentId::from("agent-other");
+    let other_server = server(
+        &other,
+        &workspace(),
+        dir.path(),
+        &secret_gates(),
+        head.clone(),
+    )
+    .unwrap();
+    let refused = call(&other_server, SECRET_EXEC).await;
+    assert!(refused.0, "{refused:?}");
+    assert!(refused.1.contains("secret-unavailable"), "{refused:?}");
+    assert!(!refused.1.contains("canary-machine-secret"), "{refused:?}");
+    assert_eq!(head.secrets().names(&other), Vec::<String>::new());
+}
+
+/// On a link below nodeProtocol 14 a remote agent has no `secretEnv`: the
+/// call fails before anything runs, even if a value were held.
+#[tokio::test]
+async fn secret_env_is_refused_on_an_older_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node_end, _head_end, _served) = crate::executor::test_link::bound_link_offering(
+        dir.path(),
+        intent_core::node_link::ProtocolRange { min: 7, max: 13 },
+    )
+    .await;
+    let head = HeadLink::default();
+    head.set(node_end);
+    head.secrets().put(
+        &agent(),
+        "API_KEY".into(),
+        zeroize::Zeroizing::new("canary-machine-secret".into()),
+    );
+    let server = server(&agent(), &workspace(), dir.path(), &secret_gates(), head).unwrap();
+    let refused = call(&server, SECRET_EXEC).await;
+    assert!(refused.0, "{refused:?}");
+    assert!(
+        refused.1.contains("secretEnv is unavailable"),
+        "{refused:?}"
+    );
+    assert!(!refused.1.contains("canary-machine-secret"), "{refused:?}");
 }

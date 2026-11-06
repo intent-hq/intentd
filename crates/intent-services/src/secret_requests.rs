@@ -23,6 +23,7 @@ use intent_core::{AgentId, Error, MessageOrigin, Result, WorkspaceApi, Workspace
 use serde_json::{json, Map, Value};
 use zeroize::Zeroizing;
 
+use crate::feature_ports::{MachineSecretAnswer, MachineSecretOp};
 use crate::Services;
 
 /// Most pending (unanswered) requests one agent may hold.
@@ -47,12 +48,20 @@ pub(crate) const SECRET_DECLINED_METADATA_TYPE: &str = "secret_declined";
 pub(crate) const CODE_REQUEST_UNKNOWN: &str = "secret-request-unknown";
 /// `error.data.code` for malformed input.
 pub(crate) const CODE_INVALID_PARAMS: &str = "invalid-params";
+/// `error.data.code` when a remote agent's machine did not take the value.
+pub(crate) const CODE_DELIVERY_FAILED: &str = "secret-delivery-failed";
+/// `secretsUnavailable` when a remote agent's machine cannot be asked.
+const MACHINE_OFFLINE: &str = "machine-offline";
 /// Prefix and code of the agent-facing missing-secret error.
 pub(crate) const CODE_UNAVAILABLE: &str = "secret-unavailable";
 
 /// Validate a secret name: 1–64 characters of `A`–`Z`, `0`–`9` and `_`,
 /// starting with a letter. Never trimmed or case-folded.
-pub(crate) fn validate_secret_name(name: &str) -> std::result::Result<(), String> {
+///
+/// # Errors
+///
+/// The agent-facing message for an invalid name.
+pub fn validate_secret_name(name: &str) -> std::result::Result<(), String> {
     let mut chars = name.chars();
     let valid = name.len() <= MAX_NAME_LEN
         && chars.next().is_some_and(|c| c.is_ascii_uppercase())
@@ -195,6 +204,12 @@ impl Listing {
                 .collect::<Vec<_>>(),
         })
     }
+}
+
+/// A pending request taken out by [`SecretVault::claim`].
+pub(crate) struct Claim {
+    key: Key,
+    pending: Pending,
 }
 
 /// In-memory store of agent-owned secrets and pending requests.
@@ -357,6 +372,60 @@ impl SecretVault {
         })
     }
 
+    /// Take a pending request out while its value travels to the agent's
+    /// machine: no other answer can take it meanwhile. [`Self::release`]
+    /// puts it back, [`Self::settle`] records it answered.
+    pub(crate) fn claim(&self, workspace_id: &WorkspaceId, request_id: &str) -> Option<Claim> {
+        let mut state = self.lock();
+        let key = state.requests.get(request_id)?.clone();
+        if key.0 != *workspace_id {
+            return None;
+        }
+        let entry = state.agents.get_mut(&key)?;
+        let index = entry
+            .pending
+            .iter()
+            .position(|p| p.request_id == request_id)?;
+        let pending = entry.pending.remove(index);
+        state.requests.remove(request_id);
+        Some(Claim { key, pending })
+    }
+
+    /// Put a claimed request back as pending (its value did not arrive).
+    /// Returns `false`, changing nothing, when the agent's entry was
+    /// cleared meanwhile (agent deleted or retired, workspace archived or
+    /// deleted).
+    pub(crate) fn release(&self, claim: Claim) -> bool {
+        let mut state = self.lock();
+        let Some(entry) = state.agents.get_mut(&claim.key) else {
+            return false;
+        };
+        let request_id = claim.pending.request_id.clone();
+        entry.pending.push(claim.pending);
+        state.requests.insert(request_id, claim.key);
+        true
+    }
+
+    /// Record a claimed request as answered with `outcome`; no value is
+    /// kept. `None`, changing nothing, when the agent's entry was cleared
+    /// meanwhile.
+    pub(crate) fn settle(&self, claim: Claim, outcome: Outcome) -> Option<Answer> {
+        let mut state = self.lock();
+        let entry = state.agents.get_mut(&claim.key)?;
+        if entry.answered.len() >= MAX_ANSWERED_PER_AGENT {
+            entry.answered.pop_front();
+        }
+        entry.answered.push_back(Answered {
+            request_id: claim.pending.request_id,
+            name: claim.pending.name.clone(),
+            outcome,
+        });
+        Some(Answer {
+            agent_id: claim.key.1,
+            name: claim.pending.name,
+        })
+    }
+
     /// Names-only listing of one agent's entry.
     pub(crate) fn list(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) -> Listing {
         let state = self.lock();
@@ -497,6 +566,181 @@ pub(crate) fn redact(text: &str, secrets: &[(String, Zeroizing<String>)]) -> Str
     out
 }
 
+/// `ws.host.exec` with an optional `secretEnv`, on `api`'s host: resolve the
+/// named secrets with `resolve` (the first missing name fails with
+/// `missing`, before anything is spawned), overlay them last on `env`, run,
+/// and redact the resolved values from `stdout` / `stderr`. Without
+/// `secretEnv` (or with `secretEnv: null`) this is the plain `host.exec`.
+/// The backend resolves from its vault; a machine (nodeProtocol 14) from the
+/// agent's [`HeldSecrets`]. Wiping is best-effort: the transient copies
+/// handed to the child's environment are ordinary strings, freed when the
+/// call returns.
+///
+/// # Errors
+///
+/// As `host.exec`; `secret-unavailable` (from `missing`) for a missing
+/// secret; invalid params for a malformed `secretEnv` or `env`.
+pub async fn exec_with_secrets<A: WorkspaceApi + ?Sized>(
+    api: &A,
+    workspace_id: WorkspaceId,
+    params: Value,
+    resolve: impl FnOnce(&[&str]) -> std::result::Result<Vec<(String, Zeroizing<String>)>, String>,
+    missing: fn(&str) -> Error,
+) -> Result<Value> {
+    let mut map = match params {
+        Value::Object(map) => map,
+        Value::Null => Map::new(),
+        _ => {
+            return Err(Error::InvalidParams(
+                "host.exec args must be an object".to_string(),
+            ))
+        }
+    };
+    let spec = match map.remove("secretEnv") {
+        None | Some(Value::Null) => return api.host_exec(workspace_id, Value::Object(map)).await,
+        Some(spec) => spec,
+    };
+    let pairs = parse_secret_env(&spec)?;
+    let names: Vec<&str> = pairs.iter().map(|(_, name)| name.as_str()).collect();
+    let resolved = resolve(&names).map_err(|name| missing(&name))?;
+    let mut env = match map.remove("env") {
+        None | Some(Value::Null) => Map::new(),
+        Some(Value::Object(env)) => env,
+        Some(_) => {
+            return Err(Error::InvalidParams(
+                "Invalid parameter: env must be an object of string values".to_string(),
+            ))
+        }
+    };
+    let by_name: HashMap<&str, &Zeroizing<String>> = resolved
+        .iter()
+        .map(|(name, value)| (name.as_str(), value))
+        .collect();
+    for (variable, name) in &pairs {
+        env.insert(
+            variable.clone(),
+            Value::String(by_name[name.as_str()].as_str().to_string()),
+        );
+    }
+    map.insert("env".to_string(), Value::Object(env));
+    let mut result = api.host_exec(workspace_id, Value::Object(map)).await?;
+    for stream in ["stdout", "stderr"] {
+        if let Some(text) = result.get(stream).and_then(Value::as_str) {
+            let redacted = redact(text, &resolved);
+            result[stream] = Value::String(redacted);
+        }
+    }
+    Ok(result)
+}
+
+/// The secrets a machine holds for one backend's agents (nodeProtocol 14,
+/// monorepo `docs/protocol/node-link.md` § Secrets on the machine): memory
+/// only, per agent, wiped when dropped. Each agent resolves only its own.
+#[derive(Default)]
+pub struct HeldSecrets {
+    agents: Mutex<HashMap<AgentId, BTreeMap<String, Zeroizing<String>>>>,
+}
+
+impl std::fmt::Debug for HeldSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldSecrets").finish_non_exhaustive()
+    }
+}
+
+impl HeldSecrets {
+    fn lock(&self) -> MutexGuard<'_, HashMap<AgentId, BTreeMap<String, Zeroizing<String>>>> {
+        self.agents.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Check `name` and `value` as `secret.provide` does.
+    ///
+    /// # Errors
+    ///
+    /// A fixed message (never containing the value) when either is invalid.
+    pub fn validate(name: &str, value: &str) -> std::result::Result<(), String> {
+        validate_secret_name(name)?;
+        if value.is_empty() || value.len() > MAX_VALUE_BYTES {
+            return Err(format!(
+                "value must be a non-empty string of at most {MAX_VALUE_BYTES} bytes"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Hold `value` as `agent_id`'s secret `name`, replacing a held one.
+    pub fn put(&self, agent_id: &AgentId, name: String, value: Zeroizing<String>) {
+        self.lock()
+            .entry(agent_id.clone())
+            .or_default()
+            .insert(name, value);
+    }
+
+    /// Drop `agent_id`'s secret `name`, or all of them; whether anything
+    /// was dropped.
+    pub fn forget(&self, agent_id: &AgentId, name: Option<&str>) -> bool {
+        let mut agents = self.lock();
+        let Some(held) = agents.get_mut(agent_id) else {
+            return false;
+        };
+        let forgotten = match name {
+            Some(name) => held.remove(name).is_some(),
+            None => !std::mem::take(held).is_empty(),
+        };
+        if held.is_empty() {
+            agents.remove(agent_id);
+        }
+        forgotten
+    }
+
+    /// `agent_id`'s held names, sorted.
+    #[must_use]
+    pub fn names(&self, agent_id: &AgentId) -> Vec<String> {
+        self.lock()
+            .get(agent_id)
+            .map(|held| held.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every named secret of `agent_id`, or the first missing name.
+    ///
+    /// # Errors
+    ///
+    /// The first name `agent_id` does not hold.
+    pub fn resolve(
+        &self,
+        agent_id: &AgentId,
+        names: &[&str],
+    ) -> std::result::Result<Vec<(String, Zeroizing<String>)>, String> {
+        let agents = self.lock();
+        let held = agents.get(agent_id);
+        names
+            .iter()
+            .map(|name| {
+                held.and_then(|held| held.get(*name))
+                    .map(|value| ((*name).to_string(), value.clone()))
+                    .ok_or_else(|| (*name).to_string())
+            })
+            .collect()
+    }
+
+    /// Drop every agent's secrets.
+    pub fn clear(&self) {
+        self.lock().clear();
+    }
+}
+
+/// The agent-facing error for a secret a remote agent does not hold on its
+/// machine; the same whatever the reason.
+#[must_use]
+pub fn remote_unavailable(name: &str) -> Error {
+    Error::SecretRequest {
+        code: CODE_UNAVAILABLE,
+        message: format!(
+            "{CODE_UNAVAILABLE}: secret {name} is not available to this agent. Secrets are held in memory on this agent's machine and are lost when Intent restarts there or on the backend. Call ws.secret.request({{ name: \"{name}\", reason }}) and end your turn."
+        ),
+    }
+}
+
 /// Parse a `secretEnv` option: an array of names (each variable is named
 /// like its secret) or an object mapping a variable name to a secret name.
 /// Returns `(variable, secret name)` pairs.
@@ -632,7 +876,68 @@ impl Services {
         agent_id: AgentId,
     ) -> Result<Value> {
         self.secret_agent_session(&workspace_id, &agent_id).await?;
-        Ok(self.secret_vault.list(&workspace_id, &agent_id).to_json())
+        let mut listing = self.secret_vault.list(&workspace_id, &agent_id).to_json();
+        if self.is_remote_agent(&agent_id).await {
+            // A remote agent's values are on its machine (§5.56 remote agents).
+            let answer = self
+                .ports
+                .remote_launch()
+                .machine_secret(self, &agent_id, MachineSecretOp::List)
+                .await;
+            listing["secrets"] = if let MachineSecretAnswer::Names(names) = answer {
+                json!(names
+                    .iter()
+                    .map(|name| json!({ "name": name }))
+                    .collect::<Vec<_>>())
+            } else {
+                listing["secretsUnavailable"] = json!(MACHINE_OFFLINE);
+                json!([])
+            };
+        }
+        Ok(listing)
+    }
+
+    /// Whether `agent_id` runs on a remote machine (its session carries a
+    /// placement).
+    async fn is_remote_agent(&self, agent_id: &AgentId) -> bool {
+        self.store
+            .get_agent_session_summary(agent_id)
+            .await
+            .is_ok_and(|session| {
+                intent_core::remote_launch::RemotePlacementView::from_metadata(
+                    session.metadata.as_ref(),
+                )
+                .is_some()
+            })
+    }
+
+    /// Drop every secret the remote agents of `workspace_id` hold on their
+    /// machines (archive): a forget for each, in the background, queued
+    /// while a machine is away.
+    pub(crate) fn forget_remote_secrets_in(&self, workspace_id: &WorkspaceId) {
+        let svc = self.clone();
+        let workspace_id = workspace_id.clone();
+        intent_core::spawn_daemon(
+            async move { svc.forget_remote_secrets_now(&workspace_id).await },
+        );
+    }
+
+    async fn forget_remote_secrets_now(&self, workspace_id: &WorkspaceId) {
+        let sessions = match self.store.list_agent_session_summaries(workspace_id).await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(%error, "secret requests: could not list the workspace's agents");
+                return;
+            }
+        };
+        for session in sessions {
+            if self.is_remote_agent(&session.id).await {
+                self.ports
+                    .remote_launch()
+                    .machine_secret(self, &session.id, MachineSecretOp::Forget { name: None })
+                    .await;
+            }
+        }
     }
 
     /// `secret.forget` / `ws.secret.forget`.
@@ -644,6 +949,26 @@ impl Services {
     ) -> Result<Value> {
         validate_secret_name(&name).map_err(invalid)?;
         self.secret_agent_session(&workspace_id, &agent_id).await?;
+        if self.is_remote_agent(&agent_id).await {
+            let answer = self
+                .ports
+                .remote_launch()
+                .machine_secret(
+                    self,
+                    &agent_id,
+                    MachineSecretOp::Forget { name: Some(name) },
+                )
+                .await;
+            return Ok(match answer {
+                MachineSecretAnswer::Queued => {
+                    json!({ "ok": true, "forgotten": false, "deferred": true })
+                }
+                MachineSecretAnswer::Forgotten(forgotten) => {
+                    json!({ "ok": true, "forgotten": forgotten })
+                }
+                _ => json!({ "ok": true, "forgotten": false }),
+            });
+        }
         let forgotten = self.secret_vault.forget(&workspace_id, &agent_id, &name);
         Ok(json!({ "ok": true, "forgotten": forgotten }))
     }
@@ -684,10 +1009,16 @@ impl Services {
             self.secret_vault.clear_agent(&owner.agent_id);
             return Err(unknown_request(&request_id));
         }
-        let answer = self
-            .secret_vault
-            .answer(&workspace_id, &request_id, outcome, value)
-            .ok_or_else(|| unknown_request(&request_id))?;
+        let answer = match (outcome, value) {
+            (Outcome::Provided, Some(value)) if self.is_remote_agent(&owner.agent_id).await => {
+                self.deliver_to_machine(&workspace_id, &request_id, &owner.agent_id, value)
+                    .await?
+            }
+            (outcome, value) => self
+                .secret_vault
+                .answer(&workspace_id, &request_id, outcome, value)
+                .ok_or_else(|| unknown_request(&request_id))?,
+        };
         let (content, metadata_type) = match outcome {
             Outcome::Provided => (provided_notice(&answer.name), SECRET_PROVIDED_METADATA_TYPE),
             Outcome::Declined => (declined_notice(&answer.name), SECRET_DECLINED_METADATA_TYPE),
@@ -727,6 +1058,73 @@ impl Services {
         // already started its turn, so clients never see a transient `idle`.
         self.maybe_emit_display_status_changed(&workspace_id).await;
         Ok(json!({ "ok": true, "requestId": request_id, "name": answer.name }))
+    }
+
+    /// `secret.provide` for a remote agent (§5.56 remote agents): the value
+    /// goes only to the agent's machine, and the request is answered only
+    /// once the machine holds it. Otherwise the request stays pending and
+    /// the call fails `secret-delivery-failed`; this side keeps no copy.
+    async fn deliver_to_machine(
+        &self,
+        workspace_id: &WorkspaceId,
+        request_id: &str,
+        agent_id: &AgentId,
+        value: Zeroizing<String>,
+    ) -> Result<Answer> {
+        let claim = self
+            .secret_vault
+            .claim(workspace_id, request_id)
+            .ok_or_else(|| unknown_request(request_id))?;
+        let name = claim.pending.name.clone();
+        let answer = self
+            .ports
+            .remote_launch()
+            .machine_secret(
+                self,
+                agent_id,
+                MachineSecretOp::Put {
+                    name: name.clone(),
+                    value,
+                },
+            )
+            .await;
+        if answer == MachineSecretAnswer::Stored {
+            if let Some(answer) = self.secret_vault.settle(claim, Outcome::Provided) {
+                return Ok(answer);
+            }
+        } else {
+            tracing::info!(agent = %agent_id, request = %request_id, ?answer, "secret request: the value did not reach the agent's machine");
+            if self.secret_vault.release(claim) {
+                self.forget_on_machine(agent_id, name);
+                return Err(Error::SecretRequest {
+                    code: CODE_DELIVERY_FAILED,
+                    message: "secret-delivery-failed: couldn't deliver the secret to this agent's machine: it is offline or needs an update. Try again when it is online.".into(),
+                });
+            }
+        }
+        // The agent or its workspace ended while the value travelled: the
+        // request is gone, and the machine must not keep the value.
+        self.forget_on_machine(agent_id, name);
+        Err(unknown_request(request_id))
+    }
+
+    /// Ask `agent_id`'s machine to forget `name`, in the background (an
+    /// offline machine must not hold the caller): a value the machine
+    /// stored without confirming it, or for a request that ended, is not
+    /// kept.
+    fn forget_on_machine(&self, agent_id: &AgentId, name: String) {
+        let svc = self.clone();
+        let agent_id = agent_id.clone();
+        intent_core::spawn_daemon(async move {
+            svc.ports
+                .remote_launch()
+                .machine_secret(
+                    &svc,
+                    &agent_id,
+                    MachineSecretOp::Forget { name: Some(name) },
+                )
+                .await;
+        });
     }
 
     /// Turn-end hook: the persisted assistant message carries these
@@ -800,57 +1198,21 @@ impl Services {
         agent_id: AgentId,
         params: Value,
     ) -> Result<Value> {
-        let mut map = match params {
-            Value::Object(map) => map,
-            Value::Null => Map::new(),
-            _ => {
-                return Err(Error::InvalidParams(
-                    "host.exec args must be an object".to_string(),
-                ))
-            }
-        };
-        let spec = match map.remove("secretEnv") {
-            None | Some(Value::Null) => {
-                return WorkspaceApi::host_exec(self, workspace_id, Value::Object(map)).await
-            }
-            Some(spec) => spec,
-        };
-        let pairs = parse_secret_env(&spec)?;
-        let names: Vec<&str> = pairs.iter().map(|(_, name)| name.as_str()).collect();
-        let resolved = self
-            .secret_vault
-            .resolve(&workspace_id, &agent_id, &names)
-            .map_err(|missing| unavailable(&missing))?;
-        let mut env = match map.remove("env") {
-            None | Some(Value::Null) => Map::new(),
-            Some(Value::Object(env)) => env,
-            Some(_) => {
-                return Err(Error::InvalidParams(
-                    "Invalid parameter: env must be an object of string values".to_string(),
-                ))
-            }
-        };
-        let by_name: HashMap<&str, &Zeroizing<String>> = resolved
-            .iter()
-            .map(|(name, value)| (name.as_str(), value))
-            .collect();
-        for (variable, name) in &pairs {
-            env.insert(
-                variable.clone(),
-                Value::String(by_name[name.as_str()].as_str().to_string()),
-            );
-        }
-        map.insert("env".to_string(), Value::Object(env));
-        let mut result = WorkspaceApi::host_exec(self, workspace_id, Value::Object(map)).await?;
-        for stream in ["stdout", "stderr"] {
-            if let Some(text) = result.get(stream).and_then(Value::as_str) {
-                let redacted = redact(text, &resolved);
-                result[stream] = Value::String(redacted);
-            }
-        }
-        Ok(result)
+        let vault = &self.secret_vault;
+        let ws = workspace_id.clone();
+        exec_with_secrets(
+            self,
+            workspace_id,
+            params,
+            |names| vault.resolve(&ws, &agent_id, names),
+            unavailable,
+        )
+        .await
     }
 }
+
+#[cfg(test)]
+mod remote_tests;
 
 #[cfg(test)]
 mod tests {

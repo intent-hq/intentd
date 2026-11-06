@@ -267,7 +267,7 @@ mod runtime_config;
 pub mod worktree_presence;
 pub use feature_ports::CommandScriptActivity;
 mod search_ops;
-mod secret_requests;
+pub mod secret_requests;
 mod sentry_ops;
 mod settings;
 mod settings_registry;
@@ -40729,6 +40729,8 @@ impl Services {
                 // Archiving drops every memory-held secret and pending
                 // request in the workspace (§5.56); unarchive starts empty.
                 this.secret_vault.clear_workspace(&id);
+                // Its remote agents' secrets are on their machines.
+                this.forget_remote_secrets_in(&id);
                 // Cancel every active background hook in the workspace: task
                 // aborted, state persisted to `cancelled`, `hook:cancelled`
                 // emitted — silently per hook. Unarchive does NOT resurrect

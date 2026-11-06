@@ -75,7 +75,7 @@ fn skill(name: &str, scope: &str, location: &str) -> MachineSkill {
     }
 }
 
-fn view(skills: Option<Vec<MachineSkill>>) -> RemotePlacementView {
+pub(crate) fn view(skills: Option<Vec<MachineSkill>>) -> RemotePlacementView {
     RemotePlacementView {
         node_id: "node-1".into(),
         lease_id: "lease-1".into(),
@@ -93,7 +93,7 @@ fn view(skills: Option<Vec<MachineSkill>>) -> RemotePlacementView {
     }
 }
 
-fn session(ws: &intent_core::WorkspaceId, id: &AgentId) -> AgentSession {
+pub(crate) fn session(ws: &intent_core::WorkspaceId, id: &AgentId) -> AgentSession {
     let ts = now_iso();
     AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),

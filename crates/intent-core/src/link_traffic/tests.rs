@@ -918,3 +918,31 @@ async fn script_frames_are_summarized() {
     }
     assert!(!records.to_string().contains("canary-output"));
 }
+
+/// An agent secret's value (`secretPut`, nodeProtocol 14) is masked in both
+/// the full and the light capture; its agent and name stay visible.
+#[tokio::test]
+async fn secret_put_values_are_masked() {
+    use crate::node_link::{LinkId, SecretPut, SecretValue};
+    for payloads in [true, false] {
+        let (traffic, _) = traffic(limits(10, 1 << 16, 1 << 16));
+        traffic.start(payloads);
+        let frame = LinkFrame::SecretPut(SecretPut {
+            request_id: LinkId::new_v4(),
+            agent_id: AgentId::from("a1"),
+            name: "API_KEY".into(),
+            value: SecretValue::from("canary-agent-secret"),
+        });
+        LinkTap::new(traffic.clone(), machine()).observe(TrafficDirection::Out, &frame, 10);
+        settle(&traffic, 1).await;
+        let record = traffic.snapshot(None, None)["records"][0].clone();
+        let text = record.to_string();
+        assert!(!text.contains("canary-agent-secret"), "{text}");
+        assert_eq!(record["frameType"], "secretPut", "{text}");
+        assert_eq!(record["agentId"], "a1", "{text}");
+        if payloads {
+            assert_eq!(record["payload"]["name"], "API_KEY", "{text}");
+            assert_eq!(record["payload"]["value"], "***", "{text}");
+        }
+    }
+}
