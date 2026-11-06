@@ -106,6 +106,13 @@ class CoverageReportTests(unittest.TestCase):
         self.assertIn(str(self.profiles), result.stderr)
         self.assertNotIn("llvm-profdata", result.stderr)
 
+    def test_missing_profile_directory_is_a_tooling_error(self):
+        env = {**self.env, "CARGO_LLVM_COV_TARGET_DIR": str(Path(self.temp.name) / "absent")}
+        result = subprocess.run(["bash", str(SCRIPT), "--summary-only"], cwd=self.project,
+                                env=env, capture_output=True, text=True, timeout=600)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("wrote no .profraw files", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

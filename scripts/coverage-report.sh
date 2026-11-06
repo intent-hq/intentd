@@ -38,7 +38,10 @@ tooling_error() {
     exit 3
 }
 
-profiles=$(find "$profile_dir" -maxdepth 1 -name '*.profraw' -type f 2>/dev/null | wc -l)
+profiles=0
+if [ -d "$profile_dir" ]; then
+    profiles=$(find "$profile_dir" -maxdepth 1 -name '*.profraw' -type f | wc -l)
+fi
 if [ "$profiles" -eq 0 ]; then
     tooling_error "the instrumented test run wrote no .profraw files, so there is no coverage data to merge."
 fi

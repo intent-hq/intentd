@@ -2036,6 +2036,10 @@ jobs:
       - name: Verify bounded coverage profile pooling
         if: steps.select.outputs.has_selection == 'true'
         run: python3 -I -B scripts/test-coverage-profile-pool.py
+      # Same proof as coverage-e2e's step, so a PR sees it before the queue.
+      - name: Verify coverage report tolerates truncated profiles
+        if: steps.select.outputs.has_selection == 'true'
+        run: python3 -I -B scripts/test-coverage-report.py
       - name: Initialize coverage storage evidence
         if: steps.select.outputs.has_selection == 'true'
         run: |
