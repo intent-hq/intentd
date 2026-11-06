@@ -168,8 +168,19 @@ describe('workflow contract', () => {
     assert.match(readFileSync(join(ROOT, '.github/workflows/v-release.yml'), 'utf8'), /^name: Release$/m);
   });
   it('is fail-soft without the E2B_API_KEY secret', () => {
-    assert.match(workflow, /E2B_API_KEY: \$\{\{ secrets\.E2B_API_KEY \}\}/);
+    assert.match(workflow, /HAS_KEY: \$\{\{ secrets\.E2B_API_KEY != '' \}\}/);
     assert.match(workflow, /::warning::E2B_API_KEY secret is not set/);
+  });
+  it('gives the key only to the build and smoke steps', () => {
+    assert.equal(workflow.match(/E2B_API_KEY: \$\{\{ secrets\.E2B_API_KEY \}\}/g).length, 2);
+    assert.doesNotMatch(workflow.split('\n    steps:\n')[0], /secrets\.E2B_API_KEY/);
+    assert.match(workflow, /npm ci --ignore-scripts/);
+  });
+  it('skips sitter releases when it picks the newest daemon release', () => {
+    assert.match(workflow, /select\(\.tagName \| test\("\^v\[0-9\]\+/);
+  });
+  it('queues release builds instead of dropping them', () => {
+    assert.match(workflow, /cancel-in-progress: false\n\s+queue: max/);
   });
   it('builds the template it then smoke-tests', () => {
     assert.equal(TEMPLATE_NAME, 'intent-node');
