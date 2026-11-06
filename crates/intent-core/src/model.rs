@@ -5667,8 +5667,8 @@ pub struct AgentDelegateInput {
     /// rejects a second delegation unless `force: true` is passed to
     /// intentionally add another agent.
     pub force: Option<bool>,
-    /// The documented `placement` object for the delegated child; single
-    /// delegation only (a batch with a placement is rejected). `null` is
+    /// The documented `placement` object for the delegated child, or the
+    /// default of every batch task (an entry's own wins). `null` is
     /// rejected rather than read as omitted.
     #[serde(deserialize_with = "crate::placement::present")]
     pub placement: Option<crate::placement::AgentPlacement>,
@@ -5718,8 +5718,8 @@ impl BatchTaskEntry {
 }
 
 /// Object form of a batch `tasks` entry (PROTOCOL §5.5): per-task
-/// `specialist`/`model`/`provider`/`reasoningEffort` override the call's top-level
-/// defaults for that task only. `agentInstructions` is carried solely so the
+/// `specialist`/`model`/`provider`/`reasoningEffort`/`placement` override the
+/// call's top-level defaults for that task only. `agentInstructions` is carried solely so the
 /// delegate op can reject it with a clear error — it is never honored (each
 /// started task's first message resolves from its own task note).
 /// `deny_unknown_fields` so a typo'd or unsupported per-entry key (e.g.
@@ -5743,6 +5743,10 @@ pub struct BatchTaskOptions {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub agent_instructions: Option<String>,
+    /// This task's `placement`, replacing the call's whole object; `null`
+    /// is rejected rather than read as omitted.
+    #[serde(default, deserialize_with = "crate::placement::present")]
+    pub placement: Option<crate::placement::AgentPlacement>,
 }
 
 /// Optional `create.*` payload on [`AgentWakeOrCreateInput`] — the fields the

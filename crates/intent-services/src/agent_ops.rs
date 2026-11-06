@@ -12941,23 +12941,49 @@ impl Services {
                 "agent.delegate: greedy was removed; delegate a held task individually to force it past the conflict hold".to_string(),
             ));
         }
-        if input.placement.is_some() && input.tasks.is_some() {
-            return Err(Error::InvalidParams(
-                "agent.delegate: placement applies to a single delegation; delegate each task that needs one on its own".to_string(),
-            ));
-        }
-        let on_backend = match &input.placement {
-            Some(placement) => placement.runs_on_backend()?,
-            None => false,
+        // Every placement in the call is checked before anything starts.
+        // Each task then resolves like the batch start loop: the last object
+        // entry for an id wins (a bare duplicate does not reset it), its
+        // placement replaces the call's, and a task with neither follows
+        // the single-delegation rule.
+        let check = |placement: &intent_core::placement::AgentPlacement| -> Result<bool> {
+            let on_backend = placement.runs_on_backend()?;
+            if !on_backend && input.tasks.is_some() {
+                placement.check_remote_supported()?;
+            }
+            Ok(on_backend)
         };
-        if input.placement.is_some() && !on_backend && input.isolation.is_some() {
+        let mut resolved: Vec<Option<bool>> = Vec::new();
+        match &input.tasks {
+            Some(entries) => {
+                let top = input.placement.as_ref().map(&check).transpose()?;
+                let mut by_id: HashMap<&str, Option<bool>> = HashMap::new();
+                for entry in entries {
+                    match entry {
+                        intent_core::BatchTaskEntry::Options(opts) => {
+                            let own = opts.placement.as_ref().map(&check).transpose()?;
+                            by_id.insert(opts.task_note_id.0.as_str(), own);
+                        }
+                        intent_core::BatchTaskEntry::Id(id) => {
+                            by_id.entry(id.0.as_str()).or_insert(None);
+                        }
+                    }
+                }
+                resolved.extend(by_id.into_values().map(|own| own.or(top)));
+            }
+            None => resolved.push(input.placement.as_ref().map(&check).transpose()?),
+        }
+        let explicit_remote = resolved.contains(&Some(false));
+        let explicit_backend = resolved.contains(&Some(true));
+        let any_unplaced = resolved.contains(&None);
+        if explicit_remote && input.isolation.is_some() {
             return Err(Error::InvalidParams(
                 "agent.delegate: placement and isolation cannot be combined; a remote agent always works in its own checkout".to_string(),
             ));
         }
         // A remote agent's sub-agents inherit its machine (see the create
         // seam), so they are placed unless they ask for the backend.
-        let inherits = input.placement.is_none()
+        let inherits = any_unplaced
             && self
                 .inherited_placement(parent_agent_id.as_ref())
                 .await?
@@ -12967,10 +12993,13 @@ impl Services {
                 "agent.delegate: a remote agent's sub-agents run on its machine, so isolation does not apply; pass placement { target: \"local\" } to use isolation on the backend".to_string(),
             ));
         }
-        let placed = inherits || (input.placement.is_some() && !on_backend);
+        let placed = inherits || explicit_remote;
         if input.tasks.is_some() {
+            // Some task runs on the backend: an explicit local placement, or
+            // none from a parent that is not remote.
+            let any_on_backend = explicit_backend || (any_unplaced && !inherits);
             return self
-                .agent_delegate_batch_op(workspace_id, input, parent_agent_id, placed)
+                .agent_delegate_batch_op(workspace_id, input, parent_agent_id, any_on_backend)
                 .await;
         }
         // Keep the child's creation, group enrollment and initial send on
@@ -13655,8 +13684,8 @@ impl Services {
     /// the start subset through the unchanged single-task path (per-task
     /// agent creation, group enrollment honoring `waitMode`). Entries may be
     /// bare task-note ids or objects carrying per-task
-    /// `specialist`/`model`/`reasoningEffort` overrides of the top-level
-    /// defaults. No scheduler state is written: held tasks are simply not
+    /// `specialist`/`model`/`reasoningEffort`/`placement` overrides of the
+    /// top-level defaults. No scheduler state is written: held tasks are simply not
     /// started, and re-calling with the same list is idempotent
     /// (running/terminal tasks classify as `skipped`). The result enumerates
     /// EVERY supplied task with its disposition + reason, carries a top-level
@@ -13672,7 +13701,7 @@ impl Services {
         workspace_id: WorkspaceId,
         input: intent_core::AgentDelegateInput,
         parent_agent_id: Option<AgentId>,
-        placed: bool,
+        any_on_backend: bool,
     ) -> Result<Value> {
         use batch::{
             classify_batch_tasks, project_unlock_plan, relations_unknown_ids, BatchDisposition,
@@ -13734,13 +13763,14 @@ impl Services {
         // already spawned. Per-entry `provider`/`model` overrides stay
         // per-row (`error` disposition via the single-task path), consistent
         // with the other per-entry options.
-        // Children placed on a remote machine (inherited from a remote
-        // parent) run the provider there, so this backend's installation
-        // says nothing about it: each child's machine admission checks it
-        // and fails only that child's row.
+        // Children placed on a remote machine (by a placement, or inherited
+        // from a remote parent) run the provider there, so this backend's
+        // installation says nothing about them: each child's machine
+        // admission checks it and fails only that child's row. The check
+        // still runs when any task runs on the backend.
         if let Some(provider_param) = input.provider.as_deref() {
             self.ensure_selectable_provider("agent.delegate", provider_param)?;
-            if !placed {
+            if any_on_backend {
                 self.ensure_provider_available_for(
                     "agent.delegate",
                     provider_param,
@@ -13867,6 +13897,9 @@ impl Services {
                         wait_mode: input.wait_mode.clone(),
                         skip_auto_commit: input.skip_auto_commit,
                         isolation: input.isolation.clone(),
+                        placement: opts
+                            .and_then(|o| o.placement.clone())
+                            .or_else(|| input.placement.clone()),
                         ..Default::default()
                     };
                     match Box::pin(self.agent_delegate_op(

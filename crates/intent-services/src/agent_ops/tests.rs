@@ -47178,6 +47178,7 @@ async fn batch_delegate_rejects_empty_and_mixed_addressing() {
                     provider: None,
                     reasoning_effort: None,
                     agent_instructions: Some("do it my way".into()),
+                    placement: None,
                 })]),
                 ..Default::default()
             },
@@ -47243,6 +47244,7 @@ async fn batch_delegate_rejects_unknown_specialist_default_fast() {
                         provider: None,
                         reasoning_effort: None,
                         agent_instructions: None,
+                        placement: None,
                     }),
                     BatchTaskEntry::Id(t2.clone()),
                 ]),
@@ -47695,6 +47697,7 @@ async fn batch_delegate_per_task_options_override_top_level_defaults() {
                         provider: None,
                         reasoning_effort: Some("high".into()),
                         agent_instructions: None,
+                        placement: None,
                     }),
                 ]),
                 specialist: Some("developer".into()),
@@ -49530,6 +49533,7 @@ async fn wire_agent_delegate_rejects_compound_model_in_batch_tasks() {
                 provider: None,
                 reasoning_effort: None,
                 agent_instructions: None,
+                placement: None,
             })]),
             ..Default::default()
         },

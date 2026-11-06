@@ -24,7 +24,11 @@ const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
 struct FakeRemote {
     launched: Mutex<Vec<RemoteLaunchRequest>>,
     needs: Mutex<Vec<RemoteLaunchNeeds>>,
+    /// Every placement admitted, in order.
+    admitted: Mutex<Vec<AgentPlacement>>,
     fail_launch: bool,
+    /// A `nodeId` admission refuses with `placement-unavailable`.
+    refuse_node: Option<&'static str>,
     /// Each final stop recorded, and whether the agent's script-stop wait
     /// (`end_agent_machine_runs`) had already run then.
     final_stops: Mutex<Vec<(AgentId, bool)>>,
@@ -88,6 +92,12 @@ impl RemoteLaunchPort for FakeRemote {
         needs: &'a RemoteLaunchNeeds,
     ) -> BoxFuture<'a, intent_core::Result<RemotePlacementView>> {
         self.needs.lock().unwrap().push(needs.clone());
+        if placement.node_id.is_some() && placement.node_id.as_deref() == self.refuse_node {
+            let failure =
+                PlatformAvailability::none(intent_core::now_iso()).unavailable(placement.clone());
+            return Box::pin(async move { Err(Error::PlacementUnavailable(Box::new(failure))) });
+        }
+        self.admitted.lock().unwrap().push(placement.clone());
         Box::pin(async move { Ok(view(placement)) })
     }
 
@@ -435,25 +445,10 @@ async fn a_failed_launch_marks_the_agent_and_fails_the_create() {
 }
 
 #[tokio::test]
-async fn delegate_takes_a_placement_only_for_a_single_task_without_isolation() {
+async fn delegate_refuses_a_remote_placement_with_isolation() {
     let (_t, svc, ws) = setup().await;
     let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
     let remote = || Some(placement(json!({"target": "remote"})));
-    let batch = svc
-        .agent_delegate_op(
-            ws.clone(),
-            AgentDelegateInput {
-                placement: remote(),
-                tasks: Some(Vec::new()),
-                ..Default::default()
-            },
-            None,
-        )
-        .await;
-    assert!(
-        matches!(&batch, Err(Error::InvalidParams(m)) if m.contains("single delegation")),
-        "{batch:?}"
-    );
     let cow = svc
         .agent_delegate_op(
             ws.clone(),
@@ -977,4 +972,404 @@ async fn deleting_a_remote_agent_records_its_final_stop_after_the_script_stop_wa
     let id = remote.launched.lock().unwrap()[0].agent_id.clone();
     svc.agent_delete_op(id.clone(), Some(ws)).await.unwrap();
     assert_eq!(*remote.final_stops.lock().unwrap(), vec![(id, true)]);
+}
+
+async fn seed_task(svc: &Services, ws: &WorkspaceId, title: &str) -> intent_core::NoteId {
+    use intent_core::WorkspaceApi as _;
+    intent_core::caller::with_caller(intent_core::caller::Caller::Daemon, async {
+        let note = svc
+            .create_note(
+                ws.clone(),
+                intent_core::NoteCreate {
+                    title: title.into(),
+                    content: Some(format!("{title} body")),
+                    tags: None,
+                    parent_id: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("create note")
+            .note;
+        svc.mark_as_task(
+            ws.clone(),
+            note.id.clone(),
+            "not_started".into(),
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("markAsTask");
+        note.id
+    })
+    .await
+}
+
+/// A batch `tasks` entry from its wire form.
+fn entry(value: Value) -> intent_core::BatchTaskEntry {
+    serde_json::from_value(value).expect("batch entry")
+}
+
+fn bare(id: &intent_core::NoteId) -> intent_core::BatchTaskEntry {
+    intent_core::BatchTaskEntry::Id(id.clone())
+}
+
+/// A batch delegation made by `parent` (a remote agent) through its
+/// `workspace_api`.
+async fn batch_from(
+    svc: &Services,
+    ws: &WorkspaceId,
+    parent: &AgentId,
+    input: AgentDelegateInput,
+) -> intent_core::Result<Value> {
+    let caller = intent_core::Caller::Agent {
+        agent_id: parent.clone(),
+    };
+    intent_core::with_caller(
+        caller,
+        svc.agent_delegate_op(ws.clone(), input, Some(parent.clone())),
+    )
+    .await
+}
+
+fn row<'a>(result: &'a Value, task: &intent_core::NoteId) -> &'a Value {
+    result["tasks"]
+        .as_array()
+        .expect("tasks rows")
+        .iter()
+        .find(|r| r["taskNoteId"] == task.0.as_str())
+        .unwrap_or_else(|| panic!("no row for {task:?}: {result}"))
+}
+
+async fn child(svc: &Services, ws: &WorkspaceId, row: &Value) -> intent_core::AgentLite {
+    let id = AgentId::from(row["agentId"].as_str().expect("agentId"));
+    svc.agent_get_op(id, Some(ws.clone())).await.expect("child")
+}
+
+async fn agent_count(svc: &Services) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_session")
+        .fetch_one(svc.store().write_pool())
+        .await
+        .unwrap()
+}
+
+/// G2: a remote agent sends a whole batch to another machine with one
+/// batch-level placement, instead of every child inheriting its machine.
+#[tokio::test]
+async fn a_remote_agents_batch_runs_on_another_machine() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let parent = remote_agent(&svc, &ws).await;
+    let first = seed_task(&svc, &ws, "First").await;
+    let second = seed_task(&svc, &ws, "Second").await;
+    let before = remote.admitted.lock().unwrap().len();
+
+    let result = batch_from(
+        &svc,
+        &ws,
+        &parent,
+        AgentDelegateInput {
+            placement: Some(placement(json!({"target": "remote", "nodeId": "node-2"}))),
+            tasks: Some(vec![bare(&first), bare(&second)]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("batch delegate");
+
+    assert_eq!(result["summary"]["started"], 2, "{result}");
+    let admitted = remote.admitted.lock().unwrap()[before..].to_vec();
+    assert_eq!(admitted.len(), 2, "{admitted:?}");
+    for placement in admitted {
+        assert_eq!(placement.node_id.as_deref(), Some("node-2"));
+    }
+}
+
+/// G2: `placement: { target: "local" }` on a batch runs every task on the
+/// backend, so a remote agent no longer delegates them one at a time.
+#[tokio::test]
+async fn a_remote_agents_batch_runs_on_the_backend_with_target_local() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let parent = remote_agent(&svc, &ws).await;
+    let first = seed_task(&svc, &ws, "First").await;
+    let second = seed_task(&svc, &ws, "Second").await;
+    let before = remote.needs.lock().unwrap().len();
+
+    let result = batch_from(
+        &svc,
+        &ws,
+        &parent,
+        AgentDelegateInput {
+            placement: Some(placement(json!({"target": "local"}))),
+            tasks: Some(vec![bare(&first), bare(&second)]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("batch delegate");
+
+    assert_eq!(result["summary"]["started"], 2, "{result}");
+    assert_eq!(
+        remote.needs.lock().unwrap().len(),
+        before,
+        "no machine asked"
+    );
+    for task in [&first, &second] {
+        let agent = child(&svc, &ws, row(&result, task)).await;
+        assert!(agent.node_id.is_none(), "{agent:?}");
+        assert!(agent.placement.is_none(), "{agent:?}");
+    }
+}
+
+/// G2: each task is admitted as its own delegation. An entry's placement
+/// replaces the batch's; a task whose machine refuses it gets an error row
+/// with nothing written, and the others still start.
+#[tokio::test]
+async fn a_batch_task_failing_admission_does_not_stop_the_others() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote {
+        refuse_node: Some("node-gone"),
+        ..FakeRemote::default()
+    });
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let parent = remote_agent(&svc, &ws).await;
+    let on_node_2 = seed_task(&svc, &ws, "On node 2").await;
+    let refused = seed_task(&svc, &ws, "Refused").await;
+    let on_backend = seed_task(&svc, &ws, "On the backend").await;
+    let before = remote.admitted.lock().unwrap().len();
+    let agents = agent_count(&svc).await;
+
+    let result = batch_from(
+        &svc,
+        &ws,
+        &parent,
+        AgentDelegateInput {
+            placement: Some(placement(json!({"target": "remote", "nodeId": "node-2"}))),
+            tasks: Some(vec![
+                bare(&on_node_2),
+                entry(json!({
+                    "taskNoteId": refused.0,
+                    "placement": {"target": "remote", "nodeId": "node-gone"},
+                })),
+                entry(json!({
+                    "taskNoteId": on_backend.0,
+                    "placement": {"target": "local"},
+                })),
+            ]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("batch delegate");
+
+    assert_eq!(result["summary"]["started"], 2, "{result}");
+    assert_eq!(result["summary"]["errors"], 1, "{result}");
+    let failed = row(&result, &refused);
+    assert_eq!(failed["disposition"], "error", "{result}");
+    assert!(
+        failed["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("placement-unavailable")),
+        "{result}"
+    );
+    assert_eq!(
+        agent_count(&svc).await,
+        agents + 2,
+        "nothing written for it"
+    );
+
+    let admitted = remote.admitted.lock().unwrap()[before..].to_vec();
+    assert_eq!(admitted.len(), 1, "{admitted:?}");
+    assert_eq!(admitted[0].node_id.as_deref(), Some("node-2"));
+    let placed = child(&svc, &ws, row(&result, &on_node_2)).await;
+    assert_eq!(placed.node_id.as_deref(), Some("node-1"), "fake view node");
+    let local = child(&svc, &ws, row(&result, &on_backend)).await;
+    assert!(local.node_id.is_none(), "{local:?}");
+}
+
+/// G2: every placement in a batch is checked before any task starts: a
+/// malformed entry placement, or a task that would run remotely in a call
+/// with `isolation`, fails the whole batch.
+#[tokio::test]
+async fn a_batch_refuses_bad_placements_before_any_task_starts() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let parent = remote_agent(&svc, &ws).await;
+    let first = seed_task(&svc, &ws, "First").await;
+    let second = seed_task(&svc, &ws, "Second").await;
+    let agents = agent_count(&svc).await;
+    let cow = || Some("cow".to_string());
+
+    let cases = [
+        (
+            "batch remote + isolation",
+            AgentDelegateInput {
+                placement: Some(placement(json!({"target": "remote"}))),
+                isolation: cow(),
+                tasks: Some(vec![bare(&first), bare(&second)]),
+                ..Default::default()
+            },
+            "cannot be combined",
+        ),
+        (
+            "entry remote + isolation",
+            AgentDelegateInput {
+                placement: Some(placement(json!({"target": "local"}))),
+                isolation: cow(),
+                tasks: Some(vec![
+                    bare(&first),
+                    entry(json!({"taskNoteId": second.0, "placement": {"target": "remote"}})),
+                ]),
+                ..Default::default()
+            },
+            "cannot be combined",
+        ),
+        (
+            "inherited + isolation",
+            AgentDelegateInput {
+                isolation: cow(),
+                tasks: Some(vec![
+                    entry(json!({"taskNoteId": first.0, "placement": {"target": "local"}})),
+                    bare(&second),
+                ]),
+                ..Default::default()
+            },
+            "isolation does not apply",
+        ),
+        (
+            "local with a machine filter",
+            AgentDelegateInput {
+                tasks: Some(vec![
+                    bare(&first),
+                    entry(json!({
+                        "taskNoteId": second.0,
+                        "placement": {"target": "local", "os": "macos"},
+                    })),
+                ]),
+                ..Default::default()
+            },
+            "omit os, arch",
+        ),
+        (
+            "malformed batch placement every entry replaces",
+            AgentDelegateInput {
+                placement: Some(placement(json!({"target": "local", "os": "macos"}))),
+                tasks: Some(vec![
+                    entry(json!({"taskNoteId": first.0, "placement": {"target": "local"}})),
+                    entry(json!({"taskNoteId": second.0, "placement": {"target": "local"}})),
+                ]),
+                ..Default::default()
+            },
+            "omit os, arch",
+        ),
+        (
+            "exclusive entry",
+            AgentDelegateInput {
+                tasks: Some(vec![
+                    bare(&first),
+                    entry(json!({
+                        "taskNoteId": second.0,
+                        "placement": {"target": "remote", "exclusive": true},
+                    })),
+                ]),
+                ..Default::default()
+            },
+            "exclusive",
+        ),
+    ];
+    for (name, input, want) in cases {
+        let result = batch_from(&svc, &ws, &parent, input).await;
+        assert!(
+            matches!(&result, Err(Error::InvalidParams(m)) if m.contains(want)),
+            "{name}: {result:?}"
+        );
+    }
+    assert_eq!(agent_count(&svc).await, agents, "nothing started");
+}
+
+/// An entry's `placement` keeps the closed wire shape: `null` is refused.
+#[test]
+fn a_batch_entry_placement_is_never_null() {
+    let null = serde_json::from_value::<intent_core::BatchTaskOptions>(
+        json!({"taskNoteId": "n1", "placement": null}),
+    );
+    assert!(null.is_err(), "{null:?}");
+    let omitted =
+        serde_json::from_value::<intent_core::BatchTaskOptions>(json!({"taskNoteId": "n1"}))
+            .expect("omitted placement");
+    assert!(omitted.placement.is_none());
+}
+
+/// A duplicated task id resolves its placement as the batch starts it: the
+/// last object entry wins and a bare duplicate does not reset it, so the
+/// `isolation` check never refuses a task for a placement it does not get.
+#[tokio::test]
+async fn a_duplicated_batch_task_is_checked_with_the_placement_it_starts_with() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let parent = remote_agent(&svc, &ws).await;
+    let first = seed_task(&svc, &ws, "First").await;
+    let second = seed_task(&svc, &ws, "Second").await;
+    let before = remote.needs.lock().unwrap().len();
+    let shared = || Some("shared".to_string());
+
+    let local_then_bare = batch_from(
+        &svc,
+        &ws,
+        &parent,
+        AgentDelegateInput {
+            isolation: shared(),
+            tasks: Some(vec![
+                entry(json!({"taskNoteId": first.0, "placement": {"target": "local"}})),
+                bare(&first),
+            ]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("a bare duplicate keeps the local placement");
+    assert_eq!(
+        local_then_bare["summary"]["started"], 1,
+        "{local_then_bare}"
+    );
+
+    let remote_then_plain = batch_from(
+        &svc,
+        &ws,
+        &parent,
+        AgentDelegateInput {
+            placement: Some(placement(json!({"target": "local"}))),
+            isolation: shared(),
+            tasks: Some(vec![
+                entry(json!({"taskNoteId": second.0, "placement": {"target": "remote"}})),
+                entry(json!({"taskNoteId": second.0})),
+            ]),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the last object entry drops the remote placement");
+    assert_eq!(
+        remote_then_plain["summary"]["started"], 1,
+        "{remote_then_plain}"
+    );
+
+    assert_eq!(
+        remote.needs.lock().unwrap().len(),
+        before,
+        "no machine asked"
+    );
+    for (result, task) in [(&local_then_bare, &first), (&remote_then_plain, &second)] {
+        let agent = child(&svc, &ws, row(result, task)).await;
+        assert!(agent.node_id.is_none(), "{agent:?}");
+    }
 }
