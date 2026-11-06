@@ -2408,6 +2408,9 @@ jobs:
       # Reporter of nightly-payload-sweep.yml (node:test, offline, no installs).
       - name: Test the nightly payload-sweep issue reporter (offline)
         run: ./scripts/test-nightly-payload-report.mjs
+      # Plan, template definition and secret handling of e2b-template.yml (node:test, offline).
+      - name: Test the intent-node E2B template scripts (offline)
+        run: ./scripts/test-e2b-template.mjs
       - name: Test optional Intel cargo-dist network handling (offline)
         run: python3 -I -B scripts/test-optional-intel-dist-network.py
       - name: Test optional Intel cargo-dist publication
