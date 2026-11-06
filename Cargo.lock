@@ -2520,6 +2520,7 @@ dependencies = [
  "intentd-test-support",
  "libc",
  "serde_json",
+ "sha2 0.11.0",
  "socket2",
  "sqlx",
  "tempfile",

@@ -706,16 +706,151 @@ pub fn write_attachment_copy(
     ))
 }
 
+/// A `ws.file.getAttachment` copy on a remote agent's machine that head
+/// sends in pieces: written to a hidden part file beside its destination
+/// and kept, by [`Self::finish`], only when its size and sha256 match
+/// head's. A copy that is dropped unfinished leaves nothing behind.
+pub struct AttachmentPieces {
+    rel: String,
+    dest: PathBuf,
+    part: PathBuf,
+    file: Option<std::fs::File>,
+    hasher: sha2::Sha256,
+    written: u64,
+}
+
+impl AttachmentPieces {
+    /// Start the copy of `file_name` under `dest_dir` (default
+    /// [`ATTACHMENTS_DIR`]) in `dest_root`, as [`write_attachment_copy`]
+    /// places it.
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn begin(dest_root: &str, dest_dir: Option<&str>, file_name: &str) -> Result<Self> {
+        use sha2::Digest as _;
+        if dest_root.is_empty() {
+            return Err(Error::Internal(ACCESS_DENIED.to_string()));
+        }
+        let (rel, dest) = attachment_destination(dest_root, dest_dir, file_name)?;
+        // Not derived from the name, so a name near the file system's limit
+        // still fits.
+        let part = dest.with_file_name(format!(".{}.part", uuid::Uuid::new_v4().simple()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+            .map_err(|e| {
+                Error::Internal(format!("failed to copy attachment \"{file_name}\": {e}"))
+            })?;
+        Ok(Self {
+            rel,
+            dest,
+            part,
+            file: Some(file),
+            hasher: sha2::Sha256::new(),
+            written: 0,
+        })
+    }
+
+    /// The bytes written so far: the offset of the next piece.
+    #[must_use]
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Write the next piece.
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        use sha2::Digest as _;
+        use std::io::Write as _;
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| Error::Internal("attachment copy already finished".into()))?;
+        file.write_all(bytes)
+            .map_err(|e| Error::Internal(format!("failed to copy attachment: {e}")))?;
+        self.hasher.update(bytes);
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Keep the copy when it is `size` bytes with `sha256` (lowercase hex);
+    /// otherwise remove it and fail with `-32602` `attachment-copy-mismatch`.
+    /// An identical file already at the destination is left as it is. The
+    /// result is [`write_attachment_copy`]'s.
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn finish(
+        mut self,
+        size: u64,
+        sha256: &str,
+        file_name: &str,
+        mime_type: Option<&str>,
+        uploaded_at: &str,
+    ) -> Result<Value> {
+        use sha2::Digest as _;
+        let file = self.file.take();
+        if let Some(file) = file {
+            file.sync_all().map_err(|e| {
+                Error::Internal(format!("failed to copy attachment \"{file_name}\": {e}"))
+            })?;
+        }
+        let digest = lower_hex(&self.hasher.clone().finalize());
+        if self.written != size || !digest.eq_ignore_ascii_case(sha256) {
+            return Err(Error::InvalidParams(format!(
+                "attachment-copy-mismatch: \"{file_name}\" arrived as {} bytes with sha256 {digest}, but the backend has {size} bytes with sha256 {sha256}. Try again, or continue without this file.",
+                self.written
+            )));
+        }
+        let identical = std::fs::metadata(&self.dest)
+            .is_ok_and(|md| md.is_file() && md.len() == size)
+            && std::fs::File::open(&self.dest)
+                .and_then(|mut existing| sha256_hex(&mut existing))
+                .is_ok_and(|existing| existing == digest);
+        if !identical {
+            std::fs::rename(&self.part, &self.dest).map_err(|e| {
+                Error::Internal(format!("failed to copy attachment \"{file_name}\": {e}"))
+            })?;
+        }
+        Ok(attachment_copy_result(
+            &self.rel,
+            file_name,
+            size,
+            uploaded_at,
+            mime_type,
+        ))
+    }
+}
+
+impl Drop for AttachmentPieces {
+    fn drop(&mut self) {
+        self.file.take();
+        let _ = std::fs::remove_file(&self.part);
+    }
+}
+
 /// The bytes of a registered attachment for a remote agent's machine:
 /// `{ fileName, mimeType?, size, uploadedAt, data }` with `data` base64,
-/// read from the canonical store like [`get_attachment`]'s source. A file
-/// larger than `max_bytes` is `-32602` `attachment-too-large-for-link`.
+/// read from the canonical store like [`get_attachment`]'s source. Without
+/// `range` a file larger than `max_bytes` is `-32602`
+/// `attachment-too-large-for-link`. With `range` (`offset`, `length`) the
+/// answer is one piece of a file of any size: at most `length` bytes from
+/// `offset`, with `offset` and, at offset 0, the whole file's `sha256`; an
+/// offset past the end is `-32602`.
 pub(crate) fn attachment_data(
     canonical_root: &str,
     record: &intent_store::AttachmentRecord,
     max_bytes: u64,
+    range: Option<(u64, u64)>,
 ) -> Result<Value> {
     use base64::Engine as _;
+    use std::io::{Read as _, Seek as _};
     if canonical_root.is_empty() {
         return Err(Error::Internal(
             "workspace has no resolved filesystem root".to_string(),
@@ -726,23 +861,79 @@ pub(crate) fn attachment_data(
         Ok(md) if md.is_file() => md.len(),
         _ => return Err(deleted_attachment(record)),
     };
-    if size > max_bytes {
-        return Err(Error::InvalidParams(format!(
-            "attachment-too-large-for-link: \"{}\" is {size} bytes; a remote agent can copy attachments of at most {max_bytes} bytes. Continue without this file, or ask the user to share it another way.",
-            record.file_name
-        )));
-    }
-    let bytes = std::fs::read(&src).map_err(|_| deleted_attachment(record))?;
+    let (bytes, piece) = if let Some((offset, length)) = range {
+        if offset > size {
+            return Err(Error::InvalidParams(format!(
+                "attachment-range-invalid: offset {offset} is past the end of \"{}\" ({size} bytes)",
+                record.file_name
+            )));
+        }
+        let mut file = std::fs::File::open(&src).map_err(|_| deleted_attachment(record))?;
+        let sha256 = if offset == 0 {
+            Some(sha256_hex(&mut file).map_err(|_| deleted_attachment(record))?)
+        } else {
+            None
+        };
+        file.seek(std::io::SeekFrom::Start(offset))
+            .map_err(|_| deleted_attachment(record))?;
+        let mut bytes = Vec::new();
+        file.take(length.min(max_bytes))
+            .read_to_end(&mut bytes)
+            .map_err(|_| deleted_attachment(record))?;
+        (bytes, Some((offset, size, sha256)))
+    } else {
+        if size > max_bytes {
+            return Err(Error::InvalidParams(format!(
+                "attachment-too-large-for-link: \"{}\" is {size} bytes; a remote agent can copy attachments of at most {max_bytes} bytes. Continue without this file, or ask the user to share it another way.",
+                record.file_name
+            )));
+        }
+        (
+            std::fs::read(&src).map_err(|_| deleted_attachment(record))?,
+            None,
+        )
+    };
     let mut result = json!({
         "fileName": record.file_name,
         "size": bytes.len(),
         "uploadedAt": record.uploaded_at,
         "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
     });
+    if let Some((offset, size, sha256)) = piece {
+        result["size"] = json!(size);
+        result["offset"] = json!(offset);
+        if let Some(sha256) = sha256 {
+            result["sha256"] = json!(sha256);
+        }
+    }
     if let Some(mime) = &record.mime_type {
         result["mimeType"] = json!(mime);
     }
     Ok(result)
+}
+
+/// `bytes` as lowercase hex.
+fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
+}
+
+/// Lowercase hex SHA-256 of everything `reader` yields.
+fn sha256_hex(reader: &mut impl std::io::Read) -> std::io::Result<String> {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(lower_hex(&hasher.finalize()))
 }
 
 /// `file.list` → bare array of `{ name, type }`.

@@ -25,7 +25,8 @@ use intent_acp::{HostFrameRouter, McpBridge, NormalizedMcpServer, WorkspaceMcpSe
 use intent_core::node_link::{LinkOutcome, McpProxy, PREPARED_CHECKOUT_PROTOCOL, SECRETS_PROTOCOL};
 use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
-    GIT_ROOTS_METHOD, MCP_PROXY_LINK_TIMEOUT, PLACEMENT_HELP_METHOD,
+    GIT_ROOTS_METHOD, MAX_LINK_ATTACHMENT_CHUNK_BYTES, MCP_PROXY_LINK_TIMEOUT,
+    PLACEMENT_HELP_METHOD,
 };
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
@@ -445,37 +446,29 @@ impl Router {
         }
     }
 
-    /// Attachment `attachment_id`'s bytes and metadata from head, for
-    /// `ws.file.getAttachment` on this node. An older backend refuses the
-    /// frame; the agent is told what to update.
-    async fn attachment_data(&self, attachment_id: &str) -> Result<AttachmentData> {
-        use base64::Engine as _;
-        let answer = self
-            .forward(
-                ATTACHMENT_DATA_METHOD,
-                &json!({ "attachmentId": attachment_id }),
-            )
-            .await
-            .map_err(|error| {
-                if error.starts_with(workspace_api::UNSUPPORTED_CODE) {
-                    Error::InvalidParams(format!(
-                        "{}: ws.file.getAttachment on a remote agent needs a newer Intent on the backend; update it, or continue without this file",
-                        workspace_api::UNSUPPORTED_CODE
-                    ))
-                } else {
-                    Error::InvalidParams(error)
-                }
-            })?;
-        let text = |key: &str| answer.get(key).and_then(Value::as_str).map(str::to_owned);
-        let malformed = || Error::Internal("head sent a malformed attachment".to_owned());
-        let bytes = text("data")
-            .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
-            .ok_or_else(malformed)?;
-        Ok(AttachmentData {
-            file_name: text("fileName").ok_or_else(malformed)?,
-            mime_type: text("mimeType"),
-            uploaded_at: text("uploadedAt").unwrap_or_default(),
-            bytes,
+    /// One answer from head for attachment `attachment_id`, for
+    /// `ws.file.getAttachment` on this node: the piece from `offset`, or, from
+    /// an older backend that ignores the range, the whole file. An older
+    /// backend that refuses the frame tells the agent what to update.
+    async fn attachment_piece(&self, attachment_id: &str, offset: u64) -> Result<Value> {
+        self.forward(
+            ATTACHMENT_DATA_METHOD,
+            &json!({
+                "attachmentId": attachment_id,
+                "offset": offset,
+                "length": MAX_LINK_ATTACHMENT_CHUNK_BYTES,
+            }),
+        )
+        .await
+        .map_err(|error| {
+            if error.starts_with(workspace_api::UNSUPPORTED_CODE) {
+                Error::InvalidParams(format!(
+                    "{}: ws.file.getAttachment on a remote agent needs a newer Intent on the backend; update it, or continue without this file",
+                    workspace_api::UNSUPPORTED_CODE
+                ))
+            } else {
+                Error::InvalidParams(error)
+            }
         })
     }
 
@@ -494,12 +487,45 @@ impl Router {
     }
 }
 
-/// An attachment head sent for `ws.file.getAttachment`.
+/// One answer head sent for `ws.file.getAttachment`: the file's metadata
+/// and the bytes of this piece (or of the whole file, from an older
+/// backend).
 struct AttachmentData {
     file_name: String,
     mime_type: Option<String>,
     uploaded_at: String,
     bytes: Vec<u8>,
+    /// The whole file's size.
+    size: u64,
+    /// Where the piece starts; `None` for a whole file.
+    offset: Option<u64>,
+    sha256: Option<String>,
+}
+
+impl AttachmentData {
+    fn parse(answer: &Value) -> Result<Self> {
+        use base64::Engine as _;
+        let text = |key: &str| answer.get(key).and_then(Value::as_str).map(str::to_owned);
+        let malformed = || Error::Internal("head sent a malformed attachment".to_owned());
+        let bytes = text("data")
+            .and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())
+            .ok_or_else(malformed)?;
+        Ok(Self {
+            file_name: text("fileName").ok_or_else(malformed)?,
+            mime_type: text("mimeType"),
+            uploaded_at: text("uploadedAt").unwrap_or_default(),
+            size: answer
+                .get("size")
+                .and_then(Value::as_u64)
+                .unwrap_or(bytes.len() as u64),
+            offset: match answer.get("offset") {
+                None => None,
+                Some(offset) => Some(offset.as_u64().ok_or_else(malformed)?),
+            },
+            sha256: text("sha256"),
+            bytes,
+        })
+    }
 }
 
 /// The node-local half of the API: the agent's worktree is its workspace
@@ -545,6 +571,75 @@ impl NodeApi {
                 .map_err(|e| Error::Internal(format!("node file task failed: {e}")))?
         })
     }
+
+    /// Copy a file head sends in pieces, from its `first` piece: ask for
+    /// each next piece where the copy ends, then keep the copy only when its
+    /// size and sha256 match head's.
+    async fn copy_attachment_pieces(
+        &self,
+        attachment_id: &str,
+        dest_dir: Option<String>,
+        first: AttachmentData,
+    ) -> Result<Value> {
+        let malformed = || Error::Internal("head sent a malformed attachment piece".to_owned());
+        let AttachmentData {
+            file_name,
+            mime_type,
+            uploaded_at,
+            size,
+            sha256,
+            ..
+        } = &first;
+        let sha256 = sha256.clone().ok_or_else(malformed)?;
+        let (file_name, mime_type, uploaded_at, size) = (
+            file_name.clone(),
+            mime_type.clone(),
+            uploaded_at.clone(),
+            *size,
+        );
+        let root = self.root();
+        let name = file_name.clone();
+        let mut copy = on_blocking(move || {
+            file_ops::AttachmentPieces::begin(&root, dest_dir.as_deref(), &name)
+        })
+        .await?;
+        let mut piece = first;
+        loop {
+            if piece.offset != Some(copy.written()) || piece.size != size {
+                return Err(malformed());
+            }
+            let done = piece.bytes.is_empty();
+            copy = on_blocking(move || copy.append(&piece.bytes).map(|()| copy)).await?;
+            if done || copy.written() >= size {
+                break;
+            }
+            piece = AttachmentData::parse(
+                &self
+                    .head
+                    .attachment_piece(attachment_id, copy.written())
+                    .await?,
+            )?;
+        }
+        on_blocking(move || {
+            copy.finish(
+                size,
+                &sha256,
+                &file_name,
+                mime_type.as_deref(),
+                &uploaded_at,
+            )
+        })
+        .await
+    }
+}
+
+/// Run `f` on a blocking thread.
+async fn on_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| Error::Internal(format!("node file task failed: {e}")))?
 }
 
 impl WorkspaceApi for NodeApi {
@@ -647,18 +742,24 @@ impl WorkspaceApi for NodeApi {
         Box::pin(async move {
             self.check(&workspace_id)?;
             file_ops::check_attachment_dest(&self.root(), dest_dir.as_deref())?;
-            let data = self.head.attachment_data(&attachment_id).await?;
-            self.blocking(&workspace_id, move |root| {
-                file_ops::write_attachment_copy(
-                    root,
-                    dest_dir.as_deref(),
-                    &data.file_name,
-                    data.mime_type.as_deref(),
-                    &data.uploaded_at,
-                    &data.bytes,
-                )
-            })
-            .await
+            let first =
+                AttachmentData::parse(&self.head.attachment_piece(&attachment_id, 0).await?)?;
+            if first.offset.is_none() {
+                return self
+                    .blocking(&workspace_id, move |root| {
+                        file_ops::write_attachment_copy(
+                            root,
+                            dest_dir.as_deref(),
+                            &first.file_name,
+                            first.mime_type.as_deref(),
+                            &first.uploaded_at,
+                            &first.bytes,
+                        )
+                    })
+                    .await;
+            }
+            self.copy_attachment_pieces(&attachment_id, dest_dir, first)
+                .await
         })
     }
 

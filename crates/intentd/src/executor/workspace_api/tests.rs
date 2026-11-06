@@ -367,7 +367,14 @@ async fn file_get_attachment_copies_heads_bytes_into_the_checkout() {
     );
     let params = asked.try_recv().unwrap();
     assert_eq!(params["method"], json!(ATTACHMENT_DATA_METHOD));
-    assert_eq!(params["args"], json!({ "attachmentId": "att-1" }));
+    assert_eq!(
+        params["args"],
+        json!({
+            "attachmentId": "att-1",
+            "offset": 0,
+            "length": intent_core::remote_launch::workspace_api::MAX_LINK_ATTACHMENT_CHUNK_BYTES,
+        })
+    );
 
     let into = ok_json(
         call(
@@ -400,6 +407,169 @@ async fn file_get_attachment_copies_heads_bytes_into_the_checkout() {
         asked.try_recv().is_err(),
         "a destDir outside the checkout is refused before head is asked"
     );
+    answering.abort();
+}
+
+/// A file larger than one frame comes from head in pieces: the machine asks
+/// for `offset`/`length` ranges, writes them as they come and keeps the copy
+/// only when its size and sha256 match head's. An older backend's answers
+/// (the whole file, or its `attachment-too-large-for-link` refusal) work as
+/// before; see [`file_get_attachment_copies_heads_bytes_into_the_checkout`].
+#[tokio::test]
+async fn file_get_attachment_fetches_a_large_file_in_pieces() {
+    use base64::Engine as _;
+    use intent_core::remote_launch::workspace_api::MAX_LINK_ATTACHMENT_CHUNK_BYTES;
+    use sha2::{Digest as _, Sha256};
+    let chunk = usize::try_from(MAX_LINK_ATTACHMENT_CHUNK_BYTES).unwrap();
+    let file: Vec<u8> = (0..2 * chunk + 123)
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
+    let digest = Sha256::digest(&file)
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"));
+            hex
+        });
+    let dir = tempfile::tempdir().unwrap();
+    let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
+    let head = HeadLink::default();
+    head.set(node_end);
+    let server = server(&agent(), &workspace(), dir.path(), &gates(), head).unwrap();
+    let (asked_tx, mut asked) = tokio::sync::mpsc::unbounded_channel();
+    let source = file.clone();
+    let answering = tokio::spawn(async move {
+        while let Some(event) = head_end.events.recv().await {
+            let LinkEvent::Request(request) = event else {
+                continue;
+            };
+            let args = request.request().params["args"].clone();
+            asked_tx.send(args.clone()).unwrap();
+            let id = args["attachmentId"].as_str().unwrap_or_default().to_owned();
+            let offset = usize::try_from(args["offset"].as_u64().unwrap()).unwrap();
+            let length = usize::try_from(args["length"].as_u64().unwrap()).unwrap();
+            let end = source.len().min(offset + length.min(chunk));
+            let mut data = source[offset..end].to_vec();
+            if id == "att-corrupt" && offset > 0 {
+                data[0] ^= 1;
+            }
+            let name = if id == "att-long" {
+                format!("{}.bin", "n".repeat(240))
+            } else {
+                format!("{id}.bin")
+            };
+            let mut answer = json!({
+                "fileName": name,
+                "mimeType": "application/octet-stream",
+                "size": source.len(),
+                "uploadedAt": "2026-11-06T00:00:00Z",
+                "offset": offset,
+                "data": base64::engine::general_purpose::STANDARD.encode(&data),
+            });
+            if offset == 0 {
+                answer["sha256"] = json!(digest);
+            }
+            request.respond(LinkOutcome::Ok(answer)).await.unwrap();
+        }
+    });
+
+    let copied = ok_json(
+        call(
+            &server,
+            r#"return JSON.stringify(await ws.file.getAttachment("att-big"));"#,
+        )
+        .await,
+    );
+    assert_eq!(
+        copied,
+        json!({
+            "path": ".intent/attachments/att-big.bin",
+            "fileName": "att-big.bin",
+            "mimeType": "application/octet-stream",
+            "size": file.len(),
+            "uploadedAt": "2026-11-06T00:00:00Z",
+        })
+    );
+    assert!(std::fs::read(dir.path().join(".intent/attachments/att-big.bin")).unwrap() == file);
+    let offsets: Vec<u64> = std::iter::from_fn(|| asked.try_recv().ok())
+        .map(|args| args["offset"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        offsets,
+        [
+            0,
+            MAX_LINK_ATTACHMENT_CHUNK_BYTES,
+            2 * MAX_LINK_ATTACHMENT_CHUNK_BYTES
+        ]
+    );
+
+    let long = call(
+        &server,
+        r#"return JSON.stringify(await ws.file.getAttachment("att-long"));"#,
+    )
+    .await;
+    assert!(
+        !long.0,
+        "a name near the file-system limit still copies: {long:?}"
+    );
+    let long_name = format!("{}.bin", "n".repeat(240));
+    assert!(dir
+        .path()
+        .join(".intent/attachments")
+        .join(&long_name)
+        .is_file());
+    std::fs::remove_file(dir.path().join(".intent/attachments").join(&long_name)).unwrap();
+    while asked.try_recv().is_ok() {}
+
+    let corrupt = call(
+        &server,
+        r#"return await ws.file.getAttachment("att-corrupt");"#,
+    )
+    .await;
+    assert!(
+        corrupt.0 && corrupt.1.contains("attachment-copy-mismatch"),
+        "{corrupt:?}"
+    );
+    let mut left: Vec<_> = std::fs::read_dir(dir.path().join(".intent/attachments"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [".gitignore", "att-big.bin"],
+        "no partial copy is kept"
+    );
+    answering.abort();
+}
+
+/// An older backend refuses a file over 5 MiB with today's error, which the
+/// call reports unchanged.
+#[tokio::test]
+async fn file_get_attachment_reports_an_older_backends_size_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
+    let head = HeadLink::default();
+    head.set(node_end);
+    let server = server(&agent(), &workspace(), dir.path(), &gates(), head).unwrap();
+    let message = "attachment-too-large-for-link: \"big.bin\" is 6000000 bytes; a remote agent can copy attachments of at most 5242880 bytes. Continue without this file, or ask the user to share it another way.";
+    let answering = tokio::spawn(async move {
+        while let Some(event) = head_end.events.recv().await {
+            let LinkEvent::Request(request) = event else {
+                continue;
+            };
+            request
+                .respond(LinkOutcome::Err(LinkRpcError {
+                    code: -32602,
+                    message: message.into(),
+                    data: None,
+                }))
+                .await
+                .unwrap();
+        }
+    });
+    let refused = call(&server, r#"return await ws.file.getAttachment("att-big");"#).await;
+    assert!(refused.0 && refused.1.contains(message), "{refused:?}");
+    assert!(!dir.path().join(".intent/attachments/big.bin").exists());
     answering.abort();
 }
 

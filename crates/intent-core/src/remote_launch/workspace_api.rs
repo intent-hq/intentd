@@ -41,12 +41,19 @@ pub const PLACEMENT_HELP_METHOD: &str = "agent.placementHelp";
 /// `ws.file.getAttachment`, which runs on the node. Args `{ attachmentId }`;
 /// head answers `{ fileName, mimeType?, size, uploadedAt, data }` (`data` is
 /// base64) for an attachment of the agent's workspace of at most
-/// [`MAX_LINK_ATTACHMENT_BYTES`].
+/// [`MAX_LINK_ATTACHMENT_BYTES`]. With `offset` and `length` too, head
+/// answers one piece of a file of any size: `data` is the bytes from
+/// `offset`, at most [`MAX_LINK_ATTACHMENT_CHUNK_BYTES`], and the answer
+/// also carries `offset` and, at offset 0, the whole file's `sha256`. An
+/// older backend ignores the range and answers as without it.
 pub const ATTACHMENT_DATA_METHOD: &str = "file.attachmentData";
 
-/// Largest attachment [`ATTACHMENT_DATA_METHOD`] carries: its base64 must
-/// fit one response frame ([`crate::node_link::MAX_FRAME_BYTES`]).
+/// Largest attachment [`ATTACHMENT_DATA_METHOD`] carries whole: its base64
+/// must fit one response frame ([`crate::node_link::MAX_FRAME_BYTES`]).
 pub const MAX_LINK_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Largest piece [`ATTACHMENT_DATA_METHOD`] carries when asked for a range.
+pub const MAX_LINK_ATTACHMENT_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The frame method the node forwards (never from agent code: the table
 /// refuses it there) for a provider's `tools/list` on one of the user MCP
