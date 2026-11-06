@@ -608,22 +608,51 @@ fn collect_pins(repo: &git2::Repository, prefix: &str, pins: &mut Vec<SubmoduleP
 }
 
 /// Node side: the submodules populated in `checkout` that are not among
-/// `pins` (a setup script initialized them on the machine), top-most only,
-/// parents before children. Their work is not carried back to head.
-#[must_use]
-pub fn unpinned_submodules(checkout: &Path, pins: &[SubmodulePin]) -> Vec<String> {
-    let populated = submodule_pins(checkout).unwrap_or_default();
-    let mut unpinned: Vec<String> = Vec::new();
-    for found in populated {
-        let pinned = pins.iter().any(|pin| pin.path == found.path);
-        let under_unpinned = unpinned
-            .iter()
-            .any(|parent| found.path.starts_with(&format!("{parent}/")));
-        if !pinned && !under_unpinned {
-            unpinned.push(found.path);
+/// `pins` (a setup script or the agent initialized them on the machine),
+/// top-most only, parents before children. Their work is not carried back
+/// to head. Pinned submodules are searched for unpinned children.
+///
+/// # Errors
+///
+/// When the checkout can't be opened.
+pub fn unpinned_submodules(checkout: &Path, pins: &[SubmodulePin]) -> Result<Vec<String>> {
+    let repo = git2::Repository::open(checkout).map_err(crate::map_git_err)?;
+    let mut unpinned = Vec::new();
+    collect_unpinned(&repo, "", pins, &mut unpinned);
+    Ok(unpinned)
+}
+
+fn collect_unpinned(
+    repo: &git2::Repository,
+    prefix: &str,
+    pins: &[SubmodulePin],
+    unpinned: &mut Vec<String>,
+) {
+    let (Some(workdir), Ok(mut submodules)) = (repo.workdir(), repo.submodules()) else {
+        return;
+    };
+    submodules.sort_by(|a, b| a.path().cmp(b.path()));
+    for submodule in submodules {
+        let Some(rel) = submodule.path().to_str() else {
+            continue;
+        };
+        let path = format!("{prefix}{rel}");
+        if module_components(&path).is_none() || !is_gitlink(repo, rel) {
+            continue;
+        }
+        let dir = workdir.join(rel);
+        if std::fs::symlink_metadata(&dir).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            continue;
+        }
+        let Some(module) = open_populated(&dir) else {
+            continue;
+        };
+        if pins.iter().any(|pin| pin.path == path) {
+            collect_unpinned(&module, &format!("{path}/"), pins, unpinned);
+        } else {
+            unpinned.push(path);
         }
     }
-    unpinned
 }
 
 /// Why head will not serve a submodule repository for a module session.

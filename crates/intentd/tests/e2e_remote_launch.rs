@@ -2464,7 +2464,7 @@ async fn a_remote_agents_setup_script_runs_on_the_machine_after_its_submodules()
     let reply = turn(&mut rpc_ws, &mut events, (&ws_id, &agent_id), "hello", 50).await;
     assert!(reply.contains("echo:"), "{reply}");
     assert!(!reply.contains("workspace setup failed"), "{reply}");
-    assert!(!reply.contains("set up on this machine"), "{reply}");
+    assert!(!reply.contains("populated on this machine"), "{reply}");
 
     let setup = setup_until(&mut rpc_ws, (&ws_id, &agent_id), 100, |setup| {
         setup["output"]
@@ -2721,7 +2721,8 @@ async fn a_remote_agent_is_told_about_a_submodule_its_setup_script_added() {
     let created = create_remote(&mut rpc_ws, &ws_id, "Remote", 10).await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
     turn(&mut rpc_ws, &mut events, (&ws_id, &agent_id), "hello", 50).await;
-    // The fixture echoes the prompt; the notice rides the first one.
+    // The fixture echoes the prompt with the notice prepended; the row's
+    // `lastAgentResponse` does not carry the notice, so read the transcript.
     let reply = timeout(wait(), async {
         let mut id = 60;
         loop {
@@ -2747,17 +2748,15 @@ async fn a_remote_agent_is_told_about_a_submodule_its_setup_script_added() {
     })
     .await
     .expect("the first turn is recorded");
-    assert!(
-        reply.contains("x was set up on this machine by the setup script"),
-        "{reply}"
-    );
-    assert!(!reply.contains("a was set up"), "{reply}");
+    assert!(reply.contains("x was populated on this machine"), "{reply}");
+    assert!(!reply.contains("a was populated"), "{reply}");
     let work = node_dir
         .join("executor")
         .join(&machine.credential_id)
         .join("agents")
         .join(&agent_id)
         .join("work");
+    assert!(work.join("a/README.md").exists(), "the pin a is carried");
     assert!(work.join("x/README.md").exists(), "the script populated x");
 
     let details = wsapi_turn(

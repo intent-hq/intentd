@@ -543,8 +543,9 @@ pub(super) fn unsent_notice(paths: &[String]) -> Option<String> {
         _ => "were",
     };
     Some(format!(
-        "[System: {} {verb} set up on this machine by the setup script, not carried from the \
-         backend; changes there won't be sent back to the backend.]",
+        "[System: {} {verb} populated on this machine (by the setup script or an earlier \
+         session), not carried from the backend; changes there won't be sent back to the \
+         backend.]",
         paths.join(", ")
     ))
 }
@@ -730,6 +731,18 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_unsent_notice_names_each_submodule_once() {
+        assert_eq!(unsent_notice(&[]), None);
+        let one = unsent_notice(&["packages/ios".to_owned()]).unwrap();
+        assert!(
+            one.contains("packages/ios was populated on this machine"),
+            "{one}"
+        );
+        let two = unsent_notice(&["a".to_owned(), "b".to_owned()]).unwrap();
+        assert!(two.contains("a, b were populated on this machine"), "{two}");
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
