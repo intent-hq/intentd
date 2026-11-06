@@ -216,15 +216,18 @@ export function analyzeRun({ run, jobs, artifacts, documents, release }) {
     requireValue(doc && !doc.archiveError, `Unreadable archive: ${doc?.archiveError}`);
     const outcome = doc.outcome;
     validateContext(outcome, run, job);
+    // A failed setup step (e.g. the crate fetch) skips the sweep; name it
+    // rather than the skip it caused.
+    const failedSteps = job.steps.filter((s) => s.conclusion === 'failure' && s.name !== TEST_STEP);
+    requireValue(
+      !failedSteps.length,
+      `Setup, recording or upload step failed: ${failedSteps.map((s) => s.name).join(', ')}`,
+    );
     requireValue(
       ['success', 'failure'].includes(outcome.testOutcome),
       'Test execution skipped or cancelled',
     );
     requireValue(['success', 'failure'].includes(job.conclusion), `Job ended ${job.conclusion}`);
-    requireValue(
-      !job.steps.some((s) => s.conclusion === 'failure' && s.name !== TEST_STEP),
-      'Setup, recording or upload step failed',
-    );
     requireValue(
       job.steps.some((s) => s.name === UPLOAD_STEP && s.conclusion === 'success'),
       'Evidence upload was not successful',
