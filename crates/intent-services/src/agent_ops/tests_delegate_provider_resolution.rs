@@ -557,6 +557,7 @@ async fn batch_delegate_provider_top_level_inherited_and_per_entry_override_wins
                         provider: Some("typo-provider".into()),
                         reasoning_effort: None,
                         agent_instructions: None,
+                        placement: None,
                     }),
                 ]),
                 provider: Some("mock".into()),
