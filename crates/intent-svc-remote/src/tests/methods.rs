@@ -485,6 +485,9 @@ async fn a_revoked_machine_no_longer_counts_its_agents() {
     assert!(!runtime.is_running());
     let exit = runtime.exit_error().unwrap_or_default();
     assert!(exit.contains("machine-revoked"), "{exit}");
+    // Sample the row as soon as the agents drop out. The connector must
+    // already have stored `revoked`; waiting here would hide the window
+    // (intent-hq/intent#8484).
     let listed = backend.call("list", json!({})).await.unwrap();
     assert_eq!(listed["machines"][0]["state"], "revoked");
     assert_eq!(listed["machines"][0]["runningAgents"], 0);
