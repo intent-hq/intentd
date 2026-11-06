@@ -422,7 +422,7 @@ impl E2bClient {
             if status == StatusCode::TOO_MANY_REQUESTS {
                 let body = read_error(response).await;
                 let message = self.scrub(&body.message, secrets);
-                let error_code = body.error_code;
+                let error_code = body.error_code.map(|c| self.scrub(&c, secrets));
                 if is_concurrency_limit(&message, error_code.as_deref()) {
                     return Err(E2bError::ConcurrencyLimit {
                         error_code,
@@ -486,6 +486,7 @@ impl E2bClient {
             error_code,
         } = read_error(response).await;
         let message = self.scrub(&message, secrets);
+        let error_code = error_code.map(|c| self.scrub(&c, secrets));
         let code = error_code.as_deref().unwrap_or("");
         match status {
             401 | 403 => E2bError::Unauthorized { status },
@@ -545,11 +546,15 @@ async fn read_error(response: Response) -> ErrorText {
 }
 
 /// E2B answers 429 for its API rate limit and for the plan's concurrent
-/// sandbox limit. It documents no code for the second, so match its code or
-/// message ("maximum number of concurrent E2B sandboxes").
+/// sandbox limit. It documents no code for the second, so match a code or
+/// message about concurrent *sandboxes* ("maximum number of concurrent E2B
+/// sandboxes"), not any mention of concurrency.
 fn is_concurrency_limit(message: &str, error_code: Option<&str>) -> bool {
-    error_code.is_some_and(|c| c.contains("concurren"))
-        || message.to_ascii_lowercase().contains("concurrent")
+    let code = error_code.unwrap_or("").to_ascii_lowercase();
+    let message = message.to_ascii_lowercase();
+    (code.contains("concurren") && code.contains("sandbox"))
+        || message.contains("concurrent e2b sandboxes")
+        || message.contains("concurrent sandboxes")
 }
 
 /// Replace every secret in `message`, then bound its length.

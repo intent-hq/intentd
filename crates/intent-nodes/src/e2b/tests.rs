@@ -1000,3 +1000,29 @@ async fn non_quota_errors_have_no_quota_limit() {
     let err = client(&server).pause("sbx1").await.unwrap_err();
     assert_eq!(err.quota_limit(), None);
 }
+
+#[tokio::test]
+async fn a_rate_limit_that_mentions_concurrent_requests_is_retried() {
+    let server = FakeServer::start(vec![
+        Reply::error(429, "", "too many concurrent requests").with_header("retry-after", "0"),
+        Reply::status(204),
+    ])
+    .await;
+    client(&server).pause("sbx1").await.unwrap();
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn error_codes_are_scrubbed() {
+    let server = FakeServer::start(vec![
+        Reply::error(429, &format!("x{KEY}"), "slow down").with_header("retry-after", "0"),
+        Reply::error(500, &format!("y{KEY}"), "failed"),
+    ])
+    .await;
+    let mut client = client(&server);
+    client.config.max_rate_limit_retries = 0;
+    for _ in 0..2 {
+        let err = client.delete("sbx1").await.unwrap_err();
+        assert_no_secrets(&format!("{err} {err:?}"));
+    }
+}
