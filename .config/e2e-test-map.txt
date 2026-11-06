@@ -142,3 +142,8 @@ crates/intent-services/src/note_write.rs             intentd::suite_wss_g_r    e
 crates/intent-services/src/note_write.rs             intentd::suite_wss_g_r    e2e_wss_note_set_content_merge
 crates/intent-services/src/codex_diagnostics/process/linux_fallback.rs intentd::suite_e2e e2e_linux_probe_owner
 crates/intent-services/src/codex_diagnostics/process/linux.rs intentd::suite_e2e e2e_linux_probe_owner
+# Human sender-device capture and browser routing across the secure transport.
+crates/intent-core/src/browser_message.rs intentd::suite_wss_a_f e2e_wss_browser_tabs
+crates/intent-transport/src/conn.rs intentd::suite_wss_a_f e2e_wss_browser_tabs
+crates/intent-services/src/agent_ops.rs intentd::suite_wss_a_f e2e_wss_browser_tabs
+crates/intent-store/src/browser_sender_repo.rs intentd::suite_wss_a_f e2e_wss_browser_tabs

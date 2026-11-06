@@ -9,8 +9,16 @@ Actions are executed as a sequence of declarative operations.
 
 A client advertising `browserNavigation: true` can receive `openTab`, `showTab`,
 `focusTab`, `closeTab`, and `navigate`. `browserExec: true` separately enables
-page automation. New `openTab` requests prefer an eligible desktop; without one,
-they can open on connected iOS. An explicit workspace client pin never falls back.
+page automation. New, unnamed `openTab` requests prefer the device that sent the
+conversation's latest accepted user message, if connected and capable of the
+whole request. Otherwise the existing desktop-first, then native fallback applies.
+A delegated helper without its own user receipt inherits the nearest parent's
+preference within the same workspace. Its own receipt, even from an unknown or
+currently unavailable device, stops inheritance; unrelated conversations do not
+share preferences. Queued user messages update this preference on acceptance; retries, queue drains,
+and automatic or subagent messages do not change it. The preference survives
+reconnects and daemon restarts. An explicit workspace client pin always wins and
+never falls back. Requests containing page automation still require a desktop.
 An offline desktop tab or desktop session does not block opening a new native
 preview when no client is pinned. `listTabs` is answered by the daemon.
 

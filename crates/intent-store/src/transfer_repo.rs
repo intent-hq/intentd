@@ -118,6 +118,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("agent_browser_sender", "connection-bound device receipts belong to the source daemon; imported agents must not inherit its client identities"),
     ("discussion_agent_grant", "local explicit addressing authority is never restored on import"),
     ("discussion_agent_activity", "local invocation receipts are not restored on import"),
     ("discussion_agent_delivery", "pending addressed messages must not replay on a destination"),
