@@ -593,6 +593,17 @@ impl Shared {
                 return;
             }
         };
+        self.settle_listed_final_stops(records).await;
+    }
+
+    /// Queue or drop (past their bound) the final stops `records` listed.
+    /// Two loads can list the same record at once (the expiry timer and
+    /// the dial loop): only the one whose `finish_final_stop` removed it
+    /// settles the stop, so its machine runs settle once (intent#8610).
+    async fn settle_listed_final_stops(
+        &self,
+        records: Vec<intent_core::remote_launch::RemoteFinalStopRecord>,
+    ) {
         for record in records {
             let Ok(stop_id) = record.stop_id.parse::<StopId>() else {
                 tracing::warn!(agent = %record.agent_id, "remote machine: a final stop record has a bad id; dropped");
@@ -611,13 +622,18 @@ impl Shared {
                 self.tuning.clock.now(),
             ) {
                 tracing::info!(agent = %record.agent_id, "remote machine: a final stop was not acknowledged within its bound; dropped");
-                if let Err(error) = self
+                match self
                     .store
                     .finish_final_stop(&record.agent_id, &record.stop_id)
                     .await
                 {
-                    tracing::warn!(agent = %record.agent_id, %error, "remote machine: could not drop an expired final stop");
-                    continue;
+                    Ok(true) => {}
+                    // Another load dropped it first and settled it.
+                    Ok(false) => continue,
+                    Err(error) => {
+                        tracing::warn!(agent = %record.agent_id, %error, "remote machine: could not drop an expired final stop");
+                        continue;
+                    }
                 }
                 self.confirm_stop(&record.agent_id, stop_id);
                 // No ack settles this stop, so nothing tracks its exit.
@@ -1020,6 +1036,28 @@ impl Shared {
             drop(exits);
             tracing::warn!(agent = %agent_id, "remote machine: the stopped agent's exit record did not arrive in time; relaunching anyway");
         }
+    }
+
+    /// The recorded final stops of this lease, listed now.
+    #[cfg(test)]
+    pub(crate) async fn list_final_stops_for_test(
+        &self,
+    ) -> Vec<intent_core::remote_launch::RemoteFinalStopRecord> {
+        let lease_id = lock(&self.status).lease_id.clone();
+        self.store.list_final_stops(&lease_id).await.unwrap()
+    }
+
+    /// Settle `records` from two loads at once, as the expiry timer and the
+    /// dial loop do when both list the same record.
+    #[cfg(test)]
+    pub(crate) async fn settle_twice_for_test(
+        &self,
+        records: Vec<intent_core::remote_launch::RemoteFinalStopRecord>,
+    ) {
+        tokio::join!(
+            self.settle_listed_final_stops(records.clone()),
+            self.settle_listed_final_stops(records),
+        );
     }
 
     #[cfg(test)]
@@ -1776,14 +1814,22 @@ async fn run(
             retry = false;
             continue;
         }
+        // A connector shut down before this dial (even before its loop
+        // first ran) binds nothing: its link would claim the lease from
+        // the connector that replaced it, then close (intent#8611).
+        if *shutdown.borrow() {
+            return;
+        }
         let target = shared.target();
         let version = lock(&shared.status).intentd_version.clone();
         let ingested = ingest.ingested();
-        let connected = connect(&target, &shared.tuning.connect, version.as_deref(), || {
-            let lease = lease.clone();
-            async move { lease.next_hello(ingested).await }
-        })
-        .await;
+        let connected = tokio::select! {
+            connected = connect(&target, &shared.tuning.connect, version.as_deref(), || {
+                let lease = lease.clone();
+                async move { lease.next_hello(ingested).await }
+            }) => connected,
+            () = wait_true(&mut shutdown) => return,
+        };
         if *shutdown.borrow() {
             if let Ok(connected) = connected {
                 connected.dialed.link.close();
