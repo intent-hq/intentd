@@ -1605,6 +1605,11 @@ jobs:
           node-version: 22
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
+      # Proves coverage-report.sh on a real crate: a truncated .profraw is
+      # dropped instead of ejecting a green run (run 42133300480), and an
+      # empty or unreadable profile set fails as a labelled tooling fault.
+      - name: Verify coverage report tolerates truncated profiles
+        run: python3 -I -B scripts/test-coverage-report.py
       - name: Prepare native startup evidence
         id: native-evidence
         shell: bash
@@ -1671,7 +1676,7 @@ jobs:
             if [[ -s coverage-summary.txt ]]; then
               cat coverage-summary.txt
             else
-              cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available"
+              cargo llvm-cov report --summary-only --failure-mode=all 2>/dev/null || echo "Coverage data not available"
             fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -1821,7 +1826,7 @@ jobs:
             if [[ -s coverage-summary.txt ]]; then
               cat coverage-summary.txt
             else
-              cargo llvm-cov report --summary-only 2>/dev/null || echo "Coverage data not available"
+              cargo llvm-cov report --summary-only --failure-mode=all 2>/dev/null || echo "Coverage data not available"
             fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -2031,6 +2036,10 @@ jobs:
       - name: Verify bounded coverage profile pooling
         if: steps.select.outputs.has_selection == 'true'
         run: python3 -I -B scripts/test-coverage-profile-pool.py
+      # Same proof as coverage-e2e's step, so a PR sees it before the queue.
+      - name: Verify coverage report tolerates truncated profiles
+        if: steps.select.outputs.has_selection == 'true'
+        run: python3 -I -B scripts/test-coverage-report.py
       - name: Initialize coverage storage evidence
         if: steps.select.outputs.has_selection == 'true'
         run: |

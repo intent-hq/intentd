@@ -43,7 +43,7 @@ INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" scripts/ci-killed-rustc-retry.sh "$BAS
 if [ "${GENERATE_LCOV:-}" = "1" ]; then
     echo ""
     echo "Generating lcov.info..."
-    cargo llvm-cov report --lcov --output-path lcov.info
+    "$BASH" scripts/coverage-report.sh --lcov --output-path lcov.info
 fi
 
 # One report invocation prints the summary AND enforces the floor (if a numeric
@@ -63,9 +63,9 @@ if [ $# -gt 0 ]; then
 else
     echo "Generating coverage report..."
 fi
-if ! cargo llvm-cov report "${REPORT_ARGS[@]}" | tee coverage-summary.txt; then
+if ! "$BASH" scripts/coverage-report.sh "${REPORT_ARGS[@]}" | tee coverage-summary.txt; then
     # Only a floor miss leaves a rendered summary behind; other report failures
-    # (profdata merge, missing llvm-tools) already print their own error.
+    # (coverage tooling faults, missing llvm-tools) already print their own error.
     if [ -n "$FLOOR" ] && grep -q '^TOTAL' coverage-summary.txt; then
         echo "ERROR: line coverage is below the ${FLOOR}% floor (see TOTAL above)" >&2
     fi
