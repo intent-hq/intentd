@@ -134,6 +134,10 @@ async fn failed_note_write_still_reports_the_completed_host_command() {
         text.contains("intentd doctor"),
         "a corrupted store gets an actionable diagnostic: {text}"
     );
+    assert!(
+        text.contains("intentd repair-indexes"),
+        "a damaged search index has a named, non-destructive fix: {text}"
+    );
 }
 
 /// The engine waits for in-flight calls before a rejection ends the script,

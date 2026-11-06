@@ -36,6 +36,7 @@ use sqlx::Row;
 mod client;
 #[cfg(unix)]
 mod command_evidence;
+mod db_repair;
 mod doctor_codex;
 mod exact_update;
 #[cfg(unix)]
@@ -169,6 +170,23 @@ enum Command {
         /// or diagnostic authentication capture occurs on macOS.
         #[arg(long)]
         codex_models: bool,
+    },
+    /// Offline repair of the derived search indexes (note and chat-message
+    /// full-text search) that `intentd doctor` reports as damaged; a damaged
+    /// index makes writes fail with "database disk image is malformed"
+    /// (code 267). Requires intentd to be stopped. Checks the database
+    /// read-only first and changes nothing when its schema version differs
+    /// from this build, when the check finds damage outside the search
+    /// indexes, or when no index is damaged. Otherwise copies the database and
+    /// its WAL to a new directory under `<data dir>/backups/`, rebuilds the
+    /// damaged indexes from the canonical tables (notes and messages are read,
+    /// never changed) and checks again. Exits 0 when the database is healthy
+    /// afterwards, 1 otherwise.
+    RepairIndexes {
+        /// Rebuild every derived index, even when none is reported damaged.
+        /// Still refuses when the check finds damage outside the indexes.
+        #[arg(long)]
+        all: bool,
     },
     /// Read or change daemon settings (§5.12) on a running daemon. With no
     /// arguments, lists every setting with its type and current value
@@ -428,6 +446,7 @@ async fn async_main(cli: Cli) -> ExitCode {
             Command::Status => cmd_status().await,
             Command::Stop => cmd_stop().await,
             Command::Doctor { codex_models } => cmd_doctor(codex_models).await,
+            Command::RepairIndexes { all } => db_repair::cmd_repair_indexes(all).await,
             Command::Settings { name, value, stdin } => {
                 to_exit(cmd_settings(name.as_deref(), value.as_deref(), stdin).await)
             }
@@ -7980,7 +7999,9 @@ async fn cmd_doctor(codex_models: bool) -> ExitCode {
             }
 
             // DB health checks (STAB-15 observability)
-            report_db_health(&store).await;
+            if !report_db_health(&store, &config.data_dir).await {
+                ok = false;
+            }
             store.close().await;
         }
         Err(e) => {
@@ -8587,38 +8608,33 @@ fn check_data_dir_writable(config: &Config) -> anyhow::Result<()> {
 
 /// Report database health metrics for diagnostics (STAB-15 observability).
 /// Runs read-only integrity and space queries; never checkpoints the WAL.
-/// Never fails the doctor check — all checks are informational.
-async fn report_db_health(store: &intent_store::DiagnosticStore) {
+/// Returns false when `PRAGMA integrity_check` reports any problem or cannot
+/// run, so doctor exits non-zero: a damaged search index blocks writes until
+/// `intentd repair-indexes` rebuilds it (intent-hq/intent#8592). The space
+/// and pool metrics stay informational.
+async fn report_db_health(
+    store: &intent_store::DiagnosticStore,
+    data_dir: &std::path::Path,
+) -> bool {
     println!("database health:");
 
-    // PRAGMA integrity_check: verify DB structural integrity
-    // Can return multiple rows if issues are found; treat anything other
-    // than a single "ok" row as a warning.
-    match sqlx::query("PRAGMA integrity_check")
-        .fetch_all(store.read_pool())
-        .await
-    {
-        Ok(rows) => {
-            if rows.len() == 1 {
-                match rows[0].try_get::<String, _>(0) {
-                    Ok(result) if result == "ok" => println!("  [ok] integrity_check: ok"),
-                    Ok(result) => println!("  [WARN] integrity_check: {result}"),
-                    Err(e) => println!("  [WARN] integrity_check: failed to decode result: {e}"),
-                }
-            } else {
-                println!("  [WARN] integrity_check: {} issues found", rows.len());
-                for row in rows {
-                    match row.try_get::<String, _>(0) {
-                        Ok(result) => println!("    - {result}"),
-                        Err(e) => println!("    - [decode error: {e}]"),
-                    }
-                }
-            }
+    // PRAGMA integrity_check: verify DB structural integrity, attributing
+    // each problem so a damaged (rebuildable) search index is told apart
+    // from damage to canonical tables.
+    let healthy = match store.integrity_report().await {
+        Ok(report) if report.is_ok() => {
+            println!("  [ok] integrity_check: ok");
+            true
+        }
+        Ok(report) => {
+            db_repair::print_problems(&report, data_dir, db_repair::Severity::Fail);
+            false
         }
         Err(e) => {
-            println!("  [WARN] integrity_check failed: {e}");
+            println!("  [FAIL] integrity_check could not run: {e}");
+            false
         }
-    }
+    };
 
     println!("  [ok] WAL checkpoint skipped (read-only diagnostics)");
 
@@ -8660,6 +8676,7 @@ async fn report_db_health(store: &intent_store::DiagnosticStore) {
         pool.size(),
         pool.num_idle()
     );
+    healthy
 }
 
 #[cfg(unix)]

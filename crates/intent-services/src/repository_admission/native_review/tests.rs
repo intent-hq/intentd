@@ -7,6 +7,20 @@ use intent_core::repository_request::{
     RepositoryReadConnection, RepositoryReadRetirements, RepositoryWireEntry,
 };
 use intent_core::{HostRole, WorkspaceApi};
+use sqlx::Connection as _;
+
+/// A separate `SQLite` connection that can take the database write lock,
+/// standing in for another writer. Read-pool connections enforce
+/// `query_only` (intent-hq/intent#8592), so this detaches one from the pool
+/// and lifts the flag for that connection only; it closes when dropped.
+async fn foreign_writer(store: &intent_store::Store) -> sqlx::SqliteConnection {
+    let mut connection = store.read_pool().acquire().await.unwrap().detach();
+    sqlx::query("PRAGMA query_only = OFF")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection
+}
 
 async fn refused_stage_response(after_commit: bool, expire_queue: bool) {
     let f = Fixture::new().await;
@@ -174,13 +188,8 @@ async fn native_review_queue_deadline_does_not_retire_admitted_commit_or_next_st
         op.progress.lock().unwrap().started = true;
         // A real SQLite writer holds post-commit attribution. Reads, original
         // admission and the Git primitive still use their unchanged paths.
-        let transaction = f
-            .services
-            .store
-            .read_pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .unwrap();
+        let mut writer = foreign_writer(&f.services.store).await;
+        let transaction = writer.begin_with("BEGIN IMMEDIATE").await.unwrap();
         let deadline = Instant::now() + QUEUE_DEADLINE;
         let work = async {
             let _capacity = capacity;
@@ -699,13 +708,8 @@ async fn native_review_queue_stage_wall_retains_owned_work_receipt_and_stops_nex
         let frame = s.owner.capture_review(&Frame::Execute(q.clone())).unwrap();
         let capacity = job(&c).unwrap();
         op.progress.lock().unwrap().started = true;
-        let transaction = f
-            .services
-            .store
-            .read_pool()
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .unwrap();
+        let mut writer = foreign_writer(&f.services.store).await;
+        let transaction = writer.begin_with("BEGIN IMMEDIATE").await.unwrap();
         let deadline = Instant::now() + QUEUE_DEADLINE;
         let work = async {
             let _capacity = capacity;
@@ -2917,7 +2921,8 @@ async fn native_review_companion_pending_parent_cancel_and_owned_resource_releas
             let c = s.concrete(&f).await;
             let op = c.review.feed.lock().unwrap().records[&command.review.operation_id].clone();
             let before = f.git.git(&f.git.path, &["rev-parse", "HEAD"]);
-            let transaction = if entered { Some(f.services.store.read_pool().begin_with("BEGIN IMMEDIATE").await.unwrap()) } else { None };
+            let mut writer = if entered { Some(foreign_writer(&f.services.store).await) } else { None };
+            let transaction = match writer.as_mut() { Some(w) => Some(w.begin_with("BEGIN IMMEDIATE").await.unwrap()), None => None };
             let (held, ready) = tokio::sync::oneshot::channel();
             let (release, released) = tokio::sync::oneshot::channel();
             let store = f.services.clone(); let path = f.git.path.clone();

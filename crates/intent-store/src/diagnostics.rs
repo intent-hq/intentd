@@ -74,6 +74,15 @@ impl DiagnosticStore {
         })
     }
 
+    /// Classified `PRAGMA integrity_check`, naming damaged derived search
+    /// indexes that `intentd repair-indexes` can rebuild.
+    ///
+    /// # Errors
+    /// Returns an error when the check cannot run.
+    pub async fn integrity_report(&self) -> Result<crate::IntegrityReport> {
+        crate::check_integrity(&self.pool).await
+    }
+
     /// Close the read-only pool without checkpointing.
     pub async fn close(&self) {
         self.pool.close().await;

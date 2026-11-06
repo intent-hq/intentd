@@ -753,7 +753,13 @@ async fn escaped_handle_retains_ownership(read_pool: bool, kind: &str) {
         Store::open_for_daemon(&db).await.is_err(),
         "{kind}, read_pool={read_pool} outlived Store but lost ownership"
     );
-    let query = "UPDATE agent_session SET name = 'still writable' WHERE id = 'synthetic-agent'";
+    // Read connections enforce `query_only` (intent-hq/intent#8592), so a
+    // retained read handle proves it is still usable with a read.
+    let query = if read_pool {
+        "SELECT name FROM agent_session WHERE id = 'synthetic-agent'"
+    } else {
+        "UPDATE agent_session SET name = 'still writable' WHERE id = 'synthetic-agent'"
+    };
     if let Some(pool) = &retained_pool {
         // Force a fresh connection after dropping Store: pool options must
         // retain ownership as well as the original SQLite connection.
@@ -1093,10 +1099,13 @@ async fn renewed_facade_retains_ownership(read_pool: bool, handle: &str) {
     }
     pool.close().await;
     drop(pool);
-    sqlx::query("UPDATE agent_session SET name = 'renewed' WHERE id = 'synthetic-agent'")
-        .execute(&mut connection)
-        .await
-        .unwrap();
+    // Read connections enforce `query_only` (intent-hq/intent#8592).
+    let query = if read_pool {
+        "SELECT name FROM agent_session WHERE id = 'synthetic-agent'"
+    } else {
+        "UPDATE agent_session SET name = 'renewed' WHERE id = 'synthetic-agent'"
+    };
+    sqlx::query(query).execute(&mut connection).await.unwrap();
     assert!(
         Store::open_for_daemon(&db).await.is_err(),
         "renewed {handle} lost ownership, read_pool={read_pool}"
@@ -1265,4 +1274,116 @@ async fn write_renewal_initialization_retains_ownership_after_cancellation() {
 #[tokio::test]
 async fn read_renewal_initialization_retains_ownership_after_cancellation() {
     renewal_initialization_ownership(true).await;
+}
+
+impl Fixture {
+    fn repair_indexes(&self, success: bool) -> String {
+        let mut command = self.command(Path::new(env!("CARGO_BIN_EXE_intentd")));
+        command.arg("repair-indexes");
+        self.run_expected(command, "repair-indexes", success)
+    }
+
+    fn backups(&self) -> Vec<PathBuf> {
+        match fs::read_dir(self.data_dir().join("backups")) {
+            Ok(entries) => entries.map(|entry| entry.unwrap().path()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+const NOTE_BODY: &str = "sourceGateProgress receipt checkpoint";
+
+async fn seed_note(store: &Store) -> intent_core::Note {
+    sqlx::query("INSERT INTO workspace (id,title,branch,status,created_at,updated_at) VALUES ('synthetic-workspace','Synthetic','main','active',?,?)")
+        .bind(TIMESTAMP).bind(TIMESTAMP).execute(store.write_pool()).await.unwrap();
+    let note = intent_core::Note {
+        id: intent_core::NoteId::from("synthetic-note"),
+        workspace_id: intent_core::WorkspaceId::from("synthetic-workspace"),
+        title: "Receipts".into(),
+        content: format!("{NOTE_BODY}\n").repeat(50),
+        content_type: intent_core::ContentType::Markdown,
+        tags: vec!["review".into()],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: intent_core::NoteVisibility::Workspace,
+        metadata: intent_core::NoteMetadata::default(),
+        created_at: TIMESTAMP.into(),
+        rev: 0,
+        updated_at: TIMESTAMP.into(),
+    };
+    store.insert_note(&note).await.unwrap();
+    note
+}
+
+/// intent-hq/intent#8592: a damaged note search index is named by doctor
+/// (read-only, with the daemon's store open) and rebuilt by the offline
+/// `intentd repair-indexes`, which backs up first and keeps the note.
+#[tokio::test]
+async fn doctor_names_damaged_note_index_and_repair_indexes_rebuilds_it() {
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let writer = Store::open_for_daemon(&db).await.unwrap();
+    let note = seed_note(&writer).await;
+    sqlx::query("UPDATE note_fts_data SET block = zeroblob(length(block)) WHERE id > 10")
+        .execute(writer.write_pool())
+        .await
+        .unwrap();
+
+    // A damaged index fails doctor, so scripts and support checks notice it.
+    let doctor = fixture.doctor_output(false);
+    assert!(doctor.contains("[FAIL] integrity_check: "), "{doctor}");
+    assert!(
+        doctor.contains("the note search index (note_fts) is damaged"),
+        "{doctor}"
+    );
+    assert!(doctor.contains("intentd repair-indexes"), "{doctor}");
+    assert!(!doctor.contains("damage outside"), "{doctor}");
+
+    // While the daemon owns the database, the repair refuses and copies nothing.
+    fixture.repair_indexes(false);
+    assert!(fixture.backups().is_empty());
+    writer.close().await;
+    drop(writer);
+
+    let repair = fixture.repair_indexes(true);
+    assert!(
+        repair.contains("rebuilt: note search index (note_fts)"),
+        "{repair}"
+    );
+    assert!(repair.contains("backup written"), "{repair}");
+    let backups = fixture.backups();
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert!(backups[0].join("intentd.db").is_file());
+    let doctor = fixture.doctor_output(true);
+    assert!(doctor.contains("integrity_check: ok"), "{doctor}");
+
+    let store = Store::open(&db).await.unwrap();
+    let stored = store.get_note(&note.workspace_id, &note.id).await.unwrap();
+    assert_eq!(stored.content, note.content);
+    let hits = store
+        .search_notes_fts(
+            "sourceGateProgress",
+            &intent_store::NoteFtsOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn repair_indexes_refuses_while_the_daemon_instance_lock_is_held() {
+    let fixture = Fixture::new();
+    Store::open(&fixture.data_dir().join("intentd.db"))
+        .await
+        .unwrap()
+        .close()
+        .await;
+    let _daemon = fixture.lock();
+    fixture.repair_indexes(false);
+    let stderr = fs::read_to_string(fixture.root.path().join("repair-indexes.stderr")).unwrap();
+    assert!(stderr.contains("intentd stop"), "{stderr}");
+    assert!(fixture.backups().is_empty());
 }

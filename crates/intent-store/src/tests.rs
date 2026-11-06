@@ -28,6 +28,7 @@ mod workspace_label;
 mod workspace_plain_folder;
 mod workspace_retired;
 
+mod derived_index;
 mod metadata_key_json;
 mod note_line_attribution;
 mod note_paging_removal;

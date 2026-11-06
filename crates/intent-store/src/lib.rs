@@ -26,6 +26,11 @@ mod completion_wake_delivery_repo;
 mod completion_watch_repo;
 mod daemon_ownership;
 mod delegation_group_repo;
+mod derived_index;
+pub use derived_index::{
+    check_integrity, repair_derived_indexes, DerivedIndex, IntegrityProblem, IntegrityReport,
+    RepairAction, RepairReport,
+};
 mod desktop_repo;
 mod diagnostics;
 mod store_pool;
@@ -398,8 +403,8 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// Holds two pools over the same DB file: a single-connection **write pool**
 /// (`max_connections=1`) to serialize all mutations and eliminate in-process
 /// writer-vs-writer `busy_timeout` contention, and a **read pool** (32 connections)
-/// intended for concurrent read (SELECT) queries — a convention, not an enforced
-/// constraint. See `connect_write` / `connect_read` for the pool configurations.
+/// for concurrent read (SELECT) queries, enforced with `PRAGMA query_only`.
+/// See `connect_write` / `connect_read` for the pool configurations.
 #[derive(Clone)]
 pub struct Store {
     // Also retained by connection options and SQLite handles; see retain_owner.
@@ -1037,9 +1042,10 @@ async fn create_database_file(
 }
 
 /// Open a WAL-mode `SQLite` **read pool** with `max_connections=32` (§9.4).
-/// The read pool is intended for read (SELECT) queries — by convention, not an
-/// enforced read-only configuration — and supports concurrent readers without
-/// contention (`SQLite` WAL mode allows many simultaneous readers).
+/// The read pool serves read (SELECT) queries — enforced with `PRAGMA
+/// query_only`, so a write fails with `SQLITE_READONLY` — and supports
+/// concurrent readers without contention (`SQLite` WAL mode allows many
+/// simultaneous readers).
 ///
 /// The PRAGMAs match the write pool — `journal_mode = WAL`, `foreign_keys =
 /// ON`, `busy_timeout = 5000`, `synchronous = NORMAL` — except `auto_vacuum`,
@@ -1091,6 +1097,16 @@ async fn connect_read_owned_timeout(
     } else {
         opts
     };
+    // Enforce the read-only convention (intent-hq/intent#8592): with
+    // `query_only` a read connection cannot write, so a stray write fails
+    // with SQLITE_READONLY instead of becoming a second concurrent writer
+    // beside the single write connection. SQLite's WAL-reset corruption bug
+    // (fixed in 3.51.3; this build bundles 3.46.0) needs two connections
+    // writing or checkpointing at once. This narrows it but does not stop a
+    // read connection from checkpointing (explicitly, or as the last one to
+    // close). The WAL PRAGMAs that follow are no-ops on an existing WAL
+    // database and still succeed under `query_only`.
+    let opts = opts.pragma("query_only", "ON");
 
     retain_pool_owner(SqlitePoolOptions::new(), owner.clone())
         .max_connections(32)
