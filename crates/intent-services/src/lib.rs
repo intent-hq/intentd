@@ -23981,27 +23981,32 @@ impl WorkspaceApi for Services {
                                     .and_then(std::result::Result::ok)
                                     .flatten()
                                 };
-                                let announced_refresh = refresh_branch.is_some();
+                                // Announced inside the per-repo lock, right
+                                // before the fetch, so a create waiting on
+                                // another create's lock is not shown as
+                                // fetching.
+                                let refresh_message = refresh_branch
+                                    .as_deref()
+                                    .map(|base| format!("Updating {base} from {remote}..."));
                                 // Local-repo provisioning milestone (unified
                                 // scale): the CoW copy / worktree add is the
                                 // dominant step of a local create, so it sits
                                 // mid-scale (no clone segment ran before it;
                                 // after a network clone the monotonic clamp
                                 // lifts it to the 85+ tail automatically).
-                                if let Some(reporter) = progress.as_deref() {
-                                    if let Some(base) = refresh_branch.as_deref() {
-                                        let message =
-                                            format!("Updating {base} from {remote}...");
-                                        boxed_await(|| {
-                                            reporter.milestone("base-refresh", 20, &message)
-                                        })
-                                        .await;
-                                    } else {
+                                // With a base refresh it follows the fetch.
+                                if refresh_message.is_none() {
+                                    if let Some(reporter) = progress.as_deref() {
                                         boxed_await(|| reporter.checkout_milestone(mode)).await;
                                     }
                                 }
-                                let provision = |mode: intent_core::CheckoutMode| {
+                                // `fetch_first`: run the PR-head / base fetch
+                                // before the checkout. The CoW→worktree retry
+                                // passes `false` — the first attempt already
+                                // fetched under the lock.
+                                let provision = |mode: intent_core::CheckoutMode, fetch_first: bool| {
                                     let name = name.clone();
+                                    let refresh_message = refresh_message.clone();
                                     let pr_checkout = pr_checkout.clone();
                                     let pr_token = pr_token.clone();
                                     let branch = branch.clone();
@@ -24044,8 +24049,21 @@ impl WorkspaceApi for Services {
                                                 let fetch_base = base_ref.clone();
                                                 let fetch_pr = pr_checkout.clone();
                                                 let fetch_token = pr_token.clone();
+                                                let announce = fetch_first
+                                                    .then_some(refresh_message.as_deref())
+                                                    .flatten();
+                                                if let (Some(reporter), Some(message)) =
+                                                    (progress.as_deref(), announce)
+                                                {
+                                                    boxed_await(|| {
+                                                        reporter.milestone("base-refresh", 20, message)
+                                                    })
+                                                    .await;
+                                                }
                                                 tokio::task::spawn_blocking(move || {
-                                                    if let Some((number, sha)) = fetch_pr.as_ref() {
+                                                    if !fetch_first {
+                                                        Ok(())
+                                                    } else if let Some((number, sha)) = fetch_pr.as_ref() {
                                                         intent_git::fetch::prepare_pr_branch(
                                                             &fetch_repo,
                                                             &fetch_remote,
@@ -24070,7 +24088,7 @@ impl WorkspaceApi for Services {
                                                 .map_err(|e| Error::Internal(format!(
                                                     "checkout provisioning task failed: {e}"
                                                 )))??;
-                                                if announced_refresh {
+                                                if announce.is_some() {
                                                     if let Some(reporter) = progress.as_deref() {
                                                         boxed_await(|| reporter.checkout_milestone(mode)).await;
                                                     }
@@ -24135,7 +24153,7 @@ impl WorkspaceApi for Services {
                                             .await
                                     }
                                 };
-                                let sha = match boxed_await(|| provision(mode)).await {
+                                let sha = match boxed_await(|| provision(mode, true)).await {
                                     Ok(sha) => sha,
                                     Err(Error::Unsupported(reason))
                                         if mode == intent_core::CheckoutMode::Cow =>
@@ -24153,7 +24171,7 @@ impl WorkspaceApi for Services {
                                         );
                                         remove_workspace_dir_if_empty(&ws_dir);
                                         mode = intent_core::CheckoutMode::Worktree;
-                                        match boxed_await(|| provision(mode)).await {
+                                        match boxed_await(|| provision(mode, false)).await {
                                             Ok(sha) => sha,
                                             Err(e) => {
                                                 // `provision_worktree` creates

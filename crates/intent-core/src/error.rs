@@ -202,7 +202,7 @@ pub enum Error {
     /// `error.data = { code: "base-refresh-failed", category, detail, baseRef,
     /// remote }`. `detail` is git's (bounded, credential-redacted) output.
     /// Distinct from [`Error::CloneFailed`]: its classifier is fetch-specific.
-    #[error("Couldn't update {} from {}: {}", .0.base_ref, .0.remote, .0.detail)]
+    #[error("{}", .0.message())]
     BaseRefreshFailed(Box<BaseRefreshFailure>),
 
     /// The `voice.transcribe` provider API key is missing. Surfaces as
@@ -688,6 +688,29 @@ pub struct BaseRefreshFailure {
     pub base_ref: String,
     /// Remote name (e.g. `origin`).
     pub remote: String,
+}
+
+impl BaseRefreshFailure {
+    /// One-line wire `message`: `Couldn't update <base> from <remote>:
+    /// <cause>`, where the cause is the first meaningful line of `detail`
+    /// (skipping blank, `hint:` and `warning:` lines). The full text stays in
+    /// `detail`.
+    #[must_use]
+    pub fn message(&self) -> String {
+        let cause = self
+            .detail
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                let lower = line.to_ascii_lowercase();
+                !line.is_empty() && !lower.starts_with("hint:") && !lower.starts_with("warning:")
+            })
+            .unwrap_or_else(|| self.detail.trim());
+        format!(
+            "Couldn't update {} from {}: {cause}",
+            self.base_ref, self.remote
+        )
+    }
 }
 
 /// Message for [`Error::RetireUnsupported`].

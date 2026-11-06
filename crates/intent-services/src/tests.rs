@@ -38205,7 +38205,7 @@ mod clone_orchestration {
         (upstream, source, branch)
     }
 
-    async fn worktree_create_phases(skip_base_refresh: Option<bool>) -> Vec<(String, String)> {
+    async fn worktree_create_phases(skip_base_refresh: Option<bool>) -> Vec<(String, String, i64)> {
         let (_upstream, source, branch) = seed_tracking_clone("intentd-prog-base");
         let root = unique_dir("intentd-prog-base-root");
         let tmp = TempDb::new();
@@ -38240,6 +38240,7 @@ mod clone_orchestration {
                         .as_str()
                         .unwrap_or_default()
                         .replace(&branch, "<base>"),
+                    f.data["percent"].as_i64().unwrap_or_default(),
                 )
             })
             .collect()
@@ -38253,12 +38254,13 @@ mod clone_orchestration {
         let phases = worktree_create_phases(None).await;
         let refresh = phases
             .iter()
-            .position(|(p, _)| p == "base-refresh")
+            .position(|(p, _, _)| p == "base-refresh")
             .unwrap_or_else(|| panic!("base-refresh milestone emitted: {phases:?}"));
         assert_eq!(phases[refresh].1, "Updating <base> from origin...");
+        assert_eq!(phases[refresh].2, 20, "nominal base-refresh percent");
         let worktree = phases
             .iter()
-            .position(|(p, _)| p == "worktree")
+            .position(|(p, _, _)| p == "worktree")
             .unwrap_or_else(|| panic!("worktree milestone emitted: {phases:?}"));
         assert!(
             refresh < worktree,
@@ -38271,10 +38273,10 @@ mod clone_orchestration {
     async fn progress_id_skip_base_refresh_emits_no_base_refresh_milestone() {
         let phases = worktree_create_phases(Some(true)).await;
         assert!(
-            !phases.iter().any(|(p, _)| p == "base-refresh"),
+            !phases.iter().any(|(p, _, _)| p == "base-refresh"),
             "no base-refresh milestone when skipped: {phases:?}"
         );
-        assert!(phases.iter().any(|(p, _)| p == "worktree"), "{phases:?}");
+        assert!(phases.iter().any(|(p, _, _)| p == "worktree"), "{phases:?}");
     }
 
     /// Direct mode (`isNewRepo`): the daemon-initialized repo path streams

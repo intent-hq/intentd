@@ -270,6 +270,11 @@ fn source_with_origin(upstream: &Path, url: &str) -> tempfile::TempDir {
     let source = common::test_tempdir("wt-refresh-failed-source-");
     git(source.path(), &["clone", upstream.to_str().unwrap(), "."]);
     git(source.path(), &["remote", "set-url", "origin", url]);
+    // Hermetic against the runner's global git config and environment: no
+    // credential helper or askpass may answer, and no proxy may intercept.
+    git(source.path(), &["config", "credential.helper", ""]);
+    git(source.path(), &["config", "core.askPass", ""]);
+    git(source.path(), &["config", "http.proxy", ""]);
     source
 }
 
@@ -310,10 +315,18 @@ async fn assert_base_refresh_failed(
     let detail = err["data"]["detail"].as_str().expect("detail string");
     assert!(!detail.is_empty(), "{resp}");
     let message = err["message"].as_str().unwrap();
+    let cause = message
+        .strip_prefix(&format!("Couldn't update {base} from origin: "))
+        .unwrap_or_else(|| panic!("documented message prefix: {resp}"));
+    assert!(
+        !cause.is_empty() && !cause.contains('\n') && detail.contains(cause),
+        "message carries one line of detail: {resp}"
+    );
+    let list = wss_rpc_raw(&mut rpc, 2, "workspace.list", json!({})).await;
     assert_eq!(
-        message,
-        format!("Couldn't update {base} from origin: {detail}"),
-        "{resp}"
+        list["result"]["workspaces"].as_array().map(Vec::len),
+        Some(0),
+        "no workspace row may be persisted: {list}"
     );
     assert!(
         git(source, &["branch", "--list", branch]).is_empty(),

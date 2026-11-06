@@ -175,7 +175,10 @@ impl FetchFailure {
         };
         Error::BaseRefreshFailed(Box::new(intent_core::BaseRefreshFailure {
             category,
-            detail: crate::redact::redact_credentials(&bounded_tail(&raw, BASE_REFRESH_DETAIL_MAX)),
+            detail: bounded_tail(
+                &crate::redact::redact_credentials(&raw),
+                BASE_REFRESH_DETAIL_MAX,
+            ),
             base_ref: base_ref.to_string(),
             remote: remote.to_string(),
         }))
@@ -224,6 +227,10 @@ pub fn classify_fetch_error(stderr: &str) -> intent_core::BaseRefreshErrorCatego
         "network is unreachable",
         "no route to host",
         "failed to connect to",
+        "connection reset by peer",
+        "connection closed by",
+        "kex_exchange_identification",
+        "could not resolve proxy",
     ]) {
         C::Network
     } else if any(&[
@@ -401,6 +408,13 @@ fn run_fetch(
         }
         cmd.env(TOKEN_ENV, token);
     }
+    // Own process group, so a timeout kill also reaps the transport
+    // (`ssh`, `git-remote-https`) instead of orphaning it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd
         .arg("fetch")
         .arg(remote)
@@ -429,19 +443,32 @@ fn run_fetch(
                 if Instant::now() >= deadline {
                     // Real cancellation: kill the child so no orphaned git process
                     // survives the wall-clock bound. `wait` reaps the exit status.
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_fetch_group(&mut child);
                     return Err(FetchFailure::TimedOut(timeout));
                 }
                 std::thread::sleep(SHELL_FETCH_POLL);
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_fetch_group(&mut child);
                 return Err(FetchFailure::Wait(e.to_string()));
             }
         }
     }
+}
+
+/// Kill the fetch child's whole process group (started with
+/// `process_group(0)`), then the child itself, and reap it.
+fn kill_fetch_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: this PID belongs to our child, started with process_group(0).
+        // A negative PID signals only that owned process group.
+        unsafe {
+            libc::kill(-child.id().cast_signed(), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn read_stderr(child: &mut std::process::Child) -> String {
@@ -553,6 +580,19 @@ mod tests {
             ("remote: Permission to o/r.git denied to someone.\nfatal: unable to access: The requested URL returned error: 403", C::AccessDenied),
             ("error: cannot open .git/FETCH_HEAD: Permission denied", C::Other),
             ("fatal: couldn't find remote ref main", C::Other),
+            ("fatal: could not read Password for 'https://u@x': terminal prompts disabled", C::AuthRequired),
+            ("fatal: unable to access 'https://x/': The requested URL returned error: 401", C::AuthRequired),
+            ("fatal: unable to access 'https://x/': The requested URL returned error: 404", C::RepoNotFound),
+            ("fatal: unable to access 'https://x/': The requested URL returned error: 403", C::AccessDenied),
+            ("error: 403 Forbidden while accessing https://x/", C::AccessDenied),
+            ("ssh: connect to host x port 22: Connection timed out", C::Network),
+            ("kex_exchange_identification: Connection closed by remote host", C::Network),
+            ("fatal: unable to access 'https://x/': Could not resolve proxy: p", C::Network),
+            // First match wins across categories.
+            ("Host key verification failed.\nPermission denied (publickey).", C::SshHostKey),
+            ("Permission denied (publickey).\nssh: Could not resolve hostname x", C::AuthRequired),
+            ("Could not resolve host: x\nRepository not found", C::Network),
+            ("Repository not found\nThe requested URL returned error: 403", C::RepoNotFound),
         ] {
             assert_eq!(classify_fetch_error(stderr), want, "{stderr}");
         }
