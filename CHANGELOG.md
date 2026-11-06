@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.139] - 2026-11-06
+
+### 🐛 Bug Fixes
+
+- *(store)* Detect and repair damaged search indexes; make the read pool read-only ([#3070](https://github.com/intent-hq/intentd/pull/3070))
+
+
 ## [0.11.138] - 2026-11-06
 
 ### 🐛 Bug Fixes
