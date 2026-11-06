@@ -8,13 +8,19 @@ Without the variable or a token (for example fork pull requests) compilation
 is uncached.
 """
 import hashlib
+import http.client
 import os
 from pathlib import Path
 import platform
+import shutil
 import socket
+import ssl
 import subprocess
+import sys
 import tarfile
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -67,6 +73,39 @@ def configuration(env):
     return select(env)[2]
 
 
+# A single GitHub 504 on the release download ejected merge-queue PRs
+# (intent-hq/intent#8613, runs 41999101145 and 41999539245). Retry transient
+# failures only: 5xx responses, connection errors and timeouts. A 4xx (a wrong
+# version or asset name) fails at once. Delays between attempts, in seconds.
+RETRY_DELAYS = (2, 5, 15)
+DOWNLOAD_TIMEOUT = 60
+
+
+def fetch(url, dest):
+    """Download url to dest in one attempt."""
+    with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response, open(dest, "wb") as output:
+        shutil.copyfileobj(response, output)
+
+
+def transient(error):
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code >= 500
+    return isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, ssl.SSLError, http.client.HTTPException))
+
+
+def download(url, dest, delays=RETRY_DELAYS, sleep=None):
+    """fetch() with bounded retries on transient failures; re-raises the last error."""
+    for attempt, delay in enumerate((*delays, None), start=1):
+        try:
+            return fetch(url, dest)
+        except Exception as error:
+            if delay is None or not transient(error):
+                raise
+            print(f"::warning::sccache download attempt {attempt} failed ({error}); "
+                  f"retrying in {delay}s", file=sys.stderr)
+            (sleep or time.sleep)(delay)
+
+
 def install(directory):
     target, checksum = ASSETS[(platform.system(), platform.machine())]
     stem = f"sccache-v{VERSION}-{target}"
@@ -77,7 +116,7 @@ def install(directory):
     # on a different, nearly full drive than RUNNER_TEMP.
     with tempfile.TemporaryDirectory(dir=directory.parent) as scratch:
         archive = Path(scratch) / "sccache.tar.gz"
-        urllib.request.urlretrieve(f"https://github.com/mozilla/sccache/releases/download/v{VERSION}/{stem}.tar.gz", archive)
+        download(f"https://github.com/mozilla/sccache/releases/download/v{VERSION}/{stem}.tar.gz", archive)
         if hashlib.sha256(archive.read_bytes()).hexdigest() != checksum:
             raise RuntimeError("sccache release checksum mismatch")
         with tarfile.open(archive) as tar:
