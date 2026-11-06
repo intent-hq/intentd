@@ -2026,6 +2026,37 @@ mod final_stops {
         node.shutdown();
     }
 
+    /// A connector shut down before its dial loop first ran (a restart
+    /// replacing it at once) binds no link: one would claim the lease and
+    /// then close under the connector that replaced it (intent#8611).
+    #[tokio::test]
+    async fn a_connector_shut_down_before_it_dials_binds_no_link() {
+        let backend = Backend::new().await;
+        let mut machine = Machine::start(&backend.id().await).await;
+        backend.expose(&mut machine).await.shutdown();
+        machine.stop().await;
+        let node = backend.bare(&machine).await;
+        let agent = placed(&backend, &node, &machine).await;
+        node.final_stop(&agent, FinalStopReason::AgentDeleted).await;
+        node.shutdown();
+        // The first connector's refused dials end while the machine is away.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        machine.restart().await;
+
+        // The pending final stop wants a link, but this connector is shut
+        // down before its loop is first polled (single-threaded runtime).
+        let stale = backend.bare(&machine).await;
+        stale.shutdown();
+        machine.no_link(Duration::from_millis(500)).await;
+
+        // Its replacement binds and sends the final stop.
+        let node = backend.bare(&machine).await;
+        let mut link = machine.accept().await;
+        assert!(link.hello.lease_agents.contains(&agent));
+        final_stop_for(&mut link, &agent).await;
+        node.shutdown();
+    }
+
     #[tokio::test]
     async fn a_retired_agents_placement_outlives_its_final_stop() {
         let (mut machine, backend, node) = exposed().await;
@@ -2310,6 +2341,43 @@ mod final_stops {
         // Nothing is left to send: the machine coming back is not dialed.
         machine.restart().await;
         machine.no_link(Duration::from_millis(300)).await;
+        node.shutdown();
+    }
+
+    /// The expiry timer and the dial loop can both list one expired final
+    /// stop: only the load that drops its record settles it, so the
+    /// machine runs settle once (intent#8610).
+    #[tokio::test]
+    async fn two_loads_of_one_expired_final_stop_settle_it_once() {
+        let backend = Backend::new().await;
+        let mut machine = Machine::start(&backend.id().await).await;
+        backend.expose(&mut machine).await.shutdown();
+        machine.stop().await;
+        let clock = crate::final_stop::Clock::default();
+        let mut quick = tuning();
+        quick.clock = clock.clone();
+        let node = backend.bare_with(&machine, quick).await;
+        let agent = placed(&backend, &node, &machine).await;
+        node.final_stop(&agent, FinalStopReason::AgentDeleted).await;
+        let shared = node.shared_ref();
+        // Both loads listed the record before either dropped it.
+        let listed = shared.list_final_stops_for_test().await;
+        assert_eq!(listed.len(), 1);
+        clock.offset_secs.store(
+            i64::try_from(intent_core::remote_launch::FINAL_STOP_BOUND.as_secs()).unwrap(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        shared.settle_twice_for_test(listed).await;
+        assert!(backend
+            .store()
+            .get_final_stop(&agent)
+            .await
+            .unwrap()
+            .is_none());
+        // The timer or the dial loop may have dropped it first; either
+        // way it settles exactly once.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(shared.final_settles_for_test(), vec![agent.clone()]);
         node.shutdown();
     }
 
