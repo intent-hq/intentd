@@ -199,18 +199,12 @@ n=$((n + 1)); echo "$n" > "{temp}/count"
 [ "$n" -gt {failures} ] || exit 22
 echo 'echo installed >> "{temp}/installed"'
 ''')
-            executable(bin_dir / 'pwsh', f'''printf '%s\\n' "$@" > "{temp}/pwsh-args"
-n=$(cat "{temp}/count" 2>/dev/null || echo 0)
-n=$((n + 1)); echo "$n" > "{temp}/count"
-[ "$n" -gt {failures} ] || exit 1
-echo installed >> "{temp}/installed"
-''')
             env = {'PATH': f'{bin_dir}:{os.environ["PATH"]}', 'INSTALL_DIST_DELAY': '0',
                    'INSTALL_DIST_RUN': run or 'fake-download | sh', 'INSTALL_DIST_SHELL': shell}
             result = subprocess.run(['bash', str(ROOT / 'scripts/install-dist.sh')], env=env,
                                     capture_output=True, text=True)
             read = lambda name: (temp / name).read_text() if (temp / name).exists() else ''
-            return result, read('count').strip(), read('installed'), read('pwsh-args')
+            return result, read('count').strip(), read('installed'), None
 
     def test_failed_download_is_retried_not_fed_to_sh(self):
         # Without pipefail the first failure would "succeed" with nothing installed.
@@ -225,16 +219,12 @@ echo installed >> "{temp}/installed"
         self.assertEqual((count, installed), ('4', ''))
         self.assertIn('failed after 4 attempts', result.stderr)
 
-    def test_pwsh_command_runs_with_stop_preference(self):
-        result, count, installed, args = self.run_script(failures=1, shell='pwsh', run='irm https://x/i.ps1 | iex')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((count, installed), ('2', 'installed\n'))
-        self.assertIn("$ErrorActionPreference = 'Stop'; irm https://x/i.ps1 | iex", args)
-
-    def test_unknown_shell_is_refused(self):
-        result, count, _, _ = self.run_script(failures=0, shell='cmd')
-        self.assertEqual((result.returncode, count), (2, ''))
-        self.assertIn('unsupported INSTALL_DIST_SHELL', result.stderr)
+    def test_non_sh_shells_are_refused(self):
+        # Windows legs (shell pwsh) use the native pwsh step, never this script.
+        for shell in ('pwsh', 'cmd', ''):
+            result, count, _, _ = self.run_script(failures=0, shell=shell)
+            self.assertEqual((result.returncode, count), (2, ''), shell)
+            self.assertIn('unsupported INSTALL_DIST_SHELL', result.stderr)
 
 
 def wget_download_function():
@@ -253,15 +243,16 @@ class InstallShWget(unittest.TestCase):
     def run_wget(self, shell, failures):
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)
-            executable(temp / 'wget', f'''echo "$*" >> "{temp}/calls"
-n=$(wc -l < "{temp}/calls")
-if [ "$n" -le {failures} ]; then : > "$2"; exit 8; fi
-echo archive > "$2"
-''')
-            driver = (f'set -eu\nPATH="{temp}:$PATH"\nsleep() {{ echo "$1" >> "{temp}/sleeps"; }}\n'
+            # A shell function, not a PATH stub: busybox ash runs its built-in
+            # wget applet ahead of PATH, but functions win in every shell.
+            stub = (f'wget() {{ echo "$*" >> "{temp}/calls"; n=$(wc -l < "{temp}/calls"); '
+                    f'if [ "$n" -le {failures} ]; then : > "$2"; echo "wget: attempt $n failed" >&2; return 8; fi; '
+                    f'echo archive > "$2"; }}\n')
+            driver = (f'set -eu\n{stub}sleep() {{ echo "$1" >> "{temp}/sleeps"; }}\n'
                       f'{wget_download_function()}\n'
                       f'if wget_download https://example.invalid/a.tar.xz "{temp}/a.tar.xz"; then echo ok; else echo failed; fi\n')
             result = subprocess.run([*shell, '-c', driver], capture_output=True, text=True)
+            self.assertTrue((temp / 'calls').exists(), f'{shell}: the wget stub never ran: {result.stderr!r}')
             calls = (temp / 'calls').read_text().splitlines()
             sleeps = (temp / 'sleeps').read_text().split() if (temp / 'sleeps').exists() else []
             data = (temp / 'a.tar.xz').read_text()
@@ -272,16 +263,19 @@ echo archive > "$2"
 
     def test_transient_failures_are_retried_quietly(self):
         for shell in POSIX_SHELLS:
-            result, calls, sleeps, data = self.run_wget(shell, failures=2)
-            self.assertEqual((result.stdout, result.stderr), ('ok\n', ''), shell)
-            self.assertEqual((len(calls), sleeps, data), (3, ['1', '2'], 'archive\n'), shell)
-            self.assertEqual(calls[0], f'-qO {calls[0].split()[1]} https://example.invalid/a.tar.xz', shell)
+            with self.subTest(shell=' '.join(shell)):
+                result, calls, sleeps, data = self.run_wget(shell, failures=2)
+                # Retried attempts' errors are hidden: output as for one good attempt.
+                self.assertEqual((result.stdout, result.stderr), ('ok\n', ''))
+                self.assertEqual((len(calls), sleeps, data), (3, ['1', '2'], 'archive\n'))
+                self.assertEqual(calls[0], f'-qO {calls[0].split()[1]} https://example.invalid/a.tar.xz')
 
-    def test_retries_are_bounded(self):
+    def test_retries_are_bounded_and_the_last_error_shows(self):
         for shell in POSIX_SHELLS:
-            result, calls, sleeps, _ = self.run_wget(shell, failures=10)
-            self.assertEqual((result.stdout, result.stderr), ('failed\n', ''), shell)
-            self.assertEqual((len(calls), sleeps), (4, ['1', '2', '3']), shell)
+            with self.subTest(shell=' '.join(shell)):
+                result, calls, sleeps, _ = self.run_wget(shell, failures=10)
+                self.assertEqual((result.stdout, result.stderr), ('failed\n', 'wget: attempt 4 failed\n'))
+                self.assertEqual((len(calls), sleeps), (4, ['1', '2', '3']))
 
     def test_curl_path_is_unchanged(self):
         self.assertIn("""download() { curl --proto '=https' --tlsv1.2 --retry 3 -fsSL -o "$2" "$1"; }""",
@@ -298,6 +292,8 @@ PYTHON_DOWNLOADERS = {
     # Local/offline-first corpus check with its own two-attempt loop.
     'scripts/check-provider-error-corpus.py': 'for attempt in range(2):',
 }
+# The two wget calls inside install.sh's retrying wget_download().
+WGET_HELPER_LINES = ('if wget -qO "$2" "$1" 2>/dev/null; then', 'wget -qO "$2" "$1"')
 # Known single-shot downloads left for a follow-up, with the reason.
 KNOWN_SINGLE_SHOT = {
     # User-facing Windows installer; its retry needs Windows/Pester coverage.
@@ -361,12 +357,24 @@ class RepositoryScan(unittest.TestCase):
     def test_wget_only_in_the_retrying_install_helper(self):
         offenders = [f'{file}: {line}' for file, text in self.shell_sources()
                      for line in command_lines(text) if invokes('wget', line)
-                     and not (file == 'scripts/install.sh' and line == 'while ! wget -qO "$2" "$1"; do')]
+                     and not (file == 'scripts/install.sh' and line in WGET_HELPER_LINES)]
         self.assertEqual(offenders, [])
 
     def test_planned_installer_runs_through_the_retry_script(self):
         for file, text in workflow_runs():
             self.assertNotIn('${{ matrix.install_dist.run }}', text, f'{file}: use scripts/install-dist.sh')
+
+    def test_windows_installer_step_retries(self):
+        steps = 0
+        for path in ('.github/workflows/v-release.yml', '.github/workflows/release-cache.yml'):
+            for job in yaml.safe_load((ROOT / path).read_text())['jobs'].values():
+                for step in job.get('steps', []):
+                    if '${{ matrix.install_dist.run }}' in str(step.get('env', {})) and step.get('shell') == 'pwsh':
+                        steps += 1
+                        self.assertEqual(step.get('if'), "runner.os == 'Windows'", path)
+                        for part in ('$attempt -ge 4', 'Start-Sleep', 'Invoke-Expression $env:INSTALL_DIST_RUN'):
+                            self.assertIn(part, step['run'], path)
+        self.assertEqual(steps, 2)
 
     def test_workflow_web_requests_retry(self):
         for file, text in workflow_runs():

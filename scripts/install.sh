@@ -83,16 +83,18 @@ xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>
 # single GitHub/CDN 5xx or dropped connection would otherwise fail the
 # install (the curl path gets the same from --retry). Flag-minimal for busybox
 # wget, whose exit status does not tell a 5xx from a 404, so every failure is
-# retried: four attempts, 1s/2s/3s apart, quiet like the single attempt was.
+# retried: four attempts, 1s/2s/3s apart. Only the last attempt's error is
+# shown, so the output matches the single attempt this replaced.
 wget_download() {
   wget_attempt=1
-  while ! wget -qO "$2" "$1"; do
-    if [ "$wget_attempt" -ge 4 ]; then
-      return 1
+  while [ "$wget_attempt" -lt 4 ]; do
+    if wget -qO "$2" "$1" 2>/dev/null; then
+      return 0
     fi
     sleep "$wget_attempt"
     wget_attempt=$((wget_attempt + 1))
   done
+  wget -qO "$2" "$1"
 }
 
 tmpdir=""

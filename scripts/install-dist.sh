@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Run cargo-dist's planned installer command with bounded retries.
 #
-# The build legs of v-release.yml and release-cache.yml install dist with the
-# command `dist plan` puts in matrix.install_dist: `curl ... | sh` (shell sh)
-# or `irm ... | iex` (shell pwsh). One GitHub 5xx on that download failed the
+# The Unix build legs of v-release.yml and release-cache.yml install dist with
+# the command `dist plan` puts in matrix.install_dist: `curl ... | sh` (shell
+# sh). Windows legs keep a native pwsh step with the same bounded loop inline
+# (`irm ... | iex`), so no shell script runs there. One GitHub 5xx on that download failed the
 # leg (the same single-shot pattern as intent-hq/intent#8613). The command
 # comes from the plan, so the whole command is retried: four attempts with
 # linear backoff. A permanent failure (for example a missing release) fails
 # after the last attempt with the installer's own error.
 #
-# Usage: INSTALL_DIST_RUN=<command> INSTALL_DIST_SHELL=sh|pwsh install-dist.sh
+# Usage: INSTALL_DIST_RUN=<command> INSTALL_DIST_SHELL=sh install-dist.sh
 # INSTALL_DIST_DELAY (seconds, default 10) scales the backoff; tests set 0.
 # The download-retry suite (test-download-retry) covers this script.
 set -euo pipefail
@@ -22,8 +23,7 @@ case "${INSTALL_DIST_SHELL:-}" in
   # bash, not sh: pipefail makes a failed curl fail the pipeline instead of
   # feeding sh an empty script that "succeeds".
   sh) run_installer() { bash -o pipefail -c "$run"; } ;;
-  pwsh) run_installer() { pwsh -NoProfile -NonInteractive -Command "\$ErrorActionPreference = 'Stop'; $run"; } ;;
-  *) echo "::error::install-dist.sh: unsupported INSTALL_DIST_SHELL '${INSTALL_DIST_SHELL:-}' (want sh or pwsh)" >&2
+  *) echo "::error::install-dist.sh: unsupported INSTALL_DIST_SHELL '${INSTALL_DIST_SHELL:-}' (want sh; Windows uses the pwsh step)" >&2
      exit 2 ;;
 esac
 

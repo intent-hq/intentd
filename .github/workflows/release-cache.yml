@@ -217,12 +217,29 @@ jobs:
           *) echo "no tailcat mapping for target '${{ join(matrix.targets, ' ') }}'" >&2; exit 1 ;;
         esac
         ls -l "$dest"
-    - name: Install dist
+    - name: Install dist (Unix)
+      if: runner.os != 'Windows'
       shell: bash
       env:
         INSTALL_DIST_RUN: ${{ matrix.install_dist.run }}
         INSTALL_DIST_SHELL: ${{ matrix.install_dist.shell }}
       run: bash scripts/install-dist.sh
+    - name: Install dist (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        INSTALL_DIST_RUN: ${{ matrix.install_dist.run }}
+      run: |
+        for ($attempt = 1; ; $attempt++) {
+          try {
+            Invoke-Expression $env:INSTALL_DIST_RUN
+            break
+          } catch {
+            if ($attempt -ge 4) { throw }
+            Write-Warning "cargo-dist installer attempt $attempt failed ($($_.Exception.Message)); retrying in $(10 * $attempt)s"
+            Start-Sleep -Seconds (10 * $attempt)
+          }
+        }
     - name: Install native build dependencies
       shell: bash
       run: ${{ matrix.packages_install }}
