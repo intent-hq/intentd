@@ -40,6 +40,7 @@ use intent_core::{Error, Result};
 use intent_services::feature_api::Services;
 
 mod agents;
+mod cloud;
 mod connect;
 mod connector;
 mod final_stop;
@@ -72,6 +73,8 @@ pub struct RemoteFeature {
     tailcat_bin: Mutex<Option<PathBuf>>,
     /// Connector timing; the defaults unless a test shortens them.
     tuning: Mutex<Option<connector::Tuning>>,
+    /// E2B cloud machines: starts in flight and the settings lock.
+    pub(crate) cloud: cloud::CloudState,
 }
 
 impl RemoteFeature {
@@ -188,7 +191,7 @@ impl RemoteFeature {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

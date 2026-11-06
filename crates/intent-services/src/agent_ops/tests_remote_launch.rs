@@ -51,6 +51,7 @@ fn view(placement: &AgentPlacement) -> RemotePlacementView {
         skills: None,
         shared_checkout_of: None,
         parent_work: None,
+        cloud_start: None,
     }
 }
 
@@ -189,6 +190,8 @@ async fn a_placed_create_persists_its_node_and_reports_what_it_starts_from() {
             provider: "auggie".into(),
             model: Some("sonnet4.5".into()),
             with_profile: false,
+            sets_profile_env: false,
+            provider_ref: "auggie".into(),
         }]
     );
 
@@ -410,6 +413,8 @@ async fn a_saved_profile_is_admitted_for_a_remote_agent() {
             provider: "codex".into(),
             model: Some("gpt-5".into()),
             with_profile: true,
+            sets_profile_env: true,
+            provider_ref: reference.into(),
         }]
     );
 }
@@ -564,6 +569,7 @@ async fn expose_node(svc: &Services, providers: Vec<intent_core::node_link::Prov
             added_at: intent_core::now_iso(),
             last_connected_at: None,
             node_protocol: None,
+            cloud: None,
         })
         .await
         .unwrap();

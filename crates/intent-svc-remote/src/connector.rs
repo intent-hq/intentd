@@ -1360,10 +1360,7 @@ impl Shared {
         };
         match self.store.get_exposed_machine(&self.machine_id()).await {
             Ok(Some(row)) => {
-                let machine = crate::methods::machine_json(&row, Some(self));
-                services
-                    .publish_remote_machine_changed(serde_json::json!({ "machine": machine }))
-                    .await;
+                crate::methods::publish_machine(services, &row, Some(self)).await;
             }
             Ok(None) => {}
             Err(error) => {

@@ -4000,6 +4000,7 @@ pub const AGENT_LIST_ROW_KEYS: &[&str] = &[
     "effectiveIsolation",
     "placementError",
     "setup",
+    "cloudStart",
     "metadata",
 ];
 
@@ -5252,6 +5253,9 @@ pub struct AgentLite {
     /// launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<crate::remote_launch::RemoteSetupStatus>,
+    /// While the agent's cloud machine starts: `{ step }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_start: Option<crate::machines::CloudStart>,
     pub metadata: AgentMetadata,
 }
 
@@ -5365,8 +5369,15 @@ impl AgentLite {
             pinned: session.pinned,
             harness_version: session.harness_version,
             harness_features: session.harness_features,
-            node_id: remote.as_ref().map(|r| r.node_id.clone()),
-            lease_id: remote.as_ref().map(|r| r.lease_id.clone()),
+            node_id: remote
+                .as_ref()
+                .filter(|r| !r.is_unlinked())
+                .map(|r| r.node_id.clone()),
+            lease_id: remote
+                .as_ref()
+                .filter(|r| !r.is_unlinked())
+                .map(|r| r.lease_id.clone()),
+            cloud_start: remote.as_ref().and_then(|r| r.cloud_start),
             node_name: remote.as_ref().map(|r| r.node_name.clone()),
             placement: remote.as_ref().map(|r| r.placement.clone()),
             effective_isolation: remote.as_ref().map(|r| r.effective_isolation),

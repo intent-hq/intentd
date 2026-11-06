@@ -539,6 +539,11 @@ pub const IDENTITY_AUTH_CHANGED: &str = "identity:auth-changed";
 // `{ machine: RemoteMachine }` or `{ machineId, removed: true }`; global and
 // owner-only, never the executor token.
 pub const REMOTE_MACHINE_CHANGED: &str = "remoteMachine:changed";
+// Cloud machines (E2B), backend side: the provider was configured or
+// removed, or a cloud machine row or its sandbox changed. Payload
+// `{ provider }`, `{ providerId, removed: true }`, `{ machine }` or
+// `{ machineId, removed: true }`; global, never the E2B key or a token.
+pub const CLOUD_MACHINE_CHANGED: &str = "cloudMachine:changed";
 // Owner-only capture of executor-link traffic: a batch of new records, or
 // (with `records: []`) capture starting or stopping. Payload `{ records:
 // LinkTrafficRecord[], capture: LinkTrafficCapture }`; global, owner-only and
@@ -782,6 +787,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     HOST_INVITES_CHANGED,
     HOST_EXECUTION_CONTEXT_CHANGED,
     REMOTE_MACHINE_CHANGED,
+    CLOUD_MACHINE_CHANGED,
     REMOTE_LINK_TRAFFIC_RECORDS,
     APP_UI_NAVIGATE,
     APP_UI_HIGHLIGHT,

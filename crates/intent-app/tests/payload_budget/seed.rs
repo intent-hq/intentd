@@ -847,6 +847,7 @@ pub async fn store(state: &LargeState) -> Seeded {
                 added_at: "2026-01-01T00:00:00.000Z".into(),
                 last_connected_at: None,
                 node_protocol: None,
+                cloud: None,
             })
             .await
             .expect("exposed machine");

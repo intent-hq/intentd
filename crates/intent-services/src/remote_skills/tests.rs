@@ -90,6 +90,7 @@ pub(crate) fn view(skills: Option<Vec<MachineSkill>>) -> RemotePlacementView {
         skills,
         shared_checkout_of: None,
         parent_work: None,
+        cloud_start: None,
     }
 }
 

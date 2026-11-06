@@ -23,7 +23,7 @@ const CREDENTIAL_COLUMNS: &str =
     "id, backend_id, backend_name, backend_fingerprint, created_at, last_used_at, revoked_at";
 const MACHINE_COLUMNS: &str = "id, name, hosts_json, port, tc_address, fingerprint, \
      credential_id, platform_json, capabilities_json, observed_at, state, added_at, \
-     last_connected_at, node_protocol";
+     last_connected_at, node_protocol, cloud_json";
 
 fn db(error: impl std::fmt::Display) -> Error {
     Error::Internal(format!("remote machine persistence: {error}"))
@@ -96,6 +96,11 @@ fn machine_row(row: &SqliteRow) -> Result<ExposedMachine> {
         node_protocol: row
             .get::<Option<i64>, _>("node_protocol")
             .map(u32::try_from)
+            .transpose()
+            .map_err(db)?,
+        cloud: row
+            .get::<Option<String>, _>("cloud_json")
+            .map(|json| serde_json::from_str(&json))
             .transpose()
             .map_err(db)?,
     })
@@ -417,8 +422,8 @@ impl Store {
         sqlx::query(
             "INSERT OR REPLACE INTO exposed_machine (id, name, hosts_json, port, tc_address, \
              fingerprint, credential_id, platform_json, capabilities_json, observed_at, state, \
-             added_at, last_connected_at, node_protocol) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             added_at, last_connected_at, node_protocol, cloud_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&machine.id)
         .bind(&machine.name)
@@ -434,6 +439,7 @@ impl Store {
         .bind(&machine.added_at)
         .bind(&machine.last_connected_at)
         .bind(machine.node_protocol.map(i64::from))
+        .bind(machine.cloud.as_ref().map(encode).transpose()?)
         .execute(&mut *tx)
         .await
         .map_err(db)?;
@@ -458,13 +464,35 @@ impl Store {
         row.as_ref().map(machine_row).transpose()
     }
 
-    /// Every exposed machine, oldest first.
+    /// Every machine the owner exposed, oldest first. Cloud machine rows
+    /// are left out: see [`Self::list_cloud_machines`].
     ///
     /// # Errors
     ///
     /// `Internal` on database failure or a corrupt row.
     pub async fn list_exposed_machines(&self) -> Result<Vec<ExposedMachine>> {
-        let sql = format!("SELECT {MACHINE_COLUMNS} FROM exposed_machine ORDER BY added_at, id");
+        let sql = format!(
+            "SELECT {MACHINE_COLUMNS} FROM exposed_machine WHERE cloud_json IS NULL \
+             ORDER BY added_at, id"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(db)?;
+        rows.iter().map(machine_row).collect()
+    }
+
+    /// Every cloud machine row (a machine the backend started in a cloud
+    /// sandbox), oldest first.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure or a corrupt row.
+    pub async fn list_cloud_machines(&self) -> Result<Vec<ExposedMachine>> {
+        let sql = format!(
+            "SELECT {MACHINE_COLUMNS} FROM exposed_machine WHERE cloud_json IS NOT NULL \
+             ORDER BY added_at, id"
+        );
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
@@ -486,6 +514,76 @@ impl Store {
                 .await
                 .map_err(db)?;
         Ok(credential.map(ExecutorCredentialId::from))
+    }
+
+    /// Replace a cloud machine row's sandbox state. Returns whether the row
+    /// exists and is a cloud machine.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn update_cloud_machine(
+        &self,
+        id: &str,
+        cloud: &intent_core::machines::CloudMachine,
+    ) -> Result<bool> {
+        let done = sqlx::query(
+            "UPDATE exposed_machine SET cloud_json = ? WHERE id = ? AND cloud_json IS NOT NULL",
+        )
+        .bind(encode(cloud)?)
+        .bind(id)
+        .execute(self.write_pool())
+        .await
+        .map_err(db)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The saved settings of cloud machine provider `id` (a JSON document),
+    /// `None` when it is not configured.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn get_cloud_machine_provider(&self, id: &str) -> Result<Option<String>> {
+        sqlx::query_scalar("SELECT config_json FROM cloud_machine_provider WHERE id = ?")
+            .bind(id)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(db)
+    }
+
+    /// Save the settings of cloud machine provider `id`.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn save_cloud_machine_provider(&self, id: &str, config_json: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO cloud_machine_provider (id, config_json, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(id)
+        .bind(config_json)
+        .bind(now_iso())
+        .execute(self.write_pool())
+        .await
+        .map_err(db)?;
+        Ok(())
+    }
+
+    /// Forget cloud machine provider `id`. Returns whether it was saved.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn delete_cloud_machine_provider(&self, id: &str) -> Result<bool> {
+        let done = sqlx::query("DELETE FROM cloud_machine_provider WHERE id = ?")
+            .bind(id)
+            .execute(self.write_pool())
+            .await
+            .map_err(db)?;
+        Ok(done.rows_affected() > 0)
     }
 
     /// Persist a machine's resting state. Returns whether the machine exists.

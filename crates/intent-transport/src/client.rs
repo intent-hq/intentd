@@ -166,6 +166,9 @@ pub(crate) fn with_runtime_capabilities(
                 // Remote agents' saved scripts run on their machines
                 // (nodeProtocol 8): advertised only with `remoteMachines`.
                 capabilities["remoteScripts"] = json!(1);
+                // E2B cloud machines: the backend starts its own machines,
+                // only where it places agents on exposed machines.
+                capabilities["cloudMachines"] = json!(1);
             }
         }
         value.to_string()

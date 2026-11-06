@@ -180,6 +180,7 @@ pub(super) enum Op {
     Delete,
     List,
     Process,
+    Template,
 }
 
 #[derive(Deserialize)]
@@ -390,6 +391,55 @@ impl E2bClient {
         Err(E2bError::Protocol("the sandbox list did not end".into()))
     }
 
+    /// Whether template `name` (`<project>/<template>`) has a ready build
+    /// tagged `tag`, as this key sees it (public templates of other projects
+    /// included).
+    ///
+    /// # Errors
+    ///
+    /// [`E2bError::Unauthorized`] for a rejected key, or an API error.
+    pub async fn template_exists(&self, name: &str, tag: &str) -> Result<bool, E2bError> {
+        let valid = |part: &str, slash: bool| {
+            !part.is_empty()
+                && part.len() <= 256
+                && part.bytes().all(|b| {
+                    b.is_ascii_alphanumeric()
+                        || matches!(b, b'-' | b'_' | b'.')
+                        || (slash && b == b'/')
+                })
+        };
+        if !valid(name, true) || !valid(tag, false) {
+            return Err(E2bError::InvalidArgument(format!(
+                "bad template reference {name:?}:{tag:?}"
+            )));
+        }
+        let alias = format!("{name}:{tag}").replace('/', "%2F");
+        let url = format!("{}/templates/aliases/{alias}", self.api());
+        match self
+            .execute(Op::Template, &[], || self.rest(self.http.get(&url)))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(E2bError::NotFound(_)) => Ok(false),
+            Err(E2bError::Api { status: 400, .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Test the key with one cheap read.
+    ///
+    /// # Errors
+    ///
+    /// [`E2bError::Unauthorized`] for a rejected key, or an API error.
+    pub async fn check_key(&self) -> Result<(), E2bError> {
+        let url = format!("{}/v2/sandboxes", self.api());
+        self.execute(Op::List, &[], || {
+            self.rest(self.http.get(&url)).query(&[("limit", "1")])
+        })
+        .await
+        .map(drop)
+    }
+
     fn api(&self) -> &str {
         self.config.api_url.trim_end_matches('/')
     }
@@ -489,6 +539,13 @@ impl E2bClient {
         let error_code = error_code.map(|c| self.scrub(&c, secrets));
         let code = error_code.as_deref().unwrap_or("");
         match status {
+            400 | 403 | 422 if op == Op::Create && is_plan_limit(&message, code) => {
+                E2bError::PlanLimit {
+                    status,
+                    error_code,
+                    message,
+                }
+            }
             401 | 403 => E2bError::Unauthorized { status },
             404 => E2bError::NotFound(message),
             409 if code == "idempotency_request_mismatch" => E2bError::IdempotencyMismatch,
@@ -555,6 +612,20 @@ fn is_concurrency_limit(message: &str, error_code: Option<&str>) -> bool {
     (code.contains("concurren") && code.contains("sandbox"))
         || message.contains("concurrent e2b sandboxes")
         || message.contains("concurrent sandboxes")
+}
+
+/// E2B refuses a create whose template asks for more vCPU or memory than the
+/// project's plan or raised limits allow. It documents no code, so match a
+/// message about CPU or memory and a limit.
+fn is_plan_limit(message: &str, error_code: &str) -> bool {
+    let text = format!("{error_code} {message}").to_ascii_lowercase();
+    let resource = ["cpu", "memory", "ram", "too large", "sandbox size"]
+        .iter()
+        .any(|word| text.contains(word));
+    let limit = ["limit", "exceed", "maximum", "plan", "not allowed", "too large"]
+        .iter()
+        .any(|word| text.contains(word));
+    resource && limit
 }
 
 /// Replace every secret in `message`, then bound its length.

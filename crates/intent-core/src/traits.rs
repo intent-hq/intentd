@@ -6334,6 +6334,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `cloudMachines.*` (E2B cloud machines, backend side): `method` is the
+    /// part after `cloudMachines.` (`configure`, `list`, `remove`) and
+    /// `params` the request's params object. Never returns the E2B key.
+    fn cloud_machines(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async move {
+            Err(Error::Internal(format!(
+                "WorkspaceApi::cloud_machines({method}) not implemented"
+            )))
+        })
+    }
+
     /// `invite.inspect` (multiplayer w4, unauthenticated `/invite`
     /// endpoint): validate `(invite_id, secret, scope)` — the
     /// [`crate::InviteErrorKind`] refusals for an unknown / expired /

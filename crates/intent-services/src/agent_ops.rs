@@ -6057,6 +6057,18 @@ impl Services {
         parent: Option<&AgentId>,
     ) -> Result<Option<(intent_core::placement::AgentPlacement, String)>> {
         Ok(self.remote_parent(parent).await?.map(|(_, view)| {
+            // A cloud parent's sub-agent shares its sandbox, which may still
+            // be starting (no machine id yet): `target: "e2b"` from an agent
+            // on a cloud machine means the parent's sandbox.
+            if view.is_cloud() {
+                return (
+                    intent_core::placement::AgentPlacement {
+                        target: Some(intent_core::placement::PlacementTarget::E2b),
+                        ..Default::default()
+                    },
+                    view.node_name,
+                );
+            }
             (
                 intent_core::placement::AgentPlacement {
                     target: Some(intent_core::placement::PlacementTarget::Remote),
@@ -6174,6 +6186,10 @@ impl Services {
             // The `"default"` sentinel asks for the provider's default.
             model: model.filter(|model| *model != "default").map(str::to_owned),
             with_profile: profile.is_some(),
+            sets_profile_env: profile
+                .as_ref()
+                .is_some_and(|env| env.entries().any(|(_, value)| value.is_some())),
+            provider_ref: provider.to_owned(),
         })
     }
 
@@ -7146,7 +7162,23 @@ impl Services {
         model: &str,
     ) -> Result<()> {
         let profile = self.resolve_remote_compatible_env(reference).await?;
-        let rows = self.store.list_exposed_machines().await?;
+        let mut rows = self.store.list_exposed_machines().await?;
+        if view.is_cloud() {
+            let sets_env = profile
+                .as_ref()
+                .is_some_and(|env| env.entries().any(|(_, value)| value.is_some()));
+            if !sets_env {
+                return Err(intent_core::machines::cloud_profile_required(reference));
+            }
+            // A cloud agent between sandboxes has no machine to check: its
+            // next sandbox reports what it offers.
+            if view.is_unlinked() {
+                return Ok(());
+            }
+            if let Some(row) = self.store.get_exposed_machine(&view.node_id).await? {
+                rows.push(row);
+            }
+        }
         let provider = crate::provider_profiles::parse_profile_ref(reference)
             .map_or(reference, |(base, _)| base);
         intent_core::machine_selection::check_switch_on_machine(

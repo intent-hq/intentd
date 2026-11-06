@@ -21,6 +21,13 @@ pub fn remote_machine_token_account(machine_id: &str) -> String {
     format!("remoteMachines.{machine_id}.token")
 }
 
+/// The secret-store account of cloud machine provider `provider`'s API key
+/// (`cloudMachines.e2b.apiKey`).
+#[must_use]
+pub fn cloud_machine_key_account(provider: &str) -> String {
+    format!("cloudMachines.{provider}.apiKey")
+}
+
 impl Services {
     /// `remoteMachines.<method>`: see
     /// [`intent_core::WorkspaceApi::remote_machines`].
@@ -34,6 +41,74 @@ impl Services {
         self.feature_remote_launch_port()
             .remote_machines(self, method, params)
             .await
+    }
+
+    /// `cloudMachines.<method>`: `configure` and `remove` are owner-only,
+    /// `list` is also open to shared-host members (the port filters the
+    /// machines to the workspaces they can manage).
+    pub(crate) async fn cloud_machines_op(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<Value> {
+        let what = format!("cloudMachines.{method}");
+        match method {
+            "list" => self.require_host_execution(&what).await?,
+            _ => self.require_machine_owner(&what).await?,
+        }
+        self.feature_remote_launch_port()
+            .cloud_machines(self, method, params)
+            .await
+    }
+
+    /// The saved API key of cloud machine provider `provider`.
+    ///
+    /// # Errors
+    ///
+    /// When the secret store cannot be read.
+    pub async fn load_cloud_machine_key(&self, provider: &str) -> Result<Option<String>> {
+        self.secrets
+            .load(&cloud_machine_key_account(provider))
+            .await
+    }
+
+    /// Save the API key of cloud machine provider `provider`.
+    ///
+    /// # Errors
+    ///
+    /// When the secret store cannot be written.
+    pub async fn store_cloud_machine_key(&self, provider: &str, key: &str) -> Result<()> {
+        self.secrets
+            .store(&cloud_machine_key_account(provider), key)
+            .await
+    }
+
+    /// Forget the API key of cloud machine provider `provider`.
+    ///
+    /// # Errors
+    ///
+    /// When the secret store cannot be written.
+    pub async fn delete_cloud_machine_key(&self, provider: &str) -> Result<()> {
+        self.secrets
+            .delete(&cloud_machine_key_account(provider))
+            .await
+    }
+
+    /// Publish `cloudMachine:changed` with `data`. Global and, like
+    /// `remoteMachine:changed`, not on the collaborator event list.
+    pub async fn publish_cloud_machine_changed(&self, data: Value) {
+        let event = intent_store::NewEvent {
+            workspace_id: WorkspaceId::from_string(String::new()),
+            timestamp: now_iso(),
+            event_type: intent_core::events::CLOUD_MACHINE_CHANGED.to_owned(),
+            actor: crate::system_actor(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data,
+        };
+        crate::publish_event(self.event_bus.as_ref(), event).await;
     }
 
     /// This daemon's own routes (its display name and WSS fingerprint), for

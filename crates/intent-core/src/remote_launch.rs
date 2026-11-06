@@ -141,9 +141,19 @@ pub struct PlacementError {
     pub code: String,
     pub detail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<CapacityRefusal>,
+    pub data: Option<PlacementErrorData>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
+}
+
+/// `placementError.data`: a machine's capacity refusal, or a cloud machine
+/// error's data (`cloud-quota`, `cloud-machine-unavailable`) without its
+/// `code`. Never a key or token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PlacementErrorData {
+    Capacity(CapacityRefusal),
+    Cloud(serde_json::Map<String, serde_json::Value>),
 }
 
 /// Longest `placementError.detail` kept, in UTF-8 bytes: the field rides
@@ -182,9 +192,26 @@ impl PlacementError {
     #[must_use]
     pub fn capacity(detail: &str, refusal: CapacityRefusal) -> Self {
         Self {
-            data: Some(refusal),
+            data: Some(PlacementErrorData::Capacity(refusal)),
             retryable: Some(true),
             ..Self::new("node-capacity", detail)
+        }
+    }
+
+    /// A cloud machine start failure: `data` is the error's data; its `code`
+    /// becomes the placement error's code and `retryable` its own field.
+    #[must_use]
+    pub fn cloud(detail: &str, data: &serde_json::Value) -> Self {
+        let mut data = data.as_object().cloned().unwrap_or_default();
+        let code = data
+            .remove("code")
+            .and_then(|code| code.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "remote-launch-failed".to_owned());
+        let retryable = data.remove("retryable").and_then(|r| r.as_bool());
+        Self {
+            data: (!data.is_empty()).then_some(PlacementErrorData::Cloud(data)),
+            retryable,
+            ..Self::new(&code, detail)
         }
     }
 
@@ -218,6 +245,13 @@ pub struct RemoteLaunchNeeds {
     /// The launch sends a selected profile's environment, so the machine's
     /// own sign-in does not apply.
     pub with_profile: bool,
+    /// The launch's profile environment sets at least one variable (a
+    /// `kind: "set"` entry). A cloud machine has no sign-in of its own and
+    /// runs only such launches.
+    pub sets_profile_env: bool,
+    /// The provider reference as given (`claude-code`, `codex@work`), for
+    /// `cloud-profile-required` data.
+    pub provider_ref: String,
 }
 
 /// The [`REMOTE_PLACEMENT_METADATA_KEY`] value: the projection fields of an
@@ -262,6 +296,10 @@ pub struct RemotePlacementView {
     /// parent's, starts from (nodeProtocol 13); never projected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_work: Option<ParentWork>,
+    /// While the agent's cloud machine starts (`AgentLite.cloudStart`).
+    /// `node_id` and `lease_id` stay empty until its link binds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_start: Option<crate::machines::CloudStart>,
 }
 
 /// Where a remote agent's sub-agent on another machine starts from: the
@@ -360,6 +398,19 @@ impl RemotePlacementView {
     #[must_use]
     pub fn pins(&self) -> &[crate::node_link::SubmodulePin] {
         self.submodules.as_deref().unwrap_or_default()
+    }
+
+    /// Whether the agent was placed on a cloud machine (`target: "e2b"`).
+    #[must_use]
+    pub fn is_cloud(&self) -> bool {
+        self.placement.is_e2b()
+    }
+
+    /// Whether the agent runs on no machine yet: a cloud agent whose
+    /// sandbox starts or is gone.
+    #[must_use]
+    pub fn is_unlinked(&self) -> bool {
+        self.node_id.is_empty()
     }
 
     /// Read the view from a session's `metadata`, if it carries one.

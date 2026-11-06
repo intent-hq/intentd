@@ -80,6 +80,7 @@ impl RemoteLaunchPort for FakeRemote {
                 skills: None,
                 shared_checkout_of: None,
                 parent_work: None,
+                cloud_start: None,
             })
         })
     }
@@ -232,6 +233,8 @@ async fn a_placed_initial_agent_starts_on_the_chosen_machine() {
             provider: "auggie".into(),
             model: Some("sonnet4.5".into()),
             with_profile: false,
+            sets_profile_env: false,
+            provider_ref: "auggie".into(),
         }]
     );
     let ws = result.workspace.id;

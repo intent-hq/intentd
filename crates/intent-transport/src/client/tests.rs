@@ -988,6 +988,7 @@ fn runtime_capabilities_are_added_only_when_on() {
             "remoteMachines": 1,
             "remoteInitialAgent": 1,
             "remoteScripts": 1,
+            "cloudMachines": 1,
         })
     );
     assert_eq!(
@@ -998,6 +999,7 @@ fn runtime_capabilities_are_added_only_when_on() {
             "remoteMachines": 1,
             "remoteInitialAgent": 1,
             "remoteScripts": 1,
+            "cloudMachines": 1,
             "startupStatus": 1,
         })
     );

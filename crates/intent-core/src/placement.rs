@@ -22,6 +22,9 @@ pub const MAX_NODE_ID_BYTES: usize = 128;
 pub enum PlacementTarget {
     Local,
     Remote,
+    /// A new E2B cloud machine (`cloudMachines: 1`), or the parent's when
+    /// the caller already runs on one.
+    E2b,
 }
 
 /// `placement.checkout`. Absent on a placement object means `isolated`.
@@ -149,6 +152,17 @@ impl AgentPlacement {
         {
             return Err("remote placement requires isolated checkout");
         }
+        if self.target == Some(PlacementTarget::E2b) {
+            if self.os.is_some() || self.arch.is_some() || self.node_id.is_some() {
+                return Err("placement.target \"e2b\" takes no os, arch or nodeId");
+            }
+            if self.exclusive.is_some() {
+                return Err("placement.target \"e2b\" takes no exclusive");
+            }
+            if self.effective_checkout() != PlacementCheckout::Isolated {
+                return Err("remote placement requires isolated checkout");
+            }
+        }
         if self.exclusive == Some(true)
             && (self.target == Some(PlacementTarget::Local)
                 || self.effective_checkout() != PlacementCheckout::Isolated)
@@ -156,6 +170,12 @@ impl AgentPlacement {
             return Err("exclusive placement requires remote isolated checkout");
         }
         Ok(())
+    }
+
+    /// Whether this placement asks for an E2B cloud machine.
+    #[must_use]
+    pub fn is_e2b(&self) -> bool {
+        self.target == Some(PlacementTarget::E2b)
     }
 
     /// The checkout this placement asks for: `isolated` when absent.

@@ -1948,6 +1948,9 @@ async fn dispatch(
         "remoteMachines.list" => remote_machines(api, "list", params).await,
         "remoteMachines.remove" => remote_machines(api, "remove", params).await,
         "remoteMachines.refresh" => remote_machines(api, "refresh", params).await,
+        "cloudMachines.configure" => cloud_machines(api, "configure", params).await,
+        "cloudMachines.list" => cloud_machines(api, "list", params).await,
+        "cloudMachines.remove" => cloud_machines(api, "remove", params).await,
         // Executor-link traffic capture (nodes.md "Link traffic capture"):
         // owner-only, daemon-global; the services recheck the owner role.
         "remoteLinkTraffic.start" => remote_link_traffic(api, "start", params).await,
@@ -6250,6 +6253,17 @@ async fn remote_machines(
     params: &Map<String, Value>,
 ) -> Result<Value, RpcErr> {
     api.remote_machines(method, Value::Object(params.clone()))
+        .await
+        .map_err(domain_to_rpc)
+}
+
+/// `cloudMachines.<method>` with the request's params object.
+async fn cloud_machines(
+    api: &dyn WorkspaceApi,
+    method: &'static str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    api.cloud_machines(method, Value::Object(params.clone()))
         .await
         .map_err(domain_to_rpc)
 }

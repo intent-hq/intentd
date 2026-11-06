@@ -10605,6 +10605,7 @@ async fn worst_case_agent_list_row(
         skills: None,
         shared_checkout_of: None,
         parent_work: None,
+        cloud_start: None,
     };
     svc.store()
         .set_agent_session_metadata_key_json(
