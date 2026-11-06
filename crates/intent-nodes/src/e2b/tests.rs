@@ -457,6 +457,7 @@ fn sandbox() -> Sandbox {
 
 fn spec() -> ProcessSpec {
     let mut spec = ProcessSpec::new("/usr/local/bin/intentd");
+    spec.user = Some("user".into());
     spec.args = vec!["call".into(), "executor.mint".into()];
     spec.cwd = Some("/home/user".into());
     spec.envs.insert(
@@ -735,7 +736,8 @@ async fn transport_errors_carry_no_secrets() {
     )
     .unwrap();
     let err = client.pause("sbx1").await.unwrap_err();
-    assert!(matches!(err, E2bError::Transport(_)), "{err:?}");
+    assert!(matches!(err, E2bError::Unreachable(_)), "{err:?}");
+    assert!(err.is_retryable());
     assert_no_secrets(&format!("{err} {err:?}"));
 }
 
@@ -769,4 +771,164 @@ fn empty_api_key_is_rejected() {
         E2bClient::new(SecretString::new(""), E2bConfig::default()),
         Err(E2bError::NotConfigured)
     ));
+}
+
+#[tokio::test]
+async fn a_key_echoed_across_the_message_cut_is_still_redacted() {
+    let message = format!("{}{KEY}{}", "x".repeat(500), "y".repeat(100));
+    let server = FakeServer::start(vec![Reply::error(400, "", &message)]).await;
+    let err = client(&server).delete("sbx1").await.unwrap_err();
+    let text = format!("{err} {err:?}");
+    assert_no_secrets(&text);
+    assert!(!text.contains(&KEY[..12]), "key prefix leaked: {text}");
+}
+
+#[tokio::test]
+async fn should_retry_header_decides_retryability() {
+    let server = FakeServer::start(vec![
+        Reply::error(503, "sandbox_capacity_unavailable", "busy")
+            .with_header("should-retry", "false"),
+        Reply::error(503, "sandbox_capacity_unavailable", "busy"),
+        Reply::error(500, "sandbox_create_failed", "failed").with_header("should-retry", "true"),
+    ])
+    .await;
+    let client = client(&server);
+    let refused = client.create(&create_request()).await.unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            E2bError::Api {
+                status: 503,
+                should_retry: Some(false),
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(!refused.is_retryable());
+    let unknown = client.create(&create_request()).await.unwrap_err();
+    assert!(
+        matches!(
+            unknown,
+            E2bError::Api {
+                should_retry: None,
+                ..
+            }
+        ),
+        "{unknown:?}"
+    );
+    assert!(unknown.is_retryable());
+    let retry = client.create(&create_request()).await.unwrap_err();
+    assert!(retry.is_retryable());
+}
+
+#[tokio::test]
+async fn rate_limit_without_retry_after_uses_the_default_wait() {
+    let server =
+        FakeServer::start(vec![Reply::error(429, "", "slow down"), Reply::status(204)]).await;
+    let mut client = client(&server);
+    client.config.default_retry_wait = Duration::from_millis(300);
+    client.pause("sbx1").await.unwrap();
+    let reqs = server.requests();
+    assert!(reqs[1].at.duration_since(reqs[0].at) >= Duration::from_millis(300));
+}
+
+#[tokio::test]
+async fn create_in_progress_retry_honors_retry_after() {
+    let server = FakeServer::start(vec![
+        Reply::error(409, "idempotency_in_progress", "in progress").with_header("retry-after", "1"),
+        Reply::json(201, &sandbox_body("sbx1")),
+    ])
+    .await;
+    client(&server).create(&create_request()).await.unwrap();
+    let reqs = server.requests();
+    assert!(reqs[1].at.duration_since(reqs[0].at) >= Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn create_422_without_the_idempotency_code_keeps_the_message() {
+    let server = FakeServer::start(vec![Reply::error(422, "", "bad template config")]).await;
+    let err = client(&server).create(&create_request()).await.unwrap_err();
+    assert!(
+        matches!(&err, E2bError::Api { status: 422, message, .. } if message == "bad template config"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn envd_messages_redact_the_access_token() {
+    let server = FakeServer::start(vec![
+        Reply::json(400, &json!({"code": 400, "message": format!("bad token {ENVD_TOKEN}")})),
+        Reply::Stream {
+            parts: vec![(
+                frame(2, &json!({"error": {"code": "unauthenticated", "message": format!("token {ENVD_TOKEN} {}", "z".repeat(2000))}})),
+                None,
+            )],
+        },
+    ])
+    .await;
+    let client = client(&server);
+    for _ in 0..2 {
+        let err = client.run_process(&sandbox(), &spec()).await.unwrap_err();
+        let text = format!("{err} {err:?}");
+        assert_no_secrets(&text);
+        assert!(text.len() < 1500, "message is not bounded");
+    }
+}
+
+#[tokio::test]
+async fn pty_output_is_reported_as_stdout() {
+    let server = FakeServer::start(vec![Reply::Stream {
+        parts: vec![(
+            [
+                frame(0, &json!({"event": {"data": {"pty": b64(b"tty")}}})),
+                frame(0, &json!({"event": {"end": {"exited": true}}})),
+                frame(2, &json!({})),
+            ]
+            .concat(),
+            None,
+        )],
+    }])
+    .await;
+    let output = client(&server)
+        .run_process(&sandbox(), &spec())
+        .await
+        .unwrap();
+    assert_eq!(output.stdout, b"tty");
+}
+
+#[tokio::test]
+async fn default_spec_lets_envd_choose_the_user() {
+    let server = FakeServer::start(vec![Reply::Stream {
+        parts: vec![(
+            [
+                frame(0, &json!({"event": {"end": {"exited": true}}})),
+                frame(2, &json!({})),
+            ]
+            .concat(),
+            None,
+        )],
+    }])
+    .await;
+    client(&server)
+        .run_process(&sandbox(), &ProcessSpec::new("/bin/true"))
+        .await
+        .unwrap();
+    assert_eq!(server.requests()[0].header("authorization"), None);
+}
+
+#[tokio::test]
+async fn process_start_waits_for_headers_only_up_to_the_request_timeout() {
+    let server =
+        FakeServer::start(vec![Reply::status(200).with_delay(Duration::from_secs(5))]).await;
+    let mut client = client(&server);
+    client.config.request_timeout = Duration::from_millis(100);
+    let started = Instant::now();
+    let err = client
+        .start_process(&sandbox(), &ProcessSpec::new("/bin/true"))
+        .await
+        .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(matches!(err, E2bError::Transport(_)), "{err:?}");
+    assert!(!err.is_retryable(), "the command may have started");
 }

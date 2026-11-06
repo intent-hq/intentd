@@ -37,8 +37,15 @@ pub enum E2bError {
         status: u16,
         error_code: Option<String>,
         message: String,
-        should_retry: bool,
+        /// E2B's `Should-Retry` header; `None` when it was absent.
+        should_retry: Option<bool>,
     },
+    /// The request was never sent (connect or DNS failure). Safe to retry.
+    #[error("E2B is unreachable: {0}")]
+    Unreachable(String),
+    /// The request may have reached E2B (timeout, dropped connection). A
+    /// retry of a create without an idempotency key, or of a process start,
+    /// can repeat the side effect.
     #[error("E2B request failed: {0}")]
     Transport(String),
     #[error("unexpected E2B response: {0}")]
@@ -57,12 +64,12 @@ impl E2bError {
             | Self::IdempotencyInProgress
             | Self::PauseRefused(_)
             | Self::Conflict(_)
-            | Self::Transport(_) => true,
+            | Self::Unreachable(_) => true,
             Self::Api {
                 status,
                 should_retry,
                 ..
-            } => *should_retry || matches!(status, 502..=504),
+            } => should_retry.unwrap_or(matches!(status, 502..=504)),
             _ => false,
         }
     }

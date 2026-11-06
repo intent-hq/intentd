@@ -246,7 +246,7 @@ impl E2bClient {
             tokio::time::sleep_until(last + self.config.create_spacing).await;
         }
         let result = self
-            .execute(Op::Create, || {
+            .execute(Op::Create, &[], || {
                 let req = self.rest(self.http.post(&url)).json_body(body.clone());
                 match &request.idempotency_key {
                     Some(key) => req.header("Idempotency-Key", key),
@@ -259,7 +259,8 @@ impl E2bClient {
         parse_json(result?, "create").await
     }
 
-    /// Connect to a sandbox, resuming it when paused, and set its timeout.
+    /// Connect to a sandbox, resuming it when paused. E2B only extends the
+    /// timeout to at least `timeout_secs`; use [`Self::set_timeout`] to shorten it.
     ///
     /// # Errors
     ///
@@ -282,7 +283,7 @@ impl E2bClient {
         })
         .map_err(|e| E2bError::InvalidArgument(e.to_string()))?;
         let response = self
-            .execute(Op::Connect, || {
+            .execute(Op::Connect, &[], || {
                 self.rest(self.http.post(&url)).json_body(body.clone())
             })
             .await?;
@@ -300,7 +301,7 @@ impl E2bClient {
     pub async fn pause(&self, sandbox_id: &str) -> Result<(), E2bError> {
         validate_sandbox_id(sandbox_id)?;
         let url = format!("{}/sandboxes/{sandbox_id}/pause", self.api());
-        self.execute(Op::Pause, || self.rest(self.http.post(&url)))
+        self.execute(Op::Pause, &[], || self.rest(self.http.post(&url)))
             .await
             .map(drop)
     }
@@ -317,7 +318,7 @@ impl E2bClient {
             timeout: timeout_secs,
         })
         .map_err(|e| E2bError::InvalidArgument(e.to_string()))?;
-        self.execute(Op::Timeout, || {
+        self.execute(Op::Timeout, &[], || {
             self.rest(self.http.post(&url)).json_body(body.clone())
         })
         .await
@@ -333,7 +334,7 @@ impl E2bClient {
         validate_sandbox_id(sandbox_id)?;
         let url = format!("{}/sandboxes/{sandbox_id}", self.api());
         match self
-            .execute(Op::Delete, || self.rest(self.http.delete(&url)))
+            .execute(Op::Delete, &[], || self.rest(self.http.delete(&url)))
             .await
         {
             Ok(_) => Ok(true),
@@ -365,7 +366,7 @@ impl E2bClient {
                 page_query.push(("nextToken", token.clone()));
             }
             let response = self
-                .execute(Op::List, || {
+                .execute(Op::List, &[], || {
                     let req = self.rest(self.http.get(&url));
                     if page_query.is_empty() {
                         req
@@ -400,22 +401,25 @@ impl E2bClient {
     }
 
     /// Send a request, retrying 429 (and 409 "in progress" on create), and map
-    /// any non-success status to an [`E2bError`].
+    /// any non-success status to an [`E2bError`]. `secrets` are extra values
+    /// to redact from error messages.
     pub(super) async fn execute(
         &self,
         op: Op,
+        secrets: &[&str],
         build: impl Fn() -> RequestBuilder,
     ) -> Result<Response, E2bError> {
         let mut attempt = 0;
+        let mut in_progress_wait = self.config.default_retry_wait;
         loop {
-            let response = build().send().await.map_err(|e| self.transport(&e))?;
+            let response = self.send(op, build(), secrets).await?;
             let status = response.status();
             if status.is_success() {
                 return Ok(response);
             }
             let retry_budget_left = attempt < self.config.max_rate_limit_retries;
+            let retry_after = retry_after(&response);
             if status == StatusCode::TOO_MANY_REQUESTS {
-                let retry_after = retry_after(&response);
                 if !retry_budget_left {
                     return Err(E2bError::RateLimited { retry_after });
                 }
@@ -424,37 +428,52 @@ impl E2bClient {
                 tokio::time::sleep(wait.min(self.config.max_retry_wait)).await;
                 continue;
             }
-            let error = self.map_error(op, response).await;
+            let error = self.map_error(op, response, secrets).await;
             if op == Op::Create
                 && matches!(error, E2bError::IdempotencyInProgress)
                 && retry_budget_left
             {
                 attempt += 1;
-                tokio::time::sleep(
-                    self.config
-                        .default_retry_wait
-                        .min(self.config.max_retry_wait),
-                )
-                .await;
+                let wait = retry_after.unwrap_or(in_progress_wait);
+                in_progress_wait = (in_progress_wait * 2).min(self.config.max_retry_wait);
+                tokio::time::sleep(wait.min(self.config.max_retry_wait)).await;
                 continue;
             }
             return Err(error);
         }
     }
 
-    async fn map_error(&self, op: Op, response: Response) -> E2bError {
+    /// REST calls carry the reqwest timeout. A process stream has none, so
+    /// only its wait for response headers is bounded here.
+    async fn send(
+        &self,
+        op: Op,
+        request: RequestBuilder,
+        secrets: &[&str],
+    ) -> Result<Response, E2bError> {
+        let sent = if op == Op::Process {
+            tokio::time::timeout(self.config.request_timeout, request.send())
+                .await
+                .map_err(|_| E2bError::Transport("envd sent no response headers in time".into()))?
+        } else {
+            request.send().await
+        };
+        sent.map_err(|e| self.transport(&e, secrets))
+    }
+
+    async fn map_error(&self, op: Op, response: Response, secrets: &[&str]) -> E2bError {
         let status = response.status().as_u16();
         let should_retry = response
             .headers()
             .get("should-retry")
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+            .and_then(|v| v.trim().parse::<bool>().ok());
         let bytes = response.bytes().await.unwrap_or_default();
         let (message, error_code) = match serde_json::from_slice::<ErrorBody>(&bytes) {
             Ok(body) => (body.message.unwrap_or_default(), body.error_code),
             Err(_) => (String::from_utf8_lossy(&bytes).trim().to_string(), None),
         };
-        let message = self.scrub(&message);
+        let message = self.scrub(&message, secrets);
         let code = error_code.as_deref().unwrap_or("");
         match status {
             401 | 403 => E2bError::Unauthorized { status },
@@ -462,9 +481,7 @@ impl E2bClient {
             409 if code == "idempotency_request_mismatch" => E2bError::IdempotencyMismatch,
             409 if code == "idempotency_in_progress" => E2bError::IdempotencyInProgress,
             409 => E2bError::Conflict(message),
-            422 if op == Op::Create || code == "idempotency_outcome_unknown" => {
-                E2bError::IdempotencyOutcomeUnknown
-            }
+            422 if code == "idempotency_outcome_unknown" => E2bError::IdempotencyOutcomeUnknown,
             503 if op == Op::Pause => E2bError::PauseRefused(message),
             502 if op == Op::Process => E2bError::NotFound(message),
             _ => E2bError::Api {
@@ -476,18 +493,34 @@ impl E2bClient {
         }
     }
 
-    pub(super) fn transport(&self, error: &reqwest::Error) -> E2bError {
-        E2bError::Transport(self.scrub(&error.to_string()))
+    pub(super) fn transport(&self, error: &reqwest::Error, secrets: &[&str]) -> E2bError {
+        let message = self.scrub(&error.to_string(), secrets);
+        if error.is_connect() {
+            E2bError::Unreachable(message)
+        } else {
+            E2bError::Transport(message)
+        }
     }
 
-    /// Bound a server-supplied message and remove the API key if echoed.
-    pub(super) fn scrub(&self, message: &str) -> String {
-        let mut out: String = message.chars().take(MAX_ERROR_MESSAGE).collect();
-        if out.contains(self.key.expose()) {
-            out = out.replace(self.key.expose(), "<redacted>");
-        }
-        out
+    /// Remove the API key and `secrets` from a server-supplied message, then
+    /// bound its length. Redaction comes first so a cut cannot split a secret.
+    pub(super) fn scrub(&self, message: &str, secrets: &[&str]) -> String {
+        let all: Vec<&str> = std::iter::once(self.key.expose())
+            .chain(secrets.iter().copied())
+            .collect();
+        scrub(message, &all)
     }
+}
+
+/// Replace every secret in `message`, then bound its length.
+pub(super) fn scrub(message: &str, secrets: &[&str]) -> String {
+    let mut out = message.to_string();
+    for secret in secrets {
+        if !secret.is_empty() && out.contains(secret) {
+            out = out.replace(secret, "<redacted>");
+        }
+    }
+    out.chars().take(MAX_ERROR_MESSAGE).collect()
 }
 
 trait JsonBody {

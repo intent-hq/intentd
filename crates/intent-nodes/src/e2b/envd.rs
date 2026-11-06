@@ -8,7 +8,7 @@ use base64::Engine as _;
 use reqwest::{Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use super::client::{validate_sandbox_id, E2bClient, Op};
+use super::client::{scrub, validate_sandbox_id, E2bClient, Op};
 use super::{E2bError, Sandbox, SecretString};
 
 /// Port envd listens on inside every sandbox.
@@ -37,7 +37,7 @@ pub struct ProcessSpec {
 }
 
 impl ProcessSpec {
-    /// A spec for `cmd` that runs as the template's default `user`.
+    /// A spec for `cmd` that runs as the sandbox's default user.
     #[must_use]
     pub fn new(cmd: impl Into<String>) -> Self {
         Self {
@@ -45,7 +45,7 @@ impl ProcessSpec {
             args: Vec::new(),
             envs: BTreeMap::new(),
             cwd: None,
-            user: Some("user".into()),
+            user: None,
             timeout: None,
         }
     }
@@ -139,6 +139,8 @@ pub struct ProcessStream {
     response: Response,
     buf: Vec<u8>,
     finished: bool,
+    /// The API key and access token, redacted from envd error messages.
+    secrets: Vec<SecretString>,
 }
 
 impl fmt::Debug for ProcessStream {
@@ -193,6 +195,8 @@ struct DataJson {
     stdout: Option<String>,
     #[serde(default)]
     stderr: Option<String>,
+    #[serde(default)]
+    pty: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -266,8 +270,13 @@ impl E2bClient {
         let timeout_ms = spec
             .timeout
             .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX));
+        let token: Vec<&str> = sandbox
+            .envd_access_token
+            .iter()
+            .map(SecretString::expose)
+            .collect();
         let response = self
-            .execute(Op::Process, || {
+            .execute(Op::Process, &token, || {
                 let mut req = self
                     .http
                     .post(&url)
@@ -296,10 +305,13 @@ impl E2bClient {
                 response.status().as_u16()
             )));
         }
+        let mut secrets = vec![self.key.clone()];
+        secrets.extend(sandbox.envd_access_token.clone());
         Ok(ProcessStream {
             response,
             buf: Vec::new(),
             finished: false,
+            secrets,
         })
     }
 
@@ -339,8 +351,8 @@ impl ProcessStream {
                     let end: EndStream = decode(&payload, "end-of-stream")?;
                     return match end.error {
                         Some(e) => Err(E2bError::Process {
-                            code: e.code,
-                            message: e.message,
+                            code: self.scrub(&e.code),
+                            message: self.scrub(&e.message),
                         }),
                         None => Ok(None),
                     };
@@ -361,7 +373,8 @@ impl ProcessStream {
                 }
                 Err(e) => {
                     self.finished = true;
-                    return Err(E2bError::Transport(e.without_url().to_string()));
+                    let message = self.scrub(&e.without_url().to_string());
+                    return Err(E2bError::Transport(message));
                 }
             }
         }
@@ -400,6 +413,11 @@ impl ProcessStream {
         })
     }
 
+    fn scrub(&self, message: &str) -> String {
+        let secrets: Vec<&str> = self.secrets.iter().map(SecretString::expose).collect();
+        scrub(message, &secrets)
+    }
+
     fn take_frame(&mut self) -> Result<Option<(u8, Vec<u8>)>, E2bError> {
         if self.buf.len() < FRAME_HEADER {
             return Ok(None);
@@ -427,7 +445,7 @@ fn convert(event: EventJson) -> Result<Option<ProcessEvent>, E2bError> {
         return Ok(Some(ProcessEvent::Started { pid: start.pid }));
     }
     if let Some(data) = event.data {
-        if let Some(out) = data.stdout {
+        if let Some(out) = data.stdout.or(data.pty) {
             return Ok(Some(ProcessEvent::Stdout(OutputChunk(decode_b64(&out)?))));
         }
         if let Some(err) = data.stderr {
