@@ -489,13 +489,14 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
     assert!(refused["error"]["data"]["supportedPlatforms"].is_array());
 
     // First message: launch on the node, stream the turn back.
-    ok(
+    let first = ok(
         &mut rpc_ws,
         91,
         "agent.sendMessage",
         json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "hello remote" }),
     )
     .await;
+    let first_message = first["messageId"].as_str().unwrap().to_owned();
     let end = event(&mut events, "agent:stream:end").await;
     assert_eq!(end["data"]["agentId"], agent_id, "{end}");
     let got = ok(
@@ -531,6 +532,31 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
         .await;
         too_large(&response);
     }
+    // Editing an earlier message is refused before the transcript is cut.
+    let response = rpc(
+        &mut rpc_ws,
+        1007,
+        "agent.editAndRegenerate",
+        json!({
+            "workspaceId": ws_id, "agentId": agent_id, "messageId": first_message,
+            "content": text, "imageBlocks": images,
+        }),
+    )
+    .await;
+    too_large(&response);
+    let kept = ok(
+        &mut rpc_ws,
+        1008,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert!(
+        kept["agent"]["lastAgentResponse"]
+            .as_str()
+            .is_some_and(|reply| reply.contains("hello remote")),
+        "{kept}"
+    );
     let agents = |list: &Value| list["agents"].as_array().map(Vec::len);
     let listed = ok(
         &mut rpc_ws,
