@@ -261,6 +261,12 @@ fn write_pins(file: &Path, pins: &[SubmodulePin]) -> anyhow::Result<()> {
     std::fs::rename(&scratch, file).context("write the submodule pins")
 }
 
+/// The pins recorded with the checkout at `worktree`: its owner's, for an
+/// agent that shares it.
+pub(super) fn recorded_pins(worktree: &Path) -> Vec<SubmodulePin> {
+    read_pins(&pins_file(worktree))
+}
+
 /// The agent's recorded pins; none for a checkout prepared without them.
 fn read_pins(file: &Path) -> Vec<SubmodulePin> {
     match std::fs::read(file) {

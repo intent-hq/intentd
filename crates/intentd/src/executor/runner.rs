@@ -358,6 +358,40 @@ struct Settled {
     stopped: bool,
 }
 
+/// Add to `settled` the submodules populated in the checkout at `cwd` that
+/// are not among its recorded pins (the setup script or an earlier session
+/// initialized them): the first turn's notice names them and the agent's
+/// `setupStatus` lists them as `unsentSubmodules`.
+async fn unsent_submodules(settled: &mut Settled, cwd: &Path) {
+    let cwd = cwd.to_path_buf();
+    let found = tokio::task::spawn_blocking(move || {
+        let pins = super::checkout::recorded_pins(&cwd);
+        intent_git::node_git::unpinned_submodules(&cwd, &pins)
+    })
+    .await;
+    let paths = match found {
+        Ok(Ok(paths)) => paths,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "node: could not list the checkout's unpinned submodules");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "node: the unpinned-submodule check did not finish");
+            return;
+        }
+    };
+    let Some(notice) = setup::unsent_notice(&paths) else {
+        return;
+    };
+    settled.notice = Some(match settled.notice.take() {
+        Some(setup) => format!("{setup}\n\n{notice}"),
+        None => notice,
+    });
+    if let Some(Value::Object(overlay)) = settled.overlay.as_mut() {
+        overlay.insert("unsentSubmodules".to_owned(), serde_json::json!(paths));
+    }
+}
+
 struct Agent {
     id: AgentId,
     workspace_id: WorkspaceId,
@@ -1325,7 +1359,7 @@ impl Runner {
                 fresh,
             })) => {
                 *lock(&agent.worktree) = Some(cwd.clone());
-                let settled = match &output {
+                let mut settled = match &output {
                     Some(output) => {
                         self.settle_setup(
                             &agent,
@@ -1339,6 +1373,9 @@ impl Runner {
                     }
                     None => Settled::default(),
                 };
+                if output.is_some() && !settled.stopped {
+                    unsent_submodules(&mut settled, &cwd).await;
+                }
                 *lock(&agent.setup_output) = None;
                 if settled.stopped {
                     Err(None)

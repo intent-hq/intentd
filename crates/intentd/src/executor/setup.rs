@@ -534,6 +534,22 @@ async fn spawn_and_wait(
     })
 }
 
+/// The notice naming the submodules populated in the checkout that are not
+/// the agent's pins, or `None` when there are none.
+pub(super) fn unsent_notice(paths: &[String]) -> Option<String> {
+    let verb = match paths {
+        [] => return None,
+        [_] => "was",
+        _ => "were",
+    };
+    Some(format!(
+        "[System: {} {verb} populated on this machine (by the setup script or an earlier \
+         session), not carried from the backend; changes there won't be sent back to the \
+         backend.]",
+        paths.join(", ")
+    ))
+}
+
 /// The first turn's notice for a setup that did not complete.
 pub(super) fn failed_notice(status: &SetupStatus, worktree: &Path, tail: &str) -> Option<String> {
     if status.state != Recorded::Failed {
@@ -715,6 +731,18 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_unsent_notice_names_each_submodule_once() {
+        assert_eq!(unsent_notice(&[]), None);
+        let one = unsent_notice(&["packages/ios".to_owned()]).unwrap();
+        assert!(
+            one.contains("packages/ios was populated on this machine"),
+            "{one}"
+        );
+        let two = unsent_notice(&["a".to_owned(), "b".to_owned()]).unwrap();
+        assert!(two.contains("a, b were populated on this machine"), "{two}");
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")

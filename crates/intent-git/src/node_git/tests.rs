@@ -772,3 +772,71 @@ fn configuring_the_hooks_removes_stale_files() {
         UPDATE_HOOK
     );
 }
+
+/// The machine's unpinned submodules: populated ones not among the pins,
+/// top-most only, searched for under pinned parents; unpopulated ones are
+/// skipped, and a checkout that is not a repository is an error.
+#[test]
+fn unpinned_submodules_are_the_populated_ones_outside_the_pins() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |dir: &Path, args: &[&str]| {
+        let mut all = vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "protocol.file.allow=always",
+        ];
+        all.extend_from_slice(args);
+        git(dir, &all)
+    };
+    let repo = |name: &str| {
+        let dir = root.path().join("src").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        run(&dir, &["init", "--quiet"]);
+        std::fs::write(dir.join("f.txt"), name).unwrap();
+        run(&dir, &["add", "f.txt"]);
+        run(&dir, &["commit", "--quiet", "-m", name]);
+        dir
+    };
+    let add = |dir: &Path, url: &Path, path: &str| {
+        run(
+            dir,
+            &["submodule", "add", "--quiet", url.to_str().unwrap(), path],
+        );
+        run(dir, &["commit", "--quiet", "-m", path]);
+    };
+    let (inner, deep, absent) = (repo("q"), repo("v"), repo("d"));
+    let pinned = repo("p");
+    add(&pinned, &inner, "q");
+    let unpinned = repo("u");
+    add(&unpinned, &deep, "v");
+    let work = root.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    run(&work, &["init", "--quiet"]);
+    for (url, path) in [(&pinned, "p"), (&unpinned, "u"), (&absent, "d")] {
+        add(&work, url, path);
+    }
+    run(
+        &work,
+        &["submodule", "update", "--quiet", "--init", "--recursive"],
+    );
+    run(&work, &["submodule", "deinit", "--quiet", "-f", "d"]);
+    let pin = |path: &str| SubmodulePin {
+        path: path.into(),
+        name: path.into(),
+        commit: String::new(),
+        module_key: String::new(),
+    };
+
+    assert_eq!(
+        unpinned_submodules(&work, &[pin("p")]).unwrap(),
+        ["p/q", "u"]
+    );
+    assert_eq!(
+        unpinned_submodules(&work, &[pin("p"), pin("p/q"), pin("u")]).unwrap(),
+        ["u/v"]
+    );
+    assert!(unpinned_submodules(&root.path().join("missing"), &[]).is_err());
+}
