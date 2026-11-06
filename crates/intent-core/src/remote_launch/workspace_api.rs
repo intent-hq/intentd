@@ -105,6 +105,10 @@ pub const FORWARDED_NAMESPACES: &[&str] = &[
     "mcp",
 ];
 
+/// The forwarded call head answers with the roots the agent's machine has,
+/// relative to its checkout, and the machine resolves in it.
+pub const GIT_ROOTS_METHOD: &str = "git.listRoots";
+
 /// Methods that run on the node, against the agent's checkout.
 pub const LOCAL_METHODS: &[&str] = &[
     "file.read",
@@ -154,7 +158,7 @@ pub const FORWARDED_METHODS: &[&str] = &[
 
 /// Why secondary git roots (`git.registerRoot`, `git.unregisterRoot`, a
 /// `gitRootId`) are refused on a remote agent.
-pub const GIT_ROOTS_MESSAGE: &str = "remote-agent-unsupported: secondary git roots are on the backend only; this agent's machine has the main checkout and its submodules.";
+pub const GIT_ROOTS_MESSAGE: &str = "remote-agent-unsupported: secondary git roots are registered on the backend; ws.git.listRoots lists this agent's submodules at their paths on its machine, so work in them by path (for example git -C <path> through ws.host.exec), not by gitRootId.";
 
 /// Why `ws.app.*` is refused on a remote agent.
 const APP_MESSAGE: &str = "remote-agent-unsupported: ws.app.* is for the Assistant workspace, whose agents run on the backend.";
@@ -425,7 +429,7 @@ mod tests {
         }
         assert_eq!(
             GIT_ROOTS_MESSAGE,
-            "remote-agent-unsupported: secondary git roots are on the backend only; this agent's machine has the main checkout and its submodules."
+            "remote-agent-unsupported: secondary git roots are registered on the backend; ws.git.listRoots lists this agent's submodules at their paths on its machine, so work in them by path (for example git -C <path> through ws.host.exec), not by gitRootId."
         );
     }
 

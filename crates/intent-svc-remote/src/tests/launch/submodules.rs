@@ -668,3 +668,74 @@ async fn setup_records_and_output_reach_the_agents_placement() {
     assert!(row["setup"].get("output").is_none(), "{row}");
     f.node.shutdown();
 }
+
+/// A remote agent's `git.listRoots` lists only the roots its machine has:
+/// the registered roots that are submodules carried in its pins, each with
+/// its path relative to the checkout (the machine makes it absolute). A
+/// plain repository inside the checkout, an unpopulated submodule and a
+/// repository outside the checkout are on the backend only and are left
+/// out (intent-hq/intent#8692).
+#[tokio::test]
+async fn a_remote_agents_git_roots_are_its_carried_submodules_relative_to_the_checkout() {
+    let (f, link, _machine) = prepared_fixture().await;
+    let _modules = add_submodules(f.repo.path());
+    let outside = tempfile::tempdir().unwrap();
+    repo_with_commit(outside.path(), "outside.txt");
+    let repo = std::fs::canonicalize(f.repo.path()).unwrap();
+    let now = intent_core::now_iso();
+    for path in [
+        repo.join("a"),
+        repo.join("a/b"),
+        repo.join("c"),
+        repo.join("d"),
+        repo.join("nested"),
+        std::fs::canonicalize(outside.path()).unwrap(),
+    ] {
+        f.services
+            .store()
+            .upsert_workspace_git_root(&intent_core::WorkspaceGitRoot {
+                id: intent_core::WorkspaceGitRootId::new(),
+                workspace_id: workspace(),
+                path: path.to_string_lossy().into_owned(),
+                source: intent_core::WorkspaceGitRootSource::Auto,
+                repo_owner: None,
+                repo_name: None,
+                registered_by_agent_ids: vec![],
+                registered_commit_sha: None,
+                pr_number: None,
+                pr_url: None,
+                pr_status: None,
+                pull_requests: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            })
+            .await
+            .unwrap();
+    }
+    let (agent, _view) = f.placed().await;
+
+    let roots = answered(forward(&link, &agent, "git.listRoots", json!({})).await);
+    let mut paths: Vec<&str> = roots
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|root| root["path"].as_str().unwrap())
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(paths, ["a", "a/b", "c"], "{roots}");
+    for root in roots.as_array().unwrap() {
+        assert!(
+            root.get("branch").is_none(),
+            "head's branch is not the machine's: {root}"
+        );
+    }
+
+    // An agent placed before pins were captured has no submodules on its
+    // machine, so no root.
+    let (before, mut view) = f.placed().await;
+    view.submodules = None;
+    f.set_view(&before, &view).await;
+    let none = answered(forward(&link, &before, "git.listRoots", json!({})).await);
+    assert_eq!(none, json!([]));
+    f.node.shutdown();
+}

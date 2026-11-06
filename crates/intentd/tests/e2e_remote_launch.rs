@@ -858,6 +858,27 @@ async fn remote_hooks_questions_and_client_calls(
     (ws_id, agent_id): (&str, &str),
     (repo, node_dir): (&Path, &Path),
 ) {
+    // A remote agent's schedule returns the hook row, as a local agent's
+    // does, so it can cancel by `result.hook.hookId` (intent-hq/intent#8691).
+    let kept = wsapi_turn(
+        rpc_ws,
+        events,
+        (ws_id, agent_id),
+        r#"wsapi const k = await ws.hook.schedule({ name: "remote quiet", delayMs: 600000, ttlMs: 60000, code: "return { dispatch: false };" }); const c = await ws.hook.cancel(k.hook.hookId); return JSON.stringify({ marker: "turn-hook-cancel", k, c });"#,
+        "turn-hook-cancel",
+        690,
+    )
+    .await;
+    let kept = wsapi_value(&kept);
+    assert_eq!(kept["k"]["dispatched"], false, "{kept}");
+    assert_eq!(kept["k"]["hook"]["name"], "remote quiet", "{kept}");
+    assert_eq!(kept["k"]["hook"]["agentId"], agent_id, "{kept}");
+    assert_eq!(
+        kept["c"]["hook"]["hookId"], kept["k"]["hook"]["hookId"],
+        "{kept}"
+    );
+    assert_eq!(kept["c"]["hook"]["state"], "cancelled", "{kept}");
+
     let scheduled = wsapi_turn(
         rpc_ws,
         events,
@@ -2394,6 +2415,37 @@ async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
         "backend only\n"
     );
 
+    // The workspace's git roots on the backend: the remote agent lists only
+    // its carried submodules, at their paths in its checkout, and not the
+    // repository outside it (intent-hq/intent#8692).
+    seed_git_roots(
+        &scratch.path().join("head"),
+        &ws_id,
+        &[
+            repo.join("a"),
+            repo.join("a/b"),
+            repo.join("c"),
+            c_url.clone(),
+        ],
+    )
+    .await;
+    let listed = wsapi_turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        r#"wsapi const info = await ws.workspace.info(); const roots = await ws.git.listRoots(); return JSON.stringify({ marker: "turn-list-roots", info, paths: roots.map(r => r.path).sort() });"#,
+        "turn-list-roots",
+        300,
+    )
+    .await;
+    let listed = wsapi_value(&listed);
+    let checkout = listed["info"]["path"].as_str().unwrap().to_owned();
+    assert_eq!(
+        listed["paths"],
+        json!(["a", "a/b", "c"].map(|path| format!("{checkout}/{path}"))),
+        "{listed}"
+    );
+
     // The agent commits in the nested `a/b` and leaves an edit in `c`.
     std::fs::write(work.join("a/b/agent.txt"), "agent commit\n").unwrap();
     git(&work.join("a/b"), &["add", "agent.txt"]);
@@ -2448,6 +2500,39 @@ async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
     // The backend's own checkouts are untouched.
     assert_eq!(heads(&repo), backend_heads);
     assert!(!repo.join("c/edit.txt").exists());
+}
+
+/// Register `paths` as `ws_id`'s secondary git roots in the backend's store.
+async fn seed_git_roots(data_dir: &Path, ws_id: &str, paths: &[std::path::PathBuf]) {
+    use intent_core::{now_iso, WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource};
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store");
+    let ts = now_iso();
+    for path in paths {
+        store
+            .upsert_workspace_git_root(&WorkspaceGitRoot {
+                id: WorkspaceGitRootId::new(),
+                workspace_id: intent_core::WorkspaceId::from(ws_id),
+                path: std::fs::canonicalize(path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                source: WorkspaceGitRootSource::Auto,
+                repo_owner: None,
+                repo_name: None,
+                registered_by_agent_ids: vec![],
+                registered_commit_sha: None,
+                pr_number: None,
+                pr_url: None,
+                pr_status: None,
+                pull_requests: None,
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+            })
+            .await
+            .expect("insert git root");
+    }
 }
 
 /// Create a remote agent named `name` on the exposed machine, retrying

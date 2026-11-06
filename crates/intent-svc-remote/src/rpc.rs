@@ -12,6 +12,7 @@
 //! The node's internal frames (its commit-policy read, a call's cards, the
 //! placement text and an attachment's bytes) are answered here directly.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,11 +23,11 @@ use intent_core::node_link::{
 };
 use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
-    INTERNAL_METHODS, MAX_FORWARDED_ATTACHMENTS, MAX_LINK_ATTACHMENT_BYTES,
+    GIT_ROOTS_METHOD, INTERNAL_METHODS, MAX_FORWARDED_ATTACHMENTS, MAX_LINK_ATTACHMENT_BYTES,
     MCP_PROXY_CALL_TOOL_METHOD, MCP_PROXY_LINK_TIMEOUT, MCP_PROXY_LIST_TOOLS_METHOD,
     PLACEMENT_HELP_METHOD,
 };
-use intent_core::remote_launch::RemoteAgentRecord;
+use intent_core::remote_launch::{RemoteAgentRecord, RemotePlacementView};
 use intent_core::{with_caller, AgentSession, Caller, Error, WorkspaceApi};
 use intent_services::feature_api::Services;
 use intent_transport::node_link::IncomingRequest;
@@ -244,9 +245,72 @@ impl HeadCalls {
             "args": request.params.get("args").cloned().unwrap_or(Value::Null),
         });
         match host(frame).await {
+            Ok(value) if method == GIT_ROOTS_METHOD => {
+                LinkOutcome::Ok(self.machine_roots(record, session, value).await)
+            }
             Ok(value) => LinkOutcome::Ok(value),
             Err(message) => refusal(CALL_FAILED, message),
         }
+    }
+
+    /// `roots`, head's `git.listRoots` answer, as the agent's machine has
+    /// them: only the submodules carried in the agent's pins, each with its
+    /// path relative to the checkout and without head's branch (the machine
+    /// resolves both in its checkout). Every other root is on the backend
+    /// only and is left out (intent-hq/intent#8692).
+    async fn machine_roots(
+        &self,
+        record: &RemoteAgentRecord,
+        session: &AgentSession,
+        roots: Value,
+    ) -> Value {
+        let Value::Array(rows) = roots else {
+            return roots;
+        };
+        let view = RemotePlacementView::from_metadata(session.metadata.as_ref());
+        let pins: Vec<&str> = view
+            .as_ref()
+            .map(|view| view.pins().iter().map(|pin| pin.path.as_str()).collect())
+            .unwrap_or_default();
+        let checkout = match self
+            .services
+            .store()
+            .get_workspace(&record.workspace_id)
+            .await
+        {
+            Ok(workspace) => crate::launch::checkout_path(&workspace),
+            Err(error) => {
+                tracing::debug!(%error, "no workspace checkout for a remote agent's git roots");
+                None
+            }
+        };
+        let Some(checkout) = checkout else {
+            return Value::Array(Vec::new());
+        };
+        let canonical = tokio::fs::canonicalize(&checkout).await.ok();
+        let rows = rows
+            .into_iter()
+            .filter_map(|mut row| {
+                let path = Path::new(row.get("path")?.as_str()?);
+                let rel = [Some(&checkout), canonical.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|base| path.strip_prefix(base).ok())?;
+                let rel = rel
+                    .components()
+                    .map(|part| part.as_os_str().to_str())
+                    .collect::<Option<Vec<_>>>()?
+                    .join("/");
+                if !pins.contains(&rel.as_str()) {
+                    return None;
+                }
+                let fields = row.as_object_mut()?;
+                fields.insert("path".to_owned(), Value::String(rel));
+                fields.remove("branch");
+                Some(row)
+            })
+            .collect();
+        Value::Array(rows)
     }
 }
 
