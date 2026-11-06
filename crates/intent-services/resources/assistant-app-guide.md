@@ -562,6 +562,14 @@ while it stays open unless the agent is retired or deleted. Choose another from 
 agent menu above the chat; Home remembers that choice for the workspace until the app
 restarts, the account or connection changes, or Home is reset.
 
+The conversation header's **More** menu groups **Rename**, **Copy conversation**,
+**Tasks**, and **Prompts** under **Conversation**. **Settings** contains **Font**
+and per-agent **Notifications**; lifecycle actions appear under **Agent** when
+available. The footer shows specialist and harness metadata when present; select
+the harness version for details. **Move panel** opens the pane movement controls.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/layout/tab-types/{AgentTabType,AgentViewSettingsDropdown}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte. -->
+
 **Retire Agent** stops an agent and keeps its conversation so it can be restored later.
 Intent refuses to retire a workspace's last top-level agent, whether you or the agent
 asks; start another agent in the workspace first, or archive the workspace instead.
