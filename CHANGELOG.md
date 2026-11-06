@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.143] - 2026-11-06
+
+### 📚 Documentation
+
+- Explain running work before PR approval reminders ([#3111](https://github.com/intent-hq/intentd/pull/3111))
+- Update MCP settings guidance ([#2414](https://github.com/intent-hq/intentd/pull/2414))
+- Describe conditional Set aside column ([#3112](https://github.com/intent-hq/intentd/pull/3112))
+
+
 ## [0.11.142] - 2026-11-06
 
 ### 🚀 Features
