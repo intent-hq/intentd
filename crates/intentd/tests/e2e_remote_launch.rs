@@ -772,6 +772,24 @@ async fn remote_hooks_questions_and_client_calls(
     (ws_id, agent_id): (&str, &str),
     (repo, node_dir): (&Path, &Path),
 ) {
+    // A remote agent's schedule returns the hook row, as a local agent's
+    // does, so it can cancel by `result.hook.hookId` (intent-hq/intent#8691).
+    let kept = wsapi_turn(
+        rpc_ws,
+        events,
+        (ws_id, agent_id),
+        r#"wsapi const k = await ws.hook.schedule({ name: "remote quiet", delayMs: 600000, ttlMs: 60000, code: "return { dispatch: false };" }); const c = await ws.hook.cancel(k.hook.hookId); return JSON.stringify({ marker: "turn-hook-cancel", k, c });"#,
+        "turn-hook-cancel",
+        690,
+    )
+    .await;
+    let kept = wsapi_value(&kept);
+    assert_eq!(kept["k"]["dispatched"], false, "{kept}");
+    assert_eq!(kept["k"]["hook"]["name"], "remote quiet", "{kept}");
+    assert_eq!(kept["k"]["hook"]["agentId"], agent_id, "{kept}");
+    assert_eq!(kept["c"]["hook"]["hookId"], kept["k"]["hook"]["hookId"], "{kept}");
+    assert_eq!(kept["c"]["hook"]["state"], "cancelled", "{kept}");
+
     let scheduled = wsapi_turn(
         rpc_ws,
         events,
@@ -2260,6 +2278,47 @@ async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
     assert_eq!(
         std::fs::read_to_string(work.join("a/ahead.txt")).unwrap(),
         "backend only\n"
+    );
+
+    // The workspace's git roots, registered by a local agent: the remote
+    // agent lists only its carried submodules, at their paths in its
+    // checkout, and not the repository outside it (intent-hq/intent#8692).
+    let local = ok(
+        &mut rpc_ws,
+        200,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Local", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let local_id = local["agent"]["id"].as_str().unwrap().to_owned();
+    let registered = wsapi_turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &local_id),
+        &format!(
+            r#"wsapi for (const p of ["a", "a/b", "c", {outside:?}]) await ws.git.registerRoot(p); return JSON.stringify({{ marker: "turn-roots", n: (await ws.git.listRoots()).length }});"#,
+            outside = c_url.to_str().unwrap(),
+        ),
+        "turn-roots",
+        210,
+    )
+    .await;
+    assert_eq!(wsapi_value(&registered)["n"], 4, "{registered}");
+    let listed = wsapi_turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        r#"wsapi const info = await ws.workspace.info(); const roots = await ws.git.listRoots(); return JSON.stringify({ marker: "turn-list-roots", info, paths: roots.map(r => r.path).sort() });"#,
+        "turn-list-roots",
+        300,
+    )
+    .await;
+    let listed = wsapi_value(&listed);
+    let checkout = listed["info"]["path"].as_str().unwrap().to_owned();
+    assert_eq!(
+        listed["paths"],
+        json!(["a", "a/b", "c"].map(|path| format!("{checkout}/{path}"))),
+        "{listed}"
     );
 
     // The agent commits in the nested `a/b` and leaves an edit in `c`.
