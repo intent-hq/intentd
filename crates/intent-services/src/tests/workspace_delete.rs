@@ -342,11 +342,11 @@ async fn loaded_deletions_allow_unrelated_writes_and_persisted_events_before_com
             "event",
         ),
     ] {
-        sqlx::query(&format!("CREATE TRIGGER probe_{kind} AFTER INSERT ON {table} WHEN {condition} BEGIN \
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TRIGGER probe_{kind} AFTER INSERT ON {table} WHEN {condition} BEGIN \
             INSERT INTO deletion_probes SELECT '{kind}', COALESCE(MAX(n),0) FROM \
             (SELECT COUNT(*) n FROM agent_message_payload p JOIN agent_session s ON s.id=p.agent_id \
             WHERE s.workspace_id IN ('delete-a','delete-b') GROUP BY s.workspace_id \
-            HAVING COUNT(*) > 0 AND COUNT(*) < {}); END", 3 * ROWS))
+            HAVING COUNT(*) > 0 AND COUNT(*) < {}); END", 3 * ROWS)))
             .execute(h.store.write_pool()).await.unwrap();
     }
     let done = AtomicBool::new(false);

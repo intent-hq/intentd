@@ -131,9 +131,9 @@ impl Store {
                 continue;
             }
             // `table` is one of two constants, never caller input.
-            let deleted = sqlx::query(&format!(
+            let deleted = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} LIMIT ?)"
-            ))
+            )))
             .bind(i64::from(batch_rows.max(1)))
             .execute(self.write_pool())
             .await
@@ -145,7 +145,7 @@ impl Store {
                     rows: deleted,
                 });
             }
-            sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
                 .execute(self.write_pool())
                 .await
                 .map_err(|e| Error::Internal(format!("drop retired {table}: {e}")))?;
@@ -302,7 +302,7 @@ impl Store {
                 // Busy-retry window: a saturated single writer must not fail
                 // the workspace delete sweep (intent-hq/intent#7705).
                 let removed = crate::with_write_txn_retry(|| async {
-                    match sqlx::query(&sql)
+                    match sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                         .bind(workspace_id)
                         .bind(batch)
                         .execute(self.write_pool())

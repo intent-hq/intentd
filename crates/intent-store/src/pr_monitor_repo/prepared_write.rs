@@ -12,7 +12,7 @@ use sqlx::Transaction;
 /// No pool acquisition, provider call or application callback occurs in commit.
 pub struct PreparedMonitorWrite {
     transaction: Transaction<'static, Sqlite>,
-    query: QueryBuilder<'static, Sqlite>,
+    query: QueryBuilder<Sqlite>,
     insert: bool,
 }
 
@@ -58,7 +58,7 @@ impl PreparedMonitorWrite {
 impl Store {
     async fn prepare_monitor_write(
         &self,
-        query: QueryBuilder<'static, Sqlite>,
+        query: QueryBuilder<Sqlite>,
         insert: bool,
     ) -> Result<PreparedMonitorWrite> {
         // Acquire SQLite's write reservation before caller/account fences. A
@@ -180,10 +180,7 @@ impl Store {
 }
 
 /// Both the legacy Store CAS entry and prepared writes compare original bytes.
-pub(super) fn captured_condition(
-    query: &mut QueryBuilder<'static, Sqlite>,
-    expected: &QualifiedPrMonitor,
-) {
+pub(super) fn captured_condition(query: &mut QueryBuilder<Sqlite>, expected: &QualifiedPrMonitor) {
     query.push(" WHERE state = 'active'");
     for (i, column) in COLUMNS.split(',').map(str::trim).enumerate() {
         query.push(" AND ").push(column).push(" IS ");

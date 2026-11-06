@@ -8548,9 +8548,9 @@ async fn rewind_repository_authority(store: &Store) {
         "credential",
     ] {
         for suffix in ["ai", "ad", "au"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DROP TRIGGER repository_authority_{kind}_{suffix}"
-            ))
+            )))
             .execute(store.write_pool())
             .await
             .expect("drop 0144 source trigger");
@@ -9861,6 +9861,7 @@ async fn invite_reusable_migration_keeps_pre_upgrade_redeemed_links_exhausted() 
         .expect("migration 0129 present");
     let sql: String = migration
         .sql
+        .as_str()
         .lines()
         .filter(|l| !l.trim_start().starts_with("--"))
         .collect::<Vec<_>>()
@@ -9871,7 +9872,7 @@ async fn invite_reusable_migration_keeps_pre_upgrade_redeemed_links_exhausted() 
             if body.is_empty() || body.starts_with("ALTER TABLE") {
                 continue;
             }
-            sqlx::query(body)
+            sqlx::query(sqlx::AssertSqlSafe(body))
                 .execute(store.write_pool())
                 .await
                 .expect("run migration statement");
@@ -10641,10 +10642,10 @@ async fn archived_workspace_refuses_member_add_invite_mint_and_join() {
         None,
         "a refused mint leaves no row"
     );
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO workspace_invite ({}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         crate::principal_repo::INVITE_COLUMNS
-    ))
+    )))
     .bind("smuggled")
     .bind(&ws.0)
     .bind("hash-smuggled")
@@ -11561,6 +11562,7 @@ async fn backfill_agent_session_identity_fills_legacy_rows_from_last_turn() {
         .expect("migration 0162 present");
     let sql: String = migration
         .sql
+        .as_str()
         .lines()
         .filter(|l| !l.trim_start().starts_with("--"))
         .collect::<Vec<_>>()
@@ -11570,7 +11572,7 @@ async fn backfill_agent_session_identity_fills_legacy_rows_from_last_turn() {
             let body = statement.trim();
             // The column ALTER already ran at open; replay the data backfill.
             if !body.is_empty() && !body.starts_with("ALTER TABLE") {
-                sqlx::query(body)
+                sqlx::query(sqlx::AssertSqlSafe(body))
                     .execute(store.write_pool())
                     .await
                     .expect("run migration statement");
@@ -11781,7 +11783,8 @@ async fn never_saved_default_upgrade_repairs_only_metadata_history() {
         .iter()
         .find(|m| m.version == 163)
         .expect("migration 0163 present")
-        .sql;
+        .sql
+        .as_str();
     let top_level: Vec<&str> = sql
         .match_indices("\nUPDATE repository_selection_state")
         .map(|(at, _)| {

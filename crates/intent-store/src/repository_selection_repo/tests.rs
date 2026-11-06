@@ -414,7 +414,7 @@ async fn migration_bootstrap_retains_unproved_hints_without_copying_them() {
     let triggers:Vec<String>=sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'repository_selection_%'")
         .fetch_all(f.store.read_pool()).await.unwrap();
     for trigger in triggers {
-        sqlx::query(&format!("DROP TRIGGER {trigger}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TRIGGER {trigger}")))
             .execute(f.store.write_pool())
             .await
             .unwrap();
@@ -539,7 +539,7 @@ async fn replay_selection_migration(store: &Store) {
     let triggers:Vec<String>=sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'repository_selection_%'")
         .fetch_all(store.read_pool()).await.unwrap();
     for trigger in triggers {
-        sqlx::query(&format!("DROP TRIGGER {trigger}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TRIGGER {trigger}")))
             .execute(store.write_pool())
             .await
             .unwrap();

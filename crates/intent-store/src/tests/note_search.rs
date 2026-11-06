@@ -115,10 +115,11 @@ async fn note_fts_lifecycle_and_composite_identity() {
     store.delete_workspace(&b).await.unwrap();
     assert!(hits(&store, "shared").await.is_empty());
     for table in ["note_fts", "note_search_ctx"] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(store.read_pool())
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap();
         assert_eq!(count, 0);
     }
 }
@@ -505,7 +506,9 @@ async fn note_fts_query_plan_hydrates_only_winners() {
             "EXPLAIN QUERY PLAN {}",
             crate::note_search_repo::search_notes_fts_sql(&options)
         );
-        let mut query = sqlx::query(&sql).bind("plan").bind("needle");
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind("plan")
+            .bind("needle");
         if filtered {
             query = query.bind("plan").bind("[\"plan\"]");
         }

@@ -56,7 +56,7 @@ impl Store {
              old_content = excluded.old_content, new_content = excluded.new_content, \
              hunks_json = excluded.hunks_json, updated_at = excluded.updated_at"
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id)
             .bind(&d.workspace_id.0)
             .bind(&d.file_path)
@@ -81,7 +81,7 @@ impl Store {
     pub async fn list_diffs(&self, workspace_id: &WorkspaceId) -> Result<Vec<DiffRow>> {
         let sql =
             format!("SELECT {DIFF_COLUMNS} FROM diffs WHERE workspace_id = ? ORDER BY created_at");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await

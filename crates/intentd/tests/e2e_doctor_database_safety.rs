@@ -825,7 +825,7 @@ async fn read_detached_retains_ownership() {
     escaped_handle_retains_ownership(true, "detached").await;
 }
 
-async fn invalid_migration_is_read_only_failure(update: &str) {
+async fn invalid_migration_is_read_only_failure(update: &'static str) {
     let fixture = Fixture::new();
     let db = fixture.data_dir().join("intentd.db");
     let writer = Store::open(&db).await.unwrap();

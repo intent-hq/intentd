@@ -88,7 +88,7 @@ impl Store {
             .transpose()
             .map_err(|e| Error::Internal(format!("encode metadata_json failed: {e}")))?;
         let sql = format!("INSERT INTO event ({EVENT_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?)");
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id)
             .bind(&ev.workspace_id.0)
             .bind(&ev.timestamp)

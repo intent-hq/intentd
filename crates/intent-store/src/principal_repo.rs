@@ -278,7 +278,7 @@ impl Store {
     /// `Error::Internal` if the database operation fails.
     pub async fn get_principal(&self, id: &PrincipalId) -> Result<Principal> {
         let sql = format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&id.0)
             .fetch_optional(self.read_pool())
             .await
@@ -303,7 +303,7 @@ impl Store {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql =
                 format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE id IN ({placeholders})");
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(&id.0);
             }
@@ -333,7 +333,7 @@ impl Store {
             if viewer.is_some() {
                 sql.push_str(" AND (id = ? OR EXISTS(SELECT 1 FROM principal v WHERE v.id = ? AND (v.is_primary = 1 OR EXISTS(SELECT 1 FROM host_member h WHERE h.principal_id = v.id))))");
             }
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(id.as_str());
             }
@@ -368,7 +368,7 @@ impl Store {
     /// the migration guarantees exactly one) or the database operation fails.
     pub async fn get_primary_principal(&self) -> Result<Principal> {
         let sql = format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE is_primary = 1");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("get primary principal failed: {e}")))?;
@@ -389,7 +389,7 @@ impl Store {
     ) -> Result<Option<Principal>> {
         let sql =
             format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE {PRINCIPAL_BY_IDENTITY}");
-        let row = bind_identity(sqlx::query(&sql), identity)
+        let row = bind_identity(sqlx::query(sqlx::AssertSqlSafe(sql.as_str())), identity)
             .fetch_optional(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("find principal by identity failed: {e}")))?;
@@ -420,7 +420,7 @@ impl Store {
         let sql = format!(
             "SELECT {PRINCIPAL_COLUMNS} FROM principal ORDER BY is_primary DESC, created_at, id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list principals failed: {e}")))?;
@@ -443,7 +443,7 @@ impl Store {
                  WHERE c.principal_id = p.id AND c.revoked_at IS NULL) \
              ORDER BY p.created_at, p.id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list credentialed guests failed: {e}")))?;
@@ -505,7 +505,7 @@ impl Store {
             "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?) \
              ON CONFLICT(id) DO UPDATE SET {PRINCIPAL_UPSERT_SET}"
         );
-        bind_principal(sqlx::query(&sql), p)
+        bind_principal(sqlx::query(sqlx::AssertSqlSafe(sql.as_str())), p)
             .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("upsert principal failed: {e}")))?;
@@ -626,7 +626,7 @@ impl Store {
              LEFT JOIN workspace_member m ON m.workspace_id = w.id AND m.principal_id = v.id \
              WHERE h.id = 1 AND w.id IN ({placeholders})"
         );
-        let mut query = sqlx::query(&sql)
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(viewer.map(|p| p.0.as_str()))
             .bind(intent_core::CHIEF_WORKSPACE_ID)
             .bind(intent_core::CHIEF_WORKSPACE_ID)
@@ -677,7 +677,7 @@ impl Store {
             "SELECT {MEMBER_COLUMNS} FROM workspace_member WHERE workspace_id = ? \
              ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, added_at, principal_id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -777,7 +777,7 @@ impl Store {
             "SELECT {MEMBER_COLUMNS} FROM workspace_member WHERE principal_id = ? \
              ORDER BY added_at, workspace_id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&principal_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -857,7 +857,7 @@ impl Store {
                 "INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?) \
                  ON CONFLICT(workspace_id, principal_id) DO NOTHING"
             );
-            let res = sqlx::query(&sql)
+            let res = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&workspace_id.0)
                 .bind(&principal_id.0)
                 .bind(role.as_str())
@@ -961,7 +961,7 @@ impl Store {
             let insert =
                 format!("INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?)");
             lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
-            sqlx::query(&insert)
+            sqlx::query(sqlx::AssertSqlSafe(insert.as_str()))
                 .bind(&workspace_id.0)
                 .bind(&principal_id.0)
                 .bind(WorkspaceRole::Collaborator.as_str())
@@ -1244,7 +1244,7 @@ impl Store {
     ) -> Result<Option<PrincipalCredential>> {
         let sql =
             format!("SELECT {CREDENTIAL_COLUMNS} FROM principal_credential WHERE token_hash = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(token_hash)
             .fetch_optional(self.read_pool())
             .await
@@ -1265,7 +1265,7 @@ impl Store {
             "SELECT {CREDENTIAL_COLUMNS} FROM principal_credential WHERE principal_id = ? \
              ORDER BY created_at DESC, token_hash"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&principal_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1406,7 +1406,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn count_open_workspace_invites(&self) -> Result<u64> {
         let sql = format!("SELECT COUNT(*) FROM workspace_invite i WHERE {INVITE_OPEN}");
-        let n: i64 = sqlx::query_scalar(&sql)
+        let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(now_iso())
             .fetch_one(self.read_pool())
             .await
@@ -1524,7 +1524,7 @@ impl Store {
                     .as_ref()
                     .and_then(PrincipalIdentity::github_user_id)
             });
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&invite.id)
                 .bind(&invite.workspace_id.0)
                 .bind(&invite.secret_hash)
@@ -1568,7 +1568,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn get_workspace_invite(&self, id: &str) -> Result<Option<WorkspaceInvite>> {
         let sql = format!("SELECT {INVITE_COLUMNS} FROM workspace_invite WHERE id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .fetch_optional(self.read_pool())
             .await
@@ -1590,7 +1590,7 @@ impl Store {
              WHERE i.workspace_id = ? AND {INVITE_OPEN} \
              ORDER BY i.created_at, i.id"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .bind(now_iso())
             .fetch_all(self.read_pool())
@@ -1612,7 +1612,7 @@ impl Store {
         let sql = format!(
             "UPDATE workspace_invite AS i SET revoked_at = ? WHERE i.id = ? AND {INVITE_OPEN}"
         );
-        let res = sqlx::query(&sql)
+        let res = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&now)
             .bind(id)
             .bind(&now)
@@ -1761,7 +1761,7 @@ impl Store {
                 "UPDATE workspace_invite AS i SET revoked_at = ? \
                  WHERE i.workspace_id = ? AND {INVITE_OPEN}"
             );
-            let revoked = sqlx::query(&revoke_sql)
+            let revoked = sqlx::query(sqlx::AssertSqlSafe(revoke_sql.as_str()))
                 .bind(archived_at)
                 .bind(&id.0)
                 .bind(archived_at)
@@ -1810,7 +1810,7 @@ impl Store {
                  redemption_count = redemption_count + 1 \
              WHERE i.id = ? AND {INVITE_OPEN}"
         );
-        let res = sqlx::query(&sql)
+        let res = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&now)
             .bind(&principal_id.0)
             .bind(id)
@@ -1872,7 +1872,7 @@ impl Store {
                 "SELECT {INVITE_COLUMNS} FROM workspace_invite i \
                  WHERE i.id = ? AND i.workspace_id = ? AND {INVITE_OPEN}"
             );
-            let open = sqlx::query(&open_sql)
+            let open = sqlx::query(sqlx::AssertSqlSafe(open_sql.as_str()))
                 .bind(invite_id)
                 .bind(&workspace_id.0)
                 .bind(&now)
@@ -1893,7 +1893,7 @@ impl Store {
             }
             let lookup =
                 format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE {PRINCIPAL_BY_IDENTITY}");
-            let existing = bind_identity(sqlx::query(&lookup), &identity_key)
+            let existing = bind_identity(sqlx::query(sqlx::AssertSqlSafe(lookup.as_str())), &identity_key)
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|e| Error::Internal(format!("invite join principal lookup failed: {e}")))?
@@ -1976,7 +1976,7 @@ impl Store {
                 "INSERT INTO principal ({PRINCIPAL_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,?){}",
                 if was_existing { format!(" ON CONFLICT(id) DO UPDATE SET {PRINCIPAL_UPSERT_SET}") } else { String::new() }
             );
-            bind_principal(sqlx::query(&upsert), &principal)
+            bind_principal(sqlx::query(sqlx::AssertSqlSafe(upsert.as_str())), &principal)
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| {
@@ -1990,7 +1990,7 @@ impl Store {
                      redemption_count = redemption_count + ? \
                  WHERE i.id = ? AND i.workspace_id = ? AND {INVITE_OPEN}"
             );
-            let redeemed = sqlx::query(&redeem_sql)
+            let redeemed = sqlx::query(sqlx::AssertSqlSafe(redeem_sql.as_str()))
                 .bind(&now)
                 .bind(&principal.id.0)
                 .bind(i64::from(!already_member))
@@ -2011,7 +2011,7 @@ impl Store {
                     "INSERT INTO workspace_member ({MEMBER_COLUMNS}) VALUES (?,?,?,?) \
                      ON CONFLICT(workspace_id, principal_id) DO NOTHING"
                 );
-                sqlx::query(&member)
+                sqlx::query(sqlx::AssertSqlSafe(member.as_str()))
                     .bind(&workspace_id.0)
                     .bind(&principal.id.0)
                     .bind(WorkspaceRole::Collaborator.as_str())
@@ -2106,7 +2106,7 @@ async fn sync_workspace_owner(
 pub(crate) const PRINCIPAL_BY_IDENTITY: &str =
     "identity_provider = ? AND instance_host = ? AND external_user_id = ?";
 
-type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
+type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>;
 
 pub(crate) fn bind_identity<'q>(
     query: SqliteQuery<'q>,

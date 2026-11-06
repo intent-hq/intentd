@@ -13,7 +13,7 @@ use sqlx::{QueryBuilder, Sqlite, Transaction};
 /// original source, account and destination fences through `commit`.
 pub struct PreparedMonitorMessage {
     transaction: Transaction<'static, Sqlite>,
-    expected: QueryBuilder<'static, Sqlite>,
+    expected: QueryBuilder<Sqlite>,
     message: AgentMessage,
     content: PreparedContent,
     metadata_json: String,
@@ -53,7 +53,7 @@ impl PreparedMonitorMessage {
         }
         let m = &self.message;
         let sql = format!("INSERT INTO agent_message ({MESSAGE_INSERT_COLUMNS}, usage_model, usage_origin) VALUES (?,?,?,?,?,?,?,?,?)");
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&m.id)
             .bind(&m.agent_id.0)
             .bind(m.seq)

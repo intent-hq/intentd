@@ -121,7 +121,7 @@ impl Store {
                 "INSERT INTO tracked_changes ({TRACKED_CHANGE_COLUMNS}) \
                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&id)
                 .bind(&c.workspace_id.0)
                 .bind(&c.path)
@@ -259,7 +259,7 @@ impl Store {
                  AND stage IN ('unstaged', 'staged') \
                  AND (id, updated_at) IN (VALUES {pairs})"
             );
-            let mut q = sqlx::query(&sql).bind(&workspace_id.0);
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&workspace_id.0);
             for (id, updated_at) in chunk {
                 q = q.bind(id).bind(updated_at);
             }
@@ -286,7 +286,7 @@ impl Store {
             "SELECT {TRACKED_CHANGE_COLUMNS} FROM tracked_changes \
              WHERE workspace_id = ? ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await

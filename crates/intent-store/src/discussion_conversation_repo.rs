@@ -182,7 +182,7 @@ impl Store {
             return Err(Error::InvalidParams("invalid recipient page bounds".into()));
         }
         let sql=format!("SELECT p.id,p.login,p.display_name,p.avatar_url FROM principal p WHERE p.id<>? AND p.id>? AND {ELIGIBLE} AND instr(lower(coalesce(p.login,'') || ' ' || coalesce(p.display_name,'') || ' ' || p.id),lower(?))>0 ORDER BY p.id LIMIT ?");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(principal.as_str())
             .bind(after.unwrap_or(""))
             .bind(ws.as_str())
@@ -268,7 +268,7 @@ impl Store {
             }
         } else {
             let membership_sql = format!("SELECT EXISTS(SELECT 1 FROM principal p JOIN workspace w ON w.id=? WHERE p.id=? AND {ELIGIBLE})");
-            let member: bool = sqlx::query_scalar(&membership_sql)
+            let member: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(membership_sql.as_str()))
                 .bind(ws.as_str())
                 .bind(principal_id.map(PrincipalId::as_str))
                 .bind(ws.as_str())
@@ -361,7 +361,7 @@ impl Store {
             ids.push(principal_id.ok_or_else(missing)?.clone());
             ids.sort();
             let sql=format!("SELECT p.id,p.login,p.display_name,p.avatar_url FROM principal p WHERE p.id IN (SELECT value FROM json_each(?)) AND {ELIGIBLE} ORDER BY p.id");
-            let rows = sqlx::query(&sql)
+            let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(serde_json::to_string(&ids).map_err(|e| Error::Internal(e.to_string()))?)
                 .bind(ws.as_str())
                 .bind(ws.as_str())
@@ -462,7 +462,7 @@ async fn validate_principal_recipients(
         .map(|m| &m.principal_id)
         .collect();
     let sql = format!("SELECT COUNT(*) FROM principal p WHERE p.id IN (SELECT value FROM json_each(?)) AND {ELIGIBLE} AND (?='default' OR EXISTS(SELECT 1 FROM workspace_discussion_conversation wdc WHERE wdc.workspace_id=?2 AND wdc.id=?4 AND wdc.deleted_at IS NULL) OR EXISTS(SELECT 1 FROM discussion_participant d WHERE d.workspace_id=? AND d.conversation_id=? AND d.principal_id=p.id))");
-    let count: i64 = sqlx::query_scalar(&sql)
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(serde_json::to_string(&ids).map_err(|e| Error::Internal(e.to_string()))?)
         .bind(ws.as_str())
         .bind(ws.as_str())

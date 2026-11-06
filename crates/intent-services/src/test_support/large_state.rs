@@ -1234,11 +1234,12 @@ mod tests {
 
     const MIB: usize = 1024 * 1024;
 
-    async fn count(store: &Store, sql: &str) -> usize {
-        let n: i64 = sqlx::query_scalar(sql)
+    async fn count(store: &Store, sql: impl sqlx::SqlSafeStr) -> usize {
+        let sql = sql.into_sql_str();
+        let n: i64 = sqlx::query_scalar(sql.clone())
             .fetch_one(store.read_pool())
             .await
-            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            .unwrap_or_else(|e| panic!("{}: {e}", sql.as_str()));
         usize::try_from(n).expect("non-negative count")
     }
 
@@ -1470,7 +1471,7 @@ mod tests {
         .await
         .expect("skill list");
         let ws = ids.big_workspace.as_str();
-        let sum = |sql: String| async move { count(s, &sql).await };
+        let sum = |sql: String| async move { count(s, sqlx::AssertSqlSafe(sql)).await };
         let sizes = [
             ("workspaces", json_len(&workspaces)),
             ("agents (big workspace)", json_len(&agents)),

@@ -571,7 +571,7 @@ mod tests {
                 .await
                 .expect("open seed pool");
             let mode = if incremental { "INCREMENTAL" } else { "NONE" };
-            sqlx::query(&format!("PRAGMA auto_vacuum = {mode}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA auto_vacuum = {mode}")))
                 .execute(&pool)
                 .await
                 .expect("auto_vacuum");

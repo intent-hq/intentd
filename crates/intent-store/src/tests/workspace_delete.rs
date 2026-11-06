@@ -302,10 +302,11 @@ async fn assert_deleted(store: &Store, workspace: &WorkspaceId, kept_messages: i
         "agent_message_fts",
         "agent_message_search_ctx",
     ] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(store.read_pool())
-            .await
-            .expect("message/search count");
+        let count: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(store.read_pool())
+                .await
+                .expect("message/search count");
         assert_eq!(
             count, kept_messages,
             "{table} preserves only unrelated rows"
@@ -588,9 +589,9 @@ async fn seed_heavy_workspace_children(store: &Store, workspace: &WorkspaceId, c
         "INSERT INTO workspace_context_item (workspace_id, id, ordinal, payload) \
          SELECT ?2, 'item-' || n, n, '{}' FROM rows",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM rows WHERE n < ?1) {insert}"
-        ))
+        )))
         .bind(count)
         .bind(&workspace.0)
         .execute(&mut *tx)
@@ -672,14 +673,15 @@ async fn workspace_delete_sweeps_heavy_children_before_final_transaction() {
         "diffs",
         "workspace_context_item",
     ] {
-        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(store.read_pool())
-            .await
-            .unwrap();
+        let total: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap();
         assert_eq!(total, 3, "{table} keeps only unrelated rows");
-        let deleted: i64 = sqlx::query_scalar(&format!(
+        let deleted: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE workspace_id = ?"
-        ))
+        )))
         .bind(&doomed.0)
         .fetch_one(store.read_pool())
         .await
@@ -714,9 +716,9 @@ async fn workspace_delete_sweeps_accumulated_agent_children() {
         "INSERT INTO pr_monitor (monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, created_at, updated_at) \
          SELECT 'monitor-' || n, 'doomed', ?2, 'owner', 'repo', n, 'completed', 't0', 't0' FROM rows",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM rows WHERE n < ?1) {insert}"
-        ))
+        )))
         .bind(HISTORY_ROWS)
         .bind(&agent.0)
         .execute(&mut *tx)
@@ -755,16 +757,17 @@ async fn workspace_delete_sweeps_accumulated_agent_children() {
         .await
         .expect("no heavy session cascade");
     for table in ["agent_queue", "hook", "pr_monitor"] {
-        let remaining: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(store.read_pool())
-            .await
-            .unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap();
         assert_eq!(remaining, 0, "{table} cleaned up");
     }
     for table in ["completion_wake_delivery", "advisory_wake_delivery"] {
-        let pairs: Vec<(String, String)> = sqlx::query_as(&format!(
+        let pairs: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT parent_agent_id, child_agent_id FROM {table}"
-        ))
+        )))
         .fetch_all(store.read_pool())
         .await
         .unwrap();

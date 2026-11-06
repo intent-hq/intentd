@@ -19,7 +19,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_known_repos(&self) -> Result<Vec<KnownRepo>> {
         let sql = format!("SELECT {KNOWN_REPO_COLUMNS} FROM known_repo ORDER BY last_used_at DESC");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| Error::Internal(format!("list known repos failed: {e}")))?;

@@ -564,7 +564,7 @@ async fn database_snapshot(store: &Store) -> Value {
     }
     let mut snapshot = serde_json::Map::new();
     for pragma in ["auto_vacuum", "journal_mode"] {
-        let row = sqlx::query(&format!("PRAGMA {pragma}"))
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA {pragma}")))
             .fetch_one(pool)
             .await
             .unwrap();
@@ -596,10 +596,10 @@ async fn database_snapshot(store: &Store) -> Value {
             })
             .map(|(column,)| format!("quote(\"{column}\")"))
             .collect();
-        let rows: Vec<String> = sqlx::query_scalar(&format!(
+        let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT {} FROM \"{table}\"",
             quoted.join(" || '|' || ")
-        ))
+        )))
         .fetch_all(pool)
         .await
         .unwrap();

@@ -65,7 +65,7 @@ async fn stop_counting(store: &Store) {
     conn.lock_handle().await.unwrap().remove_progress_handler();
 }
 
-async fn measure_batch(store: &Store, sql: &str) -> (u64, u64) {
+async fn measure_batch(store: &Store, sql: &'static str) -> (u64, u64) {
     let counter = count_steps(store).await;
     let rows = sqlx::query(sql)
         .bind("doomed")
@@ -80,7 +80,7 @@ async fn measure_batch(store: &Store, sql: &str) -> (u64, u64) {
 
 async fn plan(store: &Store, sql: &str, bindings: &[&str]) -> Vec<String> {
     let explain = format!("EXPLAIN QUERY PLAN {sql}");
-    let mut query = sqlx::query(&explain);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(explain.as_str()));
     for binding in bindings {
         query = query.bind(*binding);
     }
@@ -205,10 +205,11 @@ async fn deletion_metadata_queries_do_not_scan_unrelated_rows() {
         "advisory_wake_delivery",
         "browser_tab",
     ] {
-        let kept: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(store.read_pool())
-            .await
-            .unwrap();
+        let kept: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap();
         assert_eq!(kept, 10_000, "unrelated {table} rows preserved");
     }
     assert!(
@@ -503,10 +504,11 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
         ("note_version", 6),
         ("comment", 6),
     ] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(store.read_pool())
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap();
         assert_eq!(
             count, expected,
             "existing {table} rows preserved by upgrade"

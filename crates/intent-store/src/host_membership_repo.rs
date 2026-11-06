@@ -218,7 +218,7 @@ impl Store {
             ));
         }
         let sql = format!("INSERT INTO host_invite ({HOST_INVITE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,0)");
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&invite.id)
             .bind(&invite.secret_hash)
             .bind(&invite.secret)
@@ -241,7 +241,7 @@ impl Store {
     /// Returns `Internal` for a database failure.
     pub async fn get_host_invite(&self, id: &str) -> Result<Option<HostInvite>> {
         let sql = format!("SELECT {HOST_INVITE_COLUMNS} FROM host_invite WHERE id = ?");
-        Ok(sqlx::query(&sql)
+        Ok(sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .fetch_optional(self.read_pool())
             .await
@@ -260,7 +260,7 @@ impl Store {
 
     pub(crate) async fn list_open_host_invites_at(&self, now: &str) -> Result<Vec<HostInvite>> {
         let sql = format!("SELECT {HOST_INVITE_COLUMNS} FROM host_invite WHERE {HOST_INVITE_CANDIDATE} ORDER BY created_at, id");
-        Ok(sqlx::query(&sql)
+        Ok(sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(now)
             .fetch_all(self.read_pool())
             .await
@@ -283,7 +283,7 @@ impl Store {
             .await
             .map_err(db_error)?;
         let sql = format!("SELECT {HOST_INVITE_COLUMNS} FROM host_invite WHERE id = ?");
-        let Some(row) = sqlx::query(&sql)
+        let Some(row) = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .fetch_optional(&mut *tx)
             .await
@@ -329,7 +329,7 @@ impl Store {
             .await
             .map_err(db_error)?;
         let sql = format!("SELECT {HOST_INVITE_COLUMNS} FROM host_invite WHERE id = ?");
-        let Some(row) = sqlx::query(&sql)
+        let Some(row) = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(invite_id)
             .fetch_optional(&mut *tx)
             .await
@@ -353,7 +353,7 @@ impl Store {
         }
         let lookup =
             format!("SELECT {PRINCIPAL_COLUMNS} FROM principal WHERE {PRINCIPAL_BY_IDENTITY}");
-        let existing = bind_identity(sqlx::query(&lookup), &key)
+        let existing = bind_identity(sqlx::query(sqlx::AssertSqlSafe(lookup.as_str())), &key)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_error)?
@@ -432,10 +432,13 @@ impl Store {
                 String::new()
             }
         );
-        bind_principal(sqlx::query(&upsert), &principal)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_error)?;
+        bind_principal(
+            sqlx::query(sqlx::AssertSqlSafe(upsert.as_str())),
+            &principal,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
         let membership_added = sqlx::query("INSERT INTO host_member (principal_id, added_at) VALUES (?,?) ON CONFLICT(principal_id) DO NOTHING")
             .bind(&principal.id.0).bind(&now).execute(&mut *tx).await.map_err(db_error)?.rows_affected() != 0;
         sqlx::query("UPDATE host_invite SET redeemed_at = ?, redeemed_by_principal_id = ?, redemption_count = 1 WHERE id = ?")
@@ -585,7 +588,7 @@ impl Store {
             result.workspaces.sort_by(|a, b| a.0.cmp(&b.0));
             if removed {
                 let revoke = format!("UPDATE workspace_invite AS i SET revoked_at = ? WHERE i.created_by_principal_id = ? AND {INVITE_OPEN} RETURNING id");
-                result.revoked_invites = sqlx::query_scalar(&revoke)
+                result.revoked_invites = sqlx::query_scalar(sqlx::AssertSqlSafe(revoke.as_str()))
                     .bind(&now)
                     .bind(&principal_id.0)
                     .bind(&now)

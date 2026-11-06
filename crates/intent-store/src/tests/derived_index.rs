@@ -58,9 +58,9 @@ async fn seeded(tmp: &TempDb) -> (Store, WorkspaceId, Vec<Note>) {
 /// Overwrite the FTS5 segment pages of `table` with zeroes, the way lost or
 /// torn WAL frames leave an index whose structure points at garbage.
 async fn damage(store: &Store, table: &str) {
-    let damaged = sqlx::query(&format!(
+    let damaged = sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {table}_data SET block = zeroblob(length(block)) WHERE id > 10"
-    ))
+    )))
     .execute(store.write_pool())
     .await
     .unwrap()
@@ -133,10 +133,9 @@ async fn damaged_note_index_is_reported_read_only_and_repaired_without_losing_no
     let err = first_failed_append(&store, &mut notes)
         .await
         .expect("a write through the damaged index fails");
-    assert!(
-        err.contains("(code: 267) database disk image is malformed"),
-        "{err}"
-    );
+    // SQLite 3.46 says "database disk image is malformed"; 3.51+ names the
+    // page and table ("fts5: corruption on page 1, ..."). The code is stable.
+    assert!(err.contains("(code: 267) "), "{err}");
 
     // Doctor's read-only view names the damaged index while the daemon's
     // store is still open, and blames nothing else.
@@ -571,8 +570,10 @@ async fn integrity_lines_are_split_and_attributed() {
             .to_string(),
         format!("row 5 missing from index {index}"),
         format!("wrong # of entries in index {index}"),
+        "fts5: corruption found reading blob 137438953473 from table \"note_fts\"".to_string(),
+        "fts5: corruption on page 1, segment 12, table \"agent_message_fts\"".to_string(),
     ]);
-    assert_eq!(lines.len(), 6, "{lines:?}");
+    assert_eq!(lines.len(), 8, "{lines:?}");
     let mut attributed = Vec::new();
     for line in &lines {
         let (table, index) = attribute(pool, line).await;
@@ -591,6 +592,11 @@ async fn integrity_lines_are_split_and_attributed() {
             ),
             (table("note_search_ctx"), None),
             (table("note_search_ctx"), None),
+            (table("note_fts"), Some(DerivedIndex::NoteSearch)),
+            (
+                table("agent_message_fts"),
+                Some(DerivedIndex::MessageSearch)
+            ),
         ]
     );
     assert_eq!(

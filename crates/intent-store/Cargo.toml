@@ -46,10 +46,9 @@ nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 intentd-test-support = { path = "../intentd-test-support" }
-# tests/store_open_fsync_stall.rs wraps the VFS of the SQLite sqlx links.
-# Unpinned on purpose: both crates declare `links = "sqlite3"`, so Cargo
-# resolves this to sqlx's copy and a sqlx upgrade needs no edit here.
-libsqlite3-sys = "*"
+# The same copy sqlx links (`links = "sqlite3"`): tests/store_open_fsync_stall.rs
+# wraps its VFS and tests/sqlite_version.rs asserts the >= 3.51.3 floor.
+libsqlite3-sys = { workspace = true }
 trybuild = "1"
 tempfile = "3"
 tokio = { workspace = true }

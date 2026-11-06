@@ -58,7 +58,14 @@ agent-client-protocol = { version = "2.0", features = ["unstable_end_turn_token_
 octocrab = "0.54"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 git2 = { version = "0.21", features = ["https", "ssh"] }
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate", "chrono"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
+# SQLite >= 3.51.3 fixes the WAL-reset corruption bug (3.7.0-3.51.2, see
+# https://sqlite.org/wal.html and intent-hq/intent#8592). libsqlite3-sys 0.37
+# bundles 3.51.3 and sqlx 0.9 requires ^0.37; `links = "sqlite3"` makes this
+# the same copy sqlx links. sqlx's `sqlite` feature turns on `bundled`; no
+# feature is forced here, so intent-store's tests/sqlite_version.rs links the
+# same SQLite the daemon ships (a switch to system SQLite would fail it).
+libsqlite3-sys = "0.37"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"

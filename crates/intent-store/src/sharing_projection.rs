@@ -23,7 +23,7 @@ pub(crate) async fn reconcile_invite_expiry(
     }
     let placeholders = vec!["?"; workspace_ids.len()].join(",");
     let sql=format!("DELETE FROM workspace_invite_seat WHERE workspace_id IN ({placeholders}) AND expires_at <= ?");
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
     for id in workspace_ids {
         query = query.bind(id.as_str());
     }
@@ -51,7 +51,7 @@ impl Store {
         let observed_at = at.map_or_else(now_iso, str::to_owned);
         let placeholders = vec!["?"; ids.len()].join(",");
         let sql=format!("SELECT 1 FROM workspace_invite_seat WHERE workspace_id IN ({placeholders}) AND expires_at <= ? LIMIT 1");
-        let mut query = sqlx::query_scalar::<_, i64>(&sql);
+        let mut query = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql.as_str()));
         for id in ids {
             query = query.bind(id.as_str());
         }

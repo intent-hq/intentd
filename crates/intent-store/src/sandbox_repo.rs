@@ -82,7 +82,7 @@ impl Store {
     pub async fn insert_sandbox(&self, s: &Sandbox) -> Result<()> {
         let sql =
             format!("INSERT INTO sandbox ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&s.id)
             .bind(&s.workspace_id.0)
             .bind(&s.agent_id.0)
@@ -111,7 +111,7 @@ impl Store {
         agent_id: &AgentId,
     ) -> Result<Option<Sandbox>> {
         let sql = format!("SELECT {COLUMNS} FROM sandbox WHERE workspace_id = ? AND agent_id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .bind(&agent_id.0)
             .fetch_optional(self.read_pool())
@@ -171,7 +171,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_sandboxes(&self, workspace_id: &WorkspaceId) -> Result<Vec<Sandbox>> {
         let sql = format!("SELECT {COLUMNS} FROM sandbox WHERE workspace_id = ?");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -186,7 +186,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_all_sandboxes(&self) -> Result<Vec<Sandbox>> {
         let sql = format!("SELECT {COLUMNS} FROM sandbox");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| intent_core::Error::Internal(format!("list all sandboxes failed: {e}")))?;
@@ -201,7 +201,7 @@ impl Store {
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_sandboxes_by_status(&self, status: SandboxStatus) -> Result<Vec<Sandbox>> {
         let sql = format!("SELECT {COLUMNS} FROM sandbox WHERE status = ?");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(status.to_db())
             .fetch_all(self.read_pool())
             .await

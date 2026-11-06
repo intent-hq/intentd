@@ -1285,7 +1285,8 @@ builds and the desktop-bundled daemon are distinct from this installed launcher;
 start/restart are launcher commands. Check the installed launcher's help when its
 version differs from this guide; do not infer launcher support from daemon version.
 
-If note or chat writes fail with "database disk image is malformed" (code 267), run
+If note or chat writes fail with a code 267 error ("database disk image is malformed", or
+"fts5: corruption ..." on newer builds), run
 `intentd doctor`. When it reports only a damaged search index, quit Intent, run
 `intentd stop`, then `intentd repair-indexes`. It copies the database to
 `<data-dir>/backups/` first, then rebuilds the index from the stored notes and messages

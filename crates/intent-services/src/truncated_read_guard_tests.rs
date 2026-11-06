@@ -260,7 +260,7 @@ const RACING_TEXT: &str = "a concurrent writer text\n";
 /// writes [`RACING_TEXT`] at `rev + 1` and is itself ignored, so the
 /// guarded write's rev gate misses deterministically (no timing).
 async fn arm_racing_writer(svc: &Services) {
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE TABLE race_armed(n INTEGER);
          INSERT INTO race_armed VALUES (1);
          CREATE TRIGGER race_writer BEFORE UPDATE ON note
@@ -270,7 +270,7 @@ async fn arm_racing_writer(svc: &Services) {
                  WHERE id = OLD.id AND workspace_id = OLD.workspace_id;
              SELECT RAISE(IGNORE);
          END;"
-    ))
+    )))
     .execute(svc.store.write_pool())
     .await
     .expect("arm racing writer");

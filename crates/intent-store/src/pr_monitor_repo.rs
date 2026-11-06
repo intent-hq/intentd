@@ -20,9 +20,7 @@ mod prepared_write;
 mod registration;
 pub use prepared_write::PreparedMonitorWrite;
 
-pub(crate) fn captured_monitor_exists(
-    expected: &QualifiedPrMonitor,
-) -> QueryBuilder<'static, Sqlite> {
+pub(crate) fn captured_monitor_exists(expected: &QualifiedPrMonitor) -> QueryBuilder<Sqlite> {
     let mut query = QueryBuilder::new("SELECT monitor_id FROM pr_monitor");
     prepared_write::captured_condition(&mut query, expected);
     query
@@ -397,9 +395,9 @@ impl Store {
     /// # Errors
     /// Returns `NotFound` for an absent ID, or `Internal` for a database failure.
     pub async fn get_qualified_pr_monitor(&self, id: &PrMonitorId) -> Result<QualifiedPrMonitor> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS}, {TARGET_COLUMNS} FROM pr_monitor WHERE monitor_id = ?"
-        ))
+        )))
         .bind(&id.0)
         .fetch_optional(self.read_pool())
         .await
@@ -414,7 +412,7 @@ impl Store {
     /// # Errors
     /// Returns `Internal` for a database failure.
     pub async fn load_active_qualified_pr_monitors(&self) -> Result<Vec<QualifiedPrMonitor>> {
-        sqlx::query(&format!("SELECT {COLUMNS}, {TARGET_COLUMNS} FROM pr_monitor WHERE state = 'active' ORDER BY created_at, monitor_id"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {COLUMNS}, {TARGET_COLUMNS} FROM pr_monitor WHERE state = 'active' ORDER BY created_at, monitor_id")))
             .fetch_all(self.read_pool()).await
             .map_err(|e| intent_core::Error::Internal(format!("load qualified monitors: {e}")))?
             .iter().map(qualified_from_row).collect()
@@ -449,7 +447,7 @@ impl Store {
         scope: &str,
         id: &str,
     ) -> Result<Vec<QualifiedPrMonitor>> {
-        sqlx::query(&format!("SELECT {COLUMNS}, {TARGET_COLUMNS} FROM pr_monitor WHERE {scope} = ? ORDER BY created_at, monitor_id"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {COLUMNS}, {TARGET_COLUMNS} FROM pr_monitor WHERE {scope} = ? ORDER BY created_at, monitor_id")))
             .bind(id).fetch_all(self.read_pool()).await
             .map_err(|e| intent_core::Error::Internal(format!("list qualified monitors: {e}")))?
             .iter().map(qualified_from_row).collect()
@@ -494,7 +492,7 @@ impl Store {
             AND target_provider = ? AND target_instance_base_url = ? AND target_kind = ? AND pr_number = ? \
             AND CASE WHEN target_provider = 'github' THEN lower(target_project_path) ELSE target_project_path END \
                 = CASE WHEN ? = 'github' THEN lower(?) ELSE ? END");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(id)
             .bind(provider_word(target.repository.provider))
             .bind(&target.repository.instance_base_url)
@@ -528,7 +526,7 @@ impl Store {
             "INSERT INTO pr_monitor ({COLUMNS}, {TARGET_COLUMNS}) VALUES ({})",
             vec!["?"; 22].join(",")
         );
-        let result = sqlx::query(&sql)
+        let result = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&m.monitor_id.0)
             .bind(&m.workspace_id.0)
             .bind(&m.agent_id.0)
@@ -1078,7 +1076,7 @@ impl Store {
             "INSERT INTO pr_monitor ({COLUMNS}) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         );
-        match sqlx::query(&sql)
+        match sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&m.monitor_id.0)
             .bind(&m.workspace_id.0)
             .bind(&m.agent_id.0)
@@ -1118,7 +1116,7 @@ impl Store {
     /// Returns `Error::NotFound` if the PR monitor does not exist; `Error::Internal` if the database operation fails.
     pub async fn get_pr_monitor(&self, monitor_id: &PrMonitorId) -> Result<PrMonitor> {
         let sql = format!("SELECT {COLUMNS} FROM pr_monitor WHERE monitor_id = ?");
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&monitor_id.0)
             .fetch_optional(self.read_pool())
             .await
@@ -1151,7 +1149,7 @@ impl Store {
              AND repo_owner = ? COLLATE NOCASE AND repo_name = ? COLLATE NOCASE \
              AND pr_number = ? AND state = 'active' AND {LEGACY_LOOKUP}"
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&agent_id.0)
             .bind(repo_owner)
             .bind(repo_name)
@@ -1184,7 +1182,7 @@ impl Store {
              AND repo_owner = ? COLLATE NOCASE AND repo_name = ? COLLATE NOCASE \
              AND pr_number = ? AND state = 'active' AND {LEGACY_LOOKUP}"
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .bind(repo_owner)
             .bind(repo_name)
@@ -1206,7 +1204,7 @@ impl Store {
     pub async fn list_pr_monitors_by_agent(&self, agent_id: &AgentId) -> Result<Vec<PrMonitor>> {
         let sql =
             format!("SELECT {COLUMNS} FROM pr_monitor WHERE agent_id = ? ORDER BY created_at");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&agent_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1227,7 +1225,7 @@ impl Store {
     ) -> Result<Vec<PrMonitor>> {
         let sql =
             format!("SELECT {COLUMNS} FROM pr_monitor WHERE workspace_id = ? ORDER BY created_at");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1254,7 +1252,7 @@ impl Store {
             "SELECT {COLUMNS} FROM pr_monitor WHERE agent_id = ? AND state = 'active' \
              ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&agent_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1282,7 +1280,7 @@ impl Store {
             "SELECT {COLUMNS} FROM pr_monitor WHERE workspace_id = ? AND state = 'active' \
              ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -1316,7 +1314,7 @@ impl Store {
              AND state = 'completed' ORDER BY updated_at DESC LIMIT 1) \
              ORDER BY created_at"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
@@ -1352,7 +1350,7 @@ impl Store {
              ) WHERE state = 'active' OR state_rank = 1 \
              ORDER BY workspace_id, created_at"
         );
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
         for id in workspace_ids {
             query = query.bind(&id.0);
         }
@@ -1373,7 +1371,7 @@ impl Store {
     pub async fn load_active_pr_monitors(&self) -> Result<Vec<PrMonitor>> {
         let sql =
             format!("SELECT {COLUMNS} FROM pr_monitor WHERE state = 'active' ORDER BY created_at");
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .fetch_all(self.read_pool())
             .await
             .map_err(|e| {
@@ -1412,12 +1410,14 @@ impl Store {
         } else {
             " AND workspace_id IN (SELECT id FROM workspace WHERE archived = 0)"
         };
-        let rows = sqlx::query(&non_cancelled_list_entry_sql(archived_filter))
-            .fetch_all(self.read_pool())
-            .await
-            .map_err(|e| {
-                intent_core::Error::Internal(format!("load pr monitor list entries failed: {e}"))
-            })?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(non_cancelled_list_entry_sql(
+            archived_filter,
+        )))
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| {
+            intent_core::Error::Internal(format!("load pr monitor list entries failed: {e}"))
+        })?;
         rows.iter().map(list_entry_from_row).collect()
     }
 
@@ -1577,7 +1577,7 @@ impl Store {
         monitor_id: &PrMonitorId,
         update: PrMonitorPollUpdate<'_>,
     ) -> Result<bool> {
-        let res = sqlx::query(&UPDATE_PR_MONITOR_POLL_SQL)
+        let res = sqlx::query(sqlx::AssertSqlSafe(UPDATE_PR_MONITOR_POLL_SQL.as_str()))
             .bind(update.last_snapshot)
             .bind(update.baseline_snapshot)
             .bind(pending_to_db(update.pending_changes))
@@ -1622,16 +1622,16 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn annotate_active_pr_monitors_pause(&self, pause: &str) -> Result<u64> {
-        let res = sqlx::query(&ANNOTATE_ACTIVE_PR_MONITORS_PAUSE_SQL)
-            .bind(pause)
-            .bind(PR_MONITOR_PAUSE_MARKER)
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| {
-                intent_core::Error::Internal(format!(
-                    "annotate active pr monitors pause failed: {e}"
-                ))
-            })?;
+        let res = sqlx::query(sqlx::AssertSqlSafe(
+            ANNOTATE_ACTIVE_PR_MONITORS_PAUSE_SQL.as_str(),
+        ))
+        .bind(pause)
+        .bind(PR_MONITOR_PAUSE_MARKER)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| {
+            intent_core::Error::Internal(format!("annotate active pr monitors pause failed: {e}"))
+        })?;
         Ok(res.rows_affected())
     }
 
@@ -1662,14 +1662,16 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn clear_active_pr_monitors_pause(&self, lifted: Option<&str>) -> Result<u64> {
-        let res = sqlx::query(&CLEAR_ACTIVE_PR_MONITORS_PAUSE_SQL)
-            .bind(PR_MONITOR_PAUSE_MARKER)
-            .bind(lifted)
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| {
-                intent_core::Error::Internal(format!("clear active pr monitors pause failed: {e}"))
-            })?;
+        let res = sqlx::query(sqlx::AssertSqlSafe(
+            CLEAR_ACTIVE_PR_MONITORS_PAUSE_SQL.as_str(),
+        ))
+        .bind(PR_MONITOR_PAUSE_MARKER)
+        .bind(lifted)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| {
+            intent_core::Error::Internal(format!("clear active pr monitors pause failed: {e}"))
+        })?;
         Ok(res.rows_affected())
     }
 
@@ -1695,7 +1697,7 @@ impl Store {
         to_agent_id: &AgentId,
         update: PrMonitorPollUpdate<'_>,
     ) -> Result<bool> {
-        let res = sqlx::query(&ADOPT_PR_MONITOR_SQL)
+        let res = sqlx::query(sqlx::AssertSqlSafe(ADOPT_PR_MONITOR_SQL.as_str()))
             .bind(&to_agent_id.0)
             .bind(update.last_snapshot)
             .bind(update.baseline_snapshot)
@@ -2734,7 +2736,7 @@ mod tests {
         let ws = ws_id.0.as_str();
         let pool = store.read_pool();
         let explain = |sql: String| async move {
-            sqlx::query(&sql)
+            sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(ws)
                 .fetch_all(pool)
                 .await
@@ -4352,7 +4354,7 @@ mod tests {
             "idx_pr_monitor_identity",
             "idx_pr_monitor_workspace_identity",
         ] {
-            sqlx::query(&format!("DROP INDEX {idx}"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("DROP INDEX {idx}")))
                 .execute(store.write_pool())
                 .await
                 .expect("drop identity index");

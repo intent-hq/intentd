@@ -28,8 +28,18 @@ const MAX_LISTED_CHARS: usize = 8_000;
 const MAX_COMPACT: usize = 50;
 
 /// `SQLite`'s text for the `SQLITE_CORRUPT` family (codes 11, 267, 523, 779)
-/// and for `SQLITE_NOTADB` (26).
-const CORRUPTION_MARKERS: &[&str] = &["database disk image is malformed", "file is not a database"];
+/// and for `SQLITE_NOTADB` (26), plus sqlx's `(code: N)` prefix for those
+/// codes: `SQLite` 3.51+ words FTS5 corruption as "fts5: corruption on page
+/// ..." instead of the generic text.
+const CORRUPTION_MARKERS: &[&str] = &[
+    "database disk image is malformed",
+    "file is not a database",
+    "(code: 11)",
+    "(code: 26)",
+    "(code: 267)",
+    "(code: 523)",
+    "(code: 779)",
+];
 
 /// What a finished `host.exec` reported, already bounded so the ledger never
 /// holds a command's whole output.
@@ -398,6 +408,10 @@ mod tests {
     fn recognizes_every_corruption_rendering() {
         assert!(is_corruption("(code: 11) database disk image is malformed"));
         assert!(is_corruption("(code: 26) file is not a database"));
+        assert!(is_corruption(
+            "(code: 267) fts5: corruption on page 1, segment 12, table \"note_fts\""
+        ));
         assert!(!is_corruption("(code: 5) database is locked"));
+        assert!(!is_corruption("(code: 110) not a corruption code"));
     }
 }

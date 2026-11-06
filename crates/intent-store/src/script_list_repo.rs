@@ -66,7 +66,7 @@ impl Store {
         } else {
             sql.to_owned()
         };
-        let mut keys: Vec<(String, String)> = sqlx::query_as(&sql)
+        let mut keys: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(ws.as_str())
             .bind(owner.map(AgentId::as_str))
             .bind(owner.map(AgentId::as_str))
@@ -94,7 +94,7 @@ impl Store {
         } else {
             projection.to_owned()
         };
-        let query = sqlx::query_scalar(&projection).bind(ws.as_str());
+        let query = sqlx::query_scalar(sqlx::AssertSqlSafe(projection.as_str())).bind(ws.as_str());
         let query = if monitor {
             query
                 .bind(owner.map(AgentId::as_str))

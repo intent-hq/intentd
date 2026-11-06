@@ -745,10 +745,12 @@ impl Store {
             .map_err(|e| Error::Internal(format!("incremental_vacuum acquire failed: {e}")))?;
         let before = freelist_count_on(&mut *conn).await?;
         let started = std::time::Instant::now();
-        sqlx::query(&format!("PRAGMA incremental_vacuum({pages})"))
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("incremental_vacuum failed: {e}")))?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA incremental_vacuum({pages})"
+        )))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("incremental_vacuum failed: {e}")))?;
         let elapsed = started.elapsed();
         let after = freelist_count_on(&mut *conn).await?;
         drop(conn);

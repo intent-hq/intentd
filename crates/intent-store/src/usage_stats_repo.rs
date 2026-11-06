@@ -150,11 +150,11 @@ impl Store {
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn list_usage_stats_hourly(&self) -> Result<Vec<UsageStatsRow>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT bucket_utc, model, provider, local_date, local_hour, {COUNTER_COLUMNS}
              FROM usage_stats_hourly
              ORDER BY bucket_utc ASC, model ASC, provider ASC"
-        ))
+        )))
         .fetch_all(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("list usage stats failed: {e}")))?;
@@ -496,6 +496,7 @@ mod tests {
         // itself contain semicolons.
         let sql: String = migration
             .sql
+            .as_str()
             .lines()
             .filter(|l| !l.trim_start().starts_with("--"))
             .collect::<Vec<_>>()
@@ -505,7 +506,7 @@ mod tests {
             if body.is_empty() || body.starts_with("ALTER TABLE") {
                 continue;
             }
-            sqlx::query(body)
+            sqlx::query(sqlx::AssertSqlSafe(body))
                 .execute(store.write_pool())
                 .await
                 .expect("run backfill statement");
@@ -593,6 +594,7 @@ mod tests {
         // itself contain semicolons.
         let sql: String = migration
             .sql
+            .as_str()
             .lines()
             .filter(|l| !l.trim_start().starts_with("--"))
             .collect::<Vec<_>>()
@@ -602,7 +604,7 @@ mod tests {
             if body.is_empty() {
                 continue;
             }
-            sqlx::query(body)
+            sqlx::query(sqlx::AssertSqlSafe(body))
                 .execute(store.write_pool())
                 .await
                 .expect("run migration statement");
@@ -616,16 +618,18 @@ mod tests {
             .iter()
             .find(|m| {
                 m.sql
+                    .as_str()
                     .contains("ALTER TABLE usage_stats_hourly ADD COLUMN thought_tokens")
             })
             .expect("usage_stats_hourly thought_tokens migration present");
         let alter: String = thought_migration
             .sql
+            .as_str()
             .lines()
             .filter(|l| !l.trim_start().starts_with("--"))
             .collect::<Vec<_>>()
             .join("\n");
-        sqlx::query(alter.trim().trim_end_matches(';'))
+        sqlx::query(sqlx::AssertSqlSafe(alter.trim().trim_end_matches(';')))
             .execute(store.write_pool())
             .await
             .expect("re-apply thought_tokens ALTER");

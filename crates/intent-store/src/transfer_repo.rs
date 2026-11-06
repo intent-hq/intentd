@@ -391,12 +391,12 @@ impl Store {
             .map(|(t, _)| format!("'{t}'"))
             .collect::<Vec<_>>()
             .join(", ");
-        let col_rows = sqlx::query_as::<_, (String, String)>(&format!(
+        let col_rows = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(format!(
             "SELECT m.name, p.name FROM sqlite_master m \
              JOIN pragma_table_info(m.name) p \
              WHERE m.type = 'table' AND m.name IN ({names}) \
              ORDER BY m.name, p.cid"
-        ))
+        )))
         .fetch_all(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("transfer stats table_info failed: {e}")))?;
@@ -428,7 +428,7 @@ impl Store {
             })
             .collect::<Vec<_>>()
             .join(" UNION ALL ");
-        let rows = sqlx::query_as::<_, (i64, i64, i64)>(&sql)
+        let rows = sqlx::query_as::<_, (i64, i64, i64)>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&workspace_id.0)
             .fetch_all(self.read_pool())
             .await
@@ -456,9 +456,9 @@ impl Store {
 
     /// Column names of `table` in declaration order (via `PRAGMA table_info`).
     async fn table_columns(&self, table: &str) -> Result<Vec<String>> {
-        let rows = sqlx::query_as::<_, (i64, String)>(&format!(
+        let rows = sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(format!(
             "SELECT cid, name FROM pragma_table_info('{table}') ORDER BY cid"
-        ))
+        )))
         .fetch_all(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("table_info for {table} failed: {e}")))?;
@@ -497,7 +497,7 @@ impl Store {
         let mut out = Vec::with_capacity(TRANSFER_TABLES.len());
         for (table, predicate) in TRANSFER_TABLES {
             let sql = format!("SELECT * FROM \"{table}\" WHERE {predicate}");
-            let rows = sqlx::query(&sql)
+            let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&workspace_id.0)
                 .fetch_all(&mut *tx)
                 .await
@@ -547,11 +547,13 @@ impl Store {
             .iter()
             .filter(|(table, _)| matches!(*table, "pr_monitor" | "agent_message"))
         {
-            let rows = sqlx::query(&format!("SELECT * FROM \"{table}\" WHERE {predicate}"))
-                .bind(&workspace_id.0)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("transfer preflight failed: {e}")))?;
+            let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT * FROM \"{table}\" WHERE {predicate}"
+            )))
+            .bind(&workspace_id.0)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("transfer preflight failed: {e}")))?;
             let objects = rows
                 .iter()
                 .map(|row| row_to_json(table, row))
@@ -721,7 +723,7 @@ impl Store {
                     columns.join(",")
                 );
                 let empty_activity = serde_json::json!("[]");
-                let mut query = sqlx::query(&sql);
+                let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
                 for (key, value) in map {
                     query = bind_json_value(
                         query,
@@ -989,10 +991,10 @@ async fn reclaim_imported_metadata(
             } else {
                 ""
             };
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE {key} = ?1 AND workspace_id = ?2 \
                  AND NOT EXISTS (SELECT 1 FROM workspace WHERE id = ?2){agent_guard}"
-            ))
+            )))
             .bind(id)
             .bind(workspace)
             .execute(&mut **tx)
@@ -1042,11 +1044,11 @@ fn row_to_json(table: &str, row: &sqlx::sqlite::SqliteRow) -> Result<serde_json:
 /// Bind one exported JSON value back to its `SQLite` storage class (the inverse
 /// of [`row_to_json`]).
 fn bind_json_value<'q>(
-    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
     table: &str,
     key: &str,
     value: &serde_json::Value,
-) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>> {
+) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>> {
     Ok(match value {
         serde_json::Value::Null => query.bind(Option::<String>::None),
         serde_json::Value::Bool(b) => query.bind(i64::from(*b)),
@@ -1471,7 +1473,7 @@ mod tests {
     }
 
     async fn run(store: &Store, sql: String) {
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .execute(store.write_pool())
             .await
             .unwrap_or_else(|e| panic!("seed failed: {sql}: {e}"));
@@ -1773,7 +1775,7 @@ mod tests {
                         format!("DELETE FROM note_version WHERE note_id = 'hot' AND workspace_id = '{ws}' AND v < {k} - 20"),
                         "COMMIT".to_string(),
                     ] {
-                        sqlx::query(&sql)
+                        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
                             .execute(&mut *conn)
                             .await
                             .unwrap_or_else(|e| panic!("writer failed: {sql}: {e}"));
@@ -2153,9 +2155,9 @@ pull_request_workspace: pr_key, workspace_id, source, linked_at";
         let store = Store::open(&db.path).await.expect("open");
         let mut actual = String::new();
         for (table, _) in TRANSFER_TABLES {
-            let cols: Vec<String> = sqlx::query_scalar(&format!(
+            let cols: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
-            ))
+            )))
             .fetch_all(store.read_pool())
             .await
             .expect("table_info");

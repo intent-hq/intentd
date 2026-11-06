@@ -18,9 +18,9 @@ async fn registration_repair_guards_lifecycle_and_target_evidence() {
         let (_dir, store) = store().await;
         let old = monitor("repair");
         store.insert_pr_monitor(&old).await.unwrap();
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE pr_monitor SET {change} WHERE monitor_id='repair'"
-        ))
+        )))
         .execute(store.write_pool())
         .await
         .unwrap();
@@ -316,9 +316,9 @@ async fn qualified_scope_lists_preserve_history_targets_and_unresolved_bytes_aft
 }
 
 async fn original_bytes(pool: &crate::StorePool, id: &str) -> Vec<serde_json::Value> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMNS} FROM pr_monitor WHERE monitor_id=?"
-    ))
+    )))
     .bind(id)
     .fetch_one(pool)
     .await
@@ -684,9 +684,9 @@ async fn target_only_cas_detects_owner_state_and_raw_pending_changes_without_tim
             .get_qualified_pr_monitor(&row.monitor_id)
             .await
             .unwrap();
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE pr_monitor SET {column}=? WHERE monitor_id='guarded'"
-        ))
+        )))
         .bind(value)
         .execute(store.write_pool())
         .await
@@ -1028,9 +1028,9 @@ async fn routing_cancellation_compares_binding_target_and_poll_without_timestamp
             .unwrap();
         // Simulate an independently committed replacement with the exact same
         // updated_at. A timestamp alone cannot fence identity or private evidence.
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE pr_monitor SET {changed_column} = ? WHERE monitor_id = ?"
-        ))
+        )))
         .bind("replacement")
         .bind(original.monitor_id.as_str())
         .execute(store.write_pool())

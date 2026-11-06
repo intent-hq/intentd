@@ -16,7 +16,7 @@ impl Store {
     ) -> Result<DiscussionConversation> {
         let mut tx = self.write_pool().begin().await.map_err(|e| db(&e))?;
         let sql = format!("SELECT p.is_primary, (SELECT role FROM workspace_member WHERE workspace_id=?1 AND principal_id=p.id) AS role FROM principal p JOIN workspace w ON w.id=?1 WHERE p.id=?2 AND {}", super::discussion_conversation_repo::ELIGIBLE);
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(ws.as_str())
             .bind(principal.as_str())
             .bind(ws.as_str())

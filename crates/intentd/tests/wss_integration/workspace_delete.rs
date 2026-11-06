@@ -105,9 +105,9 @@ async fn deleted_workspace_metadata_can_be_reimported_over_wss() {
                 "attachments",
                 "attachment_idempotency_keys",
             ] {
-                let count: i64 = sqlx::query_scalar(&format!(
+                let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                     "SELECT COUNT(*) FROM {table} WHERE workspace_id=?"
-                ))
+                )))
                 .bind(ws)
                 .fetch_one(srv.store.read_pool())
                 .await
@@ -148,9 +148,9 @@ async fn deleted_workspace_metadata_can_be_reimported_over_wss() {
             "attachments",
             "attachment_idempotency_keys",
         ] {
-            let count: i64 = sqlx::query_scalar(&format!(
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM {table} WHERE workspace_id=?"
-            ))
+            )))
             .bind(ws)
             .fetch_one(srv.store.read_pool())
             .await
@@ -297,20 +297,20 @@ async fn loaded_bulk_delete_keeps_other_clients_writable_and_events_persisted() 
             "event",
         ),
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE TRIGGER probe_{kind} AFTER INSERT ON {table} WHEN {condition} BEGIN \
             INSERT INTO deletion_probes SELECT '{kind}', COALESCE(MAX(n),0) FROM \
             (SELECT COUNT(*) n FROM agent_message_payload p JOIN agent_session s ON s.id=p.agent_id \
             WHERE s.workspace_id IN ('{a}','{b}') GROUP BY s.workspace_id \
             HAVING COUNT(*) > 0 AND COUNT(*) < {}); END", 3 * ROWS
-        ))
+        )))
         .execute(srv.store.write_pool())
         .await
         .unwrap();
     }
-    sqlx::query(&format!("CREATE TRIGGER fail_partial_delete BEFORE DELETE ON agent_message \
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TRIGGER fail_partial_delete BEFORE DELETE ON agent_message \
         WHEN OLD.seq > 500 AND OLD.agent_id IN (SELECT id FROM agent_session WHERE workspace_id='{failed}') \
-        BEGIN SELECT RAISE(ABORT, 'injected WSS cleanup failure'); END"))
+        BEGIN SELECT RAISE(ABORT, 'injected WSS cleanup failure'); END")))
         .execute(srv.store.write_pool()).await.unwrap();
 
     let done = AtomicBool::new(false);

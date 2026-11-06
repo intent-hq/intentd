@@ -975,11 +975,13 @@ impl Store {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-        let row = sqlx::query(&format!("{FINAL_STOP_SELECT} WHERE agent_id = ?"))
-            .bind(stop.agent_id.as_str())
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db)?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{FINAL_STOP_SELECT} WHERE agent_id = ?"
+        )))
+        .bind(stop.agent_id.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
         let recorded = final_stop_row(&row)?;
         tx.commit().await.map_err(db)?;
         Ok(recorded)
@@ -989,9 +991,9 @@ impl Store {
     /// # Errors
     /// Returns database errors.
     pub async fn list_final_stops(&self, lease_id: &str) -> Result<Vec<RemoteFinalStopRecord>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "{FINAL_STOP_SELECT} WHERE lease_id = ? ORDER BY requested_at, agent_id"
-        ))
+        )))
         .bind(lease_id)
         .fetch_all(self.read_pool())
         .await
@@ -1006,11 +1008,13 @@ impl Store {
         &self,
         agent_id: &AgentId,
     ) -> Result<Option<RemoteFinalStopRecord>> {
-        let row = sqlx::query(&format!("{FINAL_STOP_SELECT} WHERE agent_id = ?"))
-            .bind(agent_id.as_str())
-            .fetch_optional(self.read_pool())
-            .await
-            .map_err(db)?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "{FINAL_STOP_SELECT} WHERE agent_id = ?"
+        )))
+        .bind(agent_id.as_str())
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(db)?;
         row.as_ref().map(final_stop_row).transpose()
     }
 
