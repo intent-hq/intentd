@@ -329,6 +329,21 @@ impl CreateProgress {
         }
     }
 
+    /// Local-repo checkout milestone at its nominal mid-scale 30: `cow-copy`
+    /// for a `CoW` clone, otherwise `worktree`.
+    pub(crate) async fn checkout_milestone(&self, mode: intent_core::CheckoutMode) {
+        match mode {
+            intent_core::CheckoutMode::Cow => {
+                self.milestone("cow-copy", 30, "Copying repository (CoW)...")
+                    .await;
+            }
+            _ => {
+                self.milestone("worktree", 30, "Creating linked worktree...")
+                    .await;
+            }
+        }
+    }
+
     /// Emit one progress frame on the unified scale. The percent is clamped
     /// to never decrease below the last reported value (milestone callers can
     /// request their nominal position without tracking what ran before them);

@@ -31,6 +31,10 @@ struct Fixture {
 }
 
 async fn boot() -> Fixture {
+    boot_with(|services| services).await
+}
+
+async fn boot_with(configure: impl FnOnce(Services) -> Services) -> Fixture {
     let dir_guard = common::test_tempdir("intentd-wt-err-");
     let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
@@ -40,6 +44,7 @@ async fn boot() -> Fixture {
     let services = Services::new_isolated(store)
         .with_workspaces_root(workspaces_root)
         .with_event_bus(bus.clone());
+    let services = configure(services);
     let api: Arc<dyn WorkspaceApi> = Arc::new(services);
     let opts = WsOptions {
         base_port: 0,
@@ -259,47 +264,351 @@ async fn workspace_create_refreshes_stale_base_and_preserves_source_changes() {
     );
 }
 
+/// Clone `upstream` into a fresh source repo (so `refs/remotes/origin/<base>`
+/// exists and the create refreshes it), then point `origin` at `url`.
+fn source_with_origin(upstream: &Path, url: &str) -> tempfile::TempDir {
+    let source = common::test_tempdir("wt-refresh-failed-source-");
+    git(source.path(), &["clone", upstream.to_str().unwrap(), "."]);
+    git(source.path(), &["remote", "set-url", "origin", url]);
+    source
+}
+
+/// Write an executable `core.sshCommand` stub into `dir` and install it on
+/// `repo`, so SSH remotes run `body` instead of a real `ssh`.
+fn install_ssh_stub(repo: &Path, dir: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let stub = dir.join("ssh-stub.sh");
+    std::fs::write(&stub, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(repo, &["config", "core.sshCommand", stub.to_str().unwrap()]);
+}
+
+/// Send a worktree create off `base` and assert the documented
+/// `base-refresh-failed` envelope (§9.2) with `category`, plus that nothing
+/// (branch, folder) is left behind. Returns the error object.
+async fn assert_base_refresh_failed(
+    fx: &Fixture,
+    source: &Path,
+    base: &str,
+    branch: &str,
+    category: &str,
+) -> Value {
+    let mut rpc = connect(fx.port).await;
+    let resp = wss_rpc_raw(
+        &mut rpc,
+        1,
+        "workspace.create",
+        json!({"repositoryPath": source, "branch": branch, "baseRef": base}),
+    )
+    .await;
+    let err = resp["error"].clone();
+    assert_eq!(err["code"], -32603, "{resp}");
+    assert_eq!(err["data"]["code"], "base-refresh-failed", "{resp}");
+    assert_eq!(err["data"]["category"], category, "{resp}");
+    assert_eq!(err["data"]["baseRef"], base, "{resp}");
+    assert_eq!(err["data"]["remote"], "origin", "{resp}");
+    let detail = err["data"]["detail"].as_str().expect("detail string");
+    assert!(!detail.is_empty(), "{resp}");
+    let message = err["message"].as_str().unwrap();
+    assert_eq!(
+        message,
+        format!("Couldn't update {base} from origin: {detail}"),
+        "{resp}"
+    );
+    assert!(
+        git(source, &["branch", "--list", branch]).is_empty(),
+        "{resp}"
+    );
+    assert_eq!(
+        std::fs::read_dir(fx.dir.path().join("workspaces"))
+            .unwrap()
+            .count(),
+        0,
+        "no workspace folder may be left behind: {resp}"
+    );
+    err
+}
+
 #[intent_test_macros::daemon_test]
 async fn workspace_create_rejects_stale_remote_base_when_fetch_fails() {
     let fx = boot().await;
-    let mut rpc = connect(fx.port).await;
     let upstream = common::test_tempdir("wt-refresh-missing-upstream-");
     let base = init_git_repo(upstream.path());
-    let source = common::test_tempdir("wt-refresh-failed-source-");
+    let missing = upstream.path().join("missing");
+    let source = source_with_origin(upstream.path(), missing.to_str().unwrap());
+    let err = assert_base_refresh_failed(
+        &fx,
+        source.path(),
+        &base,
+        "failed-refresh",
+        "repo-not-found",
+    )
+    .await;
+    assert!(
+        err["data"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("does not appear to be a git repository"),
+        "{err}"
+    );
+}
+
+/// HTTPS remote demanding credentials, none available and prompts disabled.
+#[intent_test_macros::daemon_test]
+async fn workspace_create_base_refresh_auth_required() {
+    use std::io::{Read, Write};
+    let fx = boot().await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    let upstream = common::test_tempdir("wt-refresh-auth-upstream-");
+    let base = init_git_repo(upstream.path());
+    let source = source_with_origin(
+        upstream.path(),
+        &format!("http://127.0.0.1:{port}/repo.git"),
+    );
+    assert_base_refresh_failed(&fx, source.path(), &base, "auth-refresh", "auth-required").await;
+}
+
+/// Remote host that does not resolve.
+#[intent_test_macros::daemon_test]
+async fn workspace_create_base_refresh_network() {
+    let fx = boot().await;
+    let upstream = common::test_tempdir("wt-refresh-net-upstream-");
+    let base = init_git_repo(upstream.path());
+    let source = source_with_origin(
+        upstream.path(),
+        "http://intent-no-such-host.invalid/repo.git",
+    );
+    assert_base_refresh_failed(&fx, source.path(), &base, "net-refresh", "network").await;
+}
+
+/// A remote that never answers outlives the (shortened) fetch deadline: the
+/// daemon kills git and reports `timeout`.
+#[intent_test_macros::daemon_test]
+async fn workspace_create_base_refresh_timeout() {
+    let fx =
+        boot_with(|s| s.with_base_refresh_timeout(std::time::Duration::from_millis(500))).await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let upstream = common::test_tempdir("wt-refresh-timeout-upstream-");
+    let base = init_git_repo(upstream.path());
+    let source = source_with_origin(
+        upstream.path(),
+        &format!("http://127.0.0.1:{port}/repo.git"),
+    );
+    let err =
+        assert_base_refresh_failed(&fx, source.path(), &base, "timeout-refresh", "timeout").await;
+    assert!(
+        err["data"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("timed out"),
+        "{err}"
+    );
+    drop(listener);
+}
+
+/// SSH remote whose host key the daemon's machine has never trusted.
+#[intent_test_macros::daemon_test]
+async fn workspace_create_base_refresh_ssh_host_key() {
+    let fx = boot().await;
+    let upstream = common::test_tempdir("wt-refresh-hostkey-upstream-");
+    let base = init_git_repo(upstream.path());
+    let source = source_with_origin(upstream.path(), "ssh://git@example.invalid/repo.git");
+    let stubs = common::test_tempdir("wt-refresh-hostkey-stub-");
+    install_ssh_stub(
+        source.path(),
+        stubs.path(),
+        "echo 'Host key verification failed.' >&2\nexit 255",
+    );
+    assert_base_refresh_failed(&fx, source.path(), &base, "hostkey-refresh", "ssh-host-key").await;
+}
+
+/// A credential embedded in the remote URL never reaches `detail` or
+/// `message`, even when git's output echoes it.
+#[intent_test_macros::daemon_test]
+async fn workspace_create_base_refresh_redacts_credentials() {
+    let fx = boot().await;
+    let upstream = common::test_tempdir("wt-refresh-redact-upstream-");
+    let base = init_git_repo(upstream.path());
+    let source = source_with_origin(
+        upstream.path(),
+        "ssh://ghp_SECRETtoken123@example.invalid/repo.git",
+    );
+    let stubs = common::test_tempdir("wt-refresh-redact-stub-");
+    install_ssh_stub(
+        source.path(),
+        stubs.path(),
+        "echo \"ssh: connect to $*: fatal: unable to access 'https://x-access-token:hunter2pass@github.com/o/r.git/'\" >&2\nexit 255",
+    );
+    let err =
+        assert_base_refresh_failed(&fx, source.path(), &base, "redact-refresh", "other").await;
+    let text = err.to_string();
+    for secret in ["ghp_SECRETtoken123", "hunter2pass"] {
+        assert!(!text.contains(secret), "credential leaked: {text}");
+    }
+    assert!(text.contains("***@"), "redaction marker expected: {text}");
+}
+
+/// `skipBaseRefresh: true` never fetches: the worktree starts at the local
+/// `refs/remotes/origin/<base>` as last fetched — not the newer upstream tip,
+/// and not the local branch with its unpushed commit.
+#[intent_test_macros::daemon_test]
+async fn workspace_create_skip_base_refresh_starts_from_last_fetched_ref() {
+    let fx = boot().await;
+    let mut rpc = connect(fx.port).await;
+    let upstream = common::test_tempdir("wt-skip-upstream-");
+    let base = init_git_repo(upstream.path());
+    let source = common::test_tempdir("wt-skip-source-");
     git(
         source.path(),
         &["clone", upstream.path().to_str().unwrap(), "."],
     );
+    let last_fetched = git(
+        source.path(),
+        &["rev-parse", &format!("refs/remotes/origin/{base}")],
+    );
+    std::fs::write(upstream.path().join("README.md"), "newer remote\n").unwrap();
+    git(upstream.path(), &["commit", "-am", "remote update"]);
+    let upstream_tip = git(upstream.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(source.path().join("local.txt"), "unpushed\n").unwrap();
+    git(source.path(), &["add", "local.txt"]);
     git(
         source.path(),
         &[
-            "remote",
-            "set-url",
-            "origin",
-            source.path().join("missing").to_str().unwrap(),
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@e.x",
+            "commit",
+            "-m",
+            "unpushed",
         ],
     );
+    let local_head = git(source.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(last_fetched, upstream_tip);
+    assert_ne!(last_fetched, local_head);
 
     let resp = wss_rpc_raw(
         &mut rpc,
         1,
         "workspace.create",
-        json!({"repositoryPath": source.path(), "branch": "failed-refresh", "baseRef": base}),
+        json!({
+            "repositoryPath": source.path(),
+            "branch": "skip-refresh",
+            "baseRef": base,
+            "skipBaseRefresh": true,
+        }),
     )
     .await;
-    assert_eq!(resp["error"]["code"], -32603, "{resp}");
-    assert!(
-        resp["error"]["data"]
-            .as_str()
-            .unwrap()
-            .contains("git fetch failed"),
+    let workspace = &resp["result"]["workspace"];
+    assert_eq!(workspace["baseCommitSha"], last_fetched, "{resp}");
+    let checkout = workspace["worktreePath"].as_str().expect("worktreePath");
+    assert_eq!(
+        git(Path::new(checkout), &["rev-parse", "HEAD"]),
+        last_fetched
+    );
+    assert_eq!(
+        git(
+            source.path(),
+            &["rev-parse", &format!("refs/remotes/origin/{base}")]
+        ),
+        last_fetched,
+        "skipBaseRefresh must not fetch"
+    );
+}
+
+/// Continue path: the same create that failed its base refresh succeeds with
+/// `skipBaseRefresh: true` (unreachable remote, no fetch attempted).
+#[intent_test_macros::daemon_test]
+async fn workspace_create_continue_after_base_refresh_failed() {
+    let fx = boot().await;
+    let upstream = common::test_tempdir("wt-continue-upstream-");
+    let base = init_git_repo(upstream.path());
+    let missing = upstream.path().join("missing");
+    let source = source_with_origin(upstream.path(), missing.to_str().unwrap());
+    let tracking = git(
+        source.path(),
+        &["rev-parse", &format!("refs/remotes/origin/{base}")],
+    );
+    assert_base_refresh_failed(&fx, source.path(), &base, "continue-ws", "repo-not-found").await;
+
+    let mut rpc = connect(fx.port).await;
+    let resp = wss_rpc_raw(
+        &mut rpc,
+        2,
+        "workspace.create",
+        json!({
+            "repositoryPath": source.path(),
+            "branch": "continue-ws",
+            "baseRef": base,
+            "skipBaseRefresh": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["result"]["workspace"]["baseCommitSha"], tracking,
         "{resp}"
     );
-    assert!(git(source.path(), &["branch", "--list", "failed-refresh"]).is_empty());
-    assert_eq!(
-        std::fs::read_dir(fx.dir.path().join("workspaces"))
-            .unwrap()
-            .count(),
-        0
+}
+
+/// M5 time-box measurement: two creates off the same repository serialize
+/// their base fetches under the per-repo provisioning lock, so the second
+/// create's wall time is about lock wait + its own fetch ≈ 2× the fetch
+/// bound. With the production 100 s bound that is ≈ 200 s, beyond the app's
+/// old 120 s create timeout, even though each fetch stays inside the daemon's
+/// own bound. Scaled down here to a 1.5 s bound.
+#[intent_test_macros::daemon_test(flavor = "multi_thread")]
+async fn concurrent_creates_serialize_base_refresh_under_repo_lock() {
+    let fx =
+        boot_with(|s| s.with_base_refresh_timeout(std::time::Duration::from_millis(1500))).await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let upstream = common::test_tempdir("wt-lock-upstream-");
+    let base = init_git_repo(upstream.path());
+    let source = source_with_origin(
+        upstream.path(),
+        &format!("http://127.0.0.1:{port}/repo.git"),
     );
+    let started = std::time::Instant::now();
+    let run = |branch: &'static str| {
+        let source = source.path().to_path_buf();
+        let base = base.clone();
+        let port = fx.port;
+        async move {
+            let mut rpc = connect(port).await;
+            let resp = wss_rpc_raw(
+                &mut rpc,
+                1,
+                "workspace.create",
+                json!({"repositoryPath": source, "branch": branch, "baseRef": base}),
+            )
+            .await;
+            (resp, started.elapsed())
+        }
+    };
+    let ((a, a_elapsed), (b, b_elapsed)) = tokio::join!(run("lock-a"), run("lock-b"));
+    for resp in [&a, &b] {
+        assert_eq!(resp["error"]["data"]["category"], "timeout", "{resp}");
+    }
+    let (first, second) = if a_elapsed <= b_elapsed {
+        (a_elapsed, b_elapsed)
+    } else {
+        (b_elapsed, a_elapsed)
+    };
+    eprintln!("M5 measurement: first create {first:?}, second create {second:?}");
+    assert!(
+        second >= std::time::Duration::from_millis(2900),
+        "second create waits for the first fetch, then runs its own: {second:?}"
+    );
+    drop(listener);
 }

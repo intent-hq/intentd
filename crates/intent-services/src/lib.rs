@@ -917,6 +917,10 @@ pub struct Services {
     /// call time: `$INTENTD_WORKSPACES_DIR`, else `~/intent/workspaces` (the
     /// FE's `WorkspaceConfig.WORKSPACES_BASE`). Tests inject a temp dir.
     workspaces_root: Option<PathBuf>,
+    /// Wall-clock bound for the `workspace.create` base-refresh fetch.
+    /// `None` keeps the production default (100 s); tests inject a short
+    /// bound to drive the `timeout` category (PROTOCOL §9.2).
+    base_refresh_timeout: Option<std::time::Duration>,
     /// Global single-flight flag for opportunistic `repo.warmCache` warms:
     /// `Some((owner, repo))` while a warm is in flight, at most one
     /// daemon-wide. A second call while set is rejected with
@@ -1809,6 +1813,7 @@ impl Services {
             workspace_vocabulary: Arc::new(workspace_vocabulary::WorkspaceVocabularyCache::new()),
             worktree_locks: intent_git::worktree::WorktreeLocks::new(),
             workspaces_root: None,
+            base_refresh_timeout: None,
             warm_in_flight: Arc::new(Mutex::new(None)),
             search_cancels: intent_search::CancelRegistry::new(),
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
@@ -5170,6 +5175,14 @@ impl Services {
     #[must_use]
     pub fn with_workspaces_root(mut self, root: PathBuf) -> Self {
         self.workspaces_root = Some(root);
+        self
+    }
+
+    /// Override the `workspace.create` base-refresh fetch bound (default
+    /// 100 s). Tests use a short bound to exercise the `timeout` category.
+    #[must_use]
+    pub fn with_base_refresh_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.base_refresh_timeout = Some(timeout);
         self
     }
 
@@ -23866,6 +23879,9 @@ impl WorkspaceApi for Services {
                                 let base_ref = ws.base_ref.clone();
                                 let remote =
                                     input.remote.unwrap_or_else(|| "origin".to_string());
+                                let skip_base_refresh =
+                                    input.skip_base_refresh.unwrap_or(false);
+                                let base_refresh_timeout = services.base_refresh_timeout;
                                 let pr_token =
                                     boxed_await(|| {
                                         github_git_token(
@@ -23938,6 +23954,34 @@ impl WorkspaceApi for Services {
                                 } else {
                                     intent_core::CheckoutMode::Worktree
                                 };
+                                // Base refresh milestone (PROTOCOL §5.1, M5):
+                                // when the checkout will first fetch its base
+                                // branch, say so — the fetch (up to 100 s,
+                                // under the per-repo lock) otherwise shows as
+                                // "Creating linked worktree...". The worktree /
+                                // CoW milestone then follows the fetch.
+                                let refresh_branch = if skip_base_refresh
+                                    || pr_checkout.is_some()
+                                    || progress.is_none()
+                                {
+                                    None
+                                } else {
+                                    let probe_repo = repo_dir.clone();
+                                    let probe_base = base_ref.clone();
+                                    let probe_remote = remote.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        intent_git::fetch::workspace_base_refresh_branch(
+                                            &probe_repo,
+                                            probe_base.as_deref(),
+                                            &probe_remote,
+                                        )
+                                    })
+                                    .await
+                                    .ok()
+                                    .and_then(std::result::Result::ok)
+                                    .flatten()
+                                };
+                                let announced_refresh = refresh_branch.is_some();
                                 // Local-repo provisioning milestone (unified
                                 // scale): the CoW copy / worktree add is the
                                 // dominant step of a local create, so it sits
@@ -23945,27 +23989,15 @@ impl WorkspaceApi for Services {
                                 // after a network clone the monotonic clamp
                                 // lifts it to the 85+ tail automatically).
                                 if let Some(reporter) = progress.as_deref() {
-                                    match mode {
-                                        intent_core::CheckoutMode::Cow => {
-                                            boxed_await(|| {
-                                                reporter.milestone(
-                                                    "cow-copy",
-                                                    30,
-                                                    "Copying repository (CoW)...",
-                                                )
-                                            })
-                                            .await;
-                                        }
-                                        _ => {
-                                            boxed_await(|| {
-                                                reporter.milestone(
-                                                    "worktree",
-                                                    30,
-                                                    "Creating linked worktree...",
-                                                )
-                                            })
-                                            .await;
-                                        }
+                                    if let Some(base) = refresh_branch.as_deref() {
+                                        let message =
+                                            format!("Updating {base} from {remote}...");
+                                        boxed_await(|| {
+                                            reporter.milestone("base-refresh", 20, &message)
+                                        })
+                                        .await;
+                                    } else {
+                                        boxed_await(|| reporter.checkout_milestone(mode)).await;
                                     }
                                 }
                                 let provision = |mode: intent_core::CheckoutMode| {
@@ -23979,6 +24011,7 @@ impl WorkspaceApi for Services {
                                     let wt = wt_path.clone();
                                     let locks = worktree_locks.clone();
                                     let lock_key = repo_dir.clone();
+                                    let progress = progress.clone();
                                     async move {
                                         // `cowCloneExclude` comes from the
                                         // source repo's config; only the CoW
@@ -23999,25 +24032,51 @@ impl WorkspaceApi for Services {
                                                 let provision_started =
                                                     std::time::Instant::now();
                                                 let repo_for_log = repo.clone();
-                                                let result = match tokio::task::spawn_blocking(
+                                                let result = async {
+                                                // Fetch step (PR head or base
+                                                // refresh), then the checkout:
+                                                // split so the worktree / CoW
+                                                // milestone lands after a
+                                                // reported base refresh.
+                                                let fetch_repo = repo.clone();
+                                                let fetch_remote = remote.clone();
+                                                let fetch_branch = branch.clone();
+                                                let fetch_base = base_ref.clone();
+                                                let fetch_pr = pr_checkout.clone();
+                                                let fetch_token = pr_token.clone();
+                                                tokio::task::spawn_blocking(move || {
+                                                    if let Some((number, sha)) = fetch_pr.as_ref() {
+                                                        intent_git::fetch::prepare_pr_branch(
+                                                            &fetch_repo,
+                                                            &fetch_remote,
+                                                            *number,
+                                                            &fetch_branch,
+                                                            sha.as_deref(),
+                                                            fetch_token.as_deref(),
+                                                        )
+                                                    } else if skip_base_refresh {
+                                                        Ok(())
+                                                    } else {
+                                                        intent_git::fetch::refresh_workspace_base_with_timeout(
+                                                            &fetch_repo,
+                                                            fetch_base.as_deref(),
+                                                            &fetch_remote,
+                                                            fetch_token.as_deref(),
+                                                            base_refresh_timeout,
+                                                        )
+                                                    }
+                                                })
+                                                .await
+                                                .map_err(|e| Error::Internal(format!(
+                                                    "checkout provisioning task failed: {e}"
+                                                )))??;
+                                                if announced_refresh {
+                                                    if let Some(reporter) = progress.as_deref() {
+                                                        boxed_await(|| reporter.checkout_milestone(mode)).await;
+                                                    }
+                                                }
+                                                match tokio::task::spawn_blocking(
                                                     move || {
-                                                        if let Some((number, sha)) = pr_checkout.as_ref() {
-                                                            intent_git::fetch::prepare_pr_branch(
-                                                                &repo,
-                                                                &remote,
-                                                                *number,
-                                                                &branch,
-                                                                sha.as_deref(),
-                                                                pr_token.as_deref(),
-                                                            )?;
-                                                        } else {
-                                                            intent_git::fetch::refresh_workspace_base(
-                                                                &repo,
-                                                                base_ref.as_deref(),
-                                                                &remote,
-                                                                pr_token.as_deref(),
-                                                            )?;
-                                                        }
                                                         let result = match mode {
                                                             intent_core::CheckoutMode::Cow => intent_git::cow_checkout::provision_cow_checkout(
                                                                 &repo,
@@ -24060,7 +24119,9 @@ impl WorkspaceApi for Services {
                                                     Err(e) => Err(Error::Internal(format!(
                                                         "checkout provisioning task failed: {e}"
                                                     ))),
-                                                };
+                                                }
+                                                }
+                                                .await;
                                                 tracing::info!(
                                                     repository_path = %repo_for_log.display(),
                                                     mode = ?mode,

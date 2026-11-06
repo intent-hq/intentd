@@ -51,34 +51,192 @@ pub fn fetch(worktree_path: &Path, remote: &str, branch: &str, token: Option<&st
     fetch_with_timeout(worktree_path, remote, branch, token, SHELL_FETCH_TIMEOUT)
 }
 
+/// The branch a workspace base refresh would fetch, if any: `base_ref` names
+/// a branch (bare or `refs/remotes/<remote>/<branch>`) whose remote-tracking
+/// ref already exists locally. Explicit local refs, tags, commits, `HEAD`,
+/// and branches with no tracking ref return `None` (no fetch).
+///
+/// # Errors
+/// Returns an error if the repository cannot be opened or the ref lookup fails.
+pub fn workspace_base_refresh_branch(
+    path: &Path,
+    base_ref: Option<&str>,
+    remote: &str,
+) -> Result<Option<String>> {
+    let Some(base) = base_ref.filter(|base| !base.is_empty()) else {
+        return Ok(None);
+    };
+    let prefix = format!("refs/remotes/{remote}/");
+    let branch = base.strip_prefix(&prefix).unwrap_or(base);
+    let tracking_ref = format!("{prefix}{branch}");
+    if branch == "HEAD" || !git2::Reference::is_valid_name(&tracking_ref) {
+        return Ok(None);
+    }
+    let repo = git2::Repository::open(path).map_err(crate::map_git_err)?;
+    let found = match repo.find_reference(&tracking_ref) {
+        // A symbolic tracking ref (`refs/remotes/<remote>/HEAD`) names no
+        // remote branch to fetch.
+        Ok(reference) => reference.kind() != Some(git2::ReferenceType::Symbolic),
+        Err(error) if error.code() == git2::ErrorCode::NotFound => false,
+        Err(error) => return Err(crate::map_git_err(error)),
+    };
+    Ok(found.then(|| branch.to_string()))
+}
+
 /// Refresh a workspace base that resolves to a remote-tracking branch.
 /// Explicit local refs, tags, commits, and HEAD retain their local semantics.
 /// Callers hold the provisioning lock across refresh and checkout.
 ///
 /// # Errors
-/// Returns an error if the repository cannot be opened or the required fetch fails.
+/// Returns an error if the repository cannot be opened, and
+/// [`Error::BaseRefreshFailed`] (classified, credential-redacted) if the
+/// required fetch fails or times out.
 pub fn refresh_workspace_base(
     path: &Path,
     base_ref: Option<&str>,
     remote: &str,
     token: Option<&str>,
 ) -> Result<()> {
-    let Some(base) = base_ref.filter(|base| !base.is_empty()) else {
+    refresh_workspace_base_with_timeout(path, base_ref, remote, token, None)
+}
+
+/// [`refresh_workspace_base`] with an explicit fetch bound (`None` keeps the
+/// default [`SHELL_FETCH_TIMEOUT`]); tests use a short bound to drive the
+/// `timeout` category without waiting 100 s.
+///
+/// # Errors
+/// As [`refresh_workspace_base`].
+pub fn refresh_workspace_base_with_timeout(
+    path: &Path,
+    base_ref: Option<&str>,
+    remote: &str,
+    token: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<()> {
+    let Some(branch) = workspace_base_refresh_branch(path, base_ref, remote)? else {
         return Ok(());
     };
-    let prefix = format!("refs/remotes/{remote}/");
-    let branch = base.strip_prefix(&prefix).unwrap_or(base);
-    let tracking_ref = format!("{prefix}{branch}");
-    if !git2::Reference::is_valid_name(&tracking_ref) {
-        return Ok(());
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+    run_fetch(
+        path,
+        remote,
+        &refspec,
+        token,
+        timeout.unwrap_or(SHELL_FETCH_TIMEOUT),
+    )
+    .map_err(|failure| failure.into_base_refresh_error(&branch, remote))
+}
+
+/// Bound on the git stderr tail carried in a base-refresh `detail`.
+const BASE_REFRESH_DETAIL_MAX: usize = 4096;
+
+/// Why a shelled-out `git fetch` did not succeed.
+#[derive(Debug)]
+enum FetchFailure {
+    Spawn(String),
+    Failed(String),
+    TimedOut(Duration),
+    Wait(String),
+}
+
+fn describe_timeout(timeout: Duration) -> String {
+    if timeout >= Duration::from_secs(1) {
+        format!("git fetch timed out after {}s", timeout.as_secs())
+    } else {
+        format!("git fetch timed out after {}ms", timeout.as_millis())
     }
-    let repo = git2::Repository::open(path).map_err(crate::map_git_err)?;
-    match repo.find_reference(&tracking_ref) {
-        Ok(_) => {}
-        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(()),
-        Err(error) => return Err(crate::map_git_err(error)),
+}
+
+impl FetchFailure {
+    fn into_internal(self) -> Error {
+        Error::Internal(match self {
+            Self::Spawn(e) => format!("failed to spawn git: {e}"),
+            Self::Failed(stderr) => format!("git fetch failed: {}", stderr.trim()),
+            Self::TimedOut(timeout) => describe_timeout(timeout),
+            Self::Wait(e) => format!("git fetch wait failed: {e}"),
+        })
     }
-    fetch(path, remote, branch, token)
+
+    fn into_base_refresh_error(self, base_ref: &str, remote: &str) -> Error {
+        use intent_core::BaseRefreshErrorCategory as C;
+        let (category, raw) = match self {
+            Self::TimedOut(timeout) => (C::Timeout, describe_timeout(timeout)),
+            Self::Failed(stderr) => {
+                let stderr = stderr.trim().to_string();
+                let raw = if stderr.is_empty() {
+                    "git fetch failed".to_string()
+                } else {
+                    stderr
+                };
+                (classify_fetch_error(&raw), raw)
+            }
+            Self::Spawn(e) => (C::Other, format!("failed to spawn git: {e}")),
+            Self::Wait(e) => (C::Other, format!("git fetch wait failed: {e}")),
+        };
+        Error::BaseRefreshFailed(Box::new(intent_core::BaseRefreshFailure {
+            category,
+            detail: crate::redact::redact_credentials(&bounded_tail(&raw, BASE_REFRESH_DETAIL_MAX)),
+            base_ref: base_ref.to_string(),
+            remote: remote.to_string(),
+        }))
+    }
+}
+
+/// Keep the last `max` bytes of `text` (on a char boundary).
+fn bounded_tail(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
+}
+
+/// Fetch-specific classifier for a failed base refresh (PROTOCOL §9.2),
+/// checked in order, first match wins. Deliberately not the clone
+/// classifier: a bare "permission denied" never reads as a bad path, and
+/// "Host key verification failed" is its own category. The `timeout`
+/// category comes from the daemon's own kill, never from stderr.
+#[must_use]
+pub fn classify_fetch_error(stderr: &str) -> intent_core::BaseRefreshErrorCategory {
+    use intent_core::BaseRefreshErrorCategory as C;
+    let m = stderr.to_lowercase();
+    let any = |needles: &[&str]| needles.iter().any(|n| m.contains(n));
+    if any(&["host key verification failed"]) {
+        C::SshHostKey
+    } else if any(&[
+        "permission denied (publickey",
+        "could not read username",
+        "could not read password",
+        "authentication failed",
+        "terminal prompts disabled",
+        "returned error: 401",
+    ]) {
+        C::AuthRequired
+    } else if any(&[
+        "could not resolve host",
+        "could not resolve hostname",
+        "connection refused",
+        "connection timed out",
+        "operation timed out",
+        "network is unreachable",
+        "no route to host",
+        "failed to connect to",
+    ]) {
+        C::Network
+    } else if any(&[
+        "repository not found",
+        "does not appear to be a git repository",
+        "returned error: 404",
+    ]) {
+        C::RepoNotFound
+    } else if any(&["returned error: 403", "403 forbidden", "denied to"]) {
+        C::AccessDenied
+    } else {
+        C::Other
+    }
 }
 
 /// Timeout-parameterised body of [`fetch`], factored out so tests can drive
@@ -213,6 +371,16 @@ fn fetch_refspec_with_timeout(
     token: Option<&str>,
     timeout: Duration,
 ) -> Result<()> {
+    run_fetch(worktree_path, remote, refspec, token, timeout).map_err(FetchFailure::into_internal)
+}
+
+fn run_fetch(
+    worktree_path: &Path,
+    remote: &str,
+    refspec: &str,
+    token: Option<&str>,
+    timeout: Duration,
+) -> std::result::Result<(), FetchFailure> {
     // `git -C <path>` so the child cwd is not this crate's cwd (parity with the
     // reference TS handler); `GIT_TERMINAL_PROMPT=0` turns any credential prompt
     // into a fast error rather than a hidden hang.
@@ -245,7 +413,7 @@ fn fetch_refspec_with_timeout(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| Error::Internal(format!("failed to spawn git: {e}")))?;
+        .map_err(|e| FetchFailure::Spawn(e.to_string()))?;
 
     let deadline = Instant::now() + timeout;
     loop {
@@ -255,10 +423,7 @@ fn fetch_refspec_with_timeout(
                     return Ok(());
                 }
                 let stderr = read_stderr(&mut child);
-                return Err(Error::Internal(format!(
-                    "git fetch failed: {}",
-                    stderr.trim()
-                )));
+                return Err(FetchFailure::Failed(stderr));
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -266,17 +431,14 @@ fn fetch_refspec_with_timeout(
                     // survives the wall-clock bound. `wait` reaps the exit status.
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(Error::Internal(format!(
-                        "git fetch timed out after {}s",
-                        timeout.as_secs()
-                    )));
+                    return Err(FetchFailure::TimedOut(timeout));
                 }
                 std::thread::sleep(SHELL_FETCH_POLL);
             }
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(Error::Internal(format!("git fetch wait failed: {e}")));
+                return Err(FetchFailure::Wait(e.to_string()));
             }
         }
     }
@@ -336,6 +498,13 @@ mod tests {
         repo.tag_lightweight("v1", tip.as_object(), false).unwrap();
         repo.reference("refs/remotes/origin/main", tip.id(), false, "test")
             .unwrap();
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+            false,
+            "test",
+        )
+        .unwrap();
         repo.remote("origin", source.path().join("missing").to_str().unwrap())
             .unwrap();
         let sha = tip.id().to_string();
@@ -343,6 +512,7 @@ mod tests {
             None,
             Some(""),
             Some("HEAD"),
+            Some("refs/remotes/origin/HEAD"),
             Some("HEAD~0"),
             Some("local-only"),
             Some("refs/heads/local-only"),
@@ -351,8 +521,71 @@ mod tests {
         ] {
             refresh_workspace_base(source.path(), base, "origin", None).unwrap();
         }
-        assert!(refresh_workspace_base(source.path(), Some("main"), "origin", None).is_err());
+        match refresh_workspace_base(source.path(), Some("main"), "origin", None) {
+            Err(Error::BaseRefreshFailed(failure)) => {
+                assert_eq!(
+                    failure.category,
+                    intent_core::BaseRefreshErrorCategory::RepoNotFound
+                );
+                assert_eq!(failure.base_ref, "main");
+                assert_eq!(failure.remote, "origin");
+            }
+            other => panic!("expected BaseRefreshFailed, got {other:?}"),
+        }
         assert_eq!(repo.head().unwrap().target(), Some(tip.id()));
+    }
+
+    #[test]
+    fn classify_fetch_error_follows_documented_order() {
+        use intent_core::BaseRefreshErrorCategory as C;
+        for (stderr, want) in [
+            ("Host key verification failed.\nfatal: Could not read from remote repository.", C::SshHostKey),
+            ("git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.", C::AuthRequired),
+            ("fatal: could not read Username for 'https://github.com': terminal prompts disabled", C::AuthRequired),
+            ("remote: Invalid username or password.\nfatal: Authentication failed for 'https://x/'", C::AuthRequired),
+            ("fatal: unable to access 'https://x/': Could not resolve host: x", C::Network),
+            ("ssh: Could not resolve hostname x: Name or service not known", C::Network),
+            ("ssh: connect to host x port 22: Connection refused", C::Network),
+            ("fatal: unable to access 'https://x/': Failed to connect to x port 443", C::Network),
+            ("ssh: connect to host x port 22: Network is unreachable", C::Network),
+            ("remote: Repository not found.\nfatal: repository 'https://x/' not found", C::RepoNotFound),
+            ("fatal: '/tmp/missing' does not appear to be a git repository", C::RepoNotFound),
+            ("remote: Permission to o/r.git denied to someone.\nfatal: unable to access: The requested URL returned error: 403", C::AccessDenied),
+            ("error: cannot open .git/FETCH_HEAD: Permission denied", C::Other),
+            ("fatal: couldn't find remote ref main", C::Other),
+        ] {
+            assert_eq!(classify_fetch_error(stderr), want, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn base_refresh_error_redacts_and_bounds_detail() {
+        let noisy = format!(
+            "{}fatal: unable to access 'https://user:s3cret@github.com/o/r.git/': Could not resolve host: github.com",
+            "x".repeat(BASE_REFRESH_DETAIL_MAX)
+        );
+        let Error::BaseRefreshFailed(failure) =
+            FetchFailure::Failed(noisy).into_base_refresh_error("main", "origin")
+        else {
+            panic!("expected BaseRefreshFailed");
+        };
+        assert!(!failure.detail.contains("s3cret"), "{}", failure.detail);
+        assert!(failure.detail.contains("***@github.com"));
+        assert!(failure.detail.len() <= BASE_REFRESH_DETAIL_MAX);
+        assert_eq!(
+            failure.category,
+            intent_core::BaseRefreshErrorCategory::Network
+        );
+        let Error::BaseRefreshFailed(failure) = FetchFailure::TimedOut(Duration::from_secs(100))
+            .into_base_refresh_error("main", "origin")
+        else {
+            panic!("expected BaseRefreshFailed");
+        };
+        assert_eq!(
+            failure.category,
+            intent_core::BaseRefreshErrorCategory::Timeout
+        );
+        assert_eq!(failure.detail, "git fetch timed out after 100s");
     }
 
     /// Fetch a branch from a local bare remote and confirm the local
