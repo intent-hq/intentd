@@ -4,6 +4,11 @@
 
 #![cfg(unix)]
 
+#[path = "npx_cache_recovery/queue_faults.rs"]
+mod queue_faults;
+#[path = "npx_cache_recovery/storage_faults.rs"]
+mod storage_faults;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
