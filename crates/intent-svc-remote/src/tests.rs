@@ -75,6 +75,7 @@ fn tuning() -> Tuning {
         fail_claim_reads: Arc::default(),
         before_publish: crate::connector::BeforePublish::default(),
         before_claim: crate::connector::BeforePublish::default(),
+        grace_gate: crate::connector::GraceGate::default(),
     }
 }
 
@@ -2377,6 +2378,125 @@ mod final_stops {
         // The timer or the dial loop may have dropped it first; either
         // way it settles exactly once.
         tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(shared.final_settles_for_test(), vec![agent.clone()]);
+        node.shutdown();
+    }
+
+    /// A final stop can expire while its ack is in flight: the expiry
+    /// drops the record and settles the stop, so the ack that comes back
+    /// next settles nothing (review of intentd#3098).
+    #[tokio::test]
+    async fn an_ack_in_flight_when_its_final_stop_expires_settles_nothing() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        backend.expose(&mut machine).await.shutdown();
+        let clock = crate::final_stop::Clock::default();
+        let mut quick = tuning();
+        quick.clock = clock.clone();
+        // One send stays in flight until the ack: no resend times it out.
+        quick.stop_resend = Backoff::new(wait(), wait());
+        let node = backend.bare_with(&machine, quick).await;
+        let agent = placed(&backend, &node, &machine).await;
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        bound(&node).await;
+        let stop_id = node.final_stop(&agent, FinalStopReason::AgentDeleted).await;
+        assert_eq!(final_stop_for(&mut link, &agent).await, stop_id);
+        let shared = node.shared_ref();
+        assert!(shared.resending_for_test(stop_id), "the ack is awaited");
+
+        // The bound passes before the ack: the expiry drops and settles it.
+        clock.offset_secs.store(
+            i64::try_from(intent_core::remote_launch::FINAL_STOP_BOUND.as_secs()).unwrap(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        shared.load_final_stops().await;
+        assert!(backend
+            .store()
+            .get_final_stop(&agent)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(shared.final_settles_for_test(), vec![agent.clone()]);
+
+        // The ack the send awaited arrives: its resender handles it and ends.
+        ack_final(&link, stop_id, &agent, FinalPush::Pushed).await;
+        tokio::time::timeout(wait(), async {
+            while shared.resending_for_test(stop_id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the resender handles the ack");
+        assert_eq!(
+            shared.final_settles_for_test(),
+            vec![agent.clone()],
+            "the expiry settled it; the late ack must not settle it again"
+        );
+        node.shutdown();
+    }
+
+    /// Below nodeProtocol 9 the ack settles the stop and its record waits
+    /// out the grace. A load that listed the record before the grace task
+    /// dropped it must not settle it again, even once the stop is past its
+    /// bound (review of intentd#3098).
+    #[tokio::test]
+    async fn a_load_during_the_grace_tasks_drop_settles_nothing() {
+        let backend = Backend::new().await;
+        let mut machine = backend.machine().await;
+        backend.expose(&mut machine).await.shutdown();
+        let clock = crate::final_stop::Clock::default();
+        let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        let mut quick = tuning();
+        quick.clock = clock.clone();
+        quick.grace_gate = crate::connector::GraceGate(Some(gate.clone()));
+        // Only this test's explicit load expires the stop.
+        quick.final_stop_check = Duration::from_secs(3600);
+        let node = backend.bare_with(&machine, quick).await;
+        let agent = placed(&backend, &node, &machine).await;
+        node.connect().await.unwrap();
+        let mut link = machine.accept().await;
+        bound(&node).await;
+        let shared = node.shared_ref();
+        shared.set_protocol_for_test(intent_core::node_link::FINAL_STOP_PROTOCOL - 1);
+        let stop_id = node.final_stop(&agent, FinalStopReason::AgentDeleted).await;
+        let sent = link
+            .expect(|frame| match frame {
+                LinkFrame::Stop {
+                    agent_id, stop_id, ..
+                } if agent_id == agent => Some(stop_id),
+                _ => None,
+            })
+            .await;
+        assert_eq!(sent, stop_id);
+        // A load lists the record before the grace task drops it.
+        let listed = shared.list_final_stops_for_test().await;
+        assert_eq!(listed.len(), 1);
+        link.ack_stop(stop_id, &agent, StopOutcome::Stopped).await;
+
+        // The grace task stops at its gate, between its two steps.
+        tokio::time::timeout(wait(), gate.0.notified())
+            .await
+            .expect("the grace task reaches its gate");
+        assert_eq!(shared.final_settles_for_test(), vec![agent.clone()]);
+        clock.offset_secs.store(
+            i64::try_from(intent_core::remote_launch::FINAL_STOP_BOUND.as_secs()).unwrap(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        shared.settle_listed_for_test(listed).await;
+        assert_eq!(
+            shared.final_settles_for_test(),
+            vec![agent.clone()],
+            "the ack settled it; the load must not settle it again"
+        );
+        gate.1.notify_one();
+        let store = backend.store().clone();
+        until("the grace task drops the record", || {
+            let store = store.clone();
+            let agent = agent.clone();
+            Box::pin(async move { store.get_final_stop(&agent).await.unwrap().is_none() })
+        })
+        .await;
         assert_eq!(shared.final_settles_for_test(), vec![agent.clone()]);
         node.shutdown();
     }
