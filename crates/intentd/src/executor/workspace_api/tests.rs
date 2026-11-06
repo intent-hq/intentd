@@ -452,8 +452,13 @@ async fn file_get_attachment_fetches_a_large_file_in_pieces() {
             if id == "att-corrupt" && offset > 0 {
                 data[0] ^= 1;
             }
+            let name = if id == "att-long" {
+                format!("{}.bin", "n".repeat(240))
+            } else {
+                format!("{id}.bin")
+            };
             let mut answer = json!({
-                "fileName": format!("{id}.bin"),
+                "fileName": name,
                 "mimeType": "application/octet-stream",
                 "size": source.len(),
                 "uploadedAt": "2026-11-06T00:00:00Z",
@@ -496,6 +501,17 @@ async fn file_get_attachment_fetches_a_large_file_in_pieces() {
             2 * MAX_LINK_ATTACHMENT_CHUNK_BYTES
         ]
     );
+
+    let long = call(
+        &server,
+        r#"return JSON.stringify(await ws.file.getAttachment("att-long"));"#,
+    )
+    .await;
+    assert!(!long.0, "a name near the file-system limit still copies: {long:?}");
+    let long_name = format!("{}.bin", "n".repeat(240));
+    assert!(dir.path().join(".intent/attachments").join(&long_name).is_file());
+    std::fs::remove_file(dir.path().join(".intent/attachments").join(&long_name)).unwrap();
+    while asked.try_recv().is_ok() {}
 
     let corrupt = call(
         &server,
