@@ -426,8 +426,8 @@ async fn refresh_claude_watches(
 /// Record a raw change for `ws_id` seen at `now`. The window opens at the
 /// FIRST change and is not extended by later ones, so a continuous stream of
 /// writes still reloads every `DEBOUNCE` (bounded latency) instead of
-/// starving; a burst longer than one window yields one event per window.
-/// Duplicate flushes are harmless because emission is fingerprint-gated.
+/// starving; a burst longer than one window yields one flush per window,
+/// each emitting at most one event and only if the resolved set changed.
 fn schedule_change(
     pending: &mut HashMap<WorkspaceId, tokio::time::Instant>,
     ws_id: WorkspaceId,
@@ -743,12 +743,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Rapid burst, written back to back. The window is fixed from the
-        // first change (the schedule tests below pin the coalescing
-        // contract deterministically), so exactly one event is guaranteed
-        // only when the whole burst lands inside one window. A loaded or
-        // stalled runner can stretch these writes past `DEBOUNCE`
-        // (intent-hq/intent#8710); the split is then correct behaviour, so
-        // only a missing event or more events than writes is a failure.
+        // first change (the schedule tests below pin that deterministically),
+        // so when the burst takes less than `DEBOUNCE` the first flush reads
+        // the fingerprint after every write has landed, and any later flush
+        // (a late notification) is suppressed by the unchanged fingerprint:
+        // exactly one event. A loaded or stalled runner can stretch these
+        // writes past `DEBOUNCE` (intent-hq/intent#8710); a split is then
+        // correct behaviour, so only a missing event or more events than
+        // writes is a failure. (A replayed pre-start event, e.g. FSEvents
+        // re-delivering the tier `mkdir`, could open a window before the
+        // burst; the warm-up above keeps it clear of all but a >250 ms burst.)
         let burst_start = Instant::now();
         for i in 0..3 {
             std::fs::write(
