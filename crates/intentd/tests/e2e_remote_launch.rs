@@ -509,6 +509,54 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
     let reply = got["lastAgentResponse"].as_str().unwrap_or_default();
     assert!(reply.contains("echo:"), "{got}");
     assert!(reply.contains("hello remote"), "{got}");
+    // A message whose images cannot cross the link is refused up front, to
+    // a running remote agent and to a new one; nothing is queued or created.
+    let (text, images) = oversized_prompt_images();
+    let too_large = |response: &Value| {
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("attachments-too-large-for-machine")),
+            "{response}"
+        );
+    };
+    for (id, method) in [(1001, "agent.sendMessage"), (1002, "agent.queueMessage")] {
+        let response = rpc(
+            &mut rpc_ws,
+            id,
+            method,
+            json!({ "workspaceId": ws_id, "agentId": agent_id, "content": text, "imageBlocks": images }),
+        )
+        .await;
+        too_large(&response);
+    }
+    let agents = |list: &Value| list["agents"].as_array().map(Vec::len);
+    let listed = ok(&mut rpc_ws, 1003, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let response = rpc(
+        &mut rpc_ws,
+        1004,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id, "name": "Pictures", "model": "default", "provider": "mock",
+            "placement": { "target": "remote" },
+            "imageBlocks": images,
+            "metadata": { "initialMessage": text },
+        }),
+    )
+    .await;
+    too_large(&response);
+    let relisted = ok(&mut rpc_ws, 1005, "agent.list", json!({ "workspaceId": ws_id })).await;
+    assert_eq!(agents(&relisted), agents(&listed), "{relisted}");
+    assert!(agents(&listed).is_some(), "{listed}");
+    let queue = ok(
+        &mut rpc_ws,
+        1006,
+        "agent.getQueue",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert!(!queue.to_string().contains(&text[..64]), "{queue}");
     // The agent's instructions went with its first prompt, persisted as its
     // system prompt.
     let session = ok(
@@ -1023,6 +1071,32 @@ async fn wsapi_turn(
     reply
 }
 
+/// A long text and two noise PNGs that image preparation keeps as they are
+/// (each under 3 MiB and 2000 px): together they fit the backend's 8 MiB
+/// image budget, but their prompt frame is over the node link's 8 MiB cap.
+fn oversized_prompt_images() -> (String, Value) {
+    use base64::Engine as _;
+    let mut state: u32 = 0x9E37_79B9;
+    let pixels: Vec<u8> = (0..1020 * 1020 * 3)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state.to_le_bytes()[0]
+        })
+        .collect();
+    let image = image::RgbImage::from_raw(1020, 1020, pixels).unwrap();
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    assert!(png.len() <= 3 * 1024 * 1024, "{} bytes", png.len());
+    let data = base64::engine::general_purpose::STANDARD.encode(&png);
+    assert!(2 * data.len() <= 8 * 1024 * 1024, "{} bytes", data.len());
+    let block = json!({ "data": data, "mimeType": "image/png" });
+    ("x".repeat(60 * 1024), json!([block.clone(), block]))
+}
+
 /// A `wsapi:` reply's returned value: the agent returns `JSON.stringify(…)`,
 /// which the reply carries as a JSON string.
 fn wsapi_value(reply: &str) -> Value {
@@ -1530,6 +1604,26 @@ async fn placement_chooses_among_exposed_machines() {
         "a refused placement creates no workspace: {after}"
     );
     assert!(count(&before).is_some(), "{before}");
+    // Images whose prompt cannot cross the link to the machine are refused
+    // before any workspace, worktree or agent exists.
+    let (text, images) = oversized_prompt_images();
+    let mut oversized = workspace("default", json!({ "target": "remote", "nodeId": b_id }));
+    oversized["initialAgent"]["prompt"] = json!(text);
+    oversized["initialAgent"]["imageBlocks"] = images;
+    let workspaces_dir = scratch.path().join("head").join("workspaces");
+    let entries = |dir: &Path| std::fs::read_dir(dir).map_or(0, Iterator::count);
+    let dirs_before = entries(&workspaces_dir);
+    let refused = rpc(&mut rpc_ws, 30, "workspace.create", oversized).await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("attachments-too-large-for-machine")),
+        "{refused}"
+    );
+    let after = ok(&mut rpc_ws, 31, "workspace.list", json!({})).await;
+    assert_eq!(count(&after), count(&before), "{after}");
+    assert_eq!(entries(&workspaces_dir), dirs_before, "no worktree is made");
     let placed = ok(
         &mut rpc_ws,
         23,
