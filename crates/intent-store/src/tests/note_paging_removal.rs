@@ -249,13 +249,21 @@ struct SaveRows {
     outside_search: BTreeMap<String, i64>,
 }
 
-/// Save `note` as revision `rev + 1` while an unrelated note insert queues
-/// behind it.
+/// Save `note` as revision `rev + 1` while an unrelated note insert, stamped
+/// `unrelated_at`, queues behind it.
+///
+/// The stamp is explicit because a note insert moves the workspace's
+/// `last_content_activity` high-water mark (migration 0147) only when it is
+/// strictly later, at `julianday`'s millisecond granularity: a wall-clock
+/// stamp in the same millisecond as the previous insert writes no `workspace`
+/// row, so two saves compared row by row differed by timing alone
+/// (intent-hq/intent#8616, intentd coverage-changed run 42008012825).
 async fn save_beside_an_unrelated_write(
     store: &Store,
     log: &WriterRowLog,
     note: &Note,
     rev: i64,
+    unrelated_at: &str,
 ) -> SaveRows {
     let before = writer_changes(store).await;
     log.take_outside_search();
@@ -270,14 +278,10 @@ async fn save_beside_an_unrelated_write(
             .await
     });
     tokio::task::yield_now().await;
-    store
-        .insert_note(&task_note(
-            &note.workspace_id,
-            &format!("unrelated {rev}"),
-            None,
-        ))
-        .await
-        .unwrap();
+    let mut unrelated = task_note(&note.workspace_id, &format!("unrelated {rev}"), None);
+    unrelated.created_at = unrelated_at.to_string();
+    unrelated.updated_at = unrelated_at.to_string();
+    store.insert_note(&unrelated).await.unwrap();
     let (saved_rev, _) = save.await.unwrap().unwrap();
     assert_eq!(saved_rev, rev + 1);
     SaveRows {
@@ -324,11 +328,37 @@ async fn large_note_save_does_not_block_an_unrelated_write() {
             note.content.push_str(&round.to_string());
             note.content.push('\n');
         }
-        let small_rows = save_beside_an_unrelated_write(&store, &log, &small, round).await;
-        let large_rows = save_beside_an_unrelated_write(&store, &log, &large, round).await;
+        // Each unrelated insert is strictly later than every earlier stamp,
+        // so it moves the workspace's content-activity mark exactly once in
+        // both saves, however fast the clock ticks. The saves themselves
+        // never move it: they keep the snapshot's `updated_at` (the notes'
+        // creation time), which is never later than the mark.
+        let small_rows = save_beside_an_unrelated_write(
+            &store,
+            &log,
+            &small,
+            round,
+            &format!("2100-01-01T00:00:{:02}Z", 2 * round),
+        )
+        .await;
+        let large_rows = save_beside_an_unrelated_write(
+            &store,
+            &log,
+            &large,
+            round,
+            &format!("2100-01-01T00:00:{:02}Z", 2 * round + 1),
+        )
+        .await;
         assert!(
             small_rows.outside_search.contains_key("note"),
             "round {round}: the update hook saw no note write: {:?}",
+            small_rows.outside_search
+        );
+        assert_eq!(
+            small_rows.outside_search.get("workspace"),
+            Some(&1),
+            "round {round}: the unrelated insert did not move the workspace's \
+             content-activity mark: {:?}",
             small_rows.outside_search
         );
         assert_eq!(
