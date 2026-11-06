@@ -79,6 +79,22 @@ systemd_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/
 # Escape a value for XML text content (launchd plist).
 xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
+# wget_download <url> <dest> — the wget fallback of download(), retried: a
+# single GitHub/CDN 5xx or dropped connection would otherwise fail the
+# install (the curl path gets the same from --retry). Flag-minimal for busybox
+# wget, whose exit status does not tell a 5xx from a 404, so every failure is
+# retried: four attempts, 1s/2s/3s apart, quiet like the single attempt was.
+wget_download() {
+  wget_attempt=1
+  while ! wget -qO "$2" "$1"; do
+    if [ "$wget_attempt" -ge 4 ]; then
+      return 1
+    fi
+    sleep "$wget_attempt"
+    wget_attempt=$((wget_attempt + 1))
+  done
+}
+
 tmpdir=""
 staged=""
 cleanup() {
@@ -857,7 +873,7 @@ main() {
   if command -v curl >/dev/null 2>&1; then
     download() { curl --proto '=https' --tlsv1.2 --retry 3 -fsSL -o "$2" "$1"; }
   elif command -v wget >/dev/null 2>&1; then
-    download() { wget -qO "$2" "$1"; }
+    download() { wget_download "$1" "$2"; }
   else
     fail "neither curl nor wget is available; install one and re-run"
   fi

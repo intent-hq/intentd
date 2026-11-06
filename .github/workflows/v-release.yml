@@ -102,7 +102,7 @@ jobs:
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
+        run: "curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh"
       - name: Cache dist
         uses: actions/upload-artifact@v7
         with:
@@ -177,7 +177,7 @@ jobs:
         if: ${{ matrix.container }}
         run: |
           if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: "Put Git Bash first on PATH (Windows)"
@@ -221,7 +221,7 @@ jobs:
         run: |
           if ! command -v rustup >/dev/null 2>&1; then
             if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
-              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain none -y
+              curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused -sSf https://sh.rustup.rs | sh -s -- --default-toolchain none -y
             fi
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
             export PATH="$HOME/.cargo/bin:$PATH"
@@ -311,8 +311,14 @@ jobs:
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-sccache.py
+      # LOCAL CUSTOMIZATION: retry the planned installer command, so one
+      # GitHub 5xx on its download does not fail the leg (intent-hq/intent#8613).
       - name: Install dist
-        run: ${{ matrix.install_dist.run }}
+        shell: bash
+        env:
+          INSTALL_DIST_RUN: ${{ matrix.install_dist.run }}
+          INSTALL_DIST_SHELL: ${{ matrix.install_dist.shell }}
+        run: bash scripts/install-dist.sh
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@v8

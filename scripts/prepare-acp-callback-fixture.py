@@ -9,6 +9,7 @@ and build receipts go to stderr. No package lifecycle scripts are enabled.
 import argparse
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -24,6 +25,9 @@ import tempfile
 import time
 import urllib.request
 
+_spec = importlib.util.spec_from_file_location("download_retry", Path(__file__).with_name("download_retry.py"))
+download_retry = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(download_retry)
 
 DEFAULT_DESCRIPTOR = (
     Path(__file__).resolve().parents[1]
@@ -385,8 +389,8 @@ def npm_tool(descriptor, node, work, env):
     return [str(node), str(npm)]
 
 
-def download(source, target):
-    require(source["url"].startswith("https://codeload.github.com/agentclientprotocol/claude-agent-acp/tar.gz/"), "unexpected source locator")
+def fetch_source(source, target):
+    """Download the pinned source tarball to target in one attempt."""
     with urllib.request.urlopen(source["url"], timeout=60) as response, target.open("xb") as output:
         require(response.geturl() == source["url"], "unexpected source redirect")
         remaining = source["bytes"]
@@ -396,6 +400,14 @@ def download(source, target):
             output.write(block)
             remaining -= len(block)
         require(not response.read(1), "oversized source download")
+
+
+def download(source, target, delays=None, sleep=None):
+    require(source["url"].startswith("https://codeload.github.com/agentclientprotocol/claude-agent-acp/tar.gz/"), "unexpected source locator")
+    # A transient GitHub 5xx or reset retries from scratch (intent-hq/intent#8613).
+    download_retry.retrying(lambda: fetch_source(source, target), "callback fixture source download",
+                            delays=download_retry.RETRY_DELAYS if delays is None else delays, sleep=sleep,
+                            cleanup=lambda: target.unlink(missing_ok=True))
     check_file(target, source)
     receipt("source-acquired", sha256=source["sha256"], bytes=source["bytes"])
 

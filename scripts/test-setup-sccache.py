@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Exercise self-hosted cache selection and checksum verification without networking."""
 import contextlib
+import http.client
 import importlib.util
 import io
 import re
 from pathlib import Path
+import ssl
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,7 +91,7 @@ class Download(unittest.TestCase):
 
     def test_network_errors_and_timeouts_are_retried(self):
         failures = [cache.urllib.error.URLError('reset'), TimeoutError('timed out'), ConnectionResetError(),
-                    cache.ssl.SSLError('bad record mac'), cache.http.client.IncompleteRead(b'')]
+                    ssl.SSLError('bad record mac'), http.client.IncompleteRead(b'')]
         calls, sleeps, data, error = self.run_download(failures, delays=(1,) * 5)
         self.assertIsNone(error)
         self.assertEqual((len(calls), data), (6, b'ok'))
@@ -119,7 +122,7 @@ class Download(unittest.TestCase):
                 raise http_error(504)
             Path(dest).write_bytes(b'corrupt archive')
         with tempfile.TemporaryDirectory() as temp, patch.object(cache, 'fetch', fetch), \
-                patch.object(cache.time, 'sleep') as sleep, contextlib.redirect_stderr(io.StringIO()):
+                patch.object(time, 'sleep') as sleep, contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
                 cache.install(Path(temp))
         self.assertEqual(len(attempts), 2)

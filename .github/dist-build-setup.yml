@@ -79,7 +79,7 @@
   run: |
     if ! command -v rustup >/dev/null 2>&1; then
       if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain none -y
+        curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused -sSf https://sh.rustup.rs | sh -s -- --default-toolchain none -y
       fi
       echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       export PATH="$HOME/.cargo/bin:$PATH"

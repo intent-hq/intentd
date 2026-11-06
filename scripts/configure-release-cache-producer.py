@@ -74,7 +74,7 @@ def cache_steps(flavor, target, runner, builds):
 def generate():
     config = tomllib.loads((ROOT / 'dist-workspace.toml').read_text())['dist']
     version = config['cargo-dist-version']
-    install = f'curl --proto \'=https\' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v{version}/cargo-dist-installer.sh | sh'
+    install = f'curl --proto \'=https\' --tlsv1.2 --retry 5 --retry-connrefused -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v{version}/cargo-dist-installer.sh | sh'
     # Consumers append the cache setup script. Exclude that step
     # here: producers call it exactly once below.
     daemon_setup = [s for s in yaml.safe_load((ROOT / '.github/dist-build-setup.yml').read_text())
@@ -96,7 +96,8 @@ def generate():
                 'Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml', '.cargo/config*',
                 'dist-workspace.toml', '**/build.rs', '**/*.c', '**/*.cc', '**/*.cpp', '**/*.h',
                 '.github/dist-build-setup.yml',
-                'scripts/setup-sccache.py', '.github/workflows/release-cache.yml',
+                'scripts/setup-sccache.py', 'scripts/download_retry.py', 'scripts/install-dist.sh',
+                '.github/workflows/release-cache.yml',
                 '.github/workflows/release-sitter.yml', 'scripts/*release*cache*.py', 'scripts/optional-intel-release.py',
             ]},
             'workflow_dispatch': {},
@@ -124,8 +125,10 @@ echo "matrix=$(jq -c '.ci.github.artifacts_matrix' cache-plan.json)" >> "$GITHUB
                 'strategy': {'fail-fast': False, 'matrix': '${{ fromJson(needs.plan.outputs.matrix) }}'},
                 'runs-on': '${{ matrix.runner }}', 'timeout-minutes': 60,
                 'steps': [{'name': 'Enable Windows long paths', 'shell': 'bash', 'run': 'git config --global core.longpaths true'}, deepcopy(CHECKOUT), *daemon_setup,
-                          {'name': 'Install dist (Unix)', 'if': "runner.os != 'Windows'", 'shell': 'bash', 'run': '${{ matrix.install_dist.run }}'},
-                          {'name': 'Install dist (Windows)', 'if': "runner.os == 'Windows'", 'shell': 'pwsh', 'run': '${{ matrix.install_dist.run }}'},
+                          {'name': 'Install dist', 'shell': 'bash',
+                           'env': {'INSTALL_DIST_RUN': '${{ matrix.install_dist.run }}',
+                                   'INSTALL_DIST_SHELL': '${{ matrix.install_dist.shell }}'},
+                           'run': 'bash scripts/install-dist.sh'},
                           {'name': 'Install native build dependencies', 'shell': 'bash', 'run': '${{ matrix.packages_install }}'},
                           *cache_steps('daemon-dist', "${{ join(matrix.targets, ' ') }}", '${{ matrix.runner }}',
                                        [{'name': 'Build cache inputs', 'shell': 'bash',

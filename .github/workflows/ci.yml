@@ -1956,6 +1956,7 @@ jobs:
           git diff --quiet "$BASE_SHA" HEAD -- \
             scripts/prepare-acp-callback-fixture.py \
             scripts/test-prepare-acp-callback-fixture.py \
+            scripts/download_retry.py \
             scripts/changed-tests.sh \
             scripts/callback-build-scope.py \
             scripts/test-callback-build-scope.py \
@@ -2398,6 +2399,7 @@ jobs:
           python3 -B scripts/test-ci-cargo-network.py
           python3 -I -B scripts/test-release-plz-rerun.py
           python3 -B scripts/test-setup-sccache.py
+          python3 -I -B scripts/test-download-retry.py
           python3 -I -B scripts/test-coverage-storage.py
           python3 -B scripts/test-hosted-runners.py
           python3 -B scripts/test-configure-runner-routing.py
@@ -2417,7 +2419,7 @@ jobs:
           # Job-private, unmanaged install: keeps cargo-dist out of a home
           # directory that a persistent runner may share between jobs.
           dir="$RUNNER_TEMP/cargo-dist"
-          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${version}/cargo-dist-installer.sh" \
+          curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${version}/cargo-dist-installer.sh" \
             | CARGO_DIST_UNMANAGED_INSTALL="$dir" sh
           PATH="$dir:$PATH" python3 -I -B scripts/test-optional-intel-dist.py
       - name: Test local and CI caller policy
@@ -2569,7 +2571,19 @@ jobs:
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $archive = Join-Path $env:RUNNER_TEMP 'powershell-7.6.7.zip'
           $destination = Join-Path $env:RUNNER_TEMP 'powershell-7.6.7'
-          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-x64.zip' -OutFile $archive
+          # Retry a 5xx or a dropped connection, not a 4xx (intent-hq/intent#8613).
+          for ($attempt = 1; ; $attempt++) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-x64.zip' -OutFile $archive
+              break
+            } catch {
+              $response = $_.Exception.Response
+              $status = if ($response) { [int]$response.StatusCode } else { 0 }
+              if ($attempt -ge 4 -or ($status -ge 400 -and $status -lt 500)) { throw }
+              Write-Warning "PowerShell 7 download attempt $attempt failed ($($_.Exception.Message)); retrying in $(5 * $attempt)s"
+              Start-Sleep -Seconds (5 * $attempt)
+            }
+          }
           if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne 'd2f952ebdbf24386cb8923553aa58e41a846db35a6155ea04c58142a4b16dbb7') {
             throw 'PowerShell archive checksum mismatch'
           }
