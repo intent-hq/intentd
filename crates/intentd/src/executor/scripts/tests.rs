@@ -301,7 +301,13 @@ async fn ending_a_binding_or_an_agent_kills_only_its_scripts() {
 async fn dropped_output_is_reported_before_the_exit() {
     let mut f = fixture().await;
     let agent = AgentId::new();
-    // Far more than the 4 MiB queue, while the backend reads nothing.
+    // The backend reads nothing until the script has written all of its
+    // output, so the overflow does not depend on how fast the host runs it.
+    // Between the script and this test sit the machine's 4 MiB output queue,
+    // the backend link's 1024-frame event queue (each frame one terminal
+    // read of at most 8 KiB) and the loopback socket buffers (at most
+    // 10 MiB under default Linux autotuning): about 22 MiB, which 48 MB
+    // exceeds with room to spare.
     f.scripts
         .start(
             &f.link,
@@ -310,11 +316,18 @@ async fn dropped_output_is_reported_before_the_exit() {
             start(
                 &agent,
                 "p1",
-                "head -c 24000000 /dev/zero | tr '\\0' a; printf 'tail\\303'",
+                "head -c 48000000 /dev/zero | tr '\\0' a; : > written; printf 'tail\\303'",
             ),
         )
         .await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let written = f.checkout.join("written");
+    tokio::time::timeout(wait(), async {
+        while !written.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the script did not finish writing its output");
     let seen = until_exited(&mut f.head, "p1").await;
     let marker = seen
         .output
