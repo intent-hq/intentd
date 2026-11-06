@@ -2,6 +2,7 @@
 //! Intent agents through an authenticated control adapter, never the host.
 use intent_core::{nodes::LeaseOwner, Error, Result};
 
+pub mod e2b;
 pub mod journal;
 use std::{future::Future, pin::Pin};
 
