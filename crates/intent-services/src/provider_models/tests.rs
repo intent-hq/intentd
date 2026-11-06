@@ -2572,3 +2572,45 @@ fn catalog_unavailable_from_plain_text_has_no_kind() {
         Some(crate::model_catalog::ModelWarningKind::CliMissing)
     );
 }
+
+/// `cursor/list_available_models` result shape (captured from cursor-agent
+/// 2026.11.05-86047df, cut to three models; `Fast\u{200b}\u{200b}` padding
+/// as emitted).
+#[test]
+fn cursor_available_models_map_base_ids_and_clean_names() {
+    let result = json!({"models":[
+        {"value":"default","name":"Auto","configOptions":[]},
+        {"value":"grok-4.7","name":"Grok 4.7  Low Fast\u{200b}\u{200b}","configOptions":[
+            {"id":"fast","name":"Fast","category":"model_config","type":"select","currentValue":"true",
+             "options":[{"value":"false","name":"Off"},{"value":"true","name":"Fast\u{200b}\u{200b}"}]}]},
+        {"value":"claude-sonnet-4","name":"Claude Sonnet 4","configOptions":[]},
+        {"name":"no value"}
+    ]});
+    let rows = super::parse::parse_cursor_available_models(&result);
+    assert_eq!(
+        rows,
+        vec![
+            json!({ "id": "default", "name": "Auto", "provider": "cursor", "isDefault": true }),
+            json!({ "id": "grok-4.7", "name": "Grok 4.7 Low Fast", "provider": "cursor" }),
+            json!({ "id": "claude-sonnet-4", "name": "Claude Sonnet 4", "provider": "cursor" }),
+        ]
+    );
+}
+
+#[test]
+fn cursor_outcome_maps_auth_required_and_empty() {
+    let auth = super::cursor_fetch_outcome(Err(super::ProbeError::Rpc(intent_acp::JsonRpcError {
+        code: -32000,
+        message: "Authentication required".into(),
+        data: None,
+    })));
+    assert!(auth.models.is_none());
+    assert_eq!(
+        auth.warning.as_deref(),
+        Some("cursor: authentication required")
+    );
+    let empty = super::cursor_fetch_outcome(Err(super::ProbeError::Empty));
+    assert_eq!(empty.warning.as_deref(), Some("cursor: no models reported"));
+    let ok = super::cursor_fetch_outcome(Ok(vec![json!({"id":"default"})]));
+    assert_eq!(ok.models.unwrap().len(), 1);
+}

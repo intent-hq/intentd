@@ -172,6 +172,7 @@ pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFe
         "droid" => fetch_droid_models().await,
         "opencode" => fetch_opencode_models().await,
         "grok" => fetch_grok_models().await,
+        "cursor" => fetch_cursor_models_at(cursor_binary(None)).await,
         "unsloth" => fetch_unsloth_models().await,
         other => ProviderModelsFetch::unavailable(other, "no dynamic model source"),
     }
@@ -667,6 +668,50 @@ pub(crate) async fn fetch_grok_models() -> ProviderModelsFetch {
             &String::from_utf8_lossy(&output.stderr),
         ),
         Err(reason) => ProviderModelsFetch::unavailable("grok", reason),
+    }
+}
+
+/// The `cursor-agent` a launch would exec, honouring `providers.paths.cursor`.
+pub(crate) fn cursor_binary(explicit_path: Option<&str>) -> Option<PathBuf> {
+    find_provider_binary(
+        "cursor",
+        intent_providers::cursor::CURSOR_COMMAND,
+        explicit_path,
+    )
+}
+
+/// cursor: session-free ACP probe — `cursor-agent acp`, `initialize`, then
+/// `cursor/list_available_models` (no `session/new`, so no chat lands in the
+/// user's Cursor history). Signed out, the extension answers the
+/// auth-required error. Auth itself stays on `cursor-agent models`
+/// (`provider_auth`).
+pub(crate) async fn fetch_cursor_models_at(binary: Option<PathBuf>) -> ProviderModelsFetch {
+    let Some(bin) = binary else {
+        return ProviderModelsFetch::unavailable("cursor", "cursor-agent binary not found");
+    };
+    let mut cmd = AcpProbeCommand::binary(bin, vec!["acp".to_string()]);
+    for (key, value) in intent_providers::cursor::CURSOR_PLAIN_OUTPUT_ENV {
+        cmd = cmd.env(*key, *value);
+    }
+    let outcome = probe::run_acp_method_probe(
+        cmd,
+        CURSOR_LIST_MODELS_METHOD,
+        parse::parse_cursor_available_models,
+    )
+    .await;
+    cursor_fetch_outcome(outcome)
+}
+
+/// Cursor's session-free model listing extension method.
+const CURSOR_LIST_MODELS_METHOD: &str = "cursor/list_available_models";
+
+/// Map the Cursor probe onto the fetch contract (pure seam).
+fn cursor_fetch_outcome(outcome: Result<Vec<Value>, ProbeError>) -> ProviderModelsFetch {
+    match outcome {
+        Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
+            ProviderModelsFetch::unavailable("cursor", "authentication required")
+        }
+        other => finish("cursor", other),
     }
 }
 

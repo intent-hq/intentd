@@ -306,7 +306,15 @@ fn availability_for_with_npx(
         None
     } else {
         let key = provider.primary_binary_provider_id();
-        override_path(key).and_then(|p| resolve_explicit_path(key, &p))
+        override_path(key).and_then(|p| {
+            if provider.id == "cursor" {
+                let dirs = crate::cursor::CursorHostDirs::from_env(home_dir().as_deref());
+                if crate::cursor::grok_host_override_reason(&p, &dirs).is_some() {
+                    return None;
+                }
+            }
+            resolve_explicit_path(key, &p)
+        })
     };
     // The secondary binary (unsloth: the `unsloth` CLI itself) is resolved
     // with the same provider_id/command pair the daemon's managed-server
@@ -633,6 +641,30 @@ fn find_provider_binary_with_source_and_dirs(
         path,
         source: ProviderBinarySource::LocalDiscovery,
     };
+    // Cursor: explicit override, then a PATH `cursor-agent` that is not the
+    // Grok agent host, then the newest versioned install. Never a bare
+    // `agent` (crate::cursor).
+    if provider_id == "cursor" {
+        let dirs = crate::cursor::CursorHostDirs::from_env(home);
+        if let Some(path) = explicit_path {
+            if let Some(pb) = resolve_explicit_path(provider_id, path) {
+                if !crate::cursor::is_grok_agent_host_path(&pb, dirs.grok_home.as_deref()) {
+                    return Some(explicit(pb));
+                }
+                // An explicit Grok agent host is refused, never silently
+                // swapped for an auto-discovered Cursor: discovery reports
+                // the row unavailable with the reason.
+                tracing::warn!(
+                    configured_path = path.trim(),
+                    "providers.paths[\"cursor\"] points at the Grok agent host, not the Cursor CLI; refusing it"
+                );
+                return None;
+            }
+        }
+        return crate::cursor::find_cursor_auto(&dirs, || find_in_dirs(enhanced_dirs, command))
+            .map(discovered);
+    }
+
     // 1. Explicit setting wins (must be executable and absolute)
     if let Some(path) = explicit_path {
         // An Antigravity custom path is an explicit choice, including when its
@@ -1567,6 +1599,80 @@ mod find_provider_binary_tests {
                 &[path_dir.path().to_path_buf()],
             ),
             Some(managed),
+        );
+    }
+
+    /// Cursor resolves `cursor-agent` on the enhanced PATH but never a bare
+    /// `agent` (a generic name the Grok agent host channel repoints).
+    #[cfg(unix)]
+    #[test]
+    fn cursor_resolves_cursor_agent_never_bare_agent() {
+        let home = unique_temp_dir("cursor-home");
+        let bin = unique_temp_dir("cursor-bin");
+        make_executable(&bin.path().join("agent"));
+        let dirs = [bin.path().to_path_buf()];
+        assert_eq!(
+            find_provider_binary_with_home_and_dirs(
+                "cursor",
+                "cursor-agent",
+                None,
+                Some(home.path()),
+                &dirs
+            ),
+            None,
+            "a bare `agent` must never stand in for cursor-agent"
+        );
+        let cursor = bin.path().join("cursor-agent");
+        make_executable(&cursor);
+        assert_eq!(
+            find_provider_binary_with_home_and_dirs(
+                "cursor",
+                "cursor-agent",
+                None,
+                Some(home.path()),
+                &dirs
+            ),
+            Some(cursor),
+        );
+    }
+
+    /// `providers.paths.cursor` wins, except when it points at the Grok agent
+    /// host: that override is refused (no silent auto-discovery fallback).
+    #[cfg(unix)]
+    #[test]
+    fn cursor_override_wins_unless_it_is_the_grok_agent_host() {
+        let home = unique_temp_dir("cursor-override-home");
+        let versioned = home
+            .path()
+            .join(".local/share/cursor-agent/versions/2026.11.05-86047df/cursor-agent");
+        fs::create_dir_all(versioned.parent().unwrap()).unwrap();
+        make_executable(&versioned);
+        let custom = unique_temp_dir("cursor-custom");
+        let wrapper = custom.path().join("my-cursor");
+        make_executable(&wrapper);
+        assert_eq!(
+            find_provider_binary_with_home_and_dirs(
+                "cursor",
+                "cursor-agent",
+                wrapper.to_str(),
+                Some(home.path()),
+                &[],
+            ),
+            Some(wrapper),
+        );
+        let host = custom.path().join("agent-host-0.3.1-linux-x64");
+        make_executable(&host);
+        // Refused, not replaced by the auto-discovered install.
+        assert!(versioned.exists());
+        assert_eq!(
+            find_provider_binary_with_home_and_dirs(
+                "cursor",
+                "cursor-agent",
+                host.to_str(),
+                Some(home.path()),
+                &[],
+            ),
+            None,
         );
     }
 

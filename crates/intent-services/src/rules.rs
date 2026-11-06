@@ -420,6 +420,20 @@ async fn build_rtk_instruction(
     Some(rtk_instruction_line(harness, &status.subcommands))
 }
 
+/// Append the provider's prompt-only note
+/// ([`intent_providers::ProviderConfig::system_prompt_note`]; Cursor's
+/// native-subagent restriction) to an assembled prompt. Other providers'
+/// prompts are returned unchanged.
+pub(crate) fn with_provider_prompt_note(
+    prompt: String,
+    provider: &intent_providers::ProviderConfig,
+) -> String {
+    match provider.system_prompt_note {
+        Some(note) => format!("{}\n\n{note}", prompt.trim_end()),
+        None => prompt,
+    }
+}
+
 /// Assemble the effective system prompt (the **internal** injection pipeline,
 /// §18.1) in documented precedence: base-system-prompt override →
 /// specialization rules (the 3-tier resolver: agent-type override → workspace
@@ -831,6 +845,25 @@ impl<'a> RulesService<'a> {
 mod tests {
     use super::*;
     use intent_core::settings_file::AgentFeaturesSettings;
+
+    /// Cursor sessions get the prompt-only native-subagent restriction;
+    /// every other provider's prompt is unchanged.
+    #[test]
+    fn provider_prompt_note_reaches_cursor_only() {
+        let base = "## Base\n\nInstructions.\n".to_string();
+        for provider in intent_providers::ACP_PROVIDERS {
+            let out = with_provider_prompt_note(base.clone(), provider);
+            if provider.id == "cursor" {
+                assert!(out.starts_with("## Base\n\nInstructions."), "{out}");
+                assert!(
+                    out.ends_with(intent_providers::CURSOR_SUBAGENT_PROMPT_NOTE),
+                    "{out}"
+                );
+            } else {
+                assert_eq!(out, base, "{}", provider.id);
+            }
+        }
+    }
     use intent_core::Workspace;
     use intent_store::Store;
     use std::path::PathBuf;

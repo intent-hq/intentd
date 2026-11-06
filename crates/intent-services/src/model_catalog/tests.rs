@@ -603,6 +603,7 @@ fn registry_covers_dynamic_providers() {
         "droid",
         "opencode",
         "grok",
+        "cursor",
         "unsloth",
     ] {
         assert!(source_for(provider).is_some(), "{provider} not registered");
@@ -1706,4 +1707,34 @@ async fn a_changed_installed_cli_failure_is_not_served_the_old_cached_kind() {
         assert_eq!(resolved.warning.as_deref(), Some(reason));
         assert_eq!(resolved.warning_kind, Some(kind));
     }
+}
+
+/// The Cursor catalog cache key follows the resolved `cursor-agent`, so a
+/// `providers.paths.cursor` change never serves another binary's rows.
+#[cfg(unix)]
+#[test]
+fn cursor_version_key_tracks_the_resolved_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let [a, b] = ["a", "b"].map(|name| {
+        let path = dir.path().join(name).join("cursor-agent");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    });
+    let key_a = super::CursorModelSource::resolve(a.to_str()).version_key;
+    let key_b = super::CursorModelSource::resolve(b.to_str()).version_key;
+    assert!(key_a.starts_with("cursor-executable-v1:"), "{key_a}");
+    assert_ne!(key_a, key_b);
+    assert_eq!(
+        key_a,
+        super::CursorModelSource::resolve(a.to_str()).version_key
+    );
+    assert_eq!(
+        super::CursorModelSource::resolve(a.to_str())
+            .binary
+            .as_deref(),
+        Some(a.as_path())
+    );
 }

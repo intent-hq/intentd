@@ -29,6 +29,12 @@
 //! - **grok** — `grok models` parsed via
 //!   [`intent_providers::parse_grok_models_command_output`] (the exit code is
 //!   never trusted).
+//! - **cursor** — `cursor-agent models` parsed via
+//!   [`intent_providers::cursor::parse_cursor_models_command_output`]: model
+//!   rows ⇒ `true`, the explicit "Authentication required" error ⇒ `false`,
+//!   else unknown. Covers a stored login and `CURSOR_API_KEY` alike (the
+//!   stored login wins when both exist) and, unlike an ACP probe, starts no
+//!   chat in the user's Cursor history.
 //! - **pi** — ACP probe via the pinned pi-acp npx adapter, gated on the `pi`
 //!   CLI being installed: non-empty model list ⇒ `true`; an empty list or an
 //!   auth-required error ⇒ `false`; else unknown.
@@ -68,6 +74,7 @@ pub(crate) const AUTH_PROBE_PROVIDERS: &[&str] = &[
     "grok",
     "pi",
     "antigravity",
+    "cursor",
 ];
 
 /// Timeout for one CLI auth probe (`auth status` / `login status` /
@@ -158,6 +165,10 @@ impl AuthIdentity {
 struct AuthVerdict {
     authenticated: Option<bool>,
     identity: Option<AuthIdentity>,
+    /// Optional human-readable status text for the wire entry
+    /// (`statusNote`). Cursor only: says the stored login is in use when
+    /// `CURSOR_API_KEY` is also set.
+    status_note: Option<String>,
 }
 
 impl AuthVerdict {
@@ -167,6 +178,7 @@ impl AuthVerdict {
         Self {
             authenticated,
             identity: None,
+            status_note: None,
         }
     }
 }
@@ -286,6 +298,19 @@ async fn check_provider_auth_cli_with(
                 }
                 Ok(Err(_)) => CliAuthProbe::Failed,
                 Err(_) => CliAuthProbe::TimedOut,
+            }
+        }
+        "cursor" => {
+            let mut cmd = probe_command(program);
+            cmd.args(auth_check_args);
+            match crate::cursor_cli::run_cursor_cli(cmd, CLI_AUTH_TIMEOUT).await {
+                Some(output) if could_not_run(output.status) => CliAuthProbe::Failed,
+                Some(output) => cursor_probe_outcome(
+                    &String::from_utf8_lossy(&output.stdout),
+                    &String::from_utf8_lossy(&output.stderr),
+                    output.status.success(),
+                ),
+                None => CliAuthProbe::TimedOut,
             }
         }
         "opencode" => {
@@ -499,6 +524,54 @@ fn grok_probe_outcome(
     }
 }
 
+/// Map one `cursor-agent models` run to a probe outcome. Never log the
+/// output: it lists the account's models.
+fn cursor_probe_outcome(stdout: &str, stderr: &str, exit_success: bool) -> CliAuthProbe {
+    let parsed =
+        intent_providers::cursor::parse_cursor_models_command_output(stdout, stderr, exit_success);
+    match parsed.authenticated {
+        Some(true) => CliAuthProbe::Authenticated,
+        Some(false) => CliAuthProbe::NotAuthenticated,
+        None if exit_success => CliAuthProbe::StatusUnknown,
+        None => CliAuthProbe::Failed,
+    }
+}
+
+/// Signed-in Cursor status text when both credentials exist.
+pub(crate) const CURSOR_STORED_LOGIN_IN_USE_NOTE: &str =
+    "Using the stored Cursor login. CURSOR_API_KEY is also set; Cursor uses the stored login while it exists.";
+
+/// The Cursor `statusNote` for a signed-in account: when `CURSOR_API_KEY`
+/// reaches the CLI (daemon env or captured login-shell env) and `cursor-agent
+/// status --format json` reports a stored access token, say the stored login
+/// is in use. Any probe failure omits the note.
+async fn cursor_stored_login_note(program: &OsStr) -> Option<String> {
+    let captured = captured_credential_env().await;
+    let key_present = std::env::var_os("CURSOR_API_KEY").is_some_and(|v| !v.is_empty())
+        || captured
+            .get("CURSOR_API_KEY")
+            .is_some_and(|v| !v.is_empty());
+    if !key_present {
+        return None;
+    }
+    let mut cmd = probe_command(program);
+    gap_fill_credentials(&mut cmd, captured);
+    cmd.args(["status", "--format", "json"]);
+    let output = crate::cursor_cli::run_cursor_cli(cmd, CLI_AUTH_TIMEOUT).await?;
+    cursor_status_note(true, &String::from_utf8_lossy(&output.stdout))
+}
+
+/// Pure seam for [`cursor_stored_login_note`]: a note only when the key is
+/// present and the status JSON reports a stored access token. Never log the
+/// payload (it carries the account email).
+fn cursor_status_note(key_present: bool, status_json: &str) -> Option<String> {
+    let stored = serde_json::from_str::<Value>(&intent_providers::cursor::strip_ansi(status_json))
+        .ok()?
+        .get("hasAccessToken")
+        .and_then(Value::as_bool)?;
+    (key_present && stored).then(|| CURSOR_STORED_LOGIN_IN_USE_NOTE.to_string())
+}
+
 /// Timeout for the opencode readiness probe (`opencode models` can be slower
 /// than a simple auth-file read; parity with the FE's 10s budget).
 const OPENCODE_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -554,6 +627,24 @@ async fn probe_provider(
         .as_ref()
         .map_or(program, |c| c.runtime.path().as_os_str().to_owned());
     match provider_id {
+        "cursor" => {
+            let args = intent_providers::find_provider(provider_id)
+                .and_then(|cfg| cfg.auth_check_args)
+                .unwrap_or_default();
+            let authenticated = check_provider_auth_cli_in(provider_id, &program, args, None)
+                .await
+                .auth_status();
+            let status_note = if authenticated == Some(true) {
+                cursor_stored_login_note(&program).await
+            } else {
+                None
+            };
+            AuthVerdict {
+                authenticated,
+                identity: None,
+                status_note,
+            }
+        }
         "auggie" | "codex" | "opencode" | "grok" => {
             let args = intent_providers::find_provider(provider_id)
                 .and_then(|cfg| cfg.auth_check_args)
@@ -586,6 +677,7 @@ async fn probe_provider(
             AuthVerdict {
                 authenticated,
                 identity: status.identity,
+                status_note: None,
             }
         }
         "droid" => {
@@ -691,6 +783,7 @@ fn resolve_probe_binary(
         "grok" => "grok",
         "pi" => "pi",
         "antigravity" => "antigravity-acp",
+        "cursor" => intent_providers::cursor::CURSOR_COMMAND,
         _ => return None,
     };
     let override_applies =
@@ -805,12 +898,13 @@ impl AuthStatusCache {
     fn promote(&self, provider_id: &str) {
         let mut demotions = self.demotions.lock().expect("auth demotions poisoned");
         *demotions.entry(provider_id.to_owned()).or_insert(0) += 1;
-        let identity = self.fresh(provider_id).and_then(|verdict| verdict.identity);
+        let prior = self.fresh(provider_id);
         self.store(
             provider_id,
             AuthVerdict {
                 authenticated: Some(true),
-                identity,
+                identity: prior.as_ref().and_then(|verdict| verdict.identity.clone()),
+                status_note: prior.and_then(|verdict| verdict.status_note),
             },
         );
     }
@@ -895,17 +989,26 @@ pub(crate) fn not_authenticated_message(provider_id: &str) -> String {
     let display = intent_providers::provider_config(provider_id).display_name;
     let login_cmd =
         intent_providers::login_command(intent_providers::base_provider_id(provider_id));
-    let caveat = if intent_providers::base_provider_id(provider_id) == "claude-code" {
-        " Note: signing into the Claude desktop app does not carry over to the CLI — run \
-         \"claude\" in a terminal, then \"/login\"."
-    } else {
-        ""
+    let caveat = match intent_providers::base_provider_id(provider_id) {
+        "claude-code" => {
+            " Note: signing into the Claude desktop app does not carry over to the CLI — run \
+             \"claude\" in a terminal, then \"/login\"."
+        }
+        "cursor" => CURSOR_CREDENTIALS_NOTE,
+        _ => "",
     };
     format!(
         "provider \"{provider_id}\" ({display}) is not authenticated — run \
          \"{login_cmd}\" in a terminal, then retry.{caveat}"
     )
 }
+
+/// How Cursor picks credentials, appended to its not-authenticated message:
+/// `cursor-agent` also accepts `CURSOR_API_KEY`, but a stored login wins
+/// over the key when both exist.
+pub(crate) const CURSOR_CREDENTIALS_NOTE: &str =
+    " Cursor also accepts a CURSOR_API_KEY in the daemon's environment; when both exist, \
+     the stored \"cursor-agent login\" wins over the key.";
 
 /// Demote one provider's cached auth verdict to a hard `false` after the
 /// runtime observed an authoritative auth-required error from its adapter
@@ -1195,6 +1298,9 @@ fn auth_status_entry(id: &str, verdict: &AuthVerdict) -> Value {
     if let Some(identity) = &verdict.identity {
         entry["identity"] = identity.to_json();
     }
+    if let Some(note) = &verdict.status_note {
+        entry["statusNote"] = json!(note);
+    }
     entry
 }
 
@@ -1269,6 +1375,78 @@ mod tests {
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
             let probe =
                 check_provider_auth_cli("auggie", stub.as_os_str(), &["token", "print"]).await;
+            assert_eq!(probe, expected, "stub {name}");
+        }
+    }
+
+    /// `cursor-agent models` decides Cursor auth from its output: model rows
+    /// (stored login, or `CURSOR_API_KEY` alone) ⇒ authenticated; the
+    /// explicit "Authentication required" error ⇒ not authenticated; a run
+    /// that listed nothing is unknown, a crash is a failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_probe_parses_models_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir("cursor-models");
+        let args = intent_providers::find_provider("cursor")
+            .unwrap()
+            .auth_check_args
+            .unwrap();
+        assert_eq!(args, &["models"]);
+        let signed_in = "printf 'Available models\\n\\nauto - Auto (current, default)\\ngpt-5.2 - GPT-5.2\\n'; exit 0";
+        let signed_out = "echo \"Error: Authentication required. Run 'agent login', pass --api-key/--auth-token, or set CURSOR_API_KEY/CURSOR_AUTH_TOKEN.\" >&2; exit 1";
+        let key_only =
+            format!("if [ -n \"$CURSOR_API_KEY\" ]; then {signed_in}; else {signed_out}; fi");
+        for (name, body, captured, expected) in [
+            (
+                "signed-in",
+                signed_in.to_string(),
+                None,
+                CliAuthProbe::Authenticated,
+            ),
+            (
+                "signed-out",
+                signed_out.to_string(),
+                None,
+                CliAuthProbe::NotAuthenticated,
+            ),
+            (
+                "empty",
+                "printf 'Available models\\n'; exit 0".into(),
+                None,
+                CliAuthProbe::StatusUnknown,
+            ),
+            (
+                "crash",
+                "echo boom >&2; exit 3".into(),
+                None,
+                CliAuthProbe::Failed,
+            ),
+            (
+                "key-only-without-key",
+                key_only.clone(),
+                None,
+                CliAuthProbe::NotAuthenticated,
+            ),
+            (
+                "key-only-with-key",
+                key_only,
+                Some("crsr-test-key"),
+                CliAuthProbe::Authenticated,
+            ),
+        ] {
+            let stub = dir.path().join(name);
+            std::fs::write(&stub, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if std::env::var_os("CURSOR_API_KEY").is_some() && captured.is_none() {
+                continue;
+            }
+            let captured: std::collections::BTreeMap<String, String> = captured
+                .map(|key| [("CURSOR_API_KEY".to_string(), key.to_string())].into())
+                .unwrap_or_default();
+            let probe =
+                check_provider_auth_cli_with("cursor", stub.as_os_str(), args, None, &captured)
+                    .await;
             assert_eq!(probe, expected, "stub {name}");
         }
     }
@@ -1838,7 +2016,7 @@ while IFS= read -r unexpected; do exit 95; done
     /// A provider without a sign-in probe is unknown and never cached.
     #[tokio::test]
     async fn default_sign_in_without_a_probe_is_unknown() {
-        for id in ["mock", "cursor", "not-a-provider"] {
+        for id in ["mock", "unsloth", "not-a-provider"] {
             assert_eq!(
                 default_sign_in(id, None).await,
                 DefaultSignIn::default(),
@@ -1928,7 +2106,7 @@ while IFS= read -r unexpected; do exit 95; done
     #[test]
     fn valid_override_resolves_install_gate() {
         let dir = unique_temp_dir("valid-override");
-        for provider in ["droid", "antigravity"] {
+        for provider in ["droid", "antigravity", "cursor"] {
             let bin = dir.path().join(provider);
             make_executable(&bin);
             let resolved = resolve_probe_binary(provider, Some(bin.to_str().unwrap()));
@@ -2135,6 +2313,7 @@ while IFS= read -r unexpected; do exit 95; done
                         org_name: Some("Old Org".into()),
                         subscription_type: Some("max".into()),
                     }),
+                    status_note: None,
                 },
             ),
         );
@@ -2163,6 +2342,7 @@ while IFS= read -r unexpected; do exit 95; done
             AuthVerdict {
                 authenticated: Some(true),
                 identity: Some(identity.clone()),
+                status_note: None,
             },
         );
         cache().demote("test-identity-demote");
@@ -2176,6 +2356,7 @@ while IFS= read -r unexpected; do exit 95; done
             AuthVerdict {
                 authenticated: Some(false),
                 identity: Some(identity.clone()),
+                status_note: None,
             },
         );
         cache().promote("test-identity-promote");
@@ -2184,8 +2365,42 @@ while IFS= read -r unexpected; do exit 95; done
             Some(AuthVerdict {
                 authenticated: Some(true),
                 identity: Some(identity),
+                status_note: None,
             })
         );
+    }
+
+    /// Mixed Cursor credentials: with `CURSOR_API_KEY` set and a stored
+    /// login (`status --format json` → `hasAccessToken: true`), the signed-in
+    /// entry says the stored login is in use; otherwise no note.
+    #[test]
+    fn cursor_status_note_names_the_stored_login_only_in_the_mixed_case() {
+        let stored = r#"{"status":"authenticated","isAuthenticated":true,"hasAccessToken":true,"hasRefreshToken":true}"#;
+        let key_only =
+            r#"{"status":"authenticated","isAuthenticated":true,"hasAccessToken":false}"#;
+        assert_eq!(
+            cursor_status_note(true, stored).as_deref(),
+            Some(CURSOR_STORED_LOGIN_IN_USE_NOTE)
+        );
+        assert_eq!(cursor_status_note(false, stored), None);
+        assert_eq!(cursor_status_note(true, key_only), None);
+        assert_eq!(cursor_status_note(true, "not json"), None);
+        let entry = auth_status_entry(
+            "cursor",
+            &AuthVerdict {
+                authenticated: Some(true),
+                identity: None,
+                status_note: cursor_status_note(true, stored),
+            },
+        );
+        assert_eq!(
+            entry,
+            json!({ "id": "cursor", "authenticated": true, "statusNote": CURSOR_STORED_LOGIN_IN_USE_NOTE })
+        );
+        assert!(entry["statusNote"]
+            .as_str()
+            .unwrap()
+            .contains("stored Cursor login"));
     }
 
     /// The wire entry carries the additive `identity` object only when the
@@ -2205,6 +2420,7 @@ while IFS= read -r unexpected; do exit 95; done
                 org_name: None,
                 subscription_type: None,
             }),
+            status_note: None,
         };
         assert_eq!(
             auth_status_entry("claude-code", &partial),
@@ -2237,6 +2453,12 @@ while IFS= read -r unexpected; do exit 95; done
             "{droid}"
         );
         assert!(!droid.contains("desktop app"), "{droid}");
+        assert!(!droid.contains("CURSOR_API_KEY"), "{droid}");
+
+        let cursor = not_authenticated_message("cursor");
+        assert!(cursor.contains("\"cursor-agent login\""), "{cursor}");
+        assert!(cursor.contains("CURSOR_API_KEY"), "{cursor}");
+        assert!(cursor.contains("stored"), "{cursor}");
     }
 
     // -----------------------------------------------------------------------

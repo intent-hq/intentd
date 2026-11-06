@@ -558,6 +558,36 @@ pub(super) fn grok_wire_rows(models: &[intent_providers::GrokModel]) -> Vec<Valu
         .collect()
 }
 
+/// Map a `cursor/list_available_models` result (`{ models: [{ value, name,
+/// configOptions }] }`) onto wire rows: id = the base model (`value`),
+/// name with Cursor's zero-width padding stripped, `default` (Auto) marked
+/// `isDefault`. Rows without a value are dropped.
+pub(super) fn parse_cursor_available_models(result: &Value) -> Vec<Value> {
+    result
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = m.get("value").and_then(Value::as_str)?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let name = m
+                .get("name")
+                .and_then(Value::as_str)
+                .map(intent_providers::cursor::clean_display_text)
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| id.to_string());
+            let mut row = wire_row(id, &name, "cursor", None);
+            if id == intent_providers::cursor::CURSOR_AUTO_MODEL {
+                row["isDefault"] = json!(true);
+            }
+            Some(row)
+        })
+        .collect()
+}
+
 /// FE `formatModelLabel` parity: hyphens become spaces and each word is
 /// capitalized (`claude-sonnet-4` → `Claude Sonnet 4`).
 fn title_case_model(model_id: &str) -> String {

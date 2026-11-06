@@ -8957,9 +8957,20 @@ impl Services {
                     .map(String::as_str),
             )
         });
+        let cursor = (source.provider_id == "cursor").then(|| {
+            crate::model_catalog::CursorModelSource::resolve(
+                self.effective_settings()
+                    .providers
+                    .paths
+                    .get("cursor")
+                    .map(String::as_str),
+            )
+        });
         let version_key = antigravity
             .as_ref()
-            .map_or_else(|| (source.version_key)(), |s| s.version_key.clone());
+            .map(|s| s.version_key.clone())
+            .or_else(|| cursor.as_ref().map(|s| s.version_key.clone()))
+            .unwrap_or_else(|| (source.version_key)());
         let resolved = if intent_providers::installed_cli::InstalledCli::for_provider(&provider_id)
             .is_some()
         {
@@ -8990,6 +9001,12 @@ impl Services {
                                     antigravity.binary,
                                 )
                                 .await,
+                            )
+                        })
+                    } else if let Some(cursor) = cursor {
+                        Box::pin(async move {
+                            crate::model_catalog::from_provider_fetch(
+                                crate::provider_models::fetch_cursor_models_at(cursor.binary).await,
                             )
                         })
                     } else {

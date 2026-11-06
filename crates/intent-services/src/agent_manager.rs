@@ -3822,6 +3822,29 @@ impl AgentManager {
                 .map_err(|e| Error::Internal(format!("pi CLI probe task failed: {e}")))?;
             crate::pi_cli::check_pi_cli_for_spawn(&status)?;
         }
+        // Refuse the Grok agent host channel posing as `cursor-agent` (its
+        // `--version` answers `grok …`). Blocking probe (≤3s), off the runtime.
+        if opts.provider.id == "cursor" {
+            // A `providers.paths.cursor` override that is the Grok agent host
+            // is refused with the discovery row's reason — never replaced by
+            // another `cursor-agent` found on PATH.
+            let override_path = self
+                .services
+                .effective_settings()
+                .providers
+                .paths
+                .get("cursor")
+                .cloned();
+            crate::cursor_cli::check_cursor_override_for_spawn(override_path.as_deref())?;
+            let binary = opts.provider_binary.map(Path::to_path_buf);
+            let status = tokio::task::spawn_blocking(move || match binary {
+                Some(path) => crate::cursor_cli::probe_cursor_cli_at(Some(path)),
+                None => crate::cursor_cli::probe_cursor_cli(override_path.as_deref()),
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("Cursor CLI probe task failed: {e}")))?;
+            crate::cursor_cli::check_cursor_cli_for_spawn(&status)?;
+        }
         let pi_extension = pi_extension_delivery(opts.provider, &config_dir)?;
 
         // For providers that consume MCP servers from the ACP session setup
@@ -3900,6 +3923,7 @@ impl AgentManager {
             )
             .await
             {
+                let prompt = crate::rules::with_provider_prompt_note(prompt, opts.provider);
                 let path = config_dir.join(format!("intentd-rules-{}.md", Uuid::new_v4()));
                 std::fs::write(&path, prompt.as_bytes())
                     .map_err(|e| Error::Internal(format!("write rules file failed: {e}")))?;
@@ -4079,6 +4103,7 @@ impl AgentManager {
                 self.sink.clone(),
             )
             .with_terminal_host(terminal_host)
+            .with_auto_allow_once(opts.provider.auto_allow_once)
             // Commands the daemon runs for the agent (ACP `terminal/create`)
             // share the agent process's private temp folder.
             .with_terminal_env_defaults(agent_tmp_env(agent_tmp_dir.as_ref())),
@@ -4777,6 +4802,7 @@ impl AgentManager {
                         provider,
                         &opened.session_id,
                         stored_model.as_deref(),
+                        opened.config_options.as_ref(),
                     )
                 })
                 .await?;
@@ -4860,6 +4886,7 @@ impl AgentManager {
                         provider,
                         &prepared.response.session_id.0,
                         stored_model.as_deref(),
+                        None,
                     )
                     .await?;
                 let candidate = prepared.response.session_id.0.to_string();
@@ -4999,6 +5026,7 @@ impl AgentManager {
                     provider,
                     &opened.session_id,
                     stored_model.as_deref(),
+                    opened.config_options.as_ref(),
                 )
             })
             .await?;
@@ -5077,6 +5105,7 @@ impl AgentManager {
                 provider,
                 &opened.session_id,
                 stored_model.as_deref(),
+                opened.config_options.as_ref(),
             )
         })
         .await?;
@@ -5436,7 +5465,19 @@ impl AgentManager {
         provider: &ProviderConfig,
         acp_session_id: &str,
         stored_model: Option<&str>,
+        advertised_options: Option<&Value>,
     ) -> Result<Option<Value>> {
+        if provider.id == "cursor" {
+            return self
+                .apply_cursor_session_model(
+                    conn,
+                    agent_id,
+                    acp_session_id,
+                    stored_model,
+                    advertised_options,
+                )
+                .await;
+        }
         if provider.id == "antigravity" {
             intent_acp::handshake::set_session_mode(conn, acp_session_id, "default")
                 .await
@@ -5546,6 +5587,57 @@ impl AgentManager {
             }
         }
         Ok(None)
+    }
+
+    /// Cursor: map the stored base model (`cursor/list_available_models`
+    /// ids; `default` = Auto) onto this session's own `model` option variant
+    /// and apply it with `session/set_config_option`. No stored model applies
+    /// Auto (skipped only when the session offers no Auto option). A model the session does not offer,
+    /// or one Cursor rejects, fails setup with an actionable error before
+    /// any prompt is sent. Cursor also saves the applied model as the
+    /// user's CLI default (accepted product behavior).
+    async fn apply_cursor_session_model(
+        &self,
+        conn: &Connection,
+        agent_id: &AgentId,
+        acp_session_id: &str,
+        stored_model: Option<&str>,
+        advertised_options: Option<&Value>,
+    ) -> Result<Option<Value>> {
+        let explicit = stored_model
+            .map(|m| m.strip_prefix("cursor:").unwrap_or(m).trim())
+            .filter(|m| !m.is_empty());
+        // No stored model means Auto, not whatever the user's Cursor CLI
+        // default became after an earlier pick (every applied pick is saved
+        // as that default), so API and delegated agents never inherit it.
+        let pick = explicit.unwrap_or(intent_providers::cursor::CURSOR_AUTO_MODEL);
+        let Some(value) = advertised_options.and_then(|options| {
+            intent_providers::cursor::cursor_session_model_value(options, pick)
+        }) else {
+            if explicit.is_none() {
+                return Ok(None);
+            }
+            self.kill_child_only(agent_id).await;
+            return Err(Error::InvalidInput(format!(
+                "Cursor does not offer model '{pick}' for this account. Refresh the Cursor model list and pick an available model; no prompt was sent."
+            )));
+        };
+        match intent_acp::session::set_session_config_option_response(
+            conn,
+            acp_session_id,
+            "model",
+            &value,
+        )
+        .await
+        {
+            Ok(response) => Ok(Some(response)),
+            Err(error) => {
+                self.kill_child_only(agent_id).await;
+                Err(Error::InvalidInput(format!(
+                    "Cursor rejected model '{pick}' ({value}): {error}. Refresh the Cursor model list and pick another model; no prompt was sent."
+                )))
+            }
+        }
     }
 
     /// Resolve the model id `maybe_apply_session_model` should send via
@@ -12497,7 +12589,13 @@ impl AgentManager {
         else {
             return Ok(());
         };
-        let mut prompt = prompt;
+        let mut prompt =
+            match session.provider.as_deref().and_then(|p| {
+                intent_providers::find_provider(intent_providers::base_provider_id(p))
+            }) {
+                Some(provider) => crate::rules::with_provider_prompt_note(prompt, provider),
+                None => prompt,
+            };
         if let Some(notice) = self
             .services
             .feature_remote_launch_port()
@@ -21422,6 +21520,7 @@ mod role_reminder_tests {
                     intent_providers::provider_config("antigravity"),
                     "candidate",
                     Some("model-a"),
+                    None,
                 )
                 .await
                 .unwrap_err();
@@ -21537,6 +21636,7 @@ mod role_reminder_tests {
                     intent_providers::find_provider(provider_id).unwrap(),
                     "sid",
                     Some(model),
+                    None,
                 ),
             )
             .await

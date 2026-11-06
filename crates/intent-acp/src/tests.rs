@@ -187,6 +187,51 @@ async fn structured_notices_are_negotiated_with_and_without_callbacks() {
     }
 }
 
+/// Cursor turns on native subagents when `clientCapabilities.subagents` or
+/// `clientCapabilities._meta.subagents` is present, and switches its model
+/// option to a parameterized picker on `_meta.parameterizedModelPicker`.
+/// Neither may be advertised, under any callback/monitoring offer, and the
+/// handshake must never send `authenticate` (Cursor's `cursor_login` starts
+/// a browser login on a signed-out host).
+#[tokio::test]
+async fn cursor_initialize_advertises_no_subagents_or_model_picker_and_skips_authenticate() {
+    use crate::callback_registration::CallbackOffer;
+    use crate::review_monitoring::ReviewMonitoringOffer;
+    let cursor = intent_providers::find_provider("cursor").unwrap();
+    for (offer, monitoring) in [
+        (CallbackOffer::Disabled, ReviewMonitoringOffer::Disabled),
+        (CallbackOffer::V1, ReviewMonitoringOffer::Disabled),
+        (CallbackOffer::V1, ReviewMonitoringOffer::V1),
+    ] {
+        let (conn, responder, _stderr) = connect_mock(ConnectionHooks::default());
+        let result = crate::handshake::handshake_with_review_monitoring(
+            std::sync::Arc::new(conn),
+            cursor,
+            offer,
+            monitoring,
+        )
+        .await
+        .unwrap();
+        assert!(!result.ordinary.authenticated);
+        drop(result);
+        let seen = responder.await.unwrap();
+        assert!(
+            seen.iter().all(|frame| frame["method"] != "authenticate"),
+            "{seen:?}"
+        );
+        let caps = &seen[0]["params"]["clientCapabilities"];
+        assert!(caps.get("subagents").is_none(), "{caps}");
+        let meta = caps.get("_meta").cloned().unwrap_or_else(|| json!({}));
+        assert!(meta.get("subagents").is_none(), "{meta}");
+        assert!(meta.get("parameterizedModelPicker").is_none(), "{meta}");
+        let text = caps.to_string();
+        assert!(
+            !text.contains("subagents") && !text.contains("parameterizedModelPicker"),
+            "{text}"
+        );
+    }
+}
+
 #[test]
 fn structured_notices_are_consumed_without_becoming_chunks() {
     for severity in ["info", "warning", "error", "_custom"] {
@@ -4221,6 +4266,139 @@ mod client_served_tests {
         assert!(sink
             .types()
             .contains(&"agent:permission:request".to_string()));
+    }
+
+    /// Cursor's own permission request shape (cursor-agent 2026.11.05-86047df):
+    /// `allow-always` first would persist an allowlist entry in the user's
+    /// Cursor config, so it is deliberately listed ahead of `allow-once` here.
+    fn cursor_permission_params() -> Value {
+        json!({
+            "sessionId": "s1",
+            "toolCall": { "toolCallId": "tc-1", "title": "Run git status", "kind": "execute", "status": "pending" },
+            "options": [
+                { "optionId": "allow-always", "name": "Allow always", "kind": "allow_always" },
+                { "optionId": "allow-once", "name": "Allow once", "kind": "allow_once" },
+                { "optionId": "reject-once", "name": "Reject", "kind": "reject_once" }
+            ]
+        })
+    }
+
+    /// With `auto_allow_once`, an auto-approved prompt answers `allow-once`;
+    /// without it the legacy first-non-destructive pick is unchanged.
+    #[tokio::test]
+    async fn auto_allow_once_selects_the_allow_once_option() {
+        for (allow_once, expected) in [(true, "allow-once"), (false, "allow-always")] {
+            let root = temp_dir();
+            let sink = Arc::new(MockSink::default());
+            let (handler, _reg) = build_handler(
+                root.path(),
+                PermissionPolicy::AllowAll,
+                sink.clone(),
+                PermissionRegistry::new(),
+            );
+            let handler = handler.with_auto_allow_once(allow_once);
+            let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+            let req = send(
+                &mut writer,
+                &mut req_rx,
+                11,
+                "session/request_permission",
+                cursor_permission_params(),
+            )
+            .await;
+            handler.serve(&conn, req).await.unwrap();
+            let resp = read_frame(&mut reader).await;
+            assert_eq!(resp["result"]["outcome"]["outcome"], json!("selected"));
+            assert_eq!(resp["result"]["outcome"]["optionId"], json!(expected));
+        }
+    }
+
+    /// Denials keep picking the reject option even with `auto_allow_once`.
+    #[tokio::test]
+    async fn auto_allow_once_does_not_change_denials() {
+        let root = temp_dir();
+        let (handler, _reg) = build_handler(
+            root.path(),
+            PermissionPolicy::DenyAll,
+            Arc::new(MockSink::default()),
+            PermissionRegistry::new(),
+        );
+        let handler = handler.with_auto_allow_once(true);
+        let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+        let req = send(
+            &mut writer,
+            &mut req_rx,
+            12,
+            "session/request_permission",
+            cursor_permission_params(),
+        )
+        .await;
+        handler.serve(&conn, req).await.unwrap();
+        let resp = read_frame(&mut reader).await;
+        assert_eq!(resp["result"]["outcome"]["optionId"], json!("reject-once"));
+    }
+
+    /// `cursor/ask_question` (params carry no sessionId) is answered with the
+    /// skipped outcome, never `method not found`, under every policy.
+    #[tokio::test]
+    async fn cursor_ask_question_is_answered_skipped() {
+        for policy in [PermissionPolicy::Interactive, PermissionPolicy::AllowAll] {
+            let root = temp_dir();
+            let sink = Arc::new(MockSink::default());
+            let (handler, _reg) =
+                build_handler(root.path(), policy, sink.clone(), PermissionRegistry::new());
+            let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+            let req = send(
+                &mut writer,
+                &mut req_rx,
+                13,
+                crate::CURSOR_ASK_QUESTION_METHOD,
+                json!({
+                    "toolCallId": "ask-1",
+                    "title": "Pick a framework",
+                    "questions": [{
+                        "id": "q1", "prompt": "Which one?", "allowMultiple": false,
+                        "options": [{ "id": "a", "label": "React" }, { "id": "b", "label": "Svelte" }]
+                    }]
+                }),
+            )
+            .await;
+            handler.serve(&conn, req).await.unwrap();
+            let resp = read_frame(&mut reader).await;
+            assert!(resp.get("error").is_none(), "{resp}");
+            assert_eq!(resp["id"], json!(13));
+            assert_eq!(resp["result"]["outcome"]["outcome"], json!("skipped"));
+            assert!(resp["result"]["outcome"]["reason"].is_string());
+            assert!(sink.types().is_empty(), "no permission prompt is raised");
+        }
+    }
+
+    /// `cursor/task` (captured: sent after a native Task tool call) gets an
+    /// empty success result, not `method not found`.
+    #[tokio::test]
+    async fn cursor_task_report_is_acknowledged_with_an_empty_result() {
+        let root = temp_dir();
+        let sink = Arc::new(MockSink::default());
+        let (handler, _reg) = build_handler(
+            root.path(),
+            PermissionPolicy::AllowAll,
+            sink.clone(),
+            PermissionRegistry::new(),
+        );
+        let (conn, mut req_rx, mut writer, mut reader) = connect_handler();
+        let req = send(
+            &mut writer,
+            &mut req_rx,
+            14,
+            crate::CURSOR_TASK_METHOD,
+            json!({"toolCallId":"call-27e9fb5d-2f35-4699-83db-5f3c01ce559a-3\nfc_93650954-f819-9d9f-9e36-f87a8cad6bd7_0","description":"Reply with HELLO","prompt":"Your only job is to reply with exactly the word HELLO and nothing else. Do not call any tools. Do not add punctuation or explanation.","subagentType":"unspecified","model":"default","agentId":"29a69723-caee-4eb1-ae48-1b5141dea32b","durationMs":1473}),
+        )
+        .await;
+        handler.serve(&conn, req).await.unwrap();
+        let resp = read_frame(&mut reader).await;
+        assert!(resp.get("error").is_none(), "{resp}");
+        assert_eq!(resp["result"], json!({}));
+        assert!(sink.types().is_empty());
     }
 
     #[tokio::test]
@@ -15776,5 +15954,210 @@ mod app_navigation_sender_tests {
                 .contains("only available in the Assistant workspace"));
         }
         assert!(api.events.lock().unwrap().is_empty());
+    }
+}
+
+/// Cursor tool-call frames. The MCP, Task and shell frames are copied
+/// verbatim from captured cursor-agent 2026.11.05-86047df traffic (spike
+/// transcripts); edit/read/grep/glob/search shapes follow that build's
+/// `summarizeToolCall` / `extractToolCallInput` (not observed live).
+mod cursor_tool_mapping {
+    use crate::session::{self, MappedUpdate};
+    use agent_client_protocol::schema::v1::SessionNotification;
+    use serde_json::{json, Value};
+
+    fn map(update: &Value) -> (String, &'static str, Value, String) {
+        let note: SessionNotification =
+            serde_json::from_value(json!({ "sessionId": "s", "update": update })).unwrap();
+        let MappedUpdate::ToolCall(mut tc) = session::map_session_update(&note.update).unwrap()
+        else {
+            panic!("expected a tool call");
+        };
+        session::apply_cursor_tool_names(&mut tc);
+        (tc.tool_name, tc.tool_kind, tc.input, tc.tool_call_id)
+    }
+
+    #[test]
+    fn mcp_call_unwraps_server_and_tool_and_keeps_newline_ids_opaque() {
+        let id = "call-319b6c00-0bab-4561-a905-9e27aefbeb53-1\nfc_56615f74-5643-917a-ac9f-479d2fe25945_0";
+        let (name, kind, input, call_id) = map(
+            &json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":"intent-workspace: intent_ping","rawInput":{"providerIdentifier":"intent-workspace","toolName":"intent_ping","args":{}}}),
+        );
+        assert_eq!(name, "intent-workspace_intent_ping");
+        assert_eq!(kind, "other");
+        assert_eq!(input, json!({}));
+        assert_eq!(call_id, id);
+        let (name, _, input, _) = map(
+            &json!({"sessionUpdate":"tool_call","toolCallId":"replay-0-4","title":"workspace-mcp: workspace_api","kind":"other","status":"pending","rawInput":{"providerIdentifier":"workspace-mcp","toolName":"workspace_api","args":{"code":"return 1","summary":"probe"}}}),
+        );
+        assert_eq!(name, "workspace_api");
+        assert_eq!(input, json!({"code":"return 1","summary":"probe"}));
+    }
+
+    #[test]
+    fn shell_task_and_native_tools_get_names_and_kinds() {
+        let (name, kind, _, _) = map(
+            &json!({"sessionUpdate":"tool_call","toolCallId":"call-29f616b7-902c-482c-930d-030b5dc8add1-0\nfc_b4d77170-841c-9ece-ab40-6899e8653b27_0","title":"`sleep 47 && echo finished-sleep`","kind":"execute","status":"pending","rawInput":{"command":"sleep 47 && echo finished-sleep"}}),
+        );
+        assert_eq!((name.as_str(), kind), ("bash", "terminal"));
+        let (name, kind, _, _) = map(
+            &json!({"sessionUpdate":"tool_call","toolCallId":"call-d5f81713-ef9b-4563-81e1-9fccb289dc3b-0\nfc_4488f13b-7cc1-9ba7-9fe8-679b98c595e1_0","title":"`git status --short | head -5; echo \"EXIT:$?\"`","kind":"execute","status":"pending","rawInput":{"command":"git status --short | head -5; echo \"EXIT:$?\""}}),
+        );
+        assert_eq!((name.as_str(), kind), ("bash", "terminal"));
+        let (name, kind, _, _) = map(
+            &json!({"sessionUpdate":"tool_call","toolCallId":"call-27e9fb5d-2f35-4699-83db-5f3c01ce559a-3\nfc_93650954-f819-9d9f-9e36-f87a8cad6bd7_0","title":"Task: Reply with HELLO","kind":"other","status":"pending","rawInput":{"_toolName":"task","prompt":"Your only job is to reply with exactly the word HELLO and nothing else. Do not call any tools. Do not add punctuation or explanation.","description":"Reply with HELLO"}}),
+        );
+        assert_eq!((name.as_str(), kind), ("Subagent", "other"));
+        for (title, acp_kind, raw, expected_name, expected_kind) in [
+            (
+                "Edit `src/main.rs`",
+                "edit",
+                json!({"path":"src/main.rs"}),
+                "edit",
+                "file",
+            ),
+            (
+                "Read src/lib.rs (1 - 40)",
+                "read",
+                json!({"path":"src/lib.rs"}),
+                "read",
+                "file",
+            ),
+            (
+                "Delete `old.txt`",
+                "delete",
+                json!({"path":"old.txt"}),
+                "delete",
+                "file",
+            ),
+            (
+                "List the `src` directory's contents",
+                "search",
+                json!({"path":"src"}),
+                "ls",
+                "search",
+            ),
+            (
+                "grep -n \"TODO\"",
+                "search",
+                json!({"pattern":"TODO","path":"src"}),
+                "grep",
+                "search",
+            ),
+            (
+                "Find `**/*.rs`",
+                "search",
+                json!({"pattern":"**/*.rs"}),
+                "glob",
+                "search",
+            ),
+            (
+                "Search: \"auth flow\"",
+                "search",
+                json!({"query":"auth flow"}),
+                "codebase-search",
+                "search",
+            ),
+            (
+                "Web Search: \"acp spec\"",
+                "search",
+                json!({"searchTerm":"acp spec"}),
+                "web-search",
+                "search",
+            ),
+            (
+                "Web Fetch: https://example.com",
+                "fetch",
+                json!({"url":"https://example.com"}),
+                "web-fetch",
+                "other",
+            ),
+            (
+                "Update TODOs: a, b",
+                "other",
+                json!({"_toolName":"updateTodos","todos":[]}),
+                "updateTodos",
+                "other",
+            ),
+        ] {
+            let (name, kind, _, _) = map(
+                &json!({"sessionUpdate":"tool_call","toolCallId":"t","title":title,"kind":acp_kind,"status":"pending","rawInput":raw}),
+            );
+            assert_eq!(
+                (name.as_str(), kind),
+                (expected_name, expected_kind),
+                "{title}"
+            );
+        }
+    }
+
+    /// The Cursor rules are gated to Cursor sessions: the generic mapping
+    /// (every other provider) leaves Cursor-shaped frames exactly as the
+    /// pre-Cursor rules named them.
+    #[test]
+    fn generic_mapping_ignores_cursor_shapes() {
+        let generic = |update: &Value| {
+            let note: SessionNotification =
+                serde_json::from_value(json!({ "sessionId": "s", "update": update })).unwrap();
+            let MappedUpdate::ToolCall(tc) = session::map_session_update(&note.update).unwrap()
+            else {
+                panic!("expected a tool call");
+            };
+            (tc.tool_name, tc.tool_kind)
+        };
+        for (title, kind, raw, expected) in [
+            ("`ls`", "execute", json!({"command":"ls"}), "`ls`"),
+            ("Terminal", "execute", json!({"command":"ls"}), "Terminal"),
+            (
+                "Task: Reply",
+                "other",
+                json!({"_toolName":"task","prompt":"p","description":"Reply"}),
+                "Task",
+            ),
+            ("Edit `a.rs`", "edit", json!({"path":"a.rs"}), "Edit `a.rs`"),
+            (
+                "Find `*.rs`",
+                "search",
+                json!({"pattern":"*.rs"}),
+                "Find `*.rs`",
+            ),
+            (
+                "srv: tool",
+                "other",
+                json!({"providerIdentifier":"srv","toolName":"tool","args":{}}),
+                "srv",
+            ),
+        ] {
+            let (name, _) = generic(
+                &json!({"sessionUpdate":"tool_call","toolCallId":"t","title":title,"kind":kind,"status":"pending","rawInput":raw}),
+            );
+            assert_eq!(name, expected, "{title}");
+        }
+    }
+
+    #[test]
+    fn cursor_pass_keeps_unrelated_shapes_and_callback_names() {
+        let mut call = session::MappedToolCall {
+            tool_call_id: "t".into(),
+            tool_name: "workspace_api".into(),
+            name_authoritative: true,
+            title: "srv: workspace_api".into(),
+            tool_kind: "other",
+            input: json!({"code":"1","summary":"s"}),
+            output: None,
+            status: "started",
+            keeps_status: false,
+        };
+        session::apply_cursor_tool_names(&mut call);
+        assert_eq!(call.tool_name, "workspace_api");
+        call.tool_name = "`ls -la`".into();
+        call.name_authoritative = false;
+        call.title = "ls -la".into();
+        call.input = json!({"command":"ls"});
+        session::apply_cursor_tool_names(&mut call);
+        assert_eq!(
+            call.tool_name, "`ls -la`",
+            "title must be the backticked command"
+        );
     }
 }

@@ -22,6 +22,7 @@ fn registry_first_provider_and_lookups() {
             "droid",
             "grok",
             "antigravity",
+            "cursor",
             "mock"
         ]
     );
@@ -352,7 +353,14 @@ fn cortex_and_droid_gate_on_enable_env_vars() {
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn session_mcp_servers_partition() {
-    let opted_in = ["claude-code", "codex", "droid", "grok", "antigravity"];
+    let opted_in = [
+        "claude-code",
+        "codex",
+        "droid",
+        "grok",
+        "antigravity",
+        "cursor",
+    ];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -371,7 +379,7 @@ fn session_mcp_servers_partition() {
 /// added provider can't accidentally opt in without updating this partition.
 #[test]
 fn config_option_model_partition() {
-    let opted_in = ["claude-code", "codex", "pi", "antigravity"];
+    let opted_in = ["claude-code", "codex", "pi", "antigravity", "cursor"];
     for id in all_provider_ids() {
         let p = find_provider(id).unwrap();
         assert_eq!(
@@ -1177,6 +1185,7 @@ fn disableable_and_always_enabled_partition_registry() {
             "droid",
             "grok",
             "antigravity",
+            "cursor",
             "mock"
         ]
     );
@@ -1839,4 +1848,68 @@ fn only_grok_requires_terminal_shell_by_default() {
             );
         }
     }
+}
+
+/// Cursor's registry entry (spec §3): a Node launcher in ACP mode, the
+/// workspace bridge over session `mcpServers`, the system prompt on the
+/// first fresh turn, the model as a config option, polite `session/cancel`
+/// (no kill on interrupt), disableable, and no ACP `authenticate` (it would
+/// start a browser login on a signed-out host).
+#[test]
+fn cursor_registry_entry() {
+    let p = find_provider("cursor").expect("cursor registered");
+    assert_eq!(p.display_name, "Cursor");
+    assert_eq!(p.short_name, "Cursor");
+    assert_eq!(p.command, "cursor-agent");
+    assert_eq!(p.base_args, &["acp"]);
+    assert_eq!(p.runtime, ProviderRuntime::Node);
+    assert!(p.supports_session_mcp_servers);
+    assert!(!p.supports_mcp_config);
+    assert_eq!(p.injection_mechanism, InjectionMechanism::FirstTurnPrepend);
+    assert!(p.supports_config_option_model);
+    assert!(!p.supports_set_model);
+    assert!(p.model_flag.is_none());
+    assert!(!p.config_option_model_strips_effort);
+    assert!(!p.kills_child_on_interrupt, "cancel rides session/cancel");
+    assert!(p.can_be_disabled);
+    assert!(!p.supports_authenticate);
+    assert!(p.supports_test_prompt);
+    assert!(p.auto_allow_once);
+    assert!(!p.requests_agent_workers);
+    assert!(p.requires_env_var.is_none() && p.requires_feature_code.is_none());
+    assert_eq!(p.auth_check_args, Some(&["models"][..]));
+    assert!(p.npx_only_package.is_none() && p.fallback_npx_package.is_none());
+    assert_eq!(login_command("cursor"), "cursor-agent login");
+    assert!(is_provider_authentication_error(
+        "cursor",
+        "Authentication required. Please run 'agent login' first"
+    ));
+}
+
+/// Only Cursor answers auto-approved prompts with `allow_once`: its
+/// `allow-always` writes into the user's Cursor config.
+#[test]
+fn auto_allow_once_partition() {
+    for id in all_provider_ids() {
+        assert_eq!(
+            find_provider(id).unwrap().auto_allow_once,
+            id == "cursor",
+            "{id}"
+        );
+    }
+}
+
+/// Only Cursor carries a prompt-only provider note (its native-subagent
+/// restriction).
+#[test]
+fn system_prompt_note_partition() {
+    for id in all_provider_ids() {
+        let note = find_provider(id).unwrap().system_prompt_note;
+        assert_eq!(note.is_some(), id == "cursor", "{id}");
+    }
+    let note = find_provider("cursor").unwrap().system_prompt_note.unwrap();
+    assert!(
+        note.contains("Task") && note.contains("ws.agent.delegate"),
+        "{note}"
+    );
 }

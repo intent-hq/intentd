@@ -312,7 +312,24 @@ pub struct ProviderConfig {
     /// download/load cycle, so a bounded probe would time out spuriously.
     /// Antigravity also opts out because it requires a private guarded profile.
     pub supports_test_prompt: bool,
+    /// When true, an auto-approved permission prompt (headless `AllowAll` /
+    /// `AutoByRisk` policies) selects the provider's `allow_once` option
+    /// rather than the first non-destructive one. For providers whose
+    /// `allow_always` answer writes the approval into the user's own CLI
+    /// configuration (Cursor persists it to `~/.cursor/cli-config.json`'s
+    /// allowlist): the daemon must never change user settings.
+    pub auto_allow_once: bool,
+    /// Provider-specific section appended to the assembled system prompt
+    /// (prompt-only policy for a provider with no tool-level knob). Cursor:
+    /// its native `Task` subagent tool stays callable without the
+    /// `subagents` client capability and `cursor-agent acp` has no
+    /// disable-tool flag.
+    pub system_prompt_note: Option<&'static str>,
 }
+
+/// Cursor's prompt-only native-subagent restriction
+/// ([`ProviderConfig::system_prompt_note`]).
+pub const CURSOR_SUBAGENT_PROMPT_NOTE: &str = "## Subagents\n\nDo not use Cursor's native Task (subagent) tool. To hand work to another agent, use Intent's delegation through the workspace tools (`ws.agent.create` or `ws.agent.delegate`), so the work stays visible in Intent.";
 
 impl ProviderConfig {
     /// ACP session selector supported by the pinned adapter. This is a
@@ -373,6 +390,8 @@ impl ProviderConfig {
             truncates_tool_descriptions: false,
             kills_child_on_interrupt: false,
             supports_test_prompt: true,
+            auto_allow_once: false,
+            system_prompt_note: None,
         }
     }
 
@@ -682,6 +701,54 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // Saved personal OAuth is reused by session/new. Do not send the
         // generic authenticate method "none", or map AllowAll to yolo.
         ..ProviderConfig::empty("antigravity", "Google Antigravity", "antigravity-acp")
+    },
+    ProviderConfig {
+        // `cursor-agent` is a bash launcher that runs Cursor's bundled `node`
+        // on `index.js`, so the V8 heap cap applies.
+        runtime: ProviderRuntime::Node,
+        // `acp` is a hidden subcommand ("Start the Cursor Agent as an ACP
+        // server"; verified on 2026.11.05-86047df).
+        base_args: &["acp"],
+        can_be_disabled: true,
+        // No `_meta` system-prompt path and no rules flag on `cursor-agent
+        // acp`, so the prompt rides the first fresh turn.
+        injection_mechanism: InjectionMechanism::FirstTurnPrepend,
+        // `session/new` / `session/load` pass `mcpServers` straight into the
+        // session's MCP lease; stdio is the ACP baseline (only http/sse are
+        // advertised in `mcpCapabilities`).
+        supports_session_mcp_servers: true,
+        // The `session/new` result advertises the model as a
+        // `configOptions[id="model"]` select of variants (`<base>[…]`; no
+        // `parameterizedModelPicker` capability is advertised). The catalog
+        // lists base ids from `cursor/list_available_models`; the daemon maps
+        // the pick onto the session's variant (`apply_cursor_session_model`).
+        // Cursor saves the applied model as the user's CLI default.
+        supports_config_option_model: true,
+        // Never send ACP `authenticate`: a stored login already marks the
+        // agent authenticated at startup, and `cursor_login` on a signed-out
+        // host starts a browser login flow from a headless daemon.
+        supports_authenticate: false,
+        // Auth probe. Signed in: `cursor-agent models` exits 0 with
+        // `id - Name` rows; signed out: exit 1, "Authentication required…".
+        // Parsed by `cursor::parse_cursor_models_command_output`; works for
+        // both a stored login and `CURSOR_API_KEY`, and starts no chat.
+        auth_check_args: Some(&["models"]),
+        // `session/new` signed out: -32000 "Authentication required".
+        auth_error_patterns: Some(&["authentication required"]),
+        // The CLI's own help says `agent login`, but a bare `agent` may be
+        // another tool (or the Grok agent host), so name the real command.
+        login_command_hint: Some("cursor-agent login"),
+        login_docs_url: Some("https://cursor.com/docs/cli/reference/authentication"),
+        short_name: "Cursor",
+        // Cursor's `allow-always` writes the approval into the user's
+        // `~/.cursor/cli-config.json` allowlist.
+        auto_allow_once: true,
+        // No spawn-time tool stripping: `cursor-agent acp` has no
+        // disable-tool flag, and the native `Task` tool stays callable even
+        // though initialize never advertises `clientCapabilities.subagents`.
+        // The restriction is prompt-only (user decision 2026-11-05).
+        system_prompt_note: Some(CURSOR_SUBAGENT_PROMPT_NOTE),
+        ..ProviderConfig::empty("cursor", "Cursor", "cursor-agent")
     },
     ProviderConfig {
         runtime: ProviderRuntime::Node,

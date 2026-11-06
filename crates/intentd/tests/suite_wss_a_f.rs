@@ -27,6 +27,7 @@ mod e2e_wss_chief_workspace;
 mod e2e_wss_codex_sandbox;
 mod e2e_wss_codex_session_title;
 mod e2e_wss_context_linkage;
+mod e2e_wss_cursor_provider;
 mod e2e_wss_disabled_provider_turn;
 mod e2e_wss_discussion_agents;
 mod e2e_wss_disk_usage;

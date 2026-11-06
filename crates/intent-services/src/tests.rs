@@ -43304,6 +43304,18 @@ mod provider_discovery_payload {
         let payload = crate::discover_providers_with_npx();
         let entries = payload["providers"].as_array().expect("providers array");
         for entry in entries {
+            // Cursor reports its CLI identity too (`cursor_cli`): never the
+            // pi version-gate fields, and a reason only with installed=false.
+            if entry["id"] == "cursor" {
+                assert!(
+                    entry.get("cliVersionOk").is_none() && entry.get("cliRequirement").is_none(),
+                    "{entry}"
+                );
+                if entry.get("unavailableReason").is_some() {
+                    assert_eq!(entry["installed"], false, "{entry}");
+                }
+                continue;
+            }
             if entry["id"] != "pi" || entry.get("gatedOff").is_some() {
                 assert!(
                     entry.get("cliCommand").is_none()
@@ -43313,7 +43325,7 @@ mod provider_discovery_payload {
                         && entry.get("cliVersionOk").is_none()
                         && entry.get("cliRequirement").is_none()
                         && entry.get("unavailableReason").is_none(),
-                    "only the probed pi row carries CLI fields: {entry}"
+                    "only the probed pi and cursor rows carry CLI fields: {entry}"
                 );
                 continue;
             }

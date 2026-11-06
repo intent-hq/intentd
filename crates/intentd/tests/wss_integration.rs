@@ -10914,6 +10914,7 @@ async fn wss_providers_catalog_round_trip() {
             "droid",
             "grok",
             "antigravity",
+            "cursor",
             "mock"
         ],
         "one row per registry entry, registry order: {resp}"

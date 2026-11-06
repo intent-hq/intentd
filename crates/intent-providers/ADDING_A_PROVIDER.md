@@ -148,7 +148,7 @@ intentd assembles one effective system prompt per agent (`assemble_system_prompt
 | `RulesFileFlag` | auggie (`--rules`), droid (`--append-system-prompt-file`) | `create_agent` writes a temp rules file; `build_provider_args` (`crates/intent-providers/src/args.rs`) appends `rules_flag` + path, gated on `supports_rules_file`. |
 | `SessionMeta` | claude-code (system prompt), codex (session title only) | `build_session_meta` (`crates/intent-services/src/agent_session.rs`) builds a provider-shaped `_meta`: claude-code `{ "claudeCode": { "options": { "disallowedTools": ["Task"] } }, "systemPrompt": "<prompt>" }` (a string `systemPrompt` fully replaces the claude_code preset prompt — at adapter 0.66.0 the string is passed to the SDK as-is and treated as a custom prompt, so the model sees only our assembled instructions), sent on `session/new` **and** `session/load` (and the recreate path); codex `{ "sessionTitle": "<agent name>" }`, sent on `session/new` only (create + recreate; never on `session/load` — monorepo#3151), while its system prompt still travels via `FirstTurnPrepend` below. Carried by `session::new_session` / `load_session` (`crates/intent-acp/src/session.rs`). |
 | `EnvConfig` | opencode | `build_provider_env` (`crates/intent-providers/src/args.rs`) emits `OPENCODE_CONFIG_CONTENT` with an `instructions: [<rules file path>]` key (plus `model`, `permission`, `mcp` — see §3b and §6). |
-| `FirstTurnPrepend` | codex (the pinned codex-acp adapter ignores `_meta.developerInstructions`, #479), cortex, pi, grok (fallback), antigravity, plus the e2e-only `mock` provider | `arm_first_turn_prepend` / `build_first_turn_prepend` (`crates/intent-services/src/agent_manager.rs`): the persisted prompt is prepended as a `<system>` block on the first turn of a *fresh* session only (never on a `session/load` resume, which retained context). |
+| `FirstTurnPrepend` | codex (the pinned codex-acp adapter ignores `_meta.developerInstructions`, #479), cortex, pi, grok (fallback), antigravity, cursor, plus the e2e-only `mock` provider | `arm_first_turn_prepend` / `build_first_turn_prepend` (`crates/intent-services/src/agent_manager.rs`): the persisted prompt is prepended as a `<system>` block on the first turn of a *fresh* session only (never on a `session/load` resume, which retained context). |
 | `None` | — | Provider gets no system prompt. Avoid if at all possible. |
 
 Add a new mechanism only if the provider genuinely supports none of these; prefer reusing
@@ -174,7 +174,7 @@ per provider — pick exactly one delivery path:
   `opencode_env_mcp_config` → `to_opencode_mcp_config` serializes the set as the
   OpenCode `mcp` block, merged into `OPENCODE_CONFIG_CONTENT` by `build_provider_env`
   (`SpawnOptions.env_mcp_config`, `crates/intent-acp/src/spawn.rs`).
-- **(c) ACP session field** (claude-code, codex, droid, grok, antigravity):
+- **(c) ACP session field** (claude-code, codex, droid, grok, antigravity, cursor):
   `supports_session_mcp_servers: true`. `create_agent` stashes
   `to_acp_session_mcp_servers(...)` on the agent handle; `start_session`
   (`crates/intent-services/src/agent_manager.rs`) passes it into every session-open
@@ -360,6 +360,42 @@ semantics). Today that is **Grok Build** only (`/bin/bash -lc '…'` in
 `command`). intentd then spawns the packed line exactly as Node `shell: true`
 would — `/bin/sh -c` on POSIX, the native shell (PowerShell `-Command` /
 `cmd /c`) on Windows — instead of exec'ing the packed string as argv[0].
+
+## Cursor (`cursor-agent acp`)
+
+Verified against Cursor CLI 2026.11.05-86047df. Code: `intent-providers/src/cursor.rs`,
+`intent-services/src/cursor_cli.rs`, the `cursor` arms in `provider_auth.rs` /
+`provider_models`, and `derive_cursor_tool_name` in `intent-acp/src/session.rs`.
+
+- **Discovery** — `providers.paths.cursor`, then `cursor-agent` on the enhanced PATH,
+  then the newest `~/.local/share/cursor-agent/versions/<ver>/cursor-agent`. Never a
+  bare `agent`. The Grok agent host channel (`cursor-agent update --channel grok`)
+  repoints the `~/.local/bin` links: candidates resolving into `$GROK_HOME` or named
+  `agent-host*` are skipped, an active `<CURSOR_CONFIG_DIR>/grok-switch.json` skips the
+  PATH tier, and a `--version` starting `grok ` marks the row unavailable
+  (`unavailableReason`) and fails agent creation.
+- **Auth** — `cursor-agent models` (stored login or `CURSOR_API_KEY`; the stored login
+  wins).
+- **Models** — `cursor/list_available_models` after `initialize`, with no `session/new`,
+  so refreshes add nothing to Cursor's chat history. Catalog ids are base models
+  (`default` = Auto); at session start the pick is mapped to the session's own
+  `model` option variant (`<base>[…]`) and applied with `session/set_config_option`.
+  No match or a rejection fails setup with an actionable error. Cursor also saves the
+  applied model as the user's CLI default (accepted).
+- **Never send ACP `authenticate`** — `cursor_login` on a signed-out host starts a
+  browser login. A stored login is picked up at process start.
+- **Agent requests** — `cursor/ask_question` is answered `skipped` (a `-32601` makes
+  Cursor re-ask through permission prompts that auto-approval would answer);
+  `cursor/task` (sent after a native Task run) gets an empty success.
+  Auto-approved permissions pick `allow_once` (`ProviderConfig::auto_allow_once`):
+  Cursor's `allow-always` writes the user's `cli-config.json` allowlist.
+- **Teardown** — `cursor-agent acp` ignores stdin EOF and spawns a worker-server plus a
+  language-server chain in its process group; the usual `killpg` teardown covers it
+  (asserted in `e2e_wss_cursor_provider`).
+- **Native subagents** — Cursor's `Task` tool stays callable without the `subagents`
+  capability and there is no disable flag, so the restriction is prompt-only
+  (`ProviderConfig::system_prompt_note`, appended by `rules::with_provider_prompt_note`).
+  Task runs map to `Subagent` in the timeline.
 
 ## Antigravity setup and compatibility boundary
 

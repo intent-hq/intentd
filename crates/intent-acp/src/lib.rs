@@ -46,7 +46,10 @@ pub use error::{
     PROVIDER_STALL_PREFIX,
 };
 pub use fs::FileService;
-pub use handler::{ClientRequestHandler, EventSink, SinkEvent};
+pub use handler::{
+    cursor_ask_question_skipped, ClientRequestHandler, EventSink, SinkEvent,
+    CURSOR_ASK_QUESTION_METHOD, CURSOR_TASK_METHOD,
+};
 pub use handshake::handshake;
 pub use mcp_bridge::{
     bridge_auth_line, run_stdio_bridge, serve_mcp_handler_tcp, serve_workspace_mcp_tcp, McpBridge,

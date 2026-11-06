@@ -87,7 +87,14 @@ pub(super) async fn run_acp_probe<F>(
 where
     F: Fn(&Value) -> Vec<Value>,
 {
-    run_probe(cmd, extract, true).await
+    run_probe(
+        cmd,
+        extract,
+        Stage::SessionNew {
+            accept_notifications: true,
+        },
+    )
+    .await
 }
 
 /// Authentication requires a successful session/new response, not a model
@@ -99,13 +106,42 @@ pub(super) async fn run_acp_session_probe<F>(
 where
     F: Fn(&Value) -> Vec<Value>,
 {
-    run_probe(cmd, extract, false).await
+    run_probe(
+        cmd,
+        extract,
+        Stage::SessionNew {
+            accept_notifications: false,
+        },
+    )
+    .await
+}
+
+/// Session-free probe: `initialize`, then one agent extension request
+/// (`method`, empty params), models read from its result. Opens no ACP
+/// session, so nothing lands in the provider's own chat history (Cursor's
+/// `cursor/list_available_models`).
+pub(super) async fn run_acp_method_probe<F>(
+    cmd: AcpProbeCommand,
+    method: &'static str,
+    extract: F,
+) -> Result<Vec<Value>, ProbeError>
+where
+    F: Fn(&Value) -> Vec<Value>,
+{
+    run_probe(cmd, extract, Stage::Method(method)).await
+}
+
+/// What the probe asks after `initialize`.
+#[derive(Clone, Copy)]
+enum Stage {
+    SessionNew { accept_notifications: bool },
+    Method(&'static str),
 }
 
 async fn run_probe<F>(
     cmd: AcpProbeCommand,
     extract: F,
-    accept_notifications: bool,
+    stage: Stage,
 ) -> Result<Vec<Value>, ProbeError>
 where
     F: Fn(&Value) -> Vec<Value>,
@@ -120,17 +156,30 @@ where
             SpawnError::Spawn(detail) => ProbeError::Spawn(detail),
         })?;
 
-    let result = tokio::time::timeout(
-        cmd.setup_timeout(),
-        drive_probe(
-            &adapter.conn,
-            adapter.notifications,
-            extract,
-            &cmd,
+    let result = match stage {
+        Stage::SessionNew {
             accept_notifications,
-        ),
-    )
-    .await
+        } => {
+            tokio::time::timeout(
+                cmd.setup_timeout(),
+                drive_probe(
+                    &adapter.conn,
+                    adapter.notifications,
+                    extract,
+                    &cmd,
+                    accept_notifications,
+                ),
+            )
+            .await
+        }
+        Stage::Method(method) => {
+            tokio::time::timeout(
+                cmd.setup_timeout(),
+                drive_method_probe(&adapter.conn, method, extract, &cmd),
+            )
+            .await
+        }
+    }
     .unwrap_or(Err(ProbeError::Timeout));
 
     let result = match result {
@@ -258,6 +307,34 @@ where
         }
     }
     Err(ProbeError::Empty)
+}
+
+/// `initialize` → `method` (no session).
+async fn drive_method_probe<F>(
+    conn: &Connection,
+    method: &'static str,
+    extract: F,
+    command: &AcpProbeCommand,
+) -> Result<Vec<Value>, ProbeError>
+where
+    F: Fn(&Value) -> Vec<Value>,
+{
+    conn.request_timeout(
+        "initialize",
+        initialize_params(),
+        command.initialize_timeout(),
+    )
+    .await
+    .map_err(map_acp_error)?;
+    let result = conn
+        .request_timeout(method, json!({}), command.session_new_timeout())
+        .await
+        .map_err(map_acp_error)?;
+    let models = extract(&result);
+    if models.is_empty() {
+        return Err(ProbeError::Empty);
+    }
+    Ok(models)
 }
 
 /// Notification method names adapters use to publish the model catalog
