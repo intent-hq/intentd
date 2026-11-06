@@ -226,7 +226,7 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
         HeadLink::default(),
     )
     .unwrap();
-    for code in [r#"return await host({ method: "secret.list", args: {} });"#] {
+    for code in [r#"return await host({ method: "secret.provide", args: {} });"#] {
         let (failed, text) = call(&server, code).await;
         assert!(failed, "{code}: {text}");
         assert!(

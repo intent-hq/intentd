@@ -74,6 +74,57 @@ async fn create_agent(rpc_ws: &mut common::TlsWs, ws_id: &str, name: &str, id: i
     }
 }
 
+/// [`wsapi_turn`] for one of several agents in the workspace: other
+/// agents' turn ends (the provided notice wakes the owner) are skipped, and
+/// the reply is polled until it carries `marker`.
+async fn agent_turn(
+    rpc_ws: &mut common::TlsWs,
+    events: &mut common::TlsWs,
+    (ws_id, agent_id): (&str, &str),
+    content: &str,
+    marker: &str,
+    id: i64,
+) -> String {
+    ok(
+        rpc_ws,
+        id,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": content }),
+    )
+    .await;
+    let mut next = id + 1;
+    let found = timeout(wait(), async {
+        loop {
+            let end = event(events, "agent:stream:end").await;
+            if end["data"]["agentId"] != agent_id {
+                continue;
+            }
+            // The turn's reply may be recorded just after its end event.
+            for _ in 0..20 {
+                let got = ok(
+                    rpc_ws,
+                    next,
+                    "agent.get",
+                    json!({ "workspaceId": ws_id, "agentId": agent_id }),
+                )
+                .await;
+                next += 1;
+                let reply = got["agent"]["lastAgentResponse"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                if reply.contains(marker) {
+                    return reply;
+                }
+                // timing-guard: poll interval for this turn's reply to be recorded
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    })
+    .await;
+    found.unwrap_or_else(|_| panic!("no reply of {agent_id} carrying {marker:?}"))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_remote_agents_secret_stays_on_its_machine() {
     if intent_providers::resolve_on_path("node").is_none()
@@ -123,7 +174,7 @@ async fn a_remote_agents_secret_stays_on_its_machine() {
     let other = create_agent(&mut rpc_ws, &ws_id, "Other", 40).await;
 
     // The owner's request is forwarded and recorded on head.
-    let reply = wsapi_turn(
+    let reply = agent_turn(
         &mut rpc_ws,
         &mut events,
         (&ws_id, &owner),
@@ -170,7 +221,7 @@ async fn a_remote_agents_secret_stays_on_its_machine() {
                 let _ = write!(hex, "{byte:02x}");
                 hex
             });
-    let reply = wsapi_turn(
+    let reply = agent_turn(
         &mut rpc_ws,
         &mut events,
         (&ws_id, &owner),
@@ -190,7 +241,7 @@ async fn a_remote_agents_secret_stays_on_its_machine() {
     assert!(stdout.ends_with("raw=[secret:API_KEY]"), "{ran}");
 
     // Another agent on the same machine never reaches it.
-    let reply = wsapi_turn(
+    let reply = agent_turn(
         &mut rpc_ws,
         &mut events,
         (&ws_id, &other),
@@ -238,7 +289,7 @@ async fn a_remote_agents_secret_stays_on_its_machine() {
         json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
     )
     .await;
-    let reply = wsapi_turn(
+    let reply = agent_turn(
         &mut rpc_ws,
         &mut events,
         (&ws_id, &owner),
