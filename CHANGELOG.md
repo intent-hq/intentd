@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.141] - 2026-11-06
+
+### 🐛 Bug Fixes
+
+- *(remote)* Settle a final stop once when its ack races its expiry ([#3102](https://github.com/intent-hq/intentd/pull/3102))
+- Update assistant help for refreshed panel menus ([#3104](https://github.com/intent-hq/intentd/pull/3104))
+
+### 🧪 Testing
+
+- *(scripts)* Wait for the producer before draining in the dropped-output test ([#3105](https://github.com/intent-hq/intentd/pull/3105))
+
+
 ## [0.11.140] - 2026-11-06
 
 ### 🚀 Features
