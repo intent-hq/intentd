@@ -601,13 +601,16 @@ watches, its last update on GitHub as of the watch's latest check). Home's short
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector,SetupScriptPicker,SetupScriptEditor,StartOnPicker}.svelte; packages/cloudlands-fe/src/lib/components/modals/SetupScriptModal.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/messages/en.json. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/{CompactWorkspaceInitializer,MultiSelectTabbedSidebar,CreateAgentSection}.svelte; packages/cloudlands-fe/src/lib/components/workspace/initializer/{InitialAgentPicker,RepoSelector,SetupScriptPicker,SetupScriptEditor,StartOnPicker,WorkspaceCreateButton,CreateButtonProgress}.svelte; packages/cloudlands-fe/src/lib/components/modals/SetupScriptModal.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace-initializer/utils/agent-settings-repo-key.ts; packages/cloudlands-fe/src/features/onboarding/messages/ProjectPickerMessage.svelte; packages/cloudlands-fe/messages/en.json. -->
 
 <!-- The searchable Machines picker for initial-agent placement is Labs-only;
 do not list it among the normal workspace settings below. -->
 
 Open **New workspace** (`/workspace/new`), describe the work in the prompt, and
-choose **Create workspace**. The settings beside the prompt (below it on narrow
+choose **Create workspace**. During creation, the button shows the current step
+and a loader on the right; its progress bar has no numeric percentage. Step labels
+slide upward as they change, or switch instantly with reduced motion. Long labels
+truncate to fit. The settings beside the prompt (below it on narrow
 windows) are **Codebase**, **Branch**, **Setup script**, **Initial agent**, and **Model**.
 Use **+** below the prompt to add context, the paperclip to attach files, or the
 microphone to dictate. These controls are grouped on the left.
