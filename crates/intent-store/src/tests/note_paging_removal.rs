@@ -330,7 +330,9 @@ async fn large_note_save_does_not_block_an_unrelated_write() {
         }
         // Each unrelated insert is strictly later than every earlier stamp,
         // so it moves the workspace's content-activity mark exactly once in
-        // both saves, however fast the clock ticks.
+        // both saves, however fast the clock ticks. The saves themselves
+        // never move it: they keep the snapshot's `updated_at` (the notes'
+        // creation time), which is never later than the mark.
         let small_rows = save_beside_an_unrelated_write(
             &store,
             &log,
