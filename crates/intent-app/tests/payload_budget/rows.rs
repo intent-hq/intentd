@@ -1468,6 +1468,10 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
         )
         .with_reason("An asset over maxBytes is sent without its bytes (its size and truncated flag only); the default variant reads one near the cap."),
         row(
+            "plugin.list",
+            vec![v("default", json!({}), Items("/plugins", seed::PLUGINS))],
+        ),
+        row(
             "prMonitor.list",
             vec![v("default", w.clone(), Items("/monitors", 200))],
         ),

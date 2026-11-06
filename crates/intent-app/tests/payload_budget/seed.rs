@@ -75,6 +75,8 @@ pub const CONVERSATIONS: usize = 150;
 pub const ACTIVE_AGENTS: usize = 200;
 pub const TERMINALS: usize = 40;
 pub const MCP_SERVERS: usize = 120;
+/// Installed plugins under the isolated plugins home.
+pub const PLUGINS: usize = 60;
 pub const CONTEXT_ITEMS: usize = 400;
 pub const PR_LINKED_WORKSPACES: usize = 300;
 pub const GIT_ROOTS: usize = 20;
@@ -177,6 +179,43 @@ fn prose(seed: usize, bytes: usize) -> String {
 
 /// Turn the big workspace's worktree into a repository with history,
 /// branches, a remote and a dirty working tree.
+/// Installed Agent Plugins with skills under an isolated plugins home
+/// (`INTENTD_USER_PLUGINS_DIR`), so `plugin.list` has a full inventory to
+/// return. Skills only: plugin MCP servers would be started by the hub.
+fn seed_plugins(worktree: &Path) {
+    let home = worktree
+        .parent()
+        .expect("worktree parent")
+        .join("plugins-home");
+    let description = "Plugin description long enough to weigh something. ".repeat(20);
+    for i in 0..PLUGINS {
+        let root = home.join("plugins").join(format!("plugin-{i:03}"));
+        std::fs::create_dir_all(&root).expect("plugin dir");
+        std::fs::write(
+            root.join("plugin.json"),
+            json!({
+                "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+                "name": format!("plugin-{i:03}"),
+                "version": "1.0.0",
+                "description": description,
+                "keywords": ["large", "state"],
+            })
+            .to_string(),
+        )
+        .expect("plugin manifest");
+        for k in 0..3 {
+            let skill = root.join("skills").join(format!("skill-{k}"));
+            std::fs::create_dir_all(&skill).expect("skill dir");
+            std::fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: skill-{k}\ndescription: Seeded plugin skill {k}.\n---\nBody\n"),
+            )
+            .expect("skill file");
+        }
+    }
+    std::env::set_var("INTENTD_USER_PLUGINS_DIR", &home);
+}
+
 fn seed_git(worktree: &Path, seeded: &mut Seeded) {
     git(worktree, &["init", "-q", "-b", "main"]);
     git(
@@ -328,6 +367,7 @@ pub async fn store(state: &LargeState) -> Seeded {
     };
 
     seed_git(&state.worktree, &mut seeded);
+    seed_plugins(&state.worktree);
 
     // Registered git roots (sibling checkouts of the workspace). Root 0 is a
     // clone of the big repository carrying the same dirty working tree, so

@@ -24,6 +24,11 @@ const REGISTRY_FILE: &str = "plugins.json";
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_PLUGINS: usize = 256;
 
+/// When set to a non-empty path, user-scope plugins live under it
+/// (`plugins/`, `plugin-data/`, `plugins.json`) instead of `~/.intent`, so dev
+/// sandboxes and test harnesses never touch the real home.
+pub(crate) const USER_DIR_ENV: &str = "INTENTD_USER_PLUGINS_DIR";
+
 const MANIFEST_FIELDS: &[&str] = &[
     "$schema",
     "name",
@@ -640,12 +645,16 @@ impl PluginPaths {
         Self { base: base.into() }
     }
 
-    /// `~/.intent`. Unit tests get no user tier unless they pass one.
+    /// `~/.intent`, or [`USER_DIR_ENV`] when set. Unit tests get no user tier
+    /// unless they pass one.
     pub(crate) fn user() -> Option<Self> {
         if cfg!(test) {
             return None;
         }
-        Self::home().map(|home| Self::new(home.join(".intent")))
+        std::env::var_os(USER_DIR_ENV)
+            .filter(|dir| !dir.is_empty())
+            .map(|dir| Self::new(PathBuf::from(dir)))
+            .or_else(|| Self::home().map(|home| Self::new(home.join(".intent"))))
     }
 
     pub(crate) fn home() -> Option<PathBuf> {
