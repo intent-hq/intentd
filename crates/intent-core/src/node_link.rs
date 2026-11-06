@@ -166,11 +166,12 @@ impl std::fmt::Display for ProtocolRange {
 /// to the machine on `/node/link`, by their wire `type` tag: binding,
 /// liveness, agent control, journal acks, the capabilities request,
 /// responses to the machine's forwarded `workspace.call` requests, and
-/// starting and stopping script runs (protocol 8), and the skills query
-/// (protocol 12). Nothing else is admitted
+/// starting and stopping script runs (protocol 8), the skills query
+/// (protocol 12), the push request (protocol 13) and the agent secret
+/// frames (protocol 14). Nothing else is admitted
 /// from an executor credential; the machine-to-backend frames (`welcome`,
 /// `journal`, `replayComplete`, `request`, `capabilitiesReply`, `stopAck`,
-/// `scriptStarted`, `scriptOutput`, `scriptExited`, `skillsReply`) and
+/// `scriptStarted`, `scriptOutput`, `scriptExited`, `skillsReply`, `secretReply`) and
 /// `cancelRequest` are
 /// refused. Git sessions use the
 /// separate `/node/git` connection, admitted per binding. Sorted;
@@ -188,6 +189,9 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "response",
     "scriptStart",
     "scriptStop",
+    "secretForget",
+    "secretList",
+    "secretPut",
     "skills",
     "stop",
 ];
