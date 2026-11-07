@@ -264,7 +264,13 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     provider_param(params)?;
     let stop_agents = bool_param(params, "stopAgents")?;
     let _settings = feature.cloud.settings.lock().await;
-    if config::load(svc).await?.is_none() {
+    // Not configured is a no-op, unless an earlier remove stopped part way
+    // (a store or secret-store error after the settings went): then this
+    // one finishes the cleanup.
+    if config::load(svc).await?.is_none()
+        && svc.store().list_cloud_machines().await?.is_empty()
+        && config::saved_key(svc).await?.is_none()
+    {
         return Ok(json!({ "ok": true, "unconfirmedStops": [] }));
     }
     // A sandbox still starting counts as live.
