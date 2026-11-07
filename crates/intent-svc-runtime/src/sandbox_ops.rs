@@ -116,11 +116,15 @@ pub async fn provision_sandbox(
         path: sandbox_path,
         branch: branch_name,
         base_commit_sha,
-        snapshot_commit_sha,
+        mut snapshot_commit_sha,
     } = outcome
     else {
         return Ok(ProvisionOutcome::Unsupported);
     };
+    let seeded = seed_from_parent_work(store, agent_id, &sandbox_path).await;
+    if let Some(start) = &seeded {
+        snapshot_commit_sha = Some(start.clone());
+    }
 
     // Persist the sandbox record
     let now = now_iso();
@@ -158,6 +162,9 @@ pub async fn provision_sandbox(
         }
         return Err(e);
     }
+    if seeded.is_some() {
+        mark_parent_work_seeded(store, workspace_id, agent_id).await;
+    }
 
     Ok(ProvisionOutcome::Supported {
         path: sandbox_path,
@@ -165,6 +172,109 @@ pub async fn provision_sandbox(
         base_commit_sha,
         snapshot_commit_sha,
     })
+}
+
+/// A backend sub-agent of a remote agent starts its own checkout from the
+/// parent's work its session records (`backendParentWork`): the sandbox
+/// branch is reset to the parent's `wip` (else `head`), which then counts as
+/// the snapshot the sub-agent's own changes start from, and files the clone
+/// carried that are not in that work are removed (ignored files are kept);
+/// each pinned submodule the parent saved work in is reset the same way.
+/// Returns that start commit, or `None` when there is no parent work or it
+/// cannot be applied (logged; the sandbox stays a copy of the checkout).
+async fn seed_from_parent_work(
+    store: &Store,
+    agent_id: &AgentId,
+    sandbox_path: &std::path::Path,
+) -> Option<String> {
+    let session = store.get_agent_session_summary(agent_id).await.ok()?;
+    let work = intent_core::remote_launch::BackendParentWork::from_metadata(
+        session.metadata.as_ref(),
+    )?;
+    let head = work.head.clone()?;
+    let start = work.wip.clone().unwrap_or(head);
+    let path = sandbox_path.to_path_buf();
+    let target = start.clone();
+    let seeded = tokio::task::spawn_blocking(move || {
+        reset_to_commit(&path, &target)?;
+        for module in &work.submodules {
+            let worktree = path.join(&module.path);
+            if !worktree.join(".git").exists() {
+                continue;
+            }
+            reset_to_commit(&worktree, module.wip.as_deref().unwrap_or(&module.head))?;
+        }
+        Ok::<(), Error>(())
+    })
+    .await;
+    match seeded {
+        Ok(Ok(())) => Some(start),
+        Ok(Err(error)) => {
+            tracing::warn!(agent = %agent_id, %error, "sandbox: could not start from the parent's work");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(agent = %agent_id, %error, "sandbox: the parent-work task failed");
+            None
+        }
+    }
+}
+
+/// Reset the checked-out branch (or detached HEAD) of `path` to `commit`
+/// and remove untracked, not ignored files.
+fn reset_to_commit(path: &std::path::Path, commit: &str) -> Result<()> {
+    let git = |e: git2::Error| Error::Internal(format!("sandbox parent work: {e}"));
+    let repo = git2::Repository::open(path).map_err(git)?;
+    let oid = git2::Oid::from_str(commit).map_err(git)?;
+    let object = repo.find_commit(oid).map_err(git)?.into_object();
+    repo.reset(&object, git2::ResetType::Hard, None)
+        .map_err(git)?;
+    let mut options = git2::StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false)
+        .exclude_submodules(true);
+    let statuses = repo.statuses(Some(&mut options)).map_err(git)?;
+    for entry in statuses.iter() {
+        if !entry.status().contains(git2::Status::WT_NEW) {
+            continue;
+        }
+        if let Ok(relative) = entry.path() {
+            let file = path.join(relative);
+            if let Err(error) = std::fs::remove_file(&file) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(Error::Internal(format!(
+                        "sandbox parent work: remove {relative}: {error}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Record that the sub-agent's checkout starts from its parent's work.
+async fn mark_parent_work_seeded(store: &Store, workspace_id: &WorkspaceId, agent_id: &AgentId) {
+    let key = intent_core::remote_launch::BACKEND_PARENT_WORK_METADATA_KEY;
+    let Ok(session) = store.get_agent_session_summary(agent_id).await else {
+        return;
+    };
+    let Some(mut work) =
+        intent_core::remote_launch::BackendParentWork::from_metadata(session.metadata.as_ref())
+    else {
+        return;
+    };
+    work.seeded = true;
+    let Ok(encoded) = serde_json::to_string(&work) else {
+        return;
+    };
+    if let Err(error) = store
+        .set_agent_session_metadata_key_json(workspace_id, agent_id, key, &encoded, &now_iso())
+        .await
+    {
+        tracing::warn!(agent = %agent_id, %error, "sandbox: could not record the parent work as applied");
+    }
 }
 
 /// Synchronous half of [`provision_sandbox`]: filesystem probe, `CoW` clone,

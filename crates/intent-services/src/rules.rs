@@ -657,6 +657,17 @@ async fn assemble_system_prompt_layers(
             parts.push(hint);
         }
     }
+    // A backend sub-agent of a remote agent: where its parent's work is.
+    if let Some(session) = agent_session {
+        if let Some(work) = intent_core::remote_launch::BackendParentWork::from_metadata(
+            session.metadata.as_ref(),
+        ) {
+            parts.push(format!(
+                "## Parent's work\n\n{}",
+                work.notice(session.workspace_id.as_str())
+            ));
+        }
+    }
     // Specialist role section (reference layer 4.8: after specialization
     // rules, user rules, and skills — before the parent-only layers).
     if let Some(bp) = specialist
