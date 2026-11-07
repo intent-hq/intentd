@@ -64,6 +64,16 @@ struct FakeState {
     /// Sandboxes whose next resume brings back another intentd build, one
     /// the backend shares no link protocol with, on this port.
     outdated: HashMap<String, u16>,
+    /// The release's template manifest (`e2b-templates.json`), served without
+    /// a key; `None` answers 404, as a release without one would.
+    manifest: Option<Value>,
+    /// Templates E2B does not know: their create answers 404.
+    missing_templates: Vec<String>,
+}
+
+/// The release manifest listing `sizes` for this build's version.
+fn manifest(sizes: &[&str]) -> Value {
+    json!({ "schema": 1, "project": "intent", "version": env!("CARGO_PKG_VERSION"), "sizes": sizes })
 }
 
 /// The fake E2B API and envd on one loopback port.
@@ -84,6 +94,7 @@ impl FakeE2b {
             root: root.to_path_buf(),
             fixture: fixture.to_owned(),
         });
+        fake.state().manifest = Some(manifest(&["2x4", "4x8", "8x16", "16x32"]));
         let served = fake.clone();
         tokio::spawn(async move {
             loop {
@@ -95,6 +106,11 @@ impl FakeE2b {
             }
         });
         fake
+    }
+
+    /// `INTENTD_E2B_MANIFEST_BASE_URL` for a backend using this fake.
+    fn manifest_base(&self) -> String {
+        format!("{}/manifests", self.url)
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
@@ -163,6 +179,14 @@ impl FakeE2b {
         let path = target.split('?').next().unwrap_or_default();
         if path == "/process.Process/Start" {
             return self.process(headers, body).await;
+        }
+        // The release mirror: public, no key.
+        if let Some(asset) = path.strip_prefix("/manifests/") {
+            let expected = format!("v{}/e2b-templates.json", env!("CARGO_PKG_VERSION"));
+            return match self.state().manifest.clone() {
+                Some(manifest) if asset == expected => json_reply(200, manifest),
+                _ => (404, "text/plain", b"Not Found".to_vec()),
+            };
         }
         if headers.get("x-api-key").map(String::as_str) != Some(E2B_KEY) {
             return json_reply(401, json!({ "code": 401, "message": "Invalid API key" }));
@@ -253,9 +277,12 @@ impl FakeE2b {
                 }
                 (204, "application/json", Vec::new())
             }
-            ("GET", alias) if alias.starts_with("/templates/aliases/") => {
-                json_reply(200, json!({ "templateID": "tpl-1", "public": true }))
-            }
+            // As E2B answers a key of another team (any user's own project):
+            // the alias lookup checks only the key's own templates.
+            ("GET", alias) if alias.starts_with("/templates/aliases/") => json_reply(
+                400,
+                json!({ "code": 400, "message": "namespace 'intent' must match your team 'acme'" }),
+            ),
             ("POST", "/v2/sandboxes") => {
                 let request: Value = serde_json::from_slice(body).unwrap();
                 let template = request["templateID"]
@@ -263,6 +290,12 @@ impl FakeE2b {
                     .unwrap_or_default()
                     .to_owned();
                 self.state().creates.push(request.clone());
+                if self.state().missing_templates.contains(&template) {
+                    return json_reply(
+                        404,
+                        json!({ "code": 404, "message": format!("template '{template}' not found") }),
+                    );
+                }
                 if self.state().refused_templates.contains(&template) {
                     return json_reply(
                         400,
@@ -695,6 +728,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     let fake = FakeE2b::start(&sandboxes, &fixture).await;
 
     let head_dir = scratch.path().join("head");
+    let manifest_base = fake.manifest_base();
     let (_head, port, cfg, ws_id) = start_backend_with(
         &head_dir,
         &repo,
@@ -702,6 +736,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
             ("INTENTD_E2B_API_URL", &fake.url),
             ("INTENTD_E2B_ENVD_URL", &fake.url),
             ("INTENTD_E2B_DIRECT_HOST", "127.0.0.1"),
+            ("INTENTD_E2B_MANIFEST_BASE_URL", &manifest_base),
         ],
     )
     .await;
@@ -799,6 +834,52 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
         .as_str()
         .unwrap()
         .ends_with(&format!("/intent-node-4x8:{}", env!("CARGO_PKG_VERSION"))));
+
+    // The key is tested alone: the sizes come from the release's manifest,
+    // never from probing templates with the key (E2B answers that only for
+    // the key's own project). A size the manifest does not list is refused.
+    fake.state().manifest = Some(manifest(&["2x4"]));
+    let unlisted = rpc(
+        &mut rpc_ws,
+        30,
+        "cloudMachines.configure",
+        json!({ "provider": "e2b", "apiKey": E2B_KEY, "size": "4x8", "validateOnly": true }),
+    )
+    .await;
+    assert_eq!(
+        unlisted["error"]["data"]["reason"], "template-missing",
+        "{unlisted}"
+    );
+    let listed = ok(
+        &mut rpc_ws,
+        31,
+        "cloudMachines.configure",
+        json!({ "provider": "e2b", "apiKey": E2B_KEY, "size": "2x4", "validateOnly": true }),
+    )
+    .await;
+    assert_eq!(listed["provider"]["state"], "ready", "{listed}");
+    // Without a manifest the backend falls back to the sizes every release
+    // builds and does not refuse a size: the create is the real check.
+    fake.state().manifest = None;
+    let fallback = ok(
+        &mut rpc_ws,
+        32,
+        "cloudMachines.configure",
+        json!({ "provider": "e2b", "apiKey": E2B_KEY, "size": "16x32", "validateOnly": true }),
+    )
+    .await;
+    let ids: Vec<&str> = fallback["provider"]["sizes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|size| size["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["2x4", "4x8"], "{fallback}");
+    fake.state().manifest = Some(manifest(&["2x4", "4x8", "8x16", "16x32"]));
+    assert!(
+        fake.state().creates.is_empty(),
+        "testing a key makes no sandbox"
+    );
 
     // No profile environment, or an account folder: refused, no sandbox.
     let bare = rpc(&mut rpc_ws, 9, "agent.create", create("codex", "Bare")).await;
@@ -972,6 +1053,39 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     assert!(failed.get("cloudStart").is_none(), "{failed}");
     let cloud = ok(&mut rpc_ws, 400, "cloudMachines.list", json!({})).await;
     assert_eq!(cloud["machines"].as_array().unwrap().len(), 1, "{cloud}");
+
+    // A template E2B does not have (create answers 404) fails the start
+    // with template-missing and leaves no sandbox.
+    let missing = ok(
+        &mut rpc_ws,
+        340,
+        "cloudMachines.configure",
+        json!({ "provider": "e2b", "size": "8x16" }),
+    )
+    .await;
+    let missing_template = missing["provider"]["template"].as_str().unwrap().to_owned();
+    {
+        let mut state = fake.state();
+        state.refused_templates.clear();
+        state.missing_templates.push(missing_template);
+    }
+    let sandboxes_before = fake.state().sandboxes.len();
+    let gone = ok(&mut rpc_ws, 341, "agent.create", create(&keyed_ref, "Gone")).await;
+    let gone_id = gone["agent"]["id"].as_str().unwrap().to_owned();
+    let failed = agent_until(&mut rpc_ws, (&ws_id, &gone_id), 350, |a| {
+        a.get("placementError").is_some()
+    })
+    .await;
+    transcript.push(failed.to_string());
+    assert_eq!(
+        failed["placementError"]["code"], "cloud-machine-unavailable",
+        "{failed}"
+    );
+    assert_eq!(
+        failed["placementError"]["data"]["reason"], "template-missing",
+        "{failed}"
+    );
+    assert_eq!(fake.state().sandboxes.len(), sandboxes_before, "no sandbox");
 
     drain_events(&mut events, &mut seen_events).await;
     // A bootstrap that fails (the mint in the sandbox) deletes the sandbox
@@ -1342,10 +1456,12 @@ impl CloudBackend {
         std::fs::create_dir_all(&sandboxes).unwrap();
         let fake = FakeE2b::start(&sandboxes, &fixture).await;
         let head_dir = scratch.path().join("head");
+        let manifest_base = fake.manifest_base();
         let mut backend_env = vec![
             ("INTENTD_E2B_API_URL", fake.url.as_str()),
             ("INTENTD_E2B_ENVD_URL", fake.url.as_str()),
             ("INTENTD_E2B_DIRECT_HOST", "127.0.0.1"),
+            ("INTENTD_E2B_MANIFEST_BASE_URL", manifest_base.as_str()),
         ];
         backend_env.extend_from_slice(env);
         let (head, port, cfg, ws_id) = start_backend_with(&head_dir, &repo, &backend_env).await;

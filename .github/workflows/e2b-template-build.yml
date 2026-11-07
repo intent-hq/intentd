@@ -13,8 +13,13 @@ on:
       latest:
         required: false
         type: boolean
+      manifest_only:
+        required: false
+        type: boolean
     secrets:
       E2B_API_KEY:
+        required: false
+      INTENTD_RELEASES_TOKEN:
         required: false
 
 permissions:
@@ -22,6 +27,7 @@ permissions:
 
 jobs:
   template:
+    if: ${{ !inputs.manifest_only }}
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     strategy:
@@ -98,3 +104,69 @@ jobs:
           node smoke.mjs "$REF" "$VERSION" "$SIZE"
           echo "### intent-node-$SIZE template" >> "$GITHUB_STEP_SUMMARY"
           echo "Built and smoke-tested \`$REF\` (intentd $VERSION); names: \`$NAMES\`." >> "$GITHUB_STEP_SUMMARY"
+
+  # After every release or manual build (also when a size failed), and alone
+  # with manifest_only: record which sizes exist for the version and attach
+  # the manifest to the intentd-releases release. PR builds publish nothing.
+  manifest:
+    needs: template
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check for the secrets
+        id: key
+        env:
+          HAS_KEY: ${{ secrets.E2B_API_KEY != '' }}
+          HAS_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN != '' }}
+        run: |
+          if [ "$HAS_KEY" != true ] || [ "$HAS_TOKEN" != true ]; then
+            echo "::warning::E2B_API_KEY or INTENTD_RELEASES_TOKEN secret is not set; skipping the E2B template manifest"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.key.outputs.present == 'true'
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        if: steps.key.outputs.present == 'true'
+        with:
+          node-version: '24'
+
+      - name: Install the E2B SDK
+        if: steps.key.outputs.present == 'true'
+        working-directory: packaging/e2b
+        run: npm ci --ignore-scripts --no-fund --no-audit
+
+      - name: Write the template manifest
+        id: manifest
+        if: steps.key.outputs.present == 'true'
+        working-directory: packaging/e2b
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          PROJECT: ${{ vars.E2B_TEMPLATE_PROJECT || 'intent' }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_LATEST: ${{ inputs.latest }}
+        run: node manifest.mjs
+
+      - name: Attach it to the intentd-releases release
+        if: steps.key.outputs.present == 'true' && steps.manifest.outputs.skip == 'false'
+        working-directory: packaging/e2b
+        env:
+          GH_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
+          VERSION: ${{ steps.manifest.outputs.version }}
+        run: |
+          gh release upload "v$VERSION" e2b-templates.json --repo intent-hq/intentd-releases --clobber
+          {
+            echo "### E2B template manifest"
+            echo '```json'
+            cat e2b-templates.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

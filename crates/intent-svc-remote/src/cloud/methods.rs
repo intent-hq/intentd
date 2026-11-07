@@ -149,31 +149,27 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
     let Some(key) = key else {
         return Err(config::not_configured());
     };
-    // The key and the template are tested before anything is saved. A key
-    // is tested whenever one is given; the template whenever the call can
-    // change it, or always with `validateOnly`.
+    // The key is tested before anything is saved, whenever one is given or
+    // with `validateOnly`. The published sizes come from the release's
+    // template manifest, never from probing templates with the key; they
+    // are read whenever the call can change the template.
+    if params.api_key.is_some() || params.validate_only {
+        config::client(key.clone())?
+            .check_key()
+            .await
+            .map_err(|error| config::to_error(&error, config::Phase::Other))?;
+        config::note_outcome(&mut next, None);
+    }
     let check_template = params.validate_only
         || params.api_key.is_some()
         || params.size.is_some()
         || params.template_project.is_some()
         || saved.is_none();
-    if params.api_key.is_some() || params.validate_only || check_template {
-        let client = config::client(key.clone())?;
-        if params.api_key.is_some() || params.validate_only {
-            client
-                .check_key()
-                .await
-                .map_err(|error| config::to_error(&error, config::Phase::Other))?;
+    if check_template {
+        next.set_sizes(config::published_sizes(&next.template_project).await);
+        if !next.allows(next.size) {
+            return Err(config::template_missing(&next.template(next.size)));
         }
-        if check_template {
-            next.sizes = config::published_sizes(&client, &next.template_project).await?;
-            next.sizes_checked_at = Some(now_iso());
-            next.sizes_version = Some(config::intentd_version().to_owned());
-            if !next.sizes.contains(&next.size) {
-                return Err(config::template_missing(&next.template(next.size)));
-            }
-        }
-        config::note_outcome(&mut next, None);
     }
     if params.validate_only {
         let mut provider = next.to_json();
@@ -231,27 +227,15 @@ async fn list(feature: &RemoteFeature, svc: &Services) -> Result<Value> {
     Ok(json!({ "providers": providers, "machines": machines }))
 }
 
-/// Check the published sizes again; a failed check keeps the last list. A
-/// change of the list or the key's state is saved and announced.
+/// Read the published sizes again (no E2B call, no key). A change of the
+/// list is saved and announced.
 async fn refresh_sizes(feature: &RemoteFeature, svc: &Services, saved: &mut ProviderConfig) {
     let Ok(_settings) = feature.cloud.settings.try_lock() else {
         return;
     };
-    let checked = match config::saved_client(svc).await {
-        Ok(client) => config::published_sizes(&client, &saved.template_project).await,
-        Err(error) => Err(error),
-    };
     let mut next = saved.clone();
-    match &checked {
-        Ok(sizes) => {
-            next.sizes.clone_from(sizes);
-            next.sizes_checked_at = Some(now_iso());
-            next.sizes_version = Some(config::intentd_version().to_owned());
-            config::note_outcome(&mut next, None);
-        }
-        Err(error) => config::note_outcome(&mut next, Some(error)),
-    }
-    let announce = next.sizes != saved.sizes || next.state != saved.state;
+    next.set_sizes(config::published_sizes(&saved.template_project).await);
+    let announce = next.sizes != saved.sizes || next.sizes_verified != saved.sizes_verified;
     if let Err(error) = config::save(svc, &next).await {
         tracing::warn!(%error, "cloud machines: could not save the checked sizes");
         return;

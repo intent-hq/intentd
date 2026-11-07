@@ -28,6 +28,15 @@ const SIZES_MAX_AGE: time::Duration = time::Duration::hours(1);
 const API_URL_ENV: &str = "INTENTD_E2B_API_URL";
 const ENVD_URL_ENV: &str = "INTENTD_E2B_ENVD_URL";
 const AGENT_PROVIDERS_ENV: &str = "INTENTD_E2B_AGENT_PROVIDERS";
+/// Where releases publish their template manifest (test seam).
+const MANIFEST_BASE_URL_ENV: &str = "INTENTD_E2B_MANIFEST_BASE_URL";
+
+/// Longest wait for a release's template manifest.
+const MANIFEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The sizes every release builds (E2B Hobby limits), offered when the
+/// release's manifest cannot be read.
+const FALLBACK_SIZES: [CloudMachineSize; 2] = [CloudMachineSize::S2x4, CloudMachineSize::S4x8];
 
 /// The result of the last E2B call with the saved key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -60,6 +69,10 @@ pub(crate) struct ProviderConfig {
     /// The intentd version `sizes` was checked for.
     #[serde(default)]
     pub(crate) sizes_version: Option<String>,
+    /// Whether `sizes` came from the release's manifest; `false` for the
+    /// fallback list, which does not refuse other sizes.
+    #[serde(default)]
+    pub(crate) sizes_verified: bool,
 }
 
 impl ProviderConfig {
@@ -75,7 +88,22 @@ impl ProviderConfig {
             sizes: Vec::new(),
             sizes_checked_at: None,
             sizes_version: None,
+            sizes_verified: false,
         }
+    }
+
+    /// Record a published-size check.
+    pub(crate) fn set_sizes(&mut self, published: Published) {
+        self.sizes = published.sizes;
+        self.sizes_verified = published.verified;
+        self.sizes_checked_at = Some(now_iso());
+        self.sizes_version = Some(intentd_version().to_owned());
+    }
+
+    /// Whether `size` may be saved: any size while the list is not
+    /// verified (the create is the real check), else a listed one.
+    pub(crate) fn allows(&self, size: CloudMachineSize) -> bool {
+        !self.sizes_verified || self.sizes.contains(&size)
     }
 
     /// The template a new sandbox of `size` starts from.
@@ -260,6 +288,16 @@ pub(crate) fn to_error(error: &E2bError, phase: Phase) -> Error {
     }
     match error {
         E2bError::NotConfigured => not_configured(),
+        // A create E2B forbids is about the template (another project's,
+        // not public), not the key: a rejected key fails with 401.
+        E2bError::Unauthorized { status: 403 } if phase == Phase::Create => {
+            cloud_machine_unavailable(
+                "template-missing",
+                false,
+                Some(403),
+                "E2B does not let this project use the Intent template for this backend's version and size; no sandbox was left behind.",
+            )
+        }
         E2bError::Unauthorized { status } => key_rejected(Some(*status)),
         E2bError::NotFound(_) if phase == Phase::Create => cloud_machine_unavailable(
             "template-missing",
@@ -282,26 +320,51 @@ pub(crate) fn to_error(error: &E2bError, phase: Phase) -> Error {
     }
 }
 
-/// Check which sizes of `project` are tagged with this backend's version.
-///
-/// # Errors
-///
-/// `key-rejected` or `api-error` when E2B cannot answer.
-pub(crate) async fn published_sizes(
-    client: &E2bClient,
-    project: &str,
-) -> Result<Vec<CloudMachineSize>> {
-    let mut sizes = Vec::new();
-    for size in CloudMachineSize::ALL {
-        let exists = client
-            .template_exists(&template_name(project, size), intentd_version())
-            .await
-            .map_err(|error| to_error(&error, Phase::Other))?;
-        if exists {
-            sizes.push(size);
+/// The sizes published for this backend's version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Published {
+    pub(crate) sizes: Vec<CloudMachineSize>,
+    /// From the release's manifest; `false` for the fallback list.
+    pub(crate) verified: bool,
+}
+
+/// The sizes of `project` published for this backend's version, from the
+/// release's template manifest. E2B cannot answer this with the owner's
+/// key: its template lookup covers only the key's own project, so a probe
+/// of Intent's public templates fails for every other key. When the
+/// manifest is missing, unreadable, or for another project or version
+/// (a custom `templateProject`), the sizes every release builds are
+/// offered, unverified: the create stays the real check.
+pub(crate) async fn published_sizes(project: &str) -> Published {
+    let base = std::env::var(MANIFEST_BASE_URL_ENV)
+        .ok()
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| intent_nodes::e2b::DEFAULT_MANIFEST_BASE_URL.to_owned());
+    let fallback = Published {
+        sizes: FALLBACK_SIZES.to_vec(),
+        verified: false,
+    };
+    match intent_nodes::e2b::fetch_template_manifest(&base, intentd_version(), MANIFEST_TIMEOUT)
+        .await
+    {
+        Ok(manifest) if manifest.project == project && manifest.version == intentd_version() => {
+            Published {
+                sizes: CloudMachineSize::ALL
+                    .into_iter()
+                    .filter(|size| manifest.sizes.iter().any(|id| id == size.id()))
+                    .collect(),
+                verified: true,
+            }
+        }
+        Ok(manifest) => {
+            tracing::info!(project = %manifest.project, version = %manifest.version, "cloud machines: the template manifest is for another project or version; sizes unverified");
+            fallback
+        }
+        Err(error) => {
+            tracing::warn!(%error, "cloud machines: could not read the release's template manifest; sizes unverified");
+            fallback
         }
     }
-    Ok(sizes)
 }
 
 /// Record the outcome of an E2B call on the saved settings: a rejected key
