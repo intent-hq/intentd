@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.147] - 2026-11-07
+
+### 🚀 Features
+
+- *(nodes)* Pause, resume and delete E2B sandboxes ([#3121](https://github.com/intent-hq/intentd/pull/3121))
+
+
 ## [0.11.146] - 2026-11-07
 
 ### 🚀 Features
