@@ -1105,7 +1105,7 @@ keeps using the installed CLI.
 
 ## Restore workspace browser use
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{SetPrimaryClientConfirmDialog.svelte,driving-indicator.ts}; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{SetPrimaryClientConfirmDialog.svelte,driving-indicator.ts}; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/lib/components/browser/BrowserTabNotices.svelte; src/features/layout/tab-types/BrowserTabType.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
 
 The workspace sidebar's menu shows **Primary client**: the client that runs this
 workspace's agent browser tabs and tunnels. When that client is offline, the menu
@@ -1126,6 +1126,12 @@ the current primary client; it does not guarantee browser availability. The
 selection updates when the primary changes; after reconnecting, wait for the
 current client and workspace browser state to refresh. Do not promise automatic
 failover or change the primary client without the user's instruction.
+
+An agent-owned browser tab shows **Controlled by** with the agent's name above
+its address bar; click it to open that agent's conversation. When the tab runs on
+another client that is online, a warning above it says this computer isn't primary for the tab:
+cookies and page state stay on the other client, so the page may differ from what
+the agent sees, and its address can change on its own.
 
 ## iOS workspace browser
 
