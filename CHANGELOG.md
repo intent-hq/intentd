@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.148] - 2026-11-07
+
+### 📚 Documentation
+
+- Describe the None agent picker entry in the guide ([#3123](https://github.com/intent-hq/intentd/pull/3123))
+
+
 ## [0.11.147] - 2026-11-07
 
 ### 🚀 Features
