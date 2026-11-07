@@ -1240,7 +1240,8 @@ overview: a turn lands on its prompt and a tool call on the call itself. The row
 details, such as errors, input, output, and start time, open next to its bar; the arrow
 keys move them between rows. To read a long agent or turn, choose **Zoom in** in its
 details; **Show all** or Escape zooms back out. Click the error count to open each
-failed call in turn.
+failed call in turn. **Search steps** filters agents, turns, and tools by name and
+reveals matches inside collapsed agents; clear it to restore the collapsed view.
 Tool calls stay in the timeline for 6 hours, and cost and tokens for 3 days; older turns
 show without them, and the totals leave them out. Cost appears only when the provider
 reports it.
