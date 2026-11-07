@@ -804,6 +804,7 @@ mod tests {
             placement: None,
             effective_isolation: None,
             placement_error: None,
+            cloud_start: None,
             submodules: None,
             setup: None,
             id: AgentId::from_string(id),

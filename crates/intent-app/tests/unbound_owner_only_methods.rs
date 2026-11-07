@@ -354,6 +354,12 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
         ("remoteLinkTraffic.start", json!({})),
         ("remoteLinkTraffic.stop", json!({})),
         ("remoteMachines.backendInfo", json!({})),
+        (
+            "cloudMachines.configure",
+            json!({ "provider": "e2b", "apiKey": "k" }),
+        ),
+        ("cloudMachines.list", json!({})),
+        ("cloudMachines.remove", json!({ "provider": "e2b" })),
         ("remoteMachines.list", json!({})),
         ("remoteMachines.refresh", json!({ "machineId": "m-1" })),
         ("remoteMachines.remove", json!({ "machineId": "m-1" })),

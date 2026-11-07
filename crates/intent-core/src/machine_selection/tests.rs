@@ -73,6 +73,7 @@ fn machine(id: &str, caps: Option<MachineCapabilities>) -> ExposedMachine {
         added_at: "2026-10-01T00:00:00Z".into(),
         last_connected_at: None,
         node_protocol: None,
+        cloud: None,
     }
 }
 

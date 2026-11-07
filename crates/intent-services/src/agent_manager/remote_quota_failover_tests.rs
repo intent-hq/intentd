@@ -668,6 +668,7 @@ async fn expose_claude_node(mgr: &AgentManager, models: &[&str]) {
             added_at: now_iso(),
             last_connected_at: None,
             node_protocol: None,
+            cloud: None,
         })
         .await
         .unwrap();

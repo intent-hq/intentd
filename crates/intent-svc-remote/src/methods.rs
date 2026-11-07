@@ -66,7 +66,26 @@ pub(crate) fn machine_json(row: &ExposedMachine, live: Option<&Shared>) -> Value
     if let Some(protocol) = row.node_protocol {
         machine.insert("nodeProtocol".into(), json!(protocol));
     }
+    if let Some(cloud) = &row.cloud {
+        machine.insert("cloud".into(), json!(cloud));
+    }
     Value::Object(machine)
+}
+
+/// Publish a machine row change: `cloudMachine:changed` for a cloud machine
+/// (never `remoteMachine:changed`), else `remoteMachine:changed`.
+pub(crate) async fn publish_machine(svc: &Services, row: &ExposedMachine, live: Option<&Shared>) {
+    let machine = machine_json(row, live);
+    if row.is_cloud() {
+        svc.publish_cloud_machine_changed(
+            json!({ "machine": machine }),
+            row.cloud.as_ref().map(|cloud| cloud.workspace_id.as_str()),
+        )
+        .await;
+    } else {
+        svc.publish_remote_machine_changed(json!({ "machine": machine }))
+            .await;
+    }
 }
 
 fn coded(internal: bool, code: &str, message: impl Into<String>, extra: Value) -> Error {
@@ -122,14 +141,19 @@ pub(crate) async fn call(
     }
 }
 
+/// This backend's display name, as `remoteMachines.backendInfo` reports it.
+pub(crate) async fn backend_name(svc: &Services) -> String {
+    svc.own_machine_routes()
+        .await
+        .map(|routes| routes.name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(host_name)
+}
+
 async fn backend_info(svc: &Services) -> Result<Value> {
     let backend_id = svc.store().daemon_id().await?;
     let routes = svc.own_machine_routes().await;
-    let name = routes
-        .as_ref()
-        .map(|routes| routes.name.trim().to_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(host_name);
+    let name = backend_name(svc).await;
     let mut info = json!({ "backendId": backend_id, "backendName": name });
     if let Some(routes) = routes {
         info["fingerprint"] = json!(routes.fingerprint);
@@ -172,15 +196,15 @@ async fn list(feature: &RemoteFeature, svc: &Services) -> Result<Value> {
 }
 
 /// The validated `add` params.
-struct AddParams {
-    machine_id: String,
-    name: String,
-    hosts: Vec<String>,
-    port: u16,
-    tc_address: Option<String>,
-    fingerprint: String,
-    credential_id: String,
-    token: String,
+pub(crate) struct AddParams {
+    pub(crate) machine_id: String,
+    pub(crate) name: String,
+    pub(crate) hosts: Vec<String>,
+    pub(crate) port: u16,
+    pub(crate) tc_address: Option<String>,
+    pub(crate) fingerprint: String,
+    pub(crate) credential_id: String,
+    pub(crate) token: String,
 }
 
 fn add_params(params: &Value) -> Result<AddParams> {
@@ -256,11 +280,35 @@ fn add_params(params: &Value) -> Result<AddParams> {
 
 async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<Value> {
     let params = add_params(params)?;
+    let (_, result) = add_machine(feature, svc, params, None).await?;
+    Ok(result)
+}
+
+/// Probe and save a machine, as `remoteMachines.add` does; with `cloud`, a
+/// cloud machine row the backend started itself. Returns the saved row and
+/// the method's result.
+pub(crate) async fn add_machine(
+    feature: &RemoteFeature,
+    svc: &Services,
+    params: AddParams,
+    cloud: Option<intent_core::machines::CloudMachine>,
+) -> Result<(ExposedMachine, Value)> {
     // Held until saved, so no agent starts on the machine between the
     // in-use check and a credential replacement.
     let _lifecycle = feature.lifecycle(&params.machine_id).await;
     let store = svc.store();
     let previous = store.get_exposed_machine(&params.machine_id).await?;
+    // A cloud machine's id is never taken over by the expose flow, nor the
+    // other way round.
+    if previous
+        .as_ref()
+        .is_some_and(|row| row.is_cloud() != cloud.is_some())
+    {
+        return Err(Error::InvalidParams(format!(
+            "machine {} is already known to this backend as another kind of machine",
+            params.machine_id
+        )));
+    }
     let replacing_credential = previous
         .as_ref()
         .is_some_and(|row| row.credential_id.as_str() != params.credential_id);
@@ -360,6 +408,7 @@ async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<
             .map_or_else(|| now.clone(), |row| row.added_at.clone()),
         last_connected_at: Some(now),
         node_protocol: Some(welcome.protocol),
+        cloud,
     };
 
     // Save. A new credential replaces the lease: the old connector stops
@@ -395,16 +444,15 @@ async fn add(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<
     accepted.tc_address.clone_from(&row.tc_address);
     node.shared_ref().set_target(accepted);
     let machine = machine_json(&row, Some(node.shared_ref()));
-    svc.publish_remote_machine_changed(json!({ "machine": machine.clone() }))
-        .await;
+    publish_machine(svc, &row, Some(node.shared_ref())).await;
     let mut result = json!({ "machine": machine });
     if let Some(replaced) = replaced {
         result["replacedCredentialId"] = json!(replaced);
     }
-    Ok(result)
+    Ok((row, result))
 }
 
-fn in_use(name: &str, running: usize) -> Error {
+pub(crate) fn in_use(name: &str, running: usize) -> Error {
     coded(
         false,
         "machine-in-use",
@@ -426,7 +474,12 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     };
     let _lifecycle = feature.lifecycle(&machine_id).await;
     let store = svc.store();
-    let Some(row) = store.get_exposed_machine(&machine_id).await? else {
+    // A cloud machine is unknown here: `cloudMachines.kill` removes it.
+    let Some(row) = store
+        .get_exposed_machine(&machine_id)
+        .await?
+        .filter(|row| !row.is_cloud())
+    else {
         return Ok(json!({ "ok": true }));
     };
     let node = match feature.running_node(&machine_id) {
@@ -482,7 +535,7 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
 /// claims the survivors before they are counted. A revoked credential needs
 /// no stops; an unreachable machine fails the removal `machine-unreachable`
 /// and keeps the machine, its token and its lease.
-async fn recover_survivors(
+pub(crate) async fn recover_survivors(
     feature: &RemoteFeature,
     svc: &Services,
     row: &ExposedMachine,
@@ -547,7 +600,7 @@ fn survivors_unknown(name: &str, recorded: usize, attempts: &Value) -> Error {
 /// fit the machine's 60 s final push) once the link speaks nodeProtocol 9. When any stop is unacknowledged the removal fails
 /// `machine-unreachable` with `unconfirmedStops` and everything stays, the
 /// stops still queued and resent. A revoked credential needs no stops.
-async fn deliver_stops(
+pub(crate) async fn deliver_stops(
     feature: &RemoteFeature,
     node: &RemoteNode,
     agents: &[AgentId],
@@ -618,7 +671,7 @@ async fn refresh(feature: &RemoteFeature, svc: &Services, params: &Value) -> Res
         .store()
         .get_exposed_machine(&machine_id)
         .await?
-        .is_none()
+        .is_none_or(|row| row.is_cloud())
     {
         return Err(not_found(&machine_id));
     }

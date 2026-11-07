@@ -913,6 +913,7 @@ fn agent_lite(id: &str, name: &str, status: AgentStatus, is_responding: bool) ->
         placement: None,
         effective_isolation: None,
         placement_error: None,
+        cloud_start: None,
         submodules: None,
         setup: None,
         id: AgentId::from_string(id),

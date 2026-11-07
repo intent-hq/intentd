@@ -142,6 +142,11 @@ async fn check_machine_prepares(
     workspace_id: &WorkspaceId,
     view: &RemotePlacementView,
 ) -> Result<()> {
+    // A cloud agent whose sandbox is not started yet: its machine is
+    // checked when it links.
+    if view.is_unlinked() {
+        return Ok(());
+    }
     let feature = svc.remote_feature().ok_or_else(no_node)?;
     let node = feature.node(svc, &view.node_id).await?;
     if !node.shared_ref().offers_prepared_checkout() {
@@ -485,6 +490,63 @@ async fn connect_failure(
     )))
 }
 
+/// The checkout a workspace's remote agents start from: its `HEAD` commit
+/// and populated submodules.
+pub(crate) async fn checkout_base(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+) -> Result<RemoteCheckoutBase> {
+    let checkout = workspace_checkout(svc, workspace_id).await?;
+    blocking(move || {
+        Ok(RemoteCheckoutBase {
+            commit: node_git::head_commit(&checkout)?,
+            submodules: node_git::submodule_pins(&checkout)?,
+        })
+    })
+    .await
+}
+
+/// Place an agent admitted on a machine there: its `base` refs and its
+/// record on the machine's lease.
+pub(crate) async fn launch_linked(svc: &Services, request: RemoteLaunchRequest) -> Result<()> {
+    let RemoteLaunchRequest {
+        workspace_id,
+        agent_id,
+        mut view,
+    } = request;
+    check_machine_prepares(svc, &workspace_id, &view).await?;
+    let checkout = workspace_checkout(svc, &workspace_id).await?;
+    if let Some(owner) = view
+        .parent_work
+        .as_ref()
+        .filter(|work| work.copied.is_none())
+        .map(|work| work.agent_id.clone())
+    {
+        copy_parent_work(svc, &workspace_id, (&checkout, &agent_id), owner, &mut view).await?;
+    }
+    let remote = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
+    let commit = git2::Oid::from_str(&view.base_commit)
+        .map_err(|_| Error::Internal("remote launch: invalid base commit".into()))?;
+    let submodules = view.pins().to_vec();
+    blocking(move || {
+        node_git::write_base_ref(&checkout, &remote, commit)?;
+        for pin in &submodules {
+            write_module_base_ref(&checkout, &remote, pin)?;
+        }
+        Ok(())
+    })
+    .await?;
+    svc.store()
+        .record_remote_agent(&RemoteAgentRecord {
+            agent_id,
+            workspace_id,
+            node_id: view.node_id,
+            lease_id: view.lease_id,
+            created_at: intent_core::now_iso(),
+        })
+        .await
+}
+
 impl RemoteLaunchPort for RemoteLaunch {
     fn placements<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<PlatformAvailability>> {
         Box::pin(machines_availability(svc))
@@ -549,6 +611,9 @@ impl RemoteLaunchPort for RemoteLaunch {
                     PlatformAvailability::none(intent_core::now_iso()),
                 ));
             };
+            if let Some(view) = crate::cloud::admit(feature, svc, placement, needs).await? {
+                return Ok(view);
+            }
             let source = ExposedMachines { svc, feature };
             let request = PlacementRequest {
                 placement,
@@ -599,6 +664,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                 skills: None,
                 shared_checkout_of: None,
                 parent_work: None,
+                cloud_start: None,
             })
         })
     }
@@ -608,16 +674,7 @@ impl RemoteLaunchPort for RemoteLaunch {
         svc: &'a Services,
         workspace_id: &'a WorkspaceId,
     ) -> BoxFuture<'a, Result<RemoteCheckoutBase>> {
-        Box::pin(async move {
-            let checkout = workspace_checkout(svc, workspace_id).await?;
-            blocking(move || {
-                Ok(RemoteCheckoutBase {
-                    commit: node_git::head_commit(&checkout)?,
-                    submodules: node_git::submodule_pins(&checkout)?,
-                })
-            })
-            .await
-        })
+        Box::pin(checkout_base(svc, workspace_id))
     }
 
     fn manages_machines(&self) -> bool {
@@ -670,43 +727,19 @@ impl RemoteLaunchPort for RemoteLaunch {
         request: RemoteLaunchRequest,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let RemoteLaunchRequest {
-                workspace_id,
-                agent_id,
-                mut view,
-            } = request;
-            check_machine_prepares(svc, &workspace_id, &view).await?;
-            let checkout = workspace_checkout(svc, &workspace_id).await?;
-            if let Some(owner) = view
-                .parent_work
-                .as_ref()
-                .filter(|work| work.copied.is_none())
-                .map(|work| work.agent_id.clone())
-            {
-                copy_parent_work(svc, &workspace_id, (&checkout, &agent_id), owner, &mut view)
-                    .await?;
+            // A new cloud agent: its sandbox starts after the reply, and
+            // its first turn waits for it.
+            if request.view.is_cloud() && request.view.is_unlinked() {
+                crate::cloud::begin_start(
+                    svc,
+                    &request.workspace_id,
+                    &request.agent_id,
+                    request.view.placement_error.as_ref(),
+                )
+                .await;
+                return Ok(());
             }
-            let remote = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
-            let commit = git2::Oid::from_str(&view.base_commit)
-                .map_err(|_| Error::Internal("remote launch: invalid base commit".into()))?;
-            let submodules = view.pins().to_vec();
-            blocking(move || {
-                node_git::write_base_ref(&checkout, &remote, commit)?;
-                for pin in &submodules {
-                    write_module_base_ref(&checkout, &remote, pin)?;
-                }
-                Ok(())
-            })
-            .await?;
-            svc.store()
-                .record_remote_agent(&RemoteAgentRecord {
-                    agent_id,
-                    workspace_id,
-                    node_id: view.node_id,
-                    lease_id: view.lease_id,
-                    created_at: intent_core::now_iso(),
-                })
-                .await
+            launch_linked(svc, request).await
         })
     }
 
@@ -843,15 +876,23 @@ impl RemoteLaunchPort for RemoteLaunch {
         agent_id: &'a AgentId,
     ) -> BoxFuture<'a, Result<Arc<RemoteRuntime>>> {
         Box::pin(async move {
-            let record = svc
-                .store()
-                .get_remote_agent(agent_id)
-                .await?
-                .ok_or_else(|| {
-                    Error::InvalidParams(format!(
-                        "node-agent-unplaced: agent {agent_id} was not placed on the execution node"
-                    ))
-                })?;
+            let mut record = svc.store().get_remote_agent(agent_id).await?;
+            // A cloud agent whose sandbox is starting (or gone) waits for
+            // it; a message sent meanwhile runs once it is linked.
+            if record.is_none() {
+                let session = svc.store().get_agent_session_summary(agent_id).await?;
+                if RemotePlacementView::from_metadata(session.metadata.as_ref())
+                    .is_some_and(|view| view.is_cloud())
+                {
+                    crate::cloud::wait_linked(svc, agent_id).await?;
+                    record = svc.store().get_remote_agent(agent_id).await?;
+                }
+            }
+            let record = record.ok_or_else(|| {
+                Error::InvalidParams(format!(
+                    "node-agent-unplaced: agent {agent_id} was not placed on the execution node"
+                ))
+            })?;
             let feature = svc.remote_feature().ok_or_else(no_node)?;
             // Held until the runtime is attached, so a replacement or removal
             // of the machine either sees this agent or happens first.
@@ -969,5 +1010,14 @@ impl RemoteLaunchPort for RemoteLaunch {
             let feature = svc.remote_feature().ok_or_else(no_node)?;
             crate::methods::call(feature, svc, method, params).await
         })
+    }
+
+    fn cloud_machines<'a>(
+        &'a self,
+        svc: &'a Services,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(crate::cloud::call(svc, method, params))
     }
 }

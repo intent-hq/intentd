@@ -1510,6 +1510,10 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 ),
             ],
         ),
+        row(
+            "cloudMachines.list",
+            vec![v("default", json!({}), Items("/machines", seed::CLOUD_MACHINES))],
+        ),
         fixed(
             "remoteMachines.backendInfo",
             "This backend's own id, name and certificate pin.",

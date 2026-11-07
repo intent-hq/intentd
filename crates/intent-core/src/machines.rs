@@ -411,6 +411,214 @@ pub struct ExposedMachine {
     /// kept while disconnected; `None` before the first bind. Saved scripts
     /// need 8.
     pub node_protocol: Option<u32>,
+    /// Set on a machine the backend started itself in a cloud sandbox
+    /// (`RemoteMachine.cloud`). Such rows are hidden from
+    /// `remoteMachines.*` and from placement without a `nodeId`.
+    pub cloud: Option<CloudMachine>,
+}
+
+impl ExposedMachine {
+    /// Whether this row is a cloud machine the backend started itself.
+    #[must_use]
+    pub fn is_cloud(&self) -> bool {
+        self.cloud.is_some()
+    }
+}
+
+/// The only cloud machine provider: E2B.
+pub const CLOUD_PROVIDER_E2B: &str = "e2b";
+/// Its display name, also every cloud agent's `nodeName`.
+pub const CLOUD_PROVIDER_E2B_NAME: &str = "E2B";
+
+/// A cloud sandbox size, `<vCPU>x<GiB>`; each size is its own template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CloudMachineSize {
+    #[serde(rename = "2x4")]
+    S2x4,
+    #[serde(rename = "4x8")]
+    S4x8,
+    #[serde(rename = "8x16")]
+    S8x16,
+    #[serde(rename = "16x32")]
+    S16x32,
+}
+
+impl CloudMachineSize {
+    /// Every size, smallest first.
+    pub const ALL: [Self; 4] = [Self::S2x4, Self::S4x8, Self::S8x16, Self::S16x32];
+    /// The size new sandboxes use unless the owner picks another.
+    pub const DEFAULT: Self = Self::S4x8;
+
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::S2x4 => "2x4",
+            Self::S4x8 => "4x8",
+            Self::S8x16 => "8x16",
+            Self::S16x32 => "16x32",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|size| size.id() == id)
+    }
+
+    #[must_use]
+    pub fn vcpu(self) -> u32 {
+        match self {
+            Self::S2x4 => 2,
+            Self::S4x8 => 4,
+            Self::S8x16 => 8,
+            Self::S16x32 => 16,
+        }
+    }
+
+    #[must_use]
+    pub fn memory_mib(self) -> u32 {
+        self.vcpu() * 2048
+    }
+
+    /// The lowest E2B plan that allows the size.
+    #[must_use]
+    pub fn plan(self) -> &'static str {
+        if self.vcpu() <= 4 {
+            "hobby"
+        } else {
+            "pro-raised-limits"
+        }
+    }
+
+    /// `CloudMachineSizeInfo` on the wire.
+    #[must_use]
+    pub fn info_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id(),
+            "vcpu": self.vcpu(),
+            "memoryMiB": self.memory_mib(),
+            "plan": self.plan(),
+        })
+    }
+}
+
+/// `CloudMachineState.state`: where the sandbox is in its life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CloudSandboxState {
+    Running,
+    Pausing,
+    Paused,
+    Resuming,
+    Stopping,
+}
+
+/// Who started a cloud machine (`cloud.startedBy`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudStartedBy {
+    pub principal_id: String,
+    pub display_name: Option<String>,
+}
+
+/// `RemoteMachine.cloud`: the sandbox behind a cloud machine row. Holds no
+/// key or token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudMachine {
+    pub provider: String,
+    pub sandbox_id: String,
+    pub state: CloudSandboxState,
+    pub template: String,
+    pub size: CloudMachineSize,
+    pub started_by: CloudStartedBy,
+    /// The top-level agent the sandbox was started for.
+    pub agent_id: String,
+    pub workspace_id: String,
+    pub started_at: String,
+    /// Seconds not paused since start, for cost estimates.
+    pub running_seconds: u64,
+}
+
+/// `AgentLite.cloudStart.step`: how far a new cloud machine got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CloudStartStep {
+    CreatingSandbox,
+    StartingDaemon,
+    Connecting,
+}
+
+/// `AgentLite.cloudStart`, present while an agent's cloud machine starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudStart {
+    pub step: CloudStartStep,
+}
+
+/// `error.data.code` of a cloud machine that cannot start or be kept.
+pub const CLOUD_MACHINE_UNAVAILABLE_CODE: &str = "cloud-machine-unavailable";
+/// `error.data.code` when a cloud launch would send no profile environment.
+pub const CLOUD_PROFILE_REQUIRED_CODE: &str = "cloud-profile-required";
+/// `error.data.code` when E2B refused for a plan limit.
+pub const CLOUD_QUOTA_CODE: &str = "cloud-quota";
+
+/// `cloud-machine-unavailable`: E2B cannot start or keep a sandbox.
+/// `not-configured` and `key-rejected` are `-32602`; every other reason is
+/// `-32603`. Never carries the key.
+#[must_use]
+pub fn cloud_machine_unavailable(
+    reason: &str,
+    retryable: bool,
+    status: Option<u16>,
+    message: impl Into<String>,
+) -> crate::Error {
+    let internal = !matches!(reason, "not-configured" | "key-rejected");
+    let mut data = serde_json::json!({
+        "code": CLOUD_MACHINE_UNAVAILABLE_CODE,
+        "provider": CLOUD_PROVIDER_E2B,
+        "reason": reason,
+        "retryable": retryable,
+    });
+    if let Some(status) = status {
+        data["status"] = serde_json::json!(status);
+    }
+    crate::Error::remote_machine(internal, message, data)
+}
+
+/// `cloud-profile-required` (`-32602`): the launch would send no profile
+/// environment, and a sandbox has no sign-in of its own.
+#[must_use]
+pub fn cloud_profile_required(provider_ref: &str) -> crate::Error {
+    crate::Error::remote_machine(
+        false,
+        format!(
+            "\"{provider_ref}\" uses this backend's own sign-in, which E2B can't use; pick a profile with an API key or token."
+        ),
+        serde_json::json!({
+            "code": CLOUD_PROFILE_REQUIRED_CODE,
+            "provider": CLOUD_PROVIDER_E2B,
+            "providerRef": provider_ref,
+        }),
+    )
+}
+
+/// `cloud-quota` (`-32602`): E2B refused for a plan limit (`concurrency`,
+/// `rate` or `plan`). Only `plan` is not retryable.
+#[must_use]
+pub fn cloud_quota(
+    limit: &str,
+    retry_after_seconds: Option<u64>,
+    message: impl Into<String>,
+) -> crate::Error {
+    let mut data = serde_json::json!({
+        "code": CLOUD_QUOTA_CODE,
+        "provider": CLOUD_PROVIDER_E2B,
+        "limit": limit,
+        "retryable": limit != "plan",
+    });
+    if let Some(seconds) = retry_after_seconds {
+        data["retryAfterSeconds"] = serde_json::json!(seconds);
+    }
+    crate::Error::remote_machine(false, message, data)
 }
 
 /// Where this machine's executor link can be dialed, as `executor.mint`

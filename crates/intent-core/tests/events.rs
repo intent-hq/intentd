@@ -229,6 +229,7 @@ const COLLABORATOR_REFUSED_EVENT_TYPES: &[&str] = &[
     "browser:tab-updated",
     "build:completed",
     "build:started",
+    "cloudMachine:changed",
     "git:clone:done",
     "git:clone:progress",
     "gitRoot:registered",

@@ -73,6 +73,9 @@ browser.upsertTab
 chat.subscribe
 chat.unsubscribe
 client.list
+cloudMachines.configure
+cloudMachines.list
+cloudMachines.remove
 comment.add
 comment.delete
 comment.getThread

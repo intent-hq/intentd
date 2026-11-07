@@ -33,6 +33,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::common;
 
+mod cloud;
 mod secrets;
 mod sub_agents;
 

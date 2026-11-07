@@ -257,6 +257,7 @@ fn machine(id: &str, credential: &str, added_at: &str) -> ExposedMachine {
         added_at: added_at.into(),
         last_connected_at: None,
         node_protocol: None,
+        cloud: None,
     }
 }
 

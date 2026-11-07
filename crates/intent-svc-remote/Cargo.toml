@@ -15,6 +15,8 @@ intent-transport = { path = "../intent-transport", version = "0.11.145" }
 intent-acp = { path = "../intent-acp", version = "0.11.145" }
 intent-git = { path = "../intent-git", version = "0.11.145" }
 intent-providers = { path = "../intent-providers", version = "0.11.145" }
+intent-nodes = { path = "../intent-nodes", version = "0.11.145" }
+serde = { workspace = true }
 git2 = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }

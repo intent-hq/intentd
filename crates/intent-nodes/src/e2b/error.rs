@@ -24,6 +24,15 @@ pub enum E2bError {
         error_code: Option<String>,
         message: String,
     },
+    /// E2B refused a create because the project's plan or limits do not
+    /// allow the template's vCPU or memory. Not retryable. Maps to
+    /// `cloud-quota` with limit `plan`.
+    #[error("E2B plan limit: {message}")]
+    PlanLimit {
+        status: u16,
+        error_code: Option<String>,
+        message: String,
+    },
     /// E2B kept no outcome for this idempotency key and did not run the create
     /// again. A sandbox may exist: look it up by metadata before a new create.
     #[error(
@@ -72,6 +81,7 @@ pub enum E2bError {
 pub enum QuotaLimit {
     Concurrency,
     Rate,
+    Plan,
 }
 
 impl QuotaLimit {
@@ -80,6 +90,7 @@ impl QuotaLimit {
         match self {
             Self::Concurrency => "concurrency",
             Self::Rate => "rate",
+            Self::Plan => "plan",
         }
     }
 }
@@ -91,6 +102,7 @@ impl E2bError {
         match self {
             Self::ConcurrencyLimit { .. } => Some(QuotaLimit::Concurrency),
             Self::RateLimited { .. } => Some(QuotaLimit::Rate),
+            Self::PlanLimit { .. } => Some(QuotaLimit::Plan),
             _ => None,
         }
     }

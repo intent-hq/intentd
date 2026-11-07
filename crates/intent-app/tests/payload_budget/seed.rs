@@ -112,6 +112,8 @@ pub const BIG_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 /// exposed to this backend.
 pub const EXECUTOR_BACKENDS: usize = 30;
 pub const EXPOSED_MACHINES: usize = 30;
+/// Cloud machine rows (one per live E2B sandbox) and their provider.
+pub const CLOUD_MACHINES: usize = 30;
 /// Extra hello'd device connections kept open for `client.list`.
 pub const DEVICES: usize = 30;
 const DEVICE_KINDS: [&str; 3] = ["desktop", "laptop", "phone"];
@@ -847,9 +849,63 @@ pub async fn store(state: &LargeState) -> Seeded {
                 added_at: "2026-01-01T00:00:00.000Z".into(),
                 last_connected_at: None,
                 node_protocol: None,
+                cloud: None,
             })
             .await
             .expect("exposed machine");
+    }
+    store
+        .save_cloud_machine_provider(
+            "e2b",
+            &json!({
+                "templateProject": "intent-hq",
+                "size": "4x8",
+                "idlePauseMinutes": 10,
+                "pausedDeleteDays": 7,
+                "configuredAt": "2026-01-01T00:00:00.000Z",
+                "sizes": ["2x4", "4x8", "8x16", "16x32"],
+            })
+            .to_string(),
+        )
+        .await
+        .expect("cloud machine provider");
+    for i in 0..CLOUD_MACHINES {
+        store
+            .save_exposed_machine(&intent_core::machines::ExposedMachine {
+                id: format!("large-state-cloud-machine-{i:02}"),
+                name: format!("E2B · {}", prose(i + 2, 60).replace('\n', " ")),
+                hosts: Vec::new(),
+                port: 5181,
+                tc_address: Some(format!("tc{i:032x}")),
+                fingerprint: format!("{:064x}", i + 3_000),
+                credential_id: intent_core::ExecutorCredentialId::from(format!(
+                    "cloud-credential-{i:02}"
+                )),
+                platform: None,
+                capabilities: None,
+                observed_at: None,
+                state: intent_core::machines::RemoteMachineState::Disconnected,
+                added_at: "2026-01-01T00:00:00.000Z".into(),
+                last_connected_at: None,
+                node_protocol: None,
+                cloud: Some(intent_core::machines::CloudMachine {
+                    provider: "e2b".into(),
+                    sandbox_id: format!("sbx{i:024x}"),
+                    state: intent_core::machines::CloudSandboxState::Running,
+                    template: "intent-hq/intent-node-16x32:0.11.139".into(),
+                    size: intent_core::machines::CloudMachineSize::S16x32,
+                    started_by: intent_core::machines::CloudStartedBy {
+                        principal_id: format!("principal-{i:032x}"),
+                        display_name: Some(prose(i + 3, 40).replace('\n', " ")),
+                    },
+                    agent_id: format!("agent-{i:032x}"),
+                    workspace_id: big_ws.0.clone(),
+                    started_at: "2026-01-01T00:00:00.000Z".into(),
+                    running_seconds: u64::MAX,
+                }),
+            })
+            .await
+            .expect("cloud machine");
     }
 
     // The workspace's remembered specialist choice.

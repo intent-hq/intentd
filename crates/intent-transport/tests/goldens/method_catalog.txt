@@ -132,6 +132,9 @@ router agent.wakeOrCreate
 router agent.workers.list
 router agent.workers.stop
 router client.list
+router cloudMachines.configure
+router cloudMachines.list
+router cloudMachines.remove
 router comment.add
 router comment.delete
 router comment.getThread

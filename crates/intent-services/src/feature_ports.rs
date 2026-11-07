@@ -1545,6 +1545,27 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
             )))
         })
     }
+
+    /// `cloudMachines.<method>` with `params`, after the services checked
+    /// the caller. A daemon without the remote feature has no cloud
+    /// machines.
+    ///
+    /// # Errors
+    ///
+    /// As documented for the method; [`Error::Unsupported`] by default.
+    fn cloud_machines<'a>(
+        &'a self,
+        svc: &'a Services,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        let _ = (svc, params);
+        Box::pin(async move {
+            Err(Error::Unsupported(format!(
+                "cloudMachines.{method}: this daemon cannot start cloud machines"
+            )))
+        })
+    }
 }
 
 /// One secret frame for [`RemoteLaunchPort::machine_secret`]. `Debug`

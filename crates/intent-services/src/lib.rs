@@ -35940,6 +35940,14 @@ impl WorkspaceApi for Services {
         Box::pin(self.remote_machines_op(method, params))
     }
 
+    fn cloud_machines(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.cloud_machines_op(method, params))
+    }
+
     // Presence (multiplayer w5) — see `presence`.
 
     fn presence_connect(&self, connection_id: String) -> BoxFuture<'_, Result<()>> {
