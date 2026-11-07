@@ -22,7 +22,7 @@ pub enum CommandEnvironment {
 /// until its process tree has exited, including after cancellation or timeout.
 #[cfg_attr(
     not(unix),
-    allow(
+    expect(
         clippy::unused_async,
         reason = "Keep the shared async API on targets without automatic cache repair"
     )
@@ -49,7 +49,8 @@ mod unix {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
-    use std::sync::{Arc, LazyLock};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use nix::errno::Errno;
@@ -76,11 +77,17 @@ mod unix {
         }) {
             return false;
         }
-        let Some(snapshot) = LaunchSnapshot::capture(command) else {
+        let cancelled_flag = Arc::new(AtomicBool::new(false));
+        let Some(snapshot) = LaunchSnapshot::capture(command, deadline, cancelled_flag.clone())
+        else {
             return false;
         };
         let package = package.to_owned();
         let (cancel, mut cancelled) = oneshot::channel::<()>();
+        let cancellation = CancelOnDrop {
+            flag: cancelled_flag,
+            _signal: cancel,
+        };
         let job = intent_core::caller::spawn_with_current_caller(async move {
             let permit = tokio::select! {
                 permit = REPAIR_SLOTS.clone().acquire_owned() => match permit {
@@ -95,10 +102,38 @@ mod unix {
             ) {
                 return false;
             }
-            let started = tokio::task::spawn_blocking(move || {
+            // Release queued owners without waiting for an available blocking worker.
+            let pending = Arc::new(Mutex::new(Some((
+                snapshot,
+                package,
+                environment,
+                keep_alive,
+                permit,
+            ))));
+            let queued = pending.clone();
+            let mut startup = tokio::task::spawn_blocking(move || {
+                let request = queued
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()?;
+                let (snapshot, package, environment, keep_alive, permit) = request;
                 snapshot.start(package, environment, keep_alive, permit)
-            })
-            .await;
+            });
+            let started = tokio::select! {
+                result = &mut startup => result,
+                _ = &mut cancelled => {
+                    startup.abort();
+                    let request = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+                    if request.is_some() {
+                        drop(request);
+                        return false;
+                    }
+                    if let Ok(Some(mut running)) = startup.await {
+                        running.cleanup().await;
+                    }
+                    return false;
+                }
+            };
             let Ok(Some(mut running)) = started else {
                 return false;
             };
@@ -109,8 +144,19 @@ mod unix {
             .ok()
             .and_then(Result::ok)
             .unwrap_or(false);
-        drop(cancel);
+        drop(cancellation);
         repaired
+    }
+
+    struct CancelOnDrop {
+        flag: Arc<AtomicBool>,
+        _signal: oneshot::Sender<()>,
+    }
+
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.flag.store(true, Ordering::Release);
+        }
     }
 
     struct LaunchSnapshot {
@@ -118,10 +164,16 @@ mod unix {
         cwd: Option<PathBuf>,
         env: Vec<(OsString, Option<OsString>)>,
         expires: u128,
+        deadline: tokio::time::Instant,
+        cancelled: Arc<AtomicBool>,
     }
 
     impl LaunchSnapshot {
-        fn capture(command: &Command) -> Option<Self> {
+        fn capture(
+            command: &Command,
+            deadline: tokio::time::Instant,
+            cancelled: Arc<AtomicBool>,
+        ) -> Option<Self> {
             let command = command.as_std();
             let npx = Path::new(command.get_program());
             let npm_name = match npx.file_name()?.to_str()? {
@@ -139,6 +191,8 @@ mod unix {
                 expires: (SystemTime::now().duration_since(UNIX_EPOCH).ok()?
                     + NPX_CACHE_REPAIR_BUDGET)
                     .as_millis(),
+                deadline,
+                cancelled,
             })
         }
 
@@ -175,6 +229,11 @@ mod unix {
                 }
             }
             crate::AgentPriority::from_env().apply(&mut command);
+            if self.cancelled.load(Ordering::Acquire)
+                || tokio::time::Instant::now() >= self.deadline
+            {
+                return None;
+            }
             let child = command.spawn().ok()?;
             let pid = child.id()?;
             Some(RunningRepair {
@@ -201,6 +260,11 @@ mod unix {
                 status = self.child.wait() => status.ok(),
                 _ = cancelled => None,
             };
+            self.cleanup().await;
+            status.is_some_and(|status| status.success())
+        }
+
+        async fn cleanup(&mut self) {
             let descendants = if self.child.id().is_some() {
                 crate::descendant_pids(self.pid).await
             } else {
@@ -219,7 +283,6 @@ mod unix {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             self.cleaned = true;
-            status.is_some_and(|status| status.success())
         }
     }
 

@@ -4,6 +4,8 @@
 
 #![cfg(unix)]
 
+#[path = "npx_cache_recovery/blocking_faults.rs"]
+mod blocking_faults;
 #[path = "npx_cache_recovery/queue_faults.rs"]
 mod queue_faults;
 #[path = "npx_cache_recovery/storage_faults.rs"]
