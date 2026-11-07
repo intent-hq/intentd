@@ -431,7 +431,10 @@ async fn start(
     let saved = config::load(svc)
         .await?
         .ok_or_else(config::not_configured)?;
-    let client = config::saved_client(svc).await?;
+    let key = config::saved_key(svc)
+        .await?
+        .ok_or_else(config::not_configured)?;
+    let client = config::client(key.clone())?;
     let session = svc.store().get_agent_session_summary(agent_id).await?;
     let backend_id = svc.store().daemon_id().await?;
     let template = saved.template(saved.size);
@@ -457,7 +460,7 @@ async fn start(
         Ok(created) => created,
         Err(error) => {
             if is_key_rejected(&error) {
-                config::note_key_rejected(svc).await;
+                config::note_key_rejected(svc, &key).await;
             }
             return Err(error);
         }

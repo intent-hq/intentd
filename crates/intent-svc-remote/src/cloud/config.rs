@@ -395,9 +395,19 @@ pub(crate) async fn published_sizes(project: &str) -> Option<Published> {
     }
 }
 
-/// Mark the saved key rejected after E2B refused it (401) on another call,
-/// so placement refuses before any sandbox, and announce the change.
-pub(crate) async fn note_key_rejected(svc: &Services) {
+/// Mark the saved key rejected after E2B refused `refused` (401) on another
+/// call, so placement refuses before any sandbox, and announce the change.
+/// Under the settings lock, and only while `refused` is still the saved
+/// key: a start that used a key the owner has since replaced never marks
+/// the new one.
+pub(crate) async fn note_key_rejected(svc: &Services, refused: &SecretString) {
+    let Ok(feature) = super::feature(svc) else {
+        return;
+    };
+    let _settings = feature.cloud.settings.lock().await;
+    if !matches!(saved_key(svc).await, Ok(Some(saved)) if &saved == refused) {
+        return;
+    }
     let Ok(Some(mut saved)) = load(svc).await else {
         return;
     };
