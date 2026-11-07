@@ -139,6 +139,12 @@ async fn pause_and_kill_admit_only_the_owner_and_the_starter() {
     // The owner may act on any machine; an unknown one is not-found.
     let owner = backend.store().get_primary_principal().await.unwrap().id;
     cloud_row(&backend, "m-2", &starter).await;
+    match call_as(&backend, &owner, HostRole::Owner, "pause", "m-2").await {
+        Err(Error::RemoteMachine(failure)) => {
+            assert_eq!(failure.data["reason"], "not-configured", "{failure:?}");
+        }
+        other => panic!("the owner's pause reaches E2B: {other:?}"),
+    }
     call_as(&backend, &owner, HostRole::Owner, "kill", "m-2")
         .await
         .expect("the owner may kill");

@@ -179,6 +179,12 @@ impl CloudState {
             .or_insert_with(tokio::time::Instant::now)
     }
 
+    /// Forget the first sight of every orphan E2B no longer lists.
+    fn keep_orphans<'a>(&self, listed: impl Iterator<Item = &'a str>) {
+        let listed: HashSet<&str> = listed.collect();
+        crate::lock(&self.orphans).retain(|id, _| listed.contains(id.as_str()));
+    }
+
     fn forget_orphan(&self, sandbox_id: &str) {
         crate::lock(&self.orphans).remove(sandbox_id);
     }

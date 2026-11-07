@@ -697,6 +697,9 @@ async fn reap(
         .filter_map(|row| row.cloud.as_ref().map(|c| c.sandbox_id.as_str()))
         .collect();
     let starting = feature.cloud.starting_agents();
+    feature
+        .cloud
+        .keep_orphans(listed.iter().map(|sandbox| sandbox.sandbox_id.as_str()));
     for sandbox in listed {
         if known.contains(sandbox.sandbox_id.as_str())
             || sandbox
