@@ -28,7 +28,7 @@ use crate::methods::AddParams;
 use crate::RemoteFeature;
 
 /// Longest wait for a sandbox start: create, boot, tunnel and probe.
-const START_WAIT: Duration = Duration::from_secs(10 * 60);
+pub(crate) const START_WAIT: Duration = Duration::from_secs(10 * 60);
 
 /// E2B timeout of a new sandbox. It pauses (never dies) when this runs out.
 const SANDBOX_TIMEOUT_SECS: u32 = 60 * 60;
@@ -211,7 +211,19 @@ pub(crate) async fn admit(
 
 /// Start the sandbox of a just-created (or sandbox-less) cloud agent in the
 /// background. A start already in flight for it is kept.
-pub(crate) async fn begin_start(svc: &Services, workspace_id: &WorkspaceId, agent_id: &AgentId) {
+///
+/// `seen` is the `placementError` the caller saw on the agent's unlinked
+/// view. A start removes itself from the in-flight map only after its
+/// outcome is on the view, so the view is read again once this start is
+/// registered: when it is linked now, or its error changed, a start ended
+/// in between and none is begun (no second sandbox for a linked agent, no
+/// instant retry of a start that just failed).
+pub(crate) async fn begin_start(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+    seen: Option<&PlacementError>,
+) {
     let Ok(feature) = super::feature(svc) else {
         return;
     };
@@ -222,6 +234,20 @@ pub(crate) async fn begin_start(svc: &Services, workspace_id: &WorkspaceId, agen
             return;
         }
         starts.insert(agent_id.to_string(), receiver);
+    }
+    let current = svc
+        .store()
+        .get_agent_session_summary(agent_id)
+        .await
+        .ok()
+        .and_then(|session| RemotePlacementView::from_metadata(session.metadata.as_ref()));
+    let still_waiting = current
+        .as_ref()
+        .is_some_and(|view| view.is_unlinked() && view.placement_error.as_ref() == seen);
+    if !still_waiting {
+        crate::lock(&feature.cloud.starts).remove(agent_id.as_str());
+        let _ = sender.send(Some(Ok(())));
+        return;
     }
     let started_by = super::started_by(svc).await;
     let svc = svc.clone();
@@ -269,7 +295,13 @@ pub(crate) async fn wait_linked(svc: &Services, agent_id: &AgentId) -> Result<Re
             Some(receiver) => receiver,
             None if !started => {
                 started = true;
-                begin_start(svc, &session.workspace_id, agent_id).await;
+                begin_start(
+                    svc,
+                    &session.workspace_id,
+                    agent_id,
+                    view.placement_error.as_ref(),
+                )
+                .await;
                 continue;
             }
             None => {
@@ -339,9 +371,15 @@ async fn record_failure(
 ) {
     tracing::warn!(agent = %agent_id, code = %failure.data["code"], reason = %failure.data["reason"], "cloud machine: the sandbox did not start");
     let error = PlacementError::cloud(&failure.message, &failure.data);
+    // A failure after the link (the launch on the new machine) leaves no
+    // machine: the agent is unlinked again, so its next message starts a
+    // new sandbox.
     match crate::view::update(svc.store(), workspace_id, agent_id, |view| {
         view.cloud_start = None;
         view.placement_error = Some(error);
+        view.node_id.clear();
+        view.lease_id.clear();
+        view.shared_checkout_of = None;
     })
     .await
     {
@@ -461,7 +499,13 @@ async fn start(
             Some(cloud),
         )
         .await?;
-        let launched = link(feature, svc, workspace_id, agent_id, &machine_id).await;
+        // `cloudMachines.remove` may have run meanwhile: nothing would be
+        // left to delete this sandbox.
+        let launched = if config::load(svc).await?.is_none() {
+            Err(config::not_configured())
+        } else {
+            link(feature, svc, workspace_id, agent_id, &machine_id).await
+        };
         if let Err(error) = launched {
             if let Ok(Some(row)) = svc.store().get_exposed_machine(&machine_id).await {
                 delete_machine(feature, svc, &row, Some(&client)).await;

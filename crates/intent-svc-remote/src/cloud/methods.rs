@@ -267,8 +267,11 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     if config::load(svc).await?.is_none() {
         return Ok(json!({ "ok": true, "unconfirmedStops": [] }));
     }
+    // A sandbox still starting counts as live: it would add its machine
+    // after the key is gone, and nothing could delete it then.
+    let starting = feature.cloud.starts_in_flight();
     let rows = svc.store().list_cloud_machines().await?;
-    if !rows.is_empty() && !stop_agents {
+    if (!rows.is_empty() || !starting.is_empty()) && !stop_agents {
         let running: usize = rows
             .iter()
             .map(|row| {
@@ -277,8 +280,16 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
                     .map_or(0, |node| node.running())
             })
             .sum();
-        return Err(crate::methods::in_use("E2B", running.max(rows.len())));
+        return Err(crate::methods::in_use(
+            "E2B",
+            running.max(rows.len() + starting.len()),
+        ));
     }
+    for mut start in starting {
+        let _ =
+            tokio::time::timeout(super::start::START_WAIT, start.wait_for(Option::is_some)).await;
+    }
+    let rows = svc.store().list_cloud_machines().await?;
     let client = config::saved_client(svc).await.ok();
     let mut unconfirmed = Vec::new();
     for row in rows {

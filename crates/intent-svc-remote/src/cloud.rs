@@ -73,6 +73,11 @@ impl CloudState {
     fn start_of(&self, agent_id: &AgentId) -> Option<watch::Receiver<StartOutcome>> {
         crate::lock(&self.starts).get(agent_id.as_str()).cloned()
     }
+
+    /// Every start in flight.
+    fn starts_in_flight(&self) -> Vec<watch::Receiver<StartOutcome>> {
+        crate::lock(&self.starts).values().cloned().collect()
+    }
 }
 
 /// The principal behind the current call, for `cloud.startedBy`: a wire

@@ -730,7 +730,13 @@ impl RemoteLaunchPort for RemoteLaunch {
             // A new cloud agent: its sandbox starts after the reply, and
             // its first turn waits for it.
             if request.view.is_cloud() && request.view.is_unlinked() {
-                crate::cloud::begin_start(svc, &request.workspace_id, &request.agent_id).await;
+                crate::cloud::begin_start(
+                    svc,
+                    &request.workspace_id,
+                    &request.agent_id,
+                    request.view.placement_error.as_ref(),
+                )
+                .await;
                 return Ok(());
             }
             launch_linked(svc, request).await
