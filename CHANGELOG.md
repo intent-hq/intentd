@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.144] - 2026-11-07
+
+### 📚 Documentation
+
+- Describe New Workspace prompt focus ([#3115](https://github.com/intent-hq/intentd/pull/3115))
+
+
 ## [0.11.143] - 2026-11-06
 
 ### 📚 Documentation
