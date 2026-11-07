@@ -13,6 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[track_caller]
 fn ps_region(name: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.ps1");
     let script = fs::read_to_string(&path).unwrap();

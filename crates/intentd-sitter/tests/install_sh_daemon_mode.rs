@@ -79,6 +79,7 @@ impl Run {
         self.calls.iter().any(|c| c == call)
     }
 
+    #[track_caller]
     fn position(&self, call: &str) -> usize {
         self.calls
             .iter()
@@ -113,6 +114,7 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+#[track_caller]
 fn sh(dir: &Path, command: &str) {
     let status = Command::new("sh")
         .arg("-c")
