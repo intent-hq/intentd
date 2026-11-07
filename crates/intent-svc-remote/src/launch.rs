@@ -693,7 +693,9 @@ impl RemoteLaunchPort for RemoteLaunch {
                 .shared_checkout_of
                 .clone()
                 .unwrap_or_else(|| parent.clone());
-            if child.node_id != parent_view.node_id {
+            // A child waiting for a new sandbox never shares, even while
+            // its parent's own sandbox is still starting (both unlinked).
+            if child.is_unlinked() || child.node_id != parent_view.node_id {
                 child.parent_work = Some(ParentWork {
                     agent_id: owner,
                     copied: None,

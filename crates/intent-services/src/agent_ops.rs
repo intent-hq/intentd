@@ -6013,6 +6013,7 @@ impl Services {
                     &plan.provider,
                     plan.model.as_deref(),
                     &placement,
+                    inherited_from.is_some(),
                 )
                 .await;
             let mut view = match (admitted, inherited_from) {
@@ -6122,8 +6123,10 @@ impl Services {
         provider: &str,
         model: Option<&str>,
         placement: &intent_core::placement::AgentPlacement,
+        inherited: bool,
     ) -> Result<intent_core::remote_launch::RemotePlacementView> {
-        let needs = self.remote_launch_needs(provider, model, placement).await?;
+        let mut needs = self.remote_launch_needs(provider, model, placement).await?;
+        needs.inherited = inherited;
         self.ports
             .remote_launch()
             .admit(self, workspace_id, placement, &needs)
@@ -6190,6 +6193,7 @@ impl Services {
                 .as_ref()
                 .is_some_and(|env| env.entries().any(|(_, value)| value.is_some())),
             provider_ref: provider.to_owned(),
+            inherited: false,
         })
     }
 

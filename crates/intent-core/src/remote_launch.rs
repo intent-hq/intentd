@@ -252,6 +252,10 @@ pub struct RemoteLaunchNeeds {
     /// The provider reference as given (`claude-code`, `codex@work`), for
     /// `cloud-profile-required` data.
     pub provider_ref: String,
+    /// The placement is the parent's, inherited by a sub-agent created
+    /// with none: from an agent on a cloud machine it means that sandbox.
+    /// An explicit `target: "e2b"` always means a new sandbox.
+    pub inherited: bool,
 }
 
 /// The [`REMOTE_PLACEMENT_METADATA_KEY`] value: the projection fields of an

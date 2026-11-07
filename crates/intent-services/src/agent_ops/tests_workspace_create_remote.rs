@@ -235,6 +235,7 @@ async fn a_placed_initial_agent_starts_on_the_chosen_machine() {
             with_profile: false,
             sets_profile_env: false,
             provider_ref: "auggie".into(),
+            inherited: false,
         }]
     );
     let ws = result.workspace.id;

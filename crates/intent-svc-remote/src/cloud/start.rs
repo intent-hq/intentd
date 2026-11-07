@@ -140,12 +140,12 @@ async fn on_machine(
 /// Admission for a placement on E2B, before anything is written. Returns
 /// `None` when `placement` is not about a cloud machine.
 ///
-/// 1. `target: "e2b"` from an agent on a cloud machine: the caller's
-///    sandbox, once it runs.
+/// 1. The placement a sub-agent of an agent on a cloud machine inherits
+///    (none given): the caller's sandbox, once it runs.
 /// 2. `target: "remote"` with a cloud machine's `nodeId`: only for a
 ///    sub-agent of the machine's agent, else `machine-unknown`.
-/// 3. `target: "e2b"` otherwise: a new sandbox, after the provider, profile
-///    and provider checks.
+/// 3. An explicit `target: "e2b"`, from any caller: a new sandbox, after the
+///    provider, profile and provider checks.
 pub(crate) async fn admit(
     feature: &RemoteFeature,
     svc: &Services,
@@ -179,7 +179,12 @@ pub(crate) async fn admit(
     if !placement.is_e2b() {
         return Ok(None);
     }
-    if let Some((caller, caller_view)) = cloud_caller(svc).await? {
+    let shared = if needs.inherited {
+        cloud_caller(svc).await?
+    } else {
+        None
+    };
+    if let Some((caller, caller_view)) = shared {
         check_profile(needs)?;
         let linked = if caller_view.is_unlinked() {
             wait_linked(svc, &caller).await?
