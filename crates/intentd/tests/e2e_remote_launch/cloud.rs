@@ -883,6 +883,11 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     .expect("the sandbox pushed the agent's work");
     assert_eq!(pushed.trim(), "from the sandbox");
 
+    // Keep the events read so far: the socket must not sit unread for the
+    // starts below (the backend drops a client that stops answering pings).
+    let mut seen_events = Vec::new();
+    drain_events(&mut events, &mut seen_events).await;
+
     // A size the plan refuses fails the start with cloud-quota, deletes
     // nothing it did not make, and adds no machine.
     let sized = ok(
@@ -911,6 +916,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     let cloud = ok(&mut rpc_ws, 400, "cloudMachines.list", json!({})).await;
     assert_eq!(cloud["machines"].as_array().unwrap().len(), 1, "{cloud}");
 
+    drain_events(&mut events, &mut seen_events).await;
     // A bootstrap that fails (the mint in the sandbox) deletes the sandbox
     // it made and adds no machine.
     let small = ok(
@@ -951,6 +957,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     let cloud = ok(&mut rpc_ws, 390, "cloudMachines.list", json!({})).await;
     assert_eq!(cloud["machines"].as_array().unwrap().len(), 1, "{cloud}");
 
+    drain_events(&mut events, &mut seen_events).await;
     // Removing the provider with a live sandbox needs stopAgents.
     let busy = rpc(
         &mut rpc_ws,
@@ -1018,6 +1025,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     })
     .await
     .expect("remove forgets the settings first");
+    drain_events(&mut events, &mut seen_events).await;
     let creates_before = fake.state().creates.len();
     let late = rpc(&mut rpc_ws, 500, "agent.create", create(&keyed_ref, "Late")).await;
     assert_eq!(
@@ -1052,15 +1060,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     assert!(!minted.is_empty(), "the sandbox minted a credential");
     secrets.extend(minted);
     let log = std::fs::read_to_string(head_dir.join("head.log")).unwrap_or_default();
-    let mut seen_events = Vec::new();
-    while let Ok(Some(Ok(Message::Text(text)))) = timeout(
-        common::test_timeout(Duration::from_millis(200)),
-        events.next(),
-    )
-    .await
-    {
-        seen_events.push(text.to_string());
-    }
+    drain_events(&mut events, &mut seen_events).await;
     for secret in &secrets {
         assert!(
             !log.contains(secret.as_str()),
@@ -1125,6 +1125,28 @@ async fn failure_containing(events: &mut common::TlsWs, agent_id: &str, needle: 
     })
     .await
     .unwrap_or_else(|_| panic!("no agent:failed with {needle:?}"))
+}
+
+/// Read every event `events` has ready into `seen` (text frames), answering
+/// pings, until it stays quiet for a moment.
+async fn drain_events(events: &mut common::TlsWs, seen: &mut Vec<String>) {
+    loop {
+        match timeout(
+            common::test_timeout(Duration::from_millis(200)),
+            events.next(),
+        )
+        .await
+        {
+            Ok(Some(Ok(Message::Text(text)))) => seen.push(text.to_string()),
+            Ok(Some(Ok(Message::Ping(p)))) => {
+                let _ = events.send(Message::Pong(p)).await;
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(error))) => panic!("event socket failed: {error}"),
+            Ok(None) => panic!("event socket closed"),
+            Err(_) => return,
+        }
+    }
 }
 
 /// Request ids for [`keep_alive`], clear of the test's own.
