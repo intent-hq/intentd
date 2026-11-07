@@ -258,7 +258,7 @@ async fn a_sandbox_agents_sub_agents_share_its_sandbox_or_start_their_own() {
     for sandbox in ["sbx1", "sbx2"] {
         machine_until(&mut rpc_ws, 1000, sandbox, |machine| machine.is_none()).await;
         // The E2B delete follows the machine row's removal.
-        call_until(&fake, sandbox, |calls| {
+        call_until(&fake, &mut rpc_ws, sandbox, |calls| {
             calls.iter().any(|call| call.0 == "DELETE")
         })
         .await;
