@@ -327,6 +327,10 @@ pub(crate) struct Shared {
     ingested: Mutex<NodeCounter>,
     /// Each agent's checkout and setup output tail (nodeProtocol 10).
     setup_outputs: Mutex<HashMap<AgentId, SetupTail>>,
+    /// The last refusal to make a cloud machine's sandbox dialable (a
+    /// resume E2B refused), as the turn error a waiting prompt fails with;
+    /// cleared by the next bind.
+    cloud_refusal: watch::Sender<Option<String>>,
     /// Asks the connector for a link: `None` just wakes it.
     demand: mpsc::UnboundedSender<Option<Waiter>>,
     shutdown: watch::Sender<bool>,
@@ -425,6 +429,37 @@ impl Shared {
                 .survivors_unclaimed
                 .load(std::sync::atomic::Ordering::SeqCst)
                 && !self.claimed.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Whether the machine has work now: a turn in flight, a live script
+    /// run, a stop to deliver or a request waiting for its reply. A cloud
+    /// machine without any is idle and may be paused.
+    pub(crate) fn busy(&self) -> bool {
+        self.agents.turns_in_flight() > 0
+            || self.machine_runs_live()
+            || !lock(&self.stops).is_empty()
+            || !lock(&self.capability_waiters).is_empty()
+            || !lock(&self.skills_waiters).is_empty()
+            || !lock(&self.push_waiters).is_empty()
+            || !lock(&self.secret_waiters).is_empty()
+    }
+
+    /// Whether something would keep a link up now (see the module docs).
+    pub(crate) fn link_wanted(&self) -> bool {
+        self.wants_link()
+    }
+
+    /// Close the current link, if any, without a redial: the cloud machine's
+    /// sandbox is being paused, and its gate holds dials until a demand.
+    pub(crate) fn close_link(&self) {
+        if let Some(link) = self.current_link() {
+            link.close();
+        }
+    }
+
+    /// Subscribe to cloud resume refusals (see the `cloud_refusal` field).
+    pub(crate) fn cloud_refusals(&self) -> watch::Receiver<Option<String>> {
+        self.cloud_refusal.subscribe()
     }
 
     /// Whether one of this machine's script runs is live: the machine stops
@@ -812,7 +847,7 @@ impl Shared {
     /// there: the queued stops are moot. Recorded final stops stay (a
     /// revocation alone drops no record) until acknowledged or past their
     /// bound.
-    fn drop_stops(&self) {
+    pub(crate) fn drop_stops(&self) {
         let dropped = {
             let mut stops = lock(&self.stops);
             let before = stops.len();
@@ -1260,11 +1295,15 @@ impl Shared {
 
     /// Dial `target` (the routes, port and pin a refreshed registration
     /// was accepted on) from now on.
-    pub(crate) fn set_target(&self, target: MachineTarget) {
-        *lock(&self.target) = target;
+    pub(crate) fn set_target(&self, mut target: MachineTarget) {
+        let mut current = lock(&self.target);
+        if target.gate.is_none() {
+            target.gate.clone_from(&current.gate);
+        }
+        *current = target;
     }
 
-    fn target(&self) -> MachineTarget {
+    pub(crate) fn target(&self) -> MachineTarget {
         lock(&self.target).clone()
     }
 
@@ -1345,7 +1384,7 @@ impl Shared {
             ConnectFailure::Unreachable(_) => RemoteMachineState::Unreachable,
             ConnectFailure::Revoked(_) => RemoteMachineState::Revoked,
             ConnectFailure::UpdateRequired(_) => RemoteMachineState::UpdateRequired,
-            ConnectFailure::Local(_) => return,
+            ConnectFailure::Local(_) | ConnectFailure::Cloud { .. } => return,
         };
         let id = self.machine_id();
         if let Err(error) = self.store.set_exposed_machine_state(&id, state).await {
@@ -1515,6 +1554,7 @@ impl RemoteNode {
             secret_forgets: Mutex::new(Vec::new()),
             secret_locks: Mutex::new(HashMap::new()),
             ingested: Mutex::new(acked),
+            cloud_refusal: watch::channel(None).0,
             demand,
             shutdown: watch::channel(false).0,
         });
@@ -1973,17 +2013,24 @@ async fn run(
     let mut waiters: Vec<Waiter> = Vec::new();
     // Redial after a failure or a lost link while the link is wanted.
     let mut retry = false;
+    // Whether someone asked for the link since the last dial: a parked
+    // (paused) cloud machine is dialed, and so resumed, only then.
+    let mut demanded = false;
     loop {
-        if !retry && waiters.is_empty() && !shared.wants_link() {
+        if !retry && !demanded && waiters.is_empty() && !shared.wants_link() {
             tokio::select! {
                 demand = demands.recv() => match demand {
-                    Some(waiter) => waiters.extend(waiter),
+                    Some(waiter) => {
+                        demanded = true;
+                        waiters.extend(waiter);
+                    }
                     None => return,
                 },
                 () = wait_true(&mut shutdown) => return,
             }
         }
         while let Ok(waiter) = demands.try_recv() {
+            demanded = true;
             waiters.extend(waiter);
         }
         // Final stops past their bound are dropped before every dial, so a
@@ -2000,14 +2047,42 @@ async fn run(
             return;
         }
         let target = shared.target();
+        if let Some(gate) = &target.gate {
+            if gate.parked() && !demanded && waiters.is_empty() {
+                // Paused: wait for a prompt, a stop or a connect request.
+                retry = false;
+                tokio::select! {
+                    demand = demands.recv() => match demand {
+                        Some(waiter) => {
+                            demanded = true;
+                            waiters.extend(waiter);
+                        }
+                        None => return,
+                    },
+                    () = wait_true(&mut shutdown) => return,
+                }
+                continue;
+            }
+        }
+        demanded = false;
         let version = lock(&shared.status).intentd_version.clone();
         let ingested = ingest.ingested();
-        let connected = tokio::select! {
-            connected = connect(&target, &shared.tuning.connect, version.as_deref(), || {
-                let lease = lease.clone();
-                async move { lease.next_hello(ingested).await }
-            }) => connected,
-            () = wait_true(&mut shutdown) => return,
+        let gated = match &target.gate {
+            Some(gate) => tokio::select! {
+                gated = gate.before_dial(&shared) => gated,
+                () = wait_true(&mut shutdown) => return,
+            },
+            None => Ok(()),
+        };
+        let connected = match gated {
+            Ok(()) => tokio::select! {
+                connected = connect(&target, &shared.tuning.connect, version.as_deref(), || {
+                    let lease = lease.clone();
+                    async move { lease.next_hello(ingested).await }
+                }) => connected,
+                () = wait_true(&mut shutdown) => return,
+            },
+            Err(failure) => Err(failure),
         };
         if *shutdown.borrow() {
             if let Ok(connected) = connected {
@@ -2023,6 +2098,12 @@ async fn run(
             Ok(connected) => connected,
             Err(failure) => {
                 tracing::warn!(machine = %target.id, failure = ?failure, "remote machine: cannot connect");
+                if let ConnectFailure::Cloud { message, data, .. } = &failure {
+                    let code = data["code"].as_str().unwrap_or("cloud-machine-unavailable");
+                    shared
+                        .cloud_refusal
+                        .send_replace(Some(format!("{code}: {message}")));
+                }
                 // Persist the resting state before revocation ends agents.
                 // `end_all` drops `running()` to zero, and a list between
                 // that and this write still reads `disconnected`
@@ -2053,15 +2134,18 @@ async fn run(
                 retry = shared.wants_link();
                 if retry {
                     let delay = match failure {
-                        ConnectFailure::Revoked(_) | ConnectFailure::UpdateRequired(_) => {
-                            shared.tuning.permanent_retry
-                        }
+                        ConnectFailure::Revoked(_)
+                        | ConnectFailure::UpdateRequired(_)
+                        | ConnectFailure::Cloud { lost: true, .. } => shared.tuning.permanent_retry,
                         _ => backoff.next_delay(),
                     };
                     tokio::select! {
                         () = tokio::time::sleep(delay) => {}
                         demand = demands.recv() => match demand {
-                            Some(waiter) => waiters.extend(waiter),
+                            Some(waiter) => {
+                                demanded = true;
+                                waiters.extend(waiter);
+                            }
                             None => return,
                         },
                         () = wait_true(&mut shutdown) => return,
@@ -2076,6 +2160,7 @@ async fn run(
             welcome,
         } = dialed;
         retry = false;
+        shared.cloud_refusal.send_replace(None);
         *lock(&shared.route) = Some(route);
         if let Err(error) = lease.record_welcome(&welcome).await {
             tracing::warn!(%error, "remote machine: could not record the welcome");
@@ -2114,7 +2199,10 @@ async fn run(
                 tokio::select! {
                     () = tokio::time::sleep(backoff.next_delay()) => {}
                     demand = demands.recv() => match demand {
-                        Some(waiter) => waiters.extend(waiter),
+                        Some(waiter) => {
+                            demanded = true;
+                            waiters.extend(waiter);
+                        }
                         None => return,
                     },
                     () = wait_true(&mut shutdown) => return,

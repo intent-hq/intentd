@@ -776,6 +776,26 @@ impl RemoteLaunchPort for RemoteLaunch {
                     continue;
                 }
                 node.final_stop(agent_id, reason).await;
+                // The agent a sandbox was started for ends for good: its
+                // sub-agents there get final stops too, then the sandbox
+                // goes.
+                if let Ok(Some(row)) = svc.store().get_exposed_machine(&record.node_id).await {
+                    if row
+                        .cloud
+                        .as_ref()
+                        .is_some_and(|cloud| cloud.agent_id == agent_id.as_str())
+                    {
+                        let svc = svc.clone();
+                        tokio::spawn(async move {
+                            let Some(feature) = svc.remote_feature() else {
+                                return;
+                            };
+                            let client = crate::cloud::saved_client(&svc).await;
+                            crate::cloud::delete_machine(feature, &svc, &row, client.as_ref())
+                                .await;
+                        });
+                    }
+                }
             }
         })
     }

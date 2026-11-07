@@ -74,7 +74,9 @@ chat.subscribe
 chat.unsubscribe
 client.list
 cloudMachines.configure
+cloudMachines.kill
 cloudMachines.list
+cloudMachines.pause
 cloudMachines.remove
 comment.add
 comment.delete

@@ -79,6 +79,22 @@ impl Services {
     /// Owner-only gate for the `executor.*` methods: the daemon itself, or a
     /// wire caller admitted as the owner whose durable host role is still
     /// owner. Members, guests, agents and executor credentials are refused.
+    /// Whether the current caller is this daemon's owner (the local seat or
+    /// an owner connection), without logging a refusal.
+    pub async fn caller_is_machine_owner(&self) -> bool {
+        match current_caller() {
+            Some(Caller::Daemon) => true,
+            Some(Caller::Wire {
+                principal_id,
+                host_role: HostRole::Owner,
+            }) => matches!(
+                self.store.get_host_role(&principal_id).await,
+                Ok(HostRole::Owner)
+            ),
+            _ => false,
+        }
+    }
+
     pub(crate) async fn require_machine_owner(&self, what: &str) -> Result<()> {
         match current_caller() {
             Some(Caller::Daemon) => Ok(()),

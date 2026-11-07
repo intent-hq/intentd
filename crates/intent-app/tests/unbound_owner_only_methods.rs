@@ -360,6 +360,8 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
         ),
         ("cloudMachines.list", json!({})),
         ("cloudMachines.remove", json!({ "provider": "e2b" })),
+        ("cloudMachines.pause", json!({ "machineId": "m-1" })),
+        ("cloudMachines.kill", json!({ "machineId": "m-1" })),
         ("remoteMachines.list", json!({})),
         ("remoteMachines.refresh", json!({ "machineId": "m-1" })),
         ("remoteMachines.remove", json!({ "machineId": "m-1" })),

@@ -30,9 +30,6 @@ use crate::RemoteFeature;
 /// Longest wait for a sandbox start: create, boot, tunnel and probe.
 pub(crate) const START_WAIT: Duration = Duration::from_secs(10 * 60);
 
-/// E2B timeout of a new sandbox. It pauses (never dies) when this runs out.
-const SANDBOX_TIMEOUT_SECS: u32 = 60 * 60;
-
 /// Longest cloud machine row name, in bytes.
 const MAX_NAME_BYTES: usize = 128;
 
@@ -449,7 +446,7 @@ async fn start(
     let created = client
         .create(&CreateSandbox {
             template_id: template.clone(),
-            timeout_secs: Some(SANDBOX_TIMEOUT_SECS),
+            timeout_secs: Some(super::lifecycle::SANDBOX_TIMEOUT_SECS),
             auto_pause: Some(true),
             metadata,
             idempotency_key: Some(idempotency_key(agent_id)),
@@ -478,6 +475,8 @@ async fn start(
             workspace_id: workspace_id.to_string(),
             started_at: now_iso(),
             running_seconds: 0,
+            running_since: Some(now_iso()),
+            paused_at: None,
         };
         let machine_id = minted.machine_id.clone();
         crate::methods::add_machine(
@@ -568,7 +567,8 @@ async fn link(
 }
 
 /// Remove cloud machine `row` for good: final stops for its agents (at most
-/// the removal budget), then its connector, row, token, leases and
+/// the removal budget; a paused sandbox is resumed first, and one that does
+/// not resume gets none), then its connector, row, token, leases and
 /// sandbox. Its agents keep their placement without a machine. Returns the
 /// agents whose stop was not acknowledged.
 pub(crate) async fn delete_machine(
@@ -577,10 +577,55 @@ pub(crate) async fn delete_machine(
     row: &ExposedMachine,
     client: Option<&E2bClient>,
 ) -> Vec<String> {
+    remove_machine(feature, svc, row, client, None).await
+}
+
+/// [`delete_machine`]; with `lost` (E2B no longer has the sandbox) there are
+/// no stops and no E2B delete, and the agents get `lost` as their
+/// `placementError`.
+pub(crate) async fn remove_machine(
+    feature: &RemoteFeature,
+    svc: &Services,
+    row: &ExposedMachine,
+    client: Option<&E2bClient>,
+    lost: Option<&PlacementError>,
+) -> Vec<String> {
     let mut unconfirmed = Vec::new();
     let _lifecycle = feature.lifecycle(&row.id).await;
     let store = svc.store();
-    if let Ok(node) = feature.node_locked(svc, &row.id).await {
+    // Another removal may have finished meanwhile.
+    let row = match store.get_exposed_machine(&row.id).await {
+        Ok(Some(current)) => current,
+        Ok(None) => {
+            feature.cloud.forget(&row.id);
+            return unconfirmed;
+        }
+        Err(_) => row.clone(),
+    };
+    let row = &row;
+    // The agents placed here, read before their final stops end their
+    // records, so each one is left without a machine afterwards.
+    let placed = placed_agents(store, &row.id).await.unwrap_or_default();
+    let mut stops = lost.is_none();
+    if let (true, Some(client), Some(cloud)) = (stops, client, &row.cloud) {
+        let paused = cloud.state != CloudSandboxState::Running;
+        super::lifecycle::set_state(svc, feature, &row.id, CloudSandboxState::Stopping).await;
+        if paused {
+            stops = super::lifecycle::resume_for_stop(feature, client, row).await;
+        }
+    }
+    let node = if stops {
+        feature.node_locked(svc, &row.id).await.ok()
+    } else {
+        if let Some(node) = feature.running_node(&row.id) {
+            node.shared_ref().drop_stops();
+            node.shared_ref().agents.end_all(
+                "cloud-machine-unavailable: the agent's E2B sandbox was deleted without a final stop; work it pushed is kept",
+            );
+        }
+        None
+    };
+    if let Some(node) = node {
         let stopped = node.stop_all().await;
         if let Err(Error::RemoteMachine(failure)) =
             crate::methods::deliver_stops(feature, &node, &stopped, &row.name).await
@@ -593,9 +638,10 @@ pub(crate) async fn delete_machine(
     if let Some(node) = feature.take_node(&row.id) {
         node.shutdown();
     }
+    let lost_error = lost.cloned();
     let unlinked = async {
         let head_id = store.daemon_id().await?;
-        let mut agents = Vec::new();
+        let mut agents = placed;
         for lease in store.list_owned_node_leases(&head_id).await? {
             if lease.owner.node_id != row.id {
                 continue;
@@ -605,17 +651,25 @@ pub(crate) async fn delete_machine(
                     .finish_final_stop(&stop.agent_id, &stop.stop_id)
                     .await?;
             }
-            agents.extend(store.list_remote_agents(&lease.owner.lease_id).await?);
+            for agent in store.list_remote_agents(&lease.owner.lease_id).await? {
+                if !agents.iter().any(|known| known.agent_id == agent.agent_id) {
+                    agents.push(agent);
+                }
+            }
         }
         store.remove_exposed_machine(&row.id).await?;
         svc.delete_remote_machine_token(&row.id).await?;
         store.end_machine_leases(&row.id, &head_id).await?;
         for agent in agents {
             store.remove_remote_agent(&agent.agent_id).await?;
+            let lost_error = lost_error.clone();
             let _ = crate::view::update(store, &agent.workspace_id, &agent.agent_id, |view| {
                 view.node_id.clear();
                 view.lease_id.clear();
                 view.shared_checkout_of = None;
+                if lost_error.is_some() {
+                    view.placement_error.clone_from(&lost_error);
+                }
             })
             .await;
             svc.publish_agent_placement_changed(&agent.workspace_id, &agent.agent_id)
@@ -627,15 +681,31 @@ pub(crate) async fn delete_machine(
     if let Err(error) = unlinked {
         tracing::warn!(machine = %row.id, %error, "cloud machine: could not remove its records");
     }
-    if let (Some(client), Some(cloud)) = (client, &row.cloud) {
+    if let (None, Some(client), Some(cloud)) = (lost, client, &row.cloud) {
         if let Err(error) = client.delete(&cloud.sandbox_id).await {
             tracing::warn!(%error, sandbox = %cloud.sandbox_id, "cloud machine: could not delete its sandbox");
         }
     }
+    feature.cloud.forget(&row.id);
     svc.publish_cloud_machine_changed(
         json!({ "machineId": row.id, "removed": true }),
         row.cloud.as_ref().map(|cloud| cloud.workspace_id.as_str()),
     )
     .await;
     unconfirmed
+}
+
+/// The agents recorded on machine `machine_id`'s leases.
+async fn placed_agents(
+    store: &intent_store::Store,
+    machine_id: &str,
+) -> Result<Vec<intent_core::remote_launch::RemoteAgentRecord>> {
+    let head_id = store.daemon_id().await?;
+    let mut agents = Vec::new();
+    for lease in store.list_owned_node_leases(&head_id).await? {
+        if lease.owner.node_id == machine_id {
+            agents.extend(store.list_remote_agents(&lease.owner.lease_id).await?);
+        }
+    }
+    Ok(agents)
 }

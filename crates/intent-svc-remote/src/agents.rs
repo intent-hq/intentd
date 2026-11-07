@@ -191,6 +191,15 @@ impl Agents {
             .count()
     }
 
+    /// Live attached agents with a turn in flight (a prompt waiting for its
+    /// turn's end).
+    pub(crate) fn turns_in_flight(&self) -> usize {
+        lock(&self.sinks)
+            .values()
+            .filter(|sink| sink.is_live() && !lock(&sink.state).turns.is_empty())
+            .count()
+    }
+
     /// The attached agents that are still live.
     pub(crate) fn live_ids(&self) -> Vec<AgentId> {
         lock(&self.sinks)

@@ -902,6 +902,8 @@ pub async fn store(state: &LargeState) -> Seeded {
                     workspace_id: big_ws.0.clone(),
                     started_at: "2026-01-01T00:00:00.000Z".into(),
                     running_seconds: u64::MAX,
+                    running_since: None,
+                    paused_at: None,
                 }),
             })
             .await

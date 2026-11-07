@@ -35,6 +35,9 @@ pub(crate) struct MachineTarget {
     pub tailcat_bin: Option<PathBuf>,
     /// Records the machine's links while the owner captures link traffic.
     pub tap: Option<LinkTap>,
+    /// A cloud machine's sandbox lifecycle: resumes a paused sandbox before
+    /// a dial, and keeps a paused one from being dialed without a demand.
+    pub gate: Option<Arc<crate::cloud::CloudGate>>,
 }
 
 impl std::fmt::Debug for MachineTarget {
@@ -111,6 +114,7 @@ impl MachineTarget {
             token,
             tailcat_bin,
             tap: None,
+            gate: None,
         })
     }
 
@@ -126,6 +130,13 @@ impl MachineTarget {
                 name: Some(self.name.clone()).filter(|name| !name.is_empty()),
             },
         ));
+        self
+    }
+
+    /// This target with the sandbox lifecycle `gate` of its cloud machine.
+    #[must_use]
+    pub(crate) fn gated(mut self, gate: Option<Arc<crate::cloud::CloudGate>>) -> Self {
+        self.gate = gate;
         self
     }
 

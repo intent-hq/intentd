@@ -1951,6 +1951,8 @@ async fn dispatch(
         "cloudMachines.configure" => cloud_machines(api, "configure", params).await,
         "cloudMachines.list" => cloud_machines(api, "list", params).await,
         "cloudMachines.remove" => cloud_machines(api, "remove", params).await,
+        "cloudMachines.pause" => cloud_machines(api, "pause", params).await,
+        "cloudMachines.kill" => cloud_machines(api, "kill", params).await,
         // Executor-link traffic capture (nodes.md "Link traffic capture"):
         // owner-only, daemon-global; the services recheck the owner role.
         "remoteLinkTraffic.start" => remote_link_traffic(api, "start", params).await,
