@@ -424,6 +424,21 @@ impl BackendParentWork {
         )
     }
 
+    /// [`Self::notice`] for a sub-agent whose own copy-on-write checkout is
+    /// still being made: what it starts from once ready, and the fallback.
+    #[must_use]
+    pub fn pending_notice(&self, workspace_id: &str) -> String {
+        if self.head.is_none() {
+            return self.notice(workspace_id);
+        }
+        format!(
+            "This sub-agent runs on the backend in its own checkout, which is being made and then starts from its parent's work, {}. If that copy cannot be made or reset, it runs in the workspace's checkout and its instructions name the parent's refs: `{}` and `{}`.",
+            self.saved(),
+            self.parent_ref(workspace_id, "head"),
+            self.parent_ref(workspace_id, "wip")
+        )
+    }
+
     /// Read the value from a session's `metadata`, if it carries one.
     #[must_use]
     pub fn from_metadata(metadata: Option<&serde_json::Value>) -> Option<Self> {

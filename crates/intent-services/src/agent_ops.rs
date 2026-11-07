@@ -13617,7 +13617,7 @@ impl Services {
         // "pending" here; the settled outcome is observable via the session's
         // sandbox fields and the `sandbox:cow:created` event.
         let mut effective_isolation: Option<&str> = None;
-        let mut seeded_notice: Option<String> = None;
+        let mut pending_notice: Option<String> = None;
 
         // Provision sandbox if isolation=cow is requested (Task 3).
         // Check if isolation is "cow" (explicit or defaulted from workspace setting).
@@ -13681,15 +13681,14 @@ impl Services {
                     }) {
                         effective_isolation = Some("pending");
                         // Its own checkout starts from the remote parent's
-                        // work, once provisioned.
+                        // work once provisioned, if the copy and reset work.
                         if let Ok(child) = self.store.get_agent_session_summary(&aid).await {
-                            if let Some(mut work) =
+                            if let Some(work) =
                                 intent_core::remote_launch::BackendParentWork::from_metadata(
                                     child.metadata.as_ref(),
                                 )
                             {
-                                work.seeded = true;
-                                seeded_notice = Some(work.notice(workspace_id.as_str()));
+                                pending_notice = Some(work.pending_notice(workspace_id.as_str()));
                             }
                         }
                     }
@@ -13820,7 +13819,7 @@ impl Services {
                 .insert("effectiveIsolation".to_string(), json!(eff_iso));
         }
         copy_remote_launch_fields(&created, &mut result);
-        if let (Some(notice), Some(obj)) = (seeded_notice, result.as_object_mut()) {
+        if let (Some(notice), Some(obj)) = (pending_notice, result.as_object_mut()) {
             obj.insert("notice".to_string(), json!(notice));
         }
         Ok(result)

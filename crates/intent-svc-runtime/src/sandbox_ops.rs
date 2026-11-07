@@ -175,13 +175,10 @@ pub async fn provision_sandbox(
 }
 
 /// A backend sub-agent of a remote agent starts its own checkout from the
-/// parent's work its session records (`backendParentWork`): the sandbox
-/// branch is reset to the parent's `wip` (else `head`), which then counts as
-/// the snapshot the sub-agent's own changes start from, and files the clone
-/// carried that are not in that work are removed (ignored files are kept);
-/// each pinned submodule the parent saved work in is reset the same way.
-/// Returns that start commit, or `None` when there is no parent work or it
-/// cannot be applied (logged; the sandbox stays a copy of the checkout).
+/// parent's work its session records (`backendParentWork`); see
+/// [`apply_parent_work`]. Returns the start commit, or `None` when there is
+/// no parent work or the superproject cannot be reset (logged; the sandbox
+/// stays a copy of the checkout).
 async fn seed_from_parent_work(
     store: &Store,
     agent_id: &AgentId,
@@ -190,28 +187,9 @@ async fn seed_from_parent_work(
     let session = store.get_agent_session_summary(agent_id).await.ok()?;
     let work =
         intent_core::remote_launch::BackendParentWork::from_metadata(session.metadata.as_ref())?;
-    let head = work.head.clone()?;
-    let start = work.wip.clone().unwrap_or(head);
     let path = sandbox_path.to_path_buf();
-    let target = start.clone();
-    let seeded = tokio::task::spawn_blocking(move || {
-        reset_to_commit(&path, &target)?;
-        for module in &work.submodules {
-            let worktree = path.join(&module.path);
-            if !worktree.join(".git").exists() {
-                continue;
-            }
-            reset_to_commit(&worktree, module.wip.as_deref().unwrap_or(&module.head))?;
-        }
-        Ok::<(), Error>(())
-    })
-    .await;
-    match seeded {
-        Ok(Ok(())) => Some(start),
-        Ok(Err(error)) => {
-            tracing::warn!(agent = %agent_id, %error, "sandbox: could not start from the parent's work");
-            None
-        }
+    match tokio::task::spawn_blocking(move || apply_parent_work(&path, &work)).await {
+        Ok(start) => start,
         Err(error) => {
             tracing::warn!(agent = %agent_id, %error, "sandbox: the parent-work task failed");
             None
@@ -219,34 +197,84 @@ async fn seed_from_parent_work(
     }
 }
 
-/// Reset the checked-out branch (or detached HEAD) of `path` to `commit`
-/// and remove untracked, not ignored files.
+/// Reset the sandbox at `path` to the parent's `wip` (else `head`), which
+/// then counts as the snapshot the sub-agent's own changes start from.
+/// Once that reset is done the start commit is returned whatever follows:
+/// removing untracked, not ignored files the clone carried (untracked
+/// directories, such as nested repositories, are kept) and resetting each
+/// pinned submodule the parent saved work in are best-effort (logged).
+/// `None` when there is no parent `head` or the superproject reset fails.
+fn apply_parent_work(
+    path: &std::path::Path,
+    work: &intent_core::remote_launch::BackendParentWork,
+) -> Option<String> {
+    let head = work.head.as_deref()?;
+    let start = work.wip.as_deref().unwrap_or(head);
+    if let Err(error) = reset_to_commit(path, start) {
+        tracing::warn!(%error, "sandbox: could not start from the parent's work");
+        return None;
+    }
+    if let Err(error) = remove_untracked_files(path) {
+        tracing::warn!(%error, "sandbox: could not remove files outside the parent's work");
+    }
+    for module in &work.submodules {
+        let worktree = path.join(&module.path);
+        if !worktree.join(".git").exists() {
+            continue;
+        }
+        let commit = module.wip.as_deref().unwrap_or(&module.head);
+        if let Err(error) =
+            reset_to_commit(&worktree, commit).and_then(|()| remove_untracked_files(&worktree))
+        {
+            tracing::warn!(module = %module.path, %error, "sandbox: could not start a submodule from the parent's work");
+        }
+    }
+    Some(start.to_owned())
+}
+
+fn parent_work_error(e: &git2::Error) -> Error {
+    Error::Internal(format!("sandbox parent work: {e}"))
+}
+
+/// Reset the checked-out branch (or detached HEAD) of `path` to `commit`.
 fn reset_to_commit(path: &std::path::Path, commit: &str) -> Result<()> {
-    let git = |e: git2::Error| Error::Internal(format!("sandbox parent work: {e}"));
-    let repo = git2::Repository::open(path).map_err(git)?;
-    let oid = git2::Oid::from_str(commit).map_err(git)?;
-    let object = repo.find_commit(oid).map_err(git)?.into_object();
+    let repo = git2::Repository::open(path).map_err(|e| parent_work_error(&e))?;
+    let oid = git2::Oid::from_str(commit).map_err(|e| parent_work_error(&e))?;
+    let object = repo
+        .find_commit(oid)
+        .map_err(|e| parent_work_error(&e))?
+        .into_object();
     repo.reset(&object, git2::ResetType::Hard, None)
-        .map_err(git)?;
+        .map_err(|e| parent_work_error(&e))
+}
+
+/// Remove the untracked, not ignored files of `path`; untracked
+/// directories git does not descend into (nested repositories) are kept.
+fn remove_untracked_files(path: &std::path::Path) -> Result<()> {
+    let repo = git2::Repository::open(path).map_err(|e| parent_work_error(&e))?;
     let mut options = git2::StatusOptions::new();
     options
         .include_untracked(true)
         .recurse_untracked_dirs(true)
         .include_ignored(false)
         .exclude_submodules(true);
-    let statuses = repo.statuses(Some(&mut options)).map_err(git)?;
+    let statuses = repo
+        .statuses(Some(&mut options))
+        .map_err(|e| parent_work_error(&e))?;
     for entry in statuses.iter() {
         if !entry.status().contains(git2::Status::WT_NEW) {
             continue;
         }
-        if let Ok(relative) = entry.path() {
-            let file = path.join(relative);
-            if let Err(error) = std::fs::remove_file(&file) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    return Err(Error::Internal(format!(
-                        "sandbox parent work: remove {relative}: {error}"
-                    )));
-                }
+        let Ok(relative) = entry.path() else { continue };
+        let file = path.join(relative);
+        if relative.ends_with('/') || file.is_dir() {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_file(&file) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(Error::Internal(format!(
+                    "sandbox parent work: remove {relative}: {error}"
+                )));
             }
         }
     }
@@ -3614,5 +3642,81 @@ mod tests {
             1
         );
         reopened.close().await;
+    }
+
+    /// Once the superproject is reset to the parent's work, that commit is
+    /// the sandbox's start even when a later step fails (a submodule whose
+    /// commit is missing, an untracked nested repository): reporting no
+    /// start would leave the old snapshot, and merge-back would carry the
+    /// parent's commits as the sub-agent's own.
+    #[test]
+    fn parent_work_start_survives_a_failed_later_step() {
+        let (_dir, repo) = temp_repo("seed");
+        let base = git2::Repository::open(&repo)
+            .unwrap()
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id();
+        let parent = commit_file(&repo, "parent.txt", "from parent", "parent work");
+        let checkout = git2::Repository::open(&repo).unwrap();
+        checkout
+            .reset(
+                &checkout.find_object(base, None).unwrap(),
+                git2::ResetType::Hard,
+                None,
+            )
+            .unwrap();
+        fs::write(repo.join("stray.txt"), "carried by the clone").unwrap();
+        init_test_repo(&repo.join("nested"));
+        init_test_repo(&repo.join("module"));
+        let work = intent_core::remote_launch::BackendParentWork {
+            agent_id: AgentId::from("agent-parent"),
+            head: Some(parent.clone()),
+            wip: None,
+            submodules: vec![intent_core::remote_launch::BackendParentModule {
+                path: "module".into(),
+                head: "0123456789abcdef0123456789abcdef01234567".into(),
+                wip: None,
+            }],
+            copied: intent_core::remote_launch::ParentWorkCopy::Pushed,
+            seeded: false,
+        };
+
+        assert_eq!(apply_parent_work(&repo, &work), Some(parent.clone()));
+        let head = git2::Repository::open(&repo)
+            .unwrap()
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id()
+            .to_string();
+        assert_eq!(head, parent);
+        assert_eq!(
+            fs::read_to_string(repo.join("parent.txt")).unwrap(),
+            "from parent"
+        );
+        assert!(!repo.join("stray.txt").exists(), "untracked file removed");
+        assert!(
+            repo.join("nested").join(".git").exists(),
+            "nested repo kept"
+        );
+    }
+
+    /// No start when the superproject itself cannot be reset.
+    #[test]
+    fn parent_work_without_its_commit_is_no_start() {
+        let (_dir, repo) = temp_repo("seed-missing");
+        let work = intent_core::remote_launch::BackendParentWork {
+            agent_id: AgentId::from("agent-parent"),
+            head: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            wip: None,
+            submodules: Vec::new(),
+            copied: intent_core::remote_launch::ParentWorkCopy::LastPush,
+            seeded: false,
+        };
+        assert_eq!(apply_parent_work(&repo, &work), None);
     }
 }
