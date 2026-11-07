@@ -1,6 +1,7 @@
 //! Sub-agents of remote agents start from the parent's work
 //! (nodeProtocol 13): on the parent's machine they share its checkout, on
-//! another machine they start from its head and wip, pushed at creation.
+//! another machine they start from its head and wip, pushed at creation,
+//! and retiring the parent ends them there.
 //! Head runs with the bound-caller assertion armed, so every frame the
 //! machines forward runs as its agent.
 
@@ -284,4 +285,46 @@ async fn a_remote_agents_sub_agent_on_another_machine_starts_from_its_work() {
         "from parent",
     )
     .await;
+
+    // Retiring the parent retires the child too: its final stop on the
+    // other machine removes its checkout there. (A user may not retire the
+    // last top-level agent.)
+    let checkout = scratch
+        .path()
+        .join("Far")
+        .join("executor")
+        .join(&far.credential_id)
+        .join("agents")
+        .join(&child_id);
+    assert!(checkout.exists(), "{}", checkout.display());
+    ok(
+        &mut rpc_ws,
+        300,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Keeper", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    ok(
+        &mut rpc_ws,
+        301,
+        "agent.retire",
+        json!({ "workspaceId": ws_id, "agentId": parent_id }),
+    )
+    .await;
+    let child = ok(
+        &mut rpc_ws,
+        302,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": child_id }),
+    )
+    .await;
+    assert!(child["agent"]["retiredAt"].is_string(), "{child}");
+    let removed = timeout(wait(), async {
+        while checkout.exists() {
+            // timing-guard: poll interval for the machine's checkout removal (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(removed.is_ok(), "the child's checkout on the other machine is removed");
 }

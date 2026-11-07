@@ -23,6 +23,8 @@ use tokio::net::TcpListener;
 
 use super::*;
 
+mod sub_agents;
+
 const E2B_KEY: &str = "e2b_test_key_0123456789abcdef0123456789abcdef";
 const PROFILE_SECRET: &str = "sk-cloud-profile-secret-7f3a91";
 
