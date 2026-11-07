@@ -123,7 +123,7 @@ fn run(pwsh: &Path, body: &str, envs: &[(&str, &str)], mode: Option<&str>) -> Ou
 
 fn choice(pwsh: &Path, param: &str, env: Option<&str>) -> String {
     let body = format!(
-        "$DaemonMode = '{param}'\ntry {{\n{}\n\"MODE=$daemonMode EXPLICIT=$daemonModeExplicit\"\n}} catch {{ \"ERROR=$($_.Exception.Message)\" }}",
+        "$DaemonMode = '{param}'\ntry {{\n{}\n\"MODE=$installMode EXPLICIT=$installModeExplicit\"\n}} catch {{ \"ERROR=$($_.Exception.Message)\" }}",
         ps_region("daemon-mode-choice")
     );
     let envs: Vec<(&str, &str)> = env
@@ -135,7 +135,7 @@ fn choice(pwsh: &Path, param: &str, env: Option<&str>) -> String {
 
 fn apply(pwsh: &Path, mode: &str, explicit: bool, verdict: &str, saved: Option<&str>) -> Outcome {
     let body = format!(
-        "$daemonMode = '{mode}'\n$daemonModeExplicit = ${explicit}\n$verdict = '{verdict}'\n$interactive = $false\n{}",
+        "$installMode = '{mode}'\n$installModeExplicit = ${explicit}\n$verdict = '{verdict}'\n$interactive = $false\n{}",
         ps_region("daemon-mode-apply")
     );
     run(pwsh, &body, &[], saved)
@@ -144,10 +144,18 @@ fn apply(pwsh: &Path, mode: &str, explicit: bool, verdict: &str, saved: Option<&
 #[test]
 fn the_choice_folds_spellings_and_the_parameter_beats_the_env_var() {
     let Some(pwsh) = pwsh() else { return };
-    assert!(choice(&pwsh, "Node", None).contains("MODE=node EXPLICIT=True"));
-    assert!(choice(&pwsh, "", Some("regular")).contains("MODE=full EXPLICIT=True"));
-    assert!(choice(&pwsh, "2", Some("full")).contains("MODE=node EXPLICIT=True"));
-    assert!(choice(&pwsh, "", None).contains("MODE= EXPLICIT=False"));
+    for (param, env, want) in [
+        ("Node", None, "MODE=node EXPLICIT=True"),
+        ("", Some("regular"), "MODE=full EXPLICIT=True"),
+        ("2", Some("full"), "MODE=node EXPLICIT=True"),
+        ("", None, "MODE= EXPLICIT=False"),
+    ] {
+        let out = choice(&pwsh, param, env);
+        assert!(
+            out.contains(want),
+            "-DaemonMode {param:?} env {env:?}: {out}"
+        );
+    }
     let bad = choice(&pwsh, "", Some("server"));
     assert!(
         bad.contains("invalid INTENTD_DAEMON_MODE value 'server' (expected full or node)"),
@@ -178,7 +186,7 @@ fn a_failed_restart_names_the_commands_and_skips_pairing() {
     let Some(pwsh) = pwsh() else { return };
     let dir_env = [("FAKE_FAIL_ON", "restart")];
     let body = format!(
-        "$daemonMode = 'node'\n$daemonModeExplicit = $true\n$verdict = 'up'\n$interactive = $false\n{}",
+        "$installMode = 'node'\n$installModeExplicit = $true\n$verdict = 'up'\n$interactive = $false\n{}",
         ps_region("daemon-mode-apply")
     );
     let outcome = run(&pwsh, &body, &dir_env, None);
