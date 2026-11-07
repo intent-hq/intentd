@@ -420,8 +420,7 @@ impl E2bClient {
             .await
         {
             Ok(_) => Ok(true),
-            Err(E2bError::NotFound(_)) => Ok(false),
-            Err(E2bError::Api { status: 400, .. }) => Ok(false),
+            Err(E2bError::NotFound(_) | E2bError::Api { status: 400, .. }) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -622,9 +621,16 @@ fn is_plan_limit(message: &str, error_code: &str) -> bool {
     let resource = ["cpu", "memory", "ram", "too large", "sandbox size"]
         .iter()
         .any(|word| text.contains(word));
-    let limit = ["limit", "exceed", "maximum", "plan", "not allowed", "too large"]
-        .iter()
-        .any(|word| text.contains(word));
+    let limit = [
+        "limit",
+        "exceed",
+        "maximum",
+        "plan",
+        "not allowed",
+        "too large",
+    ]
+    .iter()
+    .any(|word| text.contains(word));
     resource && limit
 }
 

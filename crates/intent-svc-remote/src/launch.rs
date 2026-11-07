@@ -522,8 +522,7 @@ pub(crate) async fn launch_linked(svc: &Services, request: RemoteLaunchRequest) 
         .filter(|work| work.copied.is_none())
         .map(|work| work.agent_id.clone())
     {
-        copy_parent_work(svc, &workspace_id, (&checkout, &agent_id), owner, &mut view)
-            .await?;
+        copy_parent_work(svc, &workspace_id, (&checkout, &agent_id), owner, &mut view).await?;
     }
     let remote = AgentRemote::new(workspace_id.as_str(), agent_id.as_str())?;
     let commit = git2::Oid::from_str(&view.base_commit)

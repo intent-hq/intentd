@@ -97,7 +97,9 @@ impl ProviderConfig {
             return true;
         };
         time::OffsetDateTime::parse(checked, &time::format_description::well_known::Rfc3339)
-            .map_or(true, |at| time::OffsetDateTime::now_utc() - at > SIZES_MAX_AGE)
+            .map_or(true, |at| {
+                time::OffsetDateTime::now_utc() - at > SIZES_MAX_AGE
+            })
     }
 
     /// `CloudMachineProvider` on the wire. Never holds the key.

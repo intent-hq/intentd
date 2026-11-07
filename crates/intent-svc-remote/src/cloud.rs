@@ -97,7 +97,6 @@ async fn started_by(svc: &Services) -> intent_core::machines::CloudStartedBy {
 /// The remote feature, or the error of a daemon without it.
 fn feature(svc: &Services) -> Result<&crate::RemoteFeature> {
     use crate::RemoteServicesExt as _;
-    svc.remote_feature().ok_or_else(|| {
-        Error::Unsupported("this daemon cannot start cloud machines".into())
-    })
+    svc.remote_feature()
+        .ok_or_else(|| Error::Unsupported("this daemon cannot start cloud machines".into()))
 }

@@ -271,7 +271,11 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     if !rows.is_empty() && !stop_agents {
         let running: usize = rows
             .iter()
-            .map(|row| feature.running_node(&row.id).map_or(0, |node| node.running()))
+            .map(|row| {
+                feature
+                    .running_node(&row.id)
+                    .map_or(0, |node| node.running())
+            })
             .sum();
         return Err(crate::methods::in_use("E2B", running.max(rows.len())));
     }

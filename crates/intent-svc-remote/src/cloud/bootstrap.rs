@@ -212,7 +212,11 @@ fn parse(stdout: &[u8], direct: Option<String>) -> Result<Minted> {
 }
 
 /// The `executor.mint` params for this backend.
-pub(crate) fn mint_params(backend_id: &str, backend_name: &str, fingerprint: Option<&str>) -> Value {
+pub(crate) fn mint_params(
+    backend_id: &str,
+    backend_name: &str,
+    fingerprint: Option<&str>,
+) -> Value {
     let mut params = json!({ "backendId": backend_id, "backendName": backend_name });
     if let Some(fingerprint) = fingerprint {
         params["backendFingerprint"] = json!(fingerprint);
