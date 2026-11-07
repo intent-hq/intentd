@@ -101,8 +101,19 @@ impl RemoteAgentRuntime {
                 "node-agent-not-running: the remote agent was stopped",
             ));
         }
-        self.exit_error()
-            .map(|error| AcpError::Transport(format!("node-agent-not-running: {error}")))
+        self.exit_error().map(|error| {
+            // A cloud machine's documented failure (its sandbox is gone) is
+            // the turn's own error, not a transport hiccup to redrive.
+            if error.starts_with(intent_core::machines::CLOUD_MACHINE_UNAVAILABLE_CODE) {
+                AcpError::Rpc(JsonRpcError {
+                    code: TURN_FAILED_CODE,
+                    message: error,
+                    data: None,
+                })
+            } else {
+                AcpError::Transport(format!("node-agent-not-running: {error}"))
+            }
+        })
     }
 
     /// Detach from ingestion and queue the node-side stop, which is resent
@@ -161,10 +172,21 @@ impl RemoteAgentRuntime {
         // A prompt during a reconnect waits for the link, up to the grace.
         let undelivered =
             || transport("node-link-unavailable: the prompt was not delivered to the node");
-        // A stop or an exit drops the turn's waiter, which ends the wait.
+        // A stop or an exit drops the turn's waiter, which ends the wait. A
+        // cloud machine whose resume E2B refuses fails the turn with that
+        // refusal at once.
+        let mut refusals = self.shared.cloud_refusals();
+        refusals.borrow_and_update();
         let link = tokio::select! {
             link = self.shared.link_within(self.shared.tuning.link_loss_grace) => {
                 link.ok_or_else(undelivered)?
+            }
+            refusal = next_refusal(&mut refusals) => {
+                return Err(AcpError::Rpc(JsonRpcError {
+                    code: TURN_FAILED_CODE,
+                    message: refusal,
+                    data: None,
+                }));
             }
             _ = &mut ended => {
                 return Err(self
@@ -212,6 +234,18 @@ impl RemoteAgentRuntime {
                     }
                 }
             }
+        }
+    }
+}
+
+/// The next cloud resume refusal; pending forever once none can come.
+async fn next_refusal(refusals: &mut tokio::sync::watch::Receiver<Option<String>>) -> String {
+    loop {
+        if refusals.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        if let Some(refusal) = refusals.borrow_and_update().clone() {
+            return refusal;
         }
     }
 }

@@ -45,7 +45,8 @@ impl Services {
 
     /// `cloudMachines.<method>`: `configure` and `remove` are owner-only,
     /// `list` is also open to shared-host members (the port filters the
-    /// machines to the workspaces they can manage).
+    /// machines to the workspaces they can manage), and `pause` and `kill`
+    /// to the member who started the machine (the port checks that).
     pub(crate) async fn cloud_machines_op(
         &self,
         method: &'static str,
@@ -53,7 +54,7 @@ impl Services {
     ) -> Result<Value> {
         let what = format!("cloudMachines.{method}");
         match method {
-            "list" => self.require_host_execution(&what).await?,
+            "list" | "pause" | "kill" => self.require_host_execution(&what).await?,
             _ => self.require_machine_owner(&what).await?,
         }
         self.feature_remote_launch_port()

@@ -41,6 +41,7 @@ use crate::connector::{RemoteNode, Tuning};
 use crate::machine::MachineTarget;
 use crate::RemoteServicesExt as _;
 
+mod cloud;
 mod launch;
 mod methods;
 

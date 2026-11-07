@@ -13,7 +13,7 @@ use intent_nodes::e2b::{E2bClient, E2bConfig, E2bError, QuotaLimit, SecretString
 use intent_services::feature_api::Services;
 
 /// The E2B project that publishes the intent-node templates (Intent's).
-pub(crate) const DEFAULT_TEMPLATE_PROJECT: &str = "intent-hq";
+pub(crate) const DEFAULT_TEMPLATE_PROJECT: &str = "intent";
 
 /// The base providers whose CLIs the intent-node templates install.
 const TEMPLATE_AGENT_PROVIDERS: &[&str] = &["claude-code", "codex"];

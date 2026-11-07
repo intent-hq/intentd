@@ -204,11 +204,15 @@ impl MembershipGate {
                 return workspace_id.is_empty();
             }
             // Cloud machine provider changes are global; a machine's change
-            // carries its workspace and is checked below like any other.
-            if event.event_type == intent_core::events::CLOUD_MACHINE_CHANGED
-                && workspace_id.is_empty()
-            {
-                return true;
+            // carries its workspace and goes only to those who can manage
+            // it, as `cloudMachines.list` shows machines.
+            if event.event_type == intent_core::events::CLOUD_MACHINE_CHANGED {
+                return workspace_id.is_empty()
+                    || self
+                        .api
+                        .get_workspace(WorkspaceId::from(workspace_id))
+                        .await
+                        .is_ok_and(|ws| ws.membership.is_some_and(|m| m.can_manage));
             }
             return !workspace_id.is_empty()
                 && self

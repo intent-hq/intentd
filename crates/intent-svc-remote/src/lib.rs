@@ -172,8 +172,22 @@ impl RemoteFeature {
                     "the executor token of machine {machine_id} is missing; make the machine available again"
                 ))
             })?;
+        // A cloud machine dials through its sandbox's gate; a paused one
+        // stays parked until something asks for its link.
+        let gate = row.cloud.as_ref().map(|cloud| {
+            if matches!(
+                cloud.state,
+                intent_core::machines::CloudSandboxState::Paused
+                    | intent_core::machines::CloudSandboxState::Pausing
+                    | intent_core::machines::CloudSandboxState::Resuming
+            ) {
+                self.cloud.park(machine_id);
+            }
+            cloud::CloudGate::new(svc.clone(), machine_id)
+        });
         let target = machine::MachineTarget::new(&row, &token, self.tailcat_bin())?
-            .tapped(svc.link_traffic().clone());
+            .tapped(svc.link_traffic().clone())
+            .gated(gate);
         let node = RemoteNode::start(
             svc.store().clone(),
             target,
@@ -217,6 +231,7 @@ async fn resume_exposed_machines(svc: &Services) -> Vec<String> {
     if svc.node_mode() {
         return Vec::new();
     }
+    cloud::spawn_supervisor(svc);
     let candidates = match machines_with_live_records(svc).await {
         Ok(candidates) => candidates,
         Err(error) => {
@@ -244,11 +259,21 @@ async fn machines_with_live_records(svc: &Services) -> Result<Vec<String>> {
     let mut machines = Vec::new();
     for lease in store.list_owned_node_leases(&head_id).await? {
         let machine_id = &lease.owner.node_id;
-        if lease.state.is_terminal()
-            || machines.contains(machine_id)
-            || store.get_exposed_machine(machine_id).await?.is_none()
-        {
+        if lease.state.is_terminal() || machines.contains(machine_id) {
             continue;
+        }
+        // A paused cloud machine stays paused: its connector starts (and
+        // resumes it) when something asks for it.
+        match store.get_exposed_machine(machine_id).await? {
+            None => continue,
+            Some(row)
+                if row.cloud.as_ref().is_some_and(|cloud| {
+                    cloud.state != intent_core::machines::CloudSandboxState::Running
+                }) =>
+            {
+                continue
+            }
+            Some(_) => {}
         }
         if connector::has_live_records(store, &lease.owner.lease_id).await? {
             machines.push(machine_id.clone());

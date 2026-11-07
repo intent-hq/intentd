@@ -47,6 +47,20 @@ struct FakeState {
     failed_mint_templates: Vec<String>,
     /// Templates whose sandboxes take a while to start intentd.
     slow_start_templates: Vec<String>,
+    /// Sandboxes paused now (their daemon is stopped with SIGSTOP).
+    paused: std::collections::HashSet<String>,
+    /// Every lifecycle call: (method, path).
+    calls: Vec<(String, String)>,
+    /// The next pauses and connects answer this instead, while set.
+    pause_refusal: Option<(u16, Value)>,
+    connect_refusal: Option<(u16, Value)>,
+    /// Each sandbox's create metadata.
+    metadata: HashMap<String, Value>,
+    /// Sandboxes only listed (no daemon): `{ sandboxID, metadata, startedAt? }`.
+    listed_only: Vec<Value>,
+    /// While set, every timeout renewal is 404 and every list fails (500).
+    timeouts_missing: bool,
+    list_failing: bool,
 }
 
 /// The fake E2B API and envd on one loopback port.
@@ -150,8 +164,87 @@ impl FakeE2b {
         if headers.get("x-api-key").map(String::as_str) != Some(E2B_KEY) {
             return json_reply(401, json!({ "code": 401, "message": "Invalid API key" }));
         }
+        if method != "GET" || path == "/v2/sandboxes" {
+            self.state()
+                .calls
+                .push((method.to_owned(), path.to_owned()));
+        }
         match (method, path) {
-            ("GET", "/v2/sandboxes") => json_reply(200, json!([])),
+            ("GET", "/v2/sandboxes") if self.state().list_failing => {
+                json_reply(500, json!({ "code": 500, "message": "list unavailable" }))
+            }
+            ("GET", "/v2/sandboxes") => json_reply(200, self.list(target)),
+            ("POST", connect)
+                if connect.starts_with("/v2/sandboxes/") && connect.ends_with("/connect") =>
+            {
+                let id = connect
+                    .trim_start_matches("/v2/sandboxes/")
+                    .trim_end_matches("/connect")
+                    .to_owned();
+                if let Some((status, body)) = self.state().connect_refusal.clone() {
+                    return json_reply(status, body);
+                }
+                let (resumed, reply) = {
+                    let mut state = self.state();
+                    let Some(sandbox) = state.sandboxes.get(&id) else {
+                        return json_reply(
+                            404,
+                            json!({ "code": 404, "message": "sandbox not found" }),
+                        );
+                    };
+                    let reply = json!({
+                        "sandboxID": id, "templateID": sandbox.template, "envdVersion": "0.2.0",
+                        "envdAccessToken": sandbox.envd_token, "domain": "e2b.test",
+                    });
+                    (state.paused.remove(&id), reply)
+                };
+                if resumed {
+                    self.signal(&id, "-CONT");
+                }
+                json_reply(if resumed { 201 } else { 200 }, reply)
+            }
+            ("POST", pause) if pause.starts_with("/sandboxes/") && pause.ends_with("/pause") => {
+                let id = pause
+                    .trim_start_matches("/sandboxes/")
+                    .trim_end_matches("/pause")
+                    .to_owned();
+                if let Some((status, body)) = self.state().pause_refusal.clone() {
+                    return json_reply(status, body);
+                }
+                {
+                    let mut state = self.state();
+                    if !state.sandboxes.contains_key(&id) {
+                        return json_reply(
+                            404,
+                            json!({ "code": 404, "message": "sandbox not found" }),
+                        );
+                    }
+                    if !state.paused.insert(id.clone()) {
+                        return json_reply(
+                            409,
+                            json!({ "code": 409, "message": "sandbox already paused" }),
+                        );
+                    }
+                }
+                self.signal(&id, "-STOP");
+                (204, "application/json", Vec::new())
+            }
+            ("POST", timeout)
+                if timeout.starts_with("/sandboxes/") && timeout.ends_with("/timeout") =>
+            {
+                let id = timeout
+                    .trim_start_matches("/sandboxes/")
+                    .trim_end_matches("/timeout")
+                    .to_owned();
+                let state = self.state();
+                if state.timeouts_missing
+                    || !state.sandboxes.contains_key(&id)
+                    || state.paused.contains(&id)
+                {
+                    return json_reply(404, json!({ "code": 404, "message": "sandbox not found" }));
+                }
+                (204, "application/json", Vec::new())
+            }
             ("GET", alias) if alias.starts_with("/templates/aliases/") => {
                 json_reply(200, json!({ "templateID": "tpl-1", "public": true }))
             }
@@ -161,7 +254,7 @@ impl FakeE2b {
                     .as_str()
                     .unwrap_or_default()
                     .to_owned();
-                self.state().creates.push(request);
+                self.state().creates.push(request.clone());
                 if self.state().refused_templates.contains(&template) {
                     return json_reply(
                         400,
@@ -174,6 +267,9 @@ impl FakeE2b {
                 std::fs::create_dir_all(dir.join("workspaces")).unwrap();
                 common::enable_ws_api(&dir);
                 let env = self.sandbox_env(&dir);
+                self.state()
+                    .metadata
+                    .insert(id.clone(), request["metadata"].clone());
                 self.state().sandboxes.insert(
                     id.clone(),
                     FakeSandbox {
@@ -194,13 +290,106 @@ impl FakeE2b {
             ("DELETE", path) if path.starts_with("/sandboxes/") => {
                 let id = path.trim_start_matches("/sandboxes/").to_owned();
                 self.state().deletes.push(id.clone());
-                if let Some(sandbox) = self.state().sandboxes.remove(&id) {
-                    stop_sandbox(&sandbox);
+                self.state()
+                    .listed_only
+                    .retain(|listed| listed["sandboxID"] != id.as_str());
+                if self.state().paused.remove(&id) {
+                    self.signal(&id, "-CONT");
                 }
-                (204, "application/json", Vec::new())
+                let removed = self.state().sandboxes.remove(&id);
+                match removed {
+                    Some(sandbox) => {
+                        stop_sandbox(&sandbox);
+                        (204, "application/json", Vec::new())
+                    }
+                    None => json_reply(404, json!({ "code": 404, "message": "sandbox not found" })),
+                }
             }
             _ => json_reply(404, json!({ "code": 404, "message": "not found" })),
         }
+    }
+
+    /// The sandboxes `GET /v2/sandboxes` lists, filtered by its `metadata`
+    /// query (every pair must match).
+    fn list(&self, target: &str) -> Value {
+        let query = target.split_once('?').map_or("", |(_, q)| q);
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        for pair in query.split('&') {
+            if let Some(encoded) = pair.strip_prefix("metadata=") {
+                for kv in percent_decode(encoded).split('&') {
+                    if let Some((k, v)) = kv.split_once('=') {
+                        wanted.push((percent_decode(k), percent_decode(v)));
+                    }
+                }
+            }
+        }
+        let state = self.state();
+        let mut listed: Vec<Value> = state
+            .sandboxes
+            .iter()
+            .map(|(id, sandbox)| {
+                json!({
+                    "sandboxID": id, "templateID": sandbox.template,
+                    "state": if state.paused.contains(id) { "paused" } else { "running" },
+                    "metadata": state.metadata.get(id).cloned().unwrap_or_else(|| json!({})),
+                    "startedAt": "2026-01-01T00:00:00Z", "endAt": "2026-01-01T01:00:00Z",
+                    "cpuCount": 4, "memoryMB": 8192, "envdVersion": "0.2.0",
+                })
+            })
+            .collect();
+        listed.extend(state.listed_only.iter().map(|only| {
+            let mut row = json!({
+                "templateID": "intent/intent-node-4x8:0", "state": "running",
+                "endAt": "2026-01-01T01:00:00Z", "cpuCount": 4, "memoryMB": 8192,
+                "envdVersion": "0.2.0",
+            });
+            for key in ["sandboxID", "metadata", "startedAt"] {
+                if !only[key].is_null() {
+                    row[key] = only[key].clone();
+                }
+            }
+            row
+        }));
+        listed.retain(|row| {
+            wanted
+                .iter()
+                .all(|(k, v)| row["metadata"][k.as_str()] == v.as_str())
+        });
+        Value::Array(listed)
+    }
+
+    /// Send `signal` to sandbox `id`'s daemon (a pause stops it).
+    fn signal(&self, id: &str, signal: &str) {
+        let Some(dir) = self.state().sandboxes.get(id).map(|s| s.dir.clone()) else {
+            return;
+        };
+        let Ok(pid) = std::fs::read_to_string(dir.join("intentd.pid")) else {
+            return;
+        };
+        let Some(pid) = pid.split_whitespace().next().map(str::to_owned) else {
+            return;
+        };
+        let _ = std::process::Command::new("kill")
+            .args([signal, &pid])
+            .status();
+    }
+
+    /// E2B removes sandbox `id` on its own: its daemon stops and every
+    /// later call about it is 404.
+    fn vanish(&self, id: &str) {
+        self.signal(id, "-KILL");
+        self.state().paused.remove(id);
+        self.state().sandboxes.remove(id);
+    }
+
+    /// The (method, path) lifecycle calls about sandbox `id`.
+    fn calls_for(&self, id: &str) -> Vec<(String, String)> {
+        self.state()
+            .calls
+            .iter()
+            .filter(|(_, path)| path.split('/').any(|part| part == id))
+            .cloned()
+            .collect()
     }
 
     /// A sandbox's environment: a hermetic daemon fixture, the codex
@@ -316,6 +505,36 @@ impl FakeE2b {
             .map(|n| format!("envd-token-sbx{n}-a1b2c3d4e5f6"))
             .collect()
     }
+}
+
+/// Undo `%XX` escapes (and `+` as space).
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    out.push(b);
+                    i += 3;
+                } else {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// envd's process stream for one finished process, as Connect frames.
@@ -851,5 +1070,525 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
                 "a secret reached a reply or event: {text}"
             );
         }
+    }
+}
+
+/// The `cloud` of the machine `cloudMachines.list` shows for sandbox
+/// `sandbox`, `None` once it is gone.
+async fn cloud_of(rpc_ws: &mut common::TlsWs, id: i64, sandbox: &str) -> Option<Value> {
+    let listed = ok(rpc_ws, id, "cloudMachines.list", json!({})).await;
+    listed["machines"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|machine| machine["cloud"]["sandboxId"] == sandbox)
+        .cloned()
+}
+
+/// `cloudMachines.list` until sandbox `sandbox`'s machine matches `check`
+/// (`None`: no machine for it).
+async fn machine_until(
+    rpc_ws: &mut common::TlsWs,
+    id: i64,
+    sandbox: &str,
+    check: impl Fn(Option<&Value>) -> bool,
+) -> Option<Value> {
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(120));
+    let mut id = id;
+    loop {
+        id += 1;
+        let machine = cloud_of(rpc_ws, id, sandbox).await;
+        if check(machine.as_ref()) {
+            return machine;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "machine of {sandbox} never matched: {machine:?}"
+        );
+        // timing-guard: poll interval while the lifecycle supervisor acts
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The next `agent:failed` event of `agent_id` whose error holds `needle`.
+async fn failure_containing(events: &mut common::TlsWs, agent_id: &str, needle: &str) -> String {
+    timeout(wait(), async {
+        loop {
+            let failed = event(events, "agent:failed").await;
+            let text = failed["data"].to_string();
+            if failed["data"]["agentId"] == agent_id && text.contains(needle) {
+                return text;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no agent:failed with {needle:?}"))
+}
+
+/// Wait until `fake` saw a call matching `check` about `sandbox`.
+async fn call_until(fake: &FakeE2b, sandbox: &str, check: impl Fn(&[(String, String)]) -> bool) {
+    timeout(common::test_timeout(Duration::from_secs(120)), async {
+        while !check(&fake.calls_for(sandbox)) {
+            // timing-guard: poll interval for the backend's next E2B call
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("calls for {sandbox}: {:?}", fake.calls_for(sandbox)));
+}
+
+fn is_call(call: &(String, String), method: &str, suffix: &str) -> bool {
+    call.0 == method && call.1.ends_with(suffix)
+}
+
+/// The life of a sandbox against the fake E2B, with one settings minute
+/// scaled to 100 ms and one day to 3 s. Proves every row of the lifecycle
+/// table: the timeout is renewed while the sandbox lives; it is paused and
+/// resumed before the run cap at a turn boundary, never during a turn;
+/// `cloudMachines.pause` pauses it (E2B's refusal leaves it running) and a
+/// new prompt resumes it and redials; a refused resume fails the turn with
+/// `cloud-quota`; it pauses when idle; paused too long it is resumed, final
+/// stopped and deleted, and the agent's next message starts a new sandbox;
+/// a sandbox E2B removes during a turn fails that turn with `sandbox-lost`
+/// and the next message starts another; `cloudMachines.kill` deletes it;
+/// the reaper deletes a sandbox with this backend's metadata that no machine
+/// knows, and leaves other backends' sandboxes alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping E2B lifecycle e2e: node or git not on PATH");
+        return;
+    }
+    let fixture = format!(
+        "{}/tests/fixtures/node-test-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let scratch = common::test_tempdir_in("/tmp", "itd-e2bl-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let sandboxes = scratch.path().join("e2b");
+    std::fs::create_dir_all(&sandboxes).unwrap();
+    let fake = FakeE2b::start(&sandboxes, &fixture).await;
+    let head_dir = scratch.path().join("head");
+    let (_head, port, cfg, ws_id) = start_backend_with(
+        &head_dir,
+        &repo,
+        &[
+            ("INTENTD_E2B_API_URL", &fake.url),
+            ("INTENTD_E2B_ENVD_URL", &fake.url),
+            ("INTENTD_E2B_DIRECT_HOST", "127.0.0.1"),
+            ("INTENTD_E2B_MINUTE_MS", "100"),
+            ("INTENTD_E2B_DAY_MS", "3000"),
+        ],
+    )
+    .await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    ok(
+        &mut rpc_ws,
+        1,
+        "client.hello",
+        json!({ "clientId": "e2b-life", "name": "E2B lifecycle" }),
+    )
+    .await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let keyed = ok(
+        &mut rpc_ws,
+        3,
+        "providers.profiles.create",
+        json!({ "baseProviderId": "codex", "name": "Cloud", "env": [
+            { "key": "OPENAI_API_KEY", "kind": "set", "value": PROFILE_SECRET },
+        ] }),
+    )
+    .await;
+    let keyed_ref = format!("codex@{}", keyed["profile"]["id"].as_str().unwrap());
+    let configure = |extra: Value| {
+        let mut params = json!({ "provider": "e2b" });
+        for (k, v) in extra.as_object().unwrap() {
+            params[k] = v.clone();
+        }
+        params
+    };
+    ok(
+        &mut rpc_ws,
+        4,
+        "cloudMachines.configure",
+        configure(json!({
+            "apiKey": E2B_KEY, "size": "4x8", "idlePauseMinutes": 1440, "pausedDeleteDays": 30,
+        })),
+    )
+    .await;
+    let created = ok(
+        &mut rpc_ws,
+        5,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id, "name": "Life", "model": "default", "provider": keyed_ref,
+            "placement": { "target": "e2b" },
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    let agent = (ws_id.as_str(), agent_id.as_str());
+    let reply = turn(&mut rpc_ws, &mut events, agent, "hello life", 10).await;
+    assert!(reply.contains("hello life"), "{reply}");
+    let machine = machine_until(&mut rpc_ws, 20, "sbx1", |m| m.is_some())
+        .await
+        .unwrap();
+    let machine_id = machine["id"].as_str().unwrap().to_owned();
+    assert_eq!(machine["cloud"]["state"], "running", "{machine}");
+    assert!(
+        machine["cloud"].get("runningSince").is_none(),
+        "internal times stay off the wire: {machine}"
+    );
+
+    // Renewed while it lives.
+    call_until(&fake, "sbx1", |calls| {
+        calls.iter().any(|c| is_call(c, "POST", "/sbx1/timeout"))
+    })
+    .await;
+
+    // Before the run cap (50 minutes = 5 s), at a turn boundary: paused and
+    // resumed at once, with no prompt.
+    call_until(&fake, "sbx1", |calls| {
+        calls
+            .iter()
+            .position(|c| is_call(c, "POST", "/sbx1/pause"))
+            .is_some_and(|at| {
+                calls[at..]
+                    .iter()
+                    .any(|c| is_call(c, "POST", "/sbx1/connect"))
+            })
+    })
+    .await;
+    machine_until(&mut rpc_ws, 100, "sbx1", |m| {
+        m.is_some_and(|m| m["cloud"]["state"] == "running")
+    })
+    .await;
+    let reply = turn(&mut rpc_ws, &mut events, agent, "after the cap", 200).await;
+    assert!(reply.contains("after the cap"), "{reply}");
+
+    // cloudMachines.pause: E2B's refusal leaves it running.
+    fake.state().pause_refusal = Some((503, json!({ "code": 503, "message": "node busy" })));
+    let refused = rpc(
+        &mut rpc_ws,
+        210,
+        "cloudMachines.pause",
+        json!({ "machineId": machine_id }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], -32603, "{refused}");
+    assert_eq!(
+        refused["error"]["data"]["code"], "cloud-machine-unavailable",
+        "{refused}"
+    );
+    assert_eq!(refused["error"]["data"]["retryable"], true, "{refused}");
+    assert_eq!(
+        cloud_of(&mut rpc_ws, 211, "sbx1").await.unwrap()["cloud"]["state"],
+        "running"
+    );
+    fake.state().pause_refusal = None;
+    let paused = ok(
+        &mut rpc_ws,
+        212,
+        "cloudMachines.pause",
+        json!({ "machineId": machine_id }),
+    )
+    .await;
+    assert_eq!(paused["machine"]["cloud"]["state"], "paused", "{paused}");
+    assert!(fake.state().paused.contains("sbx1"));
+    let again = ok(
+        &mut rpc_ws,
+        213,
+        "cloudMachines.pause",
+        json!({ "machineId": machine_id }),
+    )
+    .await;
+    assert_eq!(again["machine"]["cloud"]["state"], "paused", "{again}");
+
+    // A new prompt resumes it and redials.
+    let seen_calls = fake.calls_for("sbx1").len();
+    let reply = turn(&mut rpc_ws, &mut events, agent, "after the pause", 220).await;
+    assert!(reply.contains("after the pause"), "{reply}");
+    assert!(
+        fake.calls_for("sbx1")[seen_calls..]
+            .iter()
+            .any(|c| is_call(c, "POST", "/sbx1/connect")),
+        "the prompt resumed the sandbox"
+    );
+    assert!(!fake.state().paused.contains("sbx1"));
+
+    // A resume E2B refuses fails the turn with cloud-quota.
+    ok(
+        &mut rpc_ws,
+        230,
+        "cloudMachines.pause",
+        json!({ "machineId": machine_id }),
+    )
+    .await;
+    fake.state().connect_refusal = Some((
+        429,
+        json!({ "code": 429, "message": "You have reached the maximum number of concurrent E2B sandboxes" }),
+    ));
+    ok(
+        &mut rpc_ws,
+        231,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "refused resume" }),
+    )
+    .await;
+    let failed = failure_containing(&mut events, &agent_id, "cloud-quota").await;
+    assert!(failed.contains("running sandboxes"), "{failed}");
+    fake.state().connect_refusal = None;
+    ok(
+        &mut rpc_ws,
+        232,
+        "agent.retry",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    reply_containing(&mut rpc_ws, agent, "refused resume", 233).await;
+
+    // Idle for idlePauseMinutes: paused.
+    ok(
+        &mut rpc_ws,
+        240,
+        "cloudMachines.configure",
+        configure(json!({ "idlePauseMinutes": 1 })),
+    )
+    .await;
+    let idle = machine_until(&mut rpc_ws, 250, "sbx1", |m| {
+        m.is_some_and(|m| m["cloud"]["state"] == "paused")
+    })
+    .await
+    .unwrap();
+    assert!(
+        idle["cloud"]["runningSeconds"].as_u64().unwrap() >= 1,
+        "{idle}"
+    );
+
+    // Paused for pausedDeleteDays: resumed, final stopped, then deleted.
+    ok(
+        &mut rpc_ws,
+        300,
+        "cloudMachines.configure",
+        configure(json!({ "pausedDeleteDays": 1 })),
+    )
+    .await;
+    machine_until(&mut rpc_ws, 301, "sbx1", |m| m.is_none()).await;
+    let calls = fake.calls_for("sbx1");
+    let last_pause = calls
+        .iter()
+        .rposition(|c| is_call(c, "POST", "/sbx1/pause"))
+        .unwrap();
+    let resumed = calls[last_pause..]
+        .iter()
+        .position(|c| is_call(c, "POST", "/sbx1/connect"))
+        .expect("resumed before the delete");
+    let deleted = calls[last_pause..]
+        .iter()
+        .position(|c| is_call(c, "DELETE", "/sandboxes/sbx1"))
+        .expect("deleted");
+    assert!(resumed < deleted, "{calls:?}");
+    let refs = format!("refs/intent/ws/{ws_id}/agents/{agent_id}");
+    assert!(
+        try_rev(&repo, &format!("{refs}/wip")).is_some()
+            || try_rev(&repo, &format!("{refs}/head")).is_some(),
+        "the final stop kept the agent's work"
+    );
+    let sandboxless = agent_until(&mut rpc_ws, agent, 350, |a| a.get("nodeId").is_none()).await;
+    assert_eq!(sandboxless["placement"]["target"], "e2b", "{sandboxless}");
+
+    // The next message starts a new sandbox.
+    ok(
+        &mut rpc_ws,
+        400,
+        "cloudMachines.configure",
+        configure(json!({ "idlePauseMinutes": 1440, "pausedDeleteDays": 30 })),
+    )
+    .await;
+    ok(
+        &mut rpc_ws,
+        401,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "on a new sandbox" }),
+    )
+    .await;
+    reply_containing(&mut rpc_ws, agent, "on a new sandbox", 402).await;
+    let second = machine_until(&mut rpc_ws, 410, "sbx2", |m| m.is_some())
+        .await
+        .unwrap();
+    let second_id = second["id"].as_str().unwrap().to_owned();
+
+    // E2B says the sandbox is missing but its list fails: unknown, not lost.
+    {
+        let mut state = fake.state();
+        state.timeouts_missing = true;
+        state.list_failing = true;
+    }
+    let before = fake.calls_for("sbx2").len();
+    call_until(&fake, "sbx2", |calls| {
+        calls[before.min(calls.len())..]
+            .iter()
+            .filter(|c| is_call(c, "POST", "/sbx2/timeout"))
+            .count()
+            >= 2
+    })
+    .await;
+    {
+        let mut state = fake.state();
+        state.timeouts_missing = false;
+        state.list_failing = false;
+    }
+    assert!(
+        cloud_of(&mut rpc_ws, 420, "sbx2").await.is_some(),
+        "a sandbox whose state is unknown is kept"
+    );
+
+    // A turn in flight: no pause, neither asked for nor before the cap.
+    ok(
+        &mut rpc_ws,
+        500,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "block here" }),
+    )
+    .await;
+    let busy = timeout(wait(), async {
+        let mut id = 510;
+        loop {
+            id += 1;
+            // timing-guard: the blocked turn needs a moment to reach the sandbox (a pause before that is resumed by the turn)
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let refused = rpc(
+                &mut rpc_ws,
+                id,
+                "cloudMachines.pause",
+                json!({ "machineId": second_id }),
+            )
+            .await;
+            if refused["error"]["data"]["code"] == "machine-in-use" {
+                return refused;
+            }
+        }
+    })
+    .await
+    .expect("pause refused during the turn");
+    assert_eq!(busy["error"]["data"]["runningAgents"], 1, "{busy}");
+    let before = fake.calls_for("sbx2").len();
+    // timing-guard: longer than the run cap (5 s), so a planned pause would have run
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert!(
+        !fake.calls_for("sbx2")[before..]
+            .iter()
+            .any(|c| is_call(c, "POST", "/sbx2/pause")),
+        "no pause during a turn: {:?}",
+        fake.calls_for("sbx2")
+    );
+
+    // E2B removes the sandbox mid-turn: the turn fails with sandbox-lost,
+    // and the agent is left without a sandbox.
+    fake.vanish("sbx2");
+    let failed = failure_containing(&mut events, &agent_id, "sandbox-lost").await;
+    assert!(
+        failed.contains("next message starts a new sandbox"),
+        "{failed}"
+    );
+    let lost = agent_until(&mut rpc_ws, agent, 600, |a| {
+        a.get("nodeId").is_none() && a.get("placementError").is_some()
+    })
+    .await;
+    assert_eq!(
+        lost["placementError"]["data"]["reason"], "sandbox-lost",
+        "{lost}"
+    );
+    machine_until(&mut rpc_ws, 650, "sbx2", |m| m.is_none()).await;
+    // Retrying the interrupted turn starts a new sandbox for it.
+    ok(
+        &mut rpc_ws,
+        700,
+        "agent.retry",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let third = machine_until(&mut rpc_ws, 710, "sbx3", |m| m.is_some())
+        .await
+        .unwrap();
+    agent_until(&mut rpc_ws, agent, 760, |a| a.get("nodeId").is_some()).await;
+
+    // cloudMachines.kill (its turn still blocked): final stop, then delete.
+    let killed = ok(
+        &mut rpc_ws,
+        800,
+        "cloudMachines.kill",
+        json!({ "machineId": third["id"] }),
+    )
+    .await;
+    assert_eq!(killed["ok"], true, "{killed}");
+    assert!(fake.state().deletes.contains(&"sbx3".to_owned()));
+    assert!(cloud_of(&mut rpc_ws, 801, "sbx3").await.is_none());
+    let unknown = rpc(
+        &mut rpc_ws,
+        802,
+        "cloudMachines.kill",
+        json!({ "machineId": third["id"] }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
+    assert_eq!(unknown["error"]["data"]["code"], "not-found", "{unknown}");
+
+    // The reaper: this backend's orphan goes, another backend's stays.
+    let backend_id = fake.state().creates[0]["metadata"]["intentBackendId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fake.state().listed_only.extend([
+        json!({ "sandboxID": "orphan1", "startedAt": "2026-01-01T00:00:00Z",
+                "metadata": { "intentBackendId": backend_id, "agentId": "gone" } }),
+        json!({ "sandboxID": "foreign1", "startedAt": "2026-01-01T00:00:00Z",
+                "metadata": { "intentBackendId": "another-backend", "agentId": "theirs" } }),
+        json!({ "sandboxID": "undated1",
+                "metadata": { "intentBackendId": backend_id, "agentId": "gone-too" } }),
+    ]);
+    timeout(common::test_timeout(Duration::from_secs(60)), async {
+        while !fake.state().deletes.contains(&"orphan1".to_owned()) {
+            // timing-guard: poll interval for the reaper (every 10 minutes = 1 s)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the orphan is reaped");
+    assert!(
+        !fake.state().deletes.contains(&"undated1".to_owned()),
+        "an orphan without a start time gets the grace from first sight"
+    );
+    timeout(common::test_timeout(Duration::from_secs(60)), async {
+        while !fake.state().deletes.contains(&"undated1".to_owned()) {
+            // timing-guard: poll interval for the reaper after the 1.5 s grace
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the undated orphan is reaped after the grace");
+    assert!(!fake.state().deletes.contains(&"foreign1".to_owned()));
+
+    // No secret in the backend's log.
+    let log = std::fs::read_to_string(head_dir.join("head.log")).unwrap_or_default();
+    let mut secrets = vec![E2B_KEY.to_owned(), PROFILE_SECRET.to_owned()];
+    secrets.extend(fake.envd_tokens());
+    secrets.extend(fake.executor_tokens());
+    for secret in &secrets {
+        assert!(!log.contains(secret.as_str()), "a secret reached the log");
     }
 }

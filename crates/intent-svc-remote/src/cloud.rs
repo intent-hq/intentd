@@ -18,18 +18,21 @@
 
 mod bootstrap;
 mod config;
+mod lifecycle;
 mod methods;
 mod start;
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use intent_core::{AgentId, Caller, Error, Result};
 use intent_services::feature_api::Services;
 use tokio::sync::watch;
 
+pub(crate) use lifecycle::{spawn_supervisor, CloudGate};
 pub(crate) use methods::call;
-pub(crate) use start::{admit, begin_start, wait_linked};
+pub(crate) use start::{admit, begin_start, delete_machine, wait_linked};
 
 /// A finished start that failed: the error's message and data (with its
 /// `code`), so every waiter can rebuild the same error.
@@ -67,9 +70,134 @@ pub(crate) struct CloudState {
     starts: Mutex<HashMap<String, watch::Receiver<StartOutcome>>>,
     /// `configure` and `remove` take turns.
     settings: tokio::sync::Mutex<()>,
+    /// Paused machines: dialed only on a demand, which resumes them.
+    parked: Mutex<HashSet<String>>,
+    /// Machines whose sandbox E2B removed, until their removal ends.
+    lost: Mutex<HashSet<String>>,
+    /// Machines being deleted by the supervisor.
+    killing: Mutex<HashSet<String>>,
+    /// Per-machine pause/resume locks.
+    transitions: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// What the supervisor remembers about each running sandbox.
+    activity: Mutex<HashMap<String, lifecycle::Activity>>,
+    supervisor: AtomicBool,
+    /// When the reaper first saw each orphan whose start time it cannot read.
+    orphans: Mutex<HashMap<String, tokio::time::Instant>>,
 }
 
 impl CloudState {
+    pub(crate) fn is_parked(&self, machine_id: &str) -> bool {
+        crate::lock(&self.parked).contains(machine_id)
+    }
+
+    pub(crate) fn park(&self, machine_id: &str) {
+        crate::lock(&self.parked).insert(machine_id.to_owned());
+    }
+
+    pub(crate) fn unpark(&self, machine_id: &str) {
+        crate::lock(&self.parked).remove(machine_id);
+    }
+
+    fn is_lost(&self, machine_id: &str) -> bool {
+        crate::lock(&self.lost).contains(machine_id)
+    }
+
+    /// Mark the machine lost; `false` when it already was.
+    fn mark_lost(&self, machine_id: &str) -> bool {
+        crate::lock(&self.lost).insert(machine_id.to_owned())
+    }
+
+    fn is_killing(&self, machine_id: &str) -> bool {
+        crate::lock(&self.killing).contains(machine_id)
+    }
+
+    fn begin_kill(&self, machine_id: &str) -> bool {
+        crate::lock(&self.killing).insert(machine_id.to_owned())
+    }
+
+    fn end_kill(&self, machine_id: &str) {
+        crate::lock(&self.killing).remove(machine_id);
+    }
+
+    fn transition_lock(&self, machine_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        crate::lock(&self.transitions)
+            .entry(machine_id.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// Wait for the machine's pause/resume lock.
+    async fn transition(&self, machine_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        self.transition_lock(machine_id).lock_owned().await
+    }
+
+    /// Whether a pause or resume of the machine is under way.
+    fn in_transition(&self, machine_id: &str) -> bool {
+        self.transition_lock(machine_id).try_lock().is_err()
+    }
+
+    /// The machine's activity, first seen now, with `busy` noted.
+    fn activity(&self, machine_id: &str, busy: bool) -> lifecycle::Activity {
+        let mut activity = crate::lock(&self.activity);
+        let entry = activity
+            .entry(machine_id.to_owned())
+            .or_insert_with(lifecycle::Activity::fresh);
+        if busy {
+            entry.touch();
+        }
+        *entry
+    }
+
+    /// The machine just ran or resumed: its idle time starts now.
+    fn touch(&self, machine_id: &str) {
+        crate::lock(&self.activity).insert(machine_id.to_owned(), lifecycle::Activity::fresh());
+    }
+
+    fn renewed(&self, machine_id: &str) {
+        if let Some(entry) = crate::lock(&self.activity).get_mut(machine_id) {
+            entry.renewed();
+        }
+    }
+
+    fn forget_activity(&self, machine_id: &str) {
+        crate::lock(&self.activity).remove(machine_id);
+    }
+
+    /// Forget everything about a removed machine.
+    pub(crate) fn forget(&self, machine_id: &str) {
+        self.unpark(machine_id);
+        crate::lock(&self.lost).remove(machine_id);
+        crate::lock(&self.transitions).remove(machine_id);
+        self.forget_activity(machine_id);
+    }
+
+    /// When the reaper first saw orphan sandbox `sandbox_id` (now, the
+    /// first time).
+    fn first_seen_orphan(&self, sandbox_id: &str) -> tokio::time::Instant {
+        *crate::lock(&self.orphans)
+            .entry(sandbox_id.to_owned())
+            .or_insert_with(tokio::time::Instant::now)
+    }
+
+    /// Forget the first sight of every orphan E2B no longer lists.
+    fn keep_orphans<'a>(&self, listed: impl Iterator<Item = &'a str>) {
+        let listed: HashSet<&str> = listed.collect();
+        crate::lock(&self.orphans).retain(|id, _| listed.contains(id.as_str()));
+    }
+
+    fn forget_orphan(&self, sandbox_id: &str) {
+        crate::lock(&self.orphans).remove(sandbox_id);
+    }
+
+    fn supervisor_started(&self) -> bool {
+        self.supervisor.swap(true, Ordering::SeqCst)
+    }
+
+    /// The agents whose sandbox start is in flight.
+    fn starting_agents(&self) -> HashSet<String> {
+        crate::lock(&self.starts).keys().cloned().collect()
+    }
+
     fn start_of(&self, agent_id: &AgentId) -> Option<watch::Receiver<StartOutcome>> {
         crate::lock(&self.starts).get(agent_id.as_str()).cloned()
     }
@@ -97,6 +225,11 @@ async fn started_by(svc: &Services) -> intent_core::machines::CloudStartedBy {
             display_name: None,
         },
     }
+}
+
+/// A client for the saved E2B key, if one is saved.
+pub(crate) async fn saved_client(svc: &Services) -> Option<intent_nodes::e2b::E2bClient> {
+    config::saved_client(svc).await.ok()
 }
 
 /// The remote feature, or the error of a daemon without it.

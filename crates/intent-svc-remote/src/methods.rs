@@ -67,7 +67,10 @@ pub(crate) fn machine_json(row: &ExposedMachine, live: Option<&Shared>) -> Value
         machine.insert("nodeProtocol".into(), json!(protocol));
     }
     if let Some(cloud) = &row.cloud {
-        machine.insert("cloud".into(), json!(cloud));
+        machine.insert(
+            "cloud".into(),
+            cloud.to_wire(time::OffsetDateTime::now_utc()),
+        );
     }
     Value::Object(machine)
 }

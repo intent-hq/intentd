@@ -64,6 +64,14 @@ pub(crate) enum ConnectFailure {
     /// This backend could not prepare the hello (its own store failed),
     /// or the connector stopped.
     Local(String),
+    /// A cloud machine's sandbox could not be made dialable (resumed) before
+    /// the dial: the documented `cloud-*` error's message and data. `lost`
+    /// when E2B no longer has the sandbox.
+    Cloud {
+        message: String,
+        data: serde_json::Value,
+        lost: bool,
+    },
 }
 
 impl ConnectFailure {
@@ -85,6 +93,7 @@ impl ConnectFailure {
             ),
             Self::UpdateRequired(update) => Error::MachineUpdateRequired(update),
             Self::Local(message) => Error::Internal(format!("remote machine {name}: {message}")),
+            Self::Cloud { message, data, .. } => Error::remote_machine(true, message, data),
         }
     }
 }

@@ -1,6 +1,7 @@
-//! `cloudMachines.configure`, `list` and `remove`. The services already
-//! checked the caller: the owner for `configure` and `remove`, the owner or a
-//! shared-host member for `list`.
+//! `cloudMachines.configure`, `list`, `remove`, `pause` and `kill`. The
+//! services already checked the caller: the owner for `configure` and
+//! `remove`, the owner or a shared-host member for the others; `pause` and
+//! `kill` then admit only the owner and the machine's starter.
 
 use serde_json::{json, Value};
 
@@ -24,6 +25,8 @@ pub(crate) async fn call(svc: &Services, method: &str, params: Value) -> Result<
         "configure" => configure(feature, svc, &params).await,
         "list" => list(feature, svc).await,
         "remove" => remove(feature, svc, &params).await,
+        "pause" => pause(feature, svc, &params).await,
+        "kill" => kill(feature, svc, &params).await,
         other => Err(Error::InvalidParams(format!(
             "unknown method cloudMachines.{other}"
         ))),
@@ -336,5 +339,78 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         None,
     )
     .await;
+    Ok(json!({ "ok": true, "unconfirmedStops": unconfirmed }))
+}
+
+/// `-32602` `not-found` for a `machineId` that names no cloud machine.
+pub(crate) fn not_found(machine_id: &str) -> Error {
+    Error::remote_machine(
+        false,
+        format!("No cloud machine {machine_id}."),
+        json!({ "code": "not-found" }),
+    )
+}
+
+/// The cloud machine `params.machineId` names, once the caller may act on
+/// it: the owner, or the principal that started it.
+async fn own_machine(svc: &Services, params: &Value, what: &str) -> Result<ExposedMachine> {
+    let machine_id = match params.get("machineId") {
+        Some(Value::String(id)) if !id.trim().is_empty() && id.len() <= 256 => id.clone(),
+        None | Some(Value::Null) => {
+            return Err(Error::InvalidParams("machineId is required".into()))
+        }
+        Some(_) => {
+            return Err(Error::InvalidParams(
+                "machineId must be a non-blank string".into(),
+            ))
+        }
+    };
+    let row = svc
+        .store()
+        .get_exposed_machine(&machine_id)
+        .await?
+        .filter(ExposedMachine::is_cloud)
+        .ok_or_else(|| not_found(&machine_id))?;
+    if svc.caller_is_machine_owner().await {
+        return Ok(row);
+    }
+    let starter = row
+        .cloud
+        .as_ref()
+        .map(|cloud| cloud.started_by.principal_id.as_str())
+        .unwrap_or_default();
+    match intent_core::current_caller() {
+        Some(intent_core::Caller::Wire { principal_id, .. })
+            if !starter.is_empty() && principal_id.to_string() == starter =>
+        {
+            Ok(row)
+        }
+        _ => Err(Error::Forbidden(format!(
+            "cloudMachines.{what} requires the owner or the member who started the machine"
+        ))),
+    }
+}
+
+async fn pause(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<Value> {
+    let row = own_machine(svc, params, "pause").await?;
+    if let Some(saved) = config::load(svc).await? {
+        if saved.state == config::ProviderState::KeyRejected {
+            return Err(config::key_rejected(None));
+        }
+    }
+    let client = config::saved_client(svc).await?;
+    let paused = super::lifecycle::pause(svc, feature, &client, &row.id).await?;
+    let live = feature.running_node(&paused.id);
+    Ok(json!({
+        "machine": crate::methods::machine_json(&paused, live.as_ref().map(crate::RemoteNode::shared_ref)),
+    }))
+}
+
+async fn kill(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<Value> {
+    let row = own_machine(svc, params, "kill").await?;
+    // Without a working key the records still go; the reaper deletes the
+    // sandbox once a working key is saved.
+    let client = config::saved_client(svc).await.ok();
+    let unconfirmed = super::start::delete_machine(feature, svc, &row, client.as_ref()).await;
     Ok(json!({ "ok": true, "unconfirmedStops": unconfirmed }))
 }

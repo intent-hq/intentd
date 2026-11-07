@@ -535,8 +535,54 @@ pub struct CloudMachine {
     pub agent_id: String,
     pub workspace_id: String,
     pub started_at: String,
-    /// Seconds not paused since start, for cost estimates.
+    /// Seconds not paused since start, for cost estimates, up to the start
+    /// of the current running stretch.
     pub running_seconds: u64,
+    /// When the current running stretch began (the start or the last
+    /// resume); `None` while not running. Kept off the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_since: Option<String>,
+    /// When the sandbox was last paused; `None` unless paused. Kept off the
+    /// wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
+}
+
+impl CloudMachine {
+    /// Seconds not paused since start, the current stretch included.
+    #[must_use]
+    pub fn running_seconds_at(&self, now: time::OffsetDateTime) -> u64 {
+        let stretch = self
+            .running_since
+            .as_deref()
+            .and_then(parse_rfc3339)
+            .map_or(0, |since| {
+                u64::try_from((now - since).whole_seconds().max(0)).unwrap_or(0)
+            });
+        self.running_seconds.saturating_add(stretch)
+    }
+
+    /// `RemoteMachine.cloud` on the wire: no internal timestamps, and
+    /// `runningSeconds` counted up to `now`.
+    #[must_use]
+    pub fn to_wire(&self, now: time::OffsetDateTime) -> serde_json::Value {
+        let mut wire = serde_json::to_value(self).unwrap_or_default();
+        if let Some(object) = wire.as_object_mut() {
+            object.remove("runningSince");
+            object.remove("pausedAt");
+            object.insert(
+                "runningSeconds".into(),
+                serde_json::json!(self.running_seconds_at(now)),
+            );
+        }
+        wire
+    }
+}
+
+/// An RFC 3339 time, as `now_iso` writes it.
+#[must_use]
+pub fn parse_rfc3339(text: &str) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()
 }
 
 /// `AgentLite.cloudStart.step`: how far a new cloud machine got.

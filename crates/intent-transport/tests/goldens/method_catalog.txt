@@ -133,7 +133,9 @@ router agent.workers.list
 router agent.workers.stop
 router client.list
 router cloudMachines.configure
+router cloudMachines.kill
 router cloudMachines.list
+router cloudMachines.pause
 router cloudMachines.remove
 router comment.add
 router comment.delete
