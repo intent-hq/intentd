@@ -2074,25 +2074,30 @@ async fn run(
             }
         }
         let asked = demanded || !waiters.is_empty();
-        let pauses = target.gate.as_ref().map(|gate| gate.pauses());
         demanded = false;
         let version = lock(&shared.status).intentd_version.clone();
         let ingested = ingest.ingested();
         let gated = match &target.gate {
             Some(gate) => tokio::select! {
-                gated = gate.before_dial(&shared, asked) => gated,
+                gated = gate.before_dial(&shared, asked) => gated.map(Some),
                 () = wait_true(&mut shutdown) => return,
             },
-            None => Ok(()),
+            None => Ok(None),
         };
+        // The cloud machine's pause count when its gate let this dial
+        // through; `None` for an exposed machine.
+        let mut pauses = None;
         let connected = match gated {
-            Ok(()) => tokio::select! {
-                connected = connect(&target, &shared.tuning.connect, version.as_deref(), || {
-                    let lease = lease.clone();
-                    async move { lease.next_hello(ingested).await }
-                }) => connected,
-                () = wait_true(&mut shutdown) => return,
-            },
+            Ok(seen) => {
+                pauses = seen;
+                tokio::select! {
+                    connected = connect(&target, &shared.tuning.connect, version.as_deref(), || {
+                        let lease = lease.clone();
+                        async move { lease.next_hello(ingested).await }
+                    }) => connected,
+                    () = wait_true(&mut shutdown) => return,
+                }
+            }
             Err(failure) => Err(failure),
         };
         if *shutdown.borrow() {
@@ -2246,22 +2251,32 @@ async fn run(
         if let Some(hook) = &shared.tuning.before_publish.0 {
             hook(&shared);
         }
-        // The same check as after the dial, for a pause that began while
-        // this bind was being set up: nothing is published to a frozen
-        // sandbox.
+        shared.link.send_replace(Some(link.clone()));
+        // The same check as after the dial, once the link is published: a
+        // pause counts before it closes the published link, so either it
+        // closed this link or the count shows it began. Nothing stays bound
+        // to a frozen sandbox.
         if let Some(gate) = &target.gate {
             if Some(gate.pauses()) != pauses {
                 if let Some(git) = git {
                     git.abort();
                 }
                 link.close();
+                shared.link.send_if_modified(|current| {
+                    let ours = current
+                        .as_ref()
+                        .is_some_and(|c| c.binding() == link.binding());
+                    if ours {
+                        *current = None;
+                    }
+                    ours
+                });
                 shared.disconnected();
                 demanded = asked;
                 retry = shared.wants_link();
                 continue;
             }
         }
-        shared.link.send_replace(Some(link.clone()));
         shared.resend_queued(&link);
         for waiter in waiters.drain(..) {
             let _ = waiter.send(Ok(()));

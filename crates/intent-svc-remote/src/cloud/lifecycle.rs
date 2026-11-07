@@ -152,19 +152,22 @@ impl CloudGate {
     /// still has it). A sandbox E2B removed ends the machine's agents with
     /// [`SANDBOX_LOST_MESSAGE`] and removes the machine. `asked` when
     /// something asked for this dial; a redial that waited here while a
-    /// pause finished does not resume the sandbox.
+    /// pause finished does not resume the sandbox. Returns the machine's
+    /// pause count as seen under its transition lock, for the connector to
+    /// tell whether a pause began after this check.
     pub(crate) async fn before_dial(
         &self,
         shared: &Shared,
         asked: bool,
-    ) -> std::result::Result<(), ConnectFailure> {
+    ) -> std::result::Result<u64, ConnectFailure> {
         let Ok(feature) = super::feature(&self.svc) else {
-            return Ok(());
+            return Ok(0);
         };
         if feature.cloud.is_lost(&self.machine_id) {
             return Err(lost_failure());
         }
         let _transition = feature.cloud.transition(&self.machine_id).await;
+        let pauses = feature.cloud.pauses(&self.machine_id);
         if !asked && feature.cloud.is_parked(&self.machine_id) {
             return Err(ConnectFailure::Local(
                 "the sandbox was paused; it resumes when something asks for it".into(),
@@ -172,7 +175,7 @@ impl CloudGate {
         }
         let row = match self.svc.store().get_exposed_machine(&self.machine_id).await {
             Ok(Some(row)) => row,
-            Ok(None) => return Ok(()),
+            Ok(None) => return Ok(pauses),
             Err(error) => return Err(ConnectFailure::Local(error.to_string())),
         };
         if row
@@ -180,14 +183,14 @@ impl CloudGate {
             .as_ref()
             .is_none_or(|cloud| cloud.state == CloudSandboxState::Stopping)
         {
-            return Ok(());
+            return Ok(pauses);
         }
         // Without the key (a provider remove in progress), dial as is.
         let Ok(client) = config::saved_client(&self.svc).await else {
-            return Ok(());
+            return Ok(pauses);
         };
         match resume(&self.svc, feature, &client, &row).await {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(pauses),
             Err(Resumed::Lost) => {
                 sandbox_lost(&self.svc, feature, Some(shared), &row);
                 Err(lost_failure())
