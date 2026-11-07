@@ -664,7 +664,8 @@ your branch selection. If the branch list fails to load, open **Branch** and use
 **Refresh branches**.
 **Clone** is hidden only once Intent has confirmed no forge account is connected;
 to clone, use the connect link or **Settings → Connections**. Onboarding uses
-the same tab names. Open the agent picker to choose who starts the workspace.
+the same tab names. Open the agent picker to choose who starts the workspace;
+**None**, last in the list, starts an agent without specialist instructions.
 **Create new or manage specialists** closes the workspace form and opens specialist settings.
 In **Setup script**, search the list and select the repository's config, a previously
 used script, or a template to apply it. Previously used scripts appear first, most
