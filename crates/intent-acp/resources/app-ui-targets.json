@@ -197,6 +197,19 @@
     "category": "settings"
   },
   {
+    "id": "plugins",
+    "tab": "connections",
+    "hashAliases": [
+      "plugins"
+    ],
+    "scrollSelector": "#plugins",
+    "highlightSelector": "[data-highlight-id=\"plugins\"]",
+    "label": "Settings: Plugins",
+    "route": "/settings?tab=connections#plugins",
+    "description": "App-wide Agent Plugins.",
+    "category": "settings"
+  },
+  {
     "id": "git-workspace",
     "tab": "setup",
     "hashAliases": [
