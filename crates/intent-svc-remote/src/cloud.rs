@@ -81,6 +81,8 @@ pub(crate) struct CloudState {
     /// What the supervisor remembers about each running sandbox.
     activity: Mutex<HashMap<String, lifecycle::Activity>>,
     supervisor: AtomicBool,
+    /// Pauses begun per machine.
+    pauses: Mutex<HashMap<String, u64>>,
     /// When the reaper first saw each orphan whose start time it cannot read.
     orphans: Mutex<HashMap<String, tokio::time::Instant>>,
 }
@@ -92,6 +94,19 @@ impl CloudState {
 
     pub(crate) fn park(&self, machine_id: &str) {
         crate::lock(&self.parked).insert(machine_id.to_owned());
+    }
+
+    fn count_pause(&self, machine_id: &str) {
+        *crate::lock(&self.pauses)
+            .entry(machine_id.to_owned())
+            .or_default() += 1;
+    }
+
+    fn pauses(&self, machine_id: &str) -> u64 {
+        crate::lock(&self.pauses)
+            .get(machine_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub(crate) fn unpark(&self, machine_id: &str) {
@@ -168,6 +183,7 @@ impl CloudState {
         self.unpark(machine_id);
         crate::lock(&self.lost).remove(machine_id);
         crate::lock(&self.transitions).remove(machine_id);
+        crate::lock(&self.pauses).remove(machine_id);
         self.forget_activity(machine_id);
     }
 

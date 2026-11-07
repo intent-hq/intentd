@@ -767,16 +767,18 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     assert!(agent.get("nodeId").is_none(), "{created}");
     assert!(agent["cloudStart"]["step"].is_string(), "{created}");
 
-    // The first message waits for the sandbox, then runs there.
-    let reply = turn(
-        &mut rpc_ws,
+    // The first message waits for the sandbox, then runs there. Polled on
+    // the RPC socket, which a slow sandbox start must not leave unread; the
+    // event socket, unread meanwhile, is opened again.
+    send_and_reply(&mut rpc_ws, (&ws_id, &agent_id), "hello cloud", 20).await;
+    events = connect(port, cfg.clone()).await;
+    ok(
         &mut events,
-        (&ws_id, &agent_id),
-        "hello cloud",
-        20,
+        22,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "cloudMachine:changed"], "workspaceId": ws_id }),
     )
     .await;
-    assert!(reply.contains("hello cloud"), "{reply}");
     let linked = agent_until(&mut rpc_ws, (&ws_id, &agent_id), 30, |a| {
         a.get("nodeId").is_some()
     })
@@ -881,6 +883,11 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     .expect("the sandbox pushed the agent's work");
     assert_eq!(pushed.trim(), "from the sandbox");
 
+    // Keep the events read so far: the socket must not sit unread for the
+    // starts below (the backend drops a client that stops answering pings).
+    let mut seen_events = Vec::new();
+    drain_events(&mut events, &mut seen_events).await;
+
     // A size the plan refuses fails the start with cloud-quota, deletes
     // nothing it did not make, and adds no machine.
     let sized = ok(
@@ -909,6 +916,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     let cloud = ok(&mut rpc_ws, 400, "cloudMachines.list", json!({})).await;
     assert_eq!(cloud["machines"].as_array().unwrap().len(), 1, "{cloud}");
 
+    drain_events(&mut events, &mut seen_events).await;
     // A bootstrap that fails (the mint in the sandbox) deletes the sandbox
     // it made and adds no machine.
     let small = ok(
@@ -949,6 +957,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     let cloud = ok(&mut rpc_ws, 390, "cloudMachines.list", json!({})).await;
     assert_eq!(cloud["machines"].as_array().unwrap().len(), 1, "{cloud}");
 
+    drain_events(&mut events, &mut seen_events).await;
     // Removing the provider with a live sandbox needs stopAgents.
     let busy = rpc(
         &mut rpc_ws,
@@ -1016,6 +1025,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     })
     .await
     .expect("remove forgets the settings first");
+    drain_events(&mut events, &mut seen_events).await;
     let creates_before = fake.state().creates.len();
     let late = rpc(&mut rpc_ws, 500, "agent.create", create(&keyed_ref, "Late")).await;
     assert_eq!(
@@ -1050,15 +1060,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     assert!(!minted.is_empty(), "the sandbox minted a credential");
     secrets.extend(minted);
     let log = std::fs::read_to_string(head_dir.join("head.log")).unwrap_or_default();
-    let mut seen_events = Vec::new();
-    while let Ok(Some(Ok(Message::Text(text)))) = timeout(
-        common::test_timeout(Duration::from_millis(200)),
-        events.next(),
-    )
-    .await
-    {
-        seen_events.push(text.to_string());
-    }
+    drain_events(&mut events, &mut seen_events).await;
     for secret in &secrets {
         assert!(
             !log.contains(secret.as_str()),
@@ -1125,12 +1127,99 @@ async fn failure_containing(events: &mut common::TlsWs, agent_id: &str, needle: 
     .unwrap_or_else(|_| panic!("no agent:failed with {needle:?}"))
 }
 
+/// Read every event `events` has ready into `seen` (text frames), answering
+/// pings, until it stays quiet for a moment.
+async fn drain_events(events: &mut common::TlsWs, seen: &mut Vec<String>) {
+    loop {
+        match timeout(
+            common::test_timeout(Duration::from_millis(200)),
+            events.next(),
+        )
+        .await
+        {
+            Ok(Some(Ok(Message::Text(text)))) => seen.push(text.to_string()),
+            Ok(Some(Ok(Message::Ping(p)))) => {
+                let _ = events.send(Message::Pong(p)).await;
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(error))) => panic!("event socket failed: {error}"),
+            Ok(None) => panic!("event socket closed"),
+            Err(_) => return,
+        }
+    }
+}
+
+/// Request ids for [`keep_alive`], clear of the test's own.
+static KEEP_ALIVE_ID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1_000_000);
+
+/// One cheap request on `rpc_ws`, so it reads (and answers) the backend's
+/// pings: the backend drops a client that has not answered one for 60 s,
+/// which a slow (coverage) run reaches while the test only polls the fake.
+async fn keep_alive(rpc_ws: &mut common::TlsWs) {
+    let id = KEEP_ALIVE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ok(rpc_ws, id, "cloudMachines.list", json!({})).await;
+}
+
+/// Wait `total` while keeping `rpc_ws` answered.
+async fn idle(rpc_ws: &mut common::TlsWs, total: Duration) {
+    let until = tokio::time::Instant::now() + total;
+    while tokio::time::Instant::now() < until {
+        // timing-guard: a short step of a deliberate wait
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        keep_alive(rpc_ws).await;
+    }
+}
+
+/// A new connection subscribed to the workspace's agent events, opened
+/// right before the step that waits for one: a connection left unread
+/// across earlier steps may have been dropped for unanswered pings.
+async fn agent_events(port: u16, cfg: Arc<ClientConfig>, ws_id: &str) -> common::TlsWs {
+    let mut events = connect(port, cfg).await;
+    ok(
+        &mut events,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    events
+}
+
+/// Send `content` to the agent and wait for its reply, polling the
+/// conversation on `rpc_ws` (so the socket keeps answering pings however
+/// long the turn takes, for example a sandbox start on a slow runner).
+async fn send_and_reply(
+    rpc_ws: &mut common::TlsWs,
+    (ws_id, agent_id): (&str, &str),
+    content: &str,
+    id: i64,
+) {
+    ok(
+        rpc_ws,
+        id,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": content }),
+    )
+    .await;
+    reply_containing(rpc_ws, (ws_id, agent_id), content, id + 1).await;
+}
+
 /// Wait until `fake` saw a call matching `check` about `sandbox`.
-async fn call_until(fake: &FakeE2b, sandbox: &str, check: impl Fn(&[(String, String)]) -> bool) {
+async fn call_until(
+    fake: &FakeE2b,
+    rpc_ws: &mut common::TlsWs,
+    sandbox: &str,
+    check: impl Fn(&[(String, String)]) -> bool,
+) {
     timeout(common::test_timeout(Duration::from_secs(120)), async {
+        let mut polls = 0_u32;
         while !check(&fake.calls_for(sandbox)) {
             // timing-guard: poll interval for the backend's next E2B call
             tokio::time::sleep(Duration::from_millis(50)).await;
+            polls += 1;
+            if polls.is_multiple_of(20) {
+                keep_alive(rpc_ws).await;
+            }
         }
     })
     .await
@@ -1196,14 +1285,6 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
         json!({ "clientId": "e2b-life", "name": "E2B lifecycle" }),
     )
     .await;
-    let mut events = connect(port, cfg.clone()).await;
-    ok(
-        &mut events,
-        2,
-        "events.subscribe",
-        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
-    )
-    .await;
     let keyed = ok(
         &mut rpc_ws,
         3,
@@ -1242,8 +1323,7 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
     .await;
     let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
     let agent = (ws_id.as_str(), agent_id.as_str());
-    let reply = turn(&mut rpc_ws, &mut events, agent, "hello life", 10).await;
-    assert!(reply.contains("hello life"), "{reply}");
+    send_and_reply(&mut rpc_ws, agent, "hello life", 10).await;
     let machine = machine_until(&mut rpc_ws, 20, "sbx1", |m| m.is_some())
         .await
         .unwrap();
@@ -1255,14 +1335,14 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
     );
 
     // Renewed while it lives.
-    call_until(&fake, "sbx1", |calls| {
+    call_until(&fake, &mut rpc_ws, "sbx1", |calls| {
         calls.iter().any(|c| is_call(c, "POST", "/sbx1/timeout"))
     })
     .await;
 
     // Before the run cap (50 minutes = 5 s), at a turn boundary: paused and
     // resumed at once, with no prompt.
-    call_until(&fake, "sbx1", |calls| {
+    call_until(&fake, &mut rpc_ws, "sbx1", |calls| {
         calls
             .iter()
             .position(|c| is_call(c, "POST", "/sbx1/pause"))
@@ -1277,8 +1357,7 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
         m.is_some_and(|m| m["cloud"]["state"] == "running")
     })
     .await;
-    let reply = turn(&mut rpc_ws, &mut events, agent, "after the cap", 200).await;
-    assert!(reply.contains("after the cap"), "{reply}");
+    send_and_reply(&mut rpc_ws, agent, "after the cap", 200).await;
 
     // cloudMachines.pause: E2B's refusal leaves it running.
     fake.state().pause_refusal = Some((503, json!({ "code": 503, "message": "node busy" })));
@@ -1320,8 +1399,7 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
 
     // A new prompt resumes it and redials.
     let seen_calls = fake.calls_for("sbx1").len();
-    let reply = turn(&mut rpc_ws, &mut events, agent, "after the pause", 220).await;
-    assert!(reply.contains("after the pause"), "{reply}");
+    send_and_reply(&mut rpc_ws, agent, "after the pause", 220).await;
     assert!(
         fake.calls_for("sbx1")[seen_calls..]
             .iter()
@@ -1342,6 +1420,7 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
         429,
         json!({ "code": 429, "message": "You have reached the maximum number of concurrent E2B sandboxes" }),
     ));
+    let mut events = agent_events(port, cfg.clone(), &ws_id).await;
     ok(
         &mut rpc_ws,
         231,
@@ -1369,14 +1448,14 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
         configure(json!({ "idlePauseMinutes": 1 })),
     )
     .await;
-    let idle = machine_until(&mut rpc_ws, 250, "sbx1", |m| {
+    let paused_idle = machine_until(&mut rpc_ws, 250, "sbx1", |m| {
         m.is_some_and(|m| m["cloud"]["state"] == "paused")
     })
     .await
     .unwrap();
     assert!(
-        idle["cloud"]["runningSeconds"].as_u64().unwrap() >= 1,
-        "{idle}"
+        paused_idle["cloud"]["runningSeconds"].as_u64().unwrap() >= 1,
+        "{paused_idle}"
     );
 
     // Paused for pausedDeleteDays: resumed, final stopped, then deleted.
@@ -1439,7 +1518,7 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
         state.list_failing = true;
     }
     let before = fake.calls_for("sbx2").len();
-    call_until(&fake, "sbx2", |calls| {
+    call_until(&fake, &mut rpc_ws, "sbx2", |calls| {
         calls[before.min(calls.len())..]
             .iter()
             .filter(|c| is_call(c, "POST", "/sbx2/timeout"))
@@ -1488,7 +1567,7 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
     assert_eq!(busy["error"]["data"]["runningAgents"], 1, "{busy}");
     let before = fake.calls_for("sbx2").len();
     // timing-guard: longer than the run cap (5 s), so a planned pause would have run
-    tokio::time::sleep(Duration::from_secs(7)).await;
+    idle(&mut rpc_ws, Duration::from_secs(7)).await;
     assert!(
         !fake.calls_for("sbx2")[before..]
             .iter()
@@ -1499,6 +1578,7 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
 
     // E2B removes the sandbox mid-turn: the turn fails with sandbox-lost,
     // and the agent is left without a sandbox.
+    let mut events = agent_events(port, cfg.clone(), &ws_id).await;
     fake.vanish("sbx2");
     let failed = failure_containing(&mut events, &agent_id, "sandbox-lost").await;
     assert!(
@@ -1563,6 +1643,7 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
     ]);
     timeout(common::test_timeout(Duration::from_secs(60)), async {
         while !fake.state().deletes.contains(&"orphan1".to_owned()) {
+            keep_alive(&mut rpc_ws).await;
             // timing-guard: poll interval for the reaper (every 10 minutes = 1 s)
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1575,6 +1656,7 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
     );
     timeout(common::test_timeout(Duration::from_secs(60)), async {
         while !fake.state().deletes.contains(&"undated1".to_owned()) {
+            keep_alive(&mut rpc_ws).await;
             // timing-guard: poll interval for the reaper after the 1.5 s grace
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

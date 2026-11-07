@@ -2079,19 +2079,25 @@ async fn run(
         let ingested = ingest.ingested();
         let gated = match &target.gate {
             Some(gate) => tokio::select! {
-                gated = gate.before_dial(&shared, asked) => gated,
+                gated = gate.before_dial(&shared, asked) => gated.map(Some),
                 () = wait_true(&mut shutdown) => return,
             },
-            None => Ok(()),
+            None => Ok(None),
         };
+        // The cloud machine's pause count when its gate let this dial
+        // through; `None` for an exposed machine.
+        let mut pauses = None;
         let connected = match gated {
-            Ok(()) => tokio::select! {
-                connected = connect(&target, &shared.tuning.connect, version.as_deref(), || {
-                    let lease = lease.clone();
-                    async move { lease.next_hello(ingested).await }
-                }) => connected,
-                () = wait_true(&mut shutdown) => return,
-            },
+            Ok(seen) => {
+                pauses = seen;
+                tokio::select! {
+                    connected = connect(&target, &shared.tuning.connect, version.as_deref(), || {
+                        let lease = lease.clone();
+                        async move { lease.next_hello(ingested).await }
+                    }) => connected,
+                    () = wait_true(&mut shutdown) => return,
+                }
+            }
             Err(failure) => Err(failure),
         };
         if *shutdown.borrow() {
@@ -2164,6 +2170,17 @@ async fn run(
                 continue;
             }
         };
+        // A cloud machine paused while this dial was in flight: the link
+        // would be bound to a frozen sandbox. Drop it and dial again through
+        // the gate, which resumes the sandbox for an asked dial.
+        if let Some(gate) = &target.gate {
+            if Some(gate.pauses()) != pauses {
+                dialed.link.close();
+                demanded = asked;
+                retry = shared.wants_link();
+                continue;
+            }
+        }
         let link::DialedLink {
             link,
             events,
@@ -2235,6 +2252,31 @@ async fn run(
             hook(&shared);
         }
         shared.link.send_replace(Some(link.clone()));
+        // The same check as after the dial, once the link is published: a
+        // pause counts before it closes the published link, so either it
+        // closed this link or the count shows it began. Nothing stays bound
+        // to a frozen sandbox.
+        if let Some(gate) = &target.gate {
+            if Some(gate.pauses()) != pauses {
+                if let Some(git) = git {
+                    git.abort();
+                }
+                link.close();
+                shared.link.send_if_modified(|current| {
+                    let ours = current
+                        .as_ref()
+                        .is_some_and(|c| c.binding() == link.binding());
+                    if ours {
+                        *current = None;
+                    }
+                    ours
+                });
+                shared.disconnected();
+                demanded = asked;
+                retry = shared.wants_link();
+                continue;
+            }
+        }
         shared.resend_queued(&link);
         for waiter in waiters.drain(..) {
             let _ = waiter.send(Ok(()));
