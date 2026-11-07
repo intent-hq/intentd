@@ -822,7 +822,7 @@ window finishes. Older clients may show the initial messages together.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/ChatPanel.svelte; packages/intentd/crates/intent-transport/src/{conn,subscriptions}.rs. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/HomeAssistantThreads.svelte; src/lib/components/layout/sidebar-nav/cards/{ChiefCard.svelte,chief-thread-starter.svelte.ts}; src/lib/components/chat/AssistantThreadTitle.svelte. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/HomeAssistantThreads.svelte; src/lib/components/layout/sidebar-nav/cards/{ChiefCard.svelte,chief-thread-starter.svelte.ts}; src/lib/components/chat/{AssistantThreadTitle.svelte,agent-pin-menu.ts}; src/store/renderer/slices/agent-session/sagas/agent-mutation-saga.ts. Daemon: agent.update `pinned`, agent.retire, agent.restore, agent.delete. -->
 
 In **Home → Assistant**, click **New chat** at the top of the sidebar to start a
 chat; a blank chat is reused rather than duplicated. Select a thread in the
@@ -830,6 +830,16 @@ sidebar to open it. To rename it, click its title in the conversation header.
 The title field uses the available header width. Press **Enter** or click away
 to save; press **Escape** to cancel. Sidebar titles select conversations and
 cannot be edited there.
+
+Hover a chat in the sidebar to show its delete button, or right-click it for
+**Pin to top**, **Archive**, and **Delete**. Pinned chats stay at the top.
+**Archive** keeps the chat and moves it to the collapsible **Archived** group
+below the list; open an archived chat to read it, or right-click it to
+**Unarchive** or **Delete** it. The last chat that is not archived cannot be
+archived. Cmd-click (Ctrl-click on Windows and Linux) or Shift-click chats to
+select several, then choose **Archive** or **Delete** in the bar above the list
+or in the right-click menu; one **Undo** restores every deleted chat. Press
+**Escape** to clear the selection.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode,HomeWorkspacePullBadge}.svelte; src/features/home/home-workspace-opening.ts; messages/en.json. -->
 
