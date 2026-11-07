@@ -2131,9 +2131,15 @@ async fn run(
                 // that and this write still reads `disconnected`
                 // (intent-hq/intent#8484).
                 shared.record_failure(&failure).await;
-                if let (ConnectFailure::UpdateRequired(_), Some(gate)) = (&failure, &target.gate) {
-                    // A cloud sandbox never gets an update: it is deleted.
-                    gate.outdated(&shared);
+                if let (ConnectFailure::UpdateRequired(update), Some(gate)) =
+                    (&failure, &target.gate)
+                {
+                    // A cloud sandbox older than this backend never gets an
+                    // update: it is deleted. A newer one (this backend was
+                    // rolled back) links again once the backend is updated.
+                    if update.update == intent_core::machines::UpdateSide::Machine {
+                        gate.outdated(&shared);
+                    }
                 }
                 if matches!(failure, ConnectFailure::Revoked(_)) {
                     // Revocation stopped this binding's agents on the
