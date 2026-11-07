@@ -252,6 +252,10 @@ pub struct RemoteLaunchNeeds {
     /// The provider reference as given (`claude-code`, `codex@work`), for
     /// `cloud-profile-required` data.
     pub provider_ref: String,
+    /// The placement is the parent's, inherited by a sub-agent created
+    /// with none: from an agent on a cloud machine it means that sandbox.
+    /// An explicit `target: "e2b"` always means a new sandbox.
+    pub inherited: bool,
 }
 
 /// The [`REMOTE_PLACEMENT_METADATA_KEY`] value: the projection fields of an
@@ -322,6 +326,125 @@ pub enum ParentWorkCopy {
     Pushed,
     /// The parent's machine could not push now: its last push.
     LastPush,
+}
+
+/// Session `metadata` key of a backend sub-agent of a remote agent: where
+/// the parent's work was saved when the sub-agent was created
+/// ([`BackendParentWork`]). Written only by the daemon.
+pub const BACKEND_PARENT_WORK_METADATA_KEY: &str = "backendParentWork";
+
+/// The parent's work a backend (`target: "local"`) sub-agent of a remote
+/// agent starts from: the commits of the owner of the parent's checkout
+/// and its uncommitted changes, as saved in its refs. A sub-agent with its
+/// own copy-on-write checkout starts from them (`seeded`); one in the
+/// workspace's shared checkout is told where they are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendParentWork {
+    pub agent_id: crate::AgentId,
+    /// The parent's `head` commit; `None` when it has saved no work yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// The parent's `wip` commit, when it differs from `head`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wip: Option<String>,
+    /// The same for each pinned submodule the parent saved work in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submodules: Vec<BackendParentModule>,
+    pub copied: ParentWorkCopy,
+    /// The sub-agent's own checkout was reset to this work.
+    #[serde(default)]
+    pub seeded: bool,
+}
+
+/// A submodule's part of [`BackendParentWork`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendParentModule {
+    /// From the superproject root.
+    pub path: String,
+    pub head: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wip: Option<String>,
+}
+
+impl BackendParentWork {
+    /// The parent's ref `name` (`head` or `wip`) in workspace `workspace_id`.
+    #[must_use]
+    pub fn parent_ref(&self, workspace_id: &str, name: &str) -> String {
+        format!(
+            "refs/intent/ws/{workspace_id}/agents/{}/{name}",
+            self.agent_id
+        )
+    }
+
+    fn saved(&self) -> &'static str {
+        match self.copied {
+            ParentWorkCopy::Pushed => "saved when this agent was created",
+            ParentWorkCopy::LastPush => {
+                "as its machine last pushed it (it could not push again now)"
+            }
+        }
+    }
+
+    /// Where the parent's work is, for the sub-agent's instructions and the
+    /// create result's `notice`.
+    #[must_use]
+    pub fn notice(&self, workspace_id: &str) -> String {
+        let short = |commit: &str| commit.get(..12).unwrap_or(commit).to_owned();
+        let Some(head) = self.head.as_deref() else {
+            return format!(
+                "This sub-agent runs on the backend, and its parent has saved no work yet: its commits will be at `{}` and its uncommitted changes at `{}` once its machine pushes them (at the end of its turns).",
+                self.parent_ref(workspace_id, "head"),
+                self.parent_ref(workspace_id, "wip")
+            );
+        };
+        if self.seeded {
+            return format!(
+                "This sub-agent runs on the backend in its own checkout, which starts from its parent's work: commit {} with the parent's uncommitted changes, {}. Later work of either agent is not shared.",
+                short(head),
+                self.saved()
+            );
+        }
+        let wip = self.wip.as_deref().map_or_else(
+            || " The parent had no uncommitted changes.".to_owned(),
+            |wip| {
+                format!(
+                    " Its uncommitted changes are commit {} at `{}` (its tree is the parent's working tree).",
+                    short(wip),
+                    self.parent_ref(workspace_id, "wip")
+                )
+            },
+        );
+        format!(
+            "This sub-agent runs on the backend in the workspace's checkout, which does not have its parent's work. The parent's commits are at `{}` (commit {}), {}.{wip} Read them with git (for example `git show <ref>:<path>` or `git diff HEAD <ref>`); do not reset the shared checkout to them.",
+            self.parent_ref(workspace_id, "head"),
+            short(head),
+            self.saved()
+        )
+    }
+
+    /// [`Self::notice`] for a sub-agent whose own copy-on-write checkout is
+    /// still being made: what it starts from once ready, and the fallback.
+    #[must_use]
+    pub fn pending_notice(&self, workspace_id: &str) -> String {
+        if self.head.is_none() {
+            return self.notice(workspace_id);
+        }
+        format!(
+            "This sub-agent runs on the backend in its own checkout, which is being made and then starts from its parent's work, {}. If that copy cannot be made or reset, it runs in the workspace's checkout and its instructions name the parent's refs: `{}` and `{}`.",
+            self.saved(),
+            self.parent_ref(workspace_id, "head"),
+            self.parent_ref(workspace_id, "wip")
+        )
+    }
+
+    /// Read the value from a session's `metadata`, if it carries one.
+    #[must_use]
+    pub fn from_metadata(metadata: Option<&serde_json::Value>) -> Option<Self> {
+        let value = metadata?.get(BACKEND_PARENT_WORK_METADATA_KEY)?;
+        serde_json::from_value(value.clone()).ok()
+    }
 }
 
 /// Where a remote agent's checkout setup is (`methods/nodes.md` §

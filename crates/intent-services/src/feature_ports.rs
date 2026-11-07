@@ -1437,6 +1437,20 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         Box::pin(async { Ok(()) })
     }
 
+    /// The work a backend (`target: "local"`) sub-agent of remote agent
+    /// `parent` starts from: the parent's machine is asked to push now, then
+    /// the parent's (or its checkout owner's) `head` and `wip` refs are
+    /// read. `None` when the parent has no saved `head`.
+    fn backend_parent_work<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        parent: (&'a AgentId, &'a RemotePlacementView),
+    ) -> BoxFuture<'a, Result<Option<intent_core::remote_launch::BackendParentWork>>> {
+        let _ = (svc, workspace_id, parent);
+        Box::pin(async { Ok(None) })
+    }
+
     /// Place the created agent on the node: record it on the lease and
     /// write its `base` ref.
     ///

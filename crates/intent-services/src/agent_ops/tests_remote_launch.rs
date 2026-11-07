@@ -192,6 +192,7 @@ async fn a_placed_create_persists_its_node_and_reports_what_it_starts_from() {
             with_profile: false,
             sets_profile_env: false,
             provider_ref: "auggie".into(),
+            inherited: false,
         }]
     );
 
@@ -367,6 +368,7 @@ async fn unsupported_placements_are_refused_before_any_effect() {
             "claude-code@work",
             None,
             &placement(json!({"target": "remote"})),
+            false,
         )
         .await;
     assert!(
@@ -401,6 +403,7 @@ async fn a_saved_profile_is_admitted_for_a_remote_agent() {
             reference,
             Some("gpt-5"),
             &placement(json!({"target": "remote"})),
+            false,
         )
         .await
         .expect("a resolvable profile is admitted");
@@ -415,6 +418,7 @@ async fn a_saved_profile_is_admitted_for_a_remote_agent() {
             with_profile: true,
             sets_profile_env: true,
             provider_ref: reference.into(),
+            inherited: false,
         }]
     );
 }
@@ -667,6 +671,7 @@ async fn placement_refuses_a_configuration_tied_to_this_backend() {
             &folder,
             Some("gpt-5"),
             &placement(json!({"target": "remote"})),
+            false,
         )
         .await;
     assert_not_remote_compatible(&result, &folder, "CODEX_HOME");
@@ -686,6 +691,7 @@ async fn placement_refuses_a_configuration_tied_to_this_backend() {
             "claude-code",
             None,
             &placement(json!({"target": "remote"})),
+            false,
         )
         .await;
     assert_not_remote_compatible(&result, "claude-code", "CLAUDE_CONFIG_DIR");
@@ -881,6 +887,7 @@ async fn the_default_model_sentinel_requests_no_model() {
         "auggie",
         Some("default"),
         &placement(json!({"target": "remote"})),
+        false,
     )
     .await
     .unwrap();

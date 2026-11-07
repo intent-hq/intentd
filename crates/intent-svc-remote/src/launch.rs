@@ -28,8 +28,9 @@ use intent_core::placement::{
     PlacementUnavailableReason, PlatformAvailability,
 };
 use intent_core::remote_launch::{
-    EffectiveIsolation, ParentWork, ParentWorkCopy, RemoteAgentRecord, RemoteCheckoutBase,
-    RemoteLaunchNeeds, RemoteLaunchRequest, RemotePlacementView, RemoteSetupStatus,
+    BackendParentModule, BackendParentWork, EffectiveIsolation, ParentWork, ParentWorkCopy,
+    RemoteAgentRecord, RemoteCheckoutBase, RemoteLaunchNeeds, RemoteLaunchRequest,
+    RemotePlacementView, RemoteSetupStatus,
 };
 use intent_core::{AgentId, BoxFuture, Error, Result, Workspace, WorkspaceId};
 use intent_git::hub::AgentRef;
@@ -693,7 +694,9 @@ impl RemoteLaunchPort for RemoteLaunch {
                 .shared_checkout_of
                 .clone()
                 .unwrap_or_else(|| parent.clone());
-            if child.node_id != parent_view.node_id {
+            // A child waiting for a new sandbox never shares, even while
+            // its parent's own sandbox is still starting (both unlinked).
+            if child.is_unlinked() || child.node_id != parent_view.node_id {
                 child.parent_work = Some(ParentWork {
                     agent_id: owner,
                     copied: None,
@@ -706,6 +709,69 @@ impl RemoteLaunchPort for RemoteLaunch {
                 child.shared_checkout_of = Some(owner);
             }
             Ok(())
+        })
+    }
+
+    fn backend_parent_work<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        (parent, parent_view): (&'a AgentId, &'a RemotePlacementView),
+    ) -> BoxFuture<'a, Result<Option<BackendParentWork>>> {
+        Box::pin(async move {
+            let owner = parent_view
+                .shared_checkout_of
+                .clone()
+                .unwrap_or_else(|| parent.clone());
+            let pushed = push_parent_now(svc, &owner).await;
+            let checkout = workspace_checkout(svc, workspace_id).await?;
+            let remote = AgentRemote::new(workspace_id.as_str(), owner.as_str())?;
+            let pins = parent_view.pins().to_vec();
+            let (head, wip, submodules) = blocking(move || {
+                let head = node_git::read_agent_ref(&checkout, &remote, AgentRef::Head)?;
+                let wip = node_git::read_agent_ref(&checkout, &remote, AgentRef::Wip)?
+                    .filter(|wip| Some(*wip) != head);
+                let mut submodules = Vec::new();
+                for pin in pins {
+                    let Ok(module) =
+                        node_git::module_repository(&checkout, &pin.path, &pin.module_key)
+                    else {
+                        continue;
+                    };
+                    let module_remote = remote.with_module(&pin.module_key)?;
+                    let Some(module_head) =
+                        node_git::read_agent_ref(&module.worktree, &module_remote, AgentRef::Head)?
+                    else {
+                        continue;
+                    };
+                    let module_wip =
+                        node_git::read_agent_ref(&module.worktree, &module_remote, AgentRef::Wip)?
+                            .filter(|wip| *wip != module_head);
+                    submodules.push(BackendParentModule {
+                        path: pin.path,
+                        head: module_head.to_string(),
+                        wip: module_wip.map(|wip| wip.to_string()),
+                    });
+                }
+                Ok((
+                    head.map(|head| head.to_string()),
+                    wip.map(|wip| wip.to_string()),
+                    submodules,
+                ))
+            })
+            .await?;
+            Ok(Some(BackendParentWork {
+                agent_id: owner,
+                head,
+                wip,
+                submodules,
+                copied: if pushed {
+                    ParentWorkCopy::Pushed
+                } else {
+                    ParentWorkCopy::LastPush
+                },
+                seeded: false,
+            }))
         })
     }
 

@@ -1,6 +1,7 @@
 //! Sub-agents of remote agents start from the parent's work
 //! (nodeProtocol 13): on the parent's machine they share its checkout, on
-//! another machine they start from its head and wip, pushed at creation.
+//! another machine they start from its head and wip, pushed at creation,
+//! and retiring the parent ends them there.
 //! Head runs with the bound-caller assertion armed, so every frame the
 //! machines forward runs as its agent.
 
@@ -284,4 +285,212 @@ async fn a_remote_agents_sub_agent_on_another_machine_starts_from_its_work() {
         "from parent",
     )
     .await;
+
+    // Retiring the parent retires the child too: its final stop on the
+    // other machine removes its checkout there. (A user may not retire the
+    // last top-level agent.)
+    let checkout = scratch
+        .path()
+        .join("Far")
+        .join("executor")
+        .join(&far.credential_id)
+        .join("agents")
+        .join(&child_id);
+    assert!(checkout.exists(), "{}", checkout.display());
+    ok(
+        &mut rpc_ws,
+        300,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Keeper", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    ok(
+        &mut rpc_ws,
+        301,
+        "agent.retire",
+        json!({ "workspaceId": ws_id, "agentId": parent_id }),
+    )
+    .await;
+    let child = ok(
+        &mut rpc_ws,
+        302,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": child_id }),
+    )
+    .await;
+    assert!(child["agent"]["retiredAt"].is_string(), "{child}");
+    let removed = timeout(wait(), async {
+        while checkout.exists() {
+            // timing-guard: poll interval for the machine's checkout removal (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        removed.is_ok(),
+        "the child's checkout on the other machine is removed"
+    );
+}
+
+/// Whether the filesystem under `/tmp` can copy-on-write clone, as the
+/// backend's sandbox provisioning needs.
+fn cow_supported(root: &Path) -> bool {
+    let (src, dst) = (root.join("cow-src"), root.join("cow-dst"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    matches!(
+        intent_git::cow_probe(&src, &dst),
+        Ok(intent_git::CowSupport::Supported)
+    )
+}
+
+/// A remote parent's `target: "local"` sub-agent runs on the backend. In
+/// the workspace's shared checkout its instructions only say where the
+/// parent's work is (the checkout is not touched); with its own
+/// copy-on-write checkout (`isolation: "cow"`, where the filesystem supports
+/// it) that checkout starts from the parent's work, pushed at creation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remote_agents_backend_sub_agent_gets_its_work() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping remote sub-agent e2e: node or git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-back-");
+    let repo = repo_with_commit(scratch.path());
+    let fixture = format!(
+        "{}/tests/fixtures/node-test-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let (_head, port, cfg, ws_id) = start_backend_with(
+        &scratch.path().join("head"),
+        &repo,
+        &[("MOCK_AGENT_SCRIPT_PATH", fixture.as_str())],
+    )
+    .await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let machine = start_machine(&node_dir, &backend_id).await;
+    ok(
+        &mut rpc_ws,
+        2,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let parent = create_remote(&mut rpc_ws, &ws_id, "Parent", 10).await;
+    let parent_id = parent["agent"]["id"].as_str().unwrap().to_owned();
+    let cow = cow_supported(scratch.path());
+
+    let delegate = if cow {
+        r#"const d = await ws.agent.delegate({ taskText: "Cow", agentInstructions: "echo-raw", provider: "mock", model: "default", placement: { target: "local" }, isolation: "cow" });"#
+    } else {
+        "const d = null;"
+    };
+    let code = format!(
+        r#"wsapi await ws.file.write("parent.txt", "from parent"); const c = await ws.agent.create("Back", "echo-raw", {{ provider: "mock", model: "default", placement: {{ target: "local" }} }}); {delegate} return JSON.stringify({{ marker: "parent-1", c, d }});"#
+    );
+    let reply = wsapi_turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &parent_id),
+        &code,
+        "parent-1",
+        40,
+    )
+    .await;
+    let made = wsapi_value(&reply);
+    let parent_refs = format!("refs/intent/ws/{ws_id}/agents/{parent_id}");
+    let notice = made["c"]["notice"].as_str().unwrap_or_default();
+    assert!(
+        notice.contains("does not have its parent's work") && notice.contains(&parent_refs),
+        "the notice names the parent's refs: {made}"
+    );
+
+    // Shared checkout: the child runs on the backend in the workspace's
+    // checkout, which is not touched; its instructions say where the
+    // parent's work is.
+    let back_id = agent_named(&mut rpc_ws, &ws_id, "Back", 60).await;
+    let seen = reply_containing(&mut rpc_ws, (&ws_id, &back_id), "raw: ", 100).await;
+    assert!(
+        seen.contains("## Parent's work")
+            && seen.contains("does not have its parent's work")
+            && seen.contains(&format!("{parent_refs}/head"))
+            && seen.contains(&format!("{parent_refs}/wip")),
+        "the instructions name the parent's refs: {seen}"
+    );
+    assert!(
+        !repo.join("parent.txt").exists(),
+        "the checkout is untouched"
+    );
+    let back = ok(
+        &mut rpc_ws,
+        200,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": back_id }),
+    )
+    .await;
+    assert!(back["agent"].get("nodeId").is_none(), "{back}");
+    assert_eq!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["show", &format!("{parent_refs}/wip:parent.txt")])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .unwrap(),
+        "from parent",
+        "the work the instructions name holds the parent's edit"
+    );
+
+    if !cow {
+        eprintln!("skipping the copy-on-write case: the filesystem cannot clone");
+        return;
+    }
+    // Own copy-on-write checkout: it starts from the parent's work.
+    let notice = made["d"]["notice"].as_str().unwrap_or_default();
+    assert!(notice.contains("its own checkout"), "{made}");
+    let cow_id = made["d"]["agentId"]
+        .as_str()
+        .or_else(|| made["d"]["id"].as_str())
+        .map_or_else(
+            || panic!("the delegate result names the child: {made}"),
+            str::to_owned,
+        );
+    let seen = reply_containing(&mut rpc_ws, (&ws_id, &cow_id), "raw: ", 300).await;
+    assert!(
+        seen.contains("starts from its parent's work"),
+        "the instructions say so: {seen}"
+    );
+    let session = ok(
+        &mut rpc_ws,
+        400,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": cow_id }),
+    )
+    .await;
+    let sandbox = session["session"]["sandboxPath"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the child has its own checkout: {session}"));
+    assert_eq!(
+        std::fs::read_to_string(Path::new(sandbox).join("parent.txt")).unwrap(),
+        "from parent",
+        "its checkout has the parent's uncommitted edit"
+    );
+    assert!(
+        !repo.join("parent.txt").exists(),
+        "the checkout is untouched"
+    );
 }

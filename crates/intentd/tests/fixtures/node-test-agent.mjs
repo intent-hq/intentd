@@ -34,6 +34,8 @@
 // servers it got to `session-mcp.json`. A `<system>` block in the prompt is
 // ignored. "echo-skills" streams "skills: <names>" from every `<name>` of an
 // `<available_skills>` catalog anywhere in the raw prompt (or "skills: none").
+// A prompt with a block "echo-raw" streams "raw: {cwd, raw}" with its working
+// directory and the whole raw prompt (instructions included).
 import readline from 'node:readline';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -196,6 +198,20 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       return send({ id: msg.id, result: { sessionId: SESSION } });
     case 'session/prompt': {
       const text = promptText(msg.params);
+      if ((msg.params?.prompt ?? []).some((block) => promptText({ prompt: [block] }) === 'echo-raw')) {
+        const raw = (msg.params?.prompt ?? []).map((block) => block?.text ?? '').join('\n');
+        send({
+          method: 'session/update',
+          params: {
+            sessionId: SESSION,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: `raw: ${JSON.stringify({ cwd: process.cwd(), raw })}` },
+            },
+          },
+        });
+        return send({ id: msg.id, result: { stopReason: 'end_turn' } });
+      }
       if (text === 'echo-skills') {
         const raw = (msg.params?.prompt ?? []).map((block) => block?.text ?? '').join('\n');
         const catalog = raw.match(/<available_skills>([\s\S]*?)<\/available_skills>/);

@@ -797,6 +797,9 @@ pub(crate) struct AgentCreatePlan {
     /// Where the admitted remote agent runs, persisted as its daemon-owned
     /// `remotePlacement` metadata. Set only after admission.
     pub(crate) remote: Option<intent_core::remote_launch::RemotePlacementView>,
+    /// For a backend sub-agent of a remote agent: where the parent's work
+    /// is, persisted as its daemon-owned `backendParentWork` metadata.
+    pub(crate) backend_parent_work: Option<intent_core::remote_launch::BackendParentWork>,
 }
 
 /// Why [`Services::persist_agent_create`] could not persist a planned session.
@@ -5995,8 +5998,13 @@ impl Services {
                 model_origin,
             )
             .await?;
-        let (placement, inherited_from) = match plan.placement.take() {
-            Some(placement) if placement.runs_on_backend()? => (None, None),
+        let requested = plan.placement.take();
+        let on_backend = match &requested {
+            Some(placement) => placement.runs_on_backend()?,
+            None => false,
+        };
+        let (placement, inherited_from) = match requested {
+            Some(_) if on_backend => (None, None),
             Some(placement) => (Some(placement), None),
             None => match self
                 .inherited_placement(plan.parent_agent_id.as_ref())
@@ -6013,6 +6021,7 @@ impl Services {
                     &plan.provider,
                     plan.model.as_deref(),
                     &placement,
+                    inherited_from.is_some(),
                 )
                 .await;
             let mut view = match (admitted, inherited_from) {
@@ -6034,10 +6043,22 @@ impl Services {
             self.ensure_fits_planned_prompt("agent.create", &plan)
                 .await?;
         }
+        if on_backend {
+            plan.backend_parent_work = self
+                .backend_parent_work(&workspace_id, plan.parent_agent_id.as_ref())
+                .await;
+        }
         let remote = plan.remote.clone();
+        let backend_notice = plan
+            .backend_parent_work
+            .as_ref()
+            .map(|work| work.notice(workspace_id.as_str()));
         let mut created = self
             .persist_agent_create(plan, workspace_id.clone(), spec_wp)
             .await?;
+        if let (Some(notice), Some(obj)) = (backend_notice, created.as_object_mut()) {
+            obj.insert("notice".into(), json!(notice));
+        }
         if let Some(view) = remote {
             self.launch_remote_agent(&workspace_id, &mut created, view)
                 .await?;
@@ -6078,6 +6099,55 @@ impl Services {
                 view.node_name,
             )
         }))
+    }
+
+    /// Where the parent's work is for a backend sub-agent created by its
+    /// remote parent (the caller). A failure to read it is logged and the
+    /// sub-agent starts as any backend agent: the create goes ahead.
+    async fn backend_parent_work(
+        &self,
+        workspace_id: &WorkspaceId,
+        parent: Option<&AgentId>,
+    ) -> Option<intent_core::remote_launch::BackendParentWork> {
+        let (parent, view) = match self.remote_parent(parent).await {
+            Ok(found) => found?,
+            Err(error) => {
+                tracing::warn!(%error, "agent create: could not read the remote parent's placement");
+                return None;
+            }
+        };
+        match self
+            .ports
+            .remote_launch()
+            .backend_parent_work(self, workspace_id, (&parent, &view))
+            .await
+        {
+            Ok(work) => work,
+            Err(error) => {
+                tracing::warn!(parent = %parent, %error, "agent create: could not read the remote parent's work");
+                None
+            }
+        }
+    }
+
+    /// The person behind a new agent: a wire caller's principal, or for an
+    /// agent caller the person recorded on that agent. `None` for a caller
+    /// with neither (an internal create, or an agent created before the
+    /// record existed).
+    async fn creating_principal(&self) -> Option<String> {
+        match intent_core::current_caller()? {
+            intent_core::Caller::Wire { principal_id, .. } => Some(principal_id.to_string()),
+            intent_core::Caller::Agent { agent_id } => {
+                let session = self.store.get_agent_session_summary(&agent_id).await.ok()?;
+                session
+                    .metadata
+                    .as_ref()?
+                    .get(intent_store::CREATED_BY_PRINCIPAL_METADATA_KEY)?
+                    .as_str()
+                    .map(str::to_owned)
+            }
+            _ => None,
+        }
     }
 
     /// The parent and its placement, when the caller is that parent and it
@@ -6122,8 +6192,10 @@ impl Services {
         provider: &str,
         model: Option<&str>,
         placement: &intent_core::placement::AgentPlacement,
+        inherited: bool,
     ) -> Result<intent_core::remote_launch::RemotePlacementView> {
-        let needs = self.remote_launch_needs(provider, model, placement).await?;
+        let mut needs = self.remote_launch_needs(provider, model, placement).await?;
+        needs.inherited = inherited;
         self.ports
             .remote_launch()
             .admit(self, workspace_id, placement, &needs)
@@ -6190,6 +6262,7 @@ impl Services {
                 .as_ref()
                 .is_some_and(|env| env.entries().any(|(_, value)| value.is_some())),
             provider_ref: provider.to_owned(),
+            inherited: false,
         })
     }
 
@@ -6621,6 +6694,7 @@ impl Services {
             is_background,
             placement,
             remote: None,
+            backend_parent_work: None,
         })
     }
 
@@ -6674,6 +6748,7 @@ impl Services {
             is_background,
             placement: _,
             remote,
+            backend_parent_work,
         } = plan;
         let now = now_iso();
         let id = AgentId(format!("agent-{}", Uuid::new_v4()));
@@ -6694,8 +6769,45 @@ impl Services {
         // Strip caller provenance even for General agents with an override.
         if let Some(obj) = metadata.as_mut().and_then(Value::as_object_mut) {
             obj.remove("specialistGeneratedBehaviorPrompt");
-            // Only the daemon places an agent on a node.
+            // Only the daemon places an agent on a node, or names its creator.
             obj.remove(intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY);
+            obj.remove(intent_store::CREATED_BY_PRINCIPAL_METADATA_KEY);
+            obj.remove(intent_core::remote_launch::BACKEND_PARENT_WORK_METADATA_KEY);
+        }
+        if let Some(work) = backend_parent_work
+            .as_ref()
+            .and_then(|work| serde_json::to_value(work).ok())
+        {
+            let mut obj = match metadata.take() {
+                Some(Value::Object(obj)) => obj,
+                None | Some(Value::Null) => serde_json::Map::new(),
+                Some(other) => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("priorNonObjectMetadata".to_string(), other);
+                    obj
+                }
+            };
+            obj.insert(
+                intent_core::remote_launch::BACKEND_PARENT_WORK_METADATA_KEY.to_string(),
+                work,
+            );
+            metadata = Some(Value::Object(obj));
+        }
+        if let Some(creator) = self.creating_principal().await {
+            let mut obj = match metadata.take() {
+                Some(Value::Object(obj)) => obj,
+                None | Some(Value::Null) => serde_json::Map::new(),
+                Some(other) => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("priorNonObjectMetadata".to_string(), other);
+                    obj
+                }
+            };
+            obj.insert(
+                intent_store::CREATED_BY_PRINCIPAL_METADATA_KEY.to_string(),
+                Value::String(creator),
+            );
+            metadata = Some(Value::Object(obj));
         }
         if let Some(view) = &remote {
             let view = serde_json::to_value(view).map_err(|e| {
@@ -13511,6 +13623,7 @@ impl Services {
         // "pending" here; the settled outcome is observable via the session's
         // sandbox fields and the `sandbox:cow:created` event.
         let mut effective_isolation: Option<&str> = None;
+        let mut pending_notice: Option<String> = None;
 
         // Provision sandbox if isolation=cow is requested (Task 3).
         // Check if isolation is "cow" (explicit or defaulted from workspace setting).
@@ -13573,6 +13686,17 @@ impl Services {
                             .await;
                     }) {
                         effective_isolation = Some("pending");
+                        // Its own checkout starts from the remote parent's
+                        // work once provisioned, if the copy and reset work.
+                        if let Ok(child) = self.store.get_agent_session_summary(&aid).await {
+                            if let Some(work) =
+                                intent_core::remote_launch::BackendParentWork::from_metadata(
+                                    child.metadata.as_ref(),
+                                )
+                            {
+                                pending_notice = Some(work.pending_notice(workspace_id.as_str()));
+                            }
+                        }
                     }
                 }
             }
@@ -13701,6 +13825,9 @@ impl Services {
                 .insert("effectiveIsolation".to_string(), json!(eff_iso));
         }
         copy_remote_launch_fields(&created, &mut result);
+        if let (Some(notice), Some(obj)) = (pending_notice, result.as_object_mut()) {
+            obj.insert("notice".to_string(), json!(notice));
+        }
         Ok(result)
     }
 
