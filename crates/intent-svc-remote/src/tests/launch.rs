@@ -1765,11 +1765,16 @@ async fn an_inherited_placement_fails_without_falling_back() {
 
 /// `placement: { target: "local" }` runs a remote agent's sub-agent on the
 /// backend; with isolation it may combine on delegate, while isolation on
-/// an inherited placement is refused.
+/// an inherited placement is refused. A link older than `pushWip` is not
+/// asked to push; a parent with no saved work gets the notice naming where
+/// its work will be.
 #[tokio::test]
 async fn target_local_runs_a_remote_agents_sub_agent_on_the_backend() {
     let (f, link, _machine) = fixture().await;
     let (parent, _) = f.placed().await;
+    f.node
+        .shared_ref()
+        .set_protocol_for_test(intent_core::node_link::SHARED_CHECKOUT_PROTOCOL - 1);
     let created = answered(
         forward(
             &link,
@@ -1782,6 +1787,12 @@ async fn target_local_runs_a_remote_agents_sub_agent_on_the_backend() {
     let id = created["agentId"].as_str().unwrap();
     assert!(placement_of(&f, id).await.is_none(), "{created}");
     assert!(created.get("nodeId").is_none(), "{created}");
+    let notice = created["notice"].as_str().unwrap_or_default();
+    assert!(
+        notice.contains("has saved no work yet")
+            && notice.contains(&format!("agents/{parent}/head")),
+        "{created}"
+    );
 
     let mixed = refused(
         forward(
