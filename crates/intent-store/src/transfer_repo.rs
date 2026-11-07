@@ -202,6 +202,11 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          they follow the credentials, which never transfer",
     ),
     (
+        "cloud_machine_provider",
+        "this backend's cloud machine provider settings; its API key is in this backend's \
+         secret store, and its sandboxes are this backend's machines",
+    ),
+    (
         "exposed_machine",
         "machines exposed to this backend: routes, pins and credentials minted for this \
          backend's head id; the target is a different backend and holds no such credential",

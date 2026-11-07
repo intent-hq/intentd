@@ -1511,6 +1511,11 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             ],
         ),
         fixed(
+            "cloudMachines.list",
+            "At most one provider (E2B) and one machine per live sandbox, which the owner's E2B plan caps; the seed has none.",
+            vec![v("default", json!({}), Fixed("/providers"))],
+        ),
+        fixed(
             "remoteMachines.backendInfo",
             "This backend's own id, name and certificate pin.",
             vec![v("default", json!({}), Fixed("/backendId"))],
