@@ -227,15 +227,30 @@ async fn list(feature: &RemoteFeature, svc: &Services) -> Result<Value> {
     Ok(json!({ "providers": providers, "machines": machines }))
 }
 
-/// Read the published sizes again (no E2B call, no key). A change of the
-/// list is saved and announced.
+/// Read the published sizes again (from the release manifest) and test the
+/// saved key. A change of the list or the key's state is saved and
+/// announced.
 async fn refresh_sizes(feature: &RemoteFeature, svc: &Services, saved: &mut ProviderConfig) {
     let Ok(_settings) = feature.cloud.settings.try_lock() else {
         return;
     };
     let mut next = saved.clone();
     next.set_sizes(config::published_sizes(&saved.template_project).await);
-    let announce = next.sizes != saved.sizes || next.sizes_verified != saved.sizes_verified;
+    // The key too, so one revoked at E2B shows as rejected and placement
+    // refuses before any sandbox.
+    match config::saved_client(svc).await {
+        Ok(client) => match client.check_key().await {
+            Ok(()) => config::note_outcome(&mut next, None),
+            Err(error) => config::note_outcome(
+                &mut next,
+                Some(&config::to_error(&error, config::Phase::Other)),
+            ),
+        },
+        Err(error) => config::note_outcome(&mut next, Some(&error)),
+    }
+    let announce = next.sizes != saved.sizes
+        || next.sizes_verified != saved.sizes_verified
+        || next.state != saved.state;
     if let Err(error) = config::save(svc, &next).await {
         tracing::warn!(%error, "cloud machines: could not save the checked sizes");
         return;

@@ -92,12 +92,28 @@ impl ProviderConfig {
         }
     }
 
-    /// Record a published-size check.
-    pub(crate) fn set_sizes(&mut self, published: Published) {
-        self.sizes = published.sizes;
-        self.sizes_verified = published.verified;
-        self.sizes_checked_at = Some(now_iso());
-        self.sizes_version = Some(intentd_version().to_owned());
+    /// Record a published-size check. A check that could not read the
+    /// manifest (`None`) keeps the last list for this version, and leaves
+    /// it stale so the next read tries again; with no list yet it offers
+    /// the fallback.
+    pub(crate) fn set_sizes(&mut self, checked: Option<Published>) {
+        match checked {
+            Some(published) => {
+                self.sizes = published.sizes;
+                self.sizes_verified = published.verified;
+                self.sizes_checked_at = Some(now_iso());
+                self.sizes_version = Some(intentd_version().to_owned());
+            }
+            None if self.sizes_version.as_deref() == Some(intentd_version())
+                && !self.sizes.is_empty() => {}
+            None => {
+                let fallback = Published::fallback();
+                self.sizes = fallback.sizes;
+                self.sizes_verified = false;
+                self.sizes_checked_at = None;
+                self.sizes_version = Some(intentd_version().to_owned());
+            }
+        }
     }
 
     /// Whether `size` may be saved: any size while the list is not
@@ -328,6 +344,16 @@ pub(crate) struct Published {
     pub(crate) verified: bool,
 }
 
+impl Published {
+    /// The sizes every release builds, unverified.
+    pub(crate) fn fallback() -> Self {
+        Self {
+            sizes: FALLBACK_SIZES.to_vec(),
+            verified: false,
+        }
+    }
+}
+
 /// The sizes of `project` published for this backend's version, from the
 /// release's template manifest. E2B cannot answer this with the owner's
 /// key: its template lookup covers only the key's own project, so a probe
@@ -335,36 +361,56 @@ pub(crate) struct Published {
 /// manifest is missing, unreadable, or for another project or version
 /// (a custom `templateProject`), the sizes every release builds are
 /// offered, unverified: the create stays the real check.
-pub(crate) async fn published_sizes(project: &str) -> Published {
+pub(crate) async fn published_sizes(project: &str) -> Option<Published> {
     let base = std::env::var(MANIFEST_BASE_URL_ENV)
         .ok()
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| intent_nodes::e2b::DEFAULT_MANIFEST_BASE_URL.to_owned());
-    let fallback = Published {
-        sizes: FALLBACK_SIZES.to_vec(),
-        verified: false,
-    };
     match intent_nodes::e2b::fetch_template_manifest(&base, intentd_version(), MANIFEST_TIMEOUT)
         .await
     {
         Ok(manifest) if manifest.project == project && manifest.version == intentd_version() => {
-            Published {
+            Some(Published {
                 sizes: CloudMachineSize::ALL
                     .into_iter()
                     .filter(|size| manifest.sizes.iter().any(|id| id == size.id()))
                     .collect(),
                 verified: true,
-            }
+            })
         }
         Ok(manifest) => {
             tracing::info!(project = %manifest.project, version = %manifest.version, "cloud machines: the template manifest is for another project or version; sizes unverified");
-            fallback
+            Some(Published::fallback())
+        }
+        Err(intent_nodes::e2b::E2bError::NotFound(_)) => {
+            tracing::info!(
+                "cloud machines: this release has no template manifest; sizes unverified"
+            );
+            Some(Published::fallback())
         }
         Err(error) => {
-            tracing::warn!(%error, "cloud machines: could not read the release's template manifest; sizes unverified");
-            fallback
+            tracing::warn!(%error, "cloud machines: could not read the release's template manifest; keeping the last sizes");
+            None
         }
     }
+}
+
+/// Mark the saved key rejected after E2B refused it (401) on another call,
+/// so placement refuses before any sandbox, and announce the change.
+pub(crate) async fn note_key_rejected(svc: &Services) {
+    let Ok(Some(mut saved)) = load(svc).await else {
+        return;
+    };
+    if saved.state == ProviderState::KeyRejected {
+        return;
+    }
+    saved.state = ProviderState::KeyRejected;
+    if let Err(error) = save(svc, &saved).await {
+        tracing::warn!(%error, "cloud machines: could not record the rejected key");
+        return;
+    }
+    svc.publish_cloud_machine_changed(json!({ "provider": saved.to_json() }), None)
+        .await;
 }
 
 /// Record the outcome of an E2B call on the saved settings: a rejected key

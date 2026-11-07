@@ -69,6 +69,8 @@ struct FakeState {
     manifest: Option<Value>,
     /// Templates E2B does not know: their create answers 404.
     missing_templates: Vec<String>,
+    /// While set, E2B rejects the key (401), as after the owner revokes it.
+    key_revoked: bool,
 }
 
 /// The release manifest listing `sizes` for this build's version.
@@ -188,7 +190,8 @@ impl FakeE2b {
                 _ => (404, "text/plain", b"Not Found".to_vec()),
             };
         }
-        if headers.get("x-api-key").map(String::as_str) != Some(E2B_KEY) {
+        if headers.get("x-api-key").map(String::as_str) != Some(E2B_KEY) || self.state().key_revoked
+        {
             return json_reply(401, json!({ "code": 401, "message": "Invalid API key" }));
         }
         if method != "GET" || path == "/v2/sandboxes" {
@@ -1129,6 +1132,50 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     assert_eq!(cloud["machines"].as_array().unwrap().len(), 1, "{cloud}");
 
     drain_events(&mut events, &mut seen_events).await;
+    // A key revoked at E2B: the start fails key-rejected, the provider
+    // shows it, and the next placement is refused before any sandbox. A
+    // working key saved again clears it.
+    fake.state().key_revoked = true;
+    let revoked = ok(
+        &mut rpc_ws,
+        360,
+        "agent.create",
+        create(&keyed_ref, "Revoked"),
+    )
+    .await;
+    let revoked_id = revoked["agent"]["id"].as_str().unwrap().to_owned();
+    let failed = agent_until(&mut rpc_ws, (&ws_id, &revoked_id), 361, |a| {
+        a.get("placementError").is_some()
+    })
+    .await;
+    assert_eq!(
+        failed["placementError"]["data"]["reason"], "key-rejected",
+        "{failed}"
+    );
+    let listed = ok(&mut rpc_ws, 370, "cloudMachines.list", json!({})).await;
+    assert_eq!(listed["providers"][0]["state"], "key-rejected", "{listed}");
+    let refused = rpc(
+        &mut rpc_ws,
+        371,
+        "agent.create",
+        create(&keyed_ref, "Refused"),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert_eq!(
+        refused["error"]["data"]["reason"], "key-rejected",
+        "{refused}"
+    );
+    fake.state().key_revoked = false;
+    let restored = ok(
+        &mut rpc_ws,
+        372,
+        "cloudMachines.configure",
+        json!({ "provider": "e2b", "apiKey": E2B_KEY }),
+    )
+    .await;
+    assert_eq!(restored["provider"]["state"], "ready", "{restored}");
+
     // Removing the provider with a live sandbox needs stopAgents.
     let busy = rpc(
         &mut rpc_ws,
