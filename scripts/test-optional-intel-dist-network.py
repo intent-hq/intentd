@@ -56,6 +56,7 @@ class Network(unittest.TestCase):
         self.env = {**os.environ, 'PATH': f'{self.dir}{os.pathsep}{os.environ["PATH"]}',
                     'STUB_LOG': str(self.log)}
         self.env.pop('CARGO_NET_OFFLINE', None)
+        self.env.pop('RUSTUP_TOOLCHAIN', None)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -141,6 +142,55 @@ class Network(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised:
             fetch_mod.install_toolchain(self.dir, self.env, attempts=2, sleep=self.sleeps.append)
         self.assertIn('toolchain', str(raised.exception.code))
+
+    def conflict_stubs(self, uninstall_exit=0):
+        """`cargo` reports rustup's deterministic conflict (job 127971760436)
+        until the stub `rustup` has removed the partial toolchain."""
+        (self.dir / 'rust-toolchain.toml').write_text('[toolchain]\nchannel = "1.96.0"\n')
+        removed = self.dir / 'toolchain-removed'
+        cargo = self.dir / 'cargo'
+        cargo.write_text(
+            '#!/usr/bin/env python3\nimport os, sys\n'
+            f'if not os.path.exists({str(removed)!r}):\n'
+            "    sys.stderr.write(\"info: recovering from a partially installed toolchain\\n\"\n"
+            "                     \"error: failed to install component: 'clippy-preview-x86_64-unknown-linux-gnu', \"\n"
+            "                     \"detected conflict: 'bin/cargo-clippy'\\n\")\n"
+            '    sys.exit(1)\nprint("cargo 1.96.0")\n')
+        rustup = self.dir / 'rustup'
+        rustup.write_text(
+            '#!/usr/bin/env python3\nimport json, sys\n'
+            f'open({str(self.log)!r}, "a").write(json.dumps({{"rustup": sys.argv[1:]}}) + "\\n")\n'
+            f'if sys.argv[1:3] == ["toolchain", "uninstall"] and {uninstall_exit} == 0:\n'
+            f'    open({str(removed)!r}, "w").close()\n'
+            f'sys.exit({uninstall_exit})\n')
+        rustup.chmod(0o755)
+
+    def test_toolchain_install_clears_a_rustup_component_conflict(self):
+        self.conflict_stubs()
+        fetch_mod.install_toolchain(self.dir, self.env, sleep=self.sleeps.append)
+        self.assertEqual(self.calls(), [{'rustup': ['toolchain', 'uninstall', '1.96.0']}],
+                         'the partial toolchain is removed once, so the retry reinstalls it cleanly')
+
+    def test_toolchain_conflict_that_cannot_be_cleared_still_fails(self):
+        self.conflict_stubs(uninstall_exit=1)
+        with self.assertRaises(SystemExit) as raised:
+            fetch_mod.install_toolchain(self.dir, self.env, attempts=2, sleep=self.sleeps.append)
+        self.assertIn('toolchain', str(raised.exception.code))
+        self.assertEqual(len(self.calls()), 1, 'no uninstall after the final attempt')
+
+    def test_toolchain_conflict_uninstalls_the_rustup_toolchain_override(self):
+        self.conflict_stubs()
+        self.env['RUSTUP_TOOLCHAIN'] = 'stable'
+        fetch_mod.install_toolchain(self.dir, self.env, sleep=self.sleeps.append)
+        self.assertEqual(self.calls(), [{'rustup': ['toolchain', 'uninstall', 'stable']}])
+
+    def test_toolchain_conflict_without_a_channel_retries_without_a_traceback(self):
+        self.conflict_stubs()
+        (self.dir / 'rust-toolchain.toml').write_text('[toolchain]\n')
+        with self.assertRaises(SystemExit) as raised:
+            fetch_mod.install_toolchain(self.dir, self.env, attempts=2, sleep=self.sleeps.append)
+        self.assertIn('toolchain', str(raised.exception.code))
+        self.assertFalse(self.log.exists(), 'nothing to uninstall')
 
     def test_release_limits_allow_slow_attempts(self):
         self.assertGreater(fetch_mod.RELEASE_ATTEMPT_TIMEOUT, fetch_mod.FETCH_ATTEMPT_TIMEOUT)
