@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.145] - 2026-11-07
+
+### 🚀 Features
+
+- *(nodes)* Add an E2B client for sandboxes and commands ([#3097](https://github.com/intent-hq/intentd/pull/3097))
+
+
 ## [0.11.144] - 2026-11-07
 
 ### 📚 Documentation
