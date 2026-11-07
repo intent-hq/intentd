@@ -151,10 +151,11 @@ async fn get_self_info(
 pub(crate) const PAIRING_PAYLOAD_VERSION: u32 = 1;
 
 /// Build the pairing payload URI:
-/// `intent://pair?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&token=<t>[&tc=<addr>]`.
+/// `intent://pair?v=1&host=<ip[,ip...]>&port=<p>&fp=<sha256>&token=<t>[&mode=node][&tc=<addr>]`.
 ///
-/// The `tc=` parameter is additive (appended only when the tailcat tunnel is
-/// running); clients that don't know it tolerate the unknown query param.
+/// The `mode=node` and `tc=` parameters are additive (`mode=node` only from a
+/// daemon in node mode, `tc=` only while the tailcat tunnel runs); clients
+/// that don't know them tolerate the unknown query params.
 ///
 /// Query values are percent-encoded defensively. Generated values (dotted-quad
 /// IPv4 hosts, colon-separated hex fingerprints, 64-char hex tokens) pass
@@ -170,6 +171,7 @@ pub fn build_pairing_uri(
     port: u16,
     fingerprint: &str,
     token: &str,
+    node_mode: bool,
     tc_address: Option<&str>,
 ) -> String {
     let hosts = hosts
@@ -182,6 +184,11 @@ pub fn build_pairing_uri(
         encode_query_value(fingerprint),
         encode_query_value(token)
     );
+    // Non-authoritative hint so a client can file the machine before it
+    // connects; the hello's `daemonMode` decides. Before `tc`, which stays last.
+    if node_mode {
+        uri.push_str("&mode=node");
+    }
     if let Some(tc) = tc_address {
         let _ = write!(uri, "&tc={}", encode_query_value(tc));
     }
@@ -317,11 +324,13 @@ fn pairing_json(
         };
         return Err(Error::Unsupported(msg.to_string()));
     }
+    let node_mode = provider.node_mode();
     let uri = build_pairing_uri(
         &hosts,
         port,
         &cert.fingerprint256,
         token,
+        node_mode,
         snapshot.tc_address.as_deref(),
     );
     let mut result = json!({
@@ -331,6 +340,7 @@ fn pairing_json(
         "fingerprint": cert.fingerprint256,
         "token": token,
         "version": PAIRING_PAYLOAD_VERSION,
+        "daemonMode": crate::catalog::daemon_mode(node_mode),
     });
     // Additive tunnel route (presence-detected): omitted when the tunnel is
     // disabled or down, so older clients are unaffected.

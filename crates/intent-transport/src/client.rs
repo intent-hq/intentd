@@ -136,23 +136,22 @@ pub(crate) fn server_json(
     server
 }
 
-/// Add the capabilities that depend on the running daemon to a successful
-/// hello `frame`: `startupStatus: 1` when the full composition tracks
-/// startup, `remoteMachines: 1` when this backend places agents on exposed
-/// machines (the remote feature, not node mode), together with
-/// `remoteInitialAgent: 1`: `workspace.create` accepts
+/// Add what depends on the running daemon to a successful hello `frame`:
+/// `server.daemonMode` (`regular` | `node`), `startupStatus: 1` when the full
+/// composition tracks startup, `remoteMachines: 1` when this backend places
+/// agents on exposed machines (the remote feature, not node mode), together
+/// with `remoteInitialAgent: 1`: `workspace.create` accepts
 /// `initialAgent.placement`.
 pub(crate) fn with_runtime_capabilities(
     frame: Option<String>,
+    node_mode: bool,
     startup_status: bool,
     remote_machines: bool,
 ) -> Option<String> {
-    if !startup_status && !remote_machines {
-        return frame;
-    }
     frame.map(|frame| {
         let mut value: Value = serde_json::from_str(&frame).expect("encoded hello");
         if value.get("result").is_some() {
+            value["result"]["server"]["daemonMode"] = json!(crate::catalog::daemon_mode(node_mode));
             let capabilities = &mut value["result"]["server"]["capabilities"];
             if startup_status {
                 capabilities["startupStatus"] = json!(1);

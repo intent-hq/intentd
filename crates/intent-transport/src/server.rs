@@ -48,6 +48,11 @@ pub trait ServerPairingInfo: Send + Sync {
     fn data_dir(&self) -> &std::path::Path;
     /// Token store for get/generate operations.
     fn token_store(&self) -> &crate::AsyncTokenStore;
+    /// Whether the running daemon is in node mode: `pairing.getInfo` reports
+    /// it as `daemonMode` and adds the `mode=node` link hint.
+    fn node_mode(&self) -> bool {
+        false
+    }
 }
 
 /// Point-in-time snapshot of pairing-relevant server state.

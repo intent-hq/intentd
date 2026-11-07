@@ -1045,6 +1045,18 @@ pub(crate) fn member_may_call(method: &str) -> bool {
     collaborator_may_call(method) || MEMBER_METHODS.contains(&canonical_method(method))
 }
 
+/// The reported `daemonMode` (`client.hello` `server.daemonMode`, the
+/// `host.status` and `pairing.getInfo` results): the running process's mode,
+/// so `serve --node` reports `node` whatever `daemon.mode` says.
+#[must_use]
+pub fn daemon_mode(node_mode: bool) -> &'static str {
+    if node_mode {
+        "node"
+    } else {
+        "regular"
+    }
+}
+
 /// Human message of a node-mode refusal (`-32003`, `data.code: "node-mode"`).
 pub const NODE_MODE_ERROR_MESSAGE: &str = "Not available in node mode";
 

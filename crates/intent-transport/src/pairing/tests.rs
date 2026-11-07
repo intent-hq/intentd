@@ -233,7 +233,7 @@ fn provider_full(
 #[test]
 fn build_uri_joins_hosts_with_commas() {
     let hosts = vec!["192.168.1.10".to_string(), "10.0.0.5".to_string()];
-    let uri = build_pairing_uri(&hosts, 5181, "AA:BB:CC", "deadbeef", None);
+    let uri = build_pairing_uri(&hosts, 5181, "AA:BB:CC", "deadbeef", false, None);
     assert_eq!(
         uri,
         "intent://pair?v=1&host=192.168.1.10,10.0.0.5&port=5181&fp=AA:BB:CC&token=deadbeef"
@@ -243,7 +243,7 @@ fn build_uri_joins_hosts_with_commas() {
 #[test]
 fn build_uri_single_host() {
     let hosts = vec!["192.168.1.10".to_string()];
-    let uri = build_pairing_uri(&hosts, 443, "FP", "t0k3n", None);
+    let uri = build_pairing_uri(&hosts, 443, "FP", "t0k3n", false, None);
     assert_eq!(
         uri,
         "intent://pair?v=1&host=192.168.1.10&port=443&fp=FP&token=t0k3n"
@@ -255,7 +255,7 @@ fn build_uri_accepts_hostname() {
     // `intentd pair --host localhost` (intent-hq/intent#7243): a hostname,
     // not just an IP literal, passes through unchanged.
     let hosts = vec!["localhost".to_string()];
-    let uri = build_pairing_uri(&hosts, 5181, "AA:BB", "tok", None);
+    let uri = build_pairing_uri(&hosts, 5181, "AA:BB", "tok", false, None);
     assert_eq!(
         uri,
         "intent://pair?v=1&host=localhost&port=5181&fp=AA:BB&token=tok"
@@ -267,7 +267,7 @@ fn build_uri_percent_encodes_reserved_characters() {
     // Generated values pass through unchanged (hex, colons, dots), but an
     // env-injected token with reserved characters must not break the query.
     let hosts = vec!["192.168.1.10".to_string()];
-    let uri = build_pairing_uri(&hosts, 443, "AA:BB", "a&b=c%d", None);
+    let uri = build_pairing_uri(&hosts, 443, "AA:BB", "a&b=c%d", false, None);
     assert_eq!(
         uri,
         "intent://pair?v=1&host=192.168.1.10&port=443&fp=AA:BB&token=a%26b%3Dc%25d"
@@ -279,10 +279,32 @@ fn build_uri_appends_tc_param_when_present() {
     // Additive last param: existing clients parse the leading fields
     // unchanged and tolerate the unknown `tc=`.
     let hosts = vec!["192.168.1.10".to_string()];
-    let uri = build_pairing_uri(&hosts, 443, "FP", "tok", Some("tc7f2a91.tailcat.net"));
+    let uri = build_pairing_uri(
+        &hosts,
+        443,
+        "FP",
+        "tok",
+        false,
+        Some("tc7f2a91.tailcat.net"),
+    );
     assert_eq!(
         uri,
         "intent://pair?v=1&host=192.168.1.10&port=443&fp=FP&token=tok&tc=tc7f2a91.tailcat.net"
+    );
+}
+
+#[test]
+fn build_uri_places_the_node_mode_hint_before_tc() {
+    let hosts = vec!["192.168.1.10".to_string()];
+    let uri = build_pairing_uri(&hosts, 443, "FP", "tok", true, Some("tc7f2a91.tailcat.net"));
+    assert_eq!(
+        uri,
+        "intent://pair?v=1&host=192.168.1.10&port=443&fp=FP&token=tok&mode=node&tc=tc7f2a91.tailcat.net"
+    );
+    let tunnel_only = build_pairing_uri(&[], 443, "FP", "tok", true, None);
+    assert!(
+        tunnel_only.ends_with("&token=tok&mode=node"),
+        "{tunnel_only}"
     );
 }
 
@@ -322,7 +344,7 @@ async fn handle_get_info_local_success_shape() {
     let fp = result["fingerprint"].as_str().unwrap();
     assert!(fp.contains(':'), "colon-separated hex fingerprint");
     let hosts: Vec<String> = serde_json::from_value(result["hosts"].clone()).unwrap();
-    let expected_uri = build_pairing_uri(&hosts, 5181, fp, token, None);
+    let expected_uri = build_pairing_uri(&hosts, 5181, fp, token, false, None);
     assert_eq!(result["uri"].as_str().unwrap(), expected_uri);
     assert!(result["uri"]
         .as_str()
@@ -332,6 +354,9 @@ async fn handle_get_info_local_success_shape() {
     // carries no tc= param.
     assert!(result.get("tcAddress").is_none());
     assert!(!result["uri"].as_str().unwrap().contains("&tc="));
+    // A full daemon reports its mode and adds no link hint.
+    assert_eq!(result["daemonMode"], "regular");
+    assert!(!result["uri"].as_str().unwrap().contains("mode="));
 }
 
 #[tokio::test]
@@ -412,7 +437,7 @@ async fn handle_get_info_specific_bind_advertises_only_that_host() {
     let hosts: Vec<String> = serde_json::from_value(parsed["result"]["hosts"].clone()).unwrap();
     assert_eq!(hosts, vec!["192.168.1.23".to_string()]);
     let fp = parsed["result"]["fingerprint"].as_str().unwrap();
-    let expected_uri = build_pairing_uri(&hosts, 5181, fp, token, None);
+    let expected_uri = build_pairing_uri(&hosts, 5181, fp, token, false, None);
     assert_eq!(parsed["result"]["uri"].as_str().unwrap(), expected_uri);
 }
 
@@ -466,6 +491,7 @@ async fn handle_get_info_loopback_bind_with_tunnel_pairs_hostless() {
     assert_eq!(hosts, Vec::<String>::new());
     assert_eq!(parsed["result"]["tcAddress"], "tc7f2a91.tailcat.net");
     let fp = parsed["result"]["fingerprint"].as_str().unwrap();
-    let expected_uri = build_pairing_uri(&hosts, 5181, fp, token, Some("tc7f2a91.tailcat.net"));
+    let expected_uri =
+        build_pairing_uri(&hosts, 5181, fp, token, false, Some("tc7f2a91.tailcat.net"));
     assert_eq!(parsed["result"]["uri"].as_str().unwrap(), expected_uri);
 }

@@ -37,6 +37,16 @@
 # The prompt and both of those accept the obvious yes/no spellings for on/off
 # (y/yes/true, n/no/false), in any case.
 #
+# Before the service question it asks how the computer will be used: run
+# Intent here (the default) or as a node that only runs agents for another
+# Intent. A node install sets daemon.mode=node and turns the Tailcat tunnel
+# on, restarts the daemon, then runs `intentd pair --tunnel` — the interface
+# picker on a terminal, a tunnel-only link without one — and ends with the QR
+# code and the intent:// link. An unattended node install sets the service up
+# unless told not to. Force an answer:
+#
+#   INTENTD_DAEMON_MODE=full|node  (or --daemon-mode=<value>, on direct runs)
+#
 # The release channel the daemon is installed from — and updated on — defaults
 # to stable. Choose another with:
 #
@@ -56,6 +66,8 @@
 # service onto the new binary, so proceeding is an upgrade, not a conflict.
 #
 # INTENTD_SERVICE_NAME overrides the unit name / launchd label (testing).
+# INTENTD_RESTART_TIMEOUT bounds the wait for a restarted daemon, in seconds
+# (default 120; testing).
 # INTENTD_DATA_DIR, when set, is baked into the unit/plist so the service
 # serves the same data dir the install-time CLI used. A relative value is
 # anchored to the directory this installer runs in, since the service has no
@@ -334,6 +346,134 @@ apply_auto_resume() {
     info "auto-resume on service start set to '$auto_resume' (agents.resumeInterruptedOnStart)"
   else
     warn "could not set agents.resumeInterruptedOnStart=$auto_resume — set it later with: intentd settings agents.resumeInterruptedOnStart $auto_resume"
+  fi
+}
+
+# Normalize a daemon-mode answer from the flag, the env var, or the prompt:
+# lowercased, with the prompt's numbers and the daemon's own setting name
+# (`regular`) folded onto full/node. Anything else passes through for
+# validate_daemon_mode or the prompt to reject.
+normalize_daemon_mode() {
+  daemon_mode_lower=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$daemon_mode_lower" in
+    1 | full | regular) printf 'full' ;;
+    2 | node) printf 'node' ;;
+    *) printf '%s' "$daemon_mode_lower" ;;
+  esac
+}
+
+# Fail fast on a bogus daemon mode from the flag or env var.
+validate_daemon_mode() {
+  case "$1" in
+    full | node) ;;
+    *) fail "invalid daemon mode '$1' (expected full or node)" ;;
+  esac
+}
+
+# Ask how this computer will be used (sets daemon_mode). Same /dev/tty and
+# bounded-retry pattern as the auto-resume prompt: Enter (or EOF) takes the
+# recommended full install. Only a typed answer sets daemon_mode_explicit,
+# so Enter on a re-install never switches an existing node back.
+prompt_daemon_mode() {
+  printf '%s\n' "How will you use this computer?" \
+    "1) Run Intent here (recommended if you're just getting started): workspaces, agents and the app connect to it." \
+    "2) Node only: lets another Intent run agents on this computer; nothing else runs here." >/dev/tty
+  daemon_mode_tries=0
+  while [ -z "$daemon_mode" ] && [ "$daemon_mode_tries" -lt 3 ]; do
+    daemon_mode_tries=$((daemon_mode_tries + 1))
+    printf 'Choose 1 or 2 [1]: ' >/dev/tty
+    reply=""
+    read -r reply </dev/tty || reply=""
+    case "$(normalize_daemon_mode "$reply")" in
+      '') daemon_mode="full" ;;
+      full) daemon_mode="full" daemon_mode_explicit="yes" ;;
+      node) daemon_mode="node" daemon_mode_explicit="yes" ;;
+      *) warn "unrecognized answer '$reply' — answer 1 or 2" ;;
+    esac
+  done
+  if [ -z "$daemon_mode" ]; then
+    warn "still no recognized answer — keeping the default (1, run Intent here)"
+    daemon_mode="full"
+  fi
+}
+
+# Wait for the daemon that replaces pid <old> to answer (after `intentd
+# restart`, which on Unix returns once it has signalled). A new pid in the
+# data dir's pidfile proves the replacement started, so `intentd status`
+# cannot be answered by the daemon being replaced. Returns 1 on timeout.
+await_restarted_daemon() {
+  restart_waited=0
+  while [ "$restart_waited" -lt "${INTENTD_RESTART_TIMEOUT:-120}" ]; do
+    restart_pid=$(data_dir_owner_pid "$(resolve_data_dir)")
+    if [ -n "$restart_pid" ] && [ "$restart_pid" != "$1" ] \
+      && "$install_dir/intentd" status >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+    restart_waited=$((restart_waited + 1))
+  done
+  return 1
+}
+
+# The commands that finish node setup by hand, for any path that cannot.
+node_setup_hint() {
+  printf '%s' "
+To finish setting up this computer as a node, once the daemon is running:
+  intentd settings daemon.mode node
+  intentd settings server.tunnel.enabled true
+  intentd restart
+  intentd pair --tunnel"
+}
+
+# Apply the daemon-mode answer once the daemon is up (runs after
+# verify_daemon). Node: daemon.mode node and the tunnel on, a restart (the
+# mode applies at the next start), then the normal pairing flow — the
+# interface picker with the tunnel pre-checked on a terminal, a tunnel-only
+# link without one — which prints the QR code and the intent:// link. An
+# explicit full answer switches a node back to regular; the unasked default
+# writes nothing. Failures are warnings that name the commands to finish by
+# hand: the binary and the service are installed either way.
+apply_daemon_mode() {
+  case "$daemon_mode" in
+    node) ;;
+    full)
+      [ "$daemon_mode_explicit" = "yes" ] || return 0
+      case "$("$install_dir/intentd" settings daemon.mode 2>/dev/null | head -n 1)" in
+        *node*) ;;
+        *) return 0 ;;
+      esac
+      restart_from=$(data_dir_owner_pid "$(resolve_data_dir)")
+      if "$install_dir/intentd" settings daemon.mode regular >/dev/null 2>&1 \
+        && "$install_dir/intentd" restart >/dev/null 2>&1 \
+        && await_restarted_daemon "$restart_from"; then
+        info "this computer runs Intent again (daemon.mode = regular)"
+      else
+        warn "could not switch this computer back from node mode — run: intentd settings daemon.mode regular && intentd restart"
+      fi
+      return 0
+      ;;
+    *) return 0 ;;
+  esac
+  restart_from=$(data_dir_owner_pid "$(resolve_data_dir)")
+  if ! "$install_dir/intentd" settings daemon.mode node >/dev/null 2>&1; then
+    warn "could not set daemon.mode=node$(node_setup_hint)"
+    return 0
+  fi
+  "$install_dir/intentd" settings server.tunnel.enabled true >/dev/null 2>&1 \
+    || warn "could not turn the Tailcat tunnel on — pairing will offer it"
+  info "restarting the daemon in node mode..."
+  if ! "$install_dir/intentd" restart >/dev/null 2>&1 \
+    || ! await_restarted_daemon "$restart_from"; then
+    warn "the daemon did not come back in node mode — check it with: intentd status$(node_setup_hint)"
+    return 0
+  fi
+  info "node mode on — pair this computer with the Intent that will run agents here"
+  if (exec </dev/tty) 2>/dev/null; then
+    "$install_dir/intentd" pair --tunnel </dev/tty \
+      || warn "pairing did not finish — run it again with: intentd pair --tunnel"
+  else
+    "$install_dir/intentd" pair --tunnel --yes \
+      || warn "pairing did not finish — run it again with: intentd pair --tunnel"
   fi
 }
 
@@ -707,9 +847,13 @@ EOF
   # wait already told the user how to apply the setting themselves.
   if verify_daemon; then
     apply_auto_resume
+    apply_daemon_mode
+  elif [ "$daemon_mode" = "node" ]; then
+    warn "node setup did not run because the daemon is not up yet.$(node_setup_hint)"
   fi
   info "manage the service with: systemctl --user {status|stop|restart|disable} $unit_name"
-  info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
+  [ "$daemon_mode" = "node" ] \
+    || info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
 
 setup_service_macos() {
@@ -791,15 +935,20 @@ EOF
   # wait already told the user how to apply the setting themselves.
   if verify_daemon; then
     apply_auto_resume
+    apply_daemon_mode
+  elif [ "$daemon_mode" = "node" ]; then
+    warn "node setup did not run because the daemon is not up yet.$(node_setup_hint)"
   fi
   info "manage the service with: launchctl {print|bootout} gui/$uid/$label"
-  info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
+  [ "$daemon_mode" = "node" ] \
+    || info "connecting from another machine (desktop/mobile app)? Run: intentd pair"
 }
 
 main() {
   service_arg=""
   auto_resume_arg=""
   channel_arg=""
+  daemon_mode_arg=""
   for arg in "$@"; do
     case "$arg" in
       --service) service_arg="yes" ;;
@@ -812,7 +961,11 @@ main() {
         channel_arg=$(normalize_channel "${arg#--channel=}")
         validate_channel "$channel_arg"
         ;;
-      *) fail "unknown option '$arg' (supported: --service, --no-service, --auto-resume=auto|on|off, --channel=stable|beta|alpha)" ;;
+      --daemon-mode=*)
+        daemon_mode_arg=$(normalize_daemon_mode "${arg#--daemon-mode=}")
+        validate_daemon_mode "$daemon_mode_arg"
+        ;;
+      *) fail "unknown option '$arg' (supported: --service, --no-service, --auto-resume=auto|on|off, --channel=stable|beta|alpha, --daemon-mode=full|node)" ;;
     esac
   done
   # Validated before any download so garbage fails fast, interactive or not.
@@ -821,6 +974,15 @@ main() {
     auto_resume_env=$(normalize_auto_resume "$INTENTD_AUTO_RESUME")
     validate_auto_resume "$auto_resume_env"
   fi
+  # Daemon mode: flag beats the env var beats the prompt (asked later, after
+  # the download). Unset and unasked means full, written nowhere.
+  daemon_mode="$daemon_mode_arg"
+  if [ -z "$daemon_mode" ] && [ -n "${INTENTD_DAEMON_MODE:-}" ]; then
+    daemon_mode=$(normalize_daemon_mode "$INTENTD_DAEMON_MODE")
+    validate_daemon_mode "$daemon_mode"
+  fi
+  daemon_mode_explicit="no"
+  [ -z "$daemon_mode" ] || daemon_mode_explicit="yes"
   # Channel choice: flag beats the env var, same precedence as auto-resume.
   # Empty means "not asked for" — no pin is written and the sitter's own
   # stable default applies, so a re-install never clobbers a hand-set pin.
@@ -960,10 +1122,22 @@ main() {
     pin_channel
   fi
 
+  # How this computer is used: asked first, on a terminal only; no terminal
+  # and no flag or env var means the recommended full install.
+  if [ -z "$daemon_mode" ]; then
+    if (exec </dev/tty) 2>/dev/null; then
+      prompt_daemon_mode
+    else
+      daemon_mode="full"
+    fi
+  fi
+
   # Service setup decision: flags beat the env var beats the prompt. The
   # prompt talks to /dev/tty because `curl | sh` occupies stdin; when no
   # terminal is available (CI, provisioning) it must never hang, so the
-  # default there is to skip with a hint.
+  # default there is to skip with a hint — except for a node, which is only
+  # useful while its daemon runs, so an unattended node install sets the
+  # service up unless told not to.
   service_mode="$service_arg"
   if [ -z "$service_mode" ]; then
     # Case-insensitive to match install.ps1 (FALSE/No must also mean skip).
@@ -982,6 +1156,8 @@ main() {
         [nN]*) service_mode="no" ;;
         *) service_mode="yes" ;;
       esac
+    elif [ "$daemon_mode" = "node" ]; then
+      service_mode="yes"
     else
       service_mode="skip"
     fi
@@ -1041,6 +1217,17 @@ main() {
 
   if [ "$service_mode" = "skip" ]; then
     info "skipping service setup (no interactive terminal detected). To set it up, re-run with INTENTD_INSTALL_SERVICE=1"
+  fi
+  if [ "$daemon_mode" = "node" ]; then
+    printf '%s\n' "
+Next steps for a node:
+  intentd serve --node    # start the daemon in node mode in the foreground
+  intentd pair --tunnel   # in another terminal: the QR code and intent:// link to pair it
+
+To keep node mode across restarts, set it once the daemon runs:
+  intentd settings daemon.mode node
+Or re-run this installer with INTENTD_INSTALL_SERVICE=1 INTENTD_DAEMON_MODE=node."
+    return 0
   fi
   printf '%s\n' "
 Next steps:

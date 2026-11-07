@@ -152,6 +152,25 @@ fn assert_node_mode_refusal(reply: &Value, what: &str) {
     );
 }
 
+/// The mode the daemon reports to clients: `client.hello` `server.daemonMode`
+/// and the `host.status` `daemonMode`, which must agree.
+async fn reported_daemon_mode(uds: &mut Uds) -> Value {
+    let hello = assert_ok(
+        &uds.call(
+            "client.hello",
+            json!({ "clientId": "node-mode-e2e", "name": "E2E", "capabilities": {} }),
+        )
+        .await,
+        "client.hello",
+    );
+    let host = assert_ok(&uds.call("host.status", json!({})).await, "host.status");
+    assert_eq!(
+        hello["server"]["daemonMode"], host["daemonMode"],
+        "hello and host.status disagree: {hello} / {host}"
+    );
+    hello["server"]["daemonMode"].clone()
+}
+
 #[track_caller]
 fn assert_ok(reply: &Value, what: &str) -> Value {
     assert!(reply.get("error").is_none(), "{what}: {reply}");
@@ -284,7 +303,9 @@ async fn serve_node_serves_only_the_node_mode_list() {
     let mut daemon = Daemon::spawn(dir.path(), true, true);
     let mut uds = daemon.ready().await;
 
-    // Listed methods are served over the local socket.
+    // Listed methods are served over the local socket, and the daemon says
+    // it is a node.
+    assert_eq!(reported_daemon_mode(&mut uds).await, json!("node"));
     let status = assert_ok(&uds.call("system.status", json!({})).await, "system.status");
     assert!(status.is_object());
     assert_ok(&uds.call("principal.me", json!({})).await, "principal.me");
@@ -406,6 +427,7 @@ async fn persisted_daemon_mode_selects_node_mode_at_next_start() {
         &uds.call("workspace.list", json!({})).await,
         "regular workspace.list",
     );
+    assert_eq!(reported_daemon_mode(&mut uds).await, json!("regular"));
     assert_ok(
         &uds.call(
             "settings.update",
@@ -418,12 +440,18 @@ async fn persisted_daemon_mode_selects_node_mode_at_next_start() {
         &uds.call("workspace.list", json!({})).await,
         "still regular",
     );
+    assert_eq!(
+        reported_daemon_mode(&mut uds).await,
+        json!("regular"),
+        "the running mode, not the saved one"
+    );
     daemon.stop(&mut uds).await;
 
     // Next start (no flag) is node mode; switching back also waits a restart.
     let mut daemon = Daemon::spawn(dir.path(), false, false);
     let mut uds = daemon.ready().await;
     assert_node_mode_refusal(&uds.call("workspace.list", json!({})).await, "node start");
+    assert_eq!(reported_daemon_mode(&mut uds).await, json!("node"));
     assert_ok(
         &uds.call(
             "settings.update",

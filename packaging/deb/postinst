@@ -10,6 +10,11 @@ if [ "$1" = "configure" ]; then
     echo "    systemctl --user enable --now intentd"
     echo "Startup auto-resume of interrupted agents defaults to auto (headless hosts only);"
     echo "toggle it with: intentd settings agents.resumeInterruptedOnStart on|off"
+    echo "To use this computer only as a node that runs agents for another Intent,"
+    echo "once the service runs:"
+    echo "    intentd settings daemon.mode node && intentd settings server.tunnel.enabled true"
+    echo "    intentd restart"
+    echo "    intentd pair --tunnel"
 fi
 
 exit 0
