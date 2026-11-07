@@ -219,10 +219,27 @@ mod collaborator_fan_out {
 
         fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, intent_core::Result<Workspace>> {
             let allowed = self.members.lock().unwrap().contains(id.as_str());
+            // `manage-*` and `view-*` workspaces report the caller's
+            // management authority; others report no membership.
+            let membership = ["manage-", "view-"]
+                .iter()
+                .position(|prefix| id.as_str().starts_with(prefix))
+                .map(|kind| intent_core::WorkspaceMembership {
+                    can_manage: kind == 0,
+                    owner_principal_id: None,
+                    my_role: Some(if kind == 0 {
+                        intent_core::WorkspaceRole::Manager
+                    } else {
+                        intent_core::WorkspaceRole::Collaborator
+                    }),
+                    member_count: 2,
+                    open_invite_count: 0,
+                });
             Box::pin(async move {
                 if allowed {
                     Ok(Workspace {
                         id,
+                        membership,
                         ..intent_core::chief_workspace()
                     })
                 } else {
@@ -543,7 +560,8 @@ mod collaborator_fan_out {
 
     /// `cloudMachine:changed`: provider changes (global) reach every member;
     /// a machine's change carries its workspace and reaches only members who
-    /// can manage it; guests get neither.
+    /// can manage it (not those who can only view it), as `cloudMachines.list`
+    /// shows them; guests get neither.
     #[tokio::test]
     async fn cloud_machine_changes_reach_members_by_workspace_and_never_guests() {
         use intent_core::events::CLOUD_MACHINE_CHANGED;
@@ -555,13 +573,15 @@ mod collaborator_fan_out {
             let mut h = subscribe_as(
                 caller,
                 Some(role),
-                &["ws-1"],
+                &["manage-1", "view-1"],
                 json!({ "eventTypes": ["cloudMachine:changed"] }),
             )
             .await;
             for (workspace, data) in [
                 ("", json!({ "provider": { "id": "e2b" } })),
-                ("ws-1", json!({ "machine": { "id": "m-1" } })),
+                ("manage-1", json!({ "machine": { "id": "m-1" } })),
+                ("view-1", json!({ "machine": { "id": "m-3" } })),
+                ("view-1", json!({ "machineId": "m-3", "removed": true })),
                 ("ws-2", json!({ "machine": { "id": "m-2" } })),
                 ("ws-2", json!({ "machineId": "m-2", "removed": true })),
             ] {
@@ -577,7 +597,10 @@ mod collaborator_fan_out {
         let cloud = CLOUD_MACHINE_CHANGED.to_string();
         assert_eq!(
             run(intent_core::HostRole::Member).await,
-            vec![(cloud.clone(), String::new()), (cloud, "ws-1".to_owned())],
+            vec![
+                (cloud.clone(), String::new()),
+                (cloud, "manage-1".to_owned())
+            ],
             "a member sees the provider and the machines of workspaces it manages"
         );
         assert_eq!(run(intent_core::HostRole::Guest).await, Vec::new());
