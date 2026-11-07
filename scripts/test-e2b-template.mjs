@@ -8,12 +8,15 @@ import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_SIZE,
+  MANIFEST_ASSET,
   SIZES,
   archiveUrl,
+  builtSizes,
   defineTemplate,
   enabledSizes,
   installIntentdCommand,
   isResourceLimitRefusal,
+  manifestFor,
   parseSha256,
   parseSize,
   parseVersion,
@@ -184,6 +187,30 @@ describe('smoke', () => {
   });
 });
 
+describe('manifest', () => {
+  it('lists the built sizes in size order for one project and version', () => {
+    assert.equal(MANIFEST_ASSET, 'e2b-templates.json');
+    assert.deepEqual(manifestFor({ project: 'intent', version: 'v0.11.147', sizes: ['4x8', '2x4'] }), {
+      schema: 1, project: 'intent', version: '0.11.147', sizes: ['2x4', '4x8'],
+    });
+    assert.deepEqual(manifestFor({ project: 'intent', version: '0.11.147', sizes: [] }).sizes, []);
+  });
+  it('refuses a bad project, version or size', () => {
+    assert.throws(() => manifestFor({ project: 'Intent/x', version: '0.11.147', sizes: [] }), /project slug/);
+    assert.throws(() => manifestFor({ project: 'intent', version: 'main', sizes: [] }), /not an intentd release version/);
+    assert.throws(() => manifestFor({ project: 'intent', version: '0.11.147', sizes: ['3x6'] }), /unknown template size/);
+  });
+  it('checks each size tag of the version with the publishing key', async () => {
+    const asked = [];
+    const sizes = await builtSizes({
+      version: '0.11.147',
+      exists: async name => { asked.push(name); return !name.includes('8x16') && !name.includes('16x32'); },
+    });
+    assert.deepEqual(sizes, ['2x4', '4x8']);
+    assert.deepEqual(asked, ['intent-node-2x4:0.11.147', 'intent-node-4x8:0.11.147', 'intent-node-8x16:0.11.147', 'intent-node-16x32:0.11.147']);
+  });
+});
+
 describe('secrets', () => {
   it('redacts the API key from any message', () => {
     assert.equal(redact('bad key e2b_abc123 here e2b_abc123', 'e2b_abc123'), 'bad key [redacted] here [redacted]');
@@ -225,8 +252,8 @@ describe('workflow contract', () => {
     assert.match(build, /HAS_KEY: \$\{\{ secrets\.E2B_API_KEY != '' \}\}/);
     assert.match(build, /::warning::E2B_API_KEY secret is not set/);
   });
-  it('gives the key only to the build and smoke steps', () => {
-    assert.equal(build.match(/E2B_API_KEY: \$\{\{ secrets\.E2B_API_KEY \}\}/g).length, 2);
+  it('gives the key only to the build, smoke and manifest steps', () => {
+    assert.equal(build.match(/E2B_API_KEY: \$\{\{ secrets\.E2B_API_KEY \}\}/g).length, 3);
     assert.doesNotMatch(build.split('\n    steps:\n')[0], /secrets\.E2B_API_KEY \}\}/);
     assert.match(build, /npm ci --ignore-scripts/);
   });
@@ -247,5 +274,17 @@ describe('workflow contract', () => {
     assert.match(build, /ENABLED_SIZES: \$\{\{ vars\.E2B_TEMPLATE_SIZES \}\}/);
     assert.match(build, /node build\.mjs/);
     assert.match(build, /node smoke\.mjs "\$REF" "\$VERSION" "\$SIZE"/);
+  });
+  it('attaches the manifest to the release after release and manual builds only', () => {
+    const manifest = build.split('\n  manifest:\n')[1];
+    assert.match(manifest, /needs: template/);
+    assert.match(manifest, /if: \$\{\{ !cancelled\(\) && github\.event_name != 'pull_request' \}\}/);
+    assert.match(manifest, /node manifest\.mjs/);
+    assert.match(manifest, /gh release upload "v\$VERSION" e2b-templates\.json --repo intent-hq\/intentd-releases --clobber/);
+    assert.match(manifest, /GH_TOKEN: \$\{\{ secrets\.INTENTD_RELEASES_TOKEN \}\}/);
+    assert.match(build, /template:\n\s+if: \$\{\{ !inputs\.manifest_only \}\}/);
+    assert.match(job('release'), /manifest_only: \$\{\{ inputs\.manifest_only \|\| false \}\}/);
+    assert.match(job('release'), /INTENTD_RELEASES_TOKEN: \$\{\{ secrets\.INTENTD_RELEASES_TOKEN \}\}/);
+    assert.doesNotMatch(job('pull-request'), /INTENTD_RELEASES_TOKEN/);
   });
 });

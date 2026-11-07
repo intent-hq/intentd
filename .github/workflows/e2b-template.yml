@@ -15,7 +15,14 @@
 #   intent-node-<size>:<version>, move its latest tag, make the template
 #   public, then smoke-test the new tag.
 # - By hand (workflow_dispatch): the same for any published version; `latest`
-#   moves only when asked.
+#   moves only when asked. With manifest_only, nothing is built: only the
+#   template manifest is written again (a backfill for an earlier release).
+# - After release and manual builds: write the template manifest
+#   (e2b-templates.json: project, version, built sizes) and attach it to the
+#   intentd-releases release. Backends read it without a key to offer sizes;
+#   E2B's own template lookup answers only for the caller's project, so a
+#   user's key cannot check Intent's public templates. Needs the
+#   INTENTD_RELEASES_TOKEN secret (fail-soft without it).
 # - On pull requests that touch the template: build a private
 #   intent-node-<size>:pr-<number> from the newest release and smoke-test it.
 #
@@ -36,6 +43,11 @@ on:
         type: string
       latest:
         description: Also move the latest tag of each intent-node-<size> template
+        required: false
+        default: false
+        type: boolean
+      manifest_only:
+        description: Build nothing; only write and attach the template manifest of this version
         required: false
         default: false
         type: boolean
@@ -61,8 +73,10 @@ jobs:
     with:
       version: ${{ inputs.version }}
       latest: ${{ inputs.latest || false }}
+      manifest_only: ${{ inputs.manifest_only || false }}
     secrets:
       E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+      INTENTD_RELEASES_TOKEN: ${{ secrets.INTENTD_RELEASES_TOKEN }}
 
   # A new push replaces the PR's pr-<n> tags, so it cancels the older run.
   # Fork PRs get no secrets; same-repo PRs do.

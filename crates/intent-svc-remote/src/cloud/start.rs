@@ -431,7 +431,10 @@ async fn start(
     let saved = config::load(svc)
         .await?
         .ok_or_else(config::not_configured)?;
-    let client = config::saved_client(svc).await?;
+    let key = config::saved_key(svc)
+        .await?
+        .ok_or_else(config::not_configured)?;
+    let client = config::client(key.clone())?;
     let session = svc.store().get_agent_session_summary(agent_id).await?;
     let backend_id = svc.store().daemon_id().await?;
     let template = saved.template(saved.size);
@@ -452,7 +455,16 @@ async fn start(
             idempotency_key: Some(idempotency_key(agent_id)),
         })
         .await
-        .map_err(|error| config::to_error(&error, config::Phase::Create))?;
+        .map_err(|error| config::to_error(&error, config::Phase::Create));
+    let created = match created {
+        Ok(created) => created,
+        Err(error) => {
+            if is_key_rejected(&error) {
+                config::note_key_rejected(svc, &key).await;
+            }
+            return Err(error);
+        }
+    };
     let sandbox_id = created.sandbox_id.clone();
     let linked = async {
         let backend_name = crate::methods::backend_name(svc).await;
@@ -725,4 +737,9 @@ async fn placed_agents(
         }
     }
     Ok(agents)
+}
+
+/// Whether `error` is `cloud-machine-unavailable` reason `key-rejected`.
+fn is_key_rejected(error: &Error) -> bool {
+    matches!(error, Error::RemoteMachine(failure) if failure.data["reason"] == "key-rejected")
 }

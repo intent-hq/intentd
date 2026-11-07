@@ -137,6 +137,35 @@ export function installIntentdCommand(version, sha256) {
   ].join(' && ');
 }
 
+// The release's template manifest: which sizes were built for a version, in
+// which E2B project. Attached to the intentd-releases release so a backend can
+// read it without a key: E2B's template lookup only answers for templates of
+// the caller's own project, so a user's key cannot check Intent's public ones.
+export const MANIFEST_ASSET = 'e2b-templates.json';
+
+const PROJECT_SLUG = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+export function manifestFor({ project, version, sizes }) {
+  if (!PROJECT_SLUG.test(String(project ?? ''))) throw new Error(`${JSON.stringify(project)} is not an E2B project slug`);
+  const built = new Set(sizes.map(id => parseSize(id).id));
+  return {
+    schema: 1,
+    project,
+    version: parseVersion(version),
+    sizes: SIZES.map(size => size.id).filter(id => built.has(id)),
+  };
+}
+
+// The sizes whose intent-node-<size>:<version> tag exists, checked with the
+// publishing project's own key (E2B answers that lookup for its owner).
+export async function builtSizes({ version, exists }) {
+  const sizes = [];
+  for (const size of SIZES) {
+    if (await exists(`${templateName(size.id)}:${parseVersion(version)}`)) sizes.push(size.id);
+  }
+  return sizes;
+}
+
 export function npmGlobalsCommand() {
   const specs = Object.entries(NPM_GLOBALS).map(([name, version]) => `${name}@${version}`);
   return `npm install --global --no-fund --no-audit ${specs.join(' ')} && npm cache clean --force`;
