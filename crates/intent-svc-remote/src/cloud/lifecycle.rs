@@ -144,10 +144,13 @@ impl CloudGate {
 
     /// Before a dial: resume the sandbox when paused (or check that E2B
     /// still has it). A sandbox E2B removed ends the machine's agents with
-    /// [`SANDBOX_LOST_MESSAGE`] and removes the machine.
+    /// [`SANDBOX_LOST_MESSAGE`] and removes the machine. `asked` when
+    /// something asked for this dial; a redial that waited here while a
+    /// pause finished does not resume the sandbox.
     pub(crate) async fn before_dial(
         &self,
         shared: &Shared,
+        asked: bool,
     ) -> std::result::Result<(), ConnectFailure> {
         let Ok(feature) = super::feature(&self.svc) else {
             return Ok(());
@@ -156,6 +159,11 @@ impl CloudGate {
             return Err(lost_failure());
         }
         let _transition = feature.cloud.transition(&self.machine_id).await;
+        if !asked && feature.cloud.is_parked(&self.machine_id) {
+            return Err(ConnectFailure::Local(
+                "the sandbox was paused; it resumes when something asks for it".into(),
+            ));
+        }
         let row = match self.svc.store().get_exposed_machine(&self.machine_id).await {
             Ok(Some(row)) => row,
             Ok(None) => return Ok(()),

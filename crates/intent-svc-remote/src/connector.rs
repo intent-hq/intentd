@@ -1121,6 +1121,11 @@ impl Shared {
     /// `node-link-unavailable` when the stop is still unacknowledged.
     pub(crate) async fn no_stop_pending(&self, agent_id: &AgentId) -> Result<()> {
         let deadline = Instant::now() + self.tuning.stop_wait;
+        if self.stop_queued(agent_id) {
+            // The stop needs a link: ask for one, since its own request may
+            // have been spent on a dial that failed (a refused resume).
+            self.wake();
+        }
         if self.stop_queued(agent_id)
             && !self
                 .wait_stops(std::slice::from_ref(agent_id), deadline)
@@ -1568,7 +1573,11 @@ impl RemoteNode {
             shared
                 .survivors_unclaimed
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            shared.wake();
+            // A paused cloud machine is claimed once something asks for it;
+            // starting its connector does not resume it.
+            if !shared.target().gate.is_some_and(|gate| gate.parked()) {
+                shared.wake();
+            }
         }
         intent_core::spawn_daemon(run(shared.clone(), lease, Ingest::new(acked), demands));
         intent_core::spawn_daemon(expire_final_stops(Arc::downgrade(&shared)));
@@ -2064,12 +2073,13 @@ async fn run(
                 continue;
             }
         }
+        let asked = demanded || !waiters.is_empty();
         demanded = false;
         let version = lock(&shared.status).intentd_version.clone();
         let ingested = ingest.ingested();
         let gated = match &target.gate {
             Some(gate) => tokio::select! {
-                gated = gate.before_dial(&shared) => gated,
+                gated = gate.before_dial(&shared, asked) => gated,
                 () = wait_true(&mut shutdown) => return,
             },
             None => Ok(()),
