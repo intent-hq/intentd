@@ -1,9 +1,11 @@
 //! Hermetic e2e for per-agent temp folders: two real mock agents spawned by
 //! the [`AgentManager`] each see their own `TMPDIR` / `TMP` / `TEMP` (honored
 //! by Node's `os.tmpdir()` and by `mktemp` in a shell), so a fixed temp file
-//! name can no longer collide across agents. Each folder exists while its
-//! agent runs and is removed when that agent is stopped, without touching the
-//! other agent's folder.
+//! name can no longer collide across agents. The folder belongs to the agent,
+//! not its process: after the idle reaper kills both processes, a relaunched
+//! agent gets the same folder with the file its previous process wrote. The
+//! sweep reclaims an idle agent's folder but never one a live launch holds,
+//! and deleting the agent removes its folder.
 //!
 //! The mock fixture's `MOCK_AGENT_SESSION_LOG` + `MOCK_AGENT_LOG_TMPDIR`
 //! seam records what the child saw at `session/new`. Gated on `node` and the
@@ -58,19 +60,45 @@ fn read_report(log: &Path) -> TmpReport {
     TmpReport { tmpdir, raw }
 }
 
-async fn wait_gone(path: &Path) -> bool {
-    for _ in 0..200 {
-        if !path.exists() {
-            return true;
-        }
-        // timing-guard: poll interval
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    false
+/// Spawn (or relaunch) `agent_id` and return what its child reported.
+async fn launch(
+    manager: &AgentManager,
+    provider: &ProviderConfig,
+    ws: &WorkspaceId,
+    agent_id: &AgentId,
+    cwd: &Path,
+    scratch: &Path,
+    log_name: &str,
+) -> TmpReport {
+    let log = scratch.join(format!("{log_name}.session.log"));
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert("MOCK_AGENT_SESSION_LOG".into(), log.display().to_string());
+    extra_env.insert("MOCK_AGENT_LOG_TMPDIR".into(), "1".into());
+    // A shared value the per-agent folder must override.
+    extra_env.insert("TMPDIR".into(), scratch.display().to_string());
+    let mut opts = SpawnOptions::new(provider);
+    opts.cwd = Some(cwd);
+    opts.extra_env = extra_env;
+    manager
+        .create_agent(
+            agent_id.clone(),
+            ws.clone(),
+            "Tmp",
+            "interactive",
+            cwd.to_path_buf(),
+            &opts,
+        )
+        .await
+        .expect("create_agent");
+    manager
+        .start_session(agent_id, cwd.to_path_buf(), provider)
+        .await
+        .expect("start_session");
+    read_report(&log)
 }
 
 #[intent_test_macros::daemon_test]
-async fn each_agent_gets_its_own_tmpdir_removed_when_it_ends() {
+async fn agent_tmpdir_is_private_and_survives_relaunch() {
     let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").unwrap_or_else(|_| {
         format!(
             "{}/tests/fixtures/mock-acp-agent.mjs",
@@ -117,9 +145,11 @@ async fn each_agent_gets_its_own_tmpdir_removed_when_it_ends() {
     let scratch = common::test_tempdir_in("/tmp", "itd-agtmp-");
     let tmp_root = scratch.path().join("root");
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
-    let manager = AgentManager::new(services.clone(), sink, 8)
-        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"))
-        .with_agent_tmp_root(&tmp_root);
+    let manager = Arc::new(
+        AgentManager::new(services.clone(), sink, 8)
+            .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"))
+            .with_agent_tmp_root(&tmp_root),
+    );
 
     let cwd_dir = common::test_tempdir("itd-agent-cwd-");
     let cwd = cwd_dir.path().to_path_buf();
@@ -138,31 +168,17 @@ async fn each_agent_gets_its_own_tmpdir_removed_when_it_ends() {
             .await
             .expect("create agent");
         let agent_id = AgentId::from(created["agent"]["id"].as_str().unwrap());
-        let log = scratch.path().join(format!("{tag}.session.log"));
-        let mut extra_env = BTreeMap::new();
-        extra_env.insert("MOCK_AGENT_SESSION_LOG".into(), log.display().to_string());
-        extra_env.insert("MOCK_AGENT_LOG_TMPDIR".into(), "1".into());
-        // A shared value the per-agent folder must override.
-        extra_env.insert("TMPDIR".into(), scratch.path().display().to_string());
-        let mut opts = SpawnOptions::new(&provider);
-        opts.cwd = Some(&cwd);
-        opts.extra_env = extra_env;
-        manager
-            .create_agent(
-                agent_id.clone(),
-                ws.clone(),
-                "Tmp",
-                "interactive",
-                cwd.clone(),
-                &opts,
-            )
-            .await
-            .expect("create_agent");
-        manager
-            .start_session(&agent_id, cwd.clone(), &provider)
-            .await
-            .expect("start_session");
-        agents.push((agent_id, read_report(&log)));
+        let report = launch(
+            &manager,
+            &provider,
+            &ws,
+            &agent_id,
+            &cwd,
+            scratch.path(),
+            &format!("{tag}-1"),
+        )
+        .await;
+        agents.push((agent_id, report));
     }
 
     for (_, report) in &agents {
@@ -182,22 +198,63 @@ async fn each_agent_gets_its_own_tmpdir_removed_when_it_ends() {
     let (first_id, first) = &agents[0];
     let (_, second) = &agents[1];
     assert_ne!(first.tmpdir, second.tmpdir, "agents never share a temp dir");
+    let first_file = PathBuf::from(first.raw["mktemp"].as_str().unwrap());
 
-    assert!(manager.stop(first_id).await, "first agent stopped");
-    assert!(
-        wait_gone(&first.tmpdir).await,
-        "stopped agent's temp dir removed: {}",
-        first.tmpdir.display()
+    // The idle reaper kills both processes; their folders and files stay.
+    assert_eq!(
+        manager.reap_idle_older_than(Duration::ZERO).await,
+        2,
+        "idle reaper evicts both agents"
+    );
+    assert!(first_file.is_file(), "a reaped agent keeps its temp files");
+    assert!(second.tmpdir.is_dir(), "a reaped agent keeps its folder");
+
+    // The next turn relaunches the agent into the same folder.
+    let relaunched = launch(
+        &manager,
+        &provider,
+        &ws,
+        first_id,
+        &cwd,
+        scratch.path(),
+        "one-2",
+    )
+    .await;
+    assert_eq!(
+        relaunched.tmpdir, first.tmpdir,
+        "a relaunched agent gets its previous folder"
     );
     assert!(
-        second.tmpdir.is_dir(),
-        "the other agent's folder is untouched"
+        first_file.is_file(),
+        "the previous process's file survives the relaunch"
+    );
+
+    // The sweep reclaims the idle agent's folder, never a live one's.
+    intent_core::sweep_agent_tmp_root(&tmp_root, Duration::ZERO).expect("sweep");
+    assert!(
+        first_file.is_file(),
+        "the sweep skips a live agent's folder"
+    );
+    assert!(
+        !second.tmpdir.exists(),
+        "the sweep reclaims an idle agent's folder: {}",
+        second.tmpdir.display()
+    );
+
+    // Stopping (like the idle reaper) keeps the folder; deleting the agent
+    // removes it.
+    assert!(manager.stop(first_id).await, "first agent stopped");
+    assert!(first_file.is_file(), "a stopped agent keeps its temp files");
+    services.attach_agent_manager(&manager);
+    services
+        .agent_delete(first_id.clone(), Some(ws.clone()))
+        .await
+        .expect("delete agent");
+    assert!(
+        !first.tmpdir.exists(),
+        "deleting the agent removes its folder: {}",
+        first.tmpdir.display()
     );
 
     manager.shutdown().await;
-    assert!(
-        wait_gone(&second.tmpdir).await,
-        "shutdown removes the remaining temp dir: {}",
-        second.tmpdir.display()
-    );
 }

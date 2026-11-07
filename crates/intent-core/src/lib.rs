@@ -85,7 +85,8 @@ pub use agent_logs::{
     sweep_agent_logs, AGENT_LOG_RETENTION_DAYS,
 };
 pub use agent_tmp::{
-    agent_tmp_root, prepare_agent_tmp_root, sweep_agent_tmp_root, AgentTempDir, AGENT_TMP_ENV_KEYS,
+    agent_tmp_root, prepare_agent_tmp_root, remove_agent_tmp_dir, sweep_agent_tmp_root,
+    AgentTempDir, AGENT_TMP_ENV_KEYS, AGENT_TMP_MAX_IDLE,
 };
 pub use caller::{
     current_caller, is_human_authored_metadata, project_queue_for_caller,

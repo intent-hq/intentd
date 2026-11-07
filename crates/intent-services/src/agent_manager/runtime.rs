@@ -103,9 +103,9 @@ pub(super) struct LocalResources {
     pub(super) _rules_config: Option<TempConfigFile>,
     pub(super) _pi_extension: Option<PiExtensionDelivery>,
     pub(super) npx_launch_dir: Option<NpxLaunchDir>,
-    /// The launch's private temp folder (`TMPDIR` / `TMP` / `TEMP`); moves
-    /// with the child into [`DetachedChild`] and is removed after the tree
-    /// is killed.
+    /// The agent's private temp folder (`TMPDIR` / `TMP` / `TEMP`); moves
+    /// with the child into [`DetachedChild`] and is released after the tree
+    /// is killed, kept on disk for the agent's next launch.
     pub(super) agent_tmp_dir: Option<intent_core::AgentTempDir>,
     pub(super) preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
     pub(super) cleanup_lease: Option<tokio::sync::oneshot::Sender<()>>,
@@ -338,10 +338,10 @@ pub(super) struct DetachedChild {
     pub(super) spawn_pid: Option<u32>,
     /// `None` once moved into the owned cleanup task.
     pub(super) npx_launch_dir: Option<NpxLaunchDir>,
-    /// `None` once moved into the owned cleanup task. Unlike the launch dir
-    /// it is never retained: it is not the tree's cwd, may hold large files,
-    /// and is removed once the kill finishes (or with the cleanup future,
-    /// whichever comes first; the startup sweep reclaims any leak).
+    /// `None` once moved into the owned cleanup task. Released once the kill
+    /// finishes (or with the cleanup future, whichever comes first); the
+    /// folder stays for the agent's next launch until the idle sweep
+    /// reclaims it.
     pub(super) agent_tmp_dir: Option<intent_core::AgentTempDir>,
     pub(super) preparation_guard: Option<crate::provider_preparation::LaunchGuard>,
     pub(super) cleanup_lease: Option<tokio::sync::oneshot::Sender<()>>,

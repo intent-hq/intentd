@@ -7395,6 +7395,12 @@ impl Services {
                 .await?;
             known_completion &= deleted;
             self.invalidate_agent_list_cache(session_ws);
+            // The runtime is stopped above; its temp folder goes with it.
+            if let Some(manager) = self.agent_manager() {
+                manager
+                    .remove_agent_tmp_dirs(std::slice::from_ref(&agent_id))
+                    .await;
+            }
         }
         // Memory-held secrets and pending requests die with their agent
         // (§5.56). Swept only AFTER the row is gone: a concurrent

@@ -103,6 +103,11 @@ pub struct SpawnOptions<'a> {
     /// agents never share fixed temp file names. `None` leaves the child's
     /// temp variables as inherited.
     pub agent_tmp_root: Option<&'a Path>,
+    /// Stable key (the agent id) naming the folder under
+    /// [`Self::agent_tmp_root`], so every launch of one agent reuses the same
+    /// folder and its contents ([`AgentTempDir::for_agent`]). `None` gives
+    /// the launch a fresh folder removed with it.
+    pub agent_tmp_key: Option<&'a str>,
 }
 
 impl<'a> SpawnOptions<'a> {
@@ -168,6 +173,7 @@ impl<'a> SpawnOptions<'a> {
             node_max_old_space_mb: None,
             profile_env: None,
             agent_tmp_root: None,
+            agent_tmp_key: None,
         }
     }
 }
@@ -873,8 +879,9 @@ impl SpawnedAgent {
 
     /// Decompose into the child, connection, npx launch dir and private temp
     /// folder (see [`SpawnOptions::agent_tmp_root`]), e.g. to store them
-    /// separately. Both directories are removed when dropped, so keep them
-    /// alive as long as the child's process tree.
+    /// separately. The launch dir and a per-launch temp folder are removed
+    /// when dropped (a per-agent one is released for the next launch), so
+    /// keep them alive as long as the child's process tree.
     pub fn into_parts(
         self,
     ) -> (
@@ -949,12 +956,17 @@ pub fn prepare_provider(opts: &SpawnOptions) -> AcpResult<PreparedProvider> {
     })
 }
 
-/// The launch's private temp folder under [`SpawnOptions::agent_tmp_root`].
+/// The launch's private temp folder under [`SpawnOptions::agent_tmp_root`]:
+/// the agent's own folder when [`SpawnOptions::agent_tmp_key`] is set.
 /// Fail-soft: a folder that cannot be created leaves the inherited temp
 /// variables in place rather than failing the launch.
 fn create_agent_tmp_dir(opts: &SpawnOptions, command_name: &str) -> Option<AgentTempDir> {
     let root = opts.agent_tmp_root?;
-    match AgentTempDir::create(root) {
+    let dir = match opts.agent_tmp_key {
+        Some(key) => AgentTempDir::for_agent(root, key),
+        None => AgentTempDir::create(root),
+    };
+    match dir {
         Ok(dir) => Some(dir),
         Err(e) => {
             tracing::warn!(
