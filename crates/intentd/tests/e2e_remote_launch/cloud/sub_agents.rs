@@ -28,10 +28,7 @@ async fn seed_member(data_dir: &Path) -> String {
         updated_at: now_iso(),
     };
     store.upsert_principal(&principal).await.unwrap();
-    let hash: String = Sha256::digest(MEMBER_TOKEN.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let hash = lower_hex(&Sha256::digest(MEMBER_TOKEN.as_bytes()));
     store
         .insert_principal_credential(&principal.id, &hash)
         .await
@@ -175,9 +172,11 @@ async fn a_sandbox_agents_sub_agents_share_its_sandbox_or_start_their_own() {
 
     // One sub-agent with no placement, one with `target: "e2b"`, created
     // mid-turn after an uncommitted edit.
-    let read = r#"const p = await ws.file.read("parent.txt"); const i = await ws.workspace.info();"#;
-    let shared_prompt =
-        format!(r#"wsapi {read} return JSON.stringify({{ marker: "shared-1", p, path: i.path }});"#);
+    let read =
+        r#"const p = await ws.file.read("parent.txt"); const i = await ws.workspace.info();"#;
+    let shared_prompt = format!(
+        r#"wsapi {read} return JSON.stringify({{ marker: "shared-1", p, path: i.path }});"#
+    );
     let fresh_prompt =
         format!(r#"wsapi {read} return JSON.stringify({{ marker: "fresh-1", p, path: i.path }});"#);
     let code = format!(

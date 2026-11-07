@@ -188,9 +188,8 @@ async fn seed_from_parent_work(
     sandbox_path: &std::path::Path,
 ) -> Option<String> {
     let session = store.get_agent_session_summary(agent_id).await.ok()?;
-    let work = intent_core::remote_launch::BackendParentWork::from_metadata(
-        session.metadata.as_ref(),
-    )?;
+    let work =
+        intent_core::remote_launch::BackendParentWork::from_metadata(session.metadata.as_ref())?;
     let head = work.head.clone()?;
     let start = work.wip.clone().unwrap_or(head);
     let path = sandbox_path.to_path_buf();

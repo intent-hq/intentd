@@ -263,7 +263,7 @@ async fn agent_person(svc: &Services, agent_id: &AgentId) -> Option<intent_core:
     let mut creator = None;
     let mut current = Some(agent_id.clone());
     for _ in 0..64 {
-        let Some(id) = current else { break };
+        let Some(id) = current.take() else { break };
         let Ok(session) = store.get_agent_session_summary(&id).await else {
             break;
         };
@@ -289,7 +289,7 @@ async fn agent_person(svc: &Services, agent_id: &AgentId) -> Option<intent_core:
                 .and_then(serde_json::Value::as_str)
                 .map(intent_core::PrincipalId::from_string);
         }
-        current = session.parent_agent_id.clone();
+        current.clone_from(&session.parent_agent_id);
     }
     creator
 }

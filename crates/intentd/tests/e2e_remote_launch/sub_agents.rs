@@ -326,7 +326,10 @@ async fn a_remote_agents_sub_agent_on_another_machine_starts_from_its_work() {
         }
     })
     .await;
-    assert!(removed.is_ok(), "the child's checkout on the other machine is removed");
+    assert!(
+        removed.is_ok(),
+        "the child's checkout on the other machine is removed"
+    );
 }
 
 /// Whether the filesystem under `/tmp` can copy-on-write clone, as the
@@ -428,7 +431,10 @@ async fn a_remote_agents_backend_sub_agent_gets_its_work() {
             && seen.contains(&format!("{parent_refs}/wip")),
         "the instructions name the parent's refs: {seen}"
     );
-    assert!(!repo.join("parent.txt").exists(), "the checkout is untouched");
+    assert!(
+        !repo.join("parent.txt").exists(),
+        "the checkout is untouched"
+    );
     let back = ok(
         &mut rpc_ws,
         200,
@@ -459,8 +465,10 @@ async fn a_remote_agents_backend_sub_agent_gets_its_work() {
     let cow_id = made["d"]["agentId"]
         .as_str()
         .or_else(|| made["d"]["id"].as_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| panic!("the delegate result names the child: {made}"));
+        .map_or_else(
+            || panic!("the delegate result names the child: {made}"),
+            str::to_owned,
+        );
     let seen = reply_containing(&mut rpc_ws, (&ws_id, &cow_id), "raw: ", 300).await;
     assert!(
         seen.contains("starts from its parent's work"),
@@ -481,5 +489,8 @@ async fn a_remote_agents_backend_sub_agent_gets_its_work() {
         "from parent",
         "its checkout has the parent's uncommitted edit"
     );
-    assert!(!repo.join("parent.txt").exists(), "the checkout is untouched");
+    assert!(
+        !repo.join("parent.txt").exists(),
+        "the checkout is untouched"
+    );
 }

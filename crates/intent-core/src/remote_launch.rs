@@ -372,7 +372,10 @@ impl BackendParentWork {
     /// The parent's ref `name` (`head` or `wip`) in workspace `workspace_id`.
     #[must_use]
     pub fn parent_ref(&self, workspace_id: &str, name: &str) -> String {
-        format!("refs/intent/ws/{workspace_id}/agents/{}/{name}", self.agent_id)
+        format!(
+            "refs/intent/ws/{workspace_id}/agents/{}/{name}",
+            self.agent_id
+        )
     }
 
     fn saved(&self) -> &'static str {

@@ -659,9 +659,9 @@ async fn assemble_system_prompt_layers(
     }
     // A backend sub-agent of a remote agent: where its parent's work is.
     if let Some(session) = agent_session {
-        if let Some(work) = intent_core::remote_launch::BackendParentWork::from_metadata(
-            session.metadata.as_ref(),
-        ) {
+        if let Some(work) =
+            intent_core::remote_launch::BackendParentWork::from_metadata(session.metadata.as_ref())
+        {
             parts.push(format!(
                 "## Parent's work\n\n{}",
                 work.notice(session.workspace_id.as_str())

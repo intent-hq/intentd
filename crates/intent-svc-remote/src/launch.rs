@@ -28,8 +28,9 @@ use intent_core::placement::{
     PlacementUnavailableReason, PlatformAvailability,
 };
 use intent_core::remote_launch::{
-    BackendParentModule, BackendParentWork, EffectiveIsolation, ParentWork, ParentWorkCopy, RemoteAgentRecord, RemoteCheckoutBase,
-    RemoteLaunchNeeds, RemoteLaunchRequest, RemotePlacementView, RemoteSetupStatus,
+    BackendParentModule, BackendParentWork, EffectiveIsolation, ParentWork, ParentWorkCopy,
+    RemoteAgentRecord, RemoteCheckoutBase, RemoteLaunchNeeds, RemoteLaunchRequest,
+    RemotePlacementView, RemoteSetupStatus,
 };
 use intent_core::{AgentId, BoxFuture, Error, Result, Workspace, WorkspaceId};
 use intent_git::hub::AgentRef;
