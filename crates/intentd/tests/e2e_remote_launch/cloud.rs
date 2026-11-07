@@ -1628,6 +1628,13 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
     )
     .await;
     machine_until(&mut rpc_ws, 301, "sbx1", |m| m.is_none()).await;
+    // The E2B delete follows the machine row's removal.
+    call_until(&fake, &mut rpc_ws, "sbx1", |calls| {
+        calls
+            .iter()
+            .any(|c| is_call(c, "DELETE", "/sandboxes/sbx1"))
+    })
+    .await;
     let calls = fake.calls_for("sbx1");
     let last_pause = calls
         .iter()
