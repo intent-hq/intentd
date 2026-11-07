@@ -6081,6 +6081,26 @@ impl Services {
         }))
     }
 
+    /// The person behind a new agent: a wire caller's principal, or for an
+    /// agent caller the person recorded on that agent. `None` for a caller
+    /// with neither (an internal create, or an agent created before the
+    /// record existed).
+    async fn creating_principal(&self) -> Option<String> {
+        match intent_core::current_caller()? {
+            intent_core::Caller::Wire { principal_id, .. } => Some(principal_id.to_string()),
+            intent_core::Caller::Agent { agent_id } => {
+                let session = self.store.get_agent_session_summary(&agent_id).await.ok()?;
+                session
+                    .metadata
+                    .as_ref()?
+                    .get(intent_store::CREATED_BY_PRINCIPAL_METADATA_KEY)?
+                    .as_str()
+                    .map(str::to_owned)
+            }
+            _ => None,
+        }
+    }
+
     /// The parent and its placement, when the caller is that parent and it
     /// runs on a remote machine; the rules of [`Self::inherited_placement`].
     async fn remote_parent(
@@ -6698,8 +6718,25 @@ impl Services {
         // Strip caller provenance even for General agents with an override.
         if let Some(obj) = metadata.as_mut().and_then(Value::as_object_mut) {
             obj.remove("specialistGeneratedBehaviorPrompt");
-            // Only the daemon places an agent on a node.
+            // Only the daemon places an agent on a node, or names its creator.
             obj.remove(intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY);
+            obj.remove(intent_store::CREATED_BY_PRINCIPAL_METADATA_KEY);
+        }
+        if let Some(creator) = self.creating_principal().await {
+            let mut obj = match metadata.take() {
+                Some(Value::Object(obj)) => obj,
+                None | Some(Value::Null) => serde_json::Map::new(),
+                Some(other) => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("priorNonObjectMetadata".to_string(), other);
+                    obj
+                }
+            };
+            obj.insert(
+                intent_store::CREATED_BY_PRINCIPAL_METADATA_KEY.to_string(),
+                Value::String(creator),
+            );
+            metadata = Some(Value::Object(obj));
         }
         if let Some(view) = &remote {
             let view = serde_json::to_value(view).map_err(|e| {

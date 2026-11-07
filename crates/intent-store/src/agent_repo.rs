@@ -814,15 +814,22 @@ pub const MANUAL_CHOICE_METADATA_KEY: &str = "manualChoice";
 /// never projected to clients.
 pub const PROVIDER_RETURN_METADATA_KEY: &str = "providerReturn";
 
+/// Session `metadata` key holding the id of the person behind the agent:
+/// the principal that created it, or for a sub-agent its parent's. Written
+/// only at creation, by the daemon; internal: never projected to clients.
+/// `cloud.startedBy` of a sandbox an agent starts names this person.
+pub const CREATED_BY_PRINCIPAL_METADATA_KEY: &str = "createdByPrincipalId";
+
 /// Daemon-owned `metadata` keys: each has dedicated single-key writers, and
 /// whole-document writes ([`Store::update_agent_session`],
 /// [`Store::update_agent_session_metadata`]) never set or clear them, so a
 /// caller's stale snapshot cannot erase a newer value or bring back an old
 /// one (PROTOCOL §5.54 shared quota state).
-const DAEMON_OWNED_METADATA_KEYS: [&str; 3] = [
+const DAEMON_OWNED_METADATA_KEYS: [&str; 4] = [
     MANUAL_CHOICE_METADATA_KEY,
     PROVIDER_RETURN_METADATA_KEY,
     intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+    CREATED_BY_PRINCIPAL_METADATA_KEY,
 ];
 
 /// The two binds a whole-document `metadata` write needs (see
@@ -867,18 +874,20 @@ fn daemon_owned_preserving_metadata(
     raw_doc: &str,
     keep_choice_if: &str,
 ) -> String {
-    let [choice, ret, remote] = DAEMON_OWNED_METADATA_KEYS;
+    let [choice, ret, remote, creator] = DAEMON_OWNED_METADATA_KEYS;
     format!(
         "CASE WHEN metadata IS NOT NULL AND json_valid(metadata) \
               AND json_type(metadata) = 'object' \
               AND (json_type(metadata, '$.{choice}') IS NOT NULL \
                    OR json_type(metadata, '$.{ret}') IS NOT NULL \
-                   OR json_type(metadata, '$.{remote}') IS NOT NULL) \
+                   OR json_type(metadata, '$.{remote}') IS NOT NULL \
+                   OR json_type(metadata, '$.{creator}') IS NOT NULL) \
              THEN json_patch({object_doc}, json_object(\
                  '{choice}', CASE WHEN ({keep_choice_if}) \
                                   THEN json(metadata -> '$.{choice}') END, \
                  '{ret}', json(metadata -> '$.{ret}'), \
-                 '{remote}', json(metadata -> '$.{remote}'))) \
+                 '{remote}', json(metadata -> '$.{remote}'), \
+                 '{creator}', json(metadata -> '$.{creator}'))) \
          ELSE {raw_doc} END"
     )
 }

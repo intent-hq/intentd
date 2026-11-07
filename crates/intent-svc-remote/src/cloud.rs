@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use intent_core::remote_launch::RemotePlacementView;
 use intent_core::{AgentId, Caller, Error, Result};
 use intent_services::feature_api::Services;
 use tokio::sync::watch;
@@ -224,12 +225,22 @@ impl CloudState {
     }
 }
 
-/// The principal behind the current call, for `cloud.startedBy`: a wire
-/// caller's principal, else this backend's primary principal (the owner).
+/// The person behind the current call, for `cloud.startedBy`: a wire
+/// caller's principal; for an agent caller, the person behind its chain
+/// ([`agent_person`]); else, or when unknown, this backend's primary
+/// principal (the owner).
 async fn started_by(svc: &Services) -> intent_core::machines::CloudStartedBy {
-    let principal = match intent_core::current_caller() {
-        Some(Caller::Wire { principal_id, .. }) => svc.store().get_principal(&principal_id).await,
-        _ => svc.store().get_primary_principal().await,
+    let person = match intent_core::current_caller() {
+        Some(Caller::Wire { principal_id, .. }) => Some(principal_id),
+        Some(Caller::Agent { agent_id }) => agent_person(svc, &agent_id).await,
+        _ => None,
+    };
+    let principal = match person {
+        Some(principal_id) => match svc.store().get_principal(&principal_id).await {
+            Ok(principal) => Ok(principal),
+            Err(_) => svc.store().get_primary_principal().await,
+        },
+        None => svc.store().get_primary_principal().await,
     };
     match principal {
         Ok(principal) => intent_core::machines::CloudStartedBy {
@@ -241,6 +252,46 @@ async fn started_by(svc: &Services) -> intent_core::machines::CloudStartedBy {
             display_name: None,
         },
     }
+}
+
+/// The person behind agent `agent_id`: whoever started the sandbox of the
+/// closest agent of its chain (itself first, then its parents) that runs
+/// on a cloud machine, else the person recorded as its creator. `None`
+/// when neither is known (an agent created before the record existed).
+async fn agent_person(svc: &Services, agent_id: &AgentId) -> Option<intent_core::PrincipalId> {
+    let store = svc.store();
+    let mut creator = None;
+    let mut current = Some(agent_id.clone());
+    for _ in 0..64 {
+        let Some(id) = current else { break };
+        let Ok(session) = store.get_agent_session_summary(&id).await else {
+            break;
+        };
+        let metadata = session.metadata.as_ref();
+        if let Some(view) = RemotePlacementView::from_metadata(metadata)
+            .filter(|view| view.is_cloud() && !view.is_unlinked())
+        {
+            let starter = store
+                .get_exposed_machine(&view.node_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| row.cloud)
+                .map(|cloud| cloud.started_by.principal_id)
+                .filter(|id| !id.is_empty());
+            if let Some(starter) = starter {
+                return Some(intent_core::PrincipalId::from_string(starter));
+            }
+        }
+        if creator.is_none() {
+            creator = metadata
+                .and_then(|m| m.get(intent_store::CREATED_BY_PRINCIPAL_METADATA_KEY))
+                .and_then(serde_json::Value::as_str)
+                .map(intent_core::PrincipalId::from_string);
+        }
+        current = session.parent_agent_id.clone();
+    }
+    creator
 }
 
 /// A client for the saved E2B key, if one is saved.

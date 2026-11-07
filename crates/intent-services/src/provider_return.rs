@@ -101,13 +101,14 @@ pub(crate) fn read_state(session: &AgentSession) -> Option<ProviderReturnState> 
     read_state_from(session.metadata.as_ref())
 }
 
-/// Remove the return state and manual-choice token from a session about to
+/// Remove the return state, manual-choice token and creator from a session about to
 /// leave the daemon (`agent.getSession`): internal bookkeeping, kept in
 /// storage only.
 pub(crate) fn strip_internal_metadata(session: &mut AgentSession) {
     if let Some(Value::Object(metadata)) = session.metadata.as_mut() {
         metadata.remove(PROVIDER_RETURN_METADATA_KEY);
         metadata.remove(intent_store::MANUAL_CHOICE_METADATA_KEY);
+        metadata.remove(intent_store::CREATED_BY_PRINCIPAL_METADATA_KEY);
     }
 }
 
