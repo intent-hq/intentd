@@ -408,7 +408,14 @@ impl DetachedChild {
                 services.hold_periodic_commit("physical-cleanup").await;
             }
             let exited = kill_child_tree(child, spawn_pid).await;
-            drop(agent_tmp_dir);
+            if exited {
+                drop(agent_tmp_dir);
+            } else {
+                // A surviving tree may still write into the shared per-agent
+                // folder: keep holding it so neither the sweep nor an agent
+                // delete removes it from under the orphan.
+                std::mem::forget(agent_tmp_dir);
+            }
             if exited {
                 launch_dir.remove();
                 if let Some(guard) = preparation_guard {

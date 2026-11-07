@@ -192,11 +192,15 @@ pub fn sweep_agent_tmp_root(root: &Path, max_idle: Duration) -> std::io::Result<
 }
 
 /// Under the [`IN_USE`] lock, move `path` aside for removal when no launch
-/// holds it and it is idle past `max_idle`; the slow removal then runs
+/// holds it (a held one is re-stamped) and it is idle past `max_idle`; the slow removal then runs
 /// outside the lock, and a launch for the same agent creates a fresh folder.
 fn claim_idle(root: &Path, path: &Path, max_idle: Duration) -> Option<PathBuf> {
     let held = in_use();
     if held.contains_key(path) {
+        // Re-stamp a held folder: its mtime moves only on launch, release
+        // and direct entry changes, so after a crash (no release) a long
+        // single launch would otherwise look idle to the startup sweep.
+        touch(path);
         return None;
     }
     let modified = std::fs::symlink_metadata(path).ok()?.modified().ok()?;
@@ -504,6 +508,64 @@ mod tests {
         for path in &left {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
+    }
+
+    #[test]
+    fn agent_folder_is_reused_and_held_until_the_last_holder_drops() {
+        let base = base();
+        let root = base.path().join("root");
+        prepare_agent_tmp_root(&root).unwrap();
+        let first = AgentTempDir::for_agent(&root, "agent-1").unwrap();
+        std::fs::write(first.path().join("kept"), "x").unwrap();
+        let overlap = AgentTempDir::for_agent(&root, "agent-1").unwrap();
+        assert_eq!(first.path(), overlap.path());
+        let other = AgentTempDir::for_agent(&root, "agent-2").unwrap();
+        assert_ne!(first.path(), other.path());
+        let path = first.path().to_path_buf();
+        drop(first);
+        sweep_agent_tmp_root(&root, Duration::ZERO).unwrap();
+        assert!(path.join("kept").is_file(), "a held folder is never swept");
+        drop(overlap);
+        assert!(path.join("kept").is_file(), "release keeps the folder");
+        let again = AgentTempDir::for_agent(&root, "agent-1").unwrap();
+        assert!(again.path().join("kept").is_file(), "relaunch reuses it");
+    }
+
+    #[test]
+    fn delete_removes_now_or_on_the_last_release() {
+        let base = base();
+        let root = base.path().join("root");
+        prepare_agent_tmp_root(&root).unwrap();
+        let idle = AgentTempDir::for_agent(&root, "idle").unwrap();
+        let idle_path = idle.path().to_path_buf();
+        drop(idle);
+        remove_agent_tmp_dir(&root, "idle");
+        assert!(!idle_path.exists(), "an unheld folder goes at once");
+
+        let a = AgentTempDir::for_agent(&root, "busy").unwrap();
+        let b = AgentTempDir::for_agent(&root, "busy").unwrap();
+        let path = a.path().to_path_buf();
+        remove_agent_tmp_dir(&root, "busy");
+        assert!(path.is_dir(), "a held folder stays while held");
+        drop(a);
+        assert!(path.is_dir(), "one holder remains");
+        drop(b);
+        assert!(!path.exists(), "the last release removes it");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn sweep_keeps_folders_used_within_max_idle() {
+        let base = base();
+        let root = base.path().join("root");
+        prepare_agent_tmp_root(&root).unwrap();
+        let dir = AgentTempDir::for_agent(&root, "recent").unwrap();
+        let path = dir.path().to_path_buf();
+        drop(dir);
+        sweep_agent_tmp_root(&root, AGENT_TMP_MAX_IDLE).unwrap();
+        assert!(path.is_dir(), "a recently used folder is kept");
+        sweep_agent_tmp_root(&root, Duration::ZERO).unwrap();
+        assert!(!path.exists(), "an idle folder is reclaimed");
     }
 
     #[test]
