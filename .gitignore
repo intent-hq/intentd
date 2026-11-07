@@ -8,3 +8,6 @@ coverage-summary.txt
 # Python bytecode caches: never tracked (scripts/check-no-python-cache.sh fails CI on one).
 __pycache__/
 *.pyc
+
+# E2B template build dependencies (packaging/e2b, npm ci in CI).
+/packaging/e2b/node_modules/

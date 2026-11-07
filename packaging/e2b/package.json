@@ -1,0 +1,12 @@
+{
+  "name": "intent-node-e2b-template",
+  "private": true,
+  "type": "module",
+  "description": "Builds, publishes and smoke-tests the intent-node E2B template (.github/workflows/e2b-template.yml).",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "e2b": "2.63.0"
+  }
+}
