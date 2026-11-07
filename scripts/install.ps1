@@ -32,11 +32,21 @@
 # that is an upgrade, and the task is re-registered and restarted onto the new
 # binary. Any other owner refuses the setup and nothing is registered.
 #
+# Before the task question it asks how the computer will be used: run Intent
+# here (the default) or as a node that only runs agents for another Intent. A
+# node install sets daemon.mode=node and turns the Tailcat tunnel on, restarts
+# the daemon, then runs `intentd pair --tunnel` (the interface picker on a
+# console, a tunnel-only link without one) and ends with the QR code and the
+# intent:// link. A non-interactive node install sets the task up unless told
+# not to. $env:INTENTD_DAEMON_MODE = 'full'|'node' (or -DaemonMode <value>, on
+# direct runs) forces an answer.
+#
 # $env:INTENTD_SERVICE_NAME overrides the task name (testing).
 param(
     [switch]$Service,
     [switch]$NoService,
-    [string]$AutoResume = ''
+    [string]$AutoResume = '',
+    [string]$DaemonMode = ''
 )
 $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1: silence the progress bar (it slows Invoke-WebRequest
@@ -70,6 +80,36 @@ if ($env:INTENTD_AUTO_RESUME) {
         throw "install.ps1: invalid INTENTD_AUTO_RESUME value '$env:INTENTD_AUTO_RESUME' (expected auto, on, or off)"
     }
 }
+
+# >>> BEGIN daemon-mode-choice (extracted verbatim and executed by
+# crates/intentd-sitter/tests/install_ps1_daemon_mode.rs; its only inputs are
+# $DaemonMode and the environment)
+#
+# Daemon mode: -DaemonMode beats INTENTD_DAEMON_MODE beats the prompt (asked
+# after the download). Validated up front like -AutoResume. The prompt's
+# numbers and the daemon's own setting name (regular) fold onto full/node.
+function ConvertTo-DaemonMode {
+    param([string]$Value)
+    $v = "$Value".Trim().ToLowerInvariant()
+    if (@('1', 'full', 'regular') -contains $v) { return 'full' }
+    if (@('2', 'node') -contains $v) { return 'node' }
+    return $v
+}
+$daemonMode = ''
+if ($DaemonMode) {
+    $daemonMode = ConvertTo-DaemonMode $DaemonMode
+    if (@('full', 'node') -notcontains $daemonMode) {
+        throw "install.ps1: invalid -DaemonMode value '$DaemonMode' (expected full or node)"
+    }
+} elseif ($env:INTENTD_DAEMON_MODE) {
+    $daemonMode = ConvertTo-DaemonMode $env:INTENTD_DAEMON_MODE
+    if (@('full', 'node') -notcontains $daemonMode) {
+        throw "install.ps1: invalid INTENTD_DAEMON_MODE value '$env:INTENTD_DAEMON_MODE' (expected full or node)"
+    }
+}
+$daemonModeExplicit = [bool]$daemonMode
+# <<< END daemon-mode-choice
+$interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
 
 # >>> BEGIN resolve-data-dir (extracted verbatim and executed by
 # crates/intentd-sitter/tests/install_ps1_owner.rs — keep these markers).
@@ -160,8 +200,33 @@ if (@($env:Path -split ';') -notcontains $installDir) {
 
 Write-Host "install.ps1: installed intentd to $installDir\intentd.exe"
 
+# How this computer is used: asked first, on an interactive console only;
+# Enter takes the recommended full install, as does a non-interactive run
+# with no parameter or env var.
+if (-not $daemonMode) {
+    if ($interactive) {
+        Write-Host 'How will you use this computer?'
+        Write-Host "1) Run Intent here (recommended if you're just getting started): workspaces, agents and the app connect to it."
+        Write-Host '2) Node only: lets another Intent run agents on this computer; nothing else runs here.'
+        for ($try = 0; $try -lt 3 -and -not $daemonMode; $try++) {
+            $answer = ConvertTo-DaemonMode (Read-Host 'Choose 1 or 2 [1]')
+            if ($answer -eq '' -or $answer -eq 'full') { $daemonMode = 'full' }
+            elseif ($answer -eq 'node') { $daemonMode = 'node' }
+            else { Write-Warning "install.ps1: unrecognized answer '$answer' - answer 1 or 2" }
+        }
+        if (-not $daemonMode) {
+            Write-Warning 'install.ps1: still no recognized answer - keeping the default (1, run Intent here)'
+            $daemonMode = 'full'
+        }
+        $daemonModeExplicit = $true
+    } else {
+        $daemonMode = 'full'
+    }
+}
+
 # Service setup decision: switches beat the env var beat the prompt. Never
-# hang in non-interactive runs — skip with a hint instead.
+# hang in non-interactive runs — skip with a hint instead, except for a node,
+# which is only useful while its daemon runs.
 $serviceMode = ''
 if ($Service) { $serviceMode = 'yes' }
 elseif ($NoService) { $serviceMode = 'no' }
@@ -169,9 +234,11 @@ elseif ($env:INTENTD_INSTALL_SERVICE) {
     $serviceMode = if (@('0', 'false', 'no') -contains $env:INTENTD_INSTALL_SERVICE.ToLowerInvariant()) { 'no' } else { 'yes' }
 }
 if (-not $serviceMode) {
-    if ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+    if ($interactive) {
         $reply = Read-Host 'Set up intentd to start at logon and start it now? [Y/n]'
         $serviceMode = if ($reply -match '^[nN]') { 'no' } else { 'yes' }
+    } elseif ($daemonMode -eq 'node') {
+        $serviceMode = 'yes'
     } else {
         $serviceMode = 'skip'
     }
@@ -587,14 +654,77 @@ if ($serviceMode -eq 'yes') {
             Write-Warning "install.ps1: could not set agents.resumeInterruptedOnStart=$autoResume - set it later with: intentd settings agents.resumeInterruptedOnStart $autoResume"
         }
     }
+    # >>> BEGIN daemon-mode-apply (extracted verbatim and executed by
+    # crates/intentd-sitter/tests/install_ps1_daemon_mode.rs against a fake
+    # $dest; keep this block free
+    # of anything beyond $dest, $verdict, $daemonMode, $daemonModeExplicit and
+    # $interactive)
+    # Node: daemon.mode node and the tunnel on, a restart (the mode applies at
+    # the next start; on Windows `intentd restart` waits for the replacement),
+    # then the normal pairing flow, which prints the QR code and the link. An
+    # explicit full answer switches a node back; the unasked default writes
+    # nothing. Failures are warnings naming the commands to finish by hand.
+    $nodeSetupHint = "`nTo finish setting up this computer as a node, once the daemon is running:`n  intentd settings daemon.mode node`n  intentd settings server.tunnel.enabled true`n  intentd restart`n  intentd pair --tunnel"
+    if ($daemonMode -eq 'node' -and $verdict -ne 'up') {
+        Write-Warning "install.ps1: node setup did not run because the daemon is not up yet.$nodeSetupHint"
+    } elseif ($daemonMode -eq 'node') {
+        & $dest settings daemon.mode node *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "install.ps1: could not set daemon.mode=node$nodeSetupHint"
+        } else {
+            & $dest settings server.tunnel.enabled true *> $null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning 'install.ps1: could not turn the Tailcat tunnel on - pairing will offer it'
+            }
+            Write-Host 'install.ps1: restarting the daemon in node mode...'
+            & $dest restart *> $null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "install.ps1: the daemon did not come back in node mode - check it with: intentd status$nodeSetupHint"
+            } else {
+                Write-Host 'install.ps1: node mode on - pair this computer with the Intent that will run agents here'
+                if ($interactive) { & $dest pair --tunnel } else { & $dest pair --tunnel --yes }
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning 'install.ps1: pairing did not finish - run it again with: intentd pair --tunnel'
+                }
+            }
+        }
+    } elseif ($daemonModeExplicit -and $verdict -eq 'up') {
+        $currentMode = & $dest settings daemon.mode 2>$null | Select-Object -First 1
+        if ($LASTEXITCODE -eq 0 -and "$currentMode" -match 'node') {
+            & $dest settings daemon.mode regular *> $null
+            $switched = $LASTEXITCODE -eq 0
+            if ($switched) {
+                & $dest restart *> $null
+                $switched = $LASTEXITCODE -eq 0
+            }
+            if ($switched) {
+                Write-Host 'install.ps1: this computer runs Intent again (daemon.mode = regular)'
+            } else {
+                Write-Warning 'install.ps1: could not switch this computer back from node mode - run: intentd settings daemon.mode regular; intentd restart'
+            }
+        }
+    }
+    # <<< END daemon-mode-apply
     Write-Host "install.ps1: manage the service with: Get-ScheduledTask/Start-ScheduledTask/Stop-ScheduledTask/Unregister-ScheduledTask -TaskName $taskName"
-    Write-Host 'install.ps1: connecting from another machine (desktop/mobile app)? Run: intentd pair'
+    if ($daemonMode -ne 'node') {
+        Write-Host 'install.ps1: connecting from another machine (desktop/mobile app)? Run: intentd pair'
+    }
 } else {
     if ($serviceMode -eq 'skip') {
         Write-Host 'install.ps1: skipping service setup (non-interactive session). To set it up, re-run with $env:INTENTD_INSTALL_SERVICE = ''1'''
     }
     Write-Host ''
-    Write-Host 'Next steps:'
-    Write-Host '  intentd serve   # start the daemon (downloads the real daemon on first run)'
-    Write-Host '  intentd pair    # once the daemon is running (another terminal): pairing info for remote clients (desktop/mobile app)'
+    if ($daemonMode -eq 'node') {
+        Write-Host 'Next steps for a node:'
+        Write-Host '  intentd serve --node    # start the daemon in node mode in the foreground'
+        Write-Host '  intentd pair --tunnel   # in another terminal: the QR code and intent:// link to pair it'
+        Write-Host ''
+        Write-Host 'To keep node mode across restarts, set it once the daemon runs:'
+        Write-Host '  intentd settings daemon.mode node'
+        Write-Host 'Or re-run this installer with $env:INTENTD_INSTALL_SERVICE = ''1'' and $env:INTENTD_DAEMON_MODE = ''node''.'
+    } else {
+        Write-Host 'Next steps:'
+        Write-Host '  intentd serve   # start the daemon (downloads the real daemon on first run)'
+        Write-Host '  intentd pair    # once the daemon is running (another terminal): pairing info for remote clients (desktop/mobile app)'
+    }
 }

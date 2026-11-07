@@ -282,7 +282,7 @@ pub(crate) async fn handle_with_host_environment(
             let pretty_hostname = host_environment
                 .as_ref()
                 .map_or_else(pretty_hostname, |host| host.pretty_hostname.clone());
-            let result = host_status_json(
+            let mut result = host_status_json(
                 std::env::consts::OS,
                 std::env::consts::ARCH,
                 &hostname,
@@ -297,6 +297,7 @@ pub(crate) async fn handle_with_host_environment(
                     .and_then(|host| host.hardware_model.as_deref()),
                 is_local,
             );
+            result["daemonMode"] = json!(crate::catalog::daemon_mode(api.node_mode()));
             success_frame(&id_echo, &result)
         }
         HostMethod::CheckGit => {

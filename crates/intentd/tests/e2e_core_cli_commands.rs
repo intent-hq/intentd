@@ -574,6 +574,115 @@ async fn pair_with_yes_enables_wss_but_fails_without_dialable_route() {
     );
 }
 
+/// A daemon with the WSS listener off (a fresh install), a fake tailcat on
+/// hand, and — for `node` — started in node mode, as the installer leaves a
+/// node before it pairs.
+fn spawn_fresh_daemon_with_tailcat(data_dir: &PathBuf, node: bool) -> GuardedChild {
+    let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
+    let workspaces_dir = data_dir.join("workspaces");
+    std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
+    let tailcat_bin = write_fake_tailcat(data_dir);
+    let mut cmd = common::hermetic_serve_command(data_dir);
+    if node {
+        cmd.arg("--node");
+    }
+    cmd.env("INTENTD_DATA_DIR", data_dir)
+        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+        .env("INTENTD_TAILCAT_BIN", &tailcat_bin)
+        .env_remove("INTENTD_AUTH_TOKEN")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log));
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
+}
+
+/// The unattended node install: `intentd pair --tunnel --yes` on a fresh node
+/// enables the listener, turns the tunnel on and prints a tunnel-only link
+/// that says it is a node (`mode=node`, before `tc=`).
+#[tokio::test]
+async fn pair_tunnel_yes_pairs_a_fresh_node_through_the_tunnel() {
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+    let child = spawn_fresh_daemon_with_tailcat(&data_dir, true);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let output = run_pair_until_success(&data_dir, &["--tunnel", "--yes"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "pair --tunnel --yes failed: {stderr}"
+    );
+    let url = labeled_value(&stdout, "URL:").expect("URL line");
+    assert!(
+        url.starts_with("intent://pair?v=1&host=&port="),
+        "tunnel-only link: {url}"
+    );
+    assert!(
+        url.contains("&mode=node&tc=tc-"),
+        "node hint before tc: {url}"
+    );
+    assert!(stdout.contains("Tunnel:      tc-"), "{stdout}");
+    assert_eq!(
+        call_json(&data_dir, "pairing.getInfo")["daemonMode"],
+        "node"
+    );
+}
+
+/// A fresh full install (listener off, loopback bind) pairs over the tunnel
+/// by default too, with no node hint. A saved tunnel `false` with a LAN bind
+/// is kept.
+#[tokio::test]
+async fn pair_yes_turns_the_tunnel_on_for_a_loopback_only_listener() {
+    let data_dir_guard = common::test_tempdir_in("/tmp", "itdc-");
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+    let child = spawn_fresh_daemon_with_tailcat(&data_dir, false);
+    let mut daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    await_socket(&mut daemon, &socket).await;
+
+    let output = run_pair_until_success(&data_dir, &["--yes"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "pair --yes failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let url = labeled_value(&stdout, "URL:").expect("URL line");
+    assert!(url.contains("&tc=tc-") && !url.contains("mode="), "{url}");
+    assert_eq!(
+        call_json(&data_dir, "pairing.getInfo")["daemonMode"],
+        "regular"
+    );
+
+    // Saved off with a LAN bind, then a fresh listener: `--yes` keeps it off.
+    for (path, value) in [
+        ("server.tunnel.enabled", "false"),
+        ("server.wsApi.enabled", "false"),
+        ("server.bindAddress", "0.0.0.0"),
+    ] {
+        let settings = Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .args(["settings", path, value])
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .output()
+            .expect("run intentd settings");
+        assert!(settings.status.success(), "settings {path} {value}");
+    }
+    let output = run_pair(&data_dir, &["--yes"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stderr.contains("Tailcat tunnel enabled"), "{stderr}");
+    assert!(!stdout.contains("&tc="), "{stdout}");
+}
+
 /// One-shot `intentd call <method>` against the daemon in `data_dir`,
 /// returning the printed result object.
 #[track_caller]

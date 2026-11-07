@@ -977,11 +977,21 @@ fn runtime_capabilities_are_added_only_when_on() {
             .clone()
     };
     assert_eq!(
-        caps(with_runtime_capabilities(Some(ok.clone()), false, false)),
+        caps(with_runtime_capabilities(
+            Some(ok.clone()),
+            false,
+            false,
+            false
+        )),
         json!({ "liveState": true })
     );
     assert_eq!(
-        caps(with_runtime_capabilities(Some(ok.clone()), false, true)),
+        caps(with_runtime_capabilities(
+            Some(ok.clone()),
+            false,
+            false,
+            true
+        )),
         json!({
             "liveState": true,
             "remoteLinkTraffic": 1,
@@ -992,7 +1002,12 @@ fn runtime_capabilities_are_added_only_when_on() {
         })
     );
     assert_eq!(
-        caps(with_runtime_capabilities(Some(ok.clone()), true, true)),
+        caps(with_runtime_capabilities(
+            Some(ok.clone()),
+            false,
+            true,
+            true
+        )),
         json!({
             "liveState": true,
             "remoteLinkTraffic": 1,
@@ -1004,10 +1019,26 @@ fn runtime_capabilities_are_added_only_when_on() {
         })
     );
     let error = json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32602 } }).to_string();
-    let patched = with_runtime_capabilities(Some(error.clone()), true, true).unwrap();
+    let patched = with_runtime_capabilities(Some(error.clone()), true, true, true).unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(&patched).unwrap(),
         serde_json::from_str::<Value>(&error).unwrap()
     );
-    assert_eq!(with_runtime_capabilities(None, true, true), None);
+    assert_eq!(with_runtime_capabilities(None, true, true, true), None);
+}
+
+/// `server.daemonMode` reports the running mode on every successful hello.
+#[test]
+fn hello_reports_the_daemon_mode() {
+    let ok = json!({ "jsonrpc": "2.0", "id": 1, "result": { "server": { "capabilities": {} } } })
+        .to_string();
+    let mode = |node: bool| -> Value {
+        serde_json::from_str::<Value>(
+            &with_runtime_capabilities(Some(ok.clone()), node, false, false).unwrap(),
+        )
+        .unwrap()["result"]["server"]["daemonMode"]
+            .clone()
+    };
+    assert_eq!(mode(false), json!("regular"));
+    assert_eq!(mode(true), json!("node"));
 }

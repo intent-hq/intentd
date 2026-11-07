@@ -257,7 +257,10 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         svg: Option<PathBuf>,
         /// Enable external connections without prompting when they are
-        /// disabled (persists `server.wsApi.enabled = true`).
+        /// disabled (persists `server.wsApi.enabled = true`), and turn the
+        /// Tailcat tunnel on when the listener is bound to loopback only (a
+        /// fresh install), the one route other devices can then dial; the
+        /// picker pre-checks it in the same case.
         #[arg(long, short = 'y')]
         yes: bool,
         /// Re-run ONLY the endpoint selection: show the bind-address
@@ -266,8 +269,15 @@ enum Command {
         /// effective posture. Never re-pairs (no new token, no QR); requires
         /// a running daemon. Reads the selection from stdin (one line), so
         /// it also works piped.
-        #[arg(long, conflicts_with_all = ["png", "svg", "yes", "rotate", "host"])]
+        #[arg(long, conflicts_with_all = ["png", "svg", "yes", "rotate", "host", "tunnel"])]
         select_endpoints: bool,
+        /// Pair through the Tailcat tunnel: turn it on
+        /// (`server.tunnel.enabled = true`) — pre-checked in the
+        /// listen-target picker, enabled outright with `--yes` or when the
+        /// listener is already up — then wait for its `tc` address so the
+        /// link carries it. Node setup uses this.
+        #[arg(long)]
+        tunnel: bool,
         /// Mint and persist a NEW bearer token (replacing the old one) before
         /// printing, via `server.rotateToken` — only after the listener is
         /// confirmed up, so a declined enable prompt never invalidates
@@ -486,6 +496,7 @@ async fn async_main(cli: Cli) -> ExitCode {
                 svg,
                 yes,
                 select_endpoints,
+                tunnel,
                 rotate,
                 host,
             } => {
@@ -493,8 +504,17 @@ async fn async_main(cli: Cli) -> ExitCode {
                     to_exit(cmd_pair_select_endpoints().await)
                 } else {
                     to_exit(
-                        cmd_pair(png.as_deref(), svg.as_deref(), yes, rotate, host.as_deref())
-                            .await,
+                        cmd_pair(
+                            png.as_deref(),
+                            svg.as_deref(),
+                            PairOptions {
+                                yes,
+                                tunnel,
+                                rotate,
+                            },
+                            host.as_deref(),
+                        )
+                        .await,
                     )
                 }
             }
@@ -1218,30 +1238,127 @@ struct PairingPayload {
     host_port: Option<(String, u16)>,
 }
 
+/// The `intentd pair` switches shared by both payload sources.
+#[derive(Clone, Copy)]
+struct PairOptions {
+    yes: bool,
+    tunnel: bool,
+    rotate: bool,
+}
+
+/// How long `intentd pair` waits for an enabled tunnel to report its `tc`
+/// address (a daemon that just started brings the tunnel up in the
+/// background).
+const PAIR_TUNNEL_WAIT: Duration = Duration::from_secs(60);
+
+/// Whether pairing that turns the listener on should also turn the tunnel
+/// on: `--tunnel` always does; so does a listener bound to loopback only (a
+/// fresh install's default), which offers no route another device could
+/// dial, so without the tunnel that pairing could only fail. A daemon that
+/// listens on a LAN address keeps its saved tunnel choice.
+fn pair_wants_tunnel(tunnel_flag: bool, tunnel_enabled: bool, loopback_only: bool) -> bool {
+    !tunnel_enabled && (tunnel_flag || loopback_only)
+}
+
+/// Turn the tunnel on with the listener already up, in its own
+/// `settings.update`, so a tunnel that cannot start is a warning: pairing
+/// still goes ahead over the LAN hosts, if any.
+async fn enable_tunnel_for_pairing(socket: &Path) -> anyhow::Result<()> {
+    let changes = json!([{ "path": "server.tunnel.enabled", "value": true }]);
+    let response = rpc_call(socket, "settings.update", json!({ "changes": changes })).await?;
+    match response.get("error") {
+        Some(error) => eprintln!(
+            "note: could not turn the Tailcat tunnel on: {} — pairing continues without it",
+            rpc_error_text(error)
+        ),
+        None => eprintln!("Tailcat tunnel enabled (server.tunnel.enabled = true)."),
+    }
+    Ok(())
+}
+
 /// Enable external connections for pairing when the listener is down:
-/// `--yes` (or an unattended run) keeps the persisted server.bindAddress /
-/// server.tunnel.* (default: loopback, tunnel off); otherwise a consent
-/// prompt, then the listen-target picker.
-async fn enable_listener_for_pairing(socket: &Path, yes: bool) -> anyhow::Result<()> {
-    let changes = if yes {
-        Vec::new()
-    } else {
-        if !confirm_enable_wss()? {
-            anyhow::bail!(
-                "pairing requires external connections to be enabled — enable them \
-                 later with `intentd pair --yes` or via server.wsApi.enabled in \
-                 config.toml"
-            );
+/// `--yes` (or an unattended run) keeps the persisted server.bindAddress
+/// (default: loopback) and then turns the tunnel on per
+/// [`pair_wants_tunnel`]; otherwise a consent prompt, then the listen-target
+/// picker, with the tunnel pre-checked in the same cases.
+async fn enable_listener_for_pairing(socket: &Path, opts: PairOptions) -> anyhow::Result<()> {
+    let tunnel_enabled = current_bool_setting(socket, "server.tunnel.enabled").await?;
+    let current = current_bind_addresses(socket).await;
+    let loopback_only = current.iter().all(std::net::IpAddr::is_loopback);
+    let wants_tunnel = pair_wants_tunnel(opts.tunnel, tunnel_enabled, loopback_only);
+    if opts.yes {
+        enable_wss_listener(socket, &[]).await?;
+        if wants_tunnel {
+            enable_tunnel_for_pairing(socket).await?;
         }
-        // Multi-select pre-checked from the persisted state; an unchanged
-        // selection writes nothing so the stored shapes stay untouched.
-        let tunnel_enabled = current_bool_setting(socket, "server.tunnel.enabled").await?;
-        let tunnel_only = current_bool_setting(socket, "server.tunnel.only").await?;
-        let current = current_bind_addresses(socket).await;
-        let selection = prompt_listen_targets(&current, tunnel_enabled, tunnel_only)?;
-        listen_selection_changes(&selection, &current, tunnel_enabled, tunnel_only)
-    };
+        return Ok(());
+    }
+    if !confirm_enable_wss()? {
+        anyhow::bail!(
+            "pairing requires external connections to be enabled — enable them \
+             later with `intentd pair --yes` or via server.wsApi.enabled in \
+             config.toml"
+        );
+    }
+    // Multi-select pre-checked from the persisted state; an unchanged
+    // selection writes nothing so the stored shapes stay untouched.
+    let tunnel_only = current_bool_setting(socket, "server.tunnel.only").await?;
+    let selection = prompt_listen_targets(&current, tunnel_enabled || wants_tunnel, tunnel_only)?;
+    let changes = listen_selection_changes(&selection, &current, tunnel_enabled, tunnel_only);
     enable_wss_listener(socket, &changes).await
+}
+
+/// `--tunnel` with the listener already up: no picker runs, so turn the
+/// tunnel on directly. With the listener down the enable flow handles it.
+async fn enable_requested_tunnel(socket: &Path) -> anyhow::Result<()> {
+    if current_bool_setting(socket, "server.wsApi.enabled").await?
+        && !current_bool_setting(socket, "server.tunnel.enabled").await?
+    {
+        enable_tunnel_for_pairing(socket).await?;
+    }
+    Ok(())
+}
+
+/// Whether a pairing response already carries the tunnel route.
+fn has_tunnel_route(response: &Value) -> bool {
+    response
+        .pointer("/result/tcAddress")
+        .and_then(Value::as_str)
+        .is_some_and(|tc| !tc.is_empty())
+}
+
+/// `--tunnel`: while the tunnel is enabled but has not reported its `tc`
+/// address yet, query `method` again (bounded by [`PAIR_TUNNEL_WAIT`]). A
+/// fresh tunnel-only daemon answers "no dialable route" until then, so this
+/// is what lets an unattended node install print a link. Returns the last
+/// response; the caller reports any remaining error.
+async fn await_tunnel_route(
+    socket: &Path,
+    method: &str,
+    mut response: Value,
+    listener_down: fn(&Value) -> bool,
+) -> anyhow::Result<Value> {
+    if has_tunnel_route(&response)
+        || listener_down(&response)
+        || !current_bool_setting(socket, "server.tunnel.enabled").await?
+    {
+        return Ok(response);
+    }
+    eprintln!("Waiting for the Tailcat tunnel to come up...");
+    let deadline = tokio::time::Instant::now() + PAIR_TUNNEL_WAIT;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        response = rpc_call(socket, method, json!({})).await?;
+        if has_tunnel_route(&response) || listener_down(&response) {
+            return Ok(response);
+        }
+    }
+    eprintln!(
+        "note: the Tailcat tunnel is not up after {}s — the link has no tunnel route \
+         (check it with `intentd status`).",
+        PAIR_TUNNEL_WAIT.as_secs()
+    );
+    Ok(response)
 }
 
 /// The one fetch sequence both `intentd pair` sources share, so their
@@ -1253,14 +1370,19 @@ async fn enable_listener_for_pairing(socket: &Path, yes: bool) -> anyhow::Result
 async fn fetch_pairing_result(
     socket: &Path,
     method: &str,
-    yes: bool,
-    rotate: bool,
+    opts: PairOptions,
     listener_down: fn(&Value) -> bool,
 ) -> anyhow::Result<Value> {
+    if opts.tunnel {
+        enable_requested_tunnel(socket).await?;
+    }
     let mut response = rpc_call(socket, method, json!({})).await?;
     if listener_down(&response) {
-        enable_listener_for_pairing(socket, yes).await?;
+        enable_listener_for_pairing(socket, opts).await?;
         response = rpc_call(socket, method, json!({})).await?;
+    }
+    if opts.tunnel {
+        response = await_tunnel_route(socket, method, response, listener_down).await?;
     }
     if let Some(error) = response.get("error") {
         anyhow::bail!("{method} failed: {}", rpc_error_text(error));
@@ -1268,7 +1390,7 @@ async fn fetch_pairing_result(
     if listener_down(&response) {
         anyhow::bail!("{method} failed: the external-connection listener is not running");
     }
-    if rotate {
+    if opts.rotate {
         rotate_pairing_token(socket).await?;
         response = rpc_call(socket, method, json!({})).await?;
         if let Some(error) = response.get("error") {
@@ -1291,11 +1413,10 @@ fn pairing_str_field(result: &Value, method: &str, name: &str) -> anyhow::Result
 /// hosts are the daemon-advertised dialable set (loopback never included).
 async fn pairing_payload_from_get_info(
     socket: &Path,
-    yes: bool,
-    rotate: bool,
+    opts: PairOptions,
 ) -> anyhow::Result<PairingPayload> {
     const METHOD: &str = "pairing.getInfo";
-    let result = fetch_pairing_result(socket, METHOD, yes, rotate, |response| {
+    let result = fetch_pairing_result(socket, METHOD, opts, |response| {
         response.get("error").is_some_and(is_listener_down_error)
     })
     .await?;
@@ -1306,6 +1427,15 @@ async fn pairing_payload_from_get_info(
         tc_address: result["tcAddress"].as_str().map(str::to_string),
         host_port: None,
     })
+}
+
+/// Whether the running daemon reports `daemonMode: "node"` in `host.status`
+/// (for the `--host` link's `mode=node` hint). An older daemon or a failed
+/// read counts as a full daemon: the hint is optional.
+async fn daemon_reports_node_mode(socket: &Path) -> bool {
+    rpc_call(socket, "host.status", json!({}))
+        .await
+        .is_ok_and(|response| response.pointer("/result/daemonMode") == Some(&json!("node")))
 }
 
 /// `intentd pair --host <HOST>` (intent-hq/intent#7243): pair through an
@@ -1319,11 +1449,10 @@ async fn pairing_payload_from_get_info(
 async fn pairing_payload_for_host(
     socket: &Path,
     host: &str,
-    yes: bool,
-    rotate: bool,
+    opts: PairOptions,
 ) -> anyhow::Result<PairingPayload> {
     const METHOD: &str = "server.pairingInfo";
-    let result = fetch_pairing_result(socket, METHOD, yes, rotate, |response| {
+    let result = fetch_pairing_result(socket, METHOD, opts, |response| {
         response.get("error").is_none() && response["result"]["port"].is_null()
     })
     .await?;
@@ -1339,6 +1468,7 @@ async fn pairing_payload_for_host(
         port,
         &fingerprint,
         &token,
+        daemon_reports_node_mode(socket).await,
         tc_address.as_deref(),
     );
     Ok(PairingPayload {
@@ -1374,14 +1504,13 @@ async fn pairing_payload_for_host(
 async fn cmd_pair(
     png: Option<&Path>,
     svg: Option<&Path>,
-    yes: bool,
-    rotate: bool,
+    opts: PairOptions,
     host: Option<&str>,
 ) -> anyhow::Result<()> {
     let config = resolve_config()?;
     let payload = match host {
-        None => pairing_payload_from_get_info(&config.socket_path, yes, rotate).await?,
-        Some(host) => pairing_payload_for_host(&config.socket_path, host, yes, rotate).await?,
+        None => pairing_payload_from_get_info(&config.socket_path, opts).await?,
+        Some(host) => pairing_payload_for_host(&config.socket_path, host, opts).await?,
     };
     let PairingPayload {
         uri,
@@ -4791,6 +4920,10 @@ impl intent_transport::ServerPairingInfo for DaemonPairingInfo {
 
     fn token_store(&self) -> &AsyncTokenStore {
         &self.token_store
+    }
+
+    fn node_mode(&self) -> bool {
+        self.ws_runtime.api.node_mode()
     }
 }
 
