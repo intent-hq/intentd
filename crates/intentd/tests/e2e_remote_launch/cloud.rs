@@ -339,7 +339,7 @@ impl FakeE2b {
             .collect();
         listed.extend(state.listed_only.iter().map(|only| {
             let mut row = json!({
-                "templateID": "intent-hq/intent-node-4x8:0", "state": "running",
+                "templateID": "intent/intent-node-4x8:0", "state": "running",
                 "endAt": "2026-01-01T01:00:00Z", "cpuCount": 4, "memoryMB": 8192,
                 "envdVersion": "0.2.0",
             });

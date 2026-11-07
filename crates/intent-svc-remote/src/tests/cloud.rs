@@ -49,7 +49,7 @@ async fn cloud_row(backend: &Backend, id: &str, starter: &PrincipalId) {
                 provider: "e2b".into(),
                 sandbox_id: format!("sbx-{id}"),
                 state: CloudSandboxState::Running,
-                template: "intent-hq/intent-node-4x8:0".into(),
+                template: "intent/intent-node-4x8:0".into(),
                 size: CloudMachineSize::S4x8,
                 started_by: CloudStartedBy {
                     principal_id: starter.to_string(),

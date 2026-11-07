@@ -858,7 +858,7 @@ pub async fn store(state: &LargeState) -> Seeded {
         .save_cloud_machine_provider(
             "e2b",
             &json!({
-                "templateProject": "intent-hq",
+                "templateProject": "intent",
                 "size": "4x8",
                 "idlePauseMinutes": 10,
                 "pausedDeleteDays": 7,
@@ -892,7 +892,7 @@ pub async fn store(state: &LargeState) -> Seeded {
                     provider: "e2b".into(),
                     sandbox_id: format!("sbx{i:024x}"),
                     state: intent_core::machines::CloudSandboxState::Running,
-                    template: "intent-hq/intent-node-16x32:0.11.139".into(),
+                    template: "intent/intent-node-16x32:0.11.139".into(),
                     size: intent_core::machines::CloudMachineSize::S16x32,
                     started_by: intent_core::machines::CloudStartedBy {
                         principal_id: format!("principal-{i:032x}"),
