@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.150] - 2026-11-07
+
+### 🚀 Features
+
+- *(remote)* Named E2B entries, each with its own key ([#3134](https://github.com/intent-hq/intentd/pull/3134))
+
+
 ## [0.11.149] - 2026-11-07
 
 ### 🚀 Features
