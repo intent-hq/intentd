@@ -397,7 +397,7 @@ pub(crate) async fn pause(
         Ok(()) => Ok(()),
         // E2B may have paused it already (its timeout ran out).
         Err(E2bError::Conflict(_))
-            if lookup(svc, client, &cloud).await == Some(SandboxState::Paused) =>
+            if lookup(svc, client, &cloud).await == Ok(Some(SandboxState::Paused)) =>
         {
             Ok(())
         }
@@ -432,10 +432,14 @@ pub(crate) async fn pause(
     }
 }
 
-/// The state E2B lists `cloud`'s sandbox in, `None` when it lists it in no
-/// state (or cannot answer).
-async fn lookup(svc: &Services, client: &E2bClient, cloud: &CloudMachine) -> Option<SandboxState> {
-    let backend = svc.store().daemon_id().await.ok()?;
+/// The state E2B lists `cloud`'s sandbox in: `Ok(None)` when E2B lists it
+/// in no state, `Err(())` when that cannot be known (the list failed).
+async fn lookup(
+    svc: &Services,
+    client: &E2bClient,
+    cloud: &CloudMachine,
+) -> std::result::Result<Option<SandboxState>, ()> {
+    let backend = svc.store().daemon_id().await.map_err(drop)?;
     let mut metadata = BTreeMap::new();
     metadata.insert("intentBackendId".to_owned(), backend);
     metadata.insert("agentId".to_owned(), cloud.agent_id.clone());
@@ -445,10 +449,15 @@ async fn lookup(svc: &Services, client: &E2bClient, cloud: &CloudMachine) -> Opt
             states: vec![SandboxState::Running, SandboxState::Paused],
         })
         .await
-        .ok()?
-        .into_iter()
-        .find(|listed| listed.sandbox_id == cloud.sandbox_id)
-        .map(|listed| listed.state)
+        .map(|listed| {
+            listed
+                .into_iter()
+                .find(|listed| listed.sandbox_id == cloud.sandbox_id)
+                .map(|listed| listed.state)
+        })
+        .map_err(|error| {
+            tracing::warn!(sandbox = %cloud.sandbox_id, %error, "cloud machine: could not list the sandbox's state");
+        })
 }
 
 /// Resume a paused sandbox before its final stops. Returns whether it runs;
@@ -592,12 +601,14 @@ async fn renew(
         Err(E2bError::NotFound(_)) => match lookup(svc, client, cloud).await {
             // E2B paused it itself (its timeout ran out while this backend
             // was away): a demand resumes it.
-            Some(SandboxState::Paused) => {
+            Ok(Some(SandboxState::Paused)) => {
                 feature.cloud.park(&row.id);
                 set_state(svc, feature, &row.id, CloudSandboxState::Paused).await;
             }
-            Some(_) => {}
-            None => sandbox_lost(svc, feature, None, row),
+            Ok(None) => sandbox_lost(svc, feature, None, row),
+            // Still listed, or unknown (the list failed): the next renewal
+            // asks again.
+            Ok(Some(_)) | Err(()) => {}
         },
         Err(error) => {
             tracing::warn!(machine = %row.id, %error, "cloud machine: could not renew the sandbox's timeout");
@@ -695,16 +706,27 @@ async fn reap(
         {
             continue;
         }
-        let age = parse_rfc3339(&sandbox.started_at).map(|at| {
-            (time::OffsetDateTime::now_utc() - at)
-                .try_into()
-                .unwrap_or(Duration::ZERO)
-        });
-        if age.is_some_and(|age| age < clock.minutes(REAP_GRACE_MINUTES)) {
+        // An unreadable start time counts from when the reaper first saw
+        // the sandbox, so it still gets the whole grace.
+        let age = parse_rfc3339(&sandbox.started_at).map_or_else(
+            || {
+                feature
+                    .cloud
+                    .first_seen_orphan(&sandbox.sandbox_id)
+                    .elapsed()
+            },
+            |at| {
+                (time::OffsetDateTime::now_utc() - at)
+                    .try_into()
+                    .unwrap_or(Duration::ZERO)
+            },
+        );
+        if age < clock.minutes(REAP_GRACE_MINUTES) {
             continue;
         }
         match client.delete(&sandbox.sandbox_id).await {
             Ok(_) => {
+                feature.cloud.forget_orphan(&sandbox.sandbox_id);
                 tracing::info!(sandbox = %sandbox.sandbox_id, "cloud machines: deleted a sandbox no machine knows");
             }
             Err(error) => {

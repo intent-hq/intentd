@@ -81,6 +81,8 @@ pub(crate) struct CloudState {
     /// What the supervisor remembers about each running sandbox.
     activity: Mutex<HashMap<String, lifecycle::Activity>>,
     supervisor: AtomicBool,
+    /// When the reaper first saw each orphan whose start time it cannot read.
+    orphans: Mutex<HashMap<String, tokio::time::Instant>>,
 }
 
 impl CloudState {
@@ -167,6 +169,18 @@ impl CloudState {
         crate::lock(&self.lost).remove(machine_id);
         crate::lock(&self.transitions).remove(machine_id);
         self.forget_activity(machine_id);
+    }
+
+    /// When the reaper first saw orphan sandbox `sandbox_id` (now, the
+    /// first time).
+    fn first_seen_orphan(&self, sandbox_id: &str) -> tokio::time::Instant {
+        *crate::lock(&self.orphans)
+            .entry(sandbox_id.to_owned())
+            .or_insert_with(tokio::time::Instant::now)
+    }
+
+    fn forget_orphan(&self, sandbox_id: &str) {
+        crate::lock(&self.orphans).remove(sandbox_id);
     }
 
     fn supervisor_started(&self) -> bool {

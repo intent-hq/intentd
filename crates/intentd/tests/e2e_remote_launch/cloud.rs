@@ -56,8 +56,11 @@ struct FakeState {
     connect_refusal: Option<(u16, Value)>,
     /// Each sandbox's create metadata.
     metadata: HashMap<String, Value>,
-    /// Sandboxes only listed (no daemon): `{ sandboxID, metadata, startedAt }`.
+    /// Sandboxes only listed (no daemon): `{ sandboxID, metadata, startedAt? }`.
     listed_only: Vec<Value>,
+    /// While set, every timeout renewal is 404 and every list fails (500).
+    timeouts_missing: bool,
+    list_failing: bool,
 }
 
 /// The fake E2B API and envd on one loopback port.
@@ -167,6 +170,9 @@ impl FakeE2b {
                 .push((method.to_owned(), path.to_owned()));
         }
         match (method, path) {
+            ("GET", "/v2/sandboxes") if self.state().list_failing => {
+                json_reply(500, json!({ "code": 500, "message": "list unavailable" }))
+            }
             ("GET", "/v2/sandboxes") => json_reply(200, self.list(target)),
             ("POST", connect)
                 if connect.starts_with("/v2/sandboxes/") && connect.ends_with("/connect") =>
@@ -231,7 +237,10 @@ impl FakeE2b {
                     .trim_end_matches("/timeout")
                     .to_owned();
                 let state = self.state();
-                if !state.sandboxes.contains_key(&id) || state.paused.contains(&id) {
+                if state.timeouts_missing
+                    || !state.sandboxes.contains_key(&id)
+                    || state.paused.contains(&id)
+                {
                     return json_reply(404, json!({ "code": 404, "message": "sandbox not found" }));
                 }
                 (204, "application/json", Vec::new())
@@ -335,7 +344,9 @@ impl FakeE2b {
                 "envdVersion": "0.2.0",
             });
             for key in ["sandboxID", "metadata", "startedAt"] {
-                row[key] = only[key].clone();
+                if !only[key].is_null() {
+                    row[key] = only[key].clone();
+                }
             }
             row
         }));
@@ -1421,6 +1432,31 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
         .unwrap();
     let second_id = second["id"].as_str().unwrap().to_owned();
 
+    // E2B says the sandbox is missing but its list fails: unknown, not lost.
+    {
+        let mut state = fake.state();
+        state.timeouts_missing = true;
+        state.list_failing = true;
+    }
+    let before = fake.calls_for("sbx2").len();
+    call_until(&fake, "sbx2", |calls| {
+        calls[before.min(calls.len())..]
+            .iter()
+            .filter(|c| is_call(c, "POST", "/sbx2/timeout"))
+            .count()
+            >= 2
+    })
+    .await;
+    {
+        let mut state = fake.state();
+        state.timeouts_missing = false;
+        state.list_failing = false;
+    }
+    assert!(
+        cloud_of(&mut rpc_ws, 420, "sbx2").await.is_some(),
+        "a sandbox whose state is unknown is kept"
+    );
+
     // A turn in flight: no pause, neither asked for nor before the cap.
     ok(
         &mut rpc_ws,
@@ -1522,6 +1558,8 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
                 "metadata": { "intentBackendId": backend_id, "agentId": "gone" } }),
         json!({ "sandboxID": "foreign1", "startedAt": "2026-01-01T00:00:00Z",
                 "metadata": { "intentBackendId": "another-backend", "agentId": "theirs" } }),
+        json!({ "sandboxID": "undated1",
+                "metadata": { "intentBackendId": backend_id, "agentId": "gone-too" } }),
     ]);
     timeout(common::test_timeout(Duration::from_secs(60)), async {
         while !fake.state().deletes.contains(&"orphan1".to_owned()) {
@@ -1531,6 +1569,18 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
     })
     .await
     .expect("the orphan is reaped");
+    assert!(
+        !fake.state().deletes.contains(&"undated1".to_owned()),
+        "an orphan without a start time gets the grace from first sight"
+    );
+    timeout(common::test_timeout(Duration::from_secs(60)), async {
+        while !fake.state().deletes.contains(&"undated1".to_owned()) {
+            // timing-guard: poll interval for the reaper after the 1.5 s grace
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the undated orphan is reaped after the grace");
     assert!(!fake.state().deletes.contains(&"foreign1".to_owned()));
 
     // No secret in the backend's log.
