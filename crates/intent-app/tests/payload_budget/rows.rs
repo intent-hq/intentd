@@ -1510,10 +1510,9 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
                 ),
             ],
         ),
-        fixed(
+        row(
             "cloudMachines.list",
-            "At most one provider (E2B) and one machine per live sandbox, which the owner's E2B plan caps; the seed has none.",
-            vec![v("default", json!({}), Fixed("/providers"))],
+            vec![v("default", json!({}), Items("/machines", seed::CLOUD_MACHINES))],
         ),
         fixed(
             "remoteMachines.backendInfo",
