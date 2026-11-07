@@ -2074,6 +2074,7 @@ async fn run(
             }
         }
         let asked = demanded || !waiters.is_empty();
+        let pauses = target.gate.as_ref().map(|gate| gate.pauses());
         demanded = false;
         let version = lock(&shared.status).intentd_version.clone();
         let ingested = ingest.ingested();
@@ -2164,6 +2165,17 @@ async fn run(
                 continue;
             }
         };
+        // A cloud machine paused while this dial was in flight: the link
+        // would be bound to a frozen sandbox. Drop it and dial again through
+        // the gate, which resumes the sandbox for an asked dial.
+        if let Some(gate) = &target.gate {
+            if Some(gate.pauses()) != pauses {
+                dialed.link.close();
+                demanded = asked;
+                retry = shared.wants_link();
+                continue;
+            }
+        }
         let link::DialedLink {
             link,
             events,
@@ -2233,6 +2245,21 @@ async fn run(
         #[cfg(test)]
         if let Some(hook) = &shared.tuning.before_publish.0 {
             hook(&shared);
+        }
+        // The same check as after the dial, for a pause that began while
+        // this bind was being set up: nothing is published to a frozen
+        // sandbox.
+        if let Some(gate) = &target.gate {
+            if Some(gate.pauses()) != pauses {
+                if let Some(git) = git {
+                    git.abort();
+                }
+                link.close();
+                shared.disconnected();
+                demanded = asked;
+                retry = shared.wants_link();
+                continue;
+            }
         }
         shared.link.send_replace(Some(link.clone()));
         shared.resend_queued(&link);

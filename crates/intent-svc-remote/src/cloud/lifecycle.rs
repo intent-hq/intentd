@@ -137,6 +137,12 @@ impl CloudGate {
         })
     }
 
+    /// How many pauses of this machine began, so a dial that binds after
+    /// one knows it reached a frozen sandbox.
+    pub(crate) fn pauses(&self) -> u64 {
+        super::feature(&self.svc).map_or(0, |feature| feature.cloud.pauses(&self.machine_id))
+    }
+
     /// Whether the sandbox is paused: no dial until something asks.
     pub(crate) fn parked(&self) -> bool {
         super::feature(&self.svc).is_ok_and(|feature| feature.cloud.is_parked(&self.machine_id))
@@ -387,8 +393,10 @@ pub(crate) async fn pause(
             return Err(crate::methods::in_use(&row.name, turns));
         }
     }
-    // No dial from now until a demand; the link drops with the pause anyway.
+    // No dial from now until a demand; the link drops with the pause anyway,
+    // and a dial in flight is dropped when it binds.
     feature.cloud.park(machine_id);
+    feature.cloud.count_pause(machine_id);
     if let Some(node) = &node {
         node.shared_ref().close_link();
     }
