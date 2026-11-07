@@ -428,7 +428,9 @@ fn sandbox_outdated(svc: &Services, feature: &RemoteFeature, shared: &Shared, ma
         };
         // Without the key the sandbox stays; the reaper deletes it once a
         // working key is saved.
-        let client = config::saved_client(&svc).await.ok();
+        let client = config::saved_client(&svc, super::methods::row_entry(&row))
+            .await
+            .ok();
         super::start::remove_machine(feature, &svc, &row, client.as_ref(), Removal::Unlinkable)
             .await;
     });

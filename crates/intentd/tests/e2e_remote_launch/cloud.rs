@@ -40,6 +40,10 @@ struct FakeSandbox {
     env: Vec<(String, String)>,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fault the tests switch on"
+)]
 #[derive(Default)]
 struct FakeState {
     sandboxes: HashMap<String, FakeSandbox>,

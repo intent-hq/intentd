@@ -648,31 +648,31 @@ pub(crate) async fn published_sizes(project: &str) -> Option<Published> {
     }
 }
 
-/// Mark the saved key rejected after E2B refused `refused` (401) on another
-/// call, so placement refuses before any sandbox, and announce the change.
-/// Under the settings lock, and only while `refused` is still the saved
-/// key: a start that used a key the owner has since replaced never marks
-/// the new one.
-pub(crate) async fn note_key_rejected(svc: &Services, refused: &SecretString) {
+/// Mark entry `id`'s saved key rejected after E2B refused `refused` (401)
+/// on another call, so placement refuses before any sandbox, and announce
+/// the change. Under the settings lock, and only while `refused` is still
+/// the entry's saved key: a start that used a key the owner has since
+/// replaced never marks the new one.
+pub(crate) async fn note_key_rejected(svc: &Services, id: &str, refused: &SecretString) {
     let Ok(feature) = super::feature(svc) else {
         return;
     };
     let _settings = feature.cloud.settings.lock().await;
-    if !matches!(saved_key(svc).await, Ok(Some(saved)) if &saved == refused) {
+    if !matches!(saved_key(svc, id).await, Ok(Some(saved)) if &saved == refused) {
         return;
     }
-    let Ok(Some(mut saved)) = load(svc).await else {
+    let Ok(Some(mut saved)) = load(svc, id).await else {
         return;
     };
     if saved.state == ProviderState::KeyRejected {
         return;
     }
     saved.state = ProviderState::KeyRejected;
-    if let Err(error) = save(svc, &saved).await {
+    if let Err(error) = save(svc, id, &saved).await {
         tracing::warn!(%error, "cloud machines: could not record the rejected key");
         return;
     }
-    svc.publish_cloud_machine_changed(json!({ "provider": saved.to_json() }), None)
+    svc.publish_cloud_machine_changed(json!({ "provider": saved.to_json(id) }), None)
         .await;
 }
 

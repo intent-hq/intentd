@@ -619,7 +619,7 @@ async fn start(
         Ok(created) => created,
         Err(error) => {
             if is_key_rejected(&error) {
-                config::note_key_rejected(svc, &key).await;
+                config::note_key_rejected(svc, cloud_machine_id, &key).await;
             }
             return Err(error);
         }
