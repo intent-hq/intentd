@@ -118,12 +118,7 @@ fn tail(stderr: &[u8]) -> String {
 ///
 /// `cloud-machine-unavailable` `bootstrap-failed` when a step fails, or the
 /// E2B error of a failed call.
-pub(crate) async fn run(
-    client: &E2bClient,
-    sandbox: &Sandbox,
-    backend: &Value,
-    mut on_daemon_started: impl FnMut(),
-) -> Result<Minted> {
+pub(crate) async fn run(client: &E2bClient, sandbox: &Sandbox, backend: &Value) -> Result<Minted> {
     let mut start = ProcessSpec::new("/bin/sh");
     start.args = vec!["-c".into(), START_SCRIPT.into()];
     start.timeout = Some(Duration::from_secs(60));
@@ -138,7 +133,6 @@ pub(crate) async fn run(
             tail(&started.stderr)
         )));
     }
-    on_daemon_started();
 
     let direct = std::env::var(DIRECT_HOST_ENV)
         .ok()

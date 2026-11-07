@@ -186,7 +186,7 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
     }
     config::save(svc, &next).await?;
     let provider = next.to_json();
-    svc.publish_cloud_machine_changed(json!({ "provider": provider.clone() }))
+    svc.publish_cloud_machine_changed(json!({ "provider": provider.clone() }), None)
         .await;
     Ok(json!({ "provider": provider }))
 }
@@ -255,7 +255,7 @@ async fn refresh_sizes(feature: &RemoteFeature, svc: &Services, saved: &mut Prov
     }
     *saved = next;
     if announce {
-        svc.publish_cloud_machine_changed(json!({ "provider": saved.to_json() }))
+        svc.publish_cloud_machine_changed(json!({ "provider": saved.to_json() }), None)
             .await;
     }
 }
@@ -267,8 +267,7 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     if config::load(svc).await?.is_none() {
         return Ok(json!({ "ok": true, "unconfirmedStops": [] }));
     }
-    // A sandbox still starting counts as live: it would add its machine
-    // after the key is gone, and nothing could delete it then.
+    // A sandbox still starting counts as live.
     let starting = feature.cloud.starts_in_flight();
     let rows = svc.store().list_cloud_machines().await?;
     if (!rows.is_empty() || !starting.is_empty()) && !stop_agents {
@@ -285,21 +284,51 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
             running.max(rows.len() + starting.len()),
         ));
     }
-    for mut start in starting {
-        let _ =
-            tokio::time::timeout(super::start::START_WAIT, start.wait_for(Option::is_some)).await;
-    }
-    let rows = svc.store().list_cloud_machines().await?;
-    let client = config::saved_client(svc).await.ok();
-    let mut unconfirmed = Vec::new();
-    for row in rows {
-        unconfirmed.extend(super::start::delete_machine(feature, svc, &row, client.as_ref()).await);
-    }
+    // Order matters, so no sandbox outlives the key that can delete it:
+    // 1. Forget the settings: admission refuses new starts, and a start
+    //    already past create finds them gone and deletes its own sandbox.
+    //    The key stays until the end, for these deletes.
+    // 2. Wait for every start registered by now (a later one reads the
+    //    settings after step 1 and makes no sandbox), within one deadline.
+    // 3. Stop and delete every sandbox at once, so the final-stop wait is
+    //    paid once, not per sandbox.
+    // 4. Forget the key.
+    let client = config::saved_client(svc)
+        .await
+        .ok()
+        .map(std::sync::Arc::new);
     svc.store()
         .delete_cloud_machine_provider(CLOUD_PROVIDER_E2B)
         .await?;
+    let deadline = tokio::time::Instant::now() + super::start::START_WAIT;
+    for mut start in feature.cloud.starts_in_flight() {
+        let _ = tokio::time::timeout_at(deadline, start.wait_for(Option::is_some)).await;
+    }
+    let mut deletes = tokio::task::JoinSet::new();
+    for row in svc.store().list_cloud_machines().await? {
+        let svc = svc.clone();
+        let client = client.clone();
+        deletes.spawn(async move {
+            let Ok(feature) = super::feature(&svc) else {
+                return Vec::new();
+            };
+            super::start::delete_machine(feature, &svc, &row, client.as_deref()).await
+        });
+    }
+    let mut unconfirmed = Vec::new();
+    while let Some(done) = deletes.join_next().await {
+        match done {
+            Ok(agents) => unconfirmed.extend(agents),
+            Err(error) => {
+                tracing::warn!(%error, "cloud machines: a sandbox delete did not finish");
+            }
+        }
+    }
     svc.delete_cloud_machine_key(CLOUD_PROVIDER_E2B).await?;
-    svc.publish_cloud_machine_changed(json!({ "providerId": CLOUD_PROVIDER_E2B, "removed": true }))
-        .await;
+    svc.publish_cloud_machine_changed(
+        json!({ "providerId": CLOUD_PROVIDER_E2B, "removed": true }),
+        None,
+    )
+    .await;
     Ok(json!({ "ok": true, "unconfirmedStops": unconfirmed }))
 }

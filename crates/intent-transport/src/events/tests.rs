@@ -201,9 +201,22 @@ mod collaborator_fan_out {
     /// collaborator with. Shared so a test can revoke membership mid-stream.
     struct MembershipApi {
         members: Arc<Mutex<HashSet<String>>>,
+        /// The subscriber's durable host role; `None` answers as unavailable.
+        role: Option<intent_core::HostRole>,
     }
 
     impl WorkspaceApi for MembershipApi {
+        fn principal_host_role(
+            &self,
+            principal_id: PrincipalId,
+        ) -> BoxFuture<'_, intent_core::Result<intent_core::HostRole>> {
+            let _ = principal_id;
+            let role = self.role;
+            Box::pin(async move {
+                role.ok_or_else(|| Error::Forbidden("host authority unavailable".into()))
+            })
+        }
+
         fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, intent_core::Result<Workspace>> {
             let allowed = self.members.lock().unwrap().contains(id.as_str());
             Box::pin(async move {
@@ -278,6 +291,16 @@ mod collaborator_fan_out {
     /// Subscribe through the real fast path under `caller`, with `members`
     /// as the caller's member workspaces.
     async fn subscribe(caller: Caller, members: &[&str], params: Value) -> Harness {
+        subscribe_as(caller, None, members, params).await
+    }
+
+    /// [`subscribe`] with the durable host role the services report.
+    async fn subscribe_as(
+        caller: Caller,
+        role: Option<intent_core::HostRole>,
+        members: &[&str],
+        params: Value,
+    ) -> Harness {
         let dir = tempfile::Builder::new()
             .prefix("intent-transport-collab-fanout-")
             .tempdir()
@@ -292,6 +315,7 @@ mod collaborator_fan_out {
         ));
         let api: Arc<dyn WorkspaceApi> = Arc::new(MembershipApi {
             members: Arc::clone(&members),
+            role,
         });
         let (out_tx, mut rx) = outbound_channel();
         let mut subs = ConnSubs::default();
@@ -515,6 +539,48 @@ mod collaborator_fan_out {
             ]
         );
         drop(h.subs);
+    }
+
+    /// `cloudMachine:changed`: provider changes (global) reach every member;
+    /// a machine's change carries its workspace and reaches only members who
+    /// can manage it; guests get neither.
+    #[tokio::test]
+    async fn cloud_machine_changes_reach_members_by_workspace_and_never_guests() {
+        use intent_core::events::CLOUD_MACHINE_CHANGED;
+        async fn run(role: intent_core::HostRole) -> Vec<(String, String)> {
+            let caller = Caller::Wire {
+                principal_id: PrincipalId::new(),
+                host_role: role,
+            };
+            let mut h = subscribe_as(
+                caller,
+                Some(role),
+                &["ws-1"],
+                json!({ "eventTypes": ["cloudMachine:changed"] }),
+            )
+            .await;
+            for (workspace, data) in [
+                ("", json!({ "provider": { "id": "e2b" } })),
+                ("ws-1", json!({ "machine": { "id": "m-1" } })),
+                ("ws-2", json!({ "machine": { "id": "m-2" } })),
+                ("ws-2", json!({ "machineId": "m-2", "removed": true })),
+            ] {
+                h.bus
+                    .publish(&event_with(CLOUD_MACHINE_CHANGED, workspace, data))
+                    .await
+                    .unwrap();
+            }
+            let seen = delivered(&mut h.rx).await;
+            drop(h.subs);
+            seen
+        }
+        let cloud = CLOUD_MACHINE_CHANGED.to_string();
+        assert_eq!(
+            run(intent_core::HostRole::Member).await,
+            vec![(cloud.clone(), String::new()), (cloud, "ws-1".to_owned())],
+            "a member sees the provider and the machines of workspaces it manages"
+        );
+        assert_eq!(run(intent_core::HostRole::Guest).await, Vec::new());
     }
 
     #[tokio::test]

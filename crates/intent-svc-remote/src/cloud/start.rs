@@ -464,11 +464,8 @@ async fn start(
             .await
             .map(|routes| routes.fingerprint);
         let params = bootstrap::mint_params(&backend_id, &backend_name, fingerprint.as_deref());
-        let mut announced = false;
-        let minted = bootstrap::run(&client, &created, &params, || announced = true).await?;
-        if announced {
-            step(svc, workspace_id, agent_id, CloudStartStep::StartingDaemon).await;
-        }
+        step(svc, workspace_id, agent_id, CloudStartStep::StartingDaemon).await;
+        let minted = bootstrap::run(&client, &created, &params).await?;
         step(svc, workspace_id, agent_id, CloudStartStep::Connecting).await;
         let cloud = CloudMachine {
             provider: CLOUD_PROVIDER_E2B.to_owned(),
@@ -507,8 +504,9 @@ async fn start(
             link(feature, svc, workspace_id, agent_id, &machine_id).await
         };
         if let Err(error) = launched {
+            // The sandbox itself is deleted once, below.
             if let Ok(Some(row)) = svc.store().get_exposed_machine(&machine_id).await {
-                delete_machine(feature, svc, &row, Some(&client)).await;
+                delete_machine(feature, svc, &row, None).await;
             }
             return Err(error);
         }
@@ -634,7 +632,10 @@ pub(crate) async fn delete_machine(
             tracing::warn!(%error, sandbox = %cloud.sandbox_id, "cloud machine: could not delete its sandbox");
         }
     }
-    svc.publish_cloud_machine_changed(json!({ "machineId": row.id, "removed": true }))
-        .await;
+    svc.publish_cloud_machine_changed(
+        json!({ "machineId": row.id, "removed": true }),
+        row.cloud.as_ref().map(|cloud| cloud.workspace_id.as_str()),
+    )
+    .await;
     unconfirmed
 }

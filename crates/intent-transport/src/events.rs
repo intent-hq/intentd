@@ -203,6 +203,13 @@ impl MembershipGate {
             if event.event_type == intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED {
                 return workspace_id.is_empty();
             }
+            // Cloud machine provider changes are global; a machine's change
+            // carries its workspace and is checked below like any other.
+            if event.event_type == intent_core::events::CLOUD_MACHINE_CHANGED
+                && workspace_id.is_empty()
+            {
+                return true;
+            }
             return !workspace_id.is_empty()
                 && self
                     .api

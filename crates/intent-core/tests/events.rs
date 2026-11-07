@@ -440,7 +440,6 @@ fn member_event_administrator_remainder_is_frozen() {
         "app:ui-highlight",
         "app:ui-navigate",
         "app:workspace-open",
-        "cloudMachine:changed",
         "github:auth-changed",
         "host:invites-changed",
         "identity:auth-changed",

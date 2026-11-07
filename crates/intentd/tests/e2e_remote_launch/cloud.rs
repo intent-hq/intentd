@@ -29,6 +29,7 @@ const PROFILE_SECRET: &str = "sk-cloud-profile-secret-7f3a91";
 /// One fake sandbox: its directory, envd token and environment.
 struct FakeSandbox {
     dir: std::path::PathBuf,
+    template: String,
     envd_token: String,
     env: Vec<(String, String)>,
 }
@@ -42,6 +43,10 @@ struct FakeState {
     outputs: Vec<String>,
     /// Templates whose create E2B refuses for the plan.
     refused_templates: Vec<String>,
+    /// Templates whose sandboxes fail the credential mint.
+    failed_mint_templates: Vec<String>,
+    /// Templates whose sandboxes take a while to start intentd.
+    slow_start_templates: Vec<String>,
 }
 
 /// The fake E2B API and envd on one loopback port.
@@ -173,6 +178,7 @@ impl FakeE2b {
                     id.clone(),
                     FakeSandbox {
                         dir,
+                        template: template.clone(),
                         envd_token: token.clone(),
                         env,
                     },
@@ -236,7 +242,7 @@ impl FakeE2b {
         body: &[u8],
     ) -> (u16, &'static str, Vec<u8>) {
         let id = headers.get("e2b-sandbox-id").cloned().unwrap_or_default();
-        let (dir, env) = {
+        let (dir, env, fail_mint, slow_start) = {
             let state = self.state();
             let Some(sandbox) = state.sandboxes.get(&id) else {
                 return (502, "application/json", b"{}".to_vec());
@@ -244,10 +250,27 @@ impl FakeE2b {
             if headers.get("x-access-token") != Some(&sandbox.envd_token) {
                 return (401, "application/json", b"{}".to_vec());
             }
-            (sandbox.dir.clone(), sandbox.env.clone())
+            (
+                sandbox.dir.clone(),
+                sandbox.env.clone(),
+                state.failed_mint_templates.contains(&sandbox.template),
+                state.slow_start_templates.contains(&sandbox.template),
+            )
         };
         let request: Value = serde_json::from_slice(&body[5..]).unwrap();
         let process = &request["process"];
+        let script = process["args"].to_string();
+        if fail_mint && script.contains("executor.mint") {
+            return (
+                200,
+                "application/connect+json",
+                frames(b"", b"mint refused in the sandbox", 3),
+            );
+        }
+        if slow_start && script.contains("intentd serve") {
+            // timing-guard: holds the sandbox start open so a remove can run while it is in flight
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
         let mut command = tokio::process::Command::new(process["cmd"].as_str().unwrap());
         command
             .args(
@@ -270,34 +293,12 @@ impl FakeE2b {
         self.state()
             .outputs
             .push(String::from_utf8_lossy(&output.stdout).into_owned());
-        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
-        let mut frames = Vec::new();
-        let mut push = |flags: u8, value: Value| {
-            let payload = value.to_string().into_bytes();
-            frames.push(flags);
-            frames.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
-            frames.extend_from_slice(&payload);
-        };
-        push(0, json!({ "event": { "start": { "pid": 1 } } }));
-        if !output.stdout.is_empty() {
-            push(
-                0,
-                json!({ "event": { "data": { "stdout": b64(&output.stdout) } } }),
-            );
-        }
-        if !output.stderr.is_empty() {
-            push(
-                0,
-                json!({ "event": { "data": { "stderr": b64(&output.stderr) } } }),
-            );
-        }
         let code = output.status.code().unwrap_or(-1);
-        push(
-            0,
-            json!({ "event": { "end": { "exitCode": code, "exited": true, "status": format!("exit status {code}") } } }),
-        );
-        push(2, json!({}));
-        (200, "application/connect+json", frames)
+        (
+            200,
+            "application/connect+json",
+            frames(&output.stdout, &output.stderr, code),
+        )
     }
 
     /// Every executor token a sandbox minted.
@@ -315,6 +316,31 @@ impl FakeE2b {
             .map(|n| format!("envd-token-sbx{n}-a1b2c3d4e5f6"))
             .collect()
     }
+}
+
+/// envd's process stream for one finished process, as Connect frames.
+fn frames(stdout: &[u8], stderr: &[u8], code: i32) -> Vec<u8> {
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let mut frames = Vec::new();
+    let mut push = |flags: u8, value: Value| {
+        let payload = value.to_string().into_bytes();
+        frames.push(flags);
+        frames.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        frames.extend_from_slice(&payload);
+    };
+    push(0, json!({ "event": { "start": { "pid": 1 } } }));
+    if !stdout.is_empty() {
+        push(0, json!({ "event": { "data": { "stdout": b64(stdout) } } }));
+    }
+    if !stderr.is_empty() {
+        push(0, json!({ "event": { "data": { "stderr": b64(stderr) } } }));
+    }
+    push(
+        0,
+        json!({ "event": { "end": { "exitCode": code, "exited": true, "status": format!("exit status {code}") } } }),
+    );
+    push(2, json!({}));
+    frames
 }
 
 impl Drop for FakeE2b {
@@ -664,6 +690,46 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     let cloud = ok(&mut rpc_ws, 400, "cloudMachines.list", json!({})).await;
     assert_eq!(cloud["machines"].as_array().unwrap().len(), 1, "{cloud}");
 
+    // A bootstrap that fails (the mint in the sandbox) deletes the sandbox
+    // it made and adds no machine.
+    let small = ok(
+        &mut rpc_ws,
+        320,
+        "cloudMachines.configure",
+        json!({ "provider": "e2b", "size": "2x4" }),
+    )
+    .await;
+    let small_template = small["provider"]["template"].as_str().unwrap().to_owned();
+    fake.state().failed_mint_templates.push(small_template);
+    let broken = ok(
+        &mut rpc_ws,
+        321,
+        "agent.create",
+        create(&keyed_ref, "Broken"),
+    )
+    .await;
+    let broken_id = broken["agent"]["id"].as_str().unwrap().to_owned();
+    let failed = agent_until(&mut rpc_ws, (&ws_id, &broken_id), 330, |a| {
+        a.get("placementError").is_some()
+    })
+    .await;
+    transcript.push(failed.to_string());
+    assert_eq!(
+        failed["placementError"]["code"], "cloud-machine-unavailable",
+        "{failed}"
+    );
+    assert_eq!(
+        failed["placementError"]["data"]["reason"], "bootstrap-failed",
+        "{failed}"
+    );
+    let broken_sandbox = format!("sbx{}", fake.state().creates.len());
+    assert!(
+        fake.state().deletes.contains(&broken_sandbox),
+        "the failed sandbox is deleted"
+    );
+    let cloud = ok(&mut rpc_ws, 390, "cloudMachines.list", json!({})).await;
+    assert_eq!(cloud["machines"].as_array().unwrap().len(), 1, "{cloud}");
+
     // Removing the provider with a live sandbox needs stopAgents.
     let busy = rpc(
         &mut rpc_ws,
@@ -673,16 +739,88 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     )
     .await;
     assert_eq!(busy["error"]["data"]["code"], "machine-in-use", "{busy}");
-    let removed = ok(
+
+    // A start racing remove: remove forgets the settings first, so a new
+    // placement is refused before any sandbox; it waits for the start in
+    // flight, which finds the settings gone and deletes its own sandbox;
+    // then every sandbox is deleted while the key still works.
+    let slow = ok(
         &mut rpc_ws,
-        402,
-        "cloudMachines.remove",
-        json!({ "provider": "e2b", "stopAgents": true }),
+        410,
+        "cloudMachines.configure",
+        json!({ "provider": "e2b", "size": "16x32" }),
     )
     .await;
+    let slow_template = slow["provider"]["template"].as_str().unwrap().to_owned();
+    fake.state()
+        .slow_start_templates
+        .push(slow_template.clone());
+    let racer = ok(
+        &mut rpc_ws,
+        411,
+        "agent.create",
+        create(&keyed_ref, "Racer"),
+    )
+    .await;
+    let racer_id = racer["agent"]["id"].as_str().unwrap().to_owned();
+    timeout(wait(), async {
+        while fake.state().creates.last().map(|c| c["templateID"].clone())
+            != Some(json!(slow_template))
+        {
+            // timing-guard: poll interval until the racer's sandbox create reaches the fake E2B
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the racer's sandbox is being created");
+    let mut remove_ws = connect(port, cfg.clone()).await;
+    let removal = tokio::spawn(async move {
+        ok(
+            &mut remove_ws,
+            1,
+            "cloudMachines.remove",
+            json!({ "provider": "e2b", "stopAgents": true }),
+        )
+        .await
+    });
+    timeout(wait(), async {
+        let mut id = 420;
+        loop {
+            id += 1;
+            let listed = ok(&mut rpc_ws, id, "cloudMachines.list", json!({})).await;
+            if listed["providers"] == json!([]) {
+                return;
+            }
+            // timing-guard: poll interval until remove has forgotten the settings
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("remove forgets the settings first");
+    let creates_before = fake.state().creates.len();
+    let late = rpc(&mut rpc_ws, 500, "agent.create", create(&keyed_ref, "Late")).await;
+    assert_eq!(
+        late["error"]["data"]["reason"], "not-configured",
+        "a start during remove is refused: {late}"
+    );
+    let removed = removal.await.unwrap();
     transcript.push(removed.to_string());
     assert_eq!(removed["ok"], true, "{removed}");
-    assert_eq!(fake.state().deletes, ["sbx1"], "the sandbox is deleted");
+    assert_eq!(
+        fake.state().creates.len(),
+        creates_before,
+        "no late sandbox"
+    );
+    assert!(
+        fake.state().sandboxes.is_empty(),
+        "every sandbox made is deleted: {:?}",
+        fake.state().sandboxes.keys().collect::<Vec<_>>()
+    );
+    let lost = agent_until(&mut rpc_ws, (&ws_id, &racer_id), 510, |a| {
+        a.get("placementError").is_some()
+    })
+    .await;
+    assert!(lost.get("nodeId").is_none(), "{lost}");
     let after = ok(&mut rpc_ws, 403, "cloudMachines.list", json!({})).await;
     assert_eq!(after, json!({ "providers": [], "machines": [] }), "{after}");
 

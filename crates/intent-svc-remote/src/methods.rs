@@ -77,8 +77,11 @@ pub(crate) fn machine_json(row: &ExposedMachine, live: Option<&Shared>) -> Value
 pub(crate) async fn publish_machine(svc: &Services, row: &ExposedMachine, live: Option<&Shared>) {
     let machine = machine_json(row, live);
     if row.is_cloud() {
-        svc.publish_cloud_machine_changed(json!({ "machine": machine }))
-            .await;
+        svc.publish_cloud_machine_changed(
+            json!({ "machine": machine }),
+            row.cloud.as_ref().map(|cloud| cloud.workspace_id.as_str()),
+        )
+        .await;
     } else {
         svc.publish_remote_machine_changed(json!({ "machine": machine }))
             .await;

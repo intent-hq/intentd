@@ -94,11 +94,14 @@ impl Services {
             .await
     }
 
-    /// Publish `cloudMachine:changed` with `data`. Global and, like
-    /// `remoteMachine:changed`, not on the collaborator event list.
-    pub async fn publish_cloud_machine_changed(&self, data: Value) {
+    /// Publish `cloudMachine:changed` with `data`. Provider changes are
+    /// global (`workspace` `None`) and reach the owner and every shared-host
+    /// member; a machine change carries the workspace it was started for,
+    /// so members receive it only where they can manage that workspace.
+    /// Never delivered to guests.
+    pub async fn publish_cloud_machine_changed(&self, data: Value, workspace: Option<&str>) {
         let event = intent_store::NewEvent {
-            workspace_id: WorkspaceId::from_string(String::new()),
+            workspace_id: WorkspaceId::from_string(workspace.unwrap_or_default().to_owned()),
             timestamp: now_iso(),
             event_type: intent_core::events::CLOUD_MACHINE_CHANGED.to_owned(),
             actor: crate::system_actor(),
