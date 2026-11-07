@@ -1128,7 +1128,7 @@ failover or change the primary client without the user's instruction.
 
 An agent-owned browser tab shows **Controlled by** with the agent's name above
 its address bar; click it to open that agent's conversation. When the tab runs on
-another client, a warning above it says this computer isn't primary for the tab:
+another client that is online, a warning above it says this computer isn't primary for the tab:
 cookies and page state stay on the other client, so the page may differ from what
 the agent sees, and its address can change on its own.
 
