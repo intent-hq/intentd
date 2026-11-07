@@ -457,6 +457,12 @@ impl Shared {
         }
     }
 
+    /// Fail waiting prompts with `turn_error` (see the `cloud_refusal`
+    /// field).
+    pub(crate) fn refuse_turns(&self, turn_error: &str) {
+        self.cloud_refusal.send_replace(Some(turn_error.to_owned()));
+    }
+
     /// Subscribe to cloud resume refusals (see the `cloud_refusal` field).
     pub(crate) fn cloud_refusals(&self) -> watch::Receiver<Option<String>> {
         self.cloud_refusal.subscribe()
@@ -2125,6 +2131,10 @@ async fn run(
                 // that and this write still reads `disconnected`
                 // (intent-hq/intent#8484).
                 shared.record_failure(&failure).await;
+                if let (ConnectFailure::UpdateRequired(_), Some(gate)) = (&failure, &target.gate) {
+                    // A cloud sandbox never gets an update: it is deleted.
+                    gate.outdated(&shared);
+                }
                 if matches!(failure, ConnectFailure::Revoked(_)) {
                     // Revocation stopped this binding's agents on the
                     // machine: their stops are moot, and they no longer run.

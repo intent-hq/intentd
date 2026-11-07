@@ -26,6 +26,7 @@ use intent_nodes::e2b::{E2bClient, E2bError, ListSandboxes, SandboxState};
 use intent_services::feature_api::Services;
 
 use super::config;
+use super::start::Removal;
 use crate::connect::ConnectFailure;
 use crate::connector::Shared;
 use crate::RemoteFeature;
@@ -52,6 +53,19 @@ const DAY_MS_ENV: &str = "INTENTD_E2B_DAY_MS";
 
 /// The turn error of an agent whose sandbox E2B removed.
 pub(crate) const SANDBOX_LOST_MESSAGE: &str = "E2B removed this agent's sandbox, so its turn was interrupted. Work it pushed is kept; work it did not push is lost. The next message starts a new sandbox.";
+
+/// The turn error of an agent whose sandbox could not link to this backend
+/// (`machine-update-required`) and was deleted.
+pub(crate) const SANDBOX_OUTDATED_MESSAGE: &str = "This agent's E2B sandbox runs an Intent version this backend can no longer link to, so the sandbox was deleted. Work it pushed is kept; work it did not push is lost. The next message starts a new sandbox.";
+
+/// Why a machine's sandbox is gone or unusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Loss {
+    /// E2B no longer has it.
+    Removed,
+    /// It cannot link to this backend's version.
+    Outdated,
+}
 
 /// The lifecycle's clock: the length of a settings minute and day.
 #[derive(Debug, Clone, Copy)]
@@ -163,8 +177,10 @@ impl CloudGate {
         let Ok(feature) = super::feature(&self.svc) else {
             return Ok(0);
         };
-        if feature.cloud.is_lost(&self.machine_id) {
-            return Err(lost_failure());
+        match feature.cloud.loss(&self.machine_id) {
+            Some(Loss::Removed) => return Err(lost_failure()),
+            Some(Loss::Outdated) => return Err(ConnectFailure::Local(outdated_turn_error())),
+            None => {}
         }
         let _transition = feature.cloud.transition(&self.machine_id).await;
         let pauses = feature.cloud.pauses(&self.machine_id);
@@ -205,6 +221,22 @@ impl CloudGate {
             }),
         }
     }
+
+    /// The sandbox answered the dial with `machine-update-required`: it
+    /// runs an intentd this backend shares no link protocol with, so it
+    /// can never link again. See [`sandbox_outdated`].
+    pub(crate) fn outdated(&self, shared: &Shared) {
+        if let Ok(feature) = super::feature(&self.svc) {
+            sandbox_outdated(&self.svc, feature, shared, &self.machine_id);
+        }
+    }
+}
+
+pub(crate) fn outdated_turn_error() -> String {
+    format!(
+        "{}: {SANDBOX_OUTDATED_MESSAGE}",
+        intent_core::machines::MACHINE_UPDATE_REQUIRED_CODE
+    )
 }
 
 /// `cloud-machine-unavailable` `sandbox-lost`.
@@ -335,7 +367,7 @@ pub(crate) fn sandbox_lost(
     shared: Option<&Shared>,
     row: &ExposedMachine,
 ) {
-    if !feature.cloud.mark_lost(&row.id) {
+    if !feature.cloud.mark_lost(&row.id, Loss::Removed) {
         return;
     }
     tracing::warn!(machine = %row.id, sandbox = %row.cloud.as_ref().map(|c| c.sandbox_id.as_str()).unwrap_or_default(), "cloud machine: E2B removed the sandbox");
@@ -355,7 +387,49 @@ pub(crate) fn sandbox_lost(
         };
         let lost = super::StartFailure::of(&sandbox_lost_error());
         let error = PlacementError::cloud(&lost.message, &lost.data);
-        super::start::remove_machine(feature, &svc, &row, None, Some(&error)).await;
+        super::start::remove_machine(feature, &svc, &row, None, Removal::Lost(&error)).await;
+    });
+}
+
+/// Machine `machine_id`'s sandbox cannot link to this backend's version
+/// (for example a paused sandbox after the backend was updated past its
+/// link protocols): end its agents' turns with [`SANDBOX_OUTDATED_MESSAGE`],
+/// then delete the sandbox without a final stop (none can reach it) and
+/// remove the machine in the background. Its agents become agents without
+/// a sandbox; the next message starts a new one from their pushed work.
+fn sandbox_outdated(svc: &Services, feature: &RemoteFeature, shared: &Shared, machine_id: &str) {
+    if !feature.cloud.mark_lost(machine_id, Loss::Outdated) {
+        return;
+    }
+    tracing::warn!(machine = %machine_id, "cloud machine: the sandbox cannot link to this backend's version; deleting it");
+    // A prompt waiting for the link fails with this refusal. Ending the
+    // agents here would close their transport first, and a prompt closed
+    // before any output is silently redriven instead of told.
+    shared.refuse_turns(&outdated_turn_error());
+    shared.drop_stops();
+    let svc = svc.clone();
+    let machine_id = machine_id.to_owned();
+    tokio::spawn(async move {
+        let Ok(feature) = super::feature(&svc) else {
+            return;
+        };
+        let row = match svc.store().get_exposed_machine(&machine_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                feature.cloud.forget(&machine_id);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(machine = %machine_id, %error, "cloud machine: could not read it to delete its outdated sandbox");
+                feature.cloud.forget(&machine_id);
+                return;
+            }
+        };
+        // Without the key the sandbox stays; the reaper deletes it once a
+        // working key is saved.
+        let client = config::saved_client(&svc).await.ok();
+        super::start::remove_machine(feature, &svc, &row, client.as_ref(), Removal::Unlinkable)
+            .await;
     });
 }
 
@@ -555,7 +629,7 @@ async fn check(
     row: &ExposedMachine,
 ) {
     let Some(cloud) = &row.cloud else { return };
-    if feature.cloud.is_lost(&row.id) || feature.cloud.is_killing(&row.id) {
+    if feature.cloud.loss(&row.id).is_some() || feature.cloud.is_killing(&row.id) {
         return;
     }
     let node = feature.running_node(&row.id);
