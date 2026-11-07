@@ -340,6 +340,7 @@ pub fn build_args(opts: &SpawnOptions) -> Vec<String> {
     if opts.via_npx() {
         if let Some(pkg) = opts.npx_fallback_package {
             args.push(NPX_NO_WORKSPACES_ARG.to_string());
+            args.push(crate::npx_cache::NPX_SAVE_ARG.to_string());
             args.push("-y".to_string());
             args.push(pkg.to_string());
         }
@@ -983,6 +984,7 @@ pub fn prepare_npx_package(opts: &SpawnOptions, script: &str) -> AcpResult<Prepa
     std::fs::write(&script_path, script).map_err(|e| AcpError::Spawn(e.to_string()))?;
     let args = vec![
         NPX_NO_WORKSPACES_ARG.into(),
+        crate::npx_cache::NPX_SAVE_ARG.into(),
         "--yes".into(),
         "--ignore-scripts".into(),
         format!("--package={package}"),
@@ -1168,6 +1170,7 @@ mod build_args_tests {
                     build_args(&opts),
                     [
                         NPX_NO_WORKSPACES_ARG,
+                        crate::npx_cache::NPX_SAVE_ARG,
                         "-y",
                         intent_providers::CODEX_ACP_NPX_PACKAGE
                     ],
@@ -1505,6 +1508,7 @@ mod build_command_tests {
             args,
             vec![
                 "--workspaces=false".to_string(),
+                crate::npx_cache::NPX_SAVE_ARG.to_string(),
                 "-y".to_string(),
                 format!(
                     "@agentclientprotocol/claude-agent-acp@{}",

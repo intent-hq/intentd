@@ -23923,9 +23923,10 @@ mod rebuild_spawn_opts_tests {
         assert_eq!(cmd.as_std().get_program(), npx_path.as_os_str());
         let args = intent_acp::spawn::build_args(&rebuilt);
         assert_eq!(args[0], intent_acp::spawn::NPX_NO_WORKSPACES_ARG);
-        assert_eq!(args[1], "-y");
+        assert_eq!(args[1], intent_acp::npx_cache::NPX_SAVE_ARG);
+        assert_eq!(args[2], "-y");
         assert_eq!(
-            args[2],
+            args[3],
             provider.npx_only_package.expect("codex is npx-only")
         );
     }

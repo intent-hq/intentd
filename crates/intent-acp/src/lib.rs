@@ -28,6 +28,7 @@ pub mod mcp_bridge;
 pub mod mcp_config;
 pub(crate) mod mcp_env;
 pub mod mcp_server;
+pub mod npx_cache;
 pub mod permission;
 pub mod profile_env;
 pub mod review_monitoring;

@@ -1784,7 +1784,7 @@ if [ "$#" = 1 ] && [ "$1" = --version ]; then
   printf '11.0.0\n'
   exit 0
 fi
-[ "$#" = 3 ] && [ "$1" = --workspaces=false ] && [ "$2" = -y ] && [ "$3" = '{}' ] || exit 93
+[ "$#" = 4 ] && [ "$1" = --workspaces=false ] && [ "$2" = --save=true ] && [ "$3" = -y ] && [ "$4" = '{}' ] || exit 93
 [ "$CLAUDE_CODE_EXECUTABLE" = "$HOME/bin/claude" ] || exit 94
 printf '%s\n' "$*" >> "$HOME/packages"
 IFS= read -r request
@@ -1878,7 +1878,7 @@ while IFS= read -r unexpected; do exit 95; done
         assert_eq!(
             std::fs::read_to_string(root.join("packages")).unwrap(),
             format!(
-                "--workspaces=false -y {}\n",
+                "--workspaces=false --save=true -y {}\n",
                 intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
             )
         );
