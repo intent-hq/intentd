@@ -890,6 +890,7 @@ pub async fn store(state: &LargeState) -> Seeded {
                 node_protocol: None,
                 cloud: Some(intent_core::machines::CloudMachine {
                     provider: "e2b".into(),
+                    cloud_machine_id: "e2b".into(),
                     sandbox_id: format!("sbx{i:024x}"),
                     state: intent_core::machines::CloudSandboxState::Running,
                     template: "intent/intent-node-16x32:0.11.139".into(),

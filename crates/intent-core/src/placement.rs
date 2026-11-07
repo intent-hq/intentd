@@ -56,6 +56,10 @@ pub struct AgentPlacement {
     pub node_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclusive: Option<bool>,
+    /// The named E2B entry a `target: "e2b"` placement starts its sandbox
+    /// with. Absent: the caller's own entry, else the only one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cloud_machine_id: Option<String>,
 }
 
 /// Wire form of [`AgentPlacement`]: serde's derive rejects unknown and
@@ -76,6 +80,8 @@ struct WirePlacement {
     node_id: Option<String>,
     #[serde(default, deserialize_with = "present")]
     exclusive: Option<bool>,
+    #[serde(default, deserialize_with = "present")]
+    cloud_machine_id: Option<String>,
 }
 
 /// Accepts only a JSON object: a derived struct would also accept an array
@@ -127,6 +133,7 @@ impl TryFrom<WireObject> for AgentPlacement {
             arch: wire.arch,
             node_id: wire.node_id,
             exclusive: wire.exclusive,
+            cloud_machine_id: wire.cloud_machine_id,
         };
         placement.validate()?;
         Ok(placement)
@@ -146,6 +153,14 @@ impl AgentPlacement {
             .is_some_and(|id| id.is_empty() || id.len() > MAX_NODE_ID_BYTES)
         {
             return Err("placement.nodeId must contain 1-128 UTF-8 bytes");
+        }
+        if let Some(entry) = &self.cloud_machine_id {
+            if self.target != Some(PlacementTarget::E2b) {
+                return Err("placement.cloudMachineId needs placement.target \"e2b\"");
+            }
+            if entry.len() > crate::machines::MAX_CLOUD_MACHINE_ID_BYTES {
+                return Err("placement.cloudMachineId must contain at most 64 UTF-8 bytes");
+            }
         }
         if self.target == Some(PlacementTarget::Remote)
             && self.effective_checkout() != PlacementCheckout::Isolated

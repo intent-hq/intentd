@@ -429,6 +429,19 @@ impl ExposedMachine {
 pub const CLOUD_PROVIDER_E2B: &str = "e2b";
 /// Its display name, also every cloud agent's `nodeName`.
 pub const CLOUD_PROVIDER_E2B_NAME: &str = "E2B";
+/// The id of the E2B entry a single-provider setup migrates to (named
+/// [`CLOUD_PROVIDER_E2B_NAME`]); also the entry of a cloud machine row or
+/// placement saved before entries existed.
+pub const CLOUD_E2B_LEGACY_ENTRY: &str = "e2b";
+
+/// Longest `cloudMachineId`, in bytes.
+pub const MAX_CLOUD_MACHINE_ID_BYTES: usize = 64;
+/// Most named E2B entries a backend keeps.
+pub const MAX_CLOUD_MACHINE_ENTRIES: usize = 16;
+
+fn legacy_entry() -> String {
+    CLOUD_E2B_LEGACY_ENTRY.to_owned()
+}
 
 /// A cloud sandbox size, `<vCPU>x<GiB>`; each size is its own template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -526,6 +539,9 @@ pub struct CloudStartedBy {
 #[serde(rename_all = "camelCase")]
 pub struct CloudMachine {
     pub provider: String,
+    /// The named E2B entry whose key started the sandbox.
+    #[serde(default = "legacy_entry")]
+    pub cloud_machine_id: String,
     pub sandbox_id: String,
     pub state: CloudSandboxState,
     pub template: String,
@@ -617,7 +633,7 @@ pub fn cloud_machine_unavailable(
     status: Option<u16>,
     message: impl Into<String>,
 ) -> crate::Error {
-    let internal = !matches!(reason, "not-configured" | "key-rejected");
+    let internal = !matches!(reason, "not-configured" | "key-rejected" | "entry-required");
     let mut data = serde_json::json!({
         "code": CLOUD_MACHINE_UNAVAILABLE_CODE,
         "provider": CLOUD_PROVIDER_E2B,
@@ -628,6 +644,30 @@ pub fn cloud_machine_unavailable(
         data["status"] = serde_json::json!(status);
     }
     crate::Error::remote_machine(internal, message, data)
+}
+
+/// `error` with `data.cloudMachineId` set to the E2B entry `id`, when it is
+/// one of the three cloud errors and does not name an entry yet.
+#[must_use]
+pub fn with_cloud_machine_id(error: crate::Error, id: &str) -> crate::Error {
+    match error {
+        crate::Error::RemoteMachine(mut failure)
+            if !id.is_empty()
+                && failure.data.get("cloudMachineId").is_none()
+                && matches!(
+                    failure.data["code"].as_str(),
+                    Some(
+                        CLOUD_MACHINE_UNAVAILABLE_CODE
+                            | CLOUD_PROFILE_REQUIRED_CODE
+                            | CLOUD_QUOTA_CODE
+                    )
+                ) =>
+        {
+            failure.data["cloudMachineId"] = serde_json::json!(id);
+            crate::Error::RemoteMachine(failure)
+        }
+        other => other,
+    }
 }
 
 /// `cloud-profile-required` (`-32602`): the launch would send no profile

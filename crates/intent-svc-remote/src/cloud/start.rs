@@ -33,9 +33,44 @@ pub(crate) const START_WAIT: Duration = Duration::from_secs(10 * 60);
 /// Longest cloud machine row name, in bytes.
 const MAX_NAME_BYTES: usize = 128;
 
+/// An E2B entry as an agent's view names it: its id (kept on the view's
+/// placement) and its name (the view's `nodeName`).
+#[derive(Debug, Clone)]
+struct EntryRef {
+    id: String,
+    name: String,
+}
+
+impl EntryRef {
+    /// The entry of a cloud agent's view; a view saved before entries
+    /// existed is on the legacy entry.
+    fn of_view(view: &RemotePlacementView) -> Self {
+        Self {
+            id: view
+                .placement
+                .cloud_machine_id
+                .clone()
+                .unwrap_or_else(|| config::legacy_entry().to_owned()),
+            name: view.node_name.clone(),
+        }
+    }
+
+    /// The entry of cloud machine `row`, named as saved (or "E2B" once the
+    /// entry is gone).
+    async fn of_row(svc: &Services, row: &ExposedMachine) -> Self {
+        let id = super::methods::row_entry(row).to_owned();
+        let name = config::load(svc, &id)
+            .await
+            .ok()
+            .flatten()
+            .map_or_else(|| CLOUD_PROVIDER_E2B_NAME.to_owned(), |saved| saved.name);
+        Self { id, name }
+    }
+}
+
 /// The view of an agent placed on cloud machine `node`, or that waits for
-/// its sandbox (`node` `None`).
-fn view(node: Option<(&crate::RemoteNode, &str)>) -> RemotePlacementView {
+/// its sandbox (`node` `None`), with E2B entry `entry`.
+fn view(node: Option<(&crate::RemoteNode, &str)>, entry: &EntryRef) -> RemotePlacementView {
     let (node_id, lease_id) = match node {
         Some((node, node_id)) => (node_id.to_owned(), node.status().lease_id),
         None => (String::new(), String::new()),
@@ -46,10 +81,11 @@ fn view(node: Option<(&crate::RemoteNode, &str)>) -> RemotePlacementView {
         }),
         node_id,
         lease_id,
-        node_name: CLOUD_PROVIDER_E2B_NAME.to_owned(),
+        node_name: entry.name.clone(),
         placement: AgentPlacement {
             target: Some(PlacementTarget::E2b),
             checkout: Some(PlacementCheckout::Isolated),
+            cloud_machine_id: Some(entry.id.clone()),
             ..AgentPlacement::default()
         },
         effective_isolation: EffectiveIsolation::Pending,
@@ -131,10 +167,11 @@ async fn on_machine(
     feature: &RemoteFeature,
     svc: &Services,
     node_id: &str,
+    entry: &EntryRef,
 ) -> Result<RemotePlacementView> {
     let node = feature.node(svc, node_id).await?;
     node.connect().await?;
-    Ok(view(Some((&node, node_id))))
+    Ok(view(Some((&node, node_id)), entry))
 }
 
 /// Admission for a placement on E2B, before anything is written. Returns
@@ -144,8 +181,10 @@ async fn on_machine(
 ///    (none given): the caller's sandbox, once it runs.
 /// 2. `target: "remote"` with a cloud machine's `nodeId`: only for a
 ///    sub-agent of the machine's agent, else `machine-unknown`.
-/// 3. An explicit `target: "e2b"`, from any caller: a new sandbox, after the
-///    provider, profile and provider checks.
+/// 3. An explicit `target: "e2b"`, from any caller: a new sandbox with the
+///    E2B entry `placement.cloudMachineId`, else the calling cloud agent's own
+///    entry, else the only entry; after the entry, profile and provider
+///    checks.
 pub(crate) async fn admit(
     feature: &RemoteFeature,
     svc: &Services,
@@ -174,7 +213,8 @@ pub(crate) async fn admit(
             return Err(machine_unknown(placement, node_id));
         }
         check_profile(needs)?;
-        return on_machine(feature, svc, node_id).await.map(Some);
+        let entry = EntryRef::of_row(svc, &row).await;
+        return on_machine(feature, svc, node_id, &entry).await.map(Some);
     }
     if !placement.is_e2b() {
         return Ok(None);
@@ -184,18 +224,39 @@ pub(crate) async fn admit(
     } else {
         None
     };
-    if let Some((caller, caller_view)) = shared {
+    if let Some((caller, caller_view)) = &shared {
         check_profile(needs)?;
         let linked = if caller_view.is_unlinked() {
-            wait_linked(svc, &caller).await?
+            wait_linked(svc, caller).await?
         } else {
-            caller_view
+            caller_view.clone()
         };
-        return on_machine(feature, svc, &linked.node_id).await.map(Some);
+        let entry = EntryRef::of_view(&linked);
+        return on_machine(feature, svc, &linked.node_id, &entry)
+            .await
+            .map(Some);
     }
-    let Some(saved) = config::load(svc).await? else {
-        return Err(config::not_configured());
+    let chain = match intent_core::current_caller() {
+        Some(Caller::Agent { agent_id }) => chain_entry(svc, Some(agent_id)).await?,
+        _ => None,
     };
+    let (cloud_machine_id, saved) =
+        config::resolve(svc, placement.cloud_machine_id.as_deref(), chain.as_deref()).await?;
+    let tag = |error: Error| intent_core::machines::with_cloud_machine_id(error, &cloud_machine_id);
+    admit_entry(&saved, needs).map_err(tag)?;
+    Ok(Some(view(
+        None,
+        &EntryRef {
+            id: cloud_machine_id,
+            name: saved.name,
+        },
+    )))
+}
+
+/// The checks of a new sandbox with entry `saved`: its key is not known to
+/// be rejected, the launch sends a profile, the base provider is in the
+/// template.
+fn admit_entry(saved: &config::ProviderConfig, needs: &RemoteLaunchNeeds) -> Result<()> {
     if saved.state == ProviderState::KeyRejected {
         return Err(config::key_rejected(None));
     }
@@ -208,7 +269,65 @@ pub(crate) async fn admit(
             false,
         ))));
     }
-    Ok(Some(view(None)))
+    Ok(())
+}
+
+/// The entry of the nearest agent from `from` up its parents whose
+/// placement names an entry that still exists.
+async fn chain_entry(svc: &Services, from: Option<AgentId>) -> Result<Option<String>> {
+    let mut current = from;
+    for _ in 0..64 {
+        let Some(id) = current.take() else { break };
+        let session = match svc.store().get_agent_session_summary(&id).await {
+            Ok(session) => session,
+            Err(Error::NotFound(_)) => break,
+            Err(error) => return Err(error),
+        };
+        let named = RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .and_then(|view| view.placement.cloud_machine_id);
+        if let Some(entry) = named {
+            if config::load(svc, &entry).await?.is_some() {
+                return Ok(Some(entry));
+            }
+        }
+        current.clone_from(&session.parent_agent_id);
+    }
+    Ok(None)
+}
+
+/// The entry a new sandbox of cloud agent `agent_id` starts with: the one
+/// on its view; or, when its entry was removed, one picked again as for an
+/// omitted `cloudMachineId` (from its parents), then kept on its view.
+async fn agent_entry(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+    view: &RemotePlacementView,
+) -> Result<EntryRef> {
+    if view.placement.cloud_machine_id.is_some() {
+        return Ok(EntryRef::of_view(view));
+    }
+    let parent = svc
+        .store()
+        .get_agent_session_summary(agent_id)
+        .await?
+        .parent_agent_id
+        .clone();
+    let chain = chain_entry(svc, parent).await?;
+    let (id, saved) = config::resolve(svc, None, chain.as_deref()).await?;
+    let entry = EntryRef {
+        id,
+        name: saved.name,
+    };
+    let stored = entry.clone();
+    crate::view::update(svc.store(), workspace_id, agent_id, move |view| {
+        view.placement.cloud_machine_id = Some(stored.id);
+        view.node_name = stored.name;
+    })
+    .await?;
+    svc.publish_agent_placement_changed(workspace_id, agent_id)
+        .await;
+    Ok(entry)
 }
 
 /// Start the sandbox of a just-created (or sandbox-less) cloud agent in the
@@ -229,20 +348,42 @@ pub(crate) async fn begin_start(
     let Ok(feature) = super::feature(svc) else {
         return;
     };
+    let read_view = || async {
+        svc.store()
+            .get_agent_session_summary(agent_id)
+            .await
+            .ok()
+            .and_then(|session| RemotePlacementView::from_metadata(session.metadata.as_ref()))
+    };
+    // The entry is read (or picked again) before the start registers, so
+    // removing an entry waits only for its own starts.
+    let Some(before) = read_view().await else {
+        return;
+    };
+    let entry = match agent_entry(svc, workspace_id, agent_id, &before).await {
+        Ok(entry) => entry,
+        Err(error) => {
+            if before.is_unlinked() {
+                record_failure(svc, workspace_id, agent_id, &StartFailure::of(&error)).await;
+            }
+            return;
+        }
+    };
     let (sender, receiver) = watch::channel::<StartOutcome>(None);
     {
         let mut starts = crate::lock(&feature.cloud.starts);
         if starts.contains_key(agent_id.as_str()) {
             return;
         }
-        starts.insert(agent_id.to_string(), receiver);
+        starts.insert(
+            agent_id.to_string(),
+            super::Start {
+                entry: entry.id.clone(),
+                outcome: receiver,
+            },
+        );
     }
-    let current = svc
-        .store()
-        .get_agent_session_summary(agent_id)
-        .await
-        .ok()
-        .and_then(|session| RemotePlacementView::from_metadata(session.metadata.as_ref()));
+    let current = read_view().await;
     let still_waiting = current
         .as_ref()
         .is_some_and(|view| view.is_unlinked() && view.placement_error.as_ref() == seen);
@@ -256,7 +397,9 @@ pub(crate) async fn begin_start(
     let workspace_id = workspace_id.clone();
     let agent_id = agent_id.clone();
     tokio::spawn(async move {
-        let outcome = start(&svc, &workspace_id, &agent_id, started_by).await;
+        let outcome = start(&svc, &workspace_id, &agent_id, &entry.id, started_by)
+            .await
+            .map_err(|error| intent_core::machines::with_cloud_machine_id(error, &entry.id));
         let outcome = match outcome {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -396,9 +539,9 @@ async fn record_failure(
     }
 }
 
-/// `"E2B · <agent name>"`, cut to the row name limit.
-fn machine_name(agent_name: &str) -> String {
-    let mut name = format!("{CLOUD_PROVIDER_E2B_NAME} · {}", agent_name.trim());
+/// `"<entry name> · <agent name>"`, cut to the row name limit.
+pub(super) fn machine_name(entry_name: &str, agent_name: &str) -> String {
+    let mut name = format!("{} · {}", entry_name.trim(), agent_name.trim());
     if name.len() > MAX_NAME_BYTES {
         let mut end = MAX_NAME_BYTES;
         while !name.is_char_boundary(end) {
@@ -429,17 +572,27 @@ async fn start(
     svc: &Services,
     workspace_id: &WorkspaceId,
     agent_id: &AgentId,
+    cloud_machine_id: &str,
     started_by: intent_core::machines::CloudStartedBy,
 ) -> Result<()> {
     let feature = super::feature(svc)?;
     step(svc, workspace_id, agent_id, CloudStartStep::CreatingSandbox).await;
-    let saved = config::load(svc)
+    let saved = config::load(svc, cloud_machine_id)
         .await?
         .ok_or_else(config::not_configured)?;
-    let key = config::saved_key(svc)
+    let key = config::saved_key(svc, cloud_machine_id)
         .await?
         .ok_or_else(config::not_configured)?;
     let client = config::client(key.clone())?;
+    // A rename may have run since admission wrote the entry's name.
+    let renamed = crate::view::update(svc.store(), workspace_id, agent_id, |view| {
+        view.node_name.clone_from(&saved.name);
+    })
+    .await;
+    if matches!(renamed, Ok(true)) {
+        svc.publish_agent_placement_changed(workspace_id, agent_id)
+            .await;
+    }
     let session = svc.store().get_agent_session_summary(agent_id).await?;
     let backend_id = svc.store().daemon_id().await?;
     let template = saved.template(saved.size);
@@ -447,6 +600,7 @@ async fn start(
     metadata.insert("intentBackendId".to_owned(), backend_id.clone());
     metadata.insert("workspaceId".to_owned(), workspace_id.to_string());
     metadata.insert("agentId".to_owned(), agent_id.to_string());
+    metadata.insert("intentEntryId".to_owned(), cloud_machine_id.to_owned());
     metadata.insert(
         "intentdVersion".to_owned(),
         config::intentd_version().to_owned(),
@@ -465,7 +619,7 @@ async fn start(
         Ok(created) => created,
         Err(error) => {
             if is_key_rejected(&error) {
-                config::note_key_rejected(svc, &key).await;
+                config::note_key_rejected(svc, cloud_machine_id, &key).await;
             }
             return Err(error);
         }
@@ -483,6 +637,7 @@ async fn start(
         step(svc, workspace_id, agent_id, CloudStartStep::Connecting).await;
         let cloud = CloudMachine {
             provider: CLOUD_PROVIDER_E2B.to_owned(),
+            cloud_machine_id: cloud_machine_id.to_owned(),
             sandbox_id: sandbox_id.clone(),
             state: CloudSandboxState::Running,
             template: template.clone(),
@@ -501,7 +656,7 @@ async fn start(
             svc,
             AddParams {
                 machine_id: minted.machine_id,
-                name: machine_name(&session.name),
+                name: machine_name(&saved.name, &session.name),
                 hosts: minted.hosts,
                 port: minted.port,
                 tc_address: minted.tc_address,
@@ -514,7 +669,7 @@ async fn start(
         .await?;
         // `cloudMachines.remove` may have run meanwhile: nothing would be
         // left to delete this sandbox.
-        let launched = if config::load(svc).await?.is_none() {
+        let launched = if config::load(svc, cloud_machine_id).await?.is_none() {
             Err(config::not_configured())
         } else {
             link(feature, svc, workspace_id, agent_id, &machine_id).await

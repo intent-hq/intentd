@@ -47,6 +47,7 @@ async fn cloud_row(backend: &Backend, id: &str, starter: &PrincipalId) {
             node_protocol: None,
             cloud: Some(CloudMachine {
                 provider: "e2b".into(),
+                cloud_machine_id: "e2b".into(),
                 sandbox_id: format!("sbx-{id}"),
                 state: CloudSandboxState::Running,
                 template: "intent/intent-node-4x8:0".into(),
@@ -152,5 +153,365 @@ async fn pause_and_kill_admit_only_the_owner_and_the_starter() {
     match unknown {
         Err(Error::RemoteMachine(failure)) => assert_eq!(failure.data["code"], "not-found"),
         other => panic!("an unknown machine is not-found: {other:?}"),
+    }
+}
+
+mod entries {
+    //! Named E2B entries: the migration of a single provider, which entry
+    //! a placement picks, and the `configure` refusals that come before any
+    //! E2B call.
+
+    use intent_core::remote_launch::{RemotePlacementView, REMOTE_PLACEMENT_METADATA_KEY};
+    use intent_core::{AgentId, Workspace};
+
+    use super::*;
+    use crate::cloud::config::{self, ProviderConfig};
+
+    /// A cloud agent whose placement names `entry` (none when `None`).
+    async fn cloud_agent(backend: &Backend, entry: Option<&str>) -> AgentId {
+        let store = backend.store();
+        let now = intent_core::now_iso();
+        // Already there for the second agent.
+        let _ = store
+            .insert_workspace(&Workspace {
+                id: workspace(),
+                title: "Cloud".into(),
+                branch: "main".into(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                ..Default::default()
+            })
+            .await;
+        let agent = AgentId::new();
+        sqlx::query("INSERT INTO agent_session (id, workspace_id, name, status, provider, created_at, updated_at) VALUES (?, ?, 'cloud', 'idle', 'codex', ?, ?)")
+            .bind(agent.as_str())
+            .bind(workspace().as_str())
+            .bind(&now)
+            .bind(&now)
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        let mut placement = json!({ "target": "e2b", "checkout": "isolated" });
+        if let Some(entry) = entry {
+            placement["cloudMachineId"] = json!(entry);
+        }
+        let view = json!({
+            "nodeId": "", "leaseId": "", "nodeName": "E2B", "placement": placement,
+            "effectiveIsolation": "pending", "baseCommit": "",
+        });
+        store
+            .set_agent_session_metadata_key_json(
+                &workspace(),
+                &agent,
+                REMOTE_PLACEMENT_METADATA_KEY,
+                &view.to_string(),
+                &now,
+            )
+            .await
+            .unwrap();
+        agent
+    }
+
+    async fn entry_of(backend: &Backend, agent: &AgentId) -> Option<String> {
+        let session = backend
+            .store()
+            .get_agent_session_summary(agent)
+            .await
+            .unwrap();
+        RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .unwrap()
+            .placement
+            .cloud_machine_id
+    }
+
+    async fn save_entry(backend: &Backend, id: &str, name: &str) {
+        config::save(&backend.services, id, &ProviderConfig::new(name))
+            .await
+            .unwrap();
+    }
+
+    fn reason(result: intent_core::Result<impl std::fmt::Debug>) -> Value {
+        match result {
+            Err(Error::RemoteMachine(failure)) => failure.data,
+            other => panic!("expected a cloud error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_saved_single_provider_becomes_the_entry_e2b() {
+        let backend = Backend::new().await;
+        let store = backend.store();
+        // As saved before entries: no name on the settings, no entry on the
+        // sandbox row or the agents.
+        store
+            .save_cloud_machine_provider(
+                "e2b",
+                &json!({
+                    "templateProject": "intent", "size": "4x8", "idlePauseMinutes": 15,
+                    "pausedDeleteDays": 7, "configuredAt": "2026-01-01T00:00:00Z",
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let starter = principal(&backend, true).await;
+        cloud_row(&backend, "m-1", &starter).await;
+        sqlx::query(
+            "UPDATE exposed_machine SET cloud_json = json_remove(cloud_json, '$.cloudMachineId')",
+        )
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+        let old = cloud_agent(&backend, None).await;
+        let other = cloud_agent(&backend, Some("e2b-0123456789ab")).await;
+        // A size check that saves the settings before the migration runs
+        // (a client listing right after a restart) gives them a name; they
+        // are still migrated.
+        let early = config::load(&backend.services, "e2b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!early.migrated);
+        config::save(&backend.services, "e2b", &early)
+            .await
+            .unwrap();
+
+        config::migrate(&backend.services).await.unwrap();
+
+        let entries = config::load_all(&backend.services).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "e2b");
+        assert_eq!(entries[0].1.name, "E2B");
+        assert_eq!(entries[0].1.idle_pause_minutes, 15, "settings kept");
+        let raw: String = sqlx::query_scalar("SELECT cloud_json FROM exposed_machine")
+            .fetch_one(store.read_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&raw).unwrap()["cloudMachineId"],
+            "e2b"
+        );
+        assert_eq!(entry_of(&backend, &old).await.as_deref(), Some("e2b"));
+        assert_eq!(
+            entry_of(&backend, &other).await.as_deref(),
+            Some("e2b-0123456789ab"),
+            "an agent that names an entry keeps it"
+        );
+
+        // Once migrated, an agent without an entry (its entry was removed)
+        // stays without one.
+        let cleared = cloud_agent(&backend, None).await;
+        config::migrate(&backend.services).await.unwrap();
+        assert_eq!(entry_of(&backend, &cleared).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_placement_picks_its_entry_in_the_documented_order() {
+        let backend = Backend::new().await;
+        let svc = &backend.services;
+        let none = config::resolve(svc, None, None).await;
+        assert_eq!(reason(none)["reason"], "not-configured");
+        let unknown = reason(config::resolve(svc, Some("e2b-ffffffffffff"), None).await);
+        assert_eq!(unknown["reason"], "not-configured");
+        assert_eq!(unknown["cloudMachineId"], "e2b-ffffffffffff");
+
+        save_entry(&backend, "e2b-aaaaaaaaaaaa", "Alpha").await;
+        let (only, _) = config::resolve(svc, None, None).await.unwrap();
+        assert_eq!(only, "e2b-aaaaaaaaaaaa", "the only entry");
+
+        save_entry(&backend, "e2b-bbbbbbbbbbbb", "Beta").await;
+        let required = reason(config::resolve(svc, None, None).await);
+        assert_eq!(required["reason"], "entry-required");
+        assert_eq!(required["retryable"], false);
+        assert_eq!(
+            required["entries"],
+            json!([
+                { "cloudMachineId": "e2b-aaaaaaaaaaaa", "name": "Alpha" },
+                { "cloudMachineId": "e2b-bbbbbbbbbbbb", "name": "Beta" },
+            ])
+        );
+        let (chained, _) = config::resolve(svc, None, Some("e2b-bbbbbbbbbbbb"))
+            .await
+            .unwrap();
+        assert_eq!(chained, "e2b-bbbbbbbbbbbb", "the creating chain's entry");
+        let gone = reason(config::resolve(svc, None, Some("e2b-cccccccccccc")).await);
+        assert_eq!(
+            gone["reason"], "entry-required",
+            "a removed chain entry is skipped"
+        );
+
+        save_entry(&backend, "e2b", "Legacy").await;
+        let (legacy, _) = config::resolve(svc, None, None).await.unwrap();
+        assert_eq!(
+            legacy, "e2b",
+            "an older client's placement falls back to e2b"
+        );
+        let (named, _) = config::resolve(svc, Some("e2b-aaaaaaaaaaaa"), Some("e2b"))
+            .await
+            .unwrap();
+        assert_eq!(named, "e2b-aaaaaaaaaaaa", "a named entry wins");
+    }
+
+    async fn configure(backend: &Backend, params: Value) -> intent_core::Result<Value> {
+        let owner = backend.store().get_primary_principal().await.unwrap().id;
+        with_caller(
+            Caller::Wire {
+                principal_id: owner,
+                host_role: HostRole::Owner,
+            },
+            backend.services.cloud_machines("configure", params),
+        )
+        .await
+    }
+
+    fn invalid(result: intent_core::Result<Value>) -> String {
+        match result {
+            Err(Error::InvalidParams(message)) => message,
+            other => panic!("expected invalid-params: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_refuses_before_any_e2b_call() {
+        let backend = Backend::new().await;
+        let unknown =
+            reason(configure(&backend, json!({ "cloudMachineId": "e2b-ffffffffffff" })).await);
+        assert_eq!(unknown["code"], "not-found");
+        invalid(configure(&backend, json!({ "provider": "aws" })).await);
+        invalid(configure(&backend, json!({ "name": "  " })).await);
+        invalid(configure(&backend, json!({ "name": "x".repeat(65) })).await);
+        invalid(configure(&backend, json!({ "name": "A\u{7}" })).await);
+        invalid(
+            configure(
+                &backend,
+                json!({ "name": "A", "apiKey": "k", "apiKeyFrom": "e2b" }),
+            )
+            .await,
+        );
+        // Creating needs a key.
+        let keyless = reason(configure(&backend, json!({ "name": "Alpha" })).await);
+        assert_eq!(keyless["reason"], "not-configured");
+        let legacy = reason(configure(&backend, json!({ "provider": "e2b" })).await);
+        assert_eq!(legacy["reason"], "not-configured");
+
+        save_entry(&backend, "e2b", "E2B").await;
+        save_entry(&backend, "e2b-aaaaaaaaaaaa", "Alpha").await;
+        let taken = invalid(configure(&backend, json!({ "name": "alpha", "apiKey": "k" })).await);
+        assert!(taken.contains("already exists"), "{taken}");
+        let renamed = invalid(
+            configure(
+                &backend,
+                json!({ "cloudMachineId": "e2b", "name": "ALPHA" }),
+            )
+            .await,
+        );
+        assert!(renamed.contains("already exists"), "{renamed}");
+        let own = invalid(
+            configure(
+                &backend,
+                json!({ "cloudMachineId": "e2b", "apiKeyFrom": "e2b" }),
+            )
+            .await,
+        );
+        assert!(own.contains("another"), "{own}");
+        let missing = reason(
+            configure(
+                &backend,
+                json!({ "name": "Copy", "apiKeyFrom": "e2b-ffffffffffff" }),
+            )
+            .await,
+        );
+        assert_eq!(missing["code"], "not-found");
+        let keyless_source =
+            reason(configure(&backend, json!({ "name": "Copy", "apiKeyFrom": "e2b" })).await);
+        assert_eq!(keyless_source["code"], "not-found", "the source has no key");
+
+        for n in 2..16 {
+            save_entry(&backend, &format!("e2b-{n:012x}"), &format!("Entry {n}")).await;
+        }
+        let full =
+            invalid(configure(&backend, json!({ "name": "Seventeenth", "apiKey": "k" })).await);
+        assert!(full.contains("16"), "{full}");
+        let names: Vec<(String, ProviderConfig)> =
+            config::load_all(&backend.services).await.unwrap();
+        assert_eq!(names.len(), 16);
+    }
+
+    #[tokio::test]
+    async fn unknown_ids_name_no_entry() {
+        let backend = Backend::new().await;
+        // The legacy create path: "e2b" does not exist, so apiKeyFrom "e2b"
+        // names no entry.
+        let missing = reason(configure(&backend, json!({ "apiKeyFrom": "e2b" })).await);
+        assert_eq!(missing["code"], "not-found");
+        let empty = reason(configure(&backend, json!({ "cloudMachineId": "" })).await);
+        assert_eq!(empty["code"], "not-found");
+        let long = invalid(configure(&backend, json!({ "cloudMachineId": "e".repeat(65) })).await);
+        assert!(long.contains("64"), "{long}");
+    }
+
+    async fn remove(backend: &Backend, params: Value) -> intent_core::Result<Value> {
+        let owner = backend.store().get_primary_principal().await.unwrap().id;
+        with_caller(
+            Caller::Wire {
+                principal_id: owner,
+                host_role: HostRole::Owner,
+            },
+            backend.services.cloud_machines("remove", params),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_removed_entrys_key_kept_for_the_reaper_is_no_entry() {
+        let backend = Backend::new().await;
+        let svc = &backend.services;
+        let mut retired = ProviderConfig::new("e2b");
+        retired.retired_from = Some("e2b".into());
+        config::save(svc, "retired-e2b-0123456789ab", &retired)
+            .await
+            .unwrap();
+        svc.store_cloud_machine_key("retired-e2b-0123456789ab", "k")
+            .await
+            .unwrap();
+
+        assert!(config::load_all(svc).await.unwrap().is_empty());
+        assert!(config::load(svc, "retired-e2b-0123456789ab")
+            .await
+            .unwrap()
+            .is_none());
+        let none = config::resolve(svc, None, None).await;
+        assert_eq!(reason(none)["reason"], "not-configured");
+        assert_ne!(
+            config::new_cloud_machine_id(svc).await.unwrap(),
+            "e2b",
+            "a new entry does not reuse the id the reaper still holds a key for"
+        );
+        let noop = remove(
+            &backend,
+            json!({ "cloudMachineId": "retired-e2b-0123456789ab", "stopAgents": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(noop, json!({ "ok": true, "unconfirmedStops": [] }));
+        assert_eq!(
+            config::load_retired(svc).await.unwrap(),
+            vec![("retired-e2b-0123456789ab".to_owned(), "e2b".to_owned())],
+            "remove leaves the reaper's key alone"
+        );
+        assert!(config::saved_key(svc, "retired-e2b-0123456789ab")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn a_new_legacy_entry_takes_the_first_free_name() {
+        let entries = vec![
+            ("e2b-aaaaaaaaaaaa".to_owned(), ProviderConfig::new("e2b")),
+            ("e2b-bbbbbbbbbbbb".to_owned(), ProviderConfig::new("E2B 2")),
+        ];
+        assert_eq!(config::free_legacy_name(&entries, "e2b"), "E2B 3");
+        assert_eq!(config::free_legacy_name(&[], "e2b"), "E2B");
     }
 }

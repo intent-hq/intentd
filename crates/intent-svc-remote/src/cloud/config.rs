@@ -1,12 +1,18 @@
-//! The E2B provider's saved settings, its client and the mapping of E2B
-//! failures onto the documented `cloud-*` errors.
+//! The saved settings of each named E2B entry, its client and the mapping
+//! of E2B failures onto the documented `cloud-*` errors.
+//!
+//! Every entry is one `cloud_machine_provider` row (its id is the entry id)
+//! with its own key in the secret store under `cloudMachines.<id>.apiKey`.
+//! A single-provider setup saved before entries existed is the entry
+//! [`CLOUD_E2B_LEGACY_ENTRY`]: its row and key account already have that
+//! id, and its settings read with the name [`CLOUD_PROVIDER_E2B_NAME`].
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use intent_core::machines::{
-    cloud_machine_unavailable, cloud_quota, CloudMachineSize, CLOUD_PROVIDER_E2B,
-    CLOUD_PROVIDER_E2B_NAME,
+    cloud_machine_unavailable, cloud_quota, with_cloud_machine_id, CloudMachineSize,
+    CLOUD_E2B_LEGACY_ENTRY, CLOUD_PROVIDER_E2B, CLOUD_PROVIDER_E2B_NAME,
 };
 use intent_core::{now_iso, Error, Result};
 use intent_nodes::e2b::{E2bClient, E2bConfig, E2bError, QuotaLimit, SecretString};
@@ -48,10 +54,30 @@ pub(crate) enum ProviderState {
     Unreachable,
 }
 
-/// The saved provider settings (`cloud_machine_provider.config_json`).
+/// Longest entry name, in UTF-8 bytes.
+pub(crate) const MAX_ENTRY_NAME_BYTES: usize = 64;
+
+fn legacy_name() -> String {
+    CLOUD_PROVIDER_E2B_NAME.to_owned()
+}
+
+/// The saved settings of one entry (`cloud_machine_provider.config_json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderConfig {
+    /// The entry's name; settings saved before entries existed read as
+    /// "E2B".
+    #[serde(default = "legacy_name")]
+    pub(crate) name: String,
+    /// Set on the row of a removed entry whose key is kept only so the
+    /// reaper can delete sandboxes E2B would not delete at removal: the
+    /// removed entry's id. Such a row is no entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retired_from: Option<String>,
+    /// Whether the row was saved as an entry. `false` only on a single
+    /// provider saved before entries existed, until [`migrate`] ran.
+    #[serde(default)]
+    pub(crate) migrated: bool,
     pub(crate) template_project: String,
     pub(crate) size: CloudMachineSize,
     pub(crate) idle_pause_minutes: u32,
@@ -76,8 +102,11 @@ pub(crate) struct ProviderConfig {
 }
 
 impl ProviderConfig {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         Self {
+            name: name.to_owned(),
+            retired_from: None,
+            migrated: true,
             template_project: DEFAULT_TEMPLATE_PROJECT.to_owned(),
             size: CloudMachineSize::DEFAULT,
             idle_pause_minutes: 10,
@@ -146,11 +175,13 @@ impl ProviderConfig {
             })
     }
 
-    /// `CloudMachineProvider` on the wire. Never holds the key.
-    pub(crate) fn to_json(&self) -> Value {
+    /// `CloudMachineProvider` on the wire for entry `id`. Never holds the
+    /// key.
+    pub(crate) fn to_json(&self, id: &str) -> Value {
         let mut provider = json!({
-            "id": CLOUD_PROVIDER_E2B,
-            "name": CLOUD_PROVIDER_E2B_NAME,
+            "id": id,
+            "provider": CLOUD_PROVIDER_E2B,
+            "name": self.name,
             "state": self.state,
             "template": self.template(self.size),
             "templateProject": self.template_project,
@@ -194,35 +225,257 @@ pub(crate) fn agent_providers() -> Vec<String> {
     }
 }
 
-/// The saved settings, `None` when E2B is not configured.
-pub(crate) async fn load(svc: &Services) -> Result<Option<ProviderConfig>> {
-    let Some(json) = svc
-        .store()
-        .get_cloud_machine_provider(CLOUD_PROVIDER_E2B)
-        .await?
-    else {
+/// Entry `id`'s saved settings, `None` when there is no such entry (or it
+/// was removed and only its key waits for the reaper).
+pub(crate) async fn load(svc: &Services, id: &str) -> Result<Option<ProviderConfig>> {
+    let Some(json) = svc.store().get_cloud_machine_provider(id).await? else {
         return Ok(None);
     };
-    serde_json::from_str(&json)
-        .map(Some)
+    Ok(Some(decode(&json)?).filter(|config| config.retired_from.is_none()))
+}
+
+fn decode(json: &str) -> Result<ProviderConfig> {
+    serde_json::from_str(json)
         .map_err(|e| Error::Internal(format!("the saved E2B settings are unreadable: {e}")))
 }
 
-pub(crate) async fn save(svc: &Services, config: &ProviderConfig) -> Result<()> {
-    let json = serde_json::to_string(config)
-        .map_err(|e| Error::Internal(format!("encode the E2B settings: {e}")))?;
-    svc.store()
-        .save_cloud_machine_provider(CLOUD_PROVIDER_E2B, &json)
-        .await
+/// Every saved row, removed entries waiting for the reaper included, in the
+/// order they were added. An unreadable one is left out (and logged).
+async fn load_rows(svc: &Services) -> Result<Vec<(String, ProviderConfig)>> {
+    Ok(svc
+        .store()
+        .list_cloud_machine_providers()
+        .await?
+        .into_iter()
+        .filter_map(|(id, json)| match decode(&json) {
+            Ok(config) => Some((id, config)),
+            Err(error) => {
+                tracing::warn!(entry = %id, %error, "cloud machines: skipping an unreadable E2B entry");
+                None
+            }
+        })
+        .collect())
 }
 
-/// The saved key.
-pub(crate) async fn saved_key(svc: &Services) -> Result<Option<SecretString>> {
+/// Every entry, in the order they were added.
+pub(crate) async fn load_all(svc: &Services) -> Result<Vec<(String, ProviderConfig)>> {
+    Ok(load_rows(svc)
+        .await?
+        .into_iter()
+        .filter(|(_, config)| config.retired_from.is_none())
+        .collect())
+}
+
+/// The removed entries whose key is kept only for the reaper: `(row id,
+/// removed entry id)`.
+pub(crate) async fn load_retired(svc: &Services) -> Result<Vec<(String, String)>> {
+    Ok(load_rows(svc)
+        .await?
+        .into_iter()
+        .filter_map(|(id, config)| config.retired_from.map(|from| (id, from)))
+        .collect())
+}
+
+pub(crate) async fn save(svc: &Services, id: &str, config: &ProviderConfig) -> Result<()> {
+    let json = serde_json::to_string(config)
+        .map_err(|e| Error::Internal(format!("encode the E2B settings: {e}")))?;
+    svc.store().save_cloud_machine_provider(id, &json).await
+}
+
+/// Entry `id`'s saved key.
+pub(crate) async fn saved_key(svc: &Services, id: &str) -> Result<Option<SecretString>> {
     Ok(svc
-        .load_cloud_machine_key(CLOUD_PROVIDER_E2B)
+        .load_cloud_machine_key(id)
         .await?
         .filter(|key| !key.is_empty())
         .map(SecretString::new))
+}
+
+/// `e2b-<12 lowercase hex>`.
+fn random_id() -> String {
+    let hex = uuid::Uuid::new_v4().simple().to_string();
+    format!("{CLOUD_PROVIDER_E2B}-{}", &hex[..12])
+}
+
+/// The id of a new entry: `"e2b"` while no saved row has it, else
+/// `e2b-<12 hex>`.
+pub(crate) async fn new_cloud_machine_id(svc: &Services) -> Result<String> {
+    let rows = load_rows(svc).await?;
+    // A removed "e2b" whose key waits for the reaper keeps the id taken, so
+    // the reaper never counts a new entry's sandboxes as the removed one's.
+    let taken = |id: &str| {
+        rows.iter()
+            .any(|(row, saved)| row == id || saved.retired_from.as_deref() == Some(id))
+    };
+    if !taken(CLOUD_E2B_LEGACY_ENTRY) {
+        return Ok(CLOUD_E2B_LEGACY_ENTRY.to_owned());
+    }
+    loop {
+        let id = random_id();
+        if !taken(&id) {
+            return Ok(id);
+        }
+    }
+}
+
+/// Whether `id` is the row of a removed entry's key kept for the reaper.
+pub(crate) async fn is_retired(svc: &Services, id: &str) -> Result<bool> {
+    let Some(json) = svc.store().get_cloud_machine_provider(id).await? else {
+        return Ok(false);
+    };
+    Ok(decode(&json)?.retired_from.is_some())
+}
+
+/// The row id a removed entry's key is kept under for the reaper. It is not
+/// an entry id, so a new entry never reuses it.
+pub(crate) fn retired_id() -> String {
+    format!("retired-{}", random_id())
+}
+
+/// A valid entry name: 1-64 UTF-8 bytes after trimming, no control
+/// characters.
+///
+/// # Errors
+///
+/// `InvalidParams` otherwise.
+pub(crate) fn entry_name(raw: &str) -> Result<String> {
+    let name = raw.trim();
+    if name.is_empty() || name.len() > MAX_ENTRY_NAME_BYTES || name.chars().any(char::is_control) {
+        return Err(Error::InvalidParams(format!(
+            "name must be 1-{MAX_ENTRY_NAME_BYTES} UTF-8 bytes with no control characters"
+        )));
+    }
+    Ok(name.to_owned())
+}
+
+/// The first of "E2B", "E2B 2", "E2B 3", ... no entry other than `id` has
+/// (ignoring case).
+pub(crate) fn free_legacy_name(entries: &[(String, ProviderConfig)], id: &str) -> String {
+    let taken = |name: &str| {
+        entries
+            .iter()
+            .any(|(other, saved)| other != id && saved.name.to_lowercase() == name.to_lowercase())
+    };
+    let mut n = 1u32;
+    loop {
+        let name = if n == 1 {
+            CLOUD_PROVIDER_E2B_NAME.to_owned()
+        } else {
+            format!("{CLOUD_PROVIDER_E2B_NAME} {n}")
+        };
+        if !taken(&name) {
+            return name;
+        }
+        n += 1;
+    }
+}
+
+/// The entry a new sandbox starts with: with no entry at all,
+/// `not-configured`; the `requested` entry (`not-configured` when unknown);
+/// else the entry of the creating agent's chain (`chain`, when it still
+/// exists); else the only entry; else `"e2b"`; else `entry-required`.
+///
+/// # Errors
+///
+/// As above, each `cloud-machine-unavailable` naming the entry when known.
+pub(crate) async fn resolve(
+    svc: &Services,
+    requested: Option<&str>,
+    chain: Option<&str>,
+) -> Result<(String, ProviderConfig)> {
+    let mut all = load_all(svc).await?;
+    if all.is_empty() {
+        return Err(match requested {
+            Some(id) => with_cloud_machine_id(not_configured(), id),
+            None => not_configured(),
+        });
+    }
+    let find = |all: &mut Vec<(String, ProviderConfig)>, id: &str| {
+        all.iter()
+            .position(|(entry, _)| entry == id)
+            .map(|at| all.swap_remove(at))
+    };
+    if let Some(id) = requested {
+        return find(&mut all, id).ok_or_else(|| with_cloud_machine_id(not_configured(), id));
+    }
+    if let Some(entry) = chain.and_then(|id| find(&mut all, id)) {
+        return Ok(entry);
+    }
+    if all.len() == 1 {
+        return Ok(all.remove(0));
+    }
+    if let Some(entry) = find(&mut all, CLOUD_E2B_LEGACY_ENTRY) {
+        return Ok(entry);
+    }
+    Err(entry_required(&all))
+}
+
+/// `cloud-machine-unavailable` `entry-required`, listing `entries`.
+fn entry_required(entries: &[(String, ProviderConfig)]) -> Error {
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|(_, saved)| saved.name.as_str())
+        .collect();
+    let error = cloud_machine_unavailable(
+        "entry-required",
+        false,
+        None,
+        format!(
+            "Several E2B entries are set up; pick one of: {}.",
+            names.join(", ")
+        ),
+    );
+    match error {
+        Error::RemoteMachine(mut failure) => {
+            failure.data["entries"] = Value::Array(
+                entries
+                    .iter()
+                    .map(|(id, saved)| json!({ "cloudMachineId": id, "name": saved.name }))
+                    .collect(),
+            );
+            Error::RemoteMachine(failure)
+        }
+        other => other,
+    }
+}
+
+/// The entry id a cloud machine row saved before entries existed belongs
+/// to.
+pub(crate) fn legacy_entry() -> &'static str {
+    CLOUD_E2B_LEGACY_ENTRY
+}
+
+/// Turn a single provider saved before entries existed into the entry
+/// `"e2b"` named "E2B", once: its sandboxes and agents get
+/// `cloudMachineId: "e2b"`, then the row is marked `migrated` (a migration
+/// cut short runs again). Runs under the settings lock, so no `configure`,
+/// `remove` or size check interleaves.
+pub(crate) async fn migrate(svc: &Services) -> Result<()> {
+    let feature = super::feature(svc)?;
+    let _settings = feature.cloud.settings.lock().await;
+    let Some(mut legacy) = load(svc, CLOUD_E2B_LEGACY_ENTRY).await? else {
+        return Ok(());
+    };
+    if legacy.migrated {
+        return Ok(());
+    }
+    for row in svc.store().list_cloud_machines().await? {
+        if let Some(cloud) = &row.cloud {
+            svc.store().update_cloud_machine(&row.id, cloud).await?;
+        }
+    }
+    for (workspace_id, agent_id) in svc.store().list_cloud_placed_agents().await? {
+        crate::view::update(svc.store(), &workspace_id, &agent_id, |view| {
+            if view.placement.cloud_machine_id.is_none() {
+                view.placement.cloud_machine_id = Some(CLOUD_E2B_LEGACY_ENTRY.to_owned());
+            }
+        })
+        .await?;
+    }
+    legacy.migrated = true;
+    save(svc, CLOUD_E2B_LEGACY_ENTRY, &legacy).await?;
+    tracing::info!("cloud machines: the saved E2B provider is now the entry \"e2b\"");
+    Ok(())
 }
 
 /// A client for `key`.
@@ -241,13 +494,13 @@ pub(crate) fn client(key: SecretString) -> Result<E2bClient> {
     E2bClient::new(key, config).map_err(|error| to_error(&error, Phase::Other))
 }
 
-/// A client for the saved key.
+/// A client for entry `id`'s saved key.
 ///
 /// # Errors
 ///
 /// `cloud-machine-unavailable` `not-configured` without a saved key.
-pub(crate) async fn saved_client(svc: &Services) -> Result<E2bClient> {
-    let key = saved_key(svc).await?.ok_or_else(not_configured)?;
+pub(crate) async fn saved_client(svc: &Services, id: &str) -> Result<E2bClient> {
+    let key = saved_key(svc, id).await?.ok_or_else(not_configured)?;
     client(key)
 }
 
@@ -256,7 +509,7 @@ pub(crate) fn not_configured() -> Error {
         "not-configured",
         false,
         None,
-        "E2B is not set up on this backend: add an E2B API key in Settings → Machines.",
+        "This E2B entry is not set up on this backend: add one with an E2B API key in Settings → Nodes.",
     )
 }
 
@@ -265,7 +518,7 @@ pub(crate) fn key_rejected(status: Option<u16>) -> Error {
         "key-rejected",
         false,
         status,
-        "E2B rejected the saved API key: save a working key in Settings → Machines.",
+        "E2B rejected the saved API key: save a working key for this E2B entry in Settings → Nodes.",
     )
 }
 
@@ -296,7 +549,7 @@ pub(crate) fn to_error(error: &E2bError, phase: Phase) -> Error {
             _ => None,
         };
         let message = match limit {
-            QuotaLimit::Plan => "E2B refused this sandbox size for the project's plan or limits: pick a smaller size in Settings → Machines, or use E2B Pro and ask E2B support to raise the project's limits.",
+            QuotaLimit::Plan => "E2B refused this sandbox size for the project's plan or limits: pick a smaller size in Settings → Nodes, or use E2B Pro and ask E2B support to raise the project's limits.",
             QuotaLimit::Concurrency => "E2B's limit on running sandboxes for this project is reached: stop or pause another sandbox, or raise the plan's limit.",
             QuotaLimit::Rate => "E2B's request rate limit is reached: try again shortly.",
         };
@@ -395,31 +648,31 @@ pub(crate) async fn published_sizes(project: &str) -> Option<Published> {
     }
 }
 
-/// Mark the saved key rejected after E2B refused `refused` (401) on another
-/// call, so placement refuses before any sandbox, and announce the change.
-/// Under the settings lock, and only while `refused` is still the saved
-/// key: a start that used a key the owner has since replaced never marks
-/// the new one.
-pub(crate) async fn note_key_rejected(svc: &Services, refused: &SecretString) {
+/// Mark entry `id`'s saved key rejected after E2B refused `refused` (401)
+/// on another call, so placement refuses before any sandbox, and announce
+/// the change. Under the settings lock, and only while `refused` is still
+/// the entry's saved key: a start that used a key the owner has since
+/// replaced never marks the new one.
+pub(crate) async fn note_key_rejected(svc: &Services, id: &str, refused: &SecretString) {
     let Ok(feature) = super::feature(svc) else {
         return;
     };
     let _settings = feature.cloud.settings.lock().await;
-    if !matches!(saved_key(svc).await, Ok(Some(saved)) if &saved == refused) {
+    if !matches!(saved_key(svc, id).await, Ok(Some(saved)) if &saved == refused) {
         return;
     }
-    let Ok(Some(mut saved)) = load(svc).await else {
+    let Ok(Some(mut saved)) = load(svc, id).await else {
         return;
     };
     if saved.state == ProviderState::KeyRejected {
         return;
     }
     saved.state = ProviderState::KeyRejected;
-    if let Err(error) = save(svc, &saved).await {
+    if let Err(error) = save(svc, id, &saved).await {
         tracing::warn!(%error, "cloud machines: could not record the rejected key");
         return;
     }
-    svc.publish_cloud_machine_changed(json!({ "provider": saved.to_json() }), None)
+    svc.publish_cloud_machine_changed(json!({ "provider": saved.to_json(id) }), None)
         .await;
 }
 
