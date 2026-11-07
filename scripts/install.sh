@@ -372,7 +372,8 @@ validate_daemon_mode() {
 
 # Ask how this computer will be used (sets daemon_mode). Same /dev/tty and
 # bounded-retry pattern as the auto-resume prompt: Enter (or EOF) takes the
-# recommended full install.
+# recommended full install. Only a typed answer sets daemon_mode_explicit,
+# so Enter on a re-install never switches an existing node back.
 prompt_daemon_mode() {
   printf '%s\n' "How will you use this computer?" \
     "1) Run Intent here (recommended if you're just getting started): workspaces, agents and the app connect to it." \
@@ -384,8 +385,9 @@ prompt_daemon_mode() {
     reply=""
     read -r reply </dev/tty || reply=""
     case "$(normalize_daemon_mode "$reply")" in
-      '' | full) daemon_mode="full" ;;
-      node) daemon_mode="node" ;;
+      '') daemon_mode="full" ;;
+      full) daemon_mode="full" daemon_mode_explicit="yes" ;;
+      node) daemon_mode="node" daemon_mode_explicit="yes" ;;
       *) warn "unrecognized answer '$reply' — answer 1 or 2" ;;
     esac
   done
@@ -1125,7 +1127,6 @@ main() {
   if [ -z "$daemon_mode" ]; then
     if (exec </dev/tty) 2>/dev/null; then
       prompt_daemon_mode
-      daemon_mode_explicit="yes"
     else
       daemon_mode="full"
     fi

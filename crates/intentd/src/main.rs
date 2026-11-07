@@ -1280,8 +1280,9 @@ async fn enable_tunnel_for_pairing(socket: &Path) -> anyhow::Result<()> {
 /// `--yes` (or an unattended run) keeps the persisted server.bindAddress
 /// (default: loopback) and then turns the tunnel on per
 /// [`pair_wants_tunnel`]; otherwise a consent prompt, then the listen-target
-/// picker, with the tunnel pre-checked in the same cases.
-async fn enable_listener_for_pairing(socket: &Path, opts: PairOptions) -> anyhow::Result<()> {
+/// picker, with the tunnel pre-checked in the same cases. Returns whether
+/// this run turned the tunnel on, so the caller waits for its route.
+async fn enable_listener_for_pairing(socket: &Path, opts: PairOptions) -> anyhow::Result<bool> {
     let tunnel_enabled = current_bool_setting(socket, "server.tunnel.enabled").await?;
     let current = current_bind_addresses(socket).await;
     let loopback_only = current.iter().all(std::net::IpAddr::is_loopback);
@@ -1291,7 +1292,7 @@ async fn enable_listener_for_pairing(socket: &Path, opts: PairOptions) -> anyhow
         if wants_tunnel {
             enable_tunnel_for_pairing(socket).await?;
         }
-        return Ok(());
+        return Ok(wants_tunnel);
     }
     if !confirm_enable_wss()? {
         anyhow::bail!(
@@ -1305,7 +1306,8 @@ async fn enable_listener_for_pairing(socket: &Path, opts: PairOptions) -> anyhow
     let tunnel_only = current_bool_setting(socket, "server.tunnel.only").await?;
     let selection = prompt_listen_targets(&current, tunnel_enabled || wants_tunnel, tunnel_only)?;
     let changes = listen_selection_changes(&selection, &current, tunnel_enabled, tunnel_only);
-    enable_wss_listener(socket, &changes).await
+    enable_wss_listener(socket, &changes).await?;
+    Ok(selection.tailcat && !tunnel_enabled)
 }
 
 /// `--tunnel` with the listener already up: no picker runs, so turn the
@@ -1327,7 +1329,8 @@ fn has_tunnel_route(response: &Value) -> bool {
         .is_some_and(|tc| !tc.is_empty())
 }
 
-/// `--tunnel`: while the tunnel is enabled but has not reported its `tc`
+/// `--tunnel`, or a run that just turned the tunnel on: while the tunnel is
+/// enabled but has not reported its `tc`
 /// address yet, query `method` again (bounded by [`PAIR_TUNNEL_WAIT`]). A
 /// fresh tunnel-only daemon answers "no dialable route" until then, so this
 /// is what lets an unattended node install print a link. Returns the last
@@ -1377,11 +1380,12 @@ async fn fetch_pairing_result(
         enable_requested_tunnel(socket).await?;
     }
     let mut response = rpc_call(socket, method, json!({})).await?;
+    let mut tunnel_turned_on = false;
     if listener_down(&response) {
-        enable_listener_for_pairing(socket, opts).await?;
+        tunnel_turned_on = enable_listener_for_pairing(socket, opts).await?;
         response = rpc_call(socket, method, json!({})).await?;
     }
-    if opts.tunnel {
+    if opts.tunnel || tunnel_turned_on {
         response = await_tunnel_route(socket, method, response, listener_down).await?;
     }
     if let Some(error) = response.get("error") {

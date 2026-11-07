@@ -447,6 +447,28 @@ fn an_explicit_full_answer_switches_a_node_back() {
 }
 
 #[test]
+fn enter_on_a_node_keeps_it_and_a_typed_1_switches_it_back() {
+    let enter = run_install(Terminal::Answers("\n\n\n"), &[], &[], true);
+    assert!(enter.output.status.success(), "{}", enter.describe());
+    assert!(
+        !enter
+            .calls
+            .iter()
+            .any(|c| c.starts_with("settings daemon.mode"))
+            && !enter.called("restart"),
+        "{}",
+        enter.describe()
+    );
+    let typed = run_install(Terminal::Answers("1\n\n\n"), &[], &[], true);
+    assert!(typed.output.status.success(), "{}", typed.describe());
+    assert!(
+        typed.position("settings daemon.mode regular") < typed.position("restart"),
+        "{}",
+        typed.describe()
+    );
+}
+
+#[test]
 fn the_unasked_default_leaves_a_node_alone() {
     let run = run_install(Terminal::None, &["--service"], &[], true);
     assert!(run.output.status.success(), "{}", run.describe());

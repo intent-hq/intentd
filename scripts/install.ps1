@@ -210,15 +210,16 @@ if (-not $daemonMode) {
         Write-Host '2) Node only: lets another Intent run agents on this computer; nothing else runs here.'
         for ($try = 0; $try -lt 3 -and -not $daemonMode; $try++) {
             $answer = ConvertTo-DaemonMode (Read-Host 'Choose 1 or 2 [1]')
-            if ($answer -eq '' -or $answer -eq 'full') { $daemonMode = 'full' }
-            elseif ($answer -eq 'node') { $daemonMode = 'node' }
+            # Only a typed answer is explicit: Enter on a re-install never
+            # switches an existing node back.
+            if ($answer -eq '') { $daemonMode = 'full' }
+            elseif ($answer -eq 'full' -or $answer -eq 'node') { $daemonMode = $answer; $daemonModeExplicit = $true }
             else { Write-Warning "install.ps1: unrecognized answer '$answer' - answer 1 or 2" }
         }
         if (-not $daemonMode) {
             Write-Warning 'install.ps1: still no recognized answer - keeping the default (1, run Intent here)'
             $daemonMode = 'full'
         }
-        $daemonModeExplicit = $true
     } else {
         $daemonMode = 'full'
     }

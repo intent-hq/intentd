@@ -649,7 +649,9 @@ async fn pair_yes_turns_the_tunnel_on_for_a_loopback_only_listener() {
     };
     await_socket(&mut daemon, &socket).await;
 
-    let output = run_pair_until_success(&data_dir, &["--yes"]).await;
+    // One run, no retries: the first `pair --yes` on a fresh install must
+    // already print the tunnel link (it waits for the tunnel it turned on).
+    let output = run_pair(&data_dir, &["--yes"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
