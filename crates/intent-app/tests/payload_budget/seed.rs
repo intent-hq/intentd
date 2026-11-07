@@ -572,6 +572,7 @@ pub async fn store(state: &LargeState) -> Seeded {
                     owner_agent_name: Some(format!("Agent {i}")),
                     visibility: BrowserTabVisibility::Visible,
                     emulated_size: None,
+                    navigation_only: false,
                     displayed: Some(i % 2 == 0),
                 },
             )

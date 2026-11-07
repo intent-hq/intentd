@@ -1160,6 +1160,11 @@ async fn process_captured_frame(
             return reject_overloaded(&method, rpc_id, out_tx, overloaded).await;
         }
     };
+    // Only real user-message front doors carry device provenance. Never trust
+    // clientId/messageMetadata fields as the sender, nor inherit it on wakes.
+    let browser_ingress = parsed
+        .as_ref()
+        .and_then(|frame| browser_message_ingress(frame, reverse_guard.bound_client_id()));
     let api = api.clone();
     let raw = raw.to_string();
     let context = context.clone();
@@ -1173,7 +1178,12 @@ async fn process_captured_frame(
                     panic_guard::guard_prepared(
                         &method,
                         rpc_id,
-                        crate::router::prepare_message(api.as_ref(), &raw),
+                        crate::stack_frame::boxed_await(|| {
+                            intent_core::browser_message::with_browser_message_ingress(
+                                browser_ingress,
+                                crate::router::prepare_message(api.as_ref(), &raw),
+                            )
+                        }),
                     ),
                     slot,
                 )
@@ -1182,6 +1192,25 @@ async fn process_captured_frame(
             .await;
     });
     true
+}
+
+/// Capture only human-message front doors; caller metadata cannot supply a device.
+fn browser_message_ingress(
+    frame: &serde_json::Value,
+    client_id: Option<intent_core::ClientId>,
+) -> Option<intent_core::browser_message::BrowserMessageIngress> {
+    if !matches!(
+        frame["method"].as_str()?,
+        "agent.sendMessage" | "agent.queueMessage" | "agent.sendToTask" | "agent.editAndRegenerate"
+    ) {
+        return None;
+    }
+    let mut metadata = frame["params"]["messageMetadata"].clone();
+    if let Some(metadata) = metadata.as_object_mut() {
+        metadata.remove(intent_core::FROM_PRINCIPAL_ID_KEY);
+    }
+    intent_core::is_human_authored_metadata(Some(&metadata))
+        .then(|| intent_core::browser_message::BrowserMessageIngress::new(client_id))
 }
 
 /// Finish one detached slow-path RPC: await the guarded `handler`, release
@@ -3181,6 +3210,70 @@ mod monitor_event_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn browser_sender_ingress_uses_bound_identity_and_excludes_automatic_front_doors() {
+        use intent_core::browser_message::{
+            accept_browser_message, accepted_browser_message, with_browser_message_ingress,
+        };
+        let phone = intent_core::ClientId::from("bound-phone");
+        for method in [
+            "agent.sendMessage",
+            "agent.queueMessage",
+            "agent.sendToTask",
+            "agent.editAndRegenerate",
+        ] {
+            let frame = serde_json::json!({"method":method,"params":{"clientId":"spoofed", "messageMetadata":{"clientId":"spoofed","browserClientId":"spoofed"}}});
+            let ingress = browser_message_ingress(&frame, Some(phone.clone())).unwrap();
+            assert_eq!(ingress.client_id, Some(phone.clone()));
+            assert!(browser_message_ingress(&frame, None)
+                .unwrap()
+                .client_id
+                .is_none());
+            let agent = intent_core::AgentId::new();
+            with_browser_message_ingress(Some(ingress), async {
+                for caller in [
+                    intent_core::Caller::Daemon,
+                    intent_core::Caller::Agent {
+                        agent_id: agent.clone(),
+                    },
+                ] {
+                    intent_core::with_caller(caller, async {
+                        accept_browser_message(&agent, "automatic");
+                    })
+                    .await;
+                    assert!(accepted_browser_message(&agent).is_none());
+                }
+                let a = agent.clone();
+                assert!(tokio::spawn(async move { accepted_browser_message(&a) })
+                    .await
+                    .unwrap()
+                    .is_none());
+            })
+            .await;
+        }
+        for method in [
+            "agent.appendMessage",
+            "agent.retry",
+            "agent.reportToParent",
+            "agent.wakeOrCreate",
+            "agent.sendQueuedMessageNow",
+        ] {
+            assert!(browser_message_ingress(
+                &serde_json::json!({"method":method}),
+                Some(phone.clone())
+            )
+            .is_none());
+        }
+        for metadata in [
+            serde_json::json!({"source":"system"}),
+            serde_json::json!({"type":"pr_monitor_wake"}),
+            serde_json::json!({"fromAgentId":"subagent"}),
+            serde_json::json!({"source":"system", "fromPrincipalId":"spoofed"}),
+        ] {
+            assert!(browser_message_ingress(&serde_json::json!({"method":"agent.sendMessage","params":{"messageMetadata":metadata}}), Some(phone.clone())).is_none());
+        }
+    }
 
     #[tokio::test]
     async fn shutdown_fences_real_dispatch_and_waits_for_admitted_persistence() {

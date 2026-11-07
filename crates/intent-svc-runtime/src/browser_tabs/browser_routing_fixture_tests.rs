@@ -5,7 +5,7 @@
 //! [`Services::driving_client_target`]. intent-transport runs the other half,
 //! resolving that target against the case's connections.
 
-use intent_core::{ClientHostInfo, ClientId, ReverseTarget, WorkspaceId};
+use intent_core::{ClientHostInfo, ClientId, ReverseTarget, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
 use super::browser_client_pin_tests::{setup, FakeRegistry};
@@ -81,7 +81,7 @@ async fn routing_fixture_every_case_derives_the_expected_target() {
                 .expect("pin");
         }
         for tab in state["tabs"].as_array().expect("tabs") {
-            register_tab(
+            let registered = register_tab(
                 &svc,
                 &ws,
                 &format!("{name}/{}", tab["tabId"].as_str().expect("tabId")),
@@ -89,6 +89,14 @@ async fn routing_fixture_every_case_derives_the_expected_target() {
                 tab["owner"].as_str(),
             )
             .await;
+            if tab["navigationOnly"] == true {
+                let mut input: intent_core::BrowserTabInput =
+                    serde_json::from_value(serde_json::to_value(&registered).unwrap()).unwrap();
+                input.navigation_only = true;
+                svc.browser_upsert_tab(registered.host_client_id, input)
+                    .await
+                    .unwrap();
+            }
         }
         if let Some(client) = state["desktopSession"].as_str() {
             svc.feature_desktop()

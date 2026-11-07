@@ -37,7 +37,7 @@ const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 
 struct Daemon {
     child: GuardedChild,
-    _data_dir: tempfile::TempDir,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
@@ -155,7 +155,7 @@ fn client_config(fingerprint: &str) -> Arc<ClientConfig> {
 }
 
 struct Fixture {
-    _daemon: Daemon,
+    daemon: Daemon,
     port: u16,
     cfg: Arc<ClientConfig>,
 }
@@ -167,7 +167,7 @@ async fn boot() -> Fixture {
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        _data_dir: data_dir_guard,
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -179,7 +179,7 @@ async fn boot() -> Fixture {
         .expect("fingerprint")
         .to_string();
     Fixture {
-        _daemon: daemon,
+        daemon,
         port,
         cfg: client_config(&fingerprint),
     }
@@ -922,4 +922,209 @@ async fn hello_rehomes_tabs_from_a_superseded_client_id_over_wss() {
         .cloned()
         .unwrap_or_else(|| panic!("live tab listed: {listed}"));
     assert_eq!(live_tab["hostClientId"], "dev-2");
+}
+
+#[tokio::test]
+async fn native_navigation_reports_and_routes_over_secure_wss() {
+    let fx = boot().await;
+    let mut viewer = connect(&fx).await;
+    let created = wss_rpc(
+        &mut viewer,
+        1,
+        "workspace.create",
+        json!({"title":"Native navigation","branch":"main","skipWorktree":true}),
+    )
+    .await;
+    let workspace = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut native = connect(&fx).await;
+    let greeted = wss_rpc(
+        &mut native,
+        1,
+        "client.hello",
+        json!({"clientId":"phone","capabilities":{"browserNavigation":true,"browserExec":false}}),
+    )
+    .await;
+    assert!(greeted.get("error").is_none(), "{greeted}");
+    let mut report = tab("native-preview", "https://preview.test");
+    report["workspaceId"] = workspace.clone().into();
+    report["navigationOnly"] = true.into();
+    report["ownerAgentId"] = "agent-1".into();
+    let synced = wss_rpc(
+        &mut native,
+        2,
+        "browser.syncTabs",
+        json!({"tabs":[report.clone()]}),
+    )
+    .await;
+    assert!(synced.get("error").is_none(), "{synced}");
+    let _ = wss_rpc(&mut viewer, 2, "client.hello", hello("desktop")).await;
+    let pin = wss_rpc(
+        &mut viewer,
+        3,
+        "workspace.setBrowserClient",
+        json!({"workspaceId":workspace,"clientId":"desktop"}),
+    )
+    .await;
+    assert!(pin.get("error").is_none(), "{pin}");
+    report["navigationOnly"] = false.into();
+    let _ = wss_rpc(&mut native, 3, "browser.syncTabs", json!({"tabs":[report]})).await;
+    let listed = wss_rpc(
+        &mut viewer,
+        4,
+        "browser.listTabs",
+        json!({"workspaceId":workspace}),
+    )
+    .await;
+    assert_eq!(
+        listed["result"]["tabs"][0]["navigationOnly"], true,
+        "{listed}"
+    );
+    assert_eq!(listed["result"]["tabs"][0]["hostClientId"], "phone");
+    for (id, method, action) in [
+        (5, "browser.navigateTab", "navigate"),
+        (6, "browser.closeTab", "closeTab"),
+    ] {
+        let call = wss_rpc(
+            &mut viewer,
+            id,
+            method,
+            json!({"tabId":"native-preview","url":"https://updated.test"}),
+        );
+        let answer = async {
+            timeout(common::rpc_read_timeout(), async {
+                loop {
+                    match native.next().await.unwrap().unwrap() {
+                        Message::Text(text) => {
+                            let request: Value = serde_json::from_str(&text).unwrap();
+                            if request["method"] != "browser.exec" { continue; }
+                            assert_eq!(request["params"]["actions"][0]["action"], action);
+                            assert_eq!(request["params"]["workspaceId"], workspace);
+                            native.send(Message::Text(json!({"jsonrpc":"2.0","id":request["id"],"result":{"success":true,"results":[{"action":action,"success":true,"result":{"tabId":"native-preview","accepted":true,"displayed":false}}]}}).to_string().into())).await.unwrap();
+                            break;
+                        }
+                        Message::Ping(payload) => native.send(Message::Pong(payload)).await.unwrap(),
+                        _ => {}
+                    }
+                }
+            }).await.expect("native reverse request");
+        };
+        let (result, ()) = tokio::join!(call, answer);
+        assert!(result.get("error").is_none(), "{result}");
+    }
+    close_ws(native).await;
+    let listed = await_host_offline(&mut viewer, 10, &workspace).await;
+    assert_eq!(listed["result"]["tabs"][0]["navigationOnly"], true);
+    let offline = wss_rpc(
+        &mut viewer,
+        100,
+        "browser.navigateTab",
+        json!({"tabId":"native-preview","url":"https://updated.test"}),
+    )
+    .await;
+    assert_eq!(offline["error"]["code"], -32603, "{offline}");
+    assert!(offline["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("phone"));
+}
+
+#[tokio::test]
+async fn browser_sender_is_bound_to_wss_ingress_across_reconnect_and_spoofed_metadata() {
+    use intent_core::{AgentId, ClientId};
+    let fx = boot().await;
+    let mut desktop = connect(&fx).await;
+    let _ = wss_rpc(&mut desktop, 1, "client.hello", hello("desktop")).await;
+    let created = wss_rpc(
+        &mut desktop,
+        2,
+        "workspace.create",
+        json!({"title":"Sender routing","branch":"main","skipWorktree":true}),
+    )
+    .await;
+    let workspace = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let created = wss_rpc(
+        &mut desktop,
+        3,
+        "agent.create",
+        json!({"workspaceId":workspace,"name":"Sender","provider":"codex","model":"default"}),
+    )
+    .await;
+    assert!(created.get("error").is_none(), "{created}");
+    let agent = AgentId::from(created["result"]["agent"]["id"].as_str().unwrap());
+    let store = intent_store::Store::open(&fx.daemon.data_dir.path().join("intentd.db"))
+        .await
+        .unwrap();
+    let mut phone = connect(&fx).await;
+    let _ = wss_rpc(
+        &mut phone,
+        1,
+        "client.hello",
+        json!({"clientId":"phone","capabilities":{"browserNavigation":true,"browserExec":false}}),
+    )
+    .await;
+    let queued = wss_rpc(&mut phone, 2, "agent.queueMessage", json!({"agentId":agent,"messageId":"from-phone","content":"preview", "clientId":"desktop","messageMetadata":{"clientId":"desktop","browserClientId":"desktop"}})).await;
+    assert!(queued.get("error").is_none(), "{queued}");
+    assert_eq!(
+        store.latest_browser_sender(&agent).await.unwrap(),
+        Some(ClientId::from("phone"))
+    );
+    let queued = wss_rpc(
+        &mut desktop,
+        4,
+        "agent.queueMessage",
+        json!({"agentId":agent,"messageId":"from-desktop","content":"preview here"}),
+    )
+    .await;
+    assert!(queued.get("error").is_none(), "{queued}");
+    assert_eq!(
+        store.latest_browser_sender(&agent).await.unwrap(),
+        Some(ClientId::from("desktop"))
+    );
+    close_ws(phone).await;
+    let mut phone = connect(&fx).await;
+    let _ = wss_rpc(
+        &mut phone,
+        1,
+        "client.hello",
+        json!({"clientId":"phone","capabilities":{"browserNavigation":true}}),
+    )
+    .await;
+    // Reconnect alone and replay of a previous queue submission are not new messages.
+    let _ = wss_rpc(
+        &mut phone,
+        2,
+        "agent.queueMessage",
+        json!({"agentId":agent,"messageId":"from-phone","content":"preview"}),
+    )
+    .await;
+    assert_eq!(
+        store.latest_browser_sender(&agent).await.unwrap(),
+        Some(ClientId::from("desktop"))
+    );
+    let queued = wss_rpc(&mut phone, 3, "agent.queueMessage", json!({"agentId":agent,"messageId":"monitor","content":"update","messageMetadata":{"type":"pr_monitor_wake","fromPrincipalId":"forged"}})).await;
+    assert!(queued.get("error").is_none(), "{queued}");
+    assert_eq!(
+        store.latest_browser_sender(&agent).await.unwrap(),
+        Some(ClientId::from("desktop"))
+    );
+    let queued = wss_rpc(
+        &mut phone,
+        4,
+        "agent.queueMessage",
+        json!({"agentId":agent,"messageId":"phone-new","content":"latest"}),
+    )
+    .await;
+    assert!(queued.get("error").is_none(), "{queued}");
+    assert_eq!(
+        store.latest_browser_sender(&agent).await.unwrap(),
+        Some(ClientId::from("phone"))
+    );
+    close_ws(phone).await;
+    close_ws(desktop).await;
 }

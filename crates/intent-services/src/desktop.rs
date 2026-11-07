@@ -399,7 +399,7 @@ impl Services {
             .list_browser_tabs(workspace_id)
             .await?
             .into_iter()
-            .find(|tab| tab.owner_agent_id.is_some())
+            .find(|tab| tab.owner_agent_id.is_some() && !tab.navigation_only)
             .map(|tab| tab.host_client_id);
         Ok(
             claimed_host.map_or((ReverseTarget::Default, "default"), |host| {
