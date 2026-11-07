@@ -264,6 +264,17 @@ mod entries {
         .unwrap();
         let old = cloud_agent(&backend, None).await;
         let other = cloud_agent(&backend, Some("e2b-0123456789ab")).await;
+        // A size check that saves the settings before the migration runs
+        // (a client listing right after a restart) gives them a name; they
+        // are still migrated.
+        let early = config::load(&backend.services, "e2b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!early.migrated);
+        config::save(&backend.services, "e2b", &early)
+            .await
+            .unwrap();
 
         config::migrate(&backend.services).await.unwrap();
 
@@ -424,6 +435,74 @@ mod entries {
         let names: Vec<(String, ProviderConfig)> =
             config::load_all(&backend.services).await.unwrap();
         assert_eq!(names.len(), 16);
+    }
+
+    #[tokio::test]
+    async fn unknown_ids_name_no_entry() {
+        let backend = Backend::new().await;
+        // The legacy create path: "e2b" does not exist, so apiKeyFrom "e2b"
+        // names no entry.
+        let missing = reason(configure(&backend, json!({ "apiKeyFrom": "e2b" })).await);
+        assert_eq!(missing["code"], "not-found");
+        let empty = reason(configure(&backend, json!({ "cloudMachineId": "" })).await);
+        assert_eq!(empty["code"], "not-found");
+        let long = invalid(configure(&backend, json!({ "cloudMachineId": "e".repeat(65) })).await);
+        assert!(long.contains("64"), "{long}");
+    }
+
+    async fn remove(backend: &Backend, params: Value) -> intent_core::Result<Value> {
+        let owner = backend.store().get_primary_principal().await.unwrap().id;
+        with_caller(
+            Caller::Wire {
+                principal_id: owner,
+                host_role: HostRole::Owner,
+            },
+            backend.services.cloud_machines("remove", params),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_removed_entrys_key_kept_for_the_reaper_is_no_entry() {
+        let backend = Backend::new().await;
+        let svc = &backend.services;
+        let mut retired = ProviderConfig::new("e2b");
+        retired.retired_from = Some("e2b".into());
+        config::save(svc, "retired-e2b-0123456789ab", &retired)
+            .await
+            .unwrap();
+        svc.store_cloud_machine_key("retired-e2b-0123456789ab", "k")
+            .await
+            .unwrap();
+
+        assert!(config::load_all(svc).await.unwrap().is_empty());
+        assert!(config::load(svc, "retired-e2b-0123456789ab")
+            .await
+            .unwrap()
+            .is_none());
+        let none = config::resolve(svc, None, None).await;
+        assert_eq!(reason(none)["reason"], "not-configured");
+        assert_ne!(
+            config::new_cloud_machine_id(svc).await.unwrap(),
+            "e2b",
+            "a new entry does not reuse the id the reaper still holds a key for"
+        );
+        let noop = remove(
+            &backend,
+            json!({ "cloudMachineId": "retired-e2b-0123456789ab", "stopAgents": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(noop, json!({ "ok": true, "unconfirmedStops": [] }));
+        assert_eq!(
+            config::load_retired(svc).await.unwrap(),
+            vec![("retired-e2b-0123456789ab".to_owned(), "e2b".to_owned())],
+            "remove leaves the reaper's key alone"
+        );
+        assert!(config::saved_key(svc, "retired-e2b-0123456789ab")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[test]

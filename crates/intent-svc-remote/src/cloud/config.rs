@@ -74,6 +74,10 @@ pub(crate) struct ProviderConfig {
     /// removed entry's id. Such a row is no entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retired_from: Option<String>,
+    /// Whether the row was saved as an entry. `false` only on a single
+    /// provider saved before entries existed, until [`migrate`] ran.
+    #[serde(default)]
+    pub(crate) migrated: bool,
     pub(crate) template_project: String,
     pub(crate) size: CloudMachineSize,
     pub(crate) idle_pause_minutes: u32,
@@ -102,6 +106,7 @@ impl ProviderConfig {
         Self {
             name: name.to_owned(),
             retired_from: None,
+            migrated: true,
             template_project: DEFAULT_TEMPLATE_PROJECT.to_owned(),
             size: CloudMachineSize::DEFAULT,
             idle_pause_minutes: 10,
@@ -295,8 +300,13 @@ fn random_id() -> String {
 /// The id of a new entry: `"e2b"` while no saved row has it, else
 /// `e2b-<12 hex>`.
 pub(crate) async fn new_cloud_machine_id(svc: &Services) -> Result<String> {
-    let rows = svc.store().list_cloud_machine_providers().await?;
-    let taken = |id: &str| rows.iter().any(|(row, _)| row == id);
+    let rows = load_rows(svc).await?;
+    // A removed "e2b" whose key waits for the reaper keeps the id taken, so
+    // the reaper never counts a new entry's sandboxes as the removed one's.
+    let taken = |id: &str| {
+        rows.iter()
+            .any(|(row, saved)| row == id || saved.retired_from.as_deref() == Some(id))
+    };
     if !taken(CLOUD_E2B_LEGACY_ENTRY) {
         return Ok(CLOUD_E2B_LEGACY_ENTRY.to_owned());
     }
@@ -306,6 +316,14 @@ pub(crate) async fn new_cloud_machine_id(svc: &Services) -> Result<String> {
             return Ok(id);
         }
     }
+}
+
+/// Whether `id` is the row of a removed entry's key kept for the reaper.
+pub(crate) async fn is_retired(svc: &Services, id: &str) -> Result<bool> {
+    let Some(json) = svc.store().get_cloud_machine_provider(id).await? else {
+        return Ok(false);
+    };
+    Ok(decode(&json)?.retired_from.is_some())
 }
 
 /// The row id a removed entry's key is kept under for the reaper. It is not
@@ -428,20 +446,17 @@ pub(crate) fn legacy_entry() -> &'static str {
 }
 
 /// Turn a single provider saved before entries existed into the entry
-/// `"e2b"` named "E2B", once: its row gets the name, its sandboxes and
-/// agents `cloudMachineId: "e2b"`. The row's missing `name` marks a setup
-/// not migrated yet.
+/// `"e2b"` named "E2B", once: its sandboxes and agents get
+/// `cloudMachineId: "e2b"`, then the row is marked `migrated` (a migration
+/// cut short runs again). Runs under the settings lock, so no `configure`,
+/// `remove` or size check interleaves.
 pub(crate) async fn migrate(svc: &Services) -> Result<()> {
-    let Some(json) = svc
-        .store()
-        .get_cloud_machine_provider(CLOUD_E2B_LEGACY_ENTRY)
-        .await?
-    else {
+    let feature = super::feature(svc)?;
+    let _settings = feature.cloud.settings.lock().await;
+    let Some(mut legacy) = load(svc, CLOUD_E2B_LEGACY_ENTRY).await? else {
         return Ok(());
     };
-    let raw: Value = serde_json::from_str(&json)
-        .map_err(|e| Error::Internal(format!("the saved E2B settings are unreadable: {e}")))?;
-    if raw.get("name").is_some() {
+    if legacy.migrated {
         return Ok(());
     }
     for row in svc.store().list_cloud_machines().await? {
@@ -457,9 +472,8 @@ pub(crate) async fn migrate(svc: &Services) -> Result<()> {
         })
         .await?;
     }
-    // The name goes last: a migration cut short runs again.
-    let config = decode(&json)?;
-    save(svc, CLOUD_E2B_LEGACY_ENTRY, &config).await?;
+    legacy.migrated = true;
+    save(svc, CLOUD_E2B_LEGACY_ENTRY, &legacy).await?;
     tracing::info!("cloud machines: the saved E2B provider is now the entry \"e2b\"");
     Ok(())
 }

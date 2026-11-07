@@ -51,11 +51,9 @@ fn provider_param(params: &Value) -> Result<()> {
 fn entry_param(params: &Value, name: &str) -> Result<Option<String>> {
     match params.get(name) {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(id)) if !id.is_empty() && id.len() <= MAX_CLOUD_MACHINE_ID_BYTES => {
-            Ok(Some(id.clone()))
-        }
+        Some(Value::String(id)) if id.len() <= MAX_CLOUD_MACHINE_ID_BYTES => Ok(Some(id.clone())),
         Some(_) => Err(Error::InvalidParams(format!(
-            "{name} must be a string of 1-{MAX_CLOUD_MACHINE_ID_BYTES} bytes"
+            "{name} must be a string of at most {MAX_CLOUD_MACHINE_ID_BYTES} bytes"
         ))),
     }
 }
@@ -228,21 +226,19 @@ async fn configure(feature: &RemoteFeature, svc: &Services, params: &Value) -> R
         )));
     }
     let copied = match &params.api_key_from {
+        Some(from) if !entries.iter().any(|(entry, _)| entry == from) => {
+            return Err(entry_not_found(from, ""));
+        }
         Some(from) if Some(from) == id.as_ref() => {
             return Err(Error::InvalidParams(
                 "apiKeyFrom must name another E2B entry".into(),
             ))
         }
-        Some(from) => {
-            if !entries.iter().any(|(entry, _)| entry == from) {
-                return Err(entry_not_found(from, ""));
-            }
-            Some(
-                config::saved_key(svc, from)
-                    .await?
-                    .ok_or_else(|| entry_not_found(from, " with a saved key"))?,
-            )
-        }
+        Some(from) => Some(
+            config::saved_key(svc, from)
+                .await?
+                .ok_or_else(|| entry_not_found(from, " with a saved key"))?,
+        ),
         None => None,
     };
     let mut next = saved.clone().unwrap_or_else(|| ProviderConfig::new(&name));
@@ -461,6 +457,10 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         entry_param(params, "cloudMachineId")?.unwrap_or_else(|| config::legacy_entry().to_owned());
     let stop_agents = bool_param(params, "stopAgents")?;
     let _settings = feature.cloud.settings.lock().await;
+    // A removed entry's key kept for the reaper names no entry.
+    if config::is_retired(svc, &id).await? {
+        return Ok(json!({ "ok": true, "unconfirmedStops": [] }));
+    }
     let saved = config::load(svc, &id).await?;
     // An id that names no entry is a no-op, unless an earlier remove
     // stopped part way (a store or secret-store error after the settings

@@ -584,6 +584,15 @@ async fn start(
         .await?
         .ok_or_else(config::not_configured)?;
     let client = config::client(key.clone())?;
+    // A rename may have run since admission wrote the entry's name.
+    let renamed = crate::view::update(svc.store(), workspace_id, agent_id, |view| {
+        view.node_name.clone_from(&saved.name);
+    })
+    .await;
+    if matches!(renamed, Ok(true)) {
+        svc.publish_agent_placement_changed(workspace_id, agent_id)
+            .await;
+    }
     let session = svc.store().get_agent_session_summary(agent_id).await?;
     let backend_id = svc.store().daemon_id().await?;
     let template = saved.template(saved.size);

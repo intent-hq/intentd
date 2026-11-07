@@ -148,6 +148,19 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
     .await;
     assert_eq!(gone, json!({ "ok": true, "unconfirmedStops": [] }));
 
+    // A validateOnly create checks everything and saves nothing.
+    let probe = ok(
+        &mut rpc_ws,
+        8,
+        "cloudMachines.configure",
+        json!({ "name": "Probe", "apiKey": E2B_KEY_2, "validateOnly": true }),
+    )
+    .await;
+    assert_eq!(probe["provider"]["id"], "", "{probe}");
+    assert_eq!(probe["provider"]["name"], "Probe");
+    let listed = ok(&mut rpc_ws, 9, "cloudMachines.list", json!({})).await;
+    assert_eq!(listed["providers"].as_array().unwrap().len(), 2, "{listed}");
+
     // One agent per entry: named, and the "e2b" fallback of a placement
     // that names none while several entries exist.
     let on_beta = ok(
@@ -233,6 +246,72 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
     assert_eq!(ant_machine["name"], "Alpha · Ant", "{ant_machine}");
     assert_eq!(ant_machine["cloud"]["cloudMachineId"], "e2b");
 
+    // A sub-agent placed on E2B without an entry, while several exist,
+    // starts with its parent's entry.
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        100,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let kid_prompt = r#"wsapi return JSON.stringify({ marker: "kid-1" });"#;
+    let code = format!(
+        r#"wsapi await ws.agent.create("Kid", {kid_prompt:?}, {{ provider: {keyed_ref:?}, model: "default", placement: {{ target: "e2b" }} }}); return JSON.stringify({{ marker: "bee-1" }});"#
+    );
+    wsapi_turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &bee),
+        &code,
+        "bee-1",
+        110,
+    )
+    .await;
+    drop(events);
+    let kid = timeout(wait(), async {
+        let mut id = 150;
+        loop {
+            id += 1;
+            let listed = ok(
+                &mut rpc_ws,
+                id,
+                "agent.list",
+                json!({ "workspaceId": ws_id }),
+            )
+            .await;
+            if let Some(kid) = listed["agents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|a| a["name"] == "Kid")
+            {
+                return kid["id"].as_str().unwrap().to_owned();
+            }
+            // timing-guard: poll interval for the forwarded create to be listed
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the sub-agent was created");
+    let kid_linked = agent_until(&mut rpc_ws, (&ws_id, &kid), 200, |a| {
+        a.get("nodeId").is_some()
+    })
+    .await;
+    transcript.push(kid_linked.to_string());
+    assert_eq!(
+        kid_linked["placement"]["cloudMachineId"],
+        beta_id.as_str(),
+        "{kid_linked}"
+    );
+    assert_eq!(kid_linked["nodeName"], "Beta");
+    let (kid_sandbox, kid_project, _) = sandbox_of(&kid);
+    assert_eq!(
+        kid_project, E2B_KEY_2,
+        "the sub-agent's sandbox is in Beta's project"
+    );
+
     // A rename reaches the machine row and the agent.
     let renamed = ok(
         &mut rpc_ws,
@@ -274,6 +353,10 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
         assert!(
             state.deletes.contains(&bee_sandbox),
             "Gamma's sandbox is deleted"
+        );
+        assert!(
+            state.deletes.contains(&kid_sandbox),
+            "so is its sub-agent's"
         );
         assert!(
             !state.deletes.contains(&ant_sandbox),
@@ -318,5 +401,146 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
         for text in &transcript {
             assert!(!text.contains(secret), "a key reached a reply: {text}");
         }
+    }
+}
+
+/// The backend's saved entry rows (removed entries' kept keys included).
+async fn provider_rows(head_dir: &Path) -> Vec<String> {
+    let store = intent_store::Store::open(&head_dir.join("intentd.db"))
+        .await
+        .expect("open store");
+    store
+        .list_cloud_machine_providers()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_entrys_key_stays_until_the_reaper_deletes_its_sandbox() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping E2B entries e2e: node or git not on PATH");
+        return;
+    }
+    let fixture = format!(
+        "{}/tests/fixtures/node-test-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let scratch = common::test_tempdir_in("/tmp", "itd-e2b-retired-");
+    let repo = scratch.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    std::fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "--quiet", "-m", "base"]);
+    let sandboxes = scratch.path().join("e2b");
+    std::fs::create_dir_all(&sandboxes).unwrap();
+    let fake = FakeE2b::start(&sandboxes, &fixture).await;
+    let head_dir = scratch.path().join("head");
+    // A settings minute of 100 ms: the reaper lists every second.
+    let (_head, port, cfg, ws_id) = start_backend_with(
+        &head_dir,
+        &repo,
+        &[
+            ("INTENTD_E2B_API_URL", &fake.url),
+            ("INTENTD_E2B_ENVD_URL", &fake.url),
+            ("INTENTD_E2B_DIRECT_HOST", "127.0.0.1"),
+            ("INTENTD_E2B_MINUTE_MS", "100"),
+        ],
+    )
+    .await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let keyed = ok(
+        &mut rpc_ws,
+        1,
+        "providers.profiles.create",
+        json!({ "baseProviderId": "codex", "name": "Cloud", "env": [
+            { "key": "OPENAI_API_KEY", "kind": "set", "value": PROFILE_SECRET },
+        ] }),
+    )
+    .await;
+    let keyed_ref = format!("codex@{}", keyed["profile"]["id"].as_str().unwrap());
+    ok(
+        &mut rpc_ws,
+        2,
+        "cloudMachines.configure",
+        json!({ "name": "Alpha", "apiKey": E2B_KEY, "size": "4x8", "idlePauseMinutes": 1440 }),
+    )
+    .await;
+    let created = ok(
+        &mut rpc_ws,
+        3,
+        "agent.create",
+        placed(&ws_id, &keyed_ref, "Ant", None),
+    )
+    .await;
+    let ant = created["agent"]["id"].as_str().unwrap().to_owned();
+    agent_until(&mut rpc_ws, (&ws_id, &ant), 10, |a| {
+        a.get("nodeId").is_some()
+    })
+    .await;
+    let sandbox = fake.state().sandboxes.keys().next().cloned().unwrap();
+
+    // E2B will not delete: the entry goes, its key stays hidden.
+    fake.state().refuse_deletes = true;
+    let removed = ok(
+        &mut rpc_ws,
+        40,
+        "cloudMachines.remove",
+        json!({ "cloudMachineId": "e2b", "stopAgents": true }),
+    )
+    .await;
+    assert_eq!(removed["ok"], true, "{removed}");
+    assert!(fake.state().sandboxes.contains_key(&sandbox), "E2B kept it");
+    let listed = ok(&mut rpc_ws, 41, "cloudMachines.list", json!({})).await;
+    assert_eq!(
+        listed,
+        json!({ "providers": [], "machines": [] }),
+        "{listed}"
+    );
+    let rows = provider_rows(&head_dir).await;
+    assert!(
+        rows.len() == 1 && rows[0].starts_with("retired-"),
+        "the key is kept for the reaper: {rows:?}"
+    );
+    let ant_now = agent_until(&mut rpc_ws, (&ws_id, &ant), 42, |a| {
+        a["placement"].get("cloudMachineId").is_none()
+    })
+    .await;
+    assert_eq!(ant_now["placement"]["target"], "e2b", "{ant_now}");
+
+    // A new entry does not take the id the kept key still belongs to.
+    let next = ok(
+        &mut rpc_ws,
+        50,
+        "cloudMachines.configure",
+        json!({ "name": "Next", "apiKey": E2B_KEY_2, "size": "4x8", "idlePauseMinutes": 1440 }),
+    )
+    .await;
+    let next_id = next["provider"]["id"].as_str().unwrap().to_owned();
+    assert_ne!(next_id, "e2b", "{next}");
+
+    // Once E2B deletes again, the reaper deletes the sandbox, then forgets
+    // the kept key.
+    fake.state().refuse_deletes = false;
+    timeout(wait(), async {
+        loop {
+            let gone = !fake.state().sandboxes.contains_key(&sandbox);
+            if gone && provider_rows(&head_dir).await == vec![next_id.clone()] {
+                return;
+            }
+            // timing-guard: poll interval for the reaper's next pass (every second here)
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the reaper deletes the sandbox and the kept key");
+    let log = std::fs::read_to_string(head_dir.join("head.log")).unwrap_or_default();
+    for secret in [E2B_KEY, E2B_KEY_2, PROFILE_SECRET] {
+        assert!(!log.contains(secret), "a key reached the backend's log");
     }
 }

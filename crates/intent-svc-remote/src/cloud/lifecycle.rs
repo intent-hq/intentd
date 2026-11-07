@@ -615,10 +615,17 @@ async fn tick(
     }
     let rows = svc.store().list_cloud_machines().await?;
     let reap_due = last_reap.is_none_or(|at| at.elapsed() >= clock.minutes(REAP_MINUTES));
+    // Every sandbox the reaper listed this tick, in every project; `None`
+    // once a listing failed, so no first sighting is forgotten on a guess.
+    let mut listed: Option<Vec<String>> = Some(Vec::new());
+    let mut note = |more: Option<Vec<String>>| match (&mut listed, more) {
+        (Some(all), Some(more)) => all.extend(more),
+        _ => listed = None,
+    };
     if reap_due {
         *last_reap = Some(Instant::now());
         for (row_id, from) in &retired {
-            reap_retired(svc, feature, clock, &rows, row_id, from).await;
+            note(reap_retired(svc, feature, clock, &rows, row_id, from).await);
         }
     }
     for (id, saved) in &entries {
@@ -626,6 +633,7 @@ async fn tick(
             Ok(client) => Arc::new(client),
             Err(error) => {
                 tracing::debug!(entry = %id, %error, "cloud machines: no client for an E2B entry");
+                note(None);
                 continue;
             }
         };
@@ -637,8 +645,13 @@ async fn tick(
         }
         // Every row counts as known: entries may share an E2B project.
         if reap_due {
-            reap(svc, feature, &client, clock, &rows).await;
+            note(reap(svc, feature, &client, clock, &rows).await);
         }
+    }
+    if let (true, Some(listed)) = (reap_due, listed) {
+        feature
+            .cloud
+            .keep_orphans(listed.iter().map(String::as_str));
     }
     Ok(())
 }
@@ -786,24 +799,37 @@ async fn reap_retired(
     rows: &[ExposedMachine],
     row_id: &str,
     from: &str,
-) {
-    let Ok(client) = config::saved_client(svc, row_id).await else {
-        let _ = svc.store().delete_cloud_machine_provider(row_id).await;
-        return;
+) -> Option<Vec<String>> {
+    let key = match config::saved_key(svc, row_id).await {
+        Ok(Some(key)) => key,
+        // The key is really gone: nothing can delete the sandboxes now.
+        Ok(None) => {
+            let _ = svc.store().delete_cloud_machine_provider(row_id).await;
+            return Some(Vec::new());
+        }
+        // Unreadable for now: keep the row for the next pass.
+        Err(error) => {
+            tracing::warn!(%error, "cloud machines: could not read a removed entry's key");
+            return None;
+        }
     };
-    reap(svc, feature, &client, clock, rows).await;
+    let Ok(client) = config::client(key) else {
+        return None;
+    };
+    let listed = reap(svc, feature, &client, clock, rows).await;
     if entry_sandboxes_left(svc, &client, from).await {
-        return;
+        return listed;
     }
     if let Err(error) = svc.delete_cloud_machine_key(row_id).await {
         tracing::warn!(%error, "cloud machines: could not forget a removed entry's key");
-        return;
+        return listed;
     }
     if let Err(error) = svc.store().delete_cloud_machine_provider(row_id).await {
         tracing::warn!(%error, "cloud machines: could not forget a removed entry");
-        return;
+        return listed;
     }
     tracing::info!(entry = %from, "cloud machines: no sandbox of the removed entry is left; its key is gone");
+    listed
 }
 
 /// Whether E2B still lists a sandbox of this backend started with entry
@@ -843,9 +869,9 @@ async fn reap(
     client: &E2bClient,
     clock: Clock,
     rows: &[ExposedMachine],
-) {
+) -> Option<Vec<String>> {
     let Ok(backend) = svc.store().daemon_id().await else {
-        return;
+        return None;
     };
     let mut metadata = BTreeMap::new();
     metadata.insert("intentBackendId".to_owned(), backend);
@@ -859,7 +885,7 @@ async fn reap(
         Ok(listed) => listed,
         Err(error) => {
             tracing::warn!(%error, "cloud machines: could not list sandboxes for the reaper");
-            return;
+            return None;
         }
     };
     let known: HashSet<&str> = rows
@@ -867,9 +893,10 @@ async fn reap(
         .filter_map(|row| row.cloud.as_ref().map(|c| c.sandbox_id.as_str()))
         .collect();
     let starting = feature.cloud.starting_agents();
-    feature
-        .cloud
-        .keep_orphans(listed.iter().map(|sandbox| sandbox.sandbox_id.as_str()));
+    let ids = listed
+        .iter()
+        .map(|sandbox| sandbox.sandbox_id.clone())
+        .collect();
     for sandbox in listed {
         if known.contains(sandbox.sandbox_id.as_str())
             || sandbox
@@ -907,4 +934,5 @@ async fn reap(
             }
         }
     }
+    Some(ids)
 }

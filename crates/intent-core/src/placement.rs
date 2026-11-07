@@ -158,8 +158,8 @@ impl AgentPlacement {
             if self.target != Some(PlacementTarget::E2b) {
                 return Err("placement.cloudMachineId needs placement.target \"e2b\"");
             }
-            if entry.is_empty() || entry.len() > crate::machines::MAX_CLOUD_MACHINE_ID_BYTES {
-                return Err("placement.cloudMachineId must contain 1-64 UTF-8 bytes");
+            if entry.len() > crate::machines::MAX_CLOUD_MACHINE_ID_BYTES {
+                return Err("placement.cloudMachineId must contain at most 64 UTF-8 bytes");
             }
         }
         if self.target == Some(PlacementTarget::Remote)

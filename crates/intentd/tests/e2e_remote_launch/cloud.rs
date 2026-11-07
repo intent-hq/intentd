@@ -64,6 +64,8 @@ struct FakeState {
     metadata: HashMap<String, Value>,
     /// Sandboxes only listed (no daemon): `{ sandboxID, metadata, startedAt? }`.
     listed_only: Vec<Value>,
+    /// While set, every sandbox delete fails (500).
+    refuse_deletes: bool,
     /// The key (E2B project) each sandbox was created with.
     projects: HashMap<String, String>,
     /// While set, every timeout renewal is 404 and every list fails (500).
@@ -352,6 +354,9 @@ impl FakeE2b {
                         "envdAccessToken": token, "domain": "e2b.test",
                     }),
                 )
+            }
+            ("DELETE", path) if path.starts_with("/sandboxes/") && self.state().refuse_deletes => {
+                json_reply(500, json!({ "code": 500, "message": "delete unavailable" }))
             }
             ("DELETE", path) if path.starts_with("/sandboxes/") => {
                 let id = path.trim_start_matches("/sandboxes/").to_owned();
