@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.146] - 2026-11-07
+
+### 🚀 Features
+
+- *(nodes)* Start remote agents on new E2B sandboxes ([#3117](https://github.com/intent-hq/intentd/pull/3117))
+
+
 ## [0.11.145] - 2026-11-07
 
 ### 🚀 Features

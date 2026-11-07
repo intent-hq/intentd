@@ -1,6 +1,6 @@
 [package]
 name = "intent-nodes"
-version = "0.11.145"
+version = "0.11.146"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 description = "Node provider contracts, static host adapter and E2B sandbox client"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.145" }
+intent-core = { path = "../intent-core", version = "0.11.146" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
