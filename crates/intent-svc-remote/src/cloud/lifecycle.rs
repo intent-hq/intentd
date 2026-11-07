@@ -201,8 +201,9 @@ impl CloudGate {
         {
             return Ok(pauses);
         }
-        // Without the key (a provider remove in progress), dial as is.
-        let Ok(client) = config::saved_client(&self.svc).await else {
+        // Without the key (an entry remove in progress), dial as is.
+        let Ok(client) = config::saved_client(&self.svc, super::methods::row_entry(&row)).await
+        else {
             return Ok(pauses);
         };
         match resume(&self.svc, feature, &client, &row).await {
@@ -581,6 +582,9 @@ pub(crate) fn spawn_supervisor(svc: &Services) {
     }
     let svc = svc.clone();
     intent_core::spawn_daemon(async move {
+        if let Err(error) = config::migrate(&svc).await {
+            tracing::warn!(%error, "cloud machines: could not migrate the saved E2B provider");
+        }
         let mut last_reap: Option<Instant> = None;
         loop {
             let clock = Clock::current();
@@ -595,24 +599,46 @@ pub(crate) fn spawn_supervisor(svc: &Services) {
     });
 }
 
-/// One check of every cloud machine, and the reaper when due.
+/// One check of every cloud machine, and the reaper when due, per E2B
+/// entry with that entry's key. A machine whose entry is gone is left to
+/// the entry's removal.
 async fn tick(
     svc: &Services,
     feature: &RemoteFeature,
     clock: Clock,
     last_reap: &mut Option<Instant>,
 ) -> Result<()> {
-    let Some(saved) = config::load(svc).await? else {
+    let entries = config::load_all(svc).await?;
+    let retired = config::load_retired(svc).await?;
+    if entries.is_empty() && retired.is_empty() {
         return Ok(());
-    };
-    let client = Arc::new(config::saved_client(svc).await?);
-    let rows = svc.store().list_cloud_machines().await?;
-    for row in &rows {
-        check(svc, feature, &client, &saved, clock, row).await;
     }
-    if last_reap.is_none_or(|at| at.elapsed() >= clock.minutes(REAP_MINUTES)) {
+    let rows = svc.store().list_cloud_machines().await?;
+    let reap_due = last_reap.is_none_or(|at| at.elapsed() >= clock.minutes(REAP_MINUTES));
+    if reap_due {
         *last_reap = Some(Instant::now());
-        reap(svc, feature, &client, clock, &rows).await;
+        for (row_id, from) in &retired {
+            reap_retired(svc, feature, clock, &rows, row_id, from).await;
+        }
+    }
+    for (id, saved) in &entries {
+        let client = match config::saved_client(svc, id).await {
+            Ok(client) => Arc::new(client),
+            Err(error) => {
+                tracing::debug!(entry = %id, %error, "cloud machines: no client for an E2B entry");
+                continue;
+            }
+        };
+        for row in rows
+            .iter()
+            .filter(|row| super::methods::row_entry(row) == id)
+        {
+            check(svc, feature, &client, saved, clock, row).await;
+        }
+        // Every row counts as known: entries may share an E2B project.
+        if reap_due {
+            reap(svc, feature, &client, clock, &rows).await;
+        }
     }
     Ok(())
 }
@@ -748,6 +774,65 @@ fn spawn_kill(
         super::start::delete_machine(feature, &svc, &row, Some(&client)).await;
         feature.cloud.end_kill(&row.id);
     });
+}
+
+/// The reaper's pass with the key a removed entry `from` left behind
+/// (`row_id`): delete its orphans, then forget the key once E2B has no
+/// sandbox of the entry left.
+async fn reap_retired(
+    svc: &Services,
+    feature: &RemoteFeature,
+    clock: Clock,
+    rows: &[ExposedMachine],
+    row_id: &str,
+    from: &str,
+) {
+    let Ok(client) = config::saved_client(svc, row_id).await else {
+        let _ = svc.store().delete_cloud_machine_provider(row_id).await;
+        return;
+    };
+    reap(svc, feature, &client, clock, rows).await;
+    if entry_sandboxes_left(svc, &client, from).await {
+        return;
+    }
+    if let Err(error) = svc.delete_cloud_machine_key(row_id).await {
+        tracing::warn!(%error, "cloud machines: could not forget a removed entry's key");
+        return;
+    }
+    if let Err(error) = svc.store().delete_cloud_machine_provider(row_id).await {
+        tracing::warn!(%error, "cloud machines: could not forget a removed entry");
+        return;
+    }
+    tracing::info!(entry = %from, "cloud machines: no sandbox of the removed entry is left; its key is gone");
+}
+
+/// Whether E2B still lists a sandbox of this backend started with entry
+/// `id` (one from before entries counts for `"e2b"`). `true` when E2B cannot
+/// answer, so a key is never dropped too soon.
+pub(crate) async fn entry_sandboxes_left(svc: &Services, client: &E2bClient, id: &str) -> bool {
+    let Ok(backend) = svc.store().daemon_id().await else {
+        return true;
+    };
+    let mut metadata = BTreeMap::new();
+    metadata.insert("intentBackendId".to_owned(), backend);
+    match client
+        .list(&ListSandboxes {
+            metadata,
+            states: vec![SandboxState::Running, SandboxState::Paused],
+        })
+        .await
+    {
+        Ok(listed) => listed.iter().any(|sandbox| {
+            sandbox
+                .metadata
+                .get("intentEntryId")
+                .map_or(id == config::legacy_entry(), |entry| entry == id)
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "cloud machines: could not list an entry's sandboxes");
+            true
+        }
+    }
 }
 
 /// Delete every sandbox with this backend's metadata that no machine row

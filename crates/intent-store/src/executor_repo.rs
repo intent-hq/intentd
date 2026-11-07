@@ -552,6 +552,66 @@ impl Store {
             .map_err(db)
     }
 
+    /// Every saved cloud machine provider entry as `(id, config_json)`, in
+    /// the order they were first saved.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn list_cloud_machine_providers(&self) -> Result<Vec<(String, String)>> {
+        sqlx::query_as("SELECT id, config_json FROM cloud_machine_provider ORDER BY rowid")
+            .fetch_all(self.read_pool())
+            .await
+            .map_err(db)
+    }
+
+    /// Rename cloud machine `id`. Returns whether it exists.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidParams` for an empty name; `Internal` on database failure.
+    pub async fn rename_cloud_machine(&self, id: &str, name: &str) -> Result<bool> {
+        if name.is_empty() {
+            return Err(invalid("invalid exposed machine"));
+        }
+        let done = sqlx::query(
+            "UPDATE exposed_machine SET name = ? WHERE id = ? AND cloud_json IS NOT NULL",
+        )
+        .bind(name)
+        .bind(id)
+        .execute(self.write_pool())
+        .await
+        .map_err(db)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The agents placed on E2B (`remotePlacement.placement.target` is
+    /// `"e2b"`) as `(workspace id, agent id)`, deleted ones included.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on database failure.
+    pub async fn list_cloud_placed_agents(
+        &self,
+    ) -> Result<Vec<(intent_core::WorkspaceId, intent_core::AgentId)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT workspace_id, id FROM agent_session \
+             WHERE json_extract(metadata, '$.remotePlacement.placement.target') = 'e2b'",
+        )
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(db)?;
+        Ok(rows
+            .into_iter()
+            .map(|(workspace, agent)| {
+                (
+                    intent_core::WorkspaceId::from(workspace),
+                    intent_core::AgentId::from(agent),
+                )
+            })
+            .collect())
+    }
+
     /// Save the settings of cloud machine provider `id`.
     ///
     /// # Errors

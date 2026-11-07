@@ -23,9 +23,13 @@ use tokio::net::TcpListener;
 
 use super::*;
 
+mod entries;
 mod sub_agents;
 
 const E2B_KEY: &str = "e2b_test_key_0123456789abcdef0123456789abcdef";
+/// The key of a second E2B project: its sandboxes are listed, connected
+/// and deleted only with this key.
+const E2B_KEY_2: &str = "e2b_test_key_second_project_fedcba9876543210";
 const PROFILE_SECRET: &str = "sk-cloud-profile-secret-7f3a91";
 
 /// One fake sandbox: its directory, envd token and environment.
@@ -60,6 +64,8 @@ struct FakeState {
     metadata: HashMap<String, Value>,
     /// Sandboxes only listed (no daemon): `{ sandboxID, metadata, startedAt? }`.
     listed_only: Vec<Value>,
+    /// The key (E2B project) each sandbox was created with.
+    projects: HashMap<String, String>,
     /// While set, every timeout renewal is 404 and every list fails (500).
     timeouts_missing: bool,
     list_failing: bool,
@@ -192,9 +198,22 @@ impl FakeE2b {
                 _ => (404, "text/plain", b"Not Found".to_vec()),
             };
         }
-        if headers.get("x-api-key").map(String::as_str) != Some(E2B_KEY) || self.state().key_revoked
-        {
+        let key = headers.get("x-api-key").cloned().unwrap_or_default();
+        if (key != E2B_KEY && key != E2B_KEY_2) || self.state().key_revoked {
             return json_reply(401, json!({ "code": 401, "message": "Invalid API key" }));
+        }
+        // Another project's sandbox does not exist for this key.
+        let other_project = path
+            .split('/')
+            .filter(|part| part.starts_with("sbx"))
+            .any(|id| {
+                self.state()
+                    .projects
+                    .get(id)
+                    .is_some_and(|project| *project != key)
+            });
+        if other_project {
+            return json_reply(404, json!({ "code": 404, "message": "sandbox not found" }));
         }
         if method != "GET" || path == "/v2/sandboxes" {
             self.state()
@@ -205,7 +224,7 @@ impl FakeE2b {
             ("GET", "/v2/sandboxes") if self.state().list_failing => {
                 json_reply(500, json!({ "code": 500, "message": "list unavailable" }))
             }
-            ("GET", "/v2/sandboxes") => json_reply(200, self.list(target)),
+            ("GET", "/v2/sandboxes") => json_reply(200, self.list(target, &key)),
             ("POST", connect)
                 if connect.starts_with("/v2/sandboxes/") && connect.ends_with("/connect") =>
             {
@@ -316,6 +335,7 @@ impl FakeE2b {
                 self.state()
                     .metadata
                     .insert(id.clone(), request["metadata"].clone());
+                self.state().projects.insert(id.clone(), key.clone());
                 self.state().sandboxes.insert(
                     id.clone(),
                     FakeSandbox {
@@ -355,9 +375,10 @@ impl FakeE2b {
         }
     }
 
-    /// The sandboxes `GET /v2/sandboxes` lists, filtered by its `metadata`
-    /// query (every pair must match).
-    fn list(&self, target: &str) -> Value {
+    /// The sandboxes of project `key` that `GET /v2/sandboxes` lists,
+    /// filtered by its `metadata` query (every pair must match). Listed-only
+    /// rows are in the first project.
+    fn list(&self, target: &str, key: &str) -> Value {
         let query = target.split_once('?').map_or("", |(_, q)| q);
         let mut wanted: Vec<(String, String)> = Vec::new();
         for pair in query.split('&') {
@@ -373,6 +394,7 @@ impl FakeE2b {
         let mut listed: Vec<Value> = state
             .sandboxes
             .iter()
+            .filter(|(id, _)| state.projects.get(*id).map_or(E2B_KEY, String::as_str) == key)
             .map(|(id, sandbox)| {
                 json!({
                     "sandboxID": id, "templateID": sandbox.template,
@@ -383,19 +405,26 @@ impl FakeE2b {
                 })
             })
             .collect();
-        listed.extend(state.listed_only.iter().map(|only| {
-            let mut row = json!({
-                "templateID": "intent/intent-node-4x8:0", "state": "running",
-                "endAt": "2026-01-01T01:00:00Z", "cpuCount": 4, "memoryMB": 8192,
-                "envdVersion": "0.2.0",
-            });
-            for key in ["sandboxID", "metadata", "startedAt"] {
-                if !only[key].is_null() {
-                    row[key] = only[key].clone();
-                }
-            }
-            row
-        }));
+        let first_project = key == E2B_KEY;
+        listed.extend(
+            state
+                .listed_only
+                .iter()
+                .filter(|_| first_project)
+                .map(|only| {
+                    let mut row = json!({
+                        "templateID": "intent/intent-node-4x8:0", "state": "running",
+                        "endAt": "2026-01-01T01:00:00Z", "cpuCount": 4, "memoryMB": 8192,
+                        "envdVersion": "0.2.0",
+                    });
+                    for key in ["sandboxID", "metadata", "startedAt"] {
+                        if !only[key].is_null() {
+                            row[key] = only[key].clone();
+                        }
+                    }
+                    row
+                }),
+        );
         listed.retain(|row| {
             wanted
                 .iter()

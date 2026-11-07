@@ -17,7 +17,7 @@
 //! and dropped.
 
 mod bootstrap;
-mod config;
+pub(crate) mod config;
 mod lifecycle;
 mod methods;
 mod start;
@@ -64,11 +64,17 @@ impl StartFailure {
 
 type StartOutcome = Option<std::result::Result<(), StartFailure>>;
 
+/// A sandbox start in flight: the E2B entry it starts with and its outcome.
+struct Start {
+    entry: String,
+    outcome: watch::Receiver<StartOutcome>,
+}
+
 /// The cloud machines' share of the remote feature's state.
 #[derive(Default)]
 pub(crate) struct CloudState {
     /// Sandbox starts in flight, by agent id.
-    starts: Mutex<HashMap<String, watch::Receiver<StartOutcome>>>,
+    starts: Mutex<HashMap<String, Start>>,
     /// `configure` and `remove` take turns.
     settings: tokio::sync::Mutex<()>,
     /// Paused machines: dialed only on a demand, which resumes them.
@@ -222,12 +228,18 @@ impl CloudState {
     }
 
     fn start_of(&self, agent_id: &AgentId) -> Option<watch::Receiver<StartOutcome>> {
-        crate::lock(&self.starts).get(agent_id.as_str()).cloned()
+        crate::lock(&self.starts)
+            .get(agent_id.as_str())
+            .map(|start| start.outcome.clone())
     }
 
-    /// Every start in flight.
-    fn starts_in_flight(&self) -> Vec<watch::Receiver<StartOutcome>> {
-        crate::lock(&self.starts).values().cloned().collect()
+    /// Every start in flight with E2B entry `entry`.
+    fn starts_in_flight(&self, entry: &str) -> Vec<watch::Receiver<StartOutcome>> {
+        crate::lock(&self.starts)
+            .values()
+            .filter(|start| start.entry == entry)
+            .map(|start| start.outcome.clone())
+            .collect()
     }
 }
 
@@ -300,9 +312,15 @@ async fn agent_person(svc: &Services, agent_id: &AgentId) -> Option<intent_core:
     creator
 }
 
-/// A client for the saved E2B key, if one is saved.
-pub(crate) async fn saved_client(svc: &Services) -> Option<intent_nodes::e2b::E2bClient> {
-    config::saved_client(svc).await.ok()
+/// A client for the saved key of cloud machine `row`'s E2B entry, if one
+/// is saved.
+pub(crate) async fn saved_client(
+    svc: &Services,
+    row: &intent_core::machines::ExposedMachine,
+) -> Option<intent_nodes::e2b::E2bClient> {
+    config::saved_client(svc, methods::row_entry(row))
+        .await
+        .ok()
 }
 
 /// The remote feature, or the error of a daemon without it.

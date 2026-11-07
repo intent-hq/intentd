@@ -168,6 +168,8 @@ pub(crate) fn with_runtime_capabilities(
                 // E2B cloud machines: the backend starts its own machines,
                 // only where it places agents on exposed machines.
                 capabilities["cloudMachines"] = json!(1);
+                // Several named E2B entries, each with its own key.
+                capabilities["cloudMachineEntries"] = json!(1);
             }
         }
         value.to_string()

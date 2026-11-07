@@ -655,6 +655,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     arch: Some(platform.arch),
                     node_id: Some(status.node_id),
                     exclusive: None,
+                    cloud_machine_id: None,
                 },
                 effective_isolation: EffectiveIsolation::Pending,
                 placement_error: None,
@@ -856,7 +857,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                             let Some(feature) = svc.remote_feature() else {
                                 return;
                             };
-                            let client = crate::cloud::saved_client(&svc).await;
+                            let client = crate::cloud::saved_client(&svc, &row).await;
                             crate::cloud::delete_machine(feature, &svc, &row, client.as_ref())
                                 .await;
                         });
