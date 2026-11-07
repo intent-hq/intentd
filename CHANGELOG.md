@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.148] - 2026-11-07
+
+### 🚀 Features
+
+- *(nodes)* Delete an E2B sandbox that cannot link after an update ([#3122](https://github.com/intent-hq/intentd/pull/3122))
+
+### 🐛 Bug Fixes
+
+- *(nodes)* Keep the E2B e2e sockets answered and drop links to paused sandboxes ([#3126](https://github.com/intent-hq/intentd/pull/3126))
+
+### 📚 Documentation
+
+- Describe the None agent picker entry in the guide ([#3123](https://github.com/intent-hq/intentd/pull/3123))
+- *(guide)* Describe agent browser tab notices ([#3127](https://github.com/intent-hq/intentd/pull/3127))
+
+
 ## [0.11.147] - 2026-11-07
 
 ### 🚀 Features
