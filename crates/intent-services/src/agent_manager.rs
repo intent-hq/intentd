@@ -3405,6 +3405,25 @@ impl AgentManager {
         Some(root.clone())
     }
 
+    /// Remove the private temp folders of deleted agents. Call after their
+    /// runtimes are stopped; a folder a late teardown still holds goes when
+    /// that holder drops.
+    pub async fn remove_agent_tmp_dirs(&self, agent_ids: &[AgentId]) {
+        let Some(root) = self.agent_tmp_root.clone() else {
+            return;
+        };
+        let keys: Vec<String> = agent_ids.iter().map(|id| id.0.clone()).collect();
+        let removed = tokio::task::spawn_blocking(move || {
+            for key in &keys {
+                intent_core::remove_agent_tmp_dir(&root, key);
+            }
+        })
+        .await;
+        if let Err(e) = removed {
+            tracing::warn!(error = %e, "agent temp folder removal task failed");
+        }
+    }
+
     /// Set the private persistent root for Antigravity conversation state.
     #[must_use]
     pub fn with_antigravity_state_root(mut self, root: impl Into<PathBuf>) -> Self {
@@ -3964,12 +3983,17 @@ impl AgentManager {
         if spawn_opts.npx_launch_root.is_none() {
             spawn_opts.npx_launch_root = Some(config_dir.as_path());
         }
-        // Each launch gets a private temp folder under the per-daemon root
+        // Each agent gets a private temp folder under the per-daemon root
         // (`TMPDIR` / `TMP` / `TEMP`), so two agents writing the same fixed
-        // temp file name never overwrite each other. A caller-supplied root
+        // temp file name never overwrite each other. It is keyed by the agent,
+        // so a relaunch (idle reap, memory pressure, model switch, restart)
+        // finds the files the previous turn left. A caller-supplied root
         // (tests / embedders) wins.
         if spawn_opts.agent_tmp_root.is_none() {
             spawn_opts.agent_tmp_root = agent_tmp_root.as_deref();
+        }
+        if spawn_opts.agent_tmp_key.is_none() {
+            spawn_opts.agent_tmp_key = Some(agent_id.0.as_str());
         }
         // `agents.acpNodeMaxOldSpaceMb` is read live per spawn (not pinned at
         // boot), so a settings change applies to the next spawned/respawned
@@ -15065,6 +15089,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.npx_launch_root = opts.npx_launch_root;
     spawn_opts.profile_env = opts.profile_env;
     spawn_opts.agent_tmp_root = opts.agent_tmp_root;
+    spawn_opts.agent_tmp_key = opts.agent_tmp_key;
     spawn_opts
 }
 

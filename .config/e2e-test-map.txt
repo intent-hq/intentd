@@ -105,3 +105,7 @@ crates/intent-acp/src/mcp_server/bindings/host.rs        intent-services::lib   
 # Workspace base refresh (fetch before worktree/CoW create): the classified
 # base-refresh-failed envelope is exercised end to end over WSS.
 crates/intent-git/src/fetch.rs                       intentd::suite_wss_repo   e2e_wss_workspace_create_worktree_errors
+
+# Agent temp folders: spawn wiring and the runtime that holds them.
+crates/intent-acp/src/spawn.rs                       intentd::suite_wss_agents e2e_mock_agent_tmpdir
+crates/intent-services/src/agent_manager/runtime.rs  intentd::suite_wss_agents e2e_mock_agent_tmpdir

@@ -398,6 +398,7 @@ require('node:fs').writeFileSync({}, JSON.stringify({{argv:process.argv.slice(2)
             node_max_old_space_mb: None,
             profile_env: None,
             agent_tmp_root: None,
+            agent_tmp_key: None,
         };
         let mut launch = intent_acp::spawn::prepare_provider(&opts).unwrap();
         launch

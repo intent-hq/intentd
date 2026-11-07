@@ -19153,6 +19153,11 @@ impl Services {
                 }
                 Err(e) => return Err(e),
             }
+            // The rows are gone and the agents' trees are killed: remove
+            // their temp folders.
+            if let Some(manager) = manager.as_ref() {
+                manager.remove_agent_tmp_dirs(&session_ids).await;
+            }
             // The row is gone and its scripts are stopped: delete its on-disk
             // script output (best-effort; the startup orphan sweep retries).
             services

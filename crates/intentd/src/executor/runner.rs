@@ -1661,9 +1661,9 @@ impl Runner {
         options
             .extra_env
             .insert(RUN_MARKER_ENV.to_owned(), agent.run_marker.clone());
-        // The agent's private temp folder lives with its checkout (a launch
-        // folder from `agent_tmp_root` would end with each process), and
-        // beats inherited and profile values like a local launch's.
+        // The agent's private temp folder lives with its checkout, so it
+        // survives relaunches, and beats inherited and profile values like a
+        // local launch's.
         for key in intent_core::AGENT_TMP_ENV_KEYS {
             options
                 .extra_env

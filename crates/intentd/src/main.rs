@@ -2476,14 +2476,16 @@ async fn cmd_serve_owned(
             }
             root
         })
-        // Every provider launch gets a private temp folder (`TMPDIR` /
-        // `TMP` / `TEMP`) under a per-daemon root in the OS temp dir, so
-        // agents never share fixed temp file names. The data-dir lock makes
-        // this daemon the root's only user, so the startup sweep (no agent
-        // child is live yet) safely reclaims folders a killed daemon left.
+        // Every agent gets a private temp folder (`TMPDIR` / `TMP` / `TEMP`)
+        // under a per-daemon root in the OS temp dir, so agents never share
+        // fixed temp file names. Folders outlive each launch so a restarted
+        // agent finds its files; the startup sweep (and the hourly one below)
+        // reclaims only folders unused for `AGENT_TMP_MAX_IDLE`.
         .with_agent_tmp_root({
             let root = intent_core::agent_tmp_root(&config.data_dir);
-            if let Err(e) = intent_core::sweep_agent_tmp_root(&root) {
+            if let Err(e) =
+                intent_core::sweep_agent_tmp_root(&root, intent_core::AGENT_TMP_MAX_IDLE)
+            {
                 tracing::warn!(error = %e, path = %root.display(), "agent temp sweep failed");
             }
             root
@@ -2741,6 +2743,30 @@ async fn cmd_serve_owned(
     startup_work.spawn(|| {
         intent_core::spawn_daemon(async move {
             services_export_sweep.sweep_stale_export_staging().await;
+        })
+    });
+    // Agent temp folders persist across an agent's relaunches, so a daemon
+    // that runs for days must also reclaim the ones left idle while it runs
+    // (deleted agents, agents nobody resumed). Folders a live launch holds
+    // are skipped.
+    let agent_tmp_sweep_root = intent_core::agent_tmp_root(&config.data_dir);
+    startup_work.spawn(|| {
+        intent_core::spawn_daemon(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60 * 60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick is immediate; startup already swept.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let root = agent_tmp_sweep_root.clone();
+                let swept = tokio::task::spawn_blocking(move || {
+                    intent_core::sweep_agent_tmp_root(&root, intent_core::AGENT_TMP_MAX_IDLE)
+                })
+                .await;
+                if let Ok(Err(e)) = swept {
+                    tracing::warn!(error = %e, "agent temp sweep failed");
+                }
+            }
         })
     });
     // Exposed machines (daemon-to-daemon remote agents) are dialed on
