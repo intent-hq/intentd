@@ -72,8 +72,8 @@ pub(crate) struct CloudState {
     settings: tokio::sync::Mutex<()>,
     /// Paused machines: dialed only on a demand, which resumes them.
     parked: Mutex<HashSet<String>>,
-    /// Machines whose sandbox E2B removed, until their removal ends.
-    lost: Mutex<HashSet<String>>,
+    /// Machines whose sandbox is gone or unusable, until their removal ends.
+    lost: Mutex<HashMap<String, lifecycle::Loss>>,
     /// Machines being deleted by the supervisor.
     killing: Mutex<HashSet<String>>,
     /// Per-machine pause/resume locks.
@@ -113,13 +113,19 @@ impl CloudState {
         crate::lock(&self.parked).remove(machine_id);
     }
 
-    fn is_lost(&self, machine_id: &str) -> bool {
-        crate::lock(&self.lost).contains(machine_id)
+    fn loss(&self, machine_id: &str) -> Option<lifecycle::Loss> {
+        crate::lock(&self.lost).get(machine_id).copied()
     }
 
     /// Mark the machine lost; `false` when it already was.
-    fn mark_lost(&self, machine_id: &str) -> bool {
-        crate::lock(&self.lost).insert(machine_id.to_owned())
+    fn mark_lost(&self, machine_id: &str, loss: lifecycle::Loss) -> bool {
+        match crate::lock(&self.lost).entry(machine_id.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(loss);
+                true
+            }
+        }
     }
 
     fn is_killing(&self, machine_id: &str) -> bool {

@@ -61,6 +61,9 @@ struct FakeState {
     /// While set, every timeout renewal is 404 and every list fails (500).
     timeouts_missing: bool,
     list_failing: bool,
+    /// Sandboxes whose next resume brings back another intentd build, one
+    /// the backend shares no link protocol with, on this port.
+    outdated: HashMap<String, u16>,
 }
 
 /// The fake E2B API and envd on one loopback port.
@@ -199,8 +202,13 @@ impl FakeE2b {
                     (state.paused.remove(&id), reply)
                 };
                 if resumed {
-                    self.signal(&id, "-CONT");
+                    let outdated = self.state().outdated.remove(&id);
+                    match outdated {
+                        Some(port) => self.outdate(&id, port).await,
+                        None => self.signal(&id, "-CONT"),
+                    }
                 }
+
                 json_reply(if resumed { 201 } else { 200 }, reply)
             }
             ("POST", pause) if pause.starts_with("/sandboxes/") && pause.ends_with("/pause") => {
@@ -380,6 +388,55 @@ impl FakeE2b {
         self.signal(id, "-KILL");
         self.state().paused.remove(id);
         self.state().sandboxes.remove(id);
+    }
+
+    /// Sandbox `id`'s paused daemon comes back as an older intentd build on
+    /// the same port and data: one that speaks only link protocol 6, below
+    /// every protocol the backend speaks.
+    async fn outdate(&self, id: &str, port: u16) {
+        let Some((dir, env)) = self
+            .state()
+            .sandboxes
+            .get(id)
+            .map(|s| (s.dir.clone(), s.env.clone()))
+        else {
+            return;
+        };
+        self.signal(id, "-KILL");
+        let listening = || async {
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+        };
+        timeout(common::test_timeout(Duration::from_secs(30)), async {
+            while listening().await {
+                // timing-guard: poll interval until the killed daemon's port closes
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the old daemon stopped listening");
+        let log = std::fs::File::create(dir.join("outdated.log")).unwrap();
+        let mut serve = common::hermetic_serve_command_fixed_port(&dir);
+        serve
+            .current_dir(&dir)
+            .envs(env)
+            .env("INTENTD_TCP_PORT", port.to_string())
+            .env("INTENTD_TEST_NODE_LINK_PROTOCOL", "6")
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        common::hermetic_fixture_identity(&mut serve, &dir);
+        let mut child = tokio::process::Command::from(serve).spawn().unwrap();
+        tokio::spawn(async move { child.wait().await });
+        timeout(common::test_timeout(Duration::from_secs(60)), async {
+            while !listening().await {
+                // timing-guard: poll interval until the new daemon listens
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the outdated daemon listens");
     }
 
     /// The (method, path) lifecycle calls about sandbox `id`.
@@ -1230,6 +1287,110 @@ fn is_call(call: &(String, String), method: &str, suffix: &str) -> bool {
     call.0 == method && call.1.ends_with(suffix)
 }
 
+/// `cloudMachines.configure` params for E2B with `extra` members.
+#[track_caller]
+fn configure_params(extra: Value) -> Value {
+    let mut params = json!({ "provider": "e2b" });
+    let Value::Object(extra) = extra else {
+        panic!("configure members must be an object: {extra}");
+    };
+    for (k, v) in extra {
+        params[k] = v;
+    }
+    params
+}
+
+/// A backend against a fake E2B, with a one-commit repo, an API-key codex
+/// profile (`keyed_ref`), E2B configured (never idle-paused or deleted
+/// unless a test lowers it) and one connection for calls. A test opens
+/// its event connection ([`agent_events`]) right before the step that
+/// waits for an event.
+struct CloudBackend {
+    scratch: tempfile::TempDir,
+    repo: std::path::PathBuf,
+    fake: Arc<FakeE2b>,
+    head_dir: std::path::PathBuf,
+    head: common::DaemonGuard,
+    port: u16,
+    cfg: Arc<ClientConfig>,
+    ws_id: String,
+    keyed_ref: String,
+    rpc_ws: common::TlsWs,
+}
+
+impl CloudBackend {
+    /// `None` (the test skips) without node or git on PATH.
+    async fn start(prefix: &str, env: &[(&str, &str)]) -> Option<Self> {
+        if intent_providers::resolve_on_path("node").is_none()
+            || intent_providers::resolve_on_path("git").is_none()
+        {
+            eprintln!("skipping E2B e2e: node or git not on PATH");
+            return None;
+        }
+        let fixture = format!(
+            "{}/tests/fixtures/node-test-agent.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let scratch = common::test_tempdir_in("/tmp", prefix);
+        let repo = scratch.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "--quiet"]);
+        std::fs::write(repo.join("README.md"), "base\n").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(&repo, &["commit", "--quiet", "-m", "base"]);
+        let sandboxes = scratch.path().join("e2b");
+        std::fs::create_dir_all(&sandboxes).unwrap();
+        let fake = FakeE2b::start(&sandboxes, &fixture).await;
+        let head_dir = scratch.path().join("head");
+        let mut backend_env = vec![
+            ("INTENTD_E2B_API_URL", fake.url.as_str()),
+            ("INTENTD_E2B_ENVD_URL", fake.url.as_str()),
+            ("INTENTD_E2B_DIRECT_HOST", "127.0.0.1"),
+        ];
+        backend_env.extend_from_slice(env);
+        let (head, port, cfg, ws_id) = start_backend_with(&head_dir, &repo, &backend_env).await;
+        let mut rpc_ws = connect(port, cfg.clone()).await;
+        ok(
+            &mut rpc_ws,
+            1,
+            "client.hello",
+            json!({ "clientId": "e2b-life", "name": "E2B lifecycle" }),
+        )
+        .await;
+        let keyed = ok(
+            &mut rpc_ws,
+            3,
+            "providers.profiles.create",
+            json!({ "baseProviderId": "codex", "name": "Cloud", "env": [
+                { "key": "OPENAI_API_KEY", "kind": "set", "value": PROFILE_SECRET },
+            ] }),
+        )
+        .await;
+        let keyed_ref = format!("codex@{}", keyed["profile"]["id"].as_str().unwrap());
+        ok(
+            &mut rpc_ws,
+            4,
+            "cloudMachines.configure",
+            configure_params(json!({
+                "apiKey": E2B_KEY, "size": "4x8", "idlePauseMinutes": 1440, "pausedDeleteDays": 30,
+            })),
+        )
+        .await;
+        Some(Self {
+            scratch,
+            repo,
+            fake,
+            head_dir,
+            head,
+            port,
+            cfg,
+            ws_id,
+            keyed_ref,
+            rpc_ws,
+        })
+    }
+}
+
 /// The life of a sandbox against the fake E2B, with one settings minute
 /// scaled to 100 ms and one day to 3 s. Proves every row of the lifecycle
 /// table: the timeout is renewed while the sandbox lives; it is paused and
@@ -1467,6 +1628,13 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
     )
     .await;
     machine_until(&mut rpc_ws, 301, "sbx1", |m| m.is_none()).await;
+    // The E2B delete follows the machine row's removal.
+    call_until(&fake, &mut rpc_ws, "sbx1", |calls| {
+        calls
+            .iter()
+            .any(|c| is_call(c, "DELETE", "/sandboxes/sbx1"))
+    })
+    .await;
     let calls = fake.calls_for("sbx1");
     let last_pause = calls
         .iter()
@@ -1666,6 +1834,121 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
     assert!(!fake.state().deletes.contains(&"foreign1".to_owned()));
 
     // No secret in the backend's log.
+    let log = std::fs::read_to_string(head_dir.join("head.log")).unwrap_or_default();
+    let mut secrets = vec![E2B_KEY.to_owned(), PROFILE_SECRET.to_owned()];
+    secrets.extend(fake.envd_tokens());
+    secrets.extend(fake.executor_tokens());
+    for secret in &secrets {
+        assert!(!log.contains(secret.as_str()), "a secret reached the log");
+    }
+}
+
+/// A paused sandbox that comes back as an intentd build this backend shares
+/// no link protocol with (`machine-update-required`) is deleted without a
+/// final stop: the prompt that resumed it fails with a message saying so,
+/// the agent stays on E2B without a sandbox and keeps the work it pushed,
+/// and retrying the prompt starts a new sandbox from that work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paused_sandbox_that_cannot_link_after_an_update_is_deleted() {
+    let Some(CloudBackend {
+        scratch: _scratch,
+        repo,
+        fake,
+        head_dir,
+        head: _head,
+        port,
+        cfg,
+        ws_id,
+        keyed_ref,
+        mut rpc_ws,
+    }) = CloudBackend::start("itd-e2bu-", &[]).await
+    else {
+        return;
+    };
+    let created = ok(
+        &mut rpc_ws,
+        5,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id, "name": "Outdated", "model": "default", "provider": keyed_ref,
+            "placement": { "target": "e2b" },
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    let agent = (ws_id.as_str(), agent_id.as_str());
+    send_and_reply(&mut rpc_ws, agent, "before the update", 10).await;
+    let machine = machine_until(&mut rpc_ws, 20, "sbx1", |m| m.is_some())
+        .await
+        .unwrap();
+    let sandbox_port = u16::try_from(machine["port"].as_u64().unwrap()).unwrap();
+    let paused = ok(
+        &mut rpc_ws,
+        30,
+        "cloudMachines.pause",
+        json!({ "machineId": machine["id"] }),
+    )
+    .await;
+    assert_eq!(paused["machine"]["cloud"]["state"], "paused", "{paused}");
+    let refs = format!("refs/intent/ws/{ws_id}/agents/{agent_id}");
+    let pushed = (
+        try_rev(&repo, &format!("{refs}/head")),
+        try_rev(&repo, &format!("{refs}/wip")),
+    );
+
+    // The backend was updated past the sandbox's link protocol.
+    fake.state()
+        .outdated
+        .insert("sbx1".to_owned(), sandbox_port);
+    let mut events = agent_events(port, cfg.clone(), &ws_id).await;
+    ok(
+        &mut rpc_ws,
+        40,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "after the update" }),
+    )
+    .await;
+    let failed = failure_containing(&mut events, &agent_id, "machine-update-required").await;
+    assert!(failed.contains("was deleted"), "{failed}");
+    assert!(
+        failed.contains("next message starts a new sandbox"),
+        "{failed}"
+    );
+    machine_until(&mut rpc_ws, 50, "sbx1", |m| m.is_none()).await;
+    call_until(&fake, &mut rpc_ws, "sbx1", |calls| {
+        calls
+            .iter()
+            .any(|c| is_call(c, "DELETE", "/sandboxes/sbx1"))
+    })
+    .await;
+    let sandboxless = agent_until(&mut rpc_ws, agent, 100, |a| a.get("nodeId").is_none()).await;
+    assert_eq!(sandboxless["placement"]["target"], "e2b", "{sandboxless}");
+    assert_eq!(
+        (
+            try_rev(&repo, &format!("{refs}/head")),
+            try_rev(&repo, &format!("{refs}/wip")),
+        ),
+        pushed,
+        "the agent keeps the work it pushed"
+    );
+
+    // Retrying the prompt starts a new sandbox.
+    ok(
+        &mut rpc_ws,
+        200,
+        "agent.retry",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    reply_containing(&mut rpc_ws, agent, "after the update", 201).await;
+    machine_until(&mut rpc_ws, 300, "sbx2", |m| m.is_some()).await;
+    assert_no_secret_logged(&head_dir, &fake);
+}
+
+/// No E2B key, envd token, executor token or profile secret in the
+/// backend's log.
+#[track_caller]
+fn assert_no_secret_logged(head_dir: &Path, fake: &FakeE2b) {
     let log = std::fs::read_to_string(head_dir.join("head.log")).unwrap_or_default();
     let mut secrets = vec![E2B_KEY.to_owned(), PROFILE_SECRET.to_owned()];
     secrets.extend(fake.envd_tokens());

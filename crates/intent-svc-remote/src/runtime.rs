@@ -102,9 +102,12 @@ impl RemoteAgentRuntime {
             ));
         }
         self.exit_error().map(|error| {
-            // A cloud machine's documented failure (its sandbox is gone) is
-            // the turn's own error, not a transport hiccup to redrive.
-            if error.starts_with(intent_core::machines::CLOUD_MACHINE_UNAVAILABLE_CODE) {
+            // A cloud machine's documented failure (its sandbox is gone or
+            // was deleted as outdated) is the turn's own error, not a
+            // transport hiccup to redrive.
+            if error.starts_with(intent_core::machines::CLOUD_MACHINE_UNAVAILABLE_CODE)
+                || error.starts_with(intent_core::machines::MACHINE_UPDATE_REQUIRED_CODE)
+            {
                 AcpError::Rpc(JsonRpcError {
                     code: TURN_FAILED_CODE,
                     message: error,

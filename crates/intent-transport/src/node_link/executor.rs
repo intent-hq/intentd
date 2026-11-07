@@ -352,10 +352,11 @@ impl ExecutorLinks {
                 _ => return Err(super::unavailable()),
             }
         };
-        let Some(protocol) = NODE_LINK_PROTOCOLS.highest_common(hello.protocol) else {
+        let ours = spoken_protocols();
+        let Some(protocol) = ours.highest_common(hello.protocol) else {
             reject(
                 socket,
-                &format!("{}: {}", codes::VERSION_MISMATCH, NODE_LINK_PROTOCOLS.max),
+                &format!("{}: {}", codes::VERSION_MISMATCH, ours.max),
             )
             .await;
             return Err(Error::InvalidParams(codes::VERSION_MISMATCH.into()));
@@ -467,4 +468,25 @@ where
         })))
         .await;
     let _ = socket.flush().await;
+}
+
+/// Test seam: speak only the link protocol in this variable, as another
+/// intentd build would (a backend that cannot link to it). Compiled out of
+/// release builds.
+#[cfg(debug_assertions)]
+fn spoken_protocols() -> intent_core::node_link::ProtocolRange {
+    std::env::var("INTENTD_TEST_NODE_LINK_PROTOCOL")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map_or(NODE_LINK_PROTOCOLS, |only| {
+            intent_core::node_link::ProtocolRange {
+                min: only,
+                max: only,
+            }
+        })
+}
+
+#[cfg(not(debug_assertions))]
+fn spoken_protocols() -> intent_core::node_link::ProtocolRange {
+    NODE_LINK_PROTOCOLS
 }
