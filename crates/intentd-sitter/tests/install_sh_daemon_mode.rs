@@ -42,7 +42,7 @@ case "$1" in
       printf '%s = %s\n' "$2" "$3"
     fi ;;
   restart)
-    sleep 120 >/dev/null 2>&1 &
+    tail -f /dev/null >/dev/null 2>&1 &
     printf '%s\n' "$!" >"$INTENTD_DATA_DIR/intentd.pid"
     printf '%s\n' "$!" >>"$state/daemons" ;;
   pair)
