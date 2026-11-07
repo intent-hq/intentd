@@ -2339,10 +2339,14 @@ dependencies = [
 name = "intent-nodes"
 version = "0.11.144"
 dependencies = [
+ "base64 0.23.1",
  "intent-core",
+ "intentd-test-support",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.21",
  "tokio",
 ]
 
