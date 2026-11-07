@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.149] - 2026-11-07
+
+### 🚀 Features
+
+- Report daemon mode and set up nodes from the installers ([#3128](https://github.com/intent-hq/intentd/pull/3128))
+- *(remote)* Place sub-agents of remote agents on new sandboxes, machines or the backend ([#3129](https://github.com/intent-hq/intentd/pull/3129))
+
+### 🐛 Bug Fixes
+
+- Keep an agent's temp folder across relaunches ([#3131](https://github.com/intent-hq/intentd/pull/3131))
+- *(nodes)* Read E2B template sizes from the release manifest, not the key ([#3133](https://github.com/intent-hq/intentd/pull/3133))
+
+
 ## [0.11.148] - 2026-11-07
 
 ### 🚀 Features
