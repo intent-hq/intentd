@@ -1126,11 +1126,11 @@ selection updates when the primary changes; after reconnecting, wait for the
 current client and workspace browser state to refresh. Do not promise automatic
 failover or change the primary client without the user's instruction.
 
-A browser tab that runs on another client shows a warning above its address bar:
-this computer isn't primary for the tab, cookies and page state stay on the
-other client, so the page may differ from what the agent sees, and its address
-can change on its own. An agent-owned tab also shows **Controlled by** with the
-agent's name; click it to open that agent's conversation.
+An agent-owned browser tab shows **Controlled by** with the agent's name above
+its address bar; click it to open that agent's conversation. When the tab runs on
+another client, a warning above it says this computer isn't primary for the tab:
+cookies and page state stay on the other client, so the page may differ from what
+the agent sees, and its address can change on its own.
 
 ## iOS workspace browser
 
