@@ -153,6 +153,7 @@ fn launch(id: &str) -> LaunchCommand {
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
         checkout_of: None,
+        forge: None,
     }
 }
 

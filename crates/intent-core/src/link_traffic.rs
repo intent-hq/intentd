@@ -598,6 +598,13 @@ fn masked_copy(frame: &LinkFrame) -> LinkFrame {
             value: crate::node_link::SecretValue::from(MASK),
             ..put.clone()
         }),
+        LinkFrame::ForgeToken(forge) => LinkFrame::ForgeToken(crate::node_link::ForgeToken {
+            token: forge
+                .token
+                .as_ref()
+                .map(|_| crate::node_link::SecretValue::from(MASK)),
+            ..forge.clone()
+        }),
         other => other.clone(),
     }
 }
@@ -773,6 +780,18 @@ fn light_frame(frame: &LinkFrame) -> Value {
             "type": "secretReply",
             "requestId": reply.request_id,
             "agentId": agent(&reply.agent_id),
+            "outcome": reply.outcome,
+            "error": reply.error.as_deref().map(field),
+        }),
+        LinkFrame::ForgeToken(forge) => json!({
+            "type": "forgeToken",
+            "requestId": forge.request_id,
+            "host": field(&forge.host),
+            "held": forge.token.is_some(),
+        }),
+        LinkFrame::ForgeTokenReply(reply) => json!({
+            "type": "forgeTokenReply",
+            "requestId": reply.request_id,
             "outcome": reply.outcome,
             "error": reply.error.as_deref().map(field),
         }),

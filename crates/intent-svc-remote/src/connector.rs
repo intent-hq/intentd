@@ -27,7 +27,7 @@ use intent_core::node_link::{
     JournalBody, LaunchCommand, LinkFrame, LinkId, LinkOutcome, LinkRpcError, LinkWelcome,
     MachineCapabilities, MachineSkill, PushWipRequest, PushWipResult, SecretForget, SecretList,
     SecretOutcome, SecretPut, SecretReply, SetupState, SkillsQuery, StopId, StopOutcome,
-    FINAL_STOP_PROTOCOL, SECRETS_PROTOCOL, SKILLS_PROTOCOL,
+    FINAL_STOP_PROTOCOL, FORGE_TOKEN_PROTOCOL, SECRETS_PROTOCOL, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::{AgentPlatform, PlatformAvailability};
@@ -101,6 +101,10 @@ pub(crate) struct Tuning {
     /// The clock final-stop bounds are measured against.
     pub clock: crate::final_stop::Clock,
     pub connect: ConnectTuning,
+    /// How often linked machines' GitHub token is resolved again.
+    pub forge_refresh: Duration,
+    /// How often the token's watcher looks for a credential or gate change.
+    pub forge_check: Duration,
     /// Test seam: fail every ack write while set.
     #[cfg(test)]
     pub fail_ack_writes: Arc<std::sync::atomic::AtomicBool>,
@@ -172,6 +176,8 @@ impl Default for Tuning {
             final_stop_check: Duration::from_secs(60 * 60),
             clock: crate::final_stop::Clock::default(),
             connect: ConnectTuning::default(),
+            forge_refresh: Duration::from_secs(5 * 60),
+            forge_check: Duration::from_secs(2),
             #[cfg(test)]
             fail_ack_writes: Arc::default(),
             #[cfg(test)]
@@ -327,6 +333,9 @@ pub(crate) struct Shared {
     /// queued forgets included, so a queued forget never lands after a
     /// newer `secretPut`.
     secret_locks: Mutex<HashMap<AgentId, Arc<tokio::sync::Mutex<()>>>>,
+    /// The backend's GitHub token, sent after every bind and on each change
+    /// (nodeProtocol 15); `None` hands out none.
+    forge: Option<Arc<crate::forge_token::ForgeTokens>>,
     ingested: Mutex<NodeCounter>,
     /// Each agent's checkout and setup output tail (nodeProtocol 10).
     setup_outputs: Mutex<HashMap<AgentId, SetupTail>>,
@@ -1515,6 +1524,7 @@ impl RemoteNode {
         target: MachineTarget,
         tuning: Tuning,
         services: Option<Services>,
+        forge: Option<Arc<crate::forge_token::ForgeTokens>>,
     ) -> Result<Self> {
         let lease = HeadLease::open(store, &target.id).await?;
         #[cfg(test)]
@@ -1568,6 +1578,7 @@ impl RemoteNode {
             secret_waiters: Mutex::new(HashMap::new()),
             secret_forgets: Mutex::new(Vec::new()),
             secret_locks: Mutex::new(HashMap::new()),
+            forge,
             ingested: Mutex::new(acked),
             cloud_refusal: watch::channel(None).0,
             demand,
@@ -2283,6 +2294,17 @@ async fn run(
         // (intent-hq/intent#8383). Before the queued stops too, so their
         // resenders start right after they are sent.
         let git = serve_git(&shared, &endpoint, &link).await;
+        // Before the link is published, so it precedes every launch on it.
+        let forge = match &shared.forge {
+            Some(forge) if link.protocol() >= FORGE_TOKEN_PROTOCOL => {
+                let mut changes = forge.subscribe();
+                forge.refresh().await;
+                let held = changes.borrow_and_update().clone();
+                crate::forge_token::send(&link, &held).await;
+                Some(changes)
+            }
+            _ => None,
+        };
         shared.send_queued(&link).await;
         #[cfg(test)]
         if let Some(hook) = &shared.tuning.before_publish.0 {
@@ -2329,6 +2351,7 @@ async fn run(
             lease: &lease,
             link: &link,
             calls: calls.as_ref(),
+            forge,
         };
         let ended = serve(
             &shared,
@@ -2380,6 +2403,8 @@ struct Served<'a> {
     lease: &'a HeadLease,
     link: &'a NodeLink,
     calls: Option<&'a HeadCalls>,
+    /// Changes of the GitHub token to send (nodeProtocol 15).
+    forge: Option<watch::Receiver<crate::forge_token::Held>>,
 }
 
 /// Ingest one link's journal, answer its requests and connect requests,
@@ -2387,7 +2412,12 @@ struct Served<'a> {
 /// [`Tuning::idle_timeout`], or shutdown.
 async fn serve(
     shared: &Arc<Shared>,
-    Served { lease, link, calls }: Served<'_>,
+    Served {
+        lease,
+        link,
+        calls,
+        mut forge,
+    }: Served<'_>,
     ingest: &mut Ingest,
     mut events: LinkEvents,
     shutdown: &mut watch::Receiver<bool>,
@@ -2478,6 +2508,14 @@ async fn serve(
                             let _ = waiter.send(reply);
                         }
                     }
+                    LinkEvent::Frame(LinkFrame::ForgeTokenReply(reply)) => {
+                        if reply.outcome == SecretOutcome::Failed {
+                            tracing::warn!(
+                                error = reply.error.as_deref().unwrap_or("failed"),
+                                "remote machine: refused the GitHub token"
+                            );
+                        }
+                    }
                     LinkEvent::Frame(frame)
                         if frame.channel() == intent_core::node_link::LinkChannel::Script =>
                     {
@@ -2495,6 +2533,9 @@ async fn serve(
                         None => answer_unsupported(request),
                     },
                 }
+            }
+            held = crate::forge_token::changed(&mut forge) => {
+                crate::forge_token::send(link, &held).await;
             }
             demand = demands.recv() => {
                 // Someone needs the link: it is up, so answer at once and

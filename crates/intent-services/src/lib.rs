@@ -16210,6 +16210,14 @@ async fn github_git_token_for_url(
     intent_sourcecontrol::token::resolve(&github_token_source(registry)).await
 }
 
+/// Changes on every daemon-owned GitHub credential or configuration write
+/// (connect, revoke, token edits): a watcher of the resolved token
+/// re-resolves when it moves.
+#[must_use]
+pub fn github_credential_generation() -> u64 {
+    intent_sourcecontrol::cache_scope::generation()
+}
+
 /// Resolve the daemon-managed GitHub credential for the `system.gitCredential`
 /// UDS RPC backing the `intentd git-credential` helper (monorepo#884):
 /// `Some((username, password))` only when the

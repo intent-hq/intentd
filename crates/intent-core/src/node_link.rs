@@ -72,16 +72,23 @@ fn is_false(value: &bool) -> bool {
 /// user MCP server proxies ([`MCP_PROXY_PROTOCOL`]); 12 adds the machine's
 /// skills ([`SKILLS_PROTOCOL`]); 13 adds sub-agent checkouts
 /// ([`SHARED_CHECKOUT_PROTOCOL`]); 14 adds agent secrets held on the
-/// machine ([`SECRETS_PROTOCOL`]); each keeps everything the one before
+/// machine ([`SECRETS_PROTOCOL`]); 15 adds the backend's forge token
+/// ([`FORGE_TOKEN_PROTOCOL`]); each keeps everything the one before
 /// has. Neither 6 nor the single-node 5 ever
 /// shipped, and a protocol-6 peer cannot confirm a stop, so this build
-/// speaks 7 to 14: a backend never takes a stop as confirmed by a machine
+/// speaks 7 to 15: a backend never takes a stop as confirmed by a machine
 /// that cannot acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 14 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 15 };
+
+/// The first protocol with the backend's forge token on the machine: the
+/// [`LinkFrame::ForgeToken`] / [`LinkFrame::ForgeTokenReply`] frames and
+/// [`LaunchCommand::forge`]. The backend sends neither on a link that
+/// negotiated less, and its agents there start without `GH_TOKEN`.
+pub const FORGE_TOKEN_PROTOCOL: u32 = 15;
 
 /// The first protocol with agent secrets held on the machine:
 /// [`LinkHello::head_session`] and the [`LinkFrame::SecretPut`] /
@@ -167,11 +174,13 @@ impl std::fmt::Display for ProtocolRange {
 /// liveness, agent control, journal acks, the capabilities request,
 /// responses to the machine's forwarded `workspace.call` requests, and
 /// starting and stopping script runs (protocol 8), the skills query
-/// (protocol 12), the push request (protocol 13) and the agent secret
-/// frames (protocol 14). Nothing else is admitted
+/// (protocol 12), the push request (protocol 13), the agent secret
+/// frames (protocol 14) and the forge token (protocol 15). Nothing else is
+/// admitted
 /// from an executor credential; the machine-to-backend frames (`welcome`,
 /// `journal`, `replayComplete`, `request`, `capabilitiesReply`, `stopAck`,
-/// `scriptStarted`, `scriptOutput`, `scriptExited`, `skillsReply`, `secretReply`) and
+/// `scriptStarted`, `scriptOutput`, `scriptExited`, `skillsReply`, `secretReply`,
+/// `forgeTokenReply`) and
 /// `cancelRequest` are
 /// refused. Git sessions use the
 /// separate `/node/git` connection, admitted per binding. Sorted;
@@ -180,6 +189,7 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "ack",
     "cancel",
     "capabilities",
+    "forgeToken",
     "heartbeat",
     "heartbeatReply",
     "hello",
@@ -459,6 +469,21 @@ pub struct LaunchCommand {
     /// of [`SHARED_CHECKOUT_PROTOCOL`] or later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_of: Option<AgentId>,
+    /// A top-level agent's GitHub branch and remote. Sent only on a link of
+    /// [`FORGE_TOKEN_PROTOCOL`] or later, never for a sub-agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<ForgeLaunch>,
+}
+
+/// [`LaunchCommand::forge`] (nodeProtocol 15): the workspace branch a
+/// top-level agent works on and the forge remote it pushes to. The body is
+/// closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForgeLaunch {
+    /// `https://github.com/<owner>/<repo>.git`.
+    pub remote_url: String,
+    pub branch: String,
 }
 
 /// Backend to machine (nodeProtocol 13): push `agent_id`'s checkout now,
@@ -596,6 +621,36 @@ pub struct SecretReply {
     /// `secretForget`: whether anything was dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forgotten: Option<bool>,
+    /// With [`SecretOutcome::Failed`]: a fixed code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The forge host [`ForgeToken::host`] names in this build.
+pub const FORGE_HOST_GITHUB: &str = "github.com";
+
+/// Backend to machine (nodeProtocol 15): the backend's token for `host`,
+/// which every agent of this binding gets as `GH_TOKEN` at its next spawn;
+/// `None` drops the held token. Sent after every bind, before any launch,
+/// and whenever the token changes. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForgeToken {
+    pub request_id: LinkId,
+    pub host: String,
+    pub token: Option<SecretValue>,
+}
+
+/// `forgeTokenReply.error` for an unknown host or an unusable token.
+pub const FORGE_TOKEN_INVALID: &str = "forge-token-invalid";
+
+/// Machine to backend (nodeProtocol 15): the one answer to a
+/// [`ForgeToken`]. Never carries a value. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForgeTokenReply {
+    pub request_id: LinkId,
+    pub outcome: SecretOutcome,
     /// With [`SecretOutcome::Failed`]: a fixed code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -953,6 +1008,10 @@ pub enum LinkFrame {
     SecretList(SecretList),
     /// Machine to backend (nodeProtocol 14): the answer to a secret frame.
     SecretReply(SecretReply),
+    /// Backend to machine (nodeProtocol 15): hold or drop the forge token.
+    ForgeToken(ForgeToken),
+    /// Machine to backend (nodeProtocol 15): the answer to a `forgeToken`.
+    ForgeTokenReply(ForgeTokenReply),
 }
 
 /// A chunk of an agent's checkout progress and setup output, `seq`
@@ -1002,7 +1061,9 @@ impl LinkFrame {
             | Self::SecretPut(_)
             | Self::SecretForget(_)
             | Self::SecretList(_)
-            | Self::SecretReply(_) => LinkChannel::Control,
+            | Self::SecretReply(_)
+            | Self::ForgeToken(_)
+            | Self::ForgeTokenReply(_) => LinkChannel::Control,
             Self::Journal(_) | Self::Ack { .. } | Self::ReplayComplete { .. } => {
                 LinkChannel::Journal
             }
@@ -1028,6 +1089,8 @@ impl LinkFrame {
             | Self::SecretForget(_)
             | Self::SecretList(_)
             | Self::SecretReply(_) => SECRETS_PROTOCOL,
+            Self::ForgeToken(_) | Self::ForgeTokenReply(_) => FORGE_TOKEN_PROTOCOL,
+            Self::Launch(command) if command.forge.is_some() => FORGE_TOKEN_PROTOCOL,
             Self::Launch(command) if !command.mcp_proxies.is_empty() => MCP_PROXY_PROTOCOL,
             Self::Launch(command) if command.checkout.is_some() => PREPARED_CHECKOUT_PROTOCOL,
             Self::SetupOutput(_) => PREPARED_CHECKOUT_PROTOCOL,
@@ -1069,7 +1132,8 @@ impl LinkFrame {
             | Self::PushWip(_)
             | Self::SecretPut(_)
             | Self::SecretForget(_)
-            | Self::SecretList(_) => true,
+            | Self::SecretList(_)
+            | Self::ForgeToken(_) => true,
             Self::Welcome(_)
             | Self::Journal(_)
             | Self::ReplayComplete { .. }
@@ -1083,7 +1147,8 @@ impl LinkFrame {
             | Self::SetupOutput(_)
             | Self::SkillsReply(_)
             | Self::PushWipReply(_)
-            | Self::SecretReply(_) => false,
+            | Self::SecretReply(_)
+            | Self::ForgeTokenReply(_) => false,
         }
     }
 
@@ -1119,12 +1184,15 @@ impl LinkFrame {
     }
 }
 
-/// Whether undecodable `bytes` may be a secret frame (any mention of one
-/// counts, so a value is never echoed by mistake).
+/// Whether undecodable `bytes` may be a secret or forge token frame (any
+/// mention of one counts, so a value is never echoed by mistake).
 fn carries_secret(bytes: &[u8]) -> bool {
-    bytes
-        .windows(b"secret".len())
-        .any(|w| w.eq_ignore_ascii_case(b"secret"))
+    let mentions = |needle: &[u8]| {
+        bytes
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+    };
+    mentions(b"secret") || mentions(b"token")
 }
 
 fn check_frame_size(len: usize) -> Result<()> {

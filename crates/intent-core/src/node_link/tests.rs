@@ -457,6 +457,7 @@ fn every_frame() -> Vec<LinkFrame> {
             mcp_proxies: Vec::new(),
             compact_tool_descriptions: false,
             checkout_of: None,
+            forge: None,
         }),
         LinkFrame::Prompt {
             agent_id: agent_id.clone(),
@@ -850,6 +851,7 @@ fn launch_profile_env_never_debug_renders_its_values() {
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
         checkout_of: None,
+        forge: None,
     };
     let rendered = format!("{command:?} {:?}", LinkFrame::Launch(command.clone()));
     assert!(!rendered.contains("canary-secret-7f3a"), "{rendered}");
@@ -877,6 +879,7 @@ fn launch_without_a_profile_omits_profile_env() {
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
         checkout_of: None,
+        forge: None,
     };
     let wire = serde_json::to_value(&command).unwrap();
     assert!(wire.get("profileEnv").is_none(), "{wire}");
@@ -1205,6 +1208,7 @@ fn a_launch_with_a_checkout_needs_protocol_10() {
             mcp_proxies: Vec::new(),
             compact_tool_descriptions: false,
             checkout_of: None,
+            forge: None,
         })
     };
     assert_eq!(launch(None).min_protocol(), NODE_LINK_PROTOCOLS.min);
@@ -1234,6 +1238,7 @@ fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
             mcp_proxies,
             compact_tool_descriptions: false,
             checkout_of: None,
+            forge: None,
         };
     let proxy = McpProxy {
         name: "Linear".into(),
@@ -1281,6 +1286,7 @@ fn a_launch_into_another_agents_checkout_needs_protocol_13() {
         profile_env: None,
         checkout: None,
         checkout_of: Some(AgentId::from("parent")),
+        forge: None,
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
     };

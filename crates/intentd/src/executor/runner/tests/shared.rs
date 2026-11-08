@@ -10,6 +10,7 @@ fn sharing(id: &str, owner: &str) -> LaunchCommand {
     LaunchCommand {
         is_sub_agent: true,
         checkout_of: Some(AgentId::from(owner)),
+        forge: None,
         ..launch(id)
     }
 }

@@ -38,15 +38,22 @@ use intent_services::secret_requests::{exec_with_secrets, remote_unavailable, He
 use intent_transport::node_link::NodeLink;
 
 /// The link to head the agents' forwarded calls use: the newest bound one,
-/// and the secrets this backend's agents hold on the machine (nodeProtocol
-/// 14).
+/// the secrets this backend's agents hold on the machine (nodeProtocol
+/// 14), and the backend's GitHub token (nodeProtocol 15).
 #[derive(Clone, Default)]
 pub(super) struct HeadLink {
     current: Arc<Mutex<Option<NodeLink>>>,
     secrets: Arc<HeldSecrets>,
+    forge: Arc<super::forge::ForgeToken>,
 }
 
 impl HeadLink {
+    /// The backend's GitHub token, memory only (node-link.md § Forge token
+    /// on the machine).
+    pub(super) fn forge(&self) -> &Arc<super::forge::ForgeToken> {
+        &self.forge
+    }
+
     /// The agents' secrets, memory only (node-link.md § Secrets on the
     /// machine).
     pub(super) fn secrets(&self) -> &Arc<HeldSecrets> {

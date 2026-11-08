@@ -95,6 +95,7 @@ fn launch(id: &str) -> LinkFrame {
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
         checkout_of: None,
+        forge: None,
     })
 }
 

@@ -44,6 +44,7 @@ mod cloud;
 mod connect;
 mod connector;
 mod final_stop;
+mod forge_token;
 mod git;
 mod ingest;
 mod launch;
@@ -75,6 +76,8 @@ pub struct RemoteFeature {
     tuning: Mutex<Option<connector::Tuning>>,
     /// E2B cloud machines: starts in flight and the settings lock.
     pub(crate) cloud: cloud::CloudState,
+    /// The GitHub token every linked machine holds (nodeProtocol 15).
+    forge: std::sync::OnceLock<Arc<forge_token::ForgeTokens>>,
 }
 
 impl RemoteFeature {
@@ -118,6 +121,17 @@ impl RemoteFeature {
 
     pub(crate) fn tuning(&self) -> connector::Tuning {
         lock(&self.tuning).clone().unwrap_or_default()
+    }
+
+    /// The GitHub token the machines hold, its watcher started.
+    fn forge(&self, svc: &Services) -> Arc<forge_token::ForgeTokens> {
+        let forge = self
+            .forge
+            .get_or_init(|| Arc::new(forge_token::ForgeTokens::for_services(svc)))
+            .clone();
+        let tuning = self.tuning();
+        forge.watch(svc, tuning.forge_refresh, tuning.forge_check);
+        forge
     }
 
     /// The connector to exposed machine `machine_id`, started if needed
@@ -193,6 +207,7 @@ impl RemoteFeature {
             target,
             self.tuning(),
             Some(svc.clone()),
+            Some(self.forge(svc)),
         )
         .await?;
         let mut nodes = lock(&self.nodes);

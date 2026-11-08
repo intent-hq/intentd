@@ -12,7 +12,7 @@
 
 use intent_core::node_link::{
     FinalPush, LeaseBinding, LinkChannel, LinkFrame, LinkHello, LinkOutcome, LinkRpcError,
-    MachineCapabilities, PushWipResult, SkillsReply, StopId, StopOutcome, FINAL_STOP_PROTOCOL,
+    MachineCapabilities, PushWipResult, SkillsReply, StopId, StopOutcome, FINAL_STOP_PROTOCOL, FORGE_TOKEN_PROTOCOL,
     NODE_LINK_PROTOCOLS, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
@@ -241,6 +241,25 @@ async fn apply_secret(
     Some(LinkFrame::SecretReply(reply))
 }
 
+/// Apply a `forgeToken` frame (nodeProtocol 15, node-link.md § Forge token
+/// on the machine) for `binding`'s session and build its one
+/// `forgeTokenReply`. A replaced session holds, drops and answers nothing.
+async fn apply_forge(
+    runner: &Runner,
+    binding: &LeaseBinding,
+    closed: impl Fn() -> bool,
+    frame: intent_core::node_link::ForgeToken,
+) -> Option<LinkFrame> {
+    let gate = runner.link_gate().lock().await;
+    if admit(gate.as_ref(), binding, closed()) == Admission::Replaced {
+        tracing::debug!("node: dropping a forge token frame from a replaced link");
+        return None;
+    }
+    let reply = runner.forge_frame(frame);
+    drop(gate);
+    Some(LinkFrame::ForgeTokenReply(reply))
+}
+
 /// A fresh capabilities report, for [`LinkFrame::Capabilities`].
 pub(super) type Report =
     std::sync::Arc<dyn Fn() -> BoxFuture<'static, MachineCapabilities> + Send + Sync>;
@@ -263,6 +282,9 @@ pub(super) async fn serve_link(
             // Before any frame of this link: a restarted backend's hello
             // drops the secrets the previous process handed over.
             runner.adopt_head(hello.head_session.as_deref(), &hello.lease_agents);
+            if protocol < FORGE_TOKEN_PROTOCOL {
+                runner.drop_forge();
+            }
             runner.head_link().set(link.clone());
             runner.resend_setup_output(&link);
             // The backend listed the agents it still records: the
@@ -348,6 +370,13 @@ pub(super) async fn serve_link(
                         }))
                         .await;
                 });
+            }
+            LinkEvent::Frame(LinkFrame::ForgeToken(frame)) => {
+                // Handled in order, so it precedes any launch sent after it.
+                if let Some(reply) = apply_forge(&runner, &binding, || link.is_closed(), frame).await
+                {
+                    let _ = link.send(&reply).await;
+                }
             }
             LinkEvent::Frame(
                 frame @ (LinkFrame::SecretPut(_)
