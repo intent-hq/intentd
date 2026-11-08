@@ -211,6 +211,21 @@ class ServerStartup(unittest.TestCase):
                 self.assertEqual(calls, [])
 
 
+class CleanupOrder(unittest.TestCase):
+    def test_runner_cleanup_runs_before_the_cache_server_starts(self):
+        # setup-sccache.py leaves the job's server running, and the macOS
+        # cleanup refuses to run beside any sccache process.
+        checked = 0
+        for path in sorted((ROOT/'.github/workflows').glob('*.yml')):
+            for job in re.split(r'\n  [A-Za-z0-9_-]+:\n', path.read_text()):
+                cleanup = job.find('scripts/macos-ci-cleanup.py --apply')
+                setup = job.find('scripts/setup-sccache.py\n')
+                if cleanup >= 0 and setup >= 0:
+                    checked += 1
+                    self.assertLess(cleanup, setup, path.name)
+        self.assertGreaterEqual(checked, 2)
+
+
 class SelfHostedCache(unittest.TestCase):
     def test_endpoint_and_token_select_self_hosted(self):
         value = cache.configuration(SELF_HOSTED)

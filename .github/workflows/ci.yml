@@ -1151,14 +1151,6 @@ jobs:
         with:
           python-version: '3.11'
       - uses: actions/checkout@v7
-      - name: Configure the self-hosted compiler cache
-        if: needs.release-fast-path.outputs.fast_path != 'true'
-        shell: bash
-        env:
-          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
-          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
-          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
-        run: python3 scripts/setup-sccache.py
       # Per-job persistent target dir outside the work dir, self-hosted
       # runners only (see the `check` job's comment for the rationale). The
       # self-hosted macOS runner is single-slot, so no $RUNNER_NAME key.
@@ -1171,6 +1163,14 @@ jobs:
       - name: Ensure macOS CI disk headroom
         if: needs.release-fast-path.outputs.fast_path != 'true' && runner.os == 'macOS' && contains(matrix.os, 'self-hosted')
         run: python3 -I -B scripts/macos-ci-cleanup.py --apply
+      - name: Configure the self-hosted compiler cache
+        if: needs.release-fast-path.outputs.fast_path != 'true'
+        shell: bash
+        env:
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
       - name: Resolve pinned Rust channel
         if: needs.release-fast-path.outputs.fast_path != 'true'
         id: toolchain
