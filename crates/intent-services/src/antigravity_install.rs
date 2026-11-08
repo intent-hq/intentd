@@ -286,8 +286,12 @@ fn extract_bundle(
         let mut entry = zip
             .by_index(index)
             .map_err(|_| InstallError::InvalidArchive)?;
-        if ![SERVER, HARNESS].contains(&entry.name())
-            || !seen.insert(entry.name().to_owned())
+        let name = entry
+            .name()
+            .map_err(|_| InstallError::InvalidArchive)?
+            .into_owned();
+        if ![SERVER, HARNESS].contains(&name.as_str())
+            || !seen.insert(name.clone())
             || entry
                 .unix_mode()
                 .is_some_and(|mode| mode & 0o170_000 != 0 && mode & 0o170_000 != 0o100_000)
@@ -295,7 +299,7 @@ fn extract_bundle(
         {
             return Err(InstallError::InvalidArchive);
         }
-        let path = target.join(entry.name());
+        let path = target.join(&name);
         let mut out = OpenOptions::new()
             .write(true)
             .create_new(true)

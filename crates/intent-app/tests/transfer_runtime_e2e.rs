@@ -133,7 +133,7 @@ fn manifest(ws: &str) -> TransferManifest {
 fn archive(ws: &str, rows: &[(&str, Vec<Value>)]) -> Vec<u8> {
     let mut buf = std::io::Cursor::new(Vec::new());
     let mut zip = zip::ZipWriter::new(&mut buf);
-    let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
     zip.start_file("manifest.json", options).expect("manifest");
     zip.write_all(
         serde_json::to_string(&manifest(ws))

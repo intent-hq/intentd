@@ -1001,7 +1001,7 @@ fn write_archive(
     let file = std::fs::File::create(&archive_path)
         .map_err(|e| Error::Internal(format!("create export archive failed: {e}")))?;
     let mut zip = zip::ZipWriter::new(file);
-    let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
     let zerr = |what: &str, e: zip::result::ZipError| {
         Error::Internal(format!("export archive: {what} failed: {e}"))
     };
@@ -1866,7 +1866,7 @@ mod tests {
         let reader = std::io::Cursor::new(archive);
         let mut zip = zip::ZipArchive::new(reader).expect("valid zip");
         let names: Vec<String> = (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .map(|i| zip.by_index(i).unwrap().name().unwrap().into_owned())
             .collect();
         assert!(names.contains(&"manifest.json".to_string()));
         assert!(names.contains(&"rows/workspace.jsonl".to_string()));
@@ -2133,7 +2133,7 @@ mod tests {
         let reader = std::io::Cursor::new(archive);
         let mut zip = zip::ZipArchive::new(reader).expect("valid zip");
         let names: Vec<String> = (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .map(|i| zip.by_index(i).unwrap().name().unwrap().into_owned())
             .collect();
         assert!(names.contains(&"git/repo.bundle".to_string()));
         assert!(names.contains(&"git/refs.json".to_string()));
@@ -2233,7 +2233,7 @@ mod tests {
         let reader = std::io::Cursor::new(archive);
         let mut zip = zip::ZipArchive::new(reader).expect("valid zip");
         let names: Vec<String> = (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .map(|i| zip.by_index(i).unwrap().name().unwrap().into_owned())
             .collect();
         assert!(names.contains(&"git/repo.bundle".to_string()));
         assert!(names.contains(&"git/submodules/0.bundle".to_string()));
