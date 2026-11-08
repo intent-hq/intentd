@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.155] - 2026-11-08
+
+### 🐛 Bug Fixes
+
+- Probe 3 small fixes (task not-found, comment.list help, setupStatus after restart) ([#3153](https://github.com/intent-hq/intentd/pull/3153))
+
+
 ## [0.11.154] - 2026-11-08
 
 ### 🐛 Bug Fixes
