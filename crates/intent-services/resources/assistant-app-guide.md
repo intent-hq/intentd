@@ -184,6 +184,24 @@ the current connection, access, and version rather than guessing another URL.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/SettingsSidebarNav.svelte; src/shared/app-ui-targets.ts; messages/en.json. -->
 
+### Search with Cmd+K
+
+Press **Cmd+K** (Ctrl+K on Windows and Linux), type a few letters, and press Enter.
+While you type, all matches show in one list, best match first, each with a small
+category label such as **Agent**, **Repo**, or **File**. An exact name match comes
+first, then items you picked before for the same text, then stronger matches, then
+recent items. Files, note text, and chat messages arrive a moment later and appear
+below the top result. With nothing typed, the palette lists items grouped by category.
+
+Repos you have used in Intent are listed too. Enter on a repo opens **New Workspace**
+with that repo selected and the cursor in the prompt; nothing is created until you
+submit. A repo with a local clone and a GitHub or GitLab entry shows both rows,
+labeled by source. Type `+` or click the **Repos** chip (Tab cycles the chips) to see
+only repos; `+` alone lists them most recent first. Repos appear only when you can
+create workspaces.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/CommandPalette.svelte; src/lib/components/CommandPaletteFilters.svelte; src/store/renderer/slices/command-palette/command-palette-results.ts. -->
+
 ## Find a setting
 
 Open Settings and use these sidebar labels (English labels shown):
