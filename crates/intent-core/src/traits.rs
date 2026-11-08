@@ -3206,6 +3206,26 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { false })
     }
 
+    /// `ws.agent.stop` / `ws.agent.delete`: `caller` ends `target`, one of
+    /// its own sub-agents (direct or deeper), and that sub-agent's whole
+    /// subtree. `delete: false` retires them (restorable), `true` deletes
+    /// them. Refused when `target` is not a descendant of `caller`.
+    fn agent_end_descendant(
+        &self,
+        workspace_id: WorkspaceId,
+        caller: AgentId,
+        target: AgentId,
+        delete: bool,
+        reason: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, caller, target, delete, reason);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::agent_end_descendant not implemented".to_string(),
+            ))
+        })
+    }
+
     /// Soft retire (`ws.agent.retire`): set `retiredAt` on the session,
     /// keeping the row and its full conversation intact. The retired session
     /// is inert until `agent.restore` clears the mark. Emits `agent:retired`;

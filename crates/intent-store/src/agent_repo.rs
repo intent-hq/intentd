@@ -6783,7 +6783,7 @@ impl Store {
     /// another workspace (`agent.delegate` cross-workspace), and
     /// `parent_agent_id` is globally unique. One aggregate statement forced
     /// through `idx_agent_parent`, so cost is O(this agent's children), never
-    /// O(workspace sessions).
+    /// O(workspace sessions). Retired children are inert and never count.
     ///
     /// # Errors
     ///
@@ -6815,7 +6815,7 @@ impl Store {
                COALESCE(SUM(CASE WHEN status IN (?4, ?5, ?6, ?7) \
                                  THEN 1 ELSE 0 END), 0) AS running \
              FROM agent_session INDEXED BY idx_agent_parent \
-             WHERE parent_agent_id = ?8",
+             WHERE parent_agent_id = ?8 AND retired_at IS NULL",
         )
         .bind(&terminal[0])
         .bind(&terminal[1])

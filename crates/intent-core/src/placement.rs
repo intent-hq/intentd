@@ -641,5 +641,55 @@ impl fmt::Display for PlacementUnavailable {
     }
 }
 
+/// The members of the `placement` object, in wire spelling.
+pub const PLACEMENT_MEMBERS: &[&str] = &[
+    "target",
+    "checkout",
+    "os",
+    "arch",
+    "nodeId",
+    "exclusive",
+    "cloudMachineId",
+];
+
+/// The refusal for a `placement` member passed beside `placement` instead
+/// of inside it (`{ target: "remote" }` rather than
+/// `{ placement: { target: "remote" } }`), or `None`. Such a key would
+/// otherwise be ignored and the agent would quietly start on the backend.
+#[must_use]
+pub fn misplaced_member(params: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    PLACEMENT_MEMBERS
+        .iter()
+        .find(|member| params.contains_key(**member))
+        .map(|member| {
+            format!(
+                "`{member}` belongs inside `placement`, e.g. {{ placement: {{ {member}: ... }} }}"
+            )
+        })
+}
+
+/// [`misplaced_member`], then the refusal for any key outside `accepted`.
+///
+/// # Errors
+///
+/// The refusal text, naming the first offending key and, for an unknown
+/// key, the accepted ones.
+pub fn check_option_keys(
+    params: &serde_json::Map<String, serde_json::Value>,
+    what: &str,
+    accepted: &[&str],
+) -> Result<(), String> {
+    if let Some(message) = misplaced_member(params) {
+        return Err(message);
+    }
+    match params.keys().find(|k| !accepted.contains(&k.as_str())) {
+        Some(key) => Err(format!(
+            "unknown option `{key}` for {what}; accepted options: {}",
+            accepted.join(", ")
+        )),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests;

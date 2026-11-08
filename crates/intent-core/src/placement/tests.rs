@@ -554,3 +554,35 @@ fn a_hint_extends_the_message_but_not_the_data() {
     assert_eq!(hinted.message(), format!("{plain} Run it elsewhere."));
     assert_eq!(hinted.data(), data);
 }
+
+#[test]
+fn placement_members_beside_placement_and_unknown_options_are_named() {
+    let map = |v: serde_json::Value| v.as_object().unwrap().clone();
+    assert_eq!(
+        misplaced_member(&map(json!({"name": "a", "placement": {}}))),
+        None
+    );
+    for member in PLACEMENT_MEMBERS {
+        let message = misplaced_member(&map(json!({ *member: "x" }))).unwrap();
+        assert!(
+            message.starts_with(&format!("`{member}` belongs inside `placement`")),
+            "{message}"
+        );
+    }
+    let accepted = ["name", "placement"];
+    assert_eq!(
+        check_option_keys(&map(json!({"name": "a"})), "create", &accepted),
+        Ok(())
+    );
+    let unknown = check_option_keys(&map(json!({"nmae": "a"})), "create", &accepted).unwrap_err();
+    assert_eq!(
+        unknown,
+        "unknown option `nmae` for create; accepted options: name, placement"
+    );
+    let misplaced =
+        check_option_keys(&map(json!({"target": "remote"})), "create", &accepted).unwrap_err();
+    assert!(
+        misplaced.starts_with("`target` belongs inside `placement`"),
+        "{misplaced}"
+    );
+}

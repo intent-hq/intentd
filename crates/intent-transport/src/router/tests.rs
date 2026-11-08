@@ -3240,6 +3240,49 @@ async fn agent_create_rejects_client_supplied_agent_id() {
     );
 }
 
+/// A `placement` member sent beside `placement` would be ignored and the
+/// agent would start on the backend: create, delegate (also per batch
+/// entry) and wakeOrCreate (also inside `create`) refuse it with `-32602`.
+#[tokio::test]
+async fn agent_creates_refuse_placement_members_outside_placement() {
+    for (params, member) in [
+        (
+            r#""method":"agent.create","params":{"workspaceId":"ws-1","target":"remote"}"#,
+            "target",
+        ),
+        (
+            r#""method":"agent.create","params":{"workspaceId":"ws-1","os":"macos","placement":{}}"#,
+            "os",
+        ),
+        (
+            r#""method":"agent.delegate","params":{"workspaceId":"ws-1","taskNoteId":"t","nodeId":"n"}"#,
+            "nodeId",
+        ),
+        (
+            r#""method":"agent.delegate","params":{"workspaceId":"ws-1","tasks":[{"taskNoteId":"t","cloudMachineId":"c"}]}"#,
+            "cloudMachineId",
+        ),
+        (
+            r#""method":"agent.wakeOrCreate","params":{"workspaceId":"ws-1","taskNoteId":"t","contextMessage":"c","arch":"aarch64"}"#,
+            "arch",
+        ),
+        (
+            r#""method":"agent.wakeOrCreate","params":{"workspaceId":"ws-1","taskNoteId":"t","contextMessage":"c","create":{"target":"e2b"}}"#,
+            "target",
+        ),
+    ] {
+        let v = call(&format!(r#"{{"jsonrpc":"2.0","id":1,{params}}}"#))
+            .await
+            .unwrap();
+        assert_eq!(err_code(&v), -32602, "{params}: {v}");
+        let message = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&format!("`{member}` belongs inside `placement`")),
+            "{params}: {v}"
+        );
+    }
+}
+
 /// `agent.create` threads the optional `nameExplicitlySet` boolean into
 /// `AgentCreateExtra.name_explicitly_set`: omitted/null stays `None` (the
 /// service default `name.is_some()` holds) and a supplied bool is forwarded

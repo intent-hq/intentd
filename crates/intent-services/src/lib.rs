@@ -33456,6 +33456,21 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn agent_end_descendant(
+        &self,
+        workspace_id: WorkspaceId,
+        caller: AgentId,
+        target: AgentId,
+        delete: bool,
+        reason: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            self.agent_end_descendant_op(caller, target, delete, reason)
+                .await
+        })
+    }
+
     fn agent_restore(
         &self,
         agent_id: AgentId,

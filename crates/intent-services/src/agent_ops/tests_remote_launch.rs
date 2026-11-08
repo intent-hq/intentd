@@ -1386,3 +1386,153 @@ async fn a_duplicated_batch_task_is_checked_with_the_placement_it_starts_with() 
         assert!(agent.node_id.is_none(), "{agent:?}");
     }
 }
+
+/// Create an agent under `parent`, on the backend or at `placement`.
+async fn spawn_under(
+    svc: &Services,
+    ws: &WorkspaceId,
+    parent: Option<&AgentId>,
+    placement_json: Option<Value>,
+) -> AgentId {
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Child".into()),
+            Some("sonnet4.5".into()),
+            None,
+            parent.cloned(),
+            None,
+            false,
+            AgentCreateExtra {
+                provider: Some("auggie".into()),
+                placement: placement_json.map(placement),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    AgentId::from(created["agent"]["id"].as_str().unwrap())
+}
+
+async fn unsettled(svc: &Services, parent: &AgentId) -> u64 {
+    svc.store
+        .count_child_agents(parent)
+        .await
+        .unwrap()
+        .unsettled
+}
+
+/// A parent stops, then deletes, sub-agents on the backend, on a remote
+/// machine and on an E2B sandbox: every one gets its final stop where it
+/// runs, a grandchild goes with its parent, and the parent's unsettled
+/// count drops as each ends.
+#[tokio::test]
+async fn a_parent_stops_and_deletes_its_sub_agents_wherever_they_run() {
+    let (_t, svc, ws) = setup().await;
+    let svc = crate::test_support::fake_runtime::FakeRuntime::install(svc);
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let parent = spawn_under(&svc, &ws, None, None).await;
+    let local = spawn_under(&svc, &ws, Some(&parent), None).await;
+    let machine = spawn_under(&svc, &ws, Some(&parent), Some(json!({"target": "remote"}))).await;
+    let sandbox = spawn_under(&svc, &ws, Some(&parent), Some(json!({"target": "e2b"}))).await;
+    let grandchild = spawn_under(&svc, &ws, Some(&machine), None).await;
+    assert_eq!(unsettled(&svc, &parent).await, 3);
+
+    let stopped = svc
+        .agent_end_descendant_op(parent.clone(), machine.clone(), false, None)
+        .await
+        .unwrap();
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(
+        stopped["stopped"],
+        json!([machine.0, grandchild.0]),
+        "{stopped}"
+    );
+    for id in [&machine, &grandchild] {
+        let row = svc.store.get_agent_session_summary(id).await.unwrap();
+        assert!(row.retired_at.is_some(), "{id} not retired");
+    }
+    assert_eq!(unsettled(&svc, &parent).await, 2);
+    assert_eq!(unsettled(&svc, &machine).await, 0);
+
+    let stopped = svc
+        .agent_end_descendant_op(parent.clone(), local.clone(), false, Some("done".into()))
+        .await
+        .unwrap();
+    assert_eq!(stopped["stopped"], json!([local.0]), "{stopped}");
+    assert_eq!(unsettled(&svc, &parent).await, 1);
+
+    let deleted = svc
+        .agent_end_descendant_op(parent.clone(), sandbox.clone(), true, None)
+        .await
+        .unwrap();
+    assert_eq!(deleted["deleted"], json!([sandbox.0]), "{deleted}");
+    assert!(matches!(
+        svc.store.get_agent_session_summary(&sandbox).await,
+        Err(Error::NotFound(_))
+    ));
+    assert_eq!(unsettled(&svc, &parent).await, 0);
+
+    // Deleting a stopped sub-agent removes it and its subtree.
+    let deleted = svc
+        .agent_end_descendant_op(parent.clone(), machine.clone(), true, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted["deleted"],
+        json!([grandchild.0, machine.0]),
+        "{deleted}"
+    );
+
+    let stops: Vec<AgentId> = remote
+        .final_stops
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in [&machine, &sandbox, &local, &grandchild] {
+        assert!(stops.contains(id), "{id} got no final stop: {stops:?}");
+    }
+    // The parent itself is untouched.
+    let row = svc.store.get_agent_session_summary(&parent).await.unwrap();
+    assert!(row.retired_at.is_none());
+}
+
+/// Only a strict ancestor may end an agent: a sibling, a child's parent
+/// seen from below, an unrelated agent and the caller itself are refused
+/// before any effect.
+#[tokio::test]
+async fn only_an_ancestor_may_stop_or_delete_an_agent() {
+    let (_t, svc, ws) = setup().await;
+    let parent = spawn_under(&svc, &ws, None, None).await;
+    let first = spawn_under(&svc, &ws, Some(&parent), None).await;
+    let second = spawn_under(&svc, &ws, Some(&parent), None).await;
+    let stranger = spawn_under(&svc, &ws, None, None).await;
+    for (caller, target) in [
+        (&first, &second),
+        (&first, &parent),
+        (&stranger, &first),
+        (&parent, &parent),
+    ] {
+        for delete in [false, true] {
+            let refused = svc
+                .agent_end_descendant_op(caller.clone(), target.clone(), delete, None)
+                .await;
+            assert!(
+                matches!(refused, Err(Error::InvalidParams(_))),
+                "{caller} -> {target}: {refused:?}"
+            );
+        }
+    }
+    let missing = svc
+        .agent_end_descendant_op(parent.clone(), AgentId::from("agent-missing"), true, None)
+        .await;
+    assert!(matches!(missing, Err(Error::NotFound(_))), "{missing:?}");
+    for id in [&parent, &first, &second, &stranger] {
+        let row = svc.store.get_agent_session_summary(id).await.unwrap();
+        assert!(row.retired_at.is_none(), "{id} changed");
+    }
+    assert_eq!(unsettled(&svc, &parent).await, 2);
+}
