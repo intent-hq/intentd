@@ -28,7 +28,8 @@ pub(super) async fn backend_with_token(
 ) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String, String) {
     let repo = scratch.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "--quiet"]);
+    // The workspace branch follows the checkout's branch.
+    git(&repo, &["init", "--quiet", "--initial-branch=main"]);
     if let Some(origin) = origin {
         git(&repo, &["remote", "add", "origin", origin]);
     }
