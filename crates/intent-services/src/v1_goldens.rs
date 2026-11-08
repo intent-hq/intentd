@@ -883,6 +883,10 @@ fn golden_pr_monitor_unmergeable_queue_entry_after_a_merge_group_ci_failure() {
         );
     }
     assert!(crate::pr_monitor::diff_snapshots(&failed, &failed).is_empty());
+    assert_eq!(
+        crate::pr_monitor::diff_snapshots(&failed, &queued("queued", false)),
+        vec!["merge queue entry is no longer unmergeable (now queued)".to_string()]
+    );
     assert!(crate::pr_monitor::diff_snapshots(&failed, &queued("unmergeable", false)).is_empty());
     assert_eq!(
         crate::pr_monitor::render_checklist(&failed),
