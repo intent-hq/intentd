@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.159] - 2026-11-08
+
+### 🚀 Features
+
+- *(nodes)* Top-level remote agents push the workspace branch with a live git credential helper ([#3163](https://github.com/intent-hq/intentd/pull/3163))
+
+
 ## [0.11.158] - 2026-11-08
 
 ### 🚀 Features
