@@ -492,7 +492,7 @@ listing them appears each time the browser loads Intent. If the section shows th
 is in use, change **Port**. If it says the build does not include the browser version,
 the installed app predates the feature.
 
-<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; packages/cloudlands-fe/messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter}.swift; packages/ios/Intent/App/RootView.swift. -->
+<!-- Sources: packages/cloudlands-fe/src/features/daemon-status/StartupProgress.svelte; packages/cloudlands-fe/src/shared/daemon-startup.ts; packages/cloudlands-fe/src/features/backend/main/json-rpc-client.ts; packages/cloudlands-fe/src/lib/client/live/browser-websocket-transport.ts; packages/cloudlands-fe/messages/en.json; packages/ios/Intent/Services/{ConnectionManagerStartup,WebSocketAdmission}.swift; packages/ios/Intent/Views/Connection/{DaemonStartupProgressView,ConnectingView,ConnectionLossPresenter,ReadOnlyBanner,RemoteReadOnly,AvailableWhenReconnectedView}.swift; packages/ios/Intent/Services/ConversationStorePool.swift; packages/ios/Intent/Views/Workspaces/WorkspaceDetailStores.swift; packages/ios/Intent/App/{AppCoordinator,RootView}.swift. -->
 
 When the app and connected daemon support startup status, the connection screen
 shows **Starting intentd** and **Finishing startup** while services initialize.
@@ -512,6 +512,18 @@ direct or Tailcat routes. **Indexing Notes** appears only when the daemon report
 that phase. **Startup status unavailable. Reconnecting securely…** means current
 status is unavailable. For **Startup Failed**, use **Retry Connection** after
 checking the desktop daemon. **Back to Home** keeps saved credentials.
+
+If the connection drops after the iPhone, iPad, or Vision Pro app has opened, the app
+stays readable. A banner at the top shows **Reconnecting to <Mac>… · Read-only**,
+**No network connection · Read-only**, or **Local Network access needed · Read-only**.
+Tap it for guidance and **Back to Home**. The current screen, the workspace list, the
+last 5 workspaces and the last 10 conversations opened this session stay readable.
+Other content shows **Available when reconnected** and loads when the connection
+returns. Controls that change something on the Mac, such as Send, are disabled.
+Typing a draft and adding attachments still work, and nothing is sent automatically.
+The banner disappears and data refreshes when the connection returns. If reconnection
+stops, for example because access was removed, **Can't reconnect** shows the reason
+and **Back to Home**. Each window follows its own Mac.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/settings/ProviderSelector.svelte; packages/intentd/crates/intent-providers/src/{config.rs,cursor.rs}; packages/intentd/crates/intent-services/src/{cursor_cli.rs,provider_auth.rs}. -->
 
