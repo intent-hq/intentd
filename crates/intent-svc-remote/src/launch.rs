@@ -854,9 +854,15 @@ impl RemoteLaunchPort for RemoteLaunch {
                     let svc = svc.clone();
                     let agent_id = agent_id.clone();
                     let node_id = record.node_id.clone();
+                    let lease_id = record.lease_id.clone();
                     intent_core::spawn_daemon(async move {
-                        node.turns_over(&agent_id).await;
-                        final_stop_placed(&svc, &node, &agent_id, &node_id, reason).await;
+                        if node
+                            .await_turn_before_final_stop(&agent_id, SELF_RETIRE_TURN_BOUND)
+                            .await
+                            && node.status().lease_id == lease_id
+                        {
+                            final_stop_placed(&svc, &node, &agent_id, &node_id, reason).await;
+                        }
                     });
                     continue;
                 }
@@ -1106,6 +1112,10 @@ impl RemoteLaunchPort for RemoteLaunch {
         Box::pin(crate::cloud::call(svc, method, params))
     }
 }
+
+/// Longest an agent that retired itself during a turn keeps running for
+/// that turn before its machine stops it.
+const SELF_RETIRE_TURN_BOUND: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Send placed agent `agent_id` its final stop on `node`; the agent a cloud
 /// sandbox was started for also takes the sandbox with it.
