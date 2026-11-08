@@ -191,7 +191,7 @@ While you type, all matches show in one list, best match first, each with a smal
 category label such as **Agent**, **Repo**, or **File**. An exact name match comes
 first, then items you picked before for the same text, then stronger matches, then
 recent items. Files, note text, and chat messages arrive a moment later and appear
-below the top result. With nothing typed, the palette shows recent items grouped by category.
+below the top result. With nothing typed, the palette lists items grouped by category.
 
 Repos you have used in Intent are listed too. Enter on a repo opens **New Workspace**
 with that repo selected and the cursor in the prompt; nothing is created until you
