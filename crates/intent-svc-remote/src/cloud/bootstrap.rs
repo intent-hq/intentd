@@ -89,7 +89,7 @@ while :; do
     fi
     if pgrep -x tailcat >/dev/null 2>&1; then echo "tailcat is running." >&2; else echo "tailcat is not running." >&2; fi
     if [ -f "$INTENTD_DATA_DIR/serve.log" ]; then
-      grep -E ' (WARN|ERROR) ' "$INTENTD_DATA_DIR/serve.log" | tail -n 4 | cut -c 1-220 >&2
+      grep -E ' (WARN|ERROR) ' "$INTENTD_DATA_DIR/serve.log" | tail -n 4 >&2
     fi
     exit 3
   fi
