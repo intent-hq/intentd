@@ -1,6 +1,6 @@
 [package]
 name = "intent-core"
-version = "0.11.154"
+version = "0.11.155"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
