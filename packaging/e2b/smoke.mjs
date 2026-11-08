@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Smoke-tests one intent-node build: create a sandbox, check intentd, the
-// promised tools and the size, check no intentd runs yet, then kill it.
+// promised tools, the gh version and the size, check no intentd runs yet, then kill it.
 // Usage: E2B_API_KEY=... node smoke.mjs <template-ref> <intentd-version> <size>
 import { Sandbox } from 'e2b';
 import { parseSize, parseVersion, redact, smokeChecks, verifySmoke } from './intent-node.mjs';
@@ -29,9 +29,10 @@ async function main() {
       idle: await run(sandbox, checks.idle),
       cpus: await run(sandbox, checks.cpus),
       memKb: await run(sandbox, checks.memKb),
+      gh: await run(sandbox, checks.gh),
     };
     await run(sandbox, `set -e; for tool in ${checks.tools.join(' ')}; do printf '%s: ' "$tool"; command -v "$tool"; done`);
-    await run(sandbox, 'git --version; git lfs version; gh --version | head -1; rg --version | head -1; node --version; pnpm --version; python3 --version; claude --version; codex --version');
+    await run(sandbox, 'git --version; git lfs version; rg --version | head -1; node --version; pnpm --version; python3 --version; claude --version; codex --version');
     const problems = verifySmoke(version, sizeId, outputs);
     if (problems.length) throw new Error(problems.join('\n'));
     console.log(`Smoke test passed for ${ref} (intentd ${version}, ${sizeId})`);

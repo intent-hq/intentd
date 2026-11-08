@@ -6,6 +6,11 @@
 // snapshots the start command's processes, which would give every sandbox the
 // same daemon id, TLS key and tailcat key.
 //
+// gh is installed but never authenticated: the sandbox holds no GitHub
+// credentials, and the backend publishes branches and pull requests itself.
+// Language toolchains are not baked in; a repository's workspace setup script
+// installs what it needs.
+//
 // This module has no dependencies so scripts/test-e2b-template.mjs can run it
 // offline; build.mjs and smoke.mjs pass in the e2b SDK.
 
@@ -35,11 +40,17 @@ export const NPM_GLOBALS = {
   '@openai/codex': '0.167.0',
 };
 
+// Debian bookworm ships gh 2.23.0, so gh comes from its release archive. Bump
+// by hand with the new checksum (each change rebuilds its layer).
+export const GH = {
+  version: '2.103.3',
+  sha256: '4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d',
+};
+
 export const APT_PACKAGES = [
   'build-essential',
   'ca-certificates',
   'curl',
-  'gh',
   'git',
   'git-lfs',
   'procps',
@@ -171,11 +182,25 @@ export function npmGlobalsCommand() {
   return `npm install --global --no-fund --no-audit ${specs.join(' ')} && npm cache clean --force`;
 }
 
+export function installGhCommand() {
+  const name = `gh_${GH.version}_linux_amd64`;
+  return [
+    'tmp=$(mktemp -d)',
+    `curl --fail --silent --show-error --location --retry 3 --output "$tmp/gh.tar.gz" 'https://github.com/cli/cli/releases/download/v${GH.version}/${name}.tar.gz'`,
+    `echo '${GH.sha256}  '"$tmp/gh.tar.gz" | sha256sum -c -`,
+    'tar -xzf "$tmp/gh.tar.gz" -C "$tmp"',
+    `install -m 0755 "$tmp/${name}/bin/gh" /usr/local/bin/gh`,
+    'rm -rf "$tmp"',
+    'gh --version',
+  ].join(' && ');
+}
+
 export function defineTemplate(Template, { version, sha256 }) {
   return Template()
     .fromImage(BASE_IMAGE)
     .aptInstall(APT_PACKAGES)
     .runCmd('git lfs install --system', { user: 'root' })
+    .runCmd(installGhCommand(), { user: 'root' })
     .runCmd(npmGlobalsCommand(), { user: 'root' })
     .runCmd(installIntentdCommand(version, sha256), { user: 'root' });
 }
@@ -184,6 +209,7 @@ export function smokeChecks() {
   return {
     tools: ['intentd', 'tailcat', 'git', 'git-lfs', 'gh', 'rg', 'node', 'pnpm', 'python3', 'cc', 'make', 'claude', 'codex'],
     version: 'intentd --version',
+    gh: 'gh --version',
     idle: 'pgrep -x intentd || true',
     cpus: 'nproc',
     memKb: "awk '/^MemTotal:/ { print $2 }' /proc/meminfo",
@@ -201,6 +227,8 @@ export function verifySmoke(version, sizeId, outputs) {
   if (cpus !== size.cpuCount) problems.push(`the sandbox has ${cpus} vCPU, expected ${size.cpuCount}`);
   const memMiB = Math.round(Number(outputs.memKb.trim()) / 1024);
   if (!(memMiB >= size.memoryMB * 0.85)) problems.push(`the sandbox has ${memMiB} MiB of RAM, expected about ${size.memoryMB}`);
+  const gh = String(outputs.gh ?? '').split('\n')[0].trim();
+  if (!gh.startsWith(`gh version ${GH.version} `)) problems.push(`gh --version printed ${JSON.stringify(gh)}, expected "gh version ${GH.version}"`);
   if (outputs.idle.trim()) problems.push(`intentd is already running in a fresh sandbox (pid ${outputs.idle.trim()}); the template must not start it`);
   return problems;
 }

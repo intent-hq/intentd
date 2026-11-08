@@ -7,13 +7,16 @@ import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
+  APT_PACKAGES,
   DEFAULT_SIZE,
+  GH,
   MANIFEST_ASSET,
   SIZES,
   archiveUrl,
   builtSizes,
   defineTemplate,
   enabledSizes,
+  installGhCommand,
   installIntentdCommand,
   isResourceLimitRefusal,
   manifestFor,
@@ -160,10 +163,23 @@ describe('defineTemplate', () => {
     assert.match(commands, /@openai\/codex@\d/);
     assert.match(commands, /pnpm@\d/);
   });
+  it('installs a pinned gh release instead of the old Debian package', () => {
+    const command = installGhCommand();
+    assert.ok(command.includes(`https://github.com/cli/cli/releases/download/v${GH.version}/gh_${GH.version}_linux_amd64.tar.gz`));
+    assert.ok(command.includes(`${GH.sha256}  `));
+    assert.match(command, /sha256sum -c/);
+    assert.ok(!APT_PACKAGES.includes('gh'));
+    const { calls, Template } = recorder();
+    defineTemplate(Template, { version: '0.11.139', sha256: SHA });
+    assert.ok(calls.some(([name, cmd, opts]) => name === 'runCmd' && cmd === command && opts?.user === 'root'));
+  });
 });
 
 describe('smoke', () => {
-  const outputs = { version: 'intentd 0.11.139\n', idle: '', cpus: '4\n', memKb: '8000000\n' };
+  const outputs = {
+    version: 'intentd 0.11.139\n', idle: '', cpus: '4\n', memKb: '8000000\n',
+    gh: `gh version ${GH.version} (2026-10-26)\nhttps://github.com/cli/cli/releases/tag/v${GH.version}\n`,
+  };
   it('passes when the version and size match and no intentd runs', () => {
     assert.deepEqual(verifySmoke('0.11.139', '4x8', outputs), []);
   });
@@ -172,6 +188,10 @@ describe('smoke', () => {
     assert.equal(problems.length, 2);
     assert.match(problems.join('\n'), /0\.11\.138/);
     assert.match(problems.join('\n'), /running/);
+  });
+  it('reports a stale gh', () => {
+    const problems = verifySmoke('0.11.139', '4x8', { ...outputs, gh: 'gh version 2.23.0 (2023-02-14)\n' });
+    assert.deepEqual(problems, [`gh --version printed "gh version 2.23.0 (2023-02-14)", expected "gh version ${GH.version}"`]);
   });
   it('reports a sandbox smaller than its size', () => {
     const problems = verifySmoke('0.11.139', '8x16', outputs);
