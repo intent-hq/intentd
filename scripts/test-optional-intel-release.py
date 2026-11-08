@@ -5,6 +5,10 @@ import importlib.util
 import json
 import os
 import io
+import select
+import signal
+import sys
+import time
 import shutil
 import tarfile
 from pathlib import Path
@@ -31,6 +35,20 @@ def module(name):
 # loads are derived, and a missing one stops the harness here (intentd#2896).
 PUBLISH_SCRIPTS = module('script_helpers').closure(
     ['install.sh', 'install.ps1', 'refresh-release-published-at.sh', 'reconcile-sitter-intel.py'])
+
+
+def run_installer(command, env):
+    """Run install.sh with no terminal to prompt on.
+
+    install.sh asks its questions on /dev/tty (so `curl | sh` still prompts);
+    under a PTY-backed runner (a saved workspace script, a developer shell) an
+    un-detached run would block on "Choose 1 or 2" forever. The pinned
+    daemon mode answers that question, and the new session drops the
+    controlling terminal so no later prompt can hang either.
+    """
+    return subprocess.run(command, env={**env, 'INTENTD_DAEMON_MODE': 'full'},
+                          stdin=subprocess.DEVNULL, start_new_session=True,
+                          capture_output=True, text=True)
 
 
 def archive(root, target, valid=True):
@@ -271,7 +289,7 @@ shutil.copy(pathlib.Path(os.environ['TEST_RELEASES']) / 'sitter-latest' / url.rs
             self.assertEqual((old.read_bytes(), checksum.read_bytes()), old_pair)
             self.assertFalse(list((releases / 'sitter-v1.2.3').glob(f'*{INTEL}*')))
             installer = ['sh', str(ROOT / 'scripts/install.sh'), '--no-service']
-            result = subprocess.run(installer, env=env, capture_output=True, text=True)
+            result = run_installer(installer, env)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((install_dir / 'intentd').read_bytes(), payload)
             self.assertIn('1.2.2', result.stdout)
@@ -315,7 +333,7 @@ shutil.copy(pathlib.Path(os.environ['TEST_RELEASES']) / 'sitter-latest' / url.rs
                             self.assertTrue(module('optional-intel-release').valid_archive(directory, target))
             # A first-ever release with no Intel must not install another arch.
             (install_dir / 'intentd').unlink()
-            result = subprocess.run(installer, env=env, capture_output=True, text=True)
+            result = run_installer(installer, env)
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((install_dir / 'intentd').exists())
             # A failed download must stop, leaving remote assets unchanged.
@@ -334,6 +352,46 @@ shutil.copy(pathlib.Path(os.environ['TEST_RELEASES']) / 'sitter-latest' / url.rs
             for directory in (tagged, latest):
                 self.assertEqual((directory / current.name).read_bytes(), current.read_bytes())
                 self.assertTrue(module('optional-intel-release').valid_archive(directory, INTEL))
+
+
+INSTALLER_TEST = 'Consumers.test_fixed_sitter_retains_pair_and_installer_resolves_exact_intel'
+
+
+class Hermetic(unittest.TestCase):
+    @unittest.skipUnless(hasattr(os, 'fork') and sys.platform != 'win32', 'needs a POSIX pty')
+    def test_installer_run_completes_under_a_controlling_terminal(self):
+        """The installer test must finish when a terminal is attached.
+
+        Saved workspace scripts are PTY-backed; there install.sh found
+        /dev/tty and waited on its daemon-mode prompt for hours, while CI
+        (no terminal) passed.
+        """
+        import pty
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execv(sys.executable, [sys.executable, '-I', '-B', str(Path(__file__).resolve()), INSTALLER_TEST])
+        output, deadline = b'', time.monotonic() + 120
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([fd], [], [], 1)
+                if not ready:
+                    continue
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                output += chunk
+            else:
+                os.killpg(pid, signal.SIGKILL)
+                self.fail('installer test hung under a terminal:\n' + output.decode(errors='replace')[-2000:])
+        finally:
+            _, status = os.waitpid(pid, 0)
+            os.close(fd)
+        text = output.decode(errors='replace')
+        self.assertNotIn('Choose 1 or 2', text)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0, text[-2000:])
 
 
 class Homebrew(unittest.TestCase):
