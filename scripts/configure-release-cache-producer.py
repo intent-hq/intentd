@@ -38,6 +38,12 @@ CACHE_RUN = 'python3 scripts/setup-sccache.py'
 CACHE_ENV = {'INTENT_SCCACHE_ENDPOINT': '${{ vars.INTENT_SCCACHE_ENDPOINT }}',
              'INTENT_SCCACHE_TOKEN': '${{ secrets.INTENT_SCCACHE_TOKEN }}',
              'INTENT_SCCACHE_MODE': '${{ vars.INTENT_SCCACHE_MODE }}'}
+# setup-sccache.py leaves no binary on PATH after a download outage.
+STATS_RUN = ('if command -v sccache >/dev/null; then\n'
+             '  sccache --show-stats >> "$GITHUB_STEP_SUMMARY"\n'
+             'else\n'
+             '  echo "sccache was unavailable; the build was uncached." >> "$GITHUB_STEP_SUMMARY"\n'
+             'fi\n')
 CHECKOUT = {'uses': 'actions/checkout@v7', 'with': {'persist-credentials': False}}
 
 
@@ -67,7 +73,7 @@ def cache_steps(flavor, target, runner, builds):
         {'name': 'Configure the self-hosted compiler cache', 'shell': 'bash', 'env': deepcopy(CACHE_ENV), 'run': CACHE_RUN},
         *[timed_build(step) for step in builds],
         {'name': 'Report compiler cache statistics', 'shell': 'bash',
-         'run': 'sccache --show-stats >> "$GITHUB_STEP_SUMMARY"'},
+         'run': STATS_RUN},
     ]
 
 

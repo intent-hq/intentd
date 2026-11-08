@@ -11,6 +11,8 @@ jobs:
   populate:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      populated: ${{ steps.smoke.outputs.populated }}
     steps:
       - uses: actions/checkout@v7
       - name: Install pinned Rust
@@ -25,7 +27,8 @@ jobs:
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-sccache.py
-      - run: python3 -I -B scripts/test-release-cache-smoke.py --managed --phase populate
+      - id: smoke
+        run: python3 -I -B scripts/test-release-cache-smoke.py --managed --phase populate
   verify:
     needs: populate
     runs-on: ubuntu-24.04
@@ -44,4 +47,9 @@ jobs:
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-sccache.py
-      - run: python3 -I -B scripts/test-release-cache-smoke.py --managed --phase verify
+      # Without a populated cache (no endpoint, or sccache could not be
+      # downloaded there) a verify would only report missing hits.
+      - if: needs.populate.outputs.populated == 'true'
+        run: python3 -I -B scripts/test-release-cache-smoke.py --managed --phase verify
+      - if: needs.populate.outputs.populated != 'true'
+        run: echo "::notice::The populate job did not fill the managed cache; skipping verification."

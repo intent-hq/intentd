@@ -2363,9 +2363,26 @@ jobs:
             done
             sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq shellcheck
           fi
+      # The pinned binary is cached by version: GitHub release downloads
+      # returned 504s for long enough to eject intentd#3153 from the queue
+      # (run 42464451320). A miss still downloads with retries and fails
+      # here with the URL, since this job cannot lint without it.
+      - name: Read the pinned actionlint version
+        id: actionlint
+        run: sed -nE 's/^ACTIONLINT_VERSION="([^"]+)"$/version=\1/p' scripts/lint-workflows.sh >> "$GITHUB_OUTPUT"
+      - name: Restore the pinned actionlint
+        id: actionlint-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/actionlint
+          key: actionlint-${{ runner.os }}-${{ runner.arch }}-${{ steps.actionlint.outputs.version }}
       - name: Install the pinned actionlint
+        env:
+          CACHE_HIT: ${{ steps.actionlint-cache.outputs.cache-hit }}
         run: |
-          bash scripts/lint-workflows.sh --install "$RUNNER_TEMP/actionlint"
+          if [ "$CACHE_HIT" != true ]; then
+            bash scripts/lint-workflows.sh --install "$RUNNER_TEMP/actionlint"
+          fi
           echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
       # REQUIRE_ACTIONLINT=1 forbids the self-test's skip of its real cases.
       - name: Self-test make lint-workflows

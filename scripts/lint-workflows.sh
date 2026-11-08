@@ -107,7 +107,10 @@ install_actionlint() {
   staging=$(mktemp -d "$dir/.actionlint-staging.XXXXXX")
   # Staged then renamed, so an interrupted or rejected download never leaves
   # a binary behind.
-  if ! curl --fail --silent --show-error --location --retry 3 --retry-delay 5 \
+  # GitHub release downloads have returned 504s for minutes at a time
+  # (intentd#3153's queue runs), so retry for up to about five minutes.
+  if ! curl --fail --silent --show-error --location --retry 8 --retry-delay 10 \
+      --retry-max-time 300 --connect-timeout 30 --max-time 120 \
       --output "$staging/$archive" "$url"; then
     rm -rf "$staging"
     echo "lint-workflows --install: downloading $url failed" >&2

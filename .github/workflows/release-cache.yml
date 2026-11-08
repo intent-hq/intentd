@@ -246,7 +246,12 @@ jobs:
         echo "Build duration: $((SECONDS - start)) seconds" >> "$GITHUB_STEP_SUMMARY"
     - name: Report compiler cache statistics
       shell: bash
-      run: sccache --show-stats >> "$GITHUB_STEP_SUMMARY"
+      run: |
+        if command -v sccache >/dev/null; then
+          sccache --show-stats >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "sccache was unavailable; the build was uncached." >> "$GITHUB_STEP_SUMMARY"
+        fi
   sitter:
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && needs.plan.outputs.release_push != 'true'
@@ -313,4 +318,9 @@ jobs:
         echo "Build duration: $((SECONDS - start)) seconds" >> "$GITHUB_STEP_SUMMARY"
     - name: Report compiler cache statistics
       shell: bash
-      run: sccache --show-stats >> "$GITHUB_STEP_SUMMARY"
+      run: |
+        if command -v sccache >/dev/null; then
+          sccache --show-stats >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "sccache was unavailable; the build was uncached." >> "$GITHUB_STEP_SUMMARY"
+        fi

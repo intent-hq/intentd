@@ -3,6 +3,7 @@
 from copy import deepcopy
 from pathlib import Path
 import os
+import shutil
 import subprocess
 import tempfile
 import tomllib
@@ -26,6 +27,24 @@ class ManagedCache(unittest.TestCase):
                                     cwd=ROOT, env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('skipping the managed cache smoke test', result.stdout)
+
+    def test_smoke_skips_only_when_setup_could_not_download_sccache(self):
+        # setup-sccache.py marks a download outage with INTENT_SCCACHE_DISABLED=1
+        # and puts no sccache on PATH; the smoke test must not fail the job then.
+        with tempfile.TemporaryDirectory() as empty:
+            base = {'PATH': empty + ':/usr/bin:/bin', **{k: v for k, v in os.environ.items() if k == 'LD_LIBRARY_PATH'}}
+            if shutil.which('sccache', path=base['PATH']):
+                self.skipTest('sccache is installed system-wide')
+            for args in ([], ['--managed', '--phase', 'populate']):
+                env = {**base, 'INTENT_SCCACHE_DISABLED': '1', 'SCCACHE_WEBDAV_ENDPOINT': 'https://cache.example.com'}
+                result = subprocess.run(['python3', '-I', '-B', 'scripts/test-release-cache-smoke.py', *args],
+                                        cwd=ROOT, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('skipping the compiler cache smoke test', result.stdout)
+            result = subprocess.run(['python3', '-I', '-B', 'scripts/test-release-cache-smoke.py'],
+                                    cwd=ROOT, env=base, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('sccache is required', result.stderr)
 
     def test_no_archive_backend_or_local_cache_limits(self):
         text = (ROOT / 'scripts/setup-sccache.py').read_text()

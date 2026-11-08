@@ -72,6 +72,13 @@ def main():
         threading.Thread(target=server.serve_forever, daemon=True).start()
         env['SCCACHE_WEBDAV_ENDPOINT'] = f'http://127.0.0.1:{server.server_port}'
     sccache = os.environ.get('SCCACHE_BIN') or shutil.which('sccache')
+    if not sccache and os.environ.get('INTENT_SCCACHE_DISABLED') == '1':
+        # setup-sccache.py could not download the binary (a GitHub outage);
+        # there is nothing to test, and the outage must not fail the job.
+        print('::warning::sccache could not be installed; skipping the compiler cache smoke test.')
+        if server:
+            server.shutdown()
+        return
     if not sccache:
         raise SystemExit('sccache is required')
     with socket.socket() as port:
@@ -128,6 +135,11 @@ def main():
                               'changed_source_misses': changed['cache_misses']['counts']['Rust']}))
         else:
             print('Populated the managed cache for verification in a separate job.')
+            # The verify job runs only after a real populate, so an outage
+            # that skipped this phase cannot turn into a missing-hit failure.
+            if os.environ.get('GITHUB_OUTPUT'):
+                with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+                    output.write('populated=true\n')
         assert not (root / 'unused-local-cache').exists(), 'remote test must not use a disk cache'
     finally:
         subprocess.run([sccache, '--stop-server'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
