@@ -2369,10 +2369,16 @@ jobs:
       # here with the URL, since this job cannot lint without it.
       - name: Read the pinned actionlint version
         id: actionlint
-        run: sed -nE 's/^ACTIONLINT_VERSION="([^"]+)"$/version=\1/p' scripts/lint-workflows.sh >> "$GITHUB_OUTPUT"
+        run: |
+          version=$(sed -nE 's/^ACTIONLINT_VERSION="([^"]+)"$/\1/p' scripts/lint-workflows.sh)
+          if [ -z "$version" ]; then
+            echo "::error::cannot read ACTIONLINT_VERSION from scripts/lint-workflows.sh"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Restore the pinned actionlint
         id: actionlint-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/actionlint
           key: actionlint-${{ runner.os }}-${{ runner.arch }}-${{ steps.actionlint.outputs.version }}

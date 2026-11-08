@@ -11,7 +11,8 @@ INTENT_SCCACHE_DISABLED=1 is), so compilation runs uncached instead of failing.
 When the release download still fails after its retries (a GitHub 5xx or
 network outage), the same marker is exported, no WebDAV values are, and the
 job compiles uncached: the cache only speeds builds up. A 4xx or a checksum
-mismatch still fails, since it means a wrong pin or a tampered asset.
+mismatch or a rejected TLS certificate still fails, since it means a wrong
+pin or a tampered download.
 """
 import hashlib
 import importlib.util
@@ -20,6 +21,7 @@ from pathlib import Path
 import platform
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -163,6 +165,14 @@ def write_env(values):
             output.write(f"{key}={value}\n")
 
 
+def outage(error):
+    """True for a transient failure; a rejected certificate still fails the job."""
+    reason = getattr(error, "reason", error)
+    if isinstance(error, ssl.SSLCertVerificationError) or isinstance(reason, ssl.SSLCertVerificationError):
+        return False
+    return download_retry.transient(error)
+
+
 def unavailable(env, error):
     """Values that leave the job uncached when the binary could not be fetched.
 
@@ -183,7 +193,7 @@ def main():
     try:
         directory = install(Path(os.environ["RUNNER_TEMP"]) / "intent-sccache")
     except Exception as error:
-        if not download_retry.transient(error):
+        if not outage(error):
             raise
         write_env(unavailable(os.environ, error))
         return

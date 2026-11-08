@@ -258,6 +258,11 @@ class DownloadOutage(unittest.TestCase):
         with self.assertRaises(cache.urllib.error.HTTPError):
             self.run_outage(http_error(404))
 
+    def test_rejected_certificate_still_fails(self):
+        error = cache.urllib.error.URLError(ssl.SSLCertVerificationError('certificate verify failed'))
+        with self.assertRaises(cache.urllib.error.URLError):
+            self.run_outage(error)
+
     def test_tampered_asset_still_fails(self):
         def fetch(url, dest):
             Path(dest).write_bytes(b'corrupt archive')
