@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.153] - 2026-11-08
+
+### 🐛 Bug Fixes
+
+- *(scripts)* Give agents plain text for script output and hook wakes ([#3143](https://github.com/intent-hq/intentd/pull/3143))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(deps)* Migrate to zip 9 ([#3146](https://github.com/intent-hq/intentd/pull/3146))
+
+
 ## [0.11.152] - 2026-11-08
 
 ### 🚀 Features
