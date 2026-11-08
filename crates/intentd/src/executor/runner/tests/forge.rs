@@ -89,6 +89,8 @@ async fn an_unknown_host_or_unusable_token_is_refused_and_changes_nothing() {
         forge("gitlab.com", Some("other")),
         forge(FORGE_HOST_GITHUB, Some("")),
         forge(FORGE_HOST_GITHUB, Some("two\nlines")),
+        forge(FORGE_HOST_GITHUB, Some("has space")),
+        forge(FORGE_HOST_GITHUB, Some(&"x".repeat(16 * 1024 + 1))),
     ] {
         let reply = h.runner.forge_frame(frame);
         assert_eq!(reply.outcome, SecretOutcome::Failed);

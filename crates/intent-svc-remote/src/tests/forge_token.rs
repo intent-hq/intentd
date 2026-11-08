@@ -1,10 +1,13 @@
 //! The backend's GitHub token on its machines (nodeProtocol 15): sent right
 //! after every bind, before any launch on it; sent again on each change and
-//! as `null` once there is none; never sent twice for the same value.
+//! as `null` once there is none; never sent again once the machine confirmed
+//! it, and again at the next check when it did not.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use intent_core::node_link::FORGE_HOST_GITHUB;
+use intent_core::node_link::{
+    ForgeTokenReply, LinkId, SecretOutcome, FORGE_HOST_GITHUB, FORGE_TOKEN_INVALID,
+};
 use zeroize::Zeroizing;
 
 use super::*;
@@ -23,17 +26,48 @@ fn set(value: &Arc<Mutex<Option<String>>>, token: Option<&str>) {
     *value.lock().unwrap() = token.map(str::to_owned);
 }
 
-/// The token of the next `forgeToken` frame; a launch before it fails.
-async fn next_token(link: &mut NodeEnd) -> Option<String> {
+/// The next `forgeToken` frame's request id and token; a launch before it
+/// fails.
+async fn next_token(link: &mut NodeEnd) -> (LinkId, Option<String>) {
     link.expect(|frame| match frame {
         LinkFrame::ForgeToken(forge) => {
             assert_eq!(forge.host, FORGE_HOST_GITHUB);
-            Some(forge.token.map(|token| token.expose().to_owned()))
+            Some((
+                forge.request_id,
+                forge.token.map(|token| token.expose().to_owned()),
+            ))
         }
         LinkFrame::Launch(_) => panic!("a launch went out before the token"),
         _ => None,
     })
     .await
+}
+
+/// Answer frame `request_id` as the machine.
+async fn answer(link: &NodeEnd, request_id: LinkId, outcome: SecretOutcome) {
+    link.link
+        .send(&LinkFrame::ForgeTokenReply(ForgeTokenReply {
+            request_id,
+            outcome,
+            error: (outcome == SecretOutcome::Failed).then(|| FORGE_TOKEN_INVALID.to_owned()),
+        }))
+        .await
+        .unwrap();
+}
+
+/// The next token sent, confirmed by the machine.
+async fn confirmed_token(link: &mut NodeEnd, node: &RemoteNode) -> Option<String> {
+    let (request_id, token) = next_token(link).await;
+    answer(link, request_id, SecretOutcome::Ok).await;
+    let want = token.is_some();
+    tokio::time::timeout(wait(), async {
+        while node.shared_ref().forge_token_confirmed() != want {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the answer is recorded");
+    token
 }
 
 #[tokio::test]
@@ -75,29 +109,50 @@ async fn the_token_goes_out_after_every_bind_before_a_launch_and_on_each_change(
         tokio::spawn(async move { node.launch(command).await.map(|_| ()) })
     };
     let mut link = machine.accept().await;
-    assert_eq!(next_token(&mut link).await.as_deref(), Some("t-1"));
+    assert_eq!(
+        confirmed_token(&mut link, &node).await.as_deref(),
+        Some("t-1")
+    );
     link.expect(|frame| matches!(frame, LinkFrame::Launch(_)).then_some(()))
         .await;
     launching.await.unwrap().unwrap();
 
-    // A change goes out at once; the same value never twice; a removal as
-    // `null`.
+    // A confirmed value is never sent again: the next frame is the change.
+    assert!(!forge.refresh().await);
     set(&value, Some("t-2"));
     assert!(forge.refresh().await);
+    let (request_id, token) = next_token(&mut link).await;
+    assert_eq!(token.as_deref(), Some("t-2"));
+    // A refused value stays unconfirmed: the next check sends it again.
+    answer(&link, request_id, SecretOutcome::Failed).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        node.shared_ref().forge_token_confirmed(),
+        "t-1 stays confirmed"
+    );
     assert!(!forge.refresh().await);
-    assert_eq!(next_token(&mut link).await.as_deref(), Some("t-2"));
+    assert_eq!(
+        confirmed_token(&mut link, &node).await.as_deref(),
+        Some("t-2")
+    );
+    // A removal goes out as `null`.
     set(&value, None);
     assert!(forge.refresh().await);
-    assert_eq!(next_token(&mut link).await, None);
+    assert_eq!(confirmed_token(&mut link, &node).await, None);
 
-    // A new bind resolves afresh and sends the value first.
+    // A new bind starts unconfirmed, resolves afresh and sends the value
+    // first.
     set(&value, Some("t-3"));
     machine.stop().await;
     machine.restart().await;
     node.connect().await.unwrap();
     let mut again = machine.accept().await;
     assert!(again.hello.binding.generation > link.hello.binding.generation);
-    assert_eq!(next_token(&mut again).await.as_deref(), Some("t-3"));
+    assert!(!node.shared_ref().forge_token_confirmed());
+    assert_eq!(
+        confirmed_token(&mut again, &node).await.as_deref(),
+        Some("t-3")
+    );
     node.shutdown();
 }
 

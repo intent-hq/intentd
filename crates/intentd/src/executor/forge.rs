@@ -7,6 +7,9 @@ use std::sync::Mutex;
 
 use zeroize::Zeroizing;
 
+/// The longest token held.
+const MAX_TOKEN_BYTES: usize = 16 * 1024;
+
 /// See the module docs.
 #[derive(Default)]
 pub(super) struct ForgeToken(Mutex<Option<Zeroizing<String>>>);
@@ -26,10 +29,13 @@ impl ForgeToken {
         lock(&self.0).clone()
     }
 
-    /// Whether `token` may be held: not empty, and nothing that would break
-    /// an environment variable or the git credential protocol.
+    /// Whether `token` may be held: not empty, at most 16 KiB, and no
+    /// whitespace or control character (node-link.md § Forge token on the
+    /// machine, rule 6).
     pub(super) fn usable(token: &str) -> bool {
-        !token.is_empty() && !token.chars().any(char::is_control)
+        !token.is_empty()
+            && token.len() <= MAX_TOKEN_BYTES
+            && !token.chars().any(|c| c.is_whitespace() || c.is_control())
     }
 }
 

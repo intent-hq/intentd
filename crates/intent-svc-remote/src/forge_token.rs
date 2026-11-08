@@ -7,8 +7,9 @@
 //! different value. Only a SHA-256 digest is compared, and nothing here logs
 //! or renders the value.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use intent_core::node_link::{ForgeToken, LinkFrame, LinkId, SecretValue, FORGE_HOST_GITHUB};
@@ -92,23 +93,26 @@ impl ForgeTokens {
         self.held.subscribe()
     }
 
-    /// Resolve the token again; `true` when the held value changed.
+    /// Resolve the token again; `true` when the held value changed. Every
+    /// resolution wakes the linked connectors, so one whose machine has not
+    /// confirmed the value sends it again.
     pub(crate) async fn refresh(&self) -> bool {
         let _one = self.refreshing.lock().await;
         let token = (self.resolver)().await;
         let digest: Option<[u8; 32]> = token
             .as_ref()
             .map(|token| sha2::Sha256::digest(token.as_bytes()).into());
-        self.held.send_if_modified(|held| {
-            if held.digest == digest {
-                return false;
+        let mut changed = false;
+        self.held.send_modify(|held| {
+            if held.digest != digest {
+                changed = true;
+                *held = Held {
+                    token: token.map(SecretValue::from),
+                    digest,
+                };
             }
-            *held = Held {
-                token: token.map(SecretValue::from),
-                digest,
-            };
-            true
-        })
+        });
+        changed
     }
 
     /// Start the rotation watcher once: while any machine is linked, it
@@ -168,15 +172,55 @@ impl ForgeTokens {
     }
 }
 
-/// Send `held` to the machine on `link`. Never logs the value.
-pub(crate) async fn send(link: &NodeLink, held: &Held) {
-    if let Err(error) = link.send(&held.frame()).await {
+/// What one link's machine confirmed (node-link.md § Forge token on the
+/// machine, rule 3): a bind starts with nothing confirmed.
+#[derive(Default)]
+pub(crate) struct Confirmed {
+    /// The digest the machine last answered `ok` for (`Some(None)`: the
+    /// confirmed absence of a token).
+    value: Option<Option<[u8; 32]>>,
+    /// Frames sent and not yet answered, with the digest each carried.
+    pending: HashMap<LinkId, Option<[u8; 32]>>,
+}
+
+impl Confirmed {
+    /// Whether the machine confirmed a token (not `null`) on this link.
+    #[cfg(test)]
+    pub(crate) fn token(&self) -> bool {
+        matches!(self.value, Some(Some(_)))
+    }
+
+    /// Record the machine's answer to frame `request_id`.
+    pub(crate) fn answer(&mut self, request_id: LinkId, ok: bool) {
+        if let Some(digest) = self.pending.remove(&request_id) {
+            if ok {
+                self.value = Some(digest);
+            }
+        }
+    }
+}
+
+/// Send `held` to the machine on `link` unless it already confirmed that
+/// value. Never logs the value.
+pub(crate) async fn send(link: &NodeLink, held: &Held, confirmed: &Mutex<Confirmed>) {
+    let frame = {
+        let mut confirmed = crate::lock(confirmed);
+        if confirmed.value == Some(held.digest) {
+            return;
+        }
+        let frame = held.frame();
+        if let LinkFrame::ForgeToken(forge) = &frame {
+            confirmed.pending.insert(forge.request_id, held.digest);
+        }
+        frame
+    };
+    if let Err(error) = link.send(&frame).await {
         tracing::warn!(%error, "remote machine: the GitHub token was not sent");
     }
 }
 
-/// The next change of `forge`; never resolves without one (`None`, or its
-/// sender gone).
+/// The next resolution of `forge`; never resolves without one (`None`, or
+/// its sender gone).
 pub(crate) async fn changed(forge: &mut Option<watch::Receiver<Held>>) -> Held {
     loop {
         match forge {

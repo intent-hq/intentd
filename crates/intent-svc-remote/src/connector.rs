@@ -357,6 +357,8 @@ pub(crate) struct Shared {
     /// The backend's GitHub token, sent after every bind and on each change
     /// (nodeProtocol 15); `None` hands out none.
     forge: Option<Arc<crate::forge_token::ForgeTokens>>,
+    /// What the current link's machine confirmed of it.
+    forge_confirmed: Mutex<crate::forge_token::Confirmed>,
     ingested: Mutex<NodeCounter>,
     /// Each agent's checkout and setup output tail (nodeProtocol 10).
     setup_outputs: Mutex<HashMap<AgentId, SetupTail>>,
@@ -378,6 +380,13 @@ impl Shared {
     #[cfg(test)]
     pub(crate) fn is_parked(&self, agent_id: &AgentId) -> bool {
         lock(&self.parked).contains_key(agent_id)
+    }
+
+    /// Whether the current link's machine confirmed holding the GitHub
+    /// token (nodeProtocol 15).
+    #[cfg(test)]
+    pub(crate) fn forge_token_confirmed(&self) -> bool {
+        lock(&self.forge_confirmed).token()
     }
 
     #[cfg(test)]
@@ -1600,6 +1609,7 @@ impl RemoteNode {
             secret_forgets: Mutex::new(Vec::new()),
             secret_locks: Mutex::new(HashMap::new()),
             forge,
+            forge_confirmed: Mutex::default(),
             ingested: Mutex::new(acked),
             cloud_refusal: watch::channel(None).0,
             demand,
@@ -2322,7 +2332,9 @@ async fn run(
                 // A slow resolution (a stalled `gh`) leaves the last value.
                 let _ = tokio::time::timeout(FORGE_BIND_RESOLVE, forge.refresh()).await;
                 let held = changes.borrow_and_update().clone();
-                crate::forge_token::send(&link, &held).await;
+                // A bind starts with nothing confirmed.
+                *lock(&shared.forge_confirmed) = crate::forge_token::Confirmed::default();
+                crate::forge_token::send(&link, &held, &shared.forge_confirmed).await;
                 Some(changes)
             }
             _ => None,
@@ -2531,7 +2543,9 @@ async fn serve(
                         }
                     }
                     LinkEvent::Frame(LinkFrame::ForgeTokenReply(reply)) => {
-                        if reply.outcome == SecretOutcome::Failed {
+                        let ok = reply.outcome == SecretOutcome::Ok;
+                        lock(&shared.forge_confirmed).answer(reply.request_id, ok);
+                        if !ok {
                             tracing::warn!(
                                 error = reply.error.as_deref().unwrap_or("failed"),
                                 "remote machine: refused the GitHub token"
@@ -2557,7 +2571,7 @@ async fn serve(
                 }
             }
             held = crate::forge_token::changed(&mut forge) => {
-                crate::forge_token::send(link, &held).await;
+                crate::forge_token::send(link, &held, &shared.forge_confirmed).await;
             }
             demand = demands.recv() => {
                 // Someone needs the link: it is up, so answer at once and
