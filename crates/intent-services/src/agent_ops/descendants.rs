@@ -43,40 +43,61 @@ impl Services {
                 "cannot {verb} {target}: it is not one of your sub-agents. You can {verb} only agents you created (and their sub-agents)."
             )));
         }
-        let mut subtree = self.collect_retire_descendants(&target).await?;
-        // Deepest first, the target last: a sub-agent never outlives the
-        // agent it was started by.
-        subtree.reverse();
-        subtree.push(session);
         let reason = reason.unwrap_or_else(|| format!("stopped by parent agent {caller}"));
         let mut ended = Vec::new();
         let mut failed = Vec::new();
-        for member in &subtree {
-            let id = member.id.clone();
-            let outcome = if delete {
-                self.agent_delete_op(id.clone(), None).await.map(|_| true)
-            } else {
-                self.stop_one_descendant(member, &reason).await
-            };
-            match outcome {
-                Ok(true) => ended.push(id.0),
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(caller = %caller, agent = %id, error = %e, "ending a sub-agent failed");
-                    failed.push(json!({ "agentId": id.0, "error": e.to_string() }));
+        // The target first: its retire mark fences its own further turns,
+        // so it cannot start sub-agents while its subtree is being ended.
+        match self.stop_one_descendant(&session, &reason).await {
+            Ok(true) if !delete => ended.push(target.0.clone()),
+            Ok(_) => {}
+            Err(e) => {
+                failed.push(json!({ "agentId": target.0, "error": e.to_string() }));
+                return Ok(end_result(delete, &target, &ended, &failed));
+            }
+        }
+        // Then its descendants, deepest first, read again until no new
+        // one appears (one started just before the fence).
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let mut subtree = self.collect_retire_descendants(&target).await?;
+            subtree.retain(|m| seen.insert(m.id.clone()));
+            if subtree.is_empty() {
+                break;
+            }
+            subtree.reverse();
+            for member in &subtree {
+                let id = member.id.clone();
+                let outcome = if delete {
+                    self.agent_delete_op(id.clone(), None).await.map(|_| true)
+                } else {
+                    self.stop_one_descendant(member, &reason).await
+                };
+                match outcome {
+                    Ok(true) => ended.push(id.0),
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(caller = %caller, agent = %id, error = %e, "ending a sub-agent failed");
+                        failed.push(json!({ "agentId": id.0, "error": e.to_string() }));
+                    }
                 }
             }
         }
-        let key = if delete { "deleted" } else { "stopped" };
-        Ok(json!({
-            "ok": failed.is_empty(),
-            "success": failed.is_empty(),
-            "agentId": target.0,
-            key: ended,
-            "failed": failed,
-        }))
+        if delete {
+            // A descendant that could not be deleted keeps its (retired)
+            // parent row, so the caller can still reach it and retry.
+            if failed.is_empty() {
+                self.agent_delete_op(target.clone(), None).await?;
+                ended.push(target.0.clone());
+            } else {
+                failed.push(json!({
+                    "agentId": target.0,
+                    "error": "kept (stopped) because a sub-agent of it could not be deleted; retry",
+                }));
+            }
+        }
+        Ok(end_result(delete, &target, &ended, &failed))
     }
-
     /// Retire one subtree member and end its runtime. `Ok(false)` when it
     /// was already retired or is gone.
     async fn stop_one_descendant(
@@ -117,4 +138,16 @@ impl Services {
         }
         Ok(false)
     }
+}
+
+/// The `ws.agent.stop` / `ws.agent.delete` result.
+fn end_result(delete: bool, target: &AgentId, ended: &[String], failed: &[Value]) -> Value {
+    let key = if delete { "deleted" } else { "stopped" };
+    json!({
+        "ok": failed.is_empty(),
+        "success": failed.is_empty(),
+        "agentId": target.0,
+        key: ended,
+        "failed": failed,
+    })
 }

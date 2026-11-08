@@ -3194,10 +3194,6 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { false })
     }
 
-    /// Soft retire (`ws.agent.retire`): set `retiredAt` on the session,
-    /// keeping the row and its full conversation intact. The retired session
-    /// is inert until `agent.restore` clears the mark. Emits `agent:retired`;
-    /// idempotent on an already-retired session.
     /// `ws.agent.stop` / `ws.agent.delete`: `caller` ends `target`, one of
     /// its own sub-agents (direct or deeper), and that sub-agent's whole
     /// subtree. `delete: false` retires them (restorable), `true` deletes
@@ -3218,6 +3214,10 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Soft retire (`ws.agent.retire`): set `retiredAt` on the session,
+    /// keeping the row and its full conversation intact. The retired session
+    /// is inert until `agent.restore` clears the mark. Emits `agent:retired`;
+    /// idempotent on an already-retired session.
     fn agent_retire(
         &self,
         agent_id: AgentId,

@@ -1446,7 +1446,7 @@ async fn a_parent_stops_and_deletes_its_sub_agents_wherever_they_run() {
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(
         stopped["stopped"],
-        json!([grandchild.0, machine.0]),
+        json!([machine.0, grandchild.0]),
         "{stopped}"
     );
     for id in [&machine, &grandchild] {

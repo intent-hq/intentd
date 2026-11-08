@@ -13674,7 +13674,12 @@ mod wsapi4_bindings_tests {
                 "fromAgentName": "agent-caller-1",
             }))
         );
-        assert_eq!(api.agent_get_calls.lock().unwrap().len(), 1);
+        // One caller lookup (depth guard + attribution); `runsOn` reads the
+        // woken agent separately.
+        assert_eq!(
+            *api.agent_get_calls.lock().unwrap(),
+            vec!["caller-1".to_string(), "agent-woken".to_string()]
+        );
     }
 
     /// Explicit `messageMetadata` on `wakeOrCreate` (new optional 4th arg)
