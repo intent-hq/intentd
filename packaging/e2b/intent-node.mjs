@@ -6,8 +6,11 @@
 // snapshots the start command's processes, which would give every sandbox the
 // same daemon id, TLS key and tailcat key.
 //
-// gh is installed but never authenticated: the sandbox holds no GitHub
-// credentials, and the backend publishes branches and pull requests itself.
+// gh is installed but never logged in, and the image holds no GitHub
+// credentials. A linked backend hands its GitHub token to the running sandbox
+// in memory (nodeProtocol 15): every agent gets it as GH_TOKEN, and a
+// top-level agent's git also gets a credential helper, so it can push the
+// workspace branch and open a pull request.
 // No toolchains beyond Node, Python and a C compiler are baked in; a
 // repository's workspace setup script installs what it needs.
 //

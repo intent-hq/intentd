@@ -11,23 +11,27 @@ use super::secrets::{agent_turn, create_agent, files_containing};
 use super::*;
 
 /// Distinctive, so the scans cannot match anything by accident.
-const TOKEN: &str = "ghp_forgeE2eCanary7Rq2Lw9Zt4";
+pub(super) const TOKEN: &str = "ghp_forgeE2eCanary7Rq2Lw9Zt4";
 
 /// Where the backend resolves its GitHub token first.
-const TOKEN_ACCOUNT: &str = "sourceControl.github.token";
+pub(super) const TOKEN_ACCOUNT: &str = "sourceControl.github.token";
 
-fn sha_hex(value: &str) -> String {
+pub(super) fn sha_hex(value: &str) -> String {
     lower_hex(&Sha256::digest(value.as_bytes()))
 }
 
-/// A workspace repository with one commit, a backend whose secret store
-/// holds [`TOKEN`], and the backend's id.
-async fn backend_with_token(
+/// A workspace repository with one commit (and `origin`, when given), a
+/// backend whose secret store holds [`TOKEN`], and the backend's id.
+pub(super) async fn backend_with_token(
     scratch: &Path,
+    origin: Option<&str>,
 ) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String, String) {
     let repo = scratch.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "--quiet"]);
+    if let Some(origin) = origin {
+        git(&repo, &["remote", "add", "origin", origin]);
+    }
     std::fs::write(repo.join("README.md"), "base\n").unwrap();
     git(&repo, &["add", "README.md"]);
     git(&repo, &["commit", "--quiet", "-m", "base"]);
@@ -45,7 +49,7 @@ async fn backend_with_token(
 
 /// The agent's `GH_TOKEN`, as the SHA-256 the test agent reports (or
 /// `unset`).
-async fn gh_token_digest(
+pub(super) async fn gh_token_digest(
     rpc_ws: &mut common::TlsWs,
     events: &mut common::TlsWs,
     (ws_id, agent_id): (&str, &str),
@@ -92,7 +96,7 @@ async fn every_remote_agent_gets_the_backends_github_token_and_nothing_records_i
     }
     let scratch = common::test_tempdir_in("/tmp", "itd-forge-");
     let head_dir = scratch.path().join("head");
-    let (head, port, cfg, ws_id, backend_id) = backend_with_token(scratch.path()).await;
+    let (head, port, cfg, ws_id, backend_id) = backend_with_token(scratch.path(), None).await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
     ok(
         &mut rpc_ws,
@@ -196,7 +200,7 @@ async fn an_older_machine_starts_its_agents_without_the_token() {
         return;
     }
     let scratch = common::test_tempdir_in("/tmp", "itd-forge14-");
-    let (_head, port, cfg, ws_id, backend_id) = backend_with_token(scratch.path()).await;
+    let (_head, port, cfg, ws_id, backend_id) = backend_with_token(scratch.path(), None).await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
     ok(
         &mut rpc_ws,
