@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.156] - 2026-11-08
+
+### 🐛 Bug Fixes
+
+- *(agent)* Refuse misplaced placement options; let parents stop and delete sub-agents ([#3155](https://github.com/intent-hq/intentd/pull/3155))
+- *(remote)* Let a remote agent that retires itself finish its turn ([#3154](https://github.com/intent-hq/intentd/pull/3154))
+
+### 📚 Documentation
+
+- Add Cmd+K section to assistant app guide ([#3150](https://github.com/intent-hq/intentd/pull/3150))
+
+
 ## [0.11.155] - 2026-11-08
 
 ### 🐛 Bug Fixes
