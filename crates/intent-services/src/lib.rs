@@ -5280,8 +5280,9 @@ impl Services {
     /// (`clientId` + `source: "workspace"`, else `source: "default"`) and
     /// `resolved` — the driving client an agent `browser.exec` would reach
     /// right now ([`Self::driving_client_target`]: pin → client of an active
-    /// desktop session → host of the workspace's claimed tabs →
-    /// first-connected eligible client), `null`
+    /// desktop session → host of the workspace's claimed tabs → connected
+    /// client that most recently focused it → first-connected eligible
+    /// client, [`Self::browser_client_target`]), `null`
     /// when that client is offline or no eligible client is connected — and,
     /// for an unpinned workspace the desktop-session or claimed-tab rule
     /// routed, `target: { clientId, via }` naming that client even while it
@@ -5293,14 +5294,24 @@ impl Services {
         if !id.is_chief() {
             self.store.workspace_browser_client(id).await?;
         }
-        let (target, via) = self.driving_client_route(id).await?;
+        let (target, via) = self.browser_client_route(id).await?;
         let resolved = self
             .reverse_dispatch
             .as_ref()
-            .and_then(|d| d.resolve(&target).ok())
-            .map_or(serde_json::Value::Null, |r| {
-                serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
-            });
+            .and_then(|d| d.resolve(&target).ok());
+        // The focus preference names its client only once it resolves to
+        // one of the focused clients (not the first-connected fallback).
+        let focused = match (&target, &resolved) {
+            (intent_core::ReverseTarget::Preferred(clients), Some(r))
+                if clients.contains(&r.client_id) =>
+            {
+                Some(r.client_id.clone())
+            }
+            _ => None,
+        };
+        let resolved = resolved.map_or(serde_json::Value::Null, |r| {
+            serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
+        });
         let mut out = serde_json::Map::new();
         match &target {
             intent_core::ReverseTarget::Pinned(client_id) => {
@@ -5313,7 +5324,11 @@ impl Services {
         }
         out.insert("resolved".into(), resolved);
         // Every specific-client rule other than the pin reports its client.
-        if let intent_core::ReverseTarget::Client(client_id) = &target {
+        let routed = match &target {
+            intent_core::ReverseTarget::Client(client_id) => Some(client_id.clone()),
+            _ => focused,
+        };
+        if let Some(client_id) = routed {
             out.insert(
                 "target".into(),
                 serde_json::json!({ "clientId": client_id.as_str(), "via": via }),
@@ -5332,7 +5347,7 @@ impl Services {
     async fn browser_clients_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
         use intent_core::{ReverseConnectionSnapshot, ReverseDispatchError, ReverseRoute};
 
-        let (target, source) = self.driving_client_route(id).await?;
+        let (target, source) = self.browser_client_route(id).await?;
         let targets = [intent_core::ReverseTarget::Default, target];
         let snapshot = self.reverse_dispatch.as_ref().map_or_else(
             || ReverseConnectionSnapshot {
@@ -5355,6 +5370,18 @@ impl Services {
         }
         let mut workspace = routes.pop().expect("two routes");
         let unpinned = routes.pop().expect("two routes");
+        // The focus label only when a focused client actually serves the
+        // route; a fallback to the first-connected client reads `default`.
+        let source = match &targets[1] {
+            intent_core::ReverseTarget::Preferred(clients)
+                if !workspace["clientId"]
+                    .as_str()
+                    .is_some_and(|id| clients.iter().any(|c| c.as_str() == id)) =>
+            {
+                "default"
+            }
+            _ => source,
+        };
         workspace["source"] = source.into();
         Ok(serde_json::json!({
             "clients": snapshot.clients,
@@ -35954,6 +35981,10 @@ impl WorkspaceApi for Services {
     }
 
     // Presence (multiplayer w5) — see `presence`.
+
+    fn presence_bind_client(&self, connection_id: String, client_id: intent_core::ClientId) {
+        self.presence_bind_client_op(&connection_id, client_id);
+    }
 
     fn presence_connect(&self, connection_id: String) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move { self.presence_connect_op(connection_id).await })

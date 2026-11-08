@@ -410,6 +410,40 @@ impl Services {
 }
 
 impl Services {
+    /// The [`ReverseTarget`](intent_core::ReverseTarget) an agent browser
+    /// request for `workspace_id` dispatches to: the driving client
+    /// ([`Self::driving_client_target`]), except that the unassigned
+    /// fallback of a non-Chief workspace first prefers the clients that most
+    /// recently focused it (REV-2 rule 5, intent-hq/intent#7855). Desktop
+    /// control keeps reading the plain driving client, for which this
+    /// preference is not an assignment.
+    #[doc(hidden)]
+    pub async fn browser_client_target(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> intent_core::Result<intent_core::ReverseTarget> {
+        Ok(self.browser_client_route(workspace_id).await?.0)
+    }
+
+    /// [`Self::browser_client_target`] plus the rule label of
+    /// [`Self::driving_client_route`], or `"focus"` for the preference.
+    pub(crate) async fn browser_client_route(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> intent_core::Result<(intent_core::ReverseTarget, &'static str)> {
+        let route = self.driving_client_route(workspace_id).await?;
+        if workspace_id.is_chief() || !matches!(route.0, intent_core::ReverseTarget::Default) {
+            return Ok(route);
+        }
+        let recent = self.presence_recent_focus_clients(workspace_id);
+        if recent.is_empty() {
+            return Ok(route);
+        }
+        Ok((intent_core::ReverseTarget::Preferred(recent), "focus"))
+    }
+}
+
+impl Services {
     async fn desktop_validate_live(&self, live: &Live) -> DesktopResult<()> {
         if let Phase::Pending {
             request_id,

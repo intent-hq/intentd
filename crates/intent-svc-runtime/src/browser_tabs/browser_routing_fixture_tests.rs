@@ -1,8 +1,9 @@
 //! The workspace half of the shared REV-2 routing cases
 //! (`docs/protocol/fixtures/browser-routing/routing.json`, mirrored in
 //! intent-transport): for every case, the workspace state (Chief, pin, active
-//! desktop session, registry tabs) yields the case's `expect.target` from
-//! [`Services::driving_client_target`]. intent-transport runs the other half,
+//! desktop session, registry tabs, recent focus) yields the case's
+//! `expect.target` from [`Services::browser_client_target`]. intent-transport
+//! runs the other half,
 //! resolving that target against the case's connections.
 
 use intent_core::{ClientHostInfo, ClientId, ReverseTarget, WorkspaceId};
@@ -28,8 +29,18 @@ fn expected_target(case: &Value) -> ReverseTarget {
         Some("default") => ReverseTarget::Default,
         Some("client") => ReverseTarget::Client(client_id()),
         Some("pinned") => ReverseTarget::Pinned(client_id()),
+        Some("preferred") => ReverseTarget::Preferred(client_ids(&target["clientIds"], case)),
         other => panic!("{}: unknown target kind {other:?}", case["id"]),
     }
+}
+
+fn client_ids(value: &Value, case: &Value) -> Vec<ClientId> {
+    value
+        .as_array()
+        .unwrap_or_else(|| panic!("{}: expected an array of client ids", case["id"]))
+        .iter()
+        .map(|id| ClientId::from_string(id.as_str().expect("client ids are strings")))
+        .collect()
 }
 
 async fn known_client(svc: &Services, id: &str) -> ClientId {
@@ -94,7 +105,10 @@ async fn routing_fixture_every_case_derives_the_expected_target() {
             svc.feature_desktop()
                 .activate_for_test(&ws, ClientId::from_string(client));
         }
-        let got = svc.driving_client_target(&ws).await.expect(name);
+        if let Some(recent) = state.get("recentFocus") {
+            svc.presence_record_focus_for_test(&ws, &client_ids(recent, case));
+        }
+        let got = svc.browser_client_target(&ws).await.expect(name);
         let want = expected_target(case);
         if got != want {
             failures.push(format!("{name}: expected {want:?}, got {got:?}"));

@@ -59,8 +59,8 @@ use std::time::{Duration, Instant};
 
 use intent_core::events::{NOTE_PRESENCE, PRESENCE_CHANGED};
 use intent_core::{
-    current_caller, now_iso, AgentId, Caller, Error, EventActor, NoteId, Principal, PrincipalId,
-    Result, WorkspaceId,
+    current_caller, now_iso, AgentId, Caller, ClientId, Error, EventActor, NoteId, Principal,
+    PrincipalId, Result, WorkspaceId,
 };
 use intent_store::NewEvent;
 use serde_json::{json, Value};
@@ -214,7 +214,18 @@ struct Conn {
     discussion_typing: Option<DiscussionTyping>,
     /// Note-presence leases held by this connection: lease id → note.
     leases: HashMap<String, (WorkspaceId, NoteId)>,
+    /// The logical client this connection hello'd as, once bound.
+    client: Option<ClientId>,
+    /// Focus history for browser routing (intent-hq/intent#7855), as
+    /// [`State::focus_clock`] ticks: when each workspace now in `focus`
+    /// entered it, and when each workspace that left it last did.
+    focus_since: HashMap<String, u64>,
+    focus_left: HashMap<String, u64>,
 }
+
+/// Workspaces whose focus departure a connection remembers; the oldest
+/// departure is forgotten first.
+const FOCUS_HISTORY_LIMIT: usize = 64;
 
 impl Conn {
     fn new(principal: PrincipalId) -> Self {
@@ -228,7 +239,50 @@ impl Conn {
             typing: None,
             discussion_typing: None,
             leases: HashMap::new(),
+            client: None,
+            focus_since: HashMap::new(),
+            focus_left: HashMap::new(),
         }
+    }
+
+    /// Replace the focus set at `tick`, keeping the routing history: every
+    /// workspace in the new set is marked focused as of now (a repeated
+    /// update is fresh activity in this client), one leaving it records now.
+    fn set_focus(&mut self, focus: Vec<Focus>, tick: u64) {
+        let now: HashSet<String> = focus.iter().map(|f| f.workspace.clone()).collect();
+        self.focus_since.retain(|workspace, _| {
+            let stays = now.contains(workspace);
+            if !stays {
+                self.focus_left.insert(workspace.clone(), tick);
+            }
+            stays
+        });
+        for workspace in now {
+            self.focus_left.remove(&workspace);
+            self.focus_since.insert(workspace, tick);
+        }
+        while self.focus_left.len() > FOCUS_HISTORY_LIMIT {
+            let oldest = self
+                .focus_left
+                .iter()
+                .min_by_key(|(_, tick)| **tick)
+                .map(|(workspace, _)| workspace.clone());
+            match oldest {
+                Some(workspace) => self.focus_left.remove(&workspace),
+                None => break,
+            };
+        }
+        self.focus = focus;
+    }
+
+    /// This connection's routing rank for `workspace`: focusing it now
+    /// outranks any past focus; within each, the later tick (latest update
+    /// still naming it, or latest departure) wins.
+    fn focus_rank(&self, workspace: &str) -> Option<(bool, u64)> {
+        self.focus_since
+            .get(workspace)
+            .map(|tick| (true, *tick))
+            .or_else(|| self.focus_left.get(workspace).map(|tick| (false, *tick)))
     }
 
     /// The workspaces this connection's focus / typing state touches.
@@ -280,6 +334,9 @@ impl Default for Viewer {
 #[derive(Debug, Default)]
 struct State {
     focus_generation: u64,
+    /// Monotonic tick of `presence.update` focus changes; orders the focus
+    /// history browser routing reads.
+    focus_clock: u64,
     conns: HashMap<String, Conn>,
     profiles: HashMap<PrincipalId, Profile>,
     /// Bumped by every [`Services::presence_profile_changed`], cached entry
@@ -814,13 +871,15 @@ impl Services {
         let (affected, typing_source): (HashSet<String>, String) = {
             let mut state = self.presence.lock();
             state.focus_generation = state.focus_generation.wrapping_add(1);
+            state.focus_clock += 1;
+            let tick = state.focus_clock;
             let Some(conn) = state.conns.get_mut(&connection_id) else {
                 return Err(Error::InvalidParams(
                     "presence.update: the connection is no longer registered".to_string(),
                 ));
             };
             let before = conn.workspaces();
-            conn.focus = focus;
+            conn.set_focus(focus, tick);
             conn.typing = typing.map(|(agent, workspace)| {
                 // Every update naming a typing agent is a keystroke pulse:
                 // it bumps this connection's `pulse` (the receiver's
@@ -862,6 +921,74 @@ impl Services {
             self.emit_presence_changed(&workspace_id).await;
         }
         Ok(json!({ "ok": true, "typingSource": typing_source }))
+    }
+
+    /// See [`intent_core::WorkspaceApi::presence_bind_client`].
+    pub(crate) fn presence_bind_client_op(&self, connection_id: &str, client_id: ClientId) {
+        if let Some(conn) = self.presence.lock().conns.get_mut(connection_id) {
+            conn.client = Some(client_id);
+        }
+    }
+
+    /// The clients whose hello'd connections most recently focused
+    /// `workspace_id`, best first (REV-2 rule 5, intent-hq/intent#7855):
+    /// clients focusing it now (latest update naming it first), then clients
+    /// whose focus left it (latest departure first). Each client appears
+    /// once, at its best connection's rank; unbound connections are skipped.
+    pub(crate) fn presence_recent_focus_clients(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Vec<ClientId> {
+        let state = self.presence.lock();
+        let mut best: HashMap<&ClientId, (bool, u64)> = HashMap::new();
+        for conn in state.conns.values().filter(|conn| conn.hello) {
+            let (Some(client), Some(rank)) =
+                (conn.client.as_ref(), conn.focus_rank(workspace_id.as_str()))
+            else {
+                continue;
+            };
+            let entry = best.entry(client).or_insert(rank);
+            *entry = (*entry).max(rank);
+        }
+        let mut ranked: Vec<(&ClientId, (bool, u64))> = best.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+        ranked
+            .into_iter()
+            .map(|(client, _)| client.clone())
+            .collect()
+    }
+
+    /// Test seam for the shared routing fixture: make `clients` (best first)
+    /// the workspace's focus history through hello'd, bound synthetic
+    /// connections whose focus entered and then left the workspace.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn presence_record_focus_for_test(&self, workspace_id: &WorkspaceId, clients: &[ClientId]) {
+        let mut state = self.presence.lock();
+        for client in clients.iter().rev() {
+            state.focus_clock += 1;
+            let entered = state.focus_clock;
+            state.focus_clock += 1;
+            let left = state.focus_clock;
+            let mut conn = Conn::new(PrincipalId::new());
+            conn.hello = true;
+            conn.client = Some(client.clone());
+            let focus = Focus {
+                workspace: workspace_id.as_str().to_string(),
+                agent: None,
+                note: None,
+            };
+            conn.set_focus(vec![focus], entered);
+            conn.set_focus(Vec::new(), left);
+            state.conns.insert(
+                format!(
+                    "focus-fixture-{}-{}",
+                    workspace_id.as_str(),
+                    client.as_str()
+                ),
+                conn,
+            );
+        }
     }
 
     /// The store checks caller, person, every destination and resource in one

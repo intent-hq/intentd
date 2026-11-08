@@ -1295,6 +1295,14 @@ fn fixture_target(case: &serde_json::Value) -> ReverseTarget {
         Some("default") => ReverseTarget::Default,
         Some("client") => ReverseTarget::Client(client_id()),
         Some("pinned") => ReverseTarget::Pinned(client_id()),
+        Some("preferred") => ReverseTarget::Preferred(
+            target["clientIds"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{}: preferred target without clientIds", case["id"]))
+                .iter()
+                .map(|id| ClientId::from_string(id.as_str().expect("clientIds are strings")))
+                .collect(),
+        ),
         other => panic!("{}: unknown target kind {other:?}", case["id"]),
     }
 }

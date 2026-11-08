@@ -46,7 +46,9 @@ impl AgentReverseDispatch for Executor {
         principal: &PrincipalId,
     ) -> DesktopResult<DesktopConnection> {
         let connection = match target {
-            ReverseTarget::Default => self.connection.lock().unwrap().clone(),
+            ReverseTarget::Default | ReverseTarget::Preferred(_) => {
+                self.connection.lock().unwrap().clone()
+            }
             ReverseTarget::Client(client) | ReverseTarget::Pinned(client) => {
                 std::iter::once(self.connection.lock().unwrap().clone())
                     .chain(self.extra_connections.lock().unwrap().clone())

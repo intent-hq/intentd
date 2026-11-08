@@ -53,6 +53,10 @@ impl AgentReverseDispatch for FakeRegistry {
     fn resolve(&self, target: &ReverseTarget) -> Result<ResolvedClient, ReverseDispatchError> {
         let found = match target {
             ReverseTarget::Default => self.clients.iter().find(|c| c.2),
+            ReverseTarget::Preferred(ids) => ids
+                .iter()
+                .find_map(|id| self.clients.iter().find(|c| &c.0 == id && c.2))
+                .or_else(|| self.clients.iter().find(|c| c.2)),
             ReverseTarget::Client(id) | ReverseTarget::Pinned(id) => {
                 self.clients.iter().find(|c| &c.0 == id && c.2)
             }
@@ -62,7 +66,9 @@ impl AgentReverseDispatch for FakeRegistry {
                 client_id: c.0.clone(),
                 name: c.1.clone(),
             }),
-            (None, ReverseTarget::Default) => Err(ReverseDispatchError::NoClient),
+            (None, ReverseTarget::Default | ReverseTarget::Preferred(_)) => {
+                Err(ReverseDispatchError::NoClient)
+            }
             (None, ReverseTarget::Client(id) | ReverseTarget::Pinned(id)) => {
                 Err(ReverseDispatchError::ClientOffline {
                     client_id: id.clone(),
