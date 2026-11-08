@@ -351,11 +351,11 @@ async fn a_merge_group_ci_failure_wakes_the_owner_with_the_failed_job() {
     forge.edit_quiet(|s| {
         s.merge_queue_entry = Some(MergeQueueEntry {
             state: Some("unmergeable".into()),
-            failed_check: Some(intent_sourcecontrol::MergeGroupFailedCheck {
+            failed_check: Some(Box::new(intent_sourcecontrol::MergeGroupFailedCheck {
                 name: "coverage-e2e".into(),
                 conclusion: "failure".into(),
                 url: Some("https://github.com/o/r/actions/runs/42473804877/job/9".into()),
-            }),
+            })),
             ..entry(1, Some(1500))
         });
     });

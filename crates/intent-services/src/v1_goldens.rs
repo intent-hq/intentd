@@ -854,10 +854,12 @@ fn golden_pr_monitor_unmergeable_queue_entry_after_a_merge_group_ci_failure() {
             state: Some(state.to_string()),
             enqueued_at: None,
             estimated_time_to_merge: None,
-            failed_check: failed.then(|| intent_sourcecontrol::MergeGroupFailedCheck {
-                name: "cache-smoke / verify".to_string(),
-                conclusion: "failure".to_string(),
-                url: Some("https://github.com/o/r/actions/runs/42473806226/job/7".to_string()),
+            failed_check: failed.then(|| {
+                Box::new(intent_sourcecontrol::MergeGroupFailedCheck {
+                    name: "cache-smoke / verify".to_string(),
+                    conclusion: "failure".to_string(),
+                    url: Some("https://github.com/o/r/actions/runs/42473806226/job/7".to_string()),
+                })
             }),
         });
         s

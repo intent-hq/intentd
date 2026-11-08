@@ -614,7 +614,7 @@ pub struct MergeQueueEntry {
     /// marks an entry whose merge-group CI failed `unmergeable` before it
     /// ejects it, so this tells a CI failure from a conflict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failed_check: Option<MergeGroupFailedCheck>,
+    pub failed_check: Option<Box<MergeGroupFailedCheck>>,
 }
 
 /// A check on a merge-queue entry's merge-group commit that ended in a

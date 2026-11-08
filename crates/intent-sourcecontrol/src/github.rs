@@ -1631,7 +1631,7 @@ fn parse_merge_queue_entry(pr: Option<&Value>) -> Option<MergeQueueEntry> {
 /// others after it; a gate job fails last). A check without a finish time
 /// sorts after the timed ones, and on a tie a non-cancelled failure wins.
 /// `None` when nothing failed or the rollup is absent.
-fn parse_merge_group_failed_check(entry: &Value) -> Option<MergeGroupFailedCheck> {
+fn parse_merge_group_failed_check(entry: &Value) -> Option<Box<MergeGroupFailedCheck>> {
     const FAILING: [&str; 6] = [
         "failure",
         "timed_out",
@@ -1667,16 +1667,13 @@ fn parse_merge_group_failed_check(entry: &Value) -> Option<MergeGroupFailedCheck
                 .contains(&conclusion.as_str())
                 .then_some((at, name, conclusion, url))
         })
-        .min_by(|a, b| {
-            let key = |c: &(Option<&str>, &str, String, Option<&str>)| {
-                (c.0.is_none(), c.0, c.2 == "cancelled")
-            };
-            key(a).cmp(&key(b))
-        })
-        .map(|(_, name, conclusion, url)| MergeGroupFailedCheck {
-            name: name.to_string(),
-            conclusion,
-            url: url.filter(|u| !u.is_empty()).map(String::from),
+        .min_by_key(|(at, _, conclusion, _)| (at.is_none(), *at, conclusion == "cancelled"))
+        .map(|(_, name, conclusion, url)| {
+            Box::new(MergeGroupFailedCheck {
+                name: name.to_string(),
+                conclusion,
+                url: url.filter(|u| !u.is_empty()).map(String::from),
+            })
         })
 }
 
@@ -3815,11 +3812,11 @@ mod tests {
         };
         let failed = |pr: Value| parse_merge_queue_entry(Some(&pr)).unwrap().failed_check;
         let check = |name: &str, conclusion: &str| {
-            Some(MergeGroupFailedCheck {
+            Some(Box::new(MergeGroupFailedCheck {
                 name: name.into(),
                 conclusion: conclusion.into(),
                 url: Some(format!("https://github.com/o/r/actions/runs/1/job/{name}")),
-            })
+            }))
         };
 
         // A failed job, then fail-fast cancels the rest, then the gate fails.
@@ -3868,11 +3865,11 @@ mod tests {
         ]);
         assert_eq!(
             failed(untimed),
-            Some(MergeGroupFailedCheck {
+            Some(Box::new(MergeGroupFailedCheck {
                 name: "ci/legacy".into(),
                 conclusion: "error".into(),
                 url: None,
-            })
+            }))
         );
 
         // Nothing failed (yet), no rollup, or no merge-group commit: none.
@@ -3921,11 +3918,11 @@ mod tests {
         .unwrap();
         assert_eq!(sparse, json!({ "position": 1 }));
         let failed = serde_json::to_value(MergeQueueEntry {
-            failed_check: Some(MergeGroupFailedCheck {
+            failed_check: Some(Box::new(MergeGroupFailedCheck {
                 name: "check".into(),
                 conclusion: "failure".into(),
                 url: None,
-            }),
+            })),
             position: 1,
             queue_size: None,
             state: None,

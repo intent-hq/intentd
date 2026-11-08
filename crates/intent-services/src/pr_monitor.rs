@@ -9366,7 +9366,11 @@ mod tests {
                         pick(b, "2026-10-24T09:30:00Z", "2026-10-25T09:30:00Z").into(),
                     ),
                     estimated_time_to_merge: Some(pick(b, 60, 120)),
-                    failed_check: None,
+                    failed_check: Some(Box::new(intent_sourcecontrol::MergeGroupFailedCheck {
+                        name: pick(b, "check", "coverage-e2e").into(),
+                        conclusion: pick(b, "failure", "cancelled").into(),
+                        url: Some(pick(b, "https://ci.test/1", "https://ci.test/2").into()),
+                    })),
                 }),
                 checks_not_started: Some(pr_ops::ChecksNotStarted {
                     head_sha: head.into(),
