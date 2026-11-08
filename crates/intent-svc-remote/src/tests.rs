@@ -42,6 +42,7 @@ use crate::machine::MachineTarget;
 use crate::RemoteServicesExt as _;
 
 mod cloud;
+mod forge_token;
 mod launch;
 mod methods;
 
@@ -72,10 +73,13 @@ fn tuning() -> Tuning {
             attempt: Duration::from_millis(500),
             total: wait(),
         },
+        forge_refresh: Duration::from_secs(600),
+        forge_check: Duration::from_millis(20),
         fail_ack_writes: Arc::default(),
         fail_claim_reads: Arc::default(),
         before_publish: crate::connector::BeforePublish::default(),
         before_claim: crate::connector::BeforePublish::default(),
+        forge_resolver: crate::connector::ForgeResolver::default(),
         grace_gate: crate::connector::GraceGate::default(),
     }
 }
@@ -603,6 +607,7 @@ impl Backend {
             self.target(machine).await,
             tuning,
             None,
+            None,
         )
         .await
         .unwrap()
@@ -1060,6 +1065,7 @@ async fn a_machine_whose_lease_ended_is_not_bound_again() {
         backend.target(&machine).await,
         tuning(),
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -1360,6 +1366,7 @@ mod stop_acks {
             mcp_proxies: Vec::new(),
             compact_tool_descriptions: false,
             checkout_of: None,
+            forge: None,
             profile_env: None,
         }
     }

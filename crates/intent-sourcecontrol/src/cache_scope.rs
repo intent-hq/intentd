@@ -38,7 +38,10 @@ impl CacheScope {
     }
 }
 
-pub(crate) fn generation() -> u64 {
+/// The credential generation: changes on every daemon-owned credential or
+/// configuration write ([`invalidate_authorization`]).
+#[must_use]
+pub fn generation() -> u64 {
     GENERATION.load(Ordering::SeqCst)
 }
 

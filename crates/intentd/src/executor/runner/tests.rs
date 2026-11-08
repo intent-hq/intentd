@@ -9,6 +9,7 @@ use serde_json::json;
 use super::*;
 use crate::executor::storage::Storage;
 
+mod forge;
 mod shared;
 
 const PROVIDER: &str = "mock";
@@ -153,6 +154,7 @@ fn launch(id: &str) -> LaunchCommand {
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
         checkout_of: None,
+        forge: None,
     }
 }
 

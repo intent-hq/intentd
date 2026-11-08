@@ -1180,6 +1180,15 @@ async fn proxied_user_mcp_servers_ride_session_new_and_call_head() {
         .collect();
     let names: Vec<&str> = stdio.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["workspace-mcp", "Linear"]);
+    for entry in &stdio {
+        let gh_token = entry.env.iter().find(|var| var.name == "GH_TOKEN");
+        assert_eq!(
+            gh_token.map(|var| var.value.as_str()),
+            Some(""),
+            "{} blanks GH_TOKEN",
+            entry.name
+        );
+    }
     let linear = &stdio[1];
     assert_eq!(linear.args[0], "mcp-bridge");
     assert_ne!(linear.args[2], stdio[0].args[2], "its own listener");

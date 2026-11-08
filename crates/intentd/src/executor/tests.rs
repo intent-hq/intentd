@@ -462,6 +462,7 @@ fn launch_of(id: &str, provider: &str) -> LinkFrame {
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
         checkout_of: None,
+        forge: None,
     })
 }
 
@@ -816,6 +817,7 @@ async fn executor_shutdown_settles_launches_arriving_on_a_live_link() {
             mcp_proxies: Vec::new(),
             compact_tool_descriptions: false,
             checkout_of: None,
+            forge: None,
         })
     };
     dialed.link.send(&launch("a0".into())).await.unwrap();
@@ -2194,5 +2196,74 @@ async fn disabling_a_provider_keeps_its_running_agent() {
         .flat_map(Runner::running)
         .collect();
     assert_eq!(running, [AgentId::from("a1")]);
+    node.stop().await;
+}
+
+/// The forge token reply on `dialed`, skipping other frames.
+async fn forge_reply(dialed: &mut DialedLink) -> intent_core::node_link::ForgeTokenReply {
+    loop {
+        match next_frame(dialed).await {
+            Some(LinkFrame::ForgeTokenReply(reply)) => return reply,
+            Some(_) => {}
+            None => panic!("the link closed"),
+        }
+    }
+}
+
+/// nodeProtocol 15 over the real link: a `forgeToken` is held and
+/// answered; a rebind that negotiates 14 drops it, and so does revoking the
+/// backend's credential.
+#[tokio::test]
+async fn a_forge_token_is_held_until_an_older_rebind_or_a_revocation() {
+    use intent_core::node_link::{
+        ForgeToken, LinkId, ProtocolRange, SecretOutcome, SecretValue, FORGE_HOST_GITHUB,
+    };
+    let send_token = |request: u128| {
+        LinkFrame::ForgeToken(ForgeToken {
+            request_id: LinkId::from_u128(request),
+            host: FORGE_HOST_GITHUB.to_owned(),
+            token: Some(SecretValue::from("ghp_executorCanary")),
+        })
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let node = Running::start(dir.path(), 4).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    dialed.link.send(&send_token(1)).await.unwrap();
+    let reply = forge_reply(&mut dialed).await;
+    assert_eq!(reply.outcome, SecretOutcome::Ok);
+    assert_eq!(reply.request_id, LinkId::from_u128(1));
+    let runner = node.service.runners_for_test().pop().unwrap();
+    let held = || runner.head_link().forge().get().is_some();
+    assert!(held());
+
+    let mut older = hello(2, "lease-1", 0);
+    older.protocol = ProtocolRange { min: 7, max: 14 };
+    let mut rebound = dial_link(&node.endpoint, older).await.unwrap();
+    replay_complete(&mut rebound).await;
+    assert!(!held(), "a protocol-14 bind drops the token");
+
+    let mut current = dial_link(&node.endpoint, hello(3, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut current).await;
+    current.link.send(&send_token(2)).await.unwrap();
+    assert_eq!(forge_reply(&mut current).await.outcome, SecretOutcome::Ok);
+    assert!(held());
+    node.api
+        .revocations
+        .send(node.api.credential(&token()).id)
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + wait();
+    while held() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a revocation drops the token"
+        );
+        // timing-guard: poll interval for the revocation task (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     node.stop().await;
 }

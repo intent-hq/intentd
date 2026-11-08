@@ -33,6 +33,7 @@ use intent_transport::node_link::{
 };
 
 mod checkout;
+mod forge;
 mod mcp_proxy;
 mod runner;
 mod scripts;
@@ -613,6 +614,7 @@ impl ExecutorService {
 async fn stop_backend(backend: Backend) {
     // The credential is no longer active: its agents' secrets go at once.
     backend.runner.head_link().secrets().clear();
+    backend.runner.head_link().forge().clear();
     for link in &backend.links {
         link.close();
     }

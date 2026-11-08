@@ -95,6 +95,7 @@ fn launch(id: &str) -> LinkFrame {
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
         checkout_of: None,
+        forge: None,
     })
 }
 
@@ -445,4 +446,43 @@ async fn secret_frames_hold_values_for_leased_agents_until_the_backend_restarts(
     h.runner.adopt_head(Some("hs-2"), std::slice::from_ref(&a1));
     let again = reply(apply_secret(&h.runner, &b, OPEN, put(11, "a1", "API_KEY")).await);
     assert_eq!(again.outcome, SecretOutcome::Ok, "{again:?}");
+}
+
+/// nodeProtocol 15: a `forgeToken` from a closed (replaced) session holds,
+/// drops and answers nothing; a hello without a `headSession` drops it.
+#[tokio::test]
+async fn forge_token_frames_of_a_replaced_session_change_nothing() {
+    use intent_core::node_link::{ForgeToken, LinkId, SecretOutcome, SecretValue};
+    let h = harness();
+    let b = binding(1, "lease-1");
+    let frame = |token: Option<&str>| ForgeToken {
+        request_id: LinkId::new_v4(),
+        host: intent_core::node_link::FORGE_HOST_GITHUB.to_owned(),
+        token: token.map(SecretValue::from),
+    };
+    h.runner.adopt_head(Some("hs-1"), &[]);
+    let held = || {
+        h.runner
+            .head_link()
+            .forge()
+            .get()
+            .map(|token| token.to_string())
+    };
+    let Some(LinkFrame::ForgeTokenReply(reply)) =
+        apply_forge(&h.runner, &b, OPEN, frame(Some("ghp_one"))).await
+    else {
+        panic!("an open session answers");
+    };
+    assert_eq!(reply.outcome, SecretOutcome::Ok);
+    assert_eq!(held().as_deref(), Some("ghp_one"));
+
+    for token in [Some("ghp_two"), None] {
+        assert!(apply_forge(&h.runner, &b, || true, frame(token))
+            .await
+            .is_none());
+        assert_eq!(held().as_deref(), Some("ghp_one"), "{token:?}");
+    }
+
+    h.runner.adopt_head(None, &[]);
+    assert_eq!(held(), None, "a hello without a session drops it");
 }

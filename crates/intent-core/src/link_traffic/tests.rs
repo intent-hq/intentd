@@ -51,6 +51,7 @@ fn launch_frame() -> LinkFrame {
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
         checkout_of: None,
+        forge: None,
         profile_env: Some(LaunchProfileEnv(json!({
             "providerRef": "claude-code@work",
             "fingerprint": "fp-1",
@@ -943,6 +944,35 @@ async fn secret_put_values_are_masked() {
         if payloads {
             assert_eq!(record["payload"]["name"], "API_KEY", "{text}");
             assert_eq!(record["payload"]["value"], "***", "{text}");
+        }
+    }
+}
+
+/// The backend's forge token (`forgeToken`, nodeProtocol 15) is masked in
+/// both the full and the light capture; a drop (`token: null`) stays null.
+#[tokio::test]
+async fn forge_token_values_are_masked() {
+    use crate::node_link::{ForgeToken, LinkId, SecretValue};
+    for payloads in [true, false] {
+        for token in [Some("canary-forge-token"), None] {
+            let (traffic, _) = traffic(limits(10, 1 << 16, 1 << 16));
+            traffic.start(payloads);
+            let frame = LinkFrame::ForgeToken(ForgeToken {
+                request_id: LinkId::new_v4(),
+                host: "github.com".into(),
+                token: token.map(SecretValue::from),
+            });
+            LinkTap::new(traffic.clone(), machine()).observe(TrafficDirection::Out, &frame, 10);
+            settle(&traffic, 1).await;
+            let record = traffic.snapshot(None, None)["records"][0].clone();
+            let text = record.to_string();
+            assert!(!text.contains("canary-forge-token"), "{text}");
+            assert_eq!(record["frameType"], "forgeToken", "{text}");
+            if payloads {
+                assert_eq!(record["payload"]["host"], "github.com", "{text}");
+                let expected = token.map_or(serde_json::Value::Null, |_| "***".into());
+                assert_eq!(record["payload"]["token"], expected, "{text}");
+            }
         }
     }
 }

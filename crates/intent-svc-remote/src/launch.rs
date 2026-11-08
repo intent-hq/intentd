@@ -1085,6 +1085,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     mcp_proxies,
                     compact_tool_descriptions,
                     checkout_of,
+                    forge: None,
                 })
                 .await?;
             Ok(runtime as Arc<RemoteRuntime>)
