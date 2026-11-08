@@ -7761,38 +7761,44 @@ impl Services {
         // Guard: an agent (`ws.agent.retire`, including from its hooks) may
         // not retire the workspace's last active top-level agent — that would
         // leave the workspace with no visible agent to talk to. A user (wire
-        // `agent.retire`) may, and daemon-internal and unbound callers are not
-        // guarded. The workspace gate is held through the retire transition
-        // below so concurrent self-retires of the remaining top-level agents
-        // cannot all pass.
-        let refusal = match intent_core::current_caller() {
-            Some(intent_core::Caller::Agent { .. }) => Some(
-                "cannot retire: this is the last active top-level agent in the workspace. \
-                 Retiring it would leave the workspace without an agent; finish your turn \
-                 normally instead.",
+        // `agent.retire`) may. Both take the workspace gate when the target is
+        // an active top-level agent and hold it through the retire transition
+        // below, so a user retire cannot slip past a self-retire that already
+        // counted its target as the remaining agent, and concurrent
+        // self-retires cannot all pass. Daemon-internal and unbound callers
+        // are neither gated nor guarded.
+        let (gated, refusal) = match intent_core::current_caller() {
+            Some(intent_core::Caller::Agent { .. }) => (
+                true,
+                Some(
+                    "cannot retire: this is the last active top-level agent in the workspace. \
+                     Retiring it would leave the workspace without an agent; finish your turn \
+                     normally instead.",
+                ),
             ),
-            _ => None,
+            Some(intent_core::Caller::Wire { .. }) => (true, None),
+            _ => (false, None),
         };
-        let _last_top_level_gate = match refusal {
-            Some(refusal) if is_active_top_level(&session) => {
-                let gate = self
-                    .agent_retirement_gates
-                    .for_workspace(&session.workspace_id);
-                let guard = gate.lock_owned().await;
-                // A concurrent retire of this same target may have won while
-                // this call waited for the workspace gate: report it as an
-                // idempotent retry, not as a last-agent refusal.
-                if let Some(existing) = self
-                    .store
-                    .get_agent_session_summary(&session.id)
-                    .await?
-                    .retired_at
-                    .clone()
-                {
-                    return Ok(
-                        json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }),
-                    );
-                }
+        let _last_top_level_gate = if gated && is_active_top_level(&session) {
+            let gate = self
+                .agent_retirement_gates
+                .for_workspace(&session.workspace_id);
+            let guard = gate.lock_owned().await;
+            // A concurrent retire of this same target may have won while
+            // this call waited for the workspace gate: report it as an
+            // idempotent retry, not as a last-agent refusal.
+            if let Some(existing) = self
+                .store
+                .get_agent_session_summary(&session.id)
+                .await?
+                .retired_at
+                .clone()
+            {
+                return Ok(
+                    json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }),
+                );
+            }
+            if let Some(refusal) = refusal {
                 let others = self
                     .store
                     .list_active_agent_session_summaries(&session.workspace_id)
@@ -7803,9 +7809,10 @@ impl Services {
                 if others == 0 {
                     return Err(Error::InvalidParams(refusal.to_string()));
                 }
-                Some(guard)
             }
-            _ => None,
+            Some(guard)
+        } else {
+            None
         };
         // Guard (confirmed decision): retire fails while any descendant —
         // grandchildren included — is still running a turn

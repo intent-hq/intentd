@@ -1091,6 +1091,41 @@ async fn agent_self_retire_stays_guarded_after_user_retires() {
     assert_last_top_level_refusal(&err);
 }
 
+/// A user retire of a top-level agent waits on the workspace gate, so it
+/// cannot slip past an agent self-retire that already counted it as the
+/// remaining active top-level agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_retire_of_top_level_agent_waits_on_the_workspace_gate() {
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let _peer = create_agent(&svc, &ws, "Peer").await;
+    let gate = svc.agent_retirement_gates.for_workspace(&ws);
+    let held = gate.lock().await;
+    let pending = {
+        let (svc, ws, target) = (svc.clone(), ws.clone(), target.clone());
+        tokio::spawn(async move { user_retire(&svc, &ws, &target).await })
+    };
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while Arc::strong_count(&gate) < 2 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("user retire reaches the workspace gate");
+    let row = svc
+        .store()
+        .get_agent_session_with_transcript(&target)
+        .await
+        .expect("session");
+    assert!(row.retired_at.is_none(), "the gated retire has not run yet");
+    drop(held);
+    let res = pending.await.expect("join").expect("user retire succeeds");
+    assert_eq!(res["success"], json!(true), "{res}");
+}
+
 /// Two top-level agents self-retiring at the same time on separate worker
 /// threads: exactly one wins and the workspace keeps one active top-level
 /// agent. Repeated so a missing workspace gate shows up as a flake-free

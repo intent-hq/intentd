@@ -6405,8 +6405,9 @@ fn test_provider() -> intent_providers::ProviderConfig {
     }
 }
 
-/// Seed a second active top-level session beside `id` (same workspace) so
-/// the last-top-level-agent retire guard lets `id` be retired.
+/// Seed a second active top-level session beside `id` (same workspace), so
+/// `id` is not the workspace's last top-level agent (the agent self-retire
+/// guard refuses that; a user retire is not guarded).
 async fn seed_top_level_peer(mgr: &AgentManager, id: &AgentId) {
     let mut peer = mgr
         .services
