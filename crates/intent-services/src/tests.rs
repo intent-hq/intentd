@@ -47898,7 +47898,10 @@ async fn setup_status_falls_back_to_persisted_setup_events() {
     .await;
     assert_eq!(done.state, WorkspaceSetupState::Completed, "{done:?}");
     assert_eq!(done.exit_code, Some(0));
-    assert!(done.started_at.is_some() && done.finished_at.is_some(), "{done:?}");
+    assert!(
+        done.started_at.is_some() && done.finished_at.is_some(),
+        "{done:?}"
+    );
     assert_eq!(done.terminal_id, None);
     assert_eq!(
         svc.workspace_setup_status(&ws).state,

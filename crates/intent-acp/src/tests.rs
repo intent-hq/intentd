@@ -10256,7 +10256,12 @@ mod wsapi3_bindings_tests {
         let (srv, _api) = server();
         let resp = call(&srv, "return await ws.comment.list('n-1');").await;
         let v = body(&resp);
-        let mut keys: Vec<&str> = v.as_object().expect("object").keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = v
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(keys, ["threads", "totalComments", "totalThreads"]);
         let line = crate::mcp_server::WORKSPACE_API_DESCRIPTION
