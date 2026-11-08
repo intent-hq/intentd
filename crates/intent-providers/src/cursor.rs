@@ -26,48 +26,13 @@
 
 use std::path::{Path, PathBuf};
 
+use intent_core::ansi::strip_ansi;
 use intent_core::path_utils::is_executable_file;
 
 /// Environment the daemon sets on every Cursor CLI probe so output stays
 /// plain text even when the daemon runs with `FORCE_COLOR=1` (which beats
 /// `NO_COLOR` in the CLI's color library, so both are set).
 pub const CURSOR_PLAIN_OUTPUT_ENV: &[(&str, &str)] = &[("FORCE_COLOR", "0"), ("NO_COLOR", "1")];
-
-/// Remove ANSI escape sequences (CSI `ESC [ … final`, OSC `ESC ] … BEL|ST`,
-/// and two-byte `ESC x`) from CLI output before parsing.
-#[must_use]
-pub fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('[') => {
-                for c in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&c) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                while let Some(c) = chars.next() {
-                    if c == '\u{7}' {
-                        break;
-                    }
-                    if c == '\u{1b}' && chars.peek() == Some(&'\\') {
-                        chars.next();
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
 
 /// The Cursor CLI command. Never the bare `agent` alias.
 pub const CURSOR_COMMAND: &str = "cursor-agent";

@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use intent_core::ansi::strip_ansi;
 use intent_core::events::{SCRIPT_CHANGED, SCRIPT_OUTPUT, SCRIPT_STATE};
 use intent_core::{
     now_iso, Error, Result, Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState,
@@ -3533,37 +3534,6 @@ fn with_runtime(def: &Script, state: &ScriptRuntimeState) -> Value {
         );
     }
     v
-}
-
-/// Strip ANSI CSI (`ESC [ … letter`) and OSC (`ESC ] … BEL`) sequences before
-/// URL matching (mirrors the TS regex pre-clean).
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('[') => {
-                for nc in chars.by_ref() {
-                    if nc.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                for nc in chars.by_ref() {
-                    if nc == '\u{07}' {
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 /// Find the first `http(s)://localhost|127.0.0.1:PORT[/path]` URL (ported from

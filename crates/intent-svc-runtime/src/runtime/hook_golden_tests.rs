@@ -214,6 +214,44 @@ async fn golden_hook_perpetual_dispatch_wake_bytes() {
     );
 }
 
+/// Hook messages often embed `ws.script.output` text from colored scripts;
+/// the wake reaches the agent and the chat as plain text.
+#[tokio::test]
+async fn golden_hook_wake_strips_terminal_escapes() {
+    let (_t, svc, ws) = setup().await;
+    let bus = intent_services::feature_api::EventBus::new(svc.store().clone());
+    let svc = svc.with_event_bus(bus);
+    let owner = AgentId::from("agent-hooks");
+    seed_agent(&svc, &ws, &owner).await;
+    let out = svc
+        .hook_schedule_op(
+            &ws,
+            &owner,
+            &json!({
+                "name": "gate",
+                "code": "return { dispatch: true, message: 'tests \\u001b[32;1mpassed\\u001b[0m\\r\\nstep 1\\rstep 2' };",
+                "delayMs": 10_000,
+                "perpetual": true,
+            }),
+        )
+        .await
+        .expect("schedule");
+    let expires_at = out["hook"]["expiresAt"]
+        .as_str()
+        .expect("expiresAt")
+        .to_string();
+    let text = wake_texts_when(&svc, &owner, 1).await;
+    assert_eq!(
+        text,
+        vec![format!(
+            "[Background hook \"gate\"] tests passed\nstep 2\n\
+             \n\
+             [This hook remains active until {expires_at} — cancel via ws.hook.cancel \
+             when no longer needed.]"
+        )]
+    );
+}
+
 #[test]
 fn golden_hook_wake_logs_section() {
     assert_eq!(crate::hook_manager::with_wake_logs("msg", None), "msg");
