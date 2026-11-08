@@ -125,11 +125,6 @@ async fn the_token_goes_out_after_every_bind_before_a_launch_and_on_each_change(
     assert_eq!(token.as_deref(), Some("t-2"));
     // A refused value stays unconfirmed: the next check sends it again.
     answer(&link, request_id, SecretOutcome::Failed).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        node.shared_ref().forge_token_confirmed(),
-        "t-1 stays confirmed"
-    );
     assert!(!forge.refresh().await);
     assert_eq!(
         confirmed_token(&mut link, &node).await.as_deref(),
@@ -200,4 +195,26 @@ async fn the_watcher_follows_credential_changes_while_a_machine_is_linked() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!linked.has_changed().unwrap());
     bump_until_changed(&linked).await;
+}
+
+/// The gate off (`sourceControl.github.exposeGitCredentialToChildren =
+/// false`) resolves no token, whatever the host has, so machines get
+/// `null`.
+#[tokio::test]
+async fn the_gate_off_hands_out_no_token() {
+    let config = tempfile::TempDir::new().unwrap();
+    let path = config.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[sourceControl.github]\nexposeGitCredentialToChildren = false\n",
+    )
+    .unwrap();
+    let registry = Arc::new(SettingsRegistry::load(path).unwrap());
+    let tmp = TempDb::new();
+    let services =
+        Services::new(Store::open(&tmp.path).await.unwrap()).with_settings_registry(registry);
+    let forge = Arc::new(ForgeTokens::for_services(&services));
+    let held = forge.subscribe();
+    forge.refresh().await;
+    assert!(held.borrow().frame_token().is_none());
 }

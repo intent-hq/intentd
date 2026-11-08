@@ -162,7 +162,8 @@ const WORKSPACE_SERVER: &str = "workspace-mcp";
 const PROXY_WATCHDOG_MARGIN: Duration = Duration::from_secs(30);
 
 /// The `session/new` entry named `name` that runs `intentd mcp-bridge`
-/// against `bridge`, with the listener's secret in its environment.
+/// against `bridge`, with the listener's secret in its environment and
+/// `GH_TOKEN` blanked.
 fn bridge_entry(name: &str, bridge: &McpBridge, bridge_exe: &Path) -> std::io::Result<McpServer> {
     let (command, path) = intent_acp::normalize_spaced_bridge_command(
         bridge_exe,
@@ -174,6 +175,13 @@ fn bridge_entry(name: &str, bridge: &McpBridge, bridge_exe: &Path) -> std::io::R
         .chain(std::iter::once((
             intent_acp::BRIDGE_TOKEN_ENV.to_owned(),
             bridge.auth_token().to_owned(),
+        )))
+        // The provider has the backend's GitHub token (nodeProtocol 15); a
+        // provider that merges its own environment into an MCP child's must
+        // not hand it on.
+        .chain(std::iter::once((
+            super::runner::GH_TOKEN_ENV.to_owned(),
+            String::new(),
         )))
         .collect();
     let servers = std::collections::BTreeMap::from([(

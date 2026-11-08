@@ -1185,14 +1185,15 @@ impl LinkFrame {
 }
 
 /// Whether undecodable `bytes` may be a secret or forge token frame (any
-/// mention of one counts, so a value is never echoed by mistake).
+/// mention of one, or of a `"token"` member, counts, so a value is never
+/// echoed by mistake).
 fn carries_secret(bytes: &[u8]) -> bool {
     let mentions = |needle: &[u8]| {
         bytes
             .windows(needle.len())
             .any(|w| w.eq_ignore_ascii_case(needle))
     };
-    mentions(b"secret") || mentions(b"token")
+    mentions(b"secret") || mentions(b"forgetoken") || mentions(b"\"token\"")
 }
 
 fn check_frame_size(len: usize) -> Result<()> {

@@ -79,7 +79,7 @@ const RUN_MARKER_ENV: &str = "INTENT_NODE_RUN";
 
 /// Where every agent of a backend that handed over its GitHub token finds
 /// it (nodeProtocol 15).
-const GH_TOKEN_ENV: &str = "GH_TOKEN";
+pub(super) const GH_TOKEN_ENV: &str = "GH_TOKEN";
 /// The whole of a runner's shutdown: its script runs end (bounded by
 /// [`super::scripts::REAP_WAIT`]), then its agents are stopped, push their
 /// last work (each push bounded by [`FINAL_PUSH_TIMEOUT`]), are cleaned up
@@ -456,6 +456,9 @@ struct Agent {
     /// the provider's default account fails to authenticate. A profile's
     /// account says nothing about the default one.
     default_account: Option<(String, AuthFailed)>,
+    /// The forge token value its current process was spawned with
+    /// (nodeProtocol 15), masked machine-wide while held.
+    forge_lease: Mutex<Option<super::forge::SpawnLease>>,
 }
 
 impl Agent {
@@ -488,43 +491,46 @@ impl Agent {
 /// machine held while it ran (nodeProtocol 15), whatever its length.
 #[derive(Default)]
 struct Redactor {
-    profile: Vec<String>,
-    /// The forge tokens seen so far, never forgotten while the agent lives:
-    /// an earlier one may still be in its environment.
-    forge: Mutex<Vec<Zeroizing<String>>>,
-    masks: Mutex<Arc<Masks>>,
+    profile: Vec<Zeroizing<String>>,
+    /// The machine's forge token values (nodeProtocol 15): the held one and
+    /// every live agent's, whatever this agent was spawned with.
+    forge: Option<Arc<super::forge::ForgeToken>>,
+    /// The masks, with the forge version they were built at.
+    masks: Mutex<(u64, Arc<Masks>)>,
 }
 
 impl Redactor {
+    #[cfg(test)]
     fn new(profile: Option<&ProfileEnv>) -> Self {
+        Self::with_forge(profile, None)
+    }
+
+    fn with_forge(
+        profile: Option<&ProfileEnv>,
+        forge: Option<Arc<super::forge::ForgeToken>>,
+    ) -> Self {
         let masks = Masks::new(profile);
         Self {
             profile: masks.secrets.clone(),
-            forge: Mutex::default(),
-            masks: Mutex::new(Arc::new(masks)),
+            forge,
+            masks: Mutex::new((u64::MAX, Arc::new(masks))),
         }
-    }
-
-    /// Mask `token` from now on too.
-    fn forge(&self, token: &str) {
-        if token.is_empty() {
-            return;
-        }
-        let mut forge = lock(&self.forge);
-        if forge.iter().any(|held| held.as_str() == token) {
-            return;
-        }
-        forge.push(Zeroizing::new(token.to_owned()));
-        let mut secrets = self.profile.clone();
-        secrets.extend(forge.iter().map(|held| held.as_str().to_owned()));
-        drop(forge);
-        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
-        secrets.dedup();
-        *lock(&self.masks) = Arc::new(Masks { secrets });
     }
 
     fn masks(&self) -> Arc<Masks> {
-        lock(&self.masks).clone()
+        let mut cached = lock(&self.masks);
+        let Some(forge) = &self.forge else {
+            return cached.1.clone();
+        };
+        let version = forge.version();
+        if cached.0 != version {
+            let mut secrets = self.profile.clone();
+            secrets.extend(forge.masked());
+            secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+            secrets.dedup();
+            *cached = (version, Arc::new(Masks { secrets }));
+        }
+        cached.1.clone()
     }
 
     fn text(&self, text: String) -> String {
@@ -545,7 +551,7 @@ impl Redactor {
 #[derive(Default)]
 struct Masks {
     /// Longest first, so a secret containing another is masked whole.
-    secrets: Vec<String>,
+    secrets: Vec<Zeroizing<String>>,
 }
 
 impl Masks {
@@ -553,7 +559,7 @@ impl Masks {
     const MIN_LEN: usize = 8;
 
     fn new(profile: Option<&ProfileEnv>) -> Self {
-        let mut secrets: Vec<String> = profile
+        let mut secrets: Vec<Zeroizing<String>> = profile
             .into_iter()
             .flat_map(ProfileEnv::entries)
             .filter(|(key, _)| {
@@ -564,7 +570,7 @@ impl Masks {
             .filter_map(|(key, value)| {
                 let value = value.filter(|value| !value.is_empty())?;
                 (intent_acp::is_likely_secret_env_key(key) || value.len() >= Self::MIN_LEN)
-                    .then(|| value.to_owned())
+                    .then(|| Zeroizing::new(value.to_owned()))
             })
             .collect();
         secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
@@ -929,13 +935,6 @@ impl Runner {
         let token = frame
             .token
             .map(intent_core::node_link::SecretValue::into_inner);
-        if let Some(token) = &token {
-            let agents: Vec<Arc<Agent>> =
-                lock(&self.inner.state).agents.values().cloned().collect();
-            for agent in agents {
-                agent.redactor.forge(token);
-            }
-        }
         self.inner.head.forge().set(token);
         ForgeTokenReply {
             request_id,
@@ -1286,7 +1285,11 @@ impl Runner {
             run_marker: intent_core::node_link::LinkId::new_v4().to_string(),
             marks: marks_tx,
             activity: ActivityTracker::new(),
-            redactor: Arc::new(Redactor::new(profile.as_ref())),
+            redactor: Arc::new(Redactor::with_forge(
+                profile.as_ref(),
+                Some(self.inner.head.forge().clone()),
+            )),
+            forge_lease: Mutex::new(None),
             npx_launch_dir: Mutex::new(None),
             default_account: profile.is_none().then(|| {
                 (
@@ -1597,6 +1600,8 @@ impl Runner {
             {
                 state.agents.remove(&agent.id);
                 self.inner.admission.release(&agent.id);
+                // Its process is gone: its token no longer needs masking.
+                *lock(&agent.forge_lease) = None;
                 state
                     .exiting
                     .insert(agent.id.clone(), agent.journaled.clone());
@@ -1784,14 +1789,15 @@ impl Runner {
                 .insert(key.to_owned(), tmp.to_string_lossy().into_owned());
         }
         // The backend's GitHub token (nodeProtocol 15) for every agent:
-        // Intent wiring, so it beats a profile's value. Its journal masks it
-        // from before the provider can print it.
-        if let Some(token) = self.inner.head.forge().get() {
-            agent.redactor.forge(&token);
+        // Intent wiring, so it beats a profile's value. The lease keeps it
+        // masked in every journal while this process may hold it.
+        let spawned_with = self.inner.head.forge().spawn();
+        if let Some((token, _)) = &spawned_with {
             options
                 .extra_env
                 .insert(GH_TOKEN_ENV.to_owned(), token.as_str().to_owned());
         }
+        *lock(&agent.forge_lease) = spawned_with.map(|(_, lease)| lease);
         let spawned = intent_acp::spawn_provider(&options, hooks)?;
         let (child, connection, npx_launch_dir, agent_tmp_dir) = spawned.into_parts();
         // An npx launch runs from its launch directory; keep it until the

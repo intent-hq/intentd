@@ -7,7 +7,7 @@
 //! different value. Only a SHA-256 digest is compared, and nothing here logs
 //! or renders the value.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -48,6 +48,14 @@ impl Held {
     }
 }
 
+#[cfg(test)]
+impl Held {
+    /// The held token.
+    pub(crate) fn frame_token(&self) -> Option<&SecretValue> {
+        self.token.as_ref()
+    }
+}
+
 impl std::fmt::Debug for Held {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Held")
@@ -76,10 +84,6 @@ impl ForgeTokens {
     }
 
     /// The daemon's own GitHub credential, behind its gate.
-    #[cfg_attr(
-        test,
-        expect(dead_code, reason = "tests resolve through Tuning::forge_resolver")
-    )]
     pub(crate) fn for_services(svc: &Services) -> Self {
         let registry = svc.settings_registry();
         Self::new(Arc::new(move || {
@@ -121,6 +125,13 @@ impl ForgeTokens {
         changed
     }
 
+    /// [`Self::refresh`] on its own task, so a caller that stops waiting
+    /// does not cancel it: its result still reaches every linked machine.
+    pub(crate) fn refresh_in_background(self: &Arc<Self>) -> tokio::task::JoinHandle<bool> {
+        let tokens = self.clone();
+        intent_core::spawn_daemon(async move { tokens.refresh().await })
+    }
+
     /// Start the rotation watcher once: while any machine is linked, it
     /// resolves again every `every`, and at once (within `check`) after a
     /// GitHub connect, revoke or token edit, or a change of the gate.
@@ -158,12 +169,14 @@ impl ForgeTokens {
                 let Some(tokens) = tokens.upgrade() else {
                     return;
                 };
-                let now = state();
                 if tokens.held.receiver_count() == 0 {
-                    // No linked machine: each bind resolves afresh.
-                    seen = now;
+                    // No linked machine: each bind resolves afresh, and the
+                    // period starts again at the next link.
+                    seen = state();
+                    last = Instant::now();
                     continue;
                 }
+                let now = state();
                 if now != seen || last.elapsed() >= every {
                     seen = now;
                     last = Instant::now();
@@ -178,6 +191,9 @@ impl ForgeTokens {
     }
 }
 
+/// The most frames a link waits for answers to.
+const MAX_PENDING: usize = 8;
+
 /// What one link's machine confirmed (node-link.md § Forge token on the
 /// machine, rule 3): a bind starts with nothing confirmed.
 #[derive(Default)]
@@ -185,8 +201,10 @@ pub(crate) struct Confirmed {
     /// The digest the machine last answered `ok` for (`Some(None)`: the
     /// confirmed absence of a token).
     value: Option<Digest>,
-    /// Frames sent and not yet answered, with the digest each carried.
-    pending: HashMap<LinkId, Digest>,
+    /// The newest frames sent and not yet answered, with the digest each
+    /// carried; at most [`MAX_PENDING`], so a machine that never answers
+    /// holds nothing.
+    pending: VecDeque<(LinkId, Digest)>,
 }
 
 impl Confirmed {
@@ -198,9 +216,11 @@ impl Confirmed {
 
     /// Record the machine's answer to frame `request_id`.
     pub(crate) fn answer(&mut self, request_id: LinkId, ok: bool) {
-        if let Some(digest) = self.pending.remove(&request_id) {
-            if ok {
-                self.value = Some(digest);
+        if let Some(at) = self.pending.iter().position(|(id, _)| *id == request_id) {
+            if let Some((_, digest)) = self.pending.remove(at) {
+                if ok {
+                    self.value = Some(digest);
+                }
             }
         }
     }
@@ -216,7 +236,10 @@ pub(crate) async fn send(link: &NodeLink, held: &Held, confirmed: &Mutex<Confirm
         }
         let frame = held.frame();
         if let LinkFrame::ForgeToken(forge) = &frame {
-            confirmed.pending.insert(forge.request_id, held.digest);
+            if confirmed.pending.len() == MAX_PENDING {
+                confirmed.pending.pop_front();
+            }
+            confirmed.pending.push_back((forge.request_id, held.digest));
         }
         frame
     };

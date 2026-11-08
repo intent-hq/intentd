@@ -107,18 +107,56 @@ async fn an_unknown_host_or_unusable_token_is_refused_and_changes_nothing() {
     );
 }
 
-/// A token handed over while an agent runs is masked in its journal too:
-/// the next spawn (or the credential helper) may hand it out.
+/// Every journal masks the held token and every token a live agent was
+/// spawned with (node-link.md § Forge token on the machine, rule 10); a
+/// token leaves the mask once no live agent holds it.
 #[test]
-fn the_redactor_masks_each_forge_token_it_was_given() {
-    let redactor = Redactor::new(None);
-    assert_eq!(redactor.text("a ghp_one b".into()), "a ghp_one b");
-    redactor.forge("ghp_one");
-    redactor.forge("ghp_two");
-    redactor.forge("ghp_one");
-    redactor.forge("");
+fn the_redactor_masks_the_held_token_and_every_live_agents() {
+    let forge = Arc::new(crate::executor::forge::ForgeToken::default());
+    let redactor = Redactor::with_forge(None, Some(forge.clone()));
+    let line = || redactor.text("a ghp_one b ghp_two".into());
+    assert_eq!(line(), "a ghp_one b ghp_two");
+    forge.set(Some(Zeroizing::new("ghp_one".to_owned())));
+    assert_eq!(line(), "a [redacted] b ghp_two");
+    let (_, one) = forge.spawn().unwrap();
+    forge.set(Some(Zeroizing::new("ghp_two".to_owned())));
     assert_eq!(
-        redactor.text("a ghp_one b ghp_two".into()),
-        "a [redacted] b [redacted]"
+        line(),
+        "a [redacted] b [redacted]",
+        "a live agent holds ghp_one"
     );
+    drop(one);
+    assert_eq!(line(), "a ghp_one b [redacted]");
+    forge.clear();
+    assert_eq!(line(), "a ghp_one b ghp_two");
+}
+
+/// A token handed over while an agent runs is masked in that agent's
+/// journal at once, though its process was spawned without it.
+#[tokio::test]
+async fn a_token_handed_over_mid_run_is_masked_in_the_running_agents_journal() {
+    let Some(h) = harness(1, &[]) else {
+        return;
+    };
+    h.runner.adopt_head(Some("hs-1"), &[]);
+    h.runner.launch(launch("a1")).await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hello"))
+        .await;
+    wait_for(&h.runner, "turn end", turn_ended("a1", "t1")).await;
+    h.runner
+        .forge_frame(forge(FORGE_HOST_GITHUB, Some(FORGE_CANARY)));
+    h.runner
+        .prompt(
+            &AgentId::from("a1"),
+            "t2".into(),
+            text(&format!("say {FORGE_CANARY}")),
+        )
+        .await;
+    wait_for(&h.runner, "turn end", turn_ended("a1", "t2")).await;
+    h.runner.stop(&AgentId::from("a1"));
+    let all = wait_for(&h.runner, "exit", exited("a1")).await;
+    let journal = serde_json::to_string(&all).unwrap();
+    assert!(journal.contains("echo: say [redacted]"), "{journal}");
+    assert!(!journal.contains(FORGE_CANARY), "{journal}");
 }

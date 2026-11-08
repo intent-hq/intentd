@@ -2330,7 +2330,10 @@ async fn run(
             Some(forge) if link.protocol() >= FORGE_TOKEN_PROTOCOL => {
                 let mut changes = forge.subscribe();
                 // A slow resolution (a stalled `gh`) leaves the last value.
-                let _ = tokio::time::timeout(FORGE_BIND_RESOLVE, forge.refresh()).await;
+                // It keeps going after the timeout; its value then goes out
+                // as a change.
+                let _ =
+                    tokio::time::timeout(FORGE_BIND_RESOLVE, forge.refresh_in_background()).await;
                 let held = changes.borrow_and_update().clone();
                 // A bind starts with nothing confirmed.
                 *lock(&shared.forge_confirmed) = crate::forge_token::Confirmed::default();
@@ -2546,10 +2549,14 @@ async fn serve(
                         let ok = reply.outcome == SecretOutcome::Ok;
                         lock(&shared.forge_confirmed).answer(reply.request_id, ok);
                         if !ok {
-                            tracing::warn!(
-                                error = reply.error.as_deref().unwrap_or("failed"),
-                                "remote machine: refused the GitHub token"
-                            );
+                            // A fixed code only, never the peer's text.
+                            let error = match reply.error.as_deref() {
+                                Some(intent_core::node_link::FORGE_TOKEN_INVALID) => {
+                                    intent_core::node_link::FORGE_TOKEN_INVALID
+                                }
+                                _ => "failed",
+                            };
+                            tracing::warn!(error, "remote machine: refused the GitHub token");
                         }
                     }
                     LinkEvent::Frame(frame)
