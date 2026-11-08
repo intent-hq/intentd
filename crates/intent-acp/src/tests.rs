@@ -10250,6 +10250,25 @@ mod wsapi3_bindings_tests {
         assert_eq!(api.comment_list_calls.lock().unwrap()[0], "n-1");
     }
 
+    // The help line must advertise the object `comment.list` actually returns.
+    #[tokio::test]
+    async fn comment_list_result_matches_documented_shape() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.comment.list('n-1');").await;
+        let v = body(&resp);
+        let mut keys: Vec<&str> = v.as_object().expect("object").keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["threads", "totalComments", "totalThreads"]);
+        let line = crate::mcp_server::WORKSPACE_API_DESCRIPTION
+            .lines()
+            .find(|l| l.trim_start().starts_with("ws.comment.list("))
+            .expect("comment.list help line");
+        assert!(
+            line.contains("→ { threads, totalThreads, totalComments }"),
+            "{line}"
+        );
+    }
+
     #[tokio::test]
     async fn comment_get_thread_requires_id() {
         let (srv, _api) = server();
