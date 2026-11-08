@@ -615,9 +615,9 @@ Other panel menus place **Rename** under **Actions** when renaming is available.
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/layout/tab-types/{AgentTabType,AgentViewSettingsDropdown}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte. -->
 
 **Retire Agent** stops an agent and keeps its conversation so it can be restored later.
-Intent refuses to retire a workspace's last top-level agent, whether you or the agent
-asks; start another agent in the workspace first, or archive the workspace instead.
-Delegated agents can always be retired.
+You can retire any agent, including a workspace's last top-level agent. An agent
+cannot retire itself while it is the workspace's last top-level agent. Delegated
+agents can always be retired.
 
 Grouped by status, Home sorts workspaces into **Needs you**, **Running**, **Waiting**,
 and **Done & idle**, in that priority order. **Running** covers an agent at work, a
@@ -831,15 +831,14 @@ The title field uses the available header width. Press **Enter** or click away
 to save; press **Escape** to cancel. Sidebar titles select conversations and
 cannot be edited there.
 
-Hover a chat in the sidebar to show its delete button, or right-click it for
-**Pin to top**, **Archive**, and **Delete**. Pinned chats stay at the top.
-**Archive** keeps the chat and moves it to the collapsible **Archived** group
-below the list; open an archived chat to read it, or right-click it to
-**Unarchive** or **Delete** it. The last chat that is not archived cannot be
-archived. Cmd-click (Ctrl-click on Windows and Linux) or Shift-click chats to
-select several, then choose **Archive** or **Delete** in the bar above the list
-or in the right-click menu; one **Undo** restores every deleted chat. Press
-**Escape** to clear the selection.
+Hover a chat in the sidebar to show its delete button, or right-click it for **Pin
+to top**, **Archive**, and **Delete**. Pinned chats stay at the top. **Archive**
+keeps the chat and moves it to the collapsible **Archived** group below the list;
+open an archived chat to read it, or right-click it to **Unarchive** or **Delete**
+it. Cmd-click (Ctrl-click on Windows and Linux) or Shift-click chats to select
+several, then choose **Archive** or **Delete** in the bar above the list or in the
+right-click menu; one **Undo** restores every deleted chat. Press **Escape** to
+clear the selection.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeIntegrations,HomePullSummary,HomePullCode,HomeWorkspacePullBadge}.svelte; src/features/home/home-workspace-opening.ts; messages/en.json. -->
 

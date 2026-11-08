@@ -240,7 +240,7 @@ async fn a_sandbox_agents_sub_agents_share_its_sandbox_or_start_their_own() {
     assert_eq!(paused["machine"]["cloud"]["state"], "paused", "{paused}");
 
     // Retiring the parent retires its sub-agents: their final stops end
-    // both sandboxes. (A user may not retire the last top-level agent.)
+    // both sandboxes.
     ok(
         &mut rpc_ws,
         899,

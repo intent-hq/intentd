@@ -6405,8 +6405,9 @@ fn test_provider() -> intent_providers::ProviderConfig {
     }
 }
 
-/// Seed a second active top-level session beside `id` (same workspace) so
-/// the last-top-level-agent retire guard lets `id` be retired.
+/// Seed a second active top-level session beside `id` (same workspace), so
+/// `id` is not the workspace's last top-level agent (the agent self-retire
+/// guard refuses that; a user retire is not guarded).
 async fn seed_top_level_peer(mgr: &AgentManager, id: &AgentId) {
     let mut peer = mgr
         .services
@@ -11282,10 +11283,10 @@ async fn user_retire_active_descendant_rejection_does_not_stop_target() {
     mgr.stop(&id).await;
 }
 
-/// A user retire of the workspace's last top-level agent is refused before
-/// the running target is stopped: its turn and worker survive untouched.
+/// A user may retire the workspace's last top-level agent while it runs: the
+/// retire stops its worker and marks it retired like any other target.
 #[tokio::test]
-async fn user_retire_last_top_level_rejection_does_not_stop_target() {
+async fn user_retire_stops_the_last_top_level_agent() {
     let (_tmp, mgr) = manager().await;
     let mgr = Arc::new(mgr);
     mgr.services.attach_agent_manager(&mgr);
@@ -11307,15 +11308,20 @@ async fn user_retire_last_top_level_rejection_does_not_stop_target() {
         mgr.services
             .agent_retire(id.clone(), Some(ws.clone()), None),
     )
-    .await;
-    assert!(
-        matches!(result, Err(Error::InvalidParams(ref message)) if message.contains("last active top-level agent")),
-        "{result:?}"
-    );
-    assert!(!aborted.is_finished());
-    assert!(mgr.is_busy(&id));
-    assert!(mgr.contains(&id));
-    assert!(!mgr.retired.lock().unwrap().contains(&id));
+    .await
+    .expect("a user may retire the last top-level agent");
+    assert_eq!(result["success"], true);
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            while !aborted.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("retirement must abort the running worker");
+    assert!(!mgr.is_busy(&id));
     assert!(mgr
         .services
         .store
@@ -11323,8 +11329,7 @@ async fn user_retire_last_top_level_rejection_does_not_stop_target() {
         .await
         .unwrap()
         .retired_at
-        .is_none());
-    mgr.stop(&id).await;
+        .is_some());
 }
 
 #[tokio::test]

@@ -1020,8 +1020,8 @@ async fn user_retire(
     .await
 }
 
-/// The guard only covers top-level sessions: a child agent may still
-/// self-retire under the last top-level agent, and a user may retire it too.
+/// The guard only covers an agent retiring itself as the last top-level
+/// session: a child agent may still self-retire, and a user may retire any.
 /// Daemon-internal (unbound) retires are not guarded.
 #[tokio::test]
 async fn last_top_level_guard_skips_children_and_daemon_callers() {
@@ -1043,37 +1043,87 @@ async fn last_top_level_guard_skips_children_and_daemon_callers() {
         .expect("a daemon-internal caller may retire the last top-level agent");
 }
 
-/// Guard: a user (wire `agent.retire`) may not retire the workspace's last
-/// active top-level agent either. The refusal speaks to the user, mutates
-/// nothing, and lifts once another top-level agent exists.
+/// A user (wire `agent.retire`) may retire the workspace's last active
+/// top-level agent: only an agent retiring itself is guarded, so a user can
+/// clear out every chat or agent in a workspace.
 #[tokio::test]
-async fn user_retire_rejects_the_last_top_level_agent() {
+async fn user_retire_allows_the_last_top_level_agent() {
     let (_t, svc, ws) = setup().await;
     let solo = create_agent(&svc, &ws, "Solo").await;
 
-    let err = user_retire(&svc, &ws, &solo)
+    let result = user_retire(&svc, &ws, &solo)
         .await
-        .expect_err("a user must not retire the only top-level agent");
-    assert_last_top_level_refusal(&err);
-    assert!(
-        err.to_string().contains("Start another agent"),
-        "user-facing guidance: {err}"
-    );
+        .expect("a user may retire the only top-level agent");
+    assert_eq!(result["success"], true);
     let s = svc
         .store()
         .get_agent_session_with_transcript(&solo)
         .await
         .expect("session");
-    assert!(s.retired_at.is_none(), "nothing mutated on refusal");
+    assert!(
+        s.retired_at.is_some(),
+        "the last top-level agent is retired"
+    );
+    assert!(
+        svc.store()
+            .list_active_agent_session_summaries(&ws)
+            .await
+            .expect("list")
+            .is_empty(),
+        "no active agent remains"
+    );
+}
 
-    let peer = create_agent(&svc, &ws, "Peer").await;
-    user_retire(&svc, &ws, &solo)
+/// The agent self-retire guard still holds after a user retired every other
+/// top-level agent.
+#[tokio::test]
+async fn agent_self_retire_stays_guarded_after_user_retires() {
+    let (_t, svc, ws) = setup().await;
+    let first = create_agent(&svc, &ws, "First").await;
+    let second = create_agent(&svc, &ws, "Second").await;
+
+    user_retire(&svc, &ws, &first)
         .await
-        .expect("retire succeeds once a peer exists");
-    let err = user_retire(&svc, &ws, &peer)
+        .expect("a user may retire a top-level agent");
+    let err = self_retire(&svc, &ws, &second)
         .await
-        .expect_err("the remaining top-level agent is now protected");
+        .expect_err("the remaining agent must not retire itself");
     assert_last_top_level_refusal(&err);
+}
+
+/// A user retire of a top-level agent waits on the workspace gate, so it
+/// cannot slip past an agent self-retire that already counted it as the
+/// remaining active top-level agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_retire_of_top_level_agent_waits_on_the_workspace_gate() {
+    let (_t, svc, ws) = setup().await;
+    let target = create_agent(&svc, &ws, "Target").await;
+    let _peer = create_agent(&svc, &ws, "Peer").await;
+    let gate = svc.agent_retirement_gates.for_workspace(&ws);
+    let held = gate.lock().await;
+    let pending = {
+        let (svc, ws, target) = (svc.clone(), ws.clone(), target.clone());
+        tokio::spawn(async move { user_retire(&svc, &ws, &target).await })
+    };
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while Arc::strong_count(&gate) < 2 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("user retire reaches the workspace gate");
+    let row = svc
+        .store()
+        .get_agent_session_with_transcript(&target)
+        .await
+        .expect("session");
+    assert!(row.retired_at.is_none(), "the gated retire has not run yet");
+    drop(held);
+    let res = pending.await.expect("join").expect("user retire succeeds");
+    assert_eq!(res["success"], json!(true), "{res}");
 }
 
 /// Two top-level agents self-retiring at the same time on separate worker
@@ -1116,7 +1166,7 @@ async fn concurrent_self_retires_leave_one_top_level_agent() {
     }
 }
 
-/// A guarded retire that read its target before waiting on the workspace
+/// A guarded self-retire that read its target before waiting on the workspace
 /// gate must not turn into a last-agent refusal when, meanwhile, a rival
 /// retire of the same target won and the last peer retired too: the late
 /// call reports the documented idempotent `alreadyRetired` result.
@@ -1129,7 +1179,7 @@ async fn guarded_retire_reports_already_retired_after_waiting_on_the_gate() {
     let held = gate.lock().await;
     let late = {
         let (svc, ws, target) = (svc.clone(), ws.clone(), target.clone());
-        tokio::spawn(async move { user_retire(&svc, &ws, &target).await })
+        tokio::spawn(async move { self_retire(&svc, &ws, &target).await })
     };
     // The late call holds its own handle on the gate once it has read the
     // (still unretired) target and is about to wait on the lock.
