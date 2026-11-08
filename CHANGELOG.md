@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.154] - 2026-11-08
+
+### 🐛 Bug Fixes
+
+- *(browser)* Route unassigned agent browser ops to the client that last focused the workspace ([#3145](https://github.com/intent-hq/intentd/pull/3145))
+
+
 ## [0.11.153] - 2026-11-08
 
 ### 🐛 Bug Fixes
