@@ -179,6 +179,7 @@ async fn the_watcher_follows_credential_changes_while_a_machine_is_linked() {
             tokio::time::timeout(wait(), async {
                 loop {
                     generation.fetch_add(1, Ordering::SeqCst);
+                    // fixed-deadline: allow — a retry step; the outer wait() is the hang guard
                     if tokio::time::timeout(Duration::from_millis(200), rx.changed())
                         .await
                         .is_ok()

@@ -72,6 +72,7 @@ async fn gh_token_digest(
 /// Every text frame `socket` received so far.
 async fn drain(socket: &mut common::TlsWs) -> String {
     let mut seen = String::new();
+    // fixed-deadline: allow — a quiet window that ends the drain; a longer one only collects more
     while let Ok(Some(Ok(message))) = timeout(Duration::from_millis(500), socket.next()).await {
         if let Message::Text(text) = message {
             seen.push_str(&text);
