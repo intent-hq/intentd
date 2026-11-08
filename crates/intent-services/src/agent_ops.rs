@@ -7734,9 +7734,10 @@ impl Services {
     /// does NOT restore the cascaded children.
     ///
     /// GUARDED on the last top-level agent: when the caller is an AGENT
-    /// (`ws.agent.retire`) or a USER (wire `agent.retire`) and the target is
-    /// the workspace's only active top-level session, the call FAILS
-    /// (`InvalidParams`, nothing mutated, a running target is not stopped).
+    /// (`ws.agent.retire`) and the target is the workspace's only active
+    /// top-level session, the call FAILS (`InvalidParams`, nothing mutated, a
+    /// running target is not stopped). A USER (wire `agent.retire`) may
+    /// retire it, leaving the workspace with no active agent.
     pub(crate) async fn agent_retire_op(
         &self,
         agent_id: AgentId,
@@ -7757,22 +7758,18 @@ impl Services {
         if let Some(existing) = session.retired_at.clone() {
             return Ok(json!({ "success": true, "retiredAt": existing, "alreadyRetired": true }));
         }
-        // Guard: neither an agent (`ws.agent.retire`, including from its
-        // hooks) nor a user (wire `agent.retire`) may retire the workspace's
-        // last active top-level agent — that would leave the workspace with
-        // no visible agent to talk to. Daemon-internal and unbound callers
-        // are not guarded. The workspace gate is held through the retire
-        // transition below so concurrent retires of the remaining top-level
-        // agents cannot all pass.
+        // Guard: an agent (`ws.agent.retire`, including from its hooks) may
+        // not retire the workspace's last active top-level agent — that would
+        // leave the workspace with no visible agent to talk to. A user (wire
+        // `agent.retire`) may, and daemon-internal and unbound callers are not
+        // guarded. The workspace gate is held through the retire transition
+        // below so concurrent self-retires of the remaining top-level agents
+        // cannot all pass.
         let refusal = match intent_core::current_caller() {
             Some(intent_core::Caller::Agent { .. }) => Some(
                 "cannot retire: this is the last active top-level agent in the workspace. \
                  Retiring it would leave the workspace without an agent; finish your turn \
                  normally instead.",
-            ),
-            Some(intent_core::Caller::Wire { .. }) => Some(
-                "cannot retire: this is the last active top-level agent in the workspace. \
-                 Start another agent in this workspace first, or archive the workspace instead.",
             ),
             _ => None,
         };

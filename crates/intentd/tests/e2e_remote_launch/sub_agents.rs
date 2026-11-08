@@ -287,8 +287,7 @@ async fn a_remote_agents_sub_agent_on_another_machine_starts_from_its_work() {
     .await;
 
     // Retiring the parent retires the child too: its final stop on the
-    // other machine removes its checkout there. (A user may not retire the
-    // last top-level agent.)
+    // other machine removes its checkout there.
     let checkout = scratch
         .path()
         .join("Far")

@@ -210,8 +210,8 @@ async fn boot() -> Fixture {
         .insert_agent_session(&agent_session(&ws_id, agent_id.as_str()))
         .await
         .expect("seed agent");
-    // A peer top-level agent, so retiring the monitored agent is not refused
-    // as the workspace's last top-level agent.
+    // A peer top-level agent, so the workspace keeps an active agent after
+    // the monitored agent is retired.
     store
         .insert_agent_session(&agent_session(&ws_id, "agent-prmon-e2e-peer"))
         .await

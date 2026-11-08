@@ -615,9 +615,9 @@ Other panel menus place **Rename** under **Actions** when renaming is available.
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/layout/tab-types/{AgentTabType,AgentViewSettingsDropdown}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte. -->
 
 **Retire Agent** stops an agent and keeps its conversation so it can be restored later.
-Intent refuses to retire a workspace's last top-level agent, whether you or the agent
-asks; start another agent in the workspace first, or archive the workspace instead.
-Delegated agents can always be retired.
+You can retire any agent, including a workspace's last top-level agent. An agent
+cannot retire itself while it is the workspace's last top-level agent. Delegated
+agents can always be retired.
 
 Grouped by status, Home sorts workspaces into **Needs you**, **Running**, **Waiting**,
 and **Done & idle**, in that priority order. **Running** covers an agent at work, a
