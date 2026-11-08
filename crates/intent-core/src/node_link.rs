@@ -532,6 +532,10 @@ pub fn forge_agent_branch(agent_id: &AgentId) -> String {
 /// Whether `name` is a branch name git accepts (`git check-ref-format
 /// --branch` without `@{-N}` shorthands).
 #[must_use]
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "git refuses only a lowercase `.lock` component suffix"
+)]
 pub fn valid_branch_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 255

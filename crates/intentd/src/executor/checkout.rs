@@ -258,17 +258,15 @@ impl Checkouts for GitCheckouts {
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let local = forge_agent_branch(agent_id);
-            match forge {
-                Some(forge) => self
+            if let Some(forge) = forge {
+                return self
                     .cache
                     .set_forge(worktree, &local, &forge.remote_url, &forge.branch)
                     .await
-                    .map_err(|e| anyhow::anyhow!("set up the agent's branch and origin: {e}")),
-                None => {
-                    self.cache.clear_forge(worktree, &local).await;
-                    Ok(())
-                }
+                    .map_err(|e| anyhow::anyhow!("set up the agent's branch and origin: {e}"));
             }
+            self.cache.clear_forge(worktree, &local).await;
+            Ok(())
         })
     }
 }
