@@ -472,7 +472,7 @@ pub struct LaunchCommand {
     /// A top-level agent's GitHub branch and remote. Sent only on a link of
     /// [`FORGE_TOKEN_PROTOCOL`] or later, never for a sub-agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub forge: Option<ForgeLaunch>,
+    pub forge: Option<Box<ForgeLaunch>>,
 }
 
 /// [`LaunchCommand::forge`] (nodeProtocol 15): the workspace branch a

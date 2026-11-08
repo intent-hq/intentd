@@ -1552,10 +1552,10 @@ fn launch_forge_is_optional_and_needs_protocol_15() {
     let plain = LinkFrame::Launch(command.clone());
     assert!(serde_json::to_value(&plain).unwrap().get("forge").is_none());
     assert!(plain.min_protocol() < FORGE_TOKEN_PROTOCOL);
-    command.forge = Some(ForgeLaunch {
+    command.forge = Some(Box::new(ForgeLaunch {
         remote_url: "https://github.com/o/r.git".into(),
         branch: "feat/x".into(),
-    });
+    }));
     let forged = LinkFrame::Launch(command);
     let value = serde_json::to_value(&forged).unwrap();
     assert_eq!(
