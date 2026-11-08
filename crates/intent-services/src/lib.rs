@@ -28310,7 +28310,7 @@ impl WorkspaceApi for Services {
             let note = match store.get_note(&workspace_id, &task_note_id).await {
                 Ok(n) => n,
                 Err(Error::NotFound(_)) => {
-                    return Err(Error::Internal("Task note not found".to_string()))
+                    return Err(Error::NotFound(format!("task note {task_note_id}")))
                 }
                 Err(e) => return Err(e),
             };

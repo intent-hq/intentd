@@ -6302,6 +6302,19 @@ async fn mark_as_task_then_update_note_status_and_get_my_task() {
     assert_eq!(mine.subtasks[0].status, "not_started");
 }
 
+/// An unknown task id is a plain not-found (-32602), not an internal error.
+#[intent_test_macros::daemon_test]
+async fn get_my_task_unknown_id_is_not_found() {
+    let (_tmp, svc, ws, _id) = setup("# Plain").await;
+    let err = svc
+        .get_my_task(ws, NoteId::from("made-up-id"))
+        .await
+        .expect_err("unknown id");
+    assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+    assert_eq!(err.code(), -32602);
+    assert!(err.to_string().contains("made-up-id"), "{err}");
+}
+
 /// `task.list` returns ALL of the workspace's task notes (any note with task
 /// metadata except the spec itself — direct spec children, subtasks, and
 /// unlinked tasks alike, including cancelled) projected into the

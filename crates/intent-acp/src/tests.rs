@@ -3360,9 +3360,8 @@ mod mcp_tests {
             self.get_my_task_calls.lock().unwrap().push(key.clone());
             Box::pin(async move {
                 if key == "task-missing" {
-                    // Mirrors the services impl, which wraps the store's
-                    // NotFound as Error::Internal("Task note not found").
-                    return Err(Error::Internal("Task note not found".to_string()));
+                    // Mirrors the services impl: an unknown id is NotFound.
+                    return Err(Error::NotFound("task note task-missing".to_string()));
                 }
                 let task = TaskMetadata {
                     status: TaskStatus::InProgress,
@@ -5399,12 +5398,12 @@ mod _dead_dispatch_unit_tests {
     async fn get_my_task_arm_surfaces_not_found_error() {
         let (srv, api) = server();
         let resp = call(&srv, "get_my_task", json!({ "taskNoteId": "task-missing" })).await;
-        // Error::Internal → -32603 (matches services impl wrapping).
-        assert_eq!(resp["error"]["code"], json!(-32603));
+        // Error::NotFound → -32602 (a plain not-found, not an internal error).
+        assert_eq!(resp["error"]["code"], json!(-32602));
         assert!(resp["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("Task note not found"));
+            .contains("not found: task note task-missing"));
         assert_eq!(
             *api.get_my_task_calls.lock().unwrap(),
             vec!["task-missing".to_string()]
