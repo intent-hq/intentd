@@ -227,6 +227,56 @@ echo 'echo installed >> "{temp}/installed"'
             self.assertIn('unsupported INSTALL_DIST_SHELL', result.stderr)
 
 
+DIST_PIN = re.search(r'cargo-dist-version\s*=\s*"([^"]+)"', (ROOT / 'dist-workspace.toml').read_text()).group(1)
+
+
+class InstallCargoDist(unittest.TestCase):
+    """scripts/install-cargo-dist.sh: cached binary, then the installer, then crates.io."""
+
+    def run_script(self, curl_ok, cached=None):
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            bin_dir, target, fake = temp / 'bin', temp / 'cargo-dist', temp / 'fake-dist'
+            bin_dir.mkdir()
+            target.mkdir()
+            executable(fake, f'echo "cargo-dist {DIST_PIN}"\n')
+            if cached:
+                executable(target / 'dist', f'echo "cargo-dist {cached}"\n')
+            # The fake installer script copies the fake binary into the unmanaged dir.
+            installer = f'cp "{fake}" "$CARGO_DIST_UNMANAGED_INSTALL/dist"'
+            executable(bin_dir / 'curl', f'echo curl >> "{temp}/calls"\n'
+                       + (f"echo '{installer}'\n" if curl_ok else 'exit 22\n'))
+            executable(bin_dir / 'cargo', f'echo "cargo $*" >> "{temp}/calls"\n'
+                       'while [ "$1" != --root ]; do shift; done\n'
+                       f'mkdir -p "$2/bin" && cp "{fake}" "$2/bin/dist"\n')
+            env = {'PATH': f'{bin_dir}:{os.environ["PATH"]}', 'INSTALL_DIST_DELAY': '0'}
+            result = subprocess.run(['bash', str(ROOT / 'scripts/install-cargo-dist.sh'), str(target)],
+                                    env=env, capture_output=True, text=True)
+            calls = (temp / 'calls').read_text().splitlines() if (temp / 'calls').exists() else []
+            version = subprocess.run([str(target / 'dist'), '--version'], capture_output=True, text=True).stdout.strip()
+            leftovers = sorted(p.name for p in target.iterdir() if p.name != 'dist')
+            return result, calls, version, leftovers
+
+    def test_cached_binary_at_the_pin_is_kept(self):
+        result, calls, version, _ = self.run_script(curl_ok=False, cached=DIST_PIN)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((calls, version), ([], f'cargo-dist {DIST_PIN}'))
+
+    def test_stale_cache_uses_the_installer_when_the_download_works(self):
+        result, calls, version, _ = self.run_script(curl_ok=True, cached='0.0.1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((calls, version), (['curl'], f'cargo-dist {DIST_PIN}'))
+
+    def test_release_outage_builds_the_pin_from_crates_io(self):
+        # GitHub release downloads 504ed for over an hour on intentd#3156's runs.
+        result, calls, version, leftovers = self.run_script(curl_ok=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls[:4], ['curl'] * 4)
+        self.assertTrue(calls[4].startswith(f'cargo install cargo-dist --locked --version {DIST_PIN} '), calls)
+        self.assertEqual((version, leftovers), (f'cargo-dist {DIST_PIN}', []))
+        self.assertIn('building it from crates.io', result.stderr)
+
+
 def wget_download_function():
     script = (ROOT / 'scripts/install.sh').read_text()
     start = script.index('wget_download() {')

@@ -9,7 +9,7 @@ are not run. Suites that need CI-only tooling are skipped with
 
 - a `taiki-e/install-action` step makes its tool@version a requirement for every
   later step, as in CI (release-plz);
-- a step that runs the cargo-dist installer needs `dist` at the
+- a step that runs the cargo-dist installer (or install-cargo-dist.sh) needs `dist` at the
   dist-workspace.toml cargo-dist-version;
 - HOST_RULES below name the suites that depend on the host itself. A rule whose
   suite is no longer in the job is a setup error, so the table cannot go stale;
@@ -43,7 +43,7 @@ ASSIGNMENT = re.compile(r'^([A-Za-z_]\w*)=("[^"]*"|\'[^\']*\'|\S*)\s+')
 VARIABLE = re.compile(r'\$\{?([A-Za-z_]\w*)')
 TEST_COMMAND = re.compile(r'^(?:python3(?:\s+-[A-Za-z]+)*\s+)?(?:\.{1,2}/)*scripts/test-[\w.-]+(?:\s+[^;&|<>`$()]*)?$')
 # Non-test lines a test step may carry: CI-only setup the runner leaves out.
-SETUP_LINE = re.compile(r'^(?:[A-Za-z_]\w*=|python3 -m pip install\s|curl\s|rustup\s|'
+SETUP_LINE = re.compile(r'^(?:[A-Za-z_]\w*=|python3 -m pip install\s|curl\s|rustup\s|bash scripts/install-|'
                         r'python3 scripts/setup-|echo\s.*>>\s*"?\$GITHUB_(?:ENV|PATH)"?$)')
 VERSION = re.compile(r'(\d+(?:\.\d+)+)')
 
@@ -211,7 +211,7 @@ def plan(root, workflow, job):
         shell = step.get('shell', job_shell)
         if shell not in (None, 'bash'):
             needs.append(ci_context(f'step runs under shell {shell!r}'))
-        if 'cargo-dist-installer' in run:
+        if 'cargo-dist-installer' in run or 'install-cargo-dist.sh' in run:
             needs.append(exact_tool('dist', dist_pin(root)))
         cwd = root / str(step.get('working-directory', '.'))
         local = set()
