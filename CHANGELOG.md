@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.152] - 2026-11-08
+
+### 🚀 Features
+
+- *(agents)* Let users retire the last top-level agent ([#3138](https://github.com/intent-hq/intentd/pull/3138))
+
+### 🐛 Bug Fixes
+
+- *(nodes)* Bootstrap E2B intentd in one data dir ([#3141](https://github.com/intent-hq/intentd/pull/3141))
+
+
 ## [0.11.151] - 2026-11-08
 
 ### 📚 Documentation
