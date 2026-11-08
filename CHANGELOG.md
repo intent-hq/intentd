@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.151] - 2026-11-08
+
+### 📚 Documentation
+
+- *(guide)* Describe Assistant chat list actions ([#3137](https://github.com/intent-hq/intentd/pull/3137))
+
+
 ## [0.11.150] - 2026-11-07
 
 ### 🚀 Features
