@@ -26,11 +26,15 @@ use zeroize::Zeroizing;
 pub(crate) type Resolver =
     Arc<dyn Fn() -> BoxFuture<'static, Option<Zeroizing<String>>> + Send + Sync>;
 
+/// The SHA-256 of a token, or of its absence (`None`).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Digest(Option<[u8; 32]>);
+
 /// The value the machines hold, with its digest.
 #[derive(Clone, Default)]
 pub(crate) struct Held {
     token: Option<SecretValue>,
-    digest: Option<[u8; 32]>,
+    digest: Digest,
 }
 
 impl Held {
@@ -48,7 +52,7 @@ impl std::fmt::Debug for Held {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Held")
             .field("held", &self.token.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -99,9 +103,11 @@ impl ForgeTokens {
     pub(crate) async fn refresh(&self) -> bool {
         let _one = self.refreshing.lock().await;
         let token = (self.resolver)().await;
-        let digest: Option<[u8; 32]> = token
-            .as_ref()
-            .map(|token| sha2::Sha256::digest(token.as_bytes()).into());
+        let digest = Digest(
+            token
+                .as_ref()
+                .map(|token| sha2::Sha256::digest(token.as_bytes()).into()),
+        );
         let mut changed = false;
         self.held.send_modify(|held| {
             if held.digest != digest {
@@ -178,16 +184,16 @@ impl ForgeTokens {
 pub(crate) struct Confirmed {
     /// The digest the machine last answered `ok` for (`Some(None)`: the
     /// confirmed absence of a token).
-    value: Option<Option<[u8; 32]>>,
+    value: Option<Digest>,
     /// Frames sent and not yet answered, with the digest each carried.
-    pending: HashMap<LinkId, Option<[u8; 32]>>,
+    pending: HashMap<LinkId, Digest>,
 }
 
 impl Confirmed {
     /// Whether the machine confirmed a token (not `null`) on this link.
     #[cfg(test)]
     pub(crate) fn token(&self) -> bool {
-        matches!(self.value, Some(Some(_)))
+        matches!(self.value, Some(Digest(Some(_))))
     }
 
     /// Record the machine's answer to frame `request_id`.
