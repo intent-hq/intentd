@@ -535,6 +535,7 @@ pub(crate) struct AssignedAgentScan {
 }
 
 mod batch;
+mod descendants;
 
 /// Prefix of the opaque `agent.listUserMessages` `nextToken` (PROTOCOL
 /// §5.5). The token names the `seq` the next older page reads below; it is

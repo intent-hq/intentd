@@ -227,6 +227,9 @@ pub(crate) const PRELUDE: &str = r"
         getMessageBlock: (agentId, messageId, blockId, opts) =>
             host({ method: 'agent.getMessageBlock', args: { agentId, messageId, blockId, ...(opts || {}) } }),
         summary: (agentId) => host({ method: 'agent.summary', args: { agentId } }),
+        stop: (agentId, opts) =>
+            host({ method: 'agent.stop', args: { agentId, ...(opts || {}) } }),
+        delete: (agentId) => host({ method: 'agent.delete', args: { agentId } }),
         reportToParent: (report) =>
             host({ method: 'agent.reportToParent', args: { report } }),
         requestDiscussion: (reason) =>
@@ -331,6 +334,8 @@ async fn dispatch_inner(
             Ok(merge_ok(v))
         }
         "retire" => retire(api, ws, caller, args).await,
+        "stop" => end_descendant(api, ws, caller, args, false).await,
+        "delete" => end_descendant(api, ws, caller, args, true).await,
         other => Err(format!("host: unknown method `agent.{other}`")),
     }
 }
@@ -346,6 +351,111 @@ fn placement_arg(args: &Value) -> Result<Option<AgentPlacement>, String> {
         Some(value) => serde_json::from_value(value.clone())
             .map(Some)
             .map_err(|e| format!("invalid placement: {e}")),
+    }
+}
+
+/// `ws.agent.create` options (beside `name` and `message`).
+const CREATE_OPTIONS: &[&str] = &[
+    "name",
+    "message",
+    "model",
+    "specialist",
+    "provider",
+    "reasoningEffort",
+    "taskNoteId",
+    "isBackground",
+    "behaviorPrompt",
+    "idempotencyKey",
+    "messageMetadata",
+    "topLevel",
+    "placement",
+];
+
+/// `ws.agent.delegate` options.
+const DELEGATE_OPTIONS: &[&str] = &[
+    "taskNoteId",
+    "noteId",
+    "taskText",
+    "agentInstructions",
+    "specialist",
+    "model",
+    "provider",
+    "reasoningEffort",
+    "behaviorPrompt",
+    "waitMode",
+    "skipAutoCommit",
+    "isolation",
+    "force",
+    "placement",
+    "tasks",
+    "greedy",
+];
+
+/// `ws.agent.wakeOrCreate` `options.create` members.
+const WAKE_CREATE_OPTIONS: &[&str] = &[
+    "name",
+    "specialist",
+    "provider",
+    "agentType",
+    "model",
+    "reasoningEffort",
+    "contextReferences",
+    "metadata",
+    "skipAutoCommit",
+    "placement",
+];
+
+/// Refuse a misplaced `placement` member or an unknown option, so a typo
+/// fails instead of being ignored.
+fn check_options(args: &Value, what: &str, accepted: &[&str]) -> Result<(), String> {
+    match args.as_object() {
+        Some(map) => intent_core::placement::check_option_keys(map, what, accepted),
+        None => Ok(()),
+    }
+}
+
+/// Where an agent runs, for a create result: `{ target: "local" }` on this
+/// backend, else the placement target with the machine's id and name.
+async fn runs_on(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, agent_id: &str) -> Option<Value> {
+    let agent = api
+        .agent_get(AgentId::from(agent_id), Some(ws.clone()))
+        .await
+        .ok()?;
+    let Some(node_id) = agent.node_id else {
+        return Some(json!({ "target": "local" }));
+    };
+    let target = if agent.placement.as_ref().is_some_and(AgentPlacement::is_e2b) {
+        "e2b"
+    } else {
+        "remote"
+    };
+    Some(json!({ "target": target, "nodeId": node_id, "nodeName": agent.node_name }))
+}
+
+/// Add `runsOn` to a result (and to each started batch entry) that names a
+/// created or woken agent.
+async fn add_runs_on(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, out: &mut Value) {
+    if let Some(id) = out
+        .get("agentId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        if let Some(where_) = runs_on(api, ws, &id).await {
+            out["runsOn"] = where_;
+        }
+    }
+    if let Some(entries) = out.get_mut("tasks").and_then(Value::as_array_mut) {
+        for entry in entries {
+            if let Some(id) = entry
+                .get("agentId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            {
+                if let Some(where_) = runs_on(api, ws, &id).await {
+                    entry["runsOn"] = where_;
+                }
+            }
+        }
     }
 }
 
@@ -371,6 +481,7 @@ async fn create(
     caller: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
+    check_options(args, "ws.agent.create", CREATE_OPTIONS)?;
     if opt_bool(args, "topLevel").unwrap_or(false) {
         return create_top_level(api, ws, caller, args).await;
     }
@@ -510,6 +621,7 @@ async fn create(
         "subscriptionId": subscription_id,
     });
     remote_fields(&created, &mut out);
+    add_runs_on(api, ws, &mut out).await;
     Ok(out)
 }
 
@@ -724,6 +836,7 @@ async fn create_top_level(
         "sponsorAgentId": caller.as_str(),
     });
     remote_fields(&created, &mut out);
+    add_runs_on(api, ws, &mut out).await;
     Ok(out)
 }
 
@@ -733,10 +846,17 @@ async fn delegate(
     caller: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
+    check_options(args, "ws.agent.delegate", DELEGATE_OPTIONS)?;
     let tasks = match args.get("tasks").and_then(Value::as_array) {
         Some(a) => {
             let mut entries: Vec<BatchTaskEntry> = Vec::with_capacity(a.len());
             for v in a {
+                if let Some(message) = v
+                    .as_object()
+                    .and_then(intent_core::placement::misplaced_member)
+                {
+                    return Err(message);
+                }
                 match serde_json::from_value::<BatchTaskEntry>(v.clone()) {
                     Ok(entry) => entries.push(entry),
                     Err(_) => {
@@ -774,7 +894,9 @@ async fn delegate(
         .agent_delegate(ws.clone(), input, caller.cloned())
         .await
         .map_err(map_err)?;
-    Ok(merge_ok(v))
+    let mut out = merge_ok(v);
+    add_runs_on(api, ws, &mut out).await;
+    Ok(out)
 }
 
 /// Resolve the effective delivery priority for `ws.agent.send` /
@@ -1531,10 +1653,13 @@ async fn wake_or_create(
             }
             match options.get("create") {
                 None | Some(Value::Null) => None,
-                Some(create) => Some(
-                    serde_json::from_value::<AgentWakeCreateOptions>(create.clone())
-                        .map_err(|e| format!("invalid wakeOrCreate options.create: {e}"))?,
-                ),
+                Some(create) => {
+                    check_options(create, "wakeOrCreate options.create", WAKE_CREATE_OPTIONS)?;
+                    Some(
+                        serde_json::from_value::<AgentWakeCreateOptions>(create.clone())
+                            .map_err(|e| format!("invalid wakeOrCreate options.create: {e}"))?,
+                    )
+                }
             }
         }
         Some(_) => return Err("wakeOrCreate options must be an object".to_string()),
@@ -1559,6 +1684,7 @@ async fn wake_or_create(
     if let Some(obj) = out.as_object_mut() {
         obj.insert("taskNoteId".to_string(), json!(task_note_id));
     }
+    add_runs_on(api, ws, &mut out).await;
     Ok(out)
 }
 
@@ -1744,6 +1870,41 @@ async fn retire(
         }
     }
     Ok(out)
+}
+
+/// `ws.agent.stop(agentId, { reason? })` / `ws.agent.delete(agentId)`: end
+/// one of the caller's own sub-agents (direct or deeper) and its whole
+/// subtree, wherever they run (this backend, a remote machine or an E2B
+/// sandbox). `stop` retires them (the user can restore them); `delete`
+/// removes them. Refused for any agent that is not the caller's descendant.
+async fn end_descendant(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+    delete: bool,
+) -> Result<Value, String> {
+    let verb = if delete { "delete" } else { "stop" };
+    let caller = caller.ok_or_else(|| format!("agent.{verb} is only available to agents"))?;
+    let accepted: &[&str] = if delete {
+        &["agentId"]
+    } else {
+        &["agentId", "reason"]
+    };
+    check_options(args, &format!("ws.agent.{verb}"), accepted)?;
+    let target = req_str(args, "agentId").map_err(|_| "agentId is required".to_string())?;
+    let reason = opt_str_strict(args, "reason")?;
+    let v = api
+        .agent_end_descendant(
+            ws.clone(),
+            caller.clone(),
+            AgentId::from(target.as_str()),
+            delete,
+            reason,
+        )
+        .await
+        .map_err(map_err)?;
+    Ok(merge_ok(v))
 }
 
 /// Build the `{ type: "agent_message", fromAgentId, fromAgentName }`

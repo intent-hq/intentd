@@ -11303,6 +11303,9 @@ mod wsapi4_bindings_tests {
         Option<bool>,
     );
 
+    /// `(caller, target, delete, reason)` of one `agent_end_descendant`.
+    type EndDescendantCall = (String, String, bool, Option<String>);
+
     #[derive(Default)]
     struct FakeApi {
         agent_list_calls: Mutex<u32>,
@@ -11396,6 +11399,10 @@ mod wsapi4_bindings_tests {
         /// synchronously (before any hold) so a timed-out send's id is
         /// observable.
         agent_send_message_ids: Mutex<Vec<Option<String>>>,
+        /// Agent ids `agent_get` serves as running on an E2B sandbox.
+        e2b_agent_ids: Mutex<Vec<String>>,
+        /// `(caller, target, delete, reason)` of every `agent_end_descendant`.
+        end_descendant_calls: Mutex<Vec<EndDescendantCall>>,
     }
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
@@ -11586,6 +11593,7 @@ mod wsapi4_bindings_tests {
             let error = self.agent_get_error.lock().unwrap().clone();
             let is_background = self.background_agent_ids.lock().unwrap().contains(&id);
             let muted = self.muted_agent_ids.lock().unwrap().contains(&id);
+            let e2b = self.e2b_agent_ids.lock().unwrap().contains(&id);
             Box::pin(async move {
                 if let Some(e) = error {
                     return Err(Error::NotFound(e));
@@ -11593,6 +11601,12 @@ mod wsapi4_bindings_tests {
                 let mut agent = stub_agent(&id, &ws);
                 agent.metadata.is_background = is_background;
                 agent.notifications_muted = muted;
+                if e2b {
+                    agent.node_id = Some("node-e2b".into());
+                    agent.node_name = Some("E2B sandbox".into());
+                    agent.placement =
+                        Some(serde_json::from_value(json!({ "target": "e2b" })).unwrap());
+                }
                 Ok(agent)
             })
         }
@@ -11951,6 +11965,28 @@ mod wsapi4_bindings_tests {
             Box::pin(
                 async move { Ok(json!({ "success": true, "retiredAt": "2026-01-01T00:00:00Z" })) },
             )
+        }
+
+        fn agent_end_descendant(
+            &self,
+            _ws: WorkspaceId,
+            caller: AgentId,
+            target: AgentId,
+            delete: bool,
+            reason: Option<String>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.end_descendant_calls.lock().unwrap().push((
+                caller.as_str().to_string(),
+                target.as_str().to_string(),
+                delete,
+                reason,
+            ));
+            let key = if delete { "deleted" } else { "stopped" };
+            Box::pin(async move {
+                Ok(
+                    json!({ "ok": true, "agentId": target.as_str(), key: [target.as_str()], "failed": [] }),
+                )
+            })
         }
 
         fn agent_is_retired(&self, agent_id: AgentId) -> BoxFuture<'_, bool> {
@@ -13764,6 +13800,126 @@ mod wsapi4_bindings_tests {
             4,
             "refused before any call"
         );
+    }
+
+    /// A placement member beside `placement`, or any unknown option, is
+    /// refused before any create seam runs, naming the fix.
+    #[tokio::test]
+    async fn misplaced_and_unknown_create_options_are_refused() {
+        let (srv, api) = server_with_caller("caller-1");
+        for (code, expected) in [
+            (
+                "return await ws.agent.create('n', 'go', { target: 'remote' });",
+                "`target` belongs inside `placement`",
+            ),
+            (
+                "return await ws.agent.create('n', 'go', { nodeId: 'mac', placement: {} });",
+                "`nodeId` belongs inside `placement`",
+            ),
+            (
+                "return await ws.agent.create('n', 'go', { topLevel: true, os: 'macos' });",
+                "`os` belongs inside `placement`",
+            ),
+            (
+                "return await ws.agent.create('n', 'go', { createLinkedNote: true });",
+                "unknown option `createLinkedNote` for ws.agent.create",
+            ),
+            (
+                "return await ws.agent.delegate({ taskNoteId: 't-1', target: 'e2b' });",
+                "`target` belongs inside `placement`",
+            ),
+            (
+                "return await ws.agent.delegate({ taskNoteId: 't-1', machine: 'mac' });",
+                "unknown option `machine` for ws.agent.delegate",
+            ),
+            (
+                "return await ws.agent.delegate({ tasks: [{ taskNoteId: 't-1', arch: 'aarch64' }] });",
+                "`arch` belongs inside `placement`",
+            ),
+            (
+                "return await ws.agent.wakeOrCreate('tn-1', 'ctx', undefined, undefined, undefined, { create: { target: 'remote' } });",
+                "`target` belongs inside `placement`",
+            ),
+            (
+                "return await ws.agent.wakeOrCreate('tn-1', 'ctx', undefined, undefined, undefined, { create: { nmae: 'x' } });",
+                "unknown option `nmae` for wakeOrCreate options.create",
+            ),
+        ] {
+            let resp = call(&srv, code).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "{code}: {resp}");
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap_or_default();
+            assert!(text.contains(expected), "{code}: {text}");
+        }
+        assert!(api.placements.lock().unwrap().is_empty());
+        assert!(api.agent_delegate_calls.lock().unwrap().is_empty());
+    }
+
+    /// Create, delegate and wakeOrCreate results say where the agent runs.
+    #[tokio::test]
+    async fn create_results_say_where_the_agent_runs() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(&srv, "return await ws.agent.create('n', 'go');").await;
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("\"runsOn\":{\"target\":\"local\"}")
+                || text.contains("\"target\": \"local\""),
+            "{text}"
+        );
+        api.e2b_agent_ids
+            .lock()
+            .unwrap()
+            .push("agent-woken".to_string());
+        let resp = call(
+            &srv,
+            "const r = await ws.agent.wakeOrCreate('tn-1', 'ctx'); return JSON.stringify(r.runsOn);",
+        )
+        .await;
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("e2b") && text.contains("node-e2b"), "{text}");
+    }
+
+    /// `ws.agent.stop` / `ws.agent.delete` reach the service as the caller,
+    /// with the target and mode; extra options are refused.
+    #[tokio::test]
+    async fn stop_and_delete_end_a_sub_agent_as_the_caller() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(
+            &srv,
+            "await ws.agent.stop('agent-c', { reason: 'done' }); return await ws.agent.delete('agent-d');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+        assert!(
+            resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("deleted"),
+            "{resp}"
+        );
+        assert_eq!(
+            *api.end_descendant_calls.lock().unwrap(),
+            vec![
+                (
+                    "caller-1".into(),
+                    "agent-c".into(),
+                    false,
+                    Some("done".into())
+                ),
+                ("caller-1".into(), "agent-d".into(), true, None),
+            ]
+        );
+        for code in [
+            "return await ws.agent.stop();",
+            "return await ws.agent.stop('agent-c', { force: true });",
+        ] {
+            let resp = call(&srv, code).await;
+            assert_eq!(resp["result"]["isError"], json!(true), "{code}: {resp}");
+        }
+        assert_eq!(api.end_descendant_calls.lock().unwrap().len(), 2);
     }
 
     /// `ws.help("agent")` appends the daemon's live placement discovery when

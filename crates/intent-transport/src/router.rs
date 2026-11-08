@@ -2922,6 +2922,9 @@ async fn dispatch(
                     "agentId: agent IDs are server-assigned and the field must be omitted",
                 ));
             }
+            if let Some(message) = intent_core::placement::misplaced_member(params) {
+                return Err(invalid_params(message));
+            }
             let ws = require_ws_note(params)?;
             let name = opt_str(params, "name");
             let model = opt_str(params, "model");
@@ -2980,6 +2983,13 @@ async fn dispatch(
             Ok(result)
         }
         "agent.delegate" => {
+            let entries = params.get("tasks").and_then(Value::as_array);
+            if let Some(message) = std::iter::once(params)
+                .chain(entries.into_iter().flatten().filter_map(Value::as_object))
+                .find_map(intent_core::placement::misplaced_member)
+            {
+                return Err(invalid_params(message));
+            }
             let ws = require_ws_note(params)?;
             let mut rest = params.clone();
             rest.remove("workspaceId");
@@ -3514,6 +3524,12 @@ async fn dispatch(
             Ok(result)
         }
         "agent.wakeOrCreate" => {
+            if let Some(message) = std::iter::once(params)
+                .chain(params.get("create").and_then(Value::as_object))
+                .find_map(intent_core::placement::misplaced_member)
+            {
+                return Err(invalid_params(message));
+            }
             let ws = require_ws_note(params)?;
             let task_note_id = require_str_param(params, "taskNoteId").map(NoteId::from)?;
             let context_message = require_str_param(params, "contextMessage")?;
