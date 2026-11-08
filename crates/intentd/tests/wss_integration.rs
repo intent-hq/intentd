@@ -21433,7 +21433,7 @@ async fn wss_workspace_import_lifecycle() {
     // Fixture archive: manifest.json + rows/{workspace,agent_session}.jsonl.
     let mut buf = std::io::Cursor::new(Vec::new());
     let mut zip = zip::ZipWriter::new(&mut buf);
-    let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
     zip.start_file("manifest.json", options).expect("manifest");
     zip.write_all(manifest.to_string().as_bytes())
         .expect("manifest bytes");
@@ -22114,7 +22114,7 @@ async fn wss_workspace_import_commit_materializes_git() {
     });
     let mut buf = std::io::Cursor::new(Vec::new());
     let mut zip = zip::ZipWriter::new(&mut buf);
-    let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+    let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
     zip.start_file("manifest.json", options).expect("manifest");
     zip.write_all(manifest.to_string().as_bytes())
         .expect("manifest bytes");
@@ -22441,7 +22441,7 @@ async fn wss_transfer_round_trip_hydrates_unpublished_submodule() {
         let reader = std::io::Cursor::new(&archive);
         let mut zip = zip::ZipArchive::new(reader).expect("valid zip");
         let names: Vec<String> = (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .map(|i| zip.by_index(i).unwrap().name().unwrap().into_owned())
             .collect();
         assert!(
             names.contains(&"git/submodules/0.bundle".to_string()),
@@ -22619,11 +22619,12 @@ async fn wss_transfer_preserves_remote_state() {
             let mut file = original.by_index(index).unwrap();
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).unwrap();
-            if file.name() == "git/refs.json" {
+            let name = file.name().unwrap().into_owned();
+            if name == "git/refs.json" {
                 bytes = serde_json::to_vec(tampered_refs).unwrap();
             }
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
-            writer.start_file(file.name(), options).unwrap();
+            let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
+            writer.start_file(name, options).unwrap();
             writer.write_all(&bytes).unwrap();
         }
         let tampered = writer.finish().unwrap().into_inner();

@@ -922,9 +922,8 @@ fn assemble_and_extract(
         .map_err(|e| Error::InvalidParams(format!("archive is not a valid zip: {e}")))?;
     std::fs::create_dir_all(extracted_dir)
         .map_err(|e| Error::Internal(format!("create extraction dir failed: {e}")))?;
-    // `ZipArchive::extract` sanitizes entry names via `enclosed_name` and
-    // refuses symlinks whose target escapes the destination (zip-slip safe;
-    // pinned by the `extract_rejects_hostile_entries` regression test).
+    // `ZipArchive::extract` keeps every entry inside `extracted_dir`
+    // (pinned by the `extract_rejects_hostile_entries` regression test).
     zip.extract(extracted_dir)
         .map_err(|e| Error::InvalidParams(format!("archive extraction failed: {e}")))?;
     Ok(())
@@ -2433,7 +2432,8 @@ mod tests {
     /// Pin the zip-slip safety `assemble_and_extract` relies on: hostile
     /// entry names (`../evil`, absolute paths) and symlinks targeting
     /// outside the destination must not write outside the extraction dir,
-    /// whatever the `zip` crate's policy (sanitize or error) is.
+    /// whatever the `zip` crate's policy (sanitize or error) is. This is the
+    /// guard for `zip` upgrades: a bump must keep it passing unchanged.
     #[test]
     fn extract_rejects_hostile_entries() {
         use std::io::Write as _;
@@ -2457,23 +2457,30 @@ mod tests {
             );
             (staging, result)
         };
-        let options = || zip::write::FileOptions::<'_, ()>::default();
+        let options = || zip::write::FileOptions::<'_, '_, ()>::default();
 
-        // Path traversal in an entry name.
-        let (staging, result) = run(&|writer| {
-            writer.start_file("../evil.txt", options()).expect("entry");
-            writer.write_all(b"escaped").expect("bytes");
-        });
-        assert!(
-            !staging.0.parent().unwrap().join("evil.txt").exists(),
-            "traversal entry must not escape the extraction dir (result: {result:?})"
-        );
+        // Path traversal in an entry name (`/` and `\\` separators) fails
+        // the extraction outright and writes nothing outside it.
+        for name in ["../evil.txt", "a/../../evil.txt", "..\\evil.txt"] {
+            let (staging, result) = run(&|writer| {
+                writer.start_file(name, options()).expect("entry");
+                writer.write_all(b"escaped").expect("bytes");
+            });
+            assert!(
+                result.is_err(),
+                "traversal entry {name:?} must fail the extraction (result: {result:?})"
+            );
+            assert!(
+                !staging.0.parent().unwrap().join("evil.txt").exists(),
+                "traversal entry {name:?} must not escape the extraction dir"
+            );
+        }
 
         // Absolute entry name.
         let escape_target = TempDir::new("import-zip-slip-target");
         let abs = escape_target.0.join("evil-abs.txt");
         let abs_name = abs.to_string_lossy().to_string();
-        let (_staging, result) = run(&|writer| {
+        let (staging, result) = run(&|writer| {
             writer.start_file(&*abs_name, options()).expect("entry");
             writer.write_all(b"escaped").expect("bytes");
         });
@@ -2481,6 +2488,19 @@ mod tests {
             !abs.exists(),
             "absolute entry must not escape the extraction dir (result: {result:?})"
         );
+        // ...because it is re-rooted under the extraction dir instead
+        // (Unix only: elsewhere the absolute form carries a drive prefix).
+        if cfg!(unix) {
+            assert!(result.is_ok(), "absolute entry is re-rooted: {result:?}");
+            assert!(
+                staging
+                    .0
+                    .join("extracted")
+                    .join(abs.strip_prefix("/").unwrap())
+                    .is_file(),
+                "absolute entry must land inside the extraction dir"
+            );
+        }
 
         // Symlink whose target points outside the destination, plus a file
         // extracted THROUGH it. The extraction must FAIL (failing the whole
@@ -2504,6 +2524,72 @@ mod tests {
             !Path::new("/evil-via-link.txt").exists(),
             "symlink-relayed entry must not escape (result: {result:?})"
         );
+
+        // Symlink entries targeting outside the destination fail the
+        // extraction and leave nothing behind.
+        for target in ["/etc", "../outside"] {
+            let (staging, result) = run(&|writer| {
+                writer
+                    .add_symlink("link", target, options())
+                    .expect("symlink entry");
+            });
+            assert!(
+                result.is_err(),
+                "escaping symlink to {target:?} must fail the extraction (result: {result:?})"
+            );
+            assert!(
+                std::fs::symlink_metadata(staging.0.join("extracted").join("link")).is_err(),
+                "escaping symlink to {target:?} must not be created"
+            );
+        }
+    }
+
+    /// Pin `zip`'s entry-name sanitizing rules, as exposed by
+    /// `ZipFile::enclosed_name`, across `zip` upgrades: any `..` that climbs
+    /// out of the root (with `/` or `\\` separators) is rejected, absolute
+    /// names are re-rooted, and `.` / inner `..` normalize within the root.
+    /// `extract` applies the same rules through an internal path
+    /// (`safe_prepare_path`), so `extract_rejects_hostile_entries` is what
+    /// pins the extraction itself.
+    #[test]
+    fn enclosed_name_rejects_traversal() {
+        use std::io::Write as _;
+
+        let cases: &[(&str, Option<&str>)] = &[
+            ("../evil.txt", None),
+            ("a/../../evil.txt", None),
+            ("../evildir/", None),
+            ("..\\evil.txt", None),
+            ("/abs/evil.txt", Some("abs/evil.txt")),
+            ("./ok.txt", Some("ok.txt")),
+            ("a/../ok2.txt", Some("ok2.txt")),
+            ("a/b/c.txt", Some("a/b/c.txt")),
+            ("dir/", Some("dir")),
+        ];
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::FileOptions::<'_, '_, ()>::default();
+            for (name, _) in cases {
+                if name.ends_with('/') {
+                    writer.add_directory(*name, options).expect("dir entry");
+                } else {
+                    writer.start_file(*name, options).expect("entry");
+                    writer.write_all(b"x").expect("bytes");
+                }
+            }
+            writer.finish().expect("zip");
+        }
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf.into_inner())).expect("zip");
+        assert_eq!(zip.len(), cases.len());
+        for (index, (name, expected)) in cases.iter().enumerate() {
+            let entry = zip.by_index(index).expect("entry");
+            assert_eq!(
+                entry.enclosed_name(),
+                expected.map(std::path::PathBuf::from),
+                "enclosed_name({name:?})"
+            );
+        }
     }
 
     // Bind the directory before Services so consumers drop before cleanup.
@@ -2565,7 +2651,7 @@ mod tests {
         use std::io::Write as _;
         let mut buf = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(&mut buf);
-        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
         zip.start_file("manifest.json", options).expect("manifest");
         zip.write_all(serde_json::to_string(m).expect("json").as_bytes())
             .expect("manifest bytes");
@@ -4090,7 +4176,7 @@ mod tests {
             let mut buf = std::io::Cursor::new(build_archive(&m, &rows));
             buf.set_position(buf.get_ref().len() as u64);
             let mut zip = zip::ZipWriter::new_append(buf).expect("append zip");
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let options: zip::write::FileOptions<'_, '_, ()> = zip::write::FileOptions::default();
             zip.start_file("git/repo.bundle", options).expect("bundle");
             zip.write_all(b"not a real bundle").expect("bundle bytes");
             zip.finish().expect("finish").into_inner()
