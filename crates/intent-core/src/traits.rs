@@ -513,6 +513,18 @@ pub trait WorkspaceApi: Send + Sync {
         WorkspaceSetupStatus::unknown()
     }
 
+    /// [`Self::workspace_setup_status`], falling back to the persisted
+    /// `workspace:setup:*` events when this daemon lifetime has no record
+    /// (a workspace created before the last restart). Still `unknown` when
+    /// neither exists.
+    fn workspace_setup_status_resolved(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, WorkspaceSetupStatus> {
+        let status = self.workspace_setup_status(&id);
+        Box::pin(async move { status })
+    }
+
     /// `workspace.diskUsage`: on-demand cached physical footprint of the
     /// workspace's daemon-managed directory (PROTOCOL §5.1) —
     /// `{ diskUsage?, refreshing }`. A fresh cache entry returns the usage

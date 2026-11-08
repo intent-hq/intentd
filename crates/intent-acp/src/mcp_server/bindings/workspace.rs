@@ -753,10 +753,10 @@ async fn info(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, St
 }
 
 async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
-    // Daemon-owned, in-memory setup-stage state (§6.5): `unknown` when no
-    // record exists in this daemon lifetime. Agent-facing only — never part
-    // of the wire `Workspace` row.
-    let setup_status = api.workspace_setup_status(ws);
+    // Daemon-owned setup-stage state (§6.5), rebuilt from the persisted
+    // setup events after a restart; `unknown` only when neither exists.
+    // Agent-facing only — never part of the wire `Workspace` row.
+    let setup_status = api.workspace_setup_status_resolved(ws.clone()).await;
     match api.get_workspace(ws.clone()).await {
         Ok(w) => {
             let title = w.title.trim();

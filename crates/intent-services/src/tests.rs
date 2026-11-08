@@ -47864,3 +47864,79 @@ async fn workspace_list_pages_walk_every_row_once() {
         "{err:?}"
     );
 }
+
+/// `ws.workspace.details().setupStatus` survives a daemon restart: with no
+/// in-memory record, the stage is rebuilt from the persisted
+/// `workspace:setup:*` events; a live in-memory record still wins.
+#[intent_test_macros::daemon_test]
+async fn setup_status_falls_back_to_persisted_setup_events() {
+    use crate::{
+        record_setup_running, workspace_setup_completed_event, workspace_setup_started_event,
+    };
+    use intent_core::{WorkspaceSetupState, WorkspaceSetupStatus};
+
+    async fn resolve(
+        events: impl Fn(&WorkspaceId) -> Vec<intent_store::NewEvent>,
+    ) -> (TempDb, Services, WorkspaceId, WorkspaceSetupStatus) {
+        let (tmp, svc, ws, _id) = setup("# Setup").await;
+        for ev in events(&ws) {
+            svc.store().insert_event(&ev).await.expect("insert event");
+        }
+        let status = svc.workspace_setup_status_resolved(ws.clone()).await;
+        (tmp, svc, ws, status)
+    }
+
+    let (_tmp, _, _, none) = resolve(|_| Vec::new()).await;
+    assert_eq!(none.state, WorkspaceSetupState::Unknown, "{none:?}");
+
+    let (_tmp, svc, ws, done) = resolve(|ws| {
+        vec![
+            workspace_setup_started_event(ws),
+            workspace_setup_completed_event(ws, true, Some(0)),
+        ]
+    })
+    .await;
+    assert_eq!(done.state, WorkspaceSetupState::Completed, "{done:?}");
+    assert_eq!(done.exit_code, Some(0));
+    assert!(done.started_at.is_some() && done.finished_at.is_some(), "{done:?}");
+    assert_eq!(done.terminal_id, None);
+    assert_eq!(
+        svc.workspace_setup_status(&ws).state,
+        WorkspaceSetupState::Completed,
+        "the rebuilt record is cached"
+    );
+
+    let (_tmp, _, _, failed) = resolve(|ws| {
+        vec![
+            workspace_setup_started_event(ws),
+            workspace_setup_completed_event(ws, true, Some(127)),
+        ]
+    })
+    .await;
+    assert_eq!(failed.state, WorkspaceSetupState::Failed, "{failed:?}");
+    assert_eq!(failed.exit_code, Some(127));
+
+    let (_tmp, _, _, skipped) =
+        resolve(|ws| vec![workspace_setup_completed_event(ws, false, None)]).await;
+    assert_eq!(skipped.state, WorkspaceSetupState::Skipped, "{skipped:?}");
+    assert!(skipped.finished_at.is_some());
+
+    let (_tmp, _, _, cut_off) = resolve(|ws| vec![workspace_setup_started_event(ws)]).await;
+    assert_eq!(
+        cut_off.state,
+        WorkspaceSetupState::Failed,
+        "a run the daemon never saw finish: {cut_off:?}"
+    );
+    assert_eq!(cut_off.exit_code, None);
+    assert!(cut_off.started_at.is_some() && cut_off.finished_at.is_none());
+
+    let (_tmp, svc, ws, _id) = setup("# Live").await;
+    svc.store()
+        .insert_event(&workspace_setup_completed_event(&ws, true, Some(0)))
+        .await
+        .expect("insert event");
+    record_setup_running(&svc.workspace_setup_states, &ws, "term-live");
+    let live = svc.workspace_setup_status_resolved(ws).await;
+    assert_eq!(live.state, WorkspaceSetupState::Running, "{live:?}");
+    assert_eq!(live.terminal_id.as_deref(), Some("term-live"));
+}
