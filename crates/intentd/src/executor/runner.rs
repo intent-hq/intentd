@@ -1540,7 +1540,7 @@ impl Runner {
                         .into_iter()
                         .flatten()
                         .reduce(|all, next| format!("{all}\n\n{next}"));
-                    let helper_env = self.forge_helper_env(&agent, &cwd).await;
+                    let helper_env = self.forge_helper_env(&agent);
                     self.find_skills(&agent, &cwd).await;
                     match workspace_api::serve(
                         &agent.id,
@@ -1671,19 +1671,13 @@ impl Runner {
     /// The git credential helper environment of an agent with `forge`
     /// (nodeProtocol 15): none for any other agent, so a sub-agent sharing
     /// its checkout never gets it.
-    async fn forge_helper_env(&self, agent: &Agent, cwd: &Path) -> Vec<(String, String)> {
+    fn forge_helper_env(&self, agent: &Agent) -> Vec<(String, String)> {
         let (Some(_), Some(socket)) = (&agent.forge, &self.inner.git_socket) else {
             return Vec::new();
         };
         let exe = self.inner.mcp_bridge_exe.to_string_lossy().into_owned();
-        let socket = socket.clone();
-        let cwd = cwd.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
-            intent_git::auth::node_helper_env(&exe, &socket, Some(&cwd), inherited.as_deref())
-        })
-        .await
-        .unwrap_or_default()
+        let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
+        intent_git::auth::node_helper_env(&exe, socket, inherited.as_deref())
     }
 
     /// Run or account for the setup of a prepared checkout: a fresh one

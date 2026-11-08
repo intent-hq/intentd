@@ -84,10 +84,15 @@ async fn a_top_level_remote_agent_pushes_the_workspace_branch_and_its_sub_agent_
     .await;
     let node_dir = scratch.path().join("node");
     std::fs::create_dir_all(&node_dir).unwrap();
-    // The machine must not inherit a credential helper from the test's
-    // own environment (a `gh auth git-credential` there reads GH_TOKEN).
+    // The machine's own git configuration has a `store` helper (and none
+    // from the test's environment): the agents' git must never hand it the
+    // backend's token.
+    let store = format!(
+        "'credential.helper=store --file={}'",
+        node_dir.join("git-credentials").display()
+    );
     let machine =
-        start_machine_with(&node_dir, &backend_id, &[("GIT_CONFIG_PARAMETERS", "")]).await;
+        start_machine_with(&node_dir, &backend_id, &[("GIT_CONFIG_PARAMETERS", &store)]).await;
     ok(
         &mut rpc_ws,
         3,
@@ -155,6 +160,20 @@ async fn a_top_level_remote_agent_pushes_the_workspace_branch_and_its_sub_agent_
     // Its credential helper answers with the machine's token.
     let digest = sh_ok(&mut rpc_ws, &mut events, pusher, CREDENTIAL_DIGEST, 400).await;
     assert_eq!(digest, sha_hex(TOKEN));
+    // As after a successful HTTPS push: git offers the credential to
+    // every helper it consults. Only Intent's (which stores nothing) is.
+    sh_ok(
+        &mut rpc_ws,
+        &mut events,
+        pusher,
+        "printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill | git credential approve",
+        450,
+    )
+    .await;
+    assert!(
+        !node_dir.join("git-credentials").exists(),
+        "the machine's store helper got the token"
+    );
 
     // A sub-agent in the same checkout: origin and GH_TOKEN, no helper,
     // and its first turn tells it to read only.

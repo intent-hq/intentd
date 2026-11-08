@@ -239,14 +239,12 @@ impl Checkouts for GitCheckouts {
         Box::pin(async move {
             self.storage.remove_agent(agent_id)?;
             // The worktree's registration in its cache now points nowhere.
-            self.cache
-                .prune()
-                .await
-                .map_err(|e| anyhow::anyhow!("prune the checkout caches: {e}"))?;
+            let pruned = self.cache.prune().await;
+            // Also after a failed prune: the branch is the agent's alone.
             self.cache
                 .delete_branch(&forge_agent_branch(agent_id))
                 .await;
-            Ok(())
+            pruned.map_err(|e| anyhow::anyhow!("prune the checkout caches: {e}"))
         })
     }
 

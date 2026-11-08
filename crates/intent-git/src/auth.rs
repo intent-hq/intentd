@@ -394,15 +394,16 @@ pub fn daemon_helper_env(
 }
 
 /// The [`GIT_CONFIG_PARAMETERS_ENV`] pair for a remote agent with a forge
-/// branch (nodeProtocol 15): `intentd git-credential --node` for github.com,
-/// which asks the machine's intentd at `socket` for the live token and
-/// falls back to `GH_TOKEN`, ordered ahead of the helpers git would
-/// otherwise consult (see [`daemon_helper_env`]). No token bytes.
+/// branch (nodeProtocol 15): `intentd git-credential --node` as the **only**
+/// github.com helper, which asks the machine's intentd at `socket` for the
+/// live token. The machine's own helpers are reset and not re-added: git
+/// offers a working credential to every helper it consults (`store`), and
+/// the backend's token must never reach the machine's keychain or
+/// credential files. No token bytes.
 #[must_use]
 pub fn node_helper_env(
     intentd_path: &str,
     socket: &Path,
-    cwd: Option<&Path>,
     inherited_config_parameters: Option<&str>,
 ) -> Vec<(String, String)> {
     let entry = format!(
@@ -410,10 +411,7 @@ pub fn node_helper_env(
         sh_quote(intentd_path),
         sh_quote(&socket.to_string_lossy())
     );
-    let entries = github_helper_entries(
-        entry,
-        discover_github_helpers(cwd, inherited_config_parameters).as_deref(),
-    );
+    let entries = github_helper_entries(entry, Some(&[]));
     vec![(
         GIT_CONFIG_PARAMETERS_ENV.to_string(),
         config_parameters(inherited_config_parameters, &entries),

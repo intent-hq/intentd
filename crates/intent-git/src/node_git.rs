@@ -1333,9 +1333,19 @@ impl CheckoutCache {
     ) -> Result<()> {
         let _serial = self.lock.lock().await;
         self.enable_worktree_config(worktree).await?;
-        self.git
-            .git(worktree, &["switch", "--quiet", "-C", local])
-            .await?;
+        // A relaunch keeps a checkout already on `local`, and leaves one
+        // stopped mid-rebase or mid-merge as it is: git would refuse the
+        // switch, and the agent finishes that operation itself.
+        let on_branch = self
+            .git
+            .git(worktree, &["symbolic-ref", "--quiet", "HEAD"])
+            .await
+            .is_ok_and(|head| head == format!("refs/heads/{local}"));
+        if !on_branch && !self.operation_in_progress(worktree).await {
+            self.git
+                .git(worktree, &["switch", "--quiet", "-C", local])
+                .await?;
+        }
         let merge = format!("refs/heads/{branch}");
         let branch_remote = format!("branch.{local}.remote");
         let branch_merge = format!("branch.{local}.merge");
@@ -1354,6 +1364,32 @@ impl CheckoutCache {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Whether `worktree` is in the middle of a rebase, merge, cherry-pick
+    /// or revert.
+    async fn operation_in_progress(&self, worktree: &Path) -> bool {
+        for state in [
+            "rebase-merge",
+            "rebase-apply",
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+        ] {
+            if let Ok(path) = self
+                .git
+                .git(
+                    worktree,
+                    &["rev-parse", "--path-format=absolute", "--git-path", state],
+                )
+                .await
+            {
+                if Path::new(&path).exists() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Undo [`Self::set_forge`]'s config in `worktree` (a relaunch without

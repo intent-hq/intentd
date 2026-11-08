@@ -2059,12 +2059,19 @@ impl RemoteNode {
                     link::codes::UNAVAILABLE
                 ))
             })?;
-        if command.forge.is_some()
-            && (link.protocol() < FORGE_TOKEN_PROTOCOL
-                || !self.shared.forge_ready(FORGE_LAUNCH_WAIT).await)
-        {
+        let link = if command.forge.is_some() && link.protocol() >= FORGE_TOKEN_PROTOCOL {
+            let ready = self.shared.forge_ready(FORGE_LAUNCH_WAIT).await;
+            // A rebind while waiting: the answer is the new bind's, so the
+            // launch goes on that link, or without forge if it is older.
+            let current = self.shared.current_link().unwrap_or(link);
+            if !ready || current.protocol() < FORGE_TOKEN_PROTOCOL {
+                command.forge = None;
+            }
+            current
+        } else {
             command.forge = None;
-        }
+            link
+        };
         link.send(&LinkFrame::Launch(command)).await?;
         Ok(runtime)
     }

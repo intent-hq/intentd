@@ -590,11 +590,13 @@ pub async fn serve_helpers(listener: tokio::net::UnixListener, sessions: NodeGit
 
 /// The machine's current forge token for `host`, for
 /// [`serve_helpers_with`] (nodeProtocol 15).
+#[cfg(unix)]
 pub type HelperCredential =
     std::sync::Arc<dyn Fn(&str) -> Option<intent_core::node_link::SecretValue> + Send + Sync>;
 
 /// The request line of `intentd git-credential --node`: the token for
 /// `<host>` follows.
+#[cfg(unix)]
 pub const CREDENTIAL_REQUEST: &str = "credential";
 
 /// [`serve_helpers`], also answering `credential <host>\n` from

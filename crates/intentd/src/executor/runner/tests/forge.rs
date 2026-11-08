@@ -160,3 +160,47 @@ async fn a_token_handed_over_mid_run_is_masked_in_the_running_agents_journal() {
     assert!(journal.contains("echo: say [redacted]"), "{journal}");
     assert!(!journal.contains(FORGE_CANARY), "{journal}");
 }
+
+/// A `forge` member is only for a top-level agent's own checkout, with a
+/// GitHub URL and a valid branch: anything else fails the launch as a
+/// checkout failure before the agent starts.
+#[tokio::test]
+async fn an_unusable_forge_member_fails_the_launch() {
+    let Some(h) = harness(1, &[]) else { return };
+    let good = intent_core::node_link::ForgeLaunch {
+        remote_url: "https://github.com/acme/widget.git".into(),
+        branch: "main".into(),
+    };
+    let cases = [
+        ("f1", true, good.clone()),
+        (
+            "f2",
+            false,
+            intent_core::node_link::ForgeLaunch {
+                remote_url: "https://gitlab.com/acme/widget.git".into(),
+                branch: "main".into(),
+            },
+        ),
+        (
+            "f3",
+            false,
+            intent_core::node_link::ForgeLaunch {
+                remote_url: good.remote_url.clone(),
+                branch: "a..b".into(),
+            },
+        ),
+    ];
+    for (id, is_sub_agent, forge) in cases {
+        let mut command = launch(id);
+        command.is_sub_agent = is_sub_agent;
+        command.forge = Some(Box::new(forge));
+        h.runner.launch(command).await;
+        let all = wait_for(&h.runner, "exit", exited(id)).await;
+        let error = exit_error(find(&all, exited(id))).unwrap();
+        assert!(error.starts_with(codes::CHECKOUT), "{id}: {error}");
+        assert!(
+            h.storage.existing_agent_dir(&AgentId::from(id)).is_none(),
+            "{id}"
+        );
+    }
+}

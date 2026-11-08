@@ -840,3 +840,106 @@ fn unpinned_submodules_are_the_populated_ones_outside_the_pins() {
     );
     assert!(unpinned_submodules(&root.path().join("missing"), &[]).is_err());
 }
+
+const FORGE_URL: &str = "https://github.com/acme/widget.git";
+
+fn try_config(dir: &Path, key: &str) -> Option<String> {
+    let output = StdCommand::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["config", "--get", key])
+        .output()
+        .unwrap();
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// The forge branch and `origin` belong to one checkout of the shared
+/// cache, keep the agent's uncommitted work, survive a relaunch (also one
+/// stopped mid-rebase), go with a launch without `forge`, and the branch
+/// goes with the checkout.
+#[tokio::test]
+async fn a_forge_checkout_gets_its_own_branch_and_origin() {
+    let fixture = Fixture::new();
+    let a = fixture.checkout("a").await;
+    let b = fixture.checkout("b").await;
+    std::fs::write(a.join("wip.txt"), "wip\n").unwrap();
+    fixture
+        .cache
+        .set_forge(&a, "intent/a", FORGE_URL, "main")
+        .await
+        .unwrap();
+    assert_eq!(git(&a, &["symbolic-ref", "HEAD"]), "refs/heads/intent/a");
+    assert_eq!(git(&a, &["rev-parse", "HEAD"]), fixture.base);
+    assert_eq!(std::fs::read_to_string(a.join("wip.txt")).unwrap(), "wip\n");
+    assert_eq!(
+        try_config(&a, "remote.origin.url").as_deref(),
+        Some(FORGE_URL)
+    );
+    assert_eq!(
+        try_config(&a, "branch.intent/a.merge").as_deref(),
+        Some("refs/heads/main")
+    );
+    assert_eq!(try_config(&a, "push.default").as_deref(), Some("upstream"));
+    assert_eq!(
+        try_config(&b, "remote.origin.url"),
+        None,
+        "b sees no origin"
+    );
+    assert_eq!(try_config(&b, "push.default"), None);
+
+    // A relaunch keeps the branch and the agent's commits on it.
+    std::fs::write(a.join("wip.txt"), "more\n").unwrap();
+    git(&a, &["add", "wip.txt"]);
+    git(
+        &a,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "x",
+        ],
+    );
+    let moved = git(&a, &["rev-parse", "HEAD"]);
+    fixture
+        .cache
+        .set_forge(&a, "intent/a", FORGE_URL, "main")
+        .await
+        .unwrap();
+    assert_eq!(git(&a, &["rev-parse", "intent/a"]), moved);
+
+    // Stopped mid-rebase (detached, rebase state present): no switch.
+    git(&a, &["checkout", "-q", "--detach"]);
+    let rebase = git(
+        &a,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "rebase-merge",
+        ],
+    );
+    std::fs::create_dir_all(&rebase).unwrap();
+    fixture
+        .cache
+        .set_forge(&a, "intent/a", FORGE_URL, "main")
+        .await
+        .unwrap();
+    assert_eq!(git(&a, &["rev-parse", "--abbrev-ref", "HEAD"]), "HEAD");
+    std::fs::remove_dir_all(&rebase).unwrap();
+
+    // A launch without forge: no origin.
+    fixture.cache.clear_forge(&a, "intent/a").await;
+    assert_eq!(try_config(&a, "remote.origin.url"), None);
+    assert_eq!(try_config(&a, "push.default"), None);
+
+    // The branch goes with the checkout.
+    fixture.cache.remove("repo-1", &a).await.unwrap();
+    fixture.cache.delete_branch("intent/a").await;
+    assert_eq!(try_ref(&b, "refs/heads/intent/a"), None);
+}
