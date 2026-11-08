@@ -11,7 +11,9 @@ A client advertising `browserNavigation: true` can receive `openTab`, `showTab`,
 `focusTab`, `closeTab`, and `navigate`. `browserExec: true` separately enables
 page automation. New, unnamed `openTab` requests prefer the device that sent the
 conversation's latest accepted user message, if connected and capable of the
-whole request. Otherwise the existing desktop-first, then native fallback applies.
+whole request. Otherwise the workspace browser assignment applies, then recent
+workspace focus among eligible clients. If no focused client is eligible, new
+opens use the desktop-first, then native default.
 A delegated helper without its own user receipt inherits the nearest parent's
 preference within the same workspace. Its own receipt, even from an unknown or
 currently unavailable device, stops inheritance; unrelated conversations do not
