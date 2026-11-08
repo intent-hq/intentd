@@ -56,6 +56,10 @@ use crate::runtime::RemoteAgentRuntime;
 /// Longest a bind waits to resolve the GitHub token afresh.
 const FORGE_BIND_RESOLVE: Duration = Duration::from_secs(10);
 
+/// Longest a launch that would carry `forge` waits for the bind's
+/// `forgeTokenReply` (node-link.md § Forge token on the machine, rule 2).
+const FORGE_LAUNCH_WAIT: Duration = Duration::from_secs(10);
+
 /// JSON-RPC "method not found", for machine requests head cannot serve.
 const UNSUPPORTED_CODE: i32 = -32601;
 
@@ -359,6 +363,9 @@ pub(crate) struct Shared {
     forge: Option<Arc<crate::forge_token::ForgeTokens>>,
     /// What the current link's machine confirmed of it.
     forge_confirmed: Mutex<crate::forge_token::Confirmed>,
+    /// Bumped on each bind and each answer to a `forgeToken`, so a launch
+    /// waiting on [`Self::forge_confirmed`] looks again.
+    forge_answers: watch::Sender<u64>,
     ingested: Mutex<NodeCounter>,
     /// Each agent's checkout and setup output tail (nodeProtocol 10).
     setup_outputs: Mutex<HashMap<AgentId, SetupTail>>,
@@ -387,6 +394,28 @@ impl Shared {
     #[cfg(test)]
     pub(crate) fn forge_token_confirmed(&self) -> bool {
         lock(&self.forge_confirmed).token()
+    }
+
+    /// Whether a launch may carry `forge` (node-link.md § Forge token on
+    /// the machine, rules 2 and 8): the machine confirmed a token on this
+    /// bind. Waits up to `within` for the bind's `forgeTokenReply`.
+    async fn forge_ready(&self, within: Duration) -> bool {
+        let mut answers = self.forge_answers.subscribe();
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            {
+                let confirmed = lock(&self.forge_confirmed);
+                if confirmed.settled() {
+                    return confirmed.token();
+                }
+            }
+            if !matches!(
+                tokio::time::timeout_at(deadline, answers.changed()).await,
+                Ok(Ok(()))
+            ) {
+                return lock(&self.forge_confirmed).token();
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1610,6 +1639,7 @@ impl RemoteNode {
             secret_locks: Mutex::new(HashMap::new()),
             forge,
             forge_confirmed: Mutex::default(),
+            forge_answers: watch::channel(0).0,
             ingested: Mutex::new(acked),
             cloud_refusal: watch::channel(None).0,
             demand,
@@ -2005,7 +2035,7 @@ impl RemoteNode {
     /// # Errors
     ///
     /// `node-link-unavailable` when no link comes up within the grace.
-    pub async fn launch(&self, command: LaunchCommand) -> Result<Arc<RemoteAgentRuntime>> {
+    pub async fn launch(&self, mut command: LaunchCommand) -> Result<Arc<RemoteAgentRuntime>> {
         let parked = lock(&self.shared.parked).remove(&command.agent_id);
         // A parked runtime is the stopping process's while a stop for it is
         // queued: the relaunch waits for that stop below instead.
@@ -2029,6 +2059,19 @@ impl RemoteNode {
                     link::codes::UNAVAILABLE
                 ))
             })?;
+        let link = if command.forge.is_some() && link.protocol() >= FORGE_TOKEN_PROTOCOL {
+            let ready = self.shared.forge_ready(FORGE_LAUNCH_WAIT).await;
+            // A rebind while waiting: the answer is the new bind's, so the
+            // launch goes on that link, or without forge if it is older.
+            let current = self.shared.current_link().unwrap_or(link);
+            if !ready || current.protocol() < FORGE_TOKEN_PROTOCOL {
+                command.forge = None;
+            }
+            current
+        } else {
+            command.forge = None;
+            link
+        };
         link.send(&LinkFrame::Launch(command)).await?;
         Ok(runtime)
     }
@@ -2338,6 +2381,7 @@ async fn run(
                 // A bind starts with nothing confirmed.
                 *lock(&shared.forge_confirmed) = crate::forge_token::Confirmed::default();
                 crate::forge_token::send(&link, &held, &shared.forge_confirmed).await;
+                shared.forge_answers.send_modify(|n| *n = n.wrapping_add(1));
                 Some(changes)
             }
             _ => None,
@@ -2548,6 +2592,7 @@ async fn serve(
                     LinkEvent::Frame(LinkFrame::ForgeTokenReply(reply)) => {
                         let ok = reply.outcome == SecretOutcome::Ok;
                         lock(&shared.forge_confirmed).answer(reply.request_id, ok);
+                        shared.forge_answers.send_modify(|n| *n = n.wrapping_add(1));
                         if !ok {
                             // A fixed code only, never the peer's text.
                             let error = match reply.error.as_deref() {

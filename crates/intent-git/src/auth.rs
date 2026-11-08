@@ -393,6 +393,31 @@ pub fn daemon_helper_env(
     )]
 }
 
+/// The [`GIT_CONFIG_PARAMETERS_ENV`] pair for a remote agent with a forge
+/// branch (nodeProtocol 15): `intentd git-credential --node` as the **only**
+/// github.com helper, which asks the machine's intentd at `socket` for the
+/// live token. The machine's own helpers are reset and not re-added: git
+/// offers a working credential to every helper it consults (`store`), and
+/// the backend's token must never reach the machine's keychain or
+/// credential files. No token bytes.
+#[must_use]
+pub fn node_helper_env(
+    intentd_path: &str,
+    socket: &Path,
+    inherited_config_parameters: Option<&str>,
+) -> Vec<(String, String)> {
+    let entry = format!(
+        "{GITHUB_HELPER_KEY}=!{} git-credential --node --socket {}",
+        sh_quote(intentd_path),
+        sh_quote(&socket.to_string_lossy())
+    );
+    let entries = github_helper_entries(entry, Some(&[]));
+    vec![(
+        GIT_CONFIG_PARAMETERS_ENV.to_string(),
+        config_parameters(inherited_config_parameters, &entries),
+    )]
+}
+
 /// Offer the on-demand GitLab helper for one full HTTPS instance. An unset or
 /// disabled daemon policy answers silently. Existing helpers keep their order;
 /// no credentials are placed in environment, config, URLs or arguments.

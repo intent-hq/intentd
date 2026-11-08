@@ -38,6 +38,7 @@ subtle = "2"
 hex = "0.4"
 whoami = "2"
 base64.workspace = true
+zeroize = "1.9"
 socket2 = "0.6"
 semver = "1.0.28"
 uuid = { workspace = true }

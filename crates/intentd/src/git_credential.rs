@@ -155,5 +155,102 @@ pub(crate) fn extract_credential(response: &Value) -> Option<(String, String)> {
     Some((username.to_string(), password.to_string()))
 }
 
+/// The longest token the machine hands out (node-link.md § Forge token on
+/// the machine, rule 6), plus its status byte and newline.
+const MAX_NODE_REPLY: u64 = 16 * 1024 + 2;
+
+/// `intentd git-credential --node` (nodeProtocol 15), for a top-level remote
+/// agent's git: answers `get` for HTTPS github.com with the backend's live
+/// token from the machine's intentd at `socket`; `$GH_TOKEN` only when that
+/// intentd cannot be reached. Silent when the machine holds no token and on
+/// everything else, like [`run`]. The token is never logged.
+pub async fn run_node(operation: &str, socket: &Path) {
+    let attrs = parse_attributes(std::io::stdin().lock());
+    let Some(token) = node_credential(operation, &attrs, socket, DAEMON_RPC_TIMEOUT).await else {
+        return;
+    };
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(
+        stdout,
+        "username={}\npassword={}",
+        intent_git::auth::TOKEN_USERNAME,
+        token.as_str()
+    );
+    let _ = stdout.flush();
+}
+
+/// The token for a github.com `get`: the machine's live one, else
+/// `$GH_TOKEN`.
+async fn node_credential(
+    operation: &str,
+    attrs: &BTreeMap<String, String>,
+    socket: &Path,
+    wait: Duration,
+) -> Option<zeroize::Zeroizing<String>> {
+    let github = operation == "get"
+        && attrs
+            .get("protocol")
+            .is_some_and(|p| p.eq_ignore_ascii_case("https"))
+        && attrs
+            .get("host")
+            .is_some_and(|h| h.eq_ignore_ascii_case("github.com"))
+        && attrs
+            .get("username")
+            .is_none_or(|u| u == intent_git::auth::TOKEN_USERNAME);
+    if !github {
+        return None;
+    }
+    // The machine's answer wins, also "none" (revoked, gate off, dropped);
+    // the spawn-time GH_TOKEN covers only a machine that cannot be reached.
+    let token = match tokio::time::timeout(wait, machine_token(socket)).await {
+        Ok(Some(answer)) => answer,
+        Ok(None) | Err(_) => std::env::var("GH_TOKEN").ok().map(zeroize::Zeroizing::new),
+    };
+    token.filter(|token| usable(token))
+}
+
+/// The machine's answer: `Some(None)` when it holds no token, `None` when
+/// it cannot be reached or answers nothing usable.
+type MachineAnswer = Option<Option<zeroize::Zeroizing<String>>>;
+
+/// Ask the machine's intentd for the held token.
+#[cfg(not(unix))]
+#[expect(clippy::unused_async, reason = "matches the unix signature")]
+async fn machine_token(_socket: &Path) -> MachineAnswer {
+    None
+}
+
+/// Ask the machine's intentd for the held token.
+#[cfg(unix)]
+async fn machine_token(socket: &Path) -> MachineAnswer {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut stream = tokio::net::UnixStream::connect(socket).await.ok()?;
+    let request = format!(
+        "{} github.com\n",
+        intent_transport::node_link::CREDENTIAL_REQUEST
+    );
+    stream.write_all(request.as_bytes()).await.ok()?;
+    let mut reply = zeroize::Zeroizing::new(Vec::new());
+    (&mut stream)
+        .take(MAX_NODE_REPLY + 1)
+        .read_to_end(&mut reply)
+        .await
+        .ok()?;
+    if reply.first() == Some(&1) {
+        return Some(None);
+    }
+    let token = reply.strip_prefix(&[0])?.strip_suffix(b"\n")?;
+    let token = std::str::from_utf8(token).ok()?;
+    Some(Some(zeroize::Zeroizing::new(token.to_owned())))
+}
+
+/// Whether `token` can go on a git-credential line.
+fn usable(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() as u64 <= MAX_NODE_REPLY
+        && !token.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
 #[cfg(test)]
 mod tests;

@@ -205,17 +205,30 @@ pub(crate) struct Confirmed {
     /// carried; at most [`MAX_PENDING`], so a machine that never answers
     /// holds nothing.
     pending: VecDeque<(LinkId, Digest)>,
+    /// The first frame sent on this bind, and whether it was answered.
+    bind: Option<(LinkId, bool)>,
 }
 
 impl Confirmed {
     /// Whether the machine confirmed a token (not `null`) on this link.
-    #[cfg(test)]
     pub(crate) fn token(&self) -> bool {
         matches!(self.value, Some(Digest(Some(_))))
     }
 
+    /// Whether this bind's first frame was answered, or the machine
+    /// confirmed a value since: a launch that would carry `forge` stops
+    /// waiting.
+    pub(crate) fn settled(&self) -> bool {
+        self.value.is_some() || self.bind.is_some_and(|(_, answered)| answered)
+    }
+
     /// Record the machine's answer to frame `request_id`.
     pub(crate) fn answer(&mut self, request_id: LinkId, ok: bool) {
+        if let Some((id, answered)) = &mut self.bind {
+            if *id == request_id {
+                *answered = true;
+            }
+        }
         if let Some(at) = self.pending.iter().position(|(id, _)| *id == request_id) {
             if let Some((_, digest)) = self.pending.remove(at) {
                 if ok {
@@ -240,6 +253,9 @@ pub(crate) async fn send(link: &NodeLink, held: &Held, confirmed: &Mutex<Confirm
                 confirmed.pending.pop_front();
             }
             confirmed.pending.push_back((forge.request_id, held.digest));
+            if confirmed.bind.is_none() {
+                confirmed.bind = Some((forge.request_id, false));
+            }
         }
         frame
     };

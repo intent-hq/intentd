@@ -1571,3 +1571,42 @@ fn launch_forge_is_optional_and_needs_protocol_15() {
     open["forge"]["extra"] = json!(1);
     assert!(LinkFrame::decode(open.to_string().as_bytes()).is_err());
 }
+
+#[test]
+fn forge_launch_normalizes_github_origins_and_refuses_the_rest() {
+    for origin in [
+        "git@github.com:acme/widget.git",
+        "https://x-access-token@github.com/acme/widget",
+        "ssh://git@github.com/acme/widget.git",
+    ] {
+        assert_eq!(
+            ForgeLaunch::for_github(origin, "feat/x"),
+            Some(ForgeLaunch {
+                remote_url: "https://github.com/acme/widget.git".into(),
+                branch: "feat/x".into(),
+            }),
+            "{origin}"
+        );
+    }
+    for origin in [
+        "https://gitlab.com/acme/widget.git",
+        "/srv/widget.git",
+        "https://example.invalid/a@github.com/acme/widget.git",
+    ] {
+        assert_eq!(ForgeLaunch::for_github(origin, "main"), None, "{origin}");
+    }
+    for branch in [
+        "", "@", "-x", "a..b", "a b", "a:b", "x.lock", "a/.b", "a//b", "a/", "a@{1}", "a\u{7f}",
+    ] {
+        assert_eq!(
+            ForgeLaunch::for_github("git@github.com:acme/widget.git", branch),
+            None,
+            "{branch:?}"
+        );
+    }
+    let bad_url = ForgeLaunch {
+        remote_url: "https://github.com/acme/widget.git/../x.git".into(),
+        branch: "main".into(),
+    };
+    assert!(!bad_url.is_valid());
+}

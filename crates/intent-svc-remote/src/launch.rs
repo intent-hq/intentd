@@ -20,8 +20,8 @@ use intent_core::machine_selection::{
 use intent_core::machines::ExposedMachine;
 use intent_core::node_link::MachineCapabilities;
 use intent_core::node_link::{
-    FinalPush, LaunchCommand, LaunchProfileEnv, PreparedCheckout, SetupCommand, SubmodulePin,
-    MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL, SHARED_CHECKOUT_PROTOCOL,
+    FinalPush, ForgeLaunch, LaunchCommand, LaunchProfileEnv, PreparedCheckout, SetupCommand,
+    SubmodulePin, MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL, SHARED_CHECKOUT_PROTOCOL,
 };
 use intent_core::placement::{
     AgentPlacement, MachineRef, PlacementCheckout, PlacementTarget, PlacementUnavailable,
@@ -95,6 +95,19 @@ async fn workspace_checkout(svc: &Services, workspace_id: &WorkspaceId) -> Resul
             "remote agents need a workspace with a git repository to start from".into(),
         )
     })
+}
+
+/// The `forge` member a top-level agent of `workspace_id` would carry
+/// (nodeProtocol 15): the workspace branch and its checkout's `origin`,
+/// normalized to HTTPS GitHub; `None` when that `origin` is not on GitHub.
+/// The connector drops it unless the machine holds a token.
+async fn forge_launch(svc: &Services, workspace_id: &WorkspaceId) -> Option<Box<ForgeLaunch>> {
+    let workspace = svc.store().get_workspace(workspace_id).await.ok()?;
+    let checkout = checkout_path(&workspace)?;
+    let origin = blocking(move || intent_git::remote::origin_url(&checkout))
+        .await
+        .ok()??;
+    ForgeLaunch::for_github(&origin, &workspace.branch).map(Box::new)
 }
 
 /// Whether an agent with `submodules` and `setup` starts from a checkout a
@@ -1070,6 +1083,12 @@ impl RemoteLaunchPort for RemoteLaunch {
                     .is_some_and(|entry| entry.truncates_tool_descriptions);
             let checkout_dir = workspace_checkout(svc, &record.workspace_id).await?;
             let repo_key = blocking(move || node_git::repo_key(&checkout_dir)).await?;
+            // Only a top-level agent gets the workspace branch and `origin`.
+            let forge = if is_sub_agent || checkout_of.is_some() {
+                None
+            } else {
+                forge_launch(svc, &record.workspace_id).await
+            };
             let runtime = node
                 .launch(LaunchCommand {
                     agent_id: agent_id.clone(),
@@ -1085,7 +1104,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     mcp_proxies,
                     compact_tool_descriptions,
                     checkout_of,
-                    forge: None,
+                    forge,
                 })
                 .await?;
             Ok(runtime as Arc<RemoteRuntime>)

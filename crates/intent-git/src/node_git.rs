@@ -1256,6 +1256,18 @@ impl CheckoutCache {
     /// moving its `core.bare` to the cache's own worktree config first, so
     /// no other worktree of it ever reads itself as bare.
     async fn activate(&self, parent: &Path, name: &str) -> Result<()> {
+        self.enable_worktree_config(parent).await?;
+        let key = format!("submodule.{name}.active");
+        self.git
+            .git(parent, &["config", "--worktree", &key, "true"])
+            .await?;
+        Ok(())
+    }
+
+    /// Turn on per-worktree config in `worktree`'s shared cache (see
+    /// [`Self::activate`]).
+    async fn enable_worktree_config(&self, worktree: &Path) -> Result<()> {
+        let parent = worktree;
         let common = PathBuf::from(
             self.git
                 .git(
@@ -1298,11 +1310,136 @@ impl CheckoutCache {
                 )
                 .await?;
         }
-        let key = format!("submodule.{name}.active");
-        self.git
-            .git(parent, &["config", "--worktree", &key, "true"])
-            .await?;
         Ok(())
+    }
+
+    /// Node side (nodeProtocol 15): put `worktree` on the agent-local
+    /// branch `local` at its current commit (created, or reset on a
+    /// relaunch) and make `branch` on `remote_url` its upstream, with
+    /// worktree-scoped config so no other checkout of the shared cache sees
+    /// it: `origin`, its fetch refspec, the branch's remote and merge, and
+    /// `push.default = upstream`. No credential is configured.
+    ///
+    /// # Errors
+    ///
+    /// When a git step fails, for example because another checkout uses
+    /// `local`.
+    pub async fn set_forge(
+        &self,
+        worktree: &Path,
+        local: &str,
+        remote_url: &str,
+        branch: &str,
+    ) -> Result<()> {
+        let _serial = self.lock.lock().await;
+        self.enable_worktree_config(worktree).await?;
+        // A relaunch keeps a checkout already on `local`, and leaves one
+        // stopped mid-rebase or mid-merge as it is: git would refuse the
+        // switch, and the agent finishes that operation itself.
+        let on_branch = self
+            .git
+            .git(worktree, &["symbolic-ref", "--quiet", "HEAD"])
+            .await
+            .is_ok_and(|head| head == format!("refs/heads/{local}"));
+        if !on_branch && !self.operation_in_progress(worktree).await {
+            self.git
+                .git(worktree, &["switch", "--quiet", "-C", local])
+                .await?;
+        }
+        let merge = format!("refs/heads/{branch}");
+        let branch_remote = format!("branch.{local}.remote");
+        let branch_merge = format!("branch.{local}.merge");
+        for (key, value) in [
+            ("remote.origin.url", remote_url),
+            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+            (branch_remote.as_str(), "origin"),
+            (branch_merge.as_str(), merge.as_str()),
+            ("push.default", "upstream"),
+        ] {
+            self.git
+                .git(
+                    worktree,
+                    &["config", "--worktree", "--replace-all", key, value],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Whether `worktree` is in the middle of a rebase, merge, cherry-pick
+    /// or revert.
+    async fn operation_in_progress(&self, worktree: &Path) -> bool {
+        for state in [
+            "rebase-merge",
+            "rebase-apply",
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+        ] {
+            if let Ok(path) = self
+                .git
+                .git(
+                    worktree,
+                    &["rev-parse", "--path-format=absolute", "--git-path", state],
+                )
+                .await
+            {
+                if Path::new(&path).exists() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Undo [`Self::set_forge`]'s config in `worktree` (a relaunch without
+    /// `forge`): it then has no `origin`. Missing entries are fine.
+    pub async fn clear_forge(&self, worktree: &Path, local: &str) {
+        let _serial = self.lock.lock().await;
+        let Ok(own) = self
+            .git
+            .git(
+                worktree,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "config.worktree",
+                ],
+            )
+            .await
+        else {
+            return;
+        };
+        if !Path::new(&own).is_file() {
+            return;
+        }
+        let branch = format!("branch.{local}");
+        for args in [
+            ["config", "--worktree", "--remove-section", "remote.origin"],
+            ["config", "--worktree", "--remove-section", branch.as_str()],
+            ["config", "--worktree", "--unset-all", "push.default"],
+        ] {
+            let _ = self.git.git(worktree, &args).await;
+        }
+    }
+
+    /// Delete the agent-local branch `local` from every repository cache,
+    /// once its checkout is gone. Missing branches are fine.
+    pub async fn delete_branch(&self, local: &str) {
+        let _serial = self.lock.lock().await;
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return;
+        };
+        let name = format!("refs/heads/{local}");
+        for entry in entries.flatten() {
+            let cache = entry.path();
+            if cache.extension().is_some_and(|ext| ext == "git") && cache.join("HEAD").is_file() {
+                if let Err(error) = self.git.git(&cache, &["update-ref", "-d", &name]).await {
+                    tracing::warn!(%error, "node git: could not delete an agent branch");
+                }
+            }
+        }
     }
 
     /// Fetch `remote`'s refs into the bare `cache` (created on first use)

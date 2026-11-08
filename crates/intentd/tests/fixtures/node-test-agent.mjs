@@ -36,11 +36,13 @@
 // `<available_skills>` catalog anywhere in the raw prompt (or "skills: none").
 // A prompt with a block "echo-raw" streams "raw: {cwd, raw}" with its working
 // directory and the whole raw prompt (instructions included).
+// "sh <tag> <command>" runs <command> in the working directory with the
+// agent's environment and streams "sh-out <tag> {code, out}".
 import readline from 'node:readline';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 const argv = process.argv.slice(2);
 const exitAt = argv.indexOf('--exit-on-start');
@@ -309,7 +311,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       if (text === 'auth-required') return send({ id: msg.id, error: AUTH_REQUIRED });
       // The SHA-256 of a variable, never its value: `unset` without one.
       // An optional tag marks this turn's reply.
-      const digest = text.match(/^sha-env (\S+)(?: (\S+))?$/);
+      const digest = text.match(/(?:^|\n)sha-env (\S+)(?: (\S+))?$/);
       if (digest) {
         const value = process.env[digest[1]];
         const shown = value === undefined ? 'unset' : crypto.createHash('sha256').update(value).digest('hex');
@@ -318,6 +320,26 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
           params: {
             sessionId: SESSION,
             update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `sha ${digest[2] ?? '-'} ${shown}` } },
+          },
+        });
+        return send({ id: msg.id, result: { stopReason: 'end_turn' } });
+      }
+      // "sh <tag> <command>" (the prompt's last line: a wake may prefix
+      // context) runs <command> with sh in the working directory
+      // and the agent's own environment (no terminal prompts), and streams
+      // "sh-out <tag> {code, out}" with its exit code and combined output.
+      const shell = text.match(/(?:^|\n)sh (\S+) ([^\n]+)$/);
+      if (shell) {
+        const run = spawnSync('sh', ['-c', shell[2]], {
+          encoding: 'utf8',
+          env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+        });
+        const out = `${run.stdout ?? ''}${run.stderr ?? ''}`.trim();
+        send({
+          method: 'session/update',
+          params: {
+            sessionId: SESSION,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `sh-out ${shell[1]} ${JSON.stringify({ code: run.status, out })}` } },
           },
         });
         return send({ id: msg.id, result: { stopReason: 'end_turn' } });

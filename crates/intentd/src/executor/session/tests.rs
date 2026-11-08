@@ -66,6 +66,7 @@ fn harness() -> Harness {
         journal,
         home: None,
         mcp_bridge_exe: std::env::current_exe().unwrap(),
+        git_socket: None,
         auth_failed: Arc::new(|_: &str| {}),
     });
     Harness { runner, _dir: dir }

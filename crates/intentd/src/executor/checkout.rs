@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 
-use intent_core::node_link::SubmodulePin;
+use intent_core::node_link::{forge_agent_branch, ForgeLaunch, SubmodulePin};
 use intent_core::{AgentId, BoxFuture, WorkspaceId};
 use intent_git::node_git::{self, AgentRemote, CheckoutCache, ModuleCheckout};
 
@@ -80,6 +80,19 @@ pub(super) trait Checkouts: Send + Sync {
     /// Remove the agent's directory and its worktree's registration in the
     /// caches; removing an agent with none is a no-op.
     fn remove<'a>(&'a self, agent_id: &'a AgentId) -> BoxFuture<'a, anyhow::Result<()>>;
+
+    /// Give the agent's own checkout `worktree` its agent-local branch and
+    /// worktree-scoped `origin` for `forge` (nodeProtocol 15), or remove
+    /// them for a launch without one.
+    fn forge<'a>(
+        &'a self,
+        agent_id: &'a AgentId,
+        worktree: &'a Path,
+        forge: Option<&'a ForgeLaunch>,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        let _ = (agent_id, worktree, forge);
+        Box::pin(async { Ok(()) })
+    }
 
     /// Test seam: runs as the bind sweep is about to remove a checkout.
     #[cfg(test)]
@@ -226,10 +239,32 @@ impl Checkouts for GitCheckouts {
         Box::pin(async move {
             self.storage.remove_agent(agent_id)?;
             // The worktree's registration in its cache now points nowhere.
+            let pruned = self.cache.prune().await;
+            // Also after a failed prune: the branch is the agent's alone.
             self.cache
-                .prune()
-                .await
-                .map_err(|e| anyhow::anyhow!("prune the checkout caches: {e}"))
+                .delete_branch(&forge_agent_branch(agent_id))
+                .await;
+            pruned.map_err(|e| anyhow::anyhow!("prune the checkout caches: {e}"))
+        })
+    }
+
+    fn forge<'a>(
+        &'a self,
+        agent_id: &'a AgentId,
+        worktree: &'a Path,
+        forge: Option<&'a ForgeLaunch>,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let local = forge_agent_branch(agent_id);
+            if let Some(forge) = forge {
+                return self
+                    .cache
+                    .set_forge(worktree, &local, &forge.remote_url, &forge.branch)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("set up the agent's branch and origin: {e}"));
+            }
+            self.cache.clear_forge(worktree, &local).await;
+            Ok(())
         })
     }
 }

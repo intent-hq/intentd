@@ -307,6 +307,14 @@ enum Command {
     GitCredential {
         /// The git-credential operation: `get`, `store`, or `erase`.
         operation: String,
+        /// On a machine serving remote agents (nodeProtocol 15): answer
+        /// `get` for HTTPS github.com with the backend's live token from
+        /// the machine's intentd at `--socket`, else `$GH_TOKEN`.
+        #[arg(long, requires = "socket")]
+        node: bool,
+        /// The machine's per-backend helper socket, with `--node`.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<std::path::PathBuf>,
     },
     /// WSAPI-1 spike: evaluate an `(async () => { <code> })()` snippet in an
     /// isolated QuickJS context with a wall-clock timeout, and print the
@@ -518,7 +526,17 @@ async fn async_main(cli: Cli) -> ExitCode {
                     )
                 }
             }
-            Command::GitCredential { operation } => cmd_git_credential(&operation).await,
+            Command::GitCredential {
+                operation,
+                node,
+                socket,
+            } => match socket.filter(|_| node) {
+                Some(socket) => {
+                    git_credential::run_node(&operation, &socket).await;
+                    ExitCode::SUCCESS
+                }
+                None => cmd_git_credential(&operation).await,
+            },
             #[cfg(feature = "js-engine")]
             Command::JsEval { code, timeout_ms } => to_exit(cmd_js_eval(&code, timeout_ms).await),
         }

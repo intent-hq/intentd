@@ -585,16 +585,44 @@ impl Drop for GitSession {
 /// then carries the session's bytes both ways.
 #[cfg(unix)]
 pub async fn serve_helpers(listener: tokio::net::UnixListener, sessions: NodeGitSessions) {
+    serve_helpers_with(listener, sessions, None).await;
+}
+
+/// The machine's current forge token for `host`, for
+/// [`serve_helpers_with`] (nodeProtocol 15).
+#[cfg(unix)]
+pub type HelperCredential =
+    std::sync::Arc<dyn Fn(&str) -> Option<intent_core::node_link::SecretValue> + Send + Sync>;
+
+/// The request line of `intentd git-credential --node`: the token for
+/// `<host>` follows.
+#[cfg(unix)]
+pub const CREDENTIAL_REQUEST: &str = "credential";
+
+/// [`serve_helpers`], also answering `credential <host>\n` from
+/// `credential`: status byte `0` then the token and `\n`, or `1` then an
+/// error code line. The token is never logged.
+#[cfg(unix)]
+pub async fn serve_helpers_with(
+    listener: tokio::net::UnixListener,
+    sessions: NodeGitSessions,
+    credential: Option<HelperCredential>,
+) {
     while let Ok((stream, _)) = listener.accept().await {
         let sessions = sessions.clone();
+        let credential = credential.clone();
         tokio::spawn(async move {
-            let _ = serve_helper(stream, &sessions).await;
+            let _ = serve_helper(stream, &sessions, credential.as_ref()).await;
         });
     }
 }
 
 #[cfg(unix)]
-async fn serve_helper(stream: tokio::net::UnixStream, sessions: &NodeGitSessions) -> Result<()> {
+async fn serve_helper(
+    stream: tokio::net::UnixStream,
+    sessions: &NodeGitSessions,
+    credential: Option<&HelperCredential>,
+) -> Result<()> {
     use tokio::io::AsyncBufReadExt as _;
 
     let (read, mut write) = stream.into_split();
@@ -609,6 +637,16 @@ async fn serve_helper(stream: tokio::net::UnixStream, sessions: &NodeGitSessions
         .ok()
         .and_then(|line| line.strip_suffix('\n'))
         .and_then(|line| line.split_once(' '));
+    if let Some((CREDENTIAL_REQUEST, host)) = request {
+        let token = credential.and_then(|credential| credential(host));
+        let reply = match &token {
+            Some(token) => zeroize::Zeroizing::new(format!("\x00{}\n", token.expose())),
+            None => zeroize::Zeroizing::new(format!("\x01{}\n", codes::UNAVAILABLE)),
+        };
+        let _ = write.write_all(reply.as_bytes()).await;
+        let _ = write.shutdown().await;
+        return Ok(());
+    }
     let opened = match request {
         Some((service, url)) => match (GitService::parse(service), AgentRemote::parse(url)) {
             (Ok(service), Ok(remote)) => sessions.open(service, &remote).await,

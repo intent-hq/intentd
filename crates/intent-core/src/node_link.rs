@@ -486,6 +486,75 @@ pub struct ForgeLaunch {
     pub branch: String,
 }
 
+impl ForgeLaunch {
+    /// The forge member for a workspace whose checkout's `origin` is
+    /// `origin` and whose branch is `branch`: `None` unless `origin` names a
+    /// GitHub repository (normalized to its HTTPS URL) and `branch` is a
+    /// valid branch name.
+    #[must_use]
+    pub fn for_github(origin: &str, branch: &str) -> Option<Self> {
+        let repo = crate::git_remote_url::GitRemoteUrl::parse(origin)?.github_repo()?;
+        let launch = Self {
+            remote_url: format!("https://github.com/{}/{}.git", repo.owner, repo.name),
+            branch: branch.to_owned(),
+        };
+        launch.is_valid().then_some(launch)
+    }
+
+    /// Whether `remote_url` has the form `https://github.com/<owner>/<repo>.git`
+    /// and `branch` is a valid branch name; a launch with any other fails
+    /// with `node-checkout-failed`.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let segment = |s: &str| {
+            !s.is_empty()
+                && !s.starts_with('.')
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        };
+        let url_ok = self
+            .remote_url
+            .strip_prefix("https://github.com/")
+            .and_then(|rest| rest.strip_suffix(".git"))
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(owner, name)| segment(owner) && segment(name));
+        url_ok && valid_branch_name(&self.branch)
+    }
+}
+
+/// The agent-local branch a top-level agent with [`LaunchCommand::forge`]
+/// works on (nodeProtocol 15).
+#[must_use]
+pub fn forge_agent_branch(agent_id: &AgentId) -> String {
+    format!("intent/{}", agent_id.0)
+}
+
+/// Whether `name` is a branch name git accepts (`git check-ref-format
+/// --branch` without `@{-N}` shorthands).
+#[must_use]
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "git refuses only a lowercase `.lock` component suffix"
+)]
+pub fn valid_branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "@"
+        && !name.starts_with(['-', '/'])
+        && !name.ends_with(['/', '.'])
+        && !name.contains("..")
+        && !name.contains("//")
+        && !name.contains("@{")
+        && !name.chars().any(|c| {
+            c.is_ascii_control()
+                || c.is_whitespace()
+                || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
+        && name
+            .split('/')
+            .all(|part| !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
 /// Backend to machine (nodeProtocol 13): push `agent_id`'s checkout now,
 /// as after a turn. The machine answers with one [`PushWipResult`] for
 /// `request_id`. The body is closed.

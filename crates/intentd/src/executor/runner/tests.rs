@@ -121,6 +121,7 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
         checkouts: checkouts.clone(),
         journal,
         mcp_bridge_exe: std::env::current_exe().unwrap(),
+        git_socket: None,
         home: Some(dir.path().join("home")),
         auth_failed: {
             let auth_failures = auth_failures.clone();
@@ -431,6 +432,7 @@ async fn a_pump_ending_without_an_exit_record_settles_it_as_lost() {
         checkouts: crate::executor::checkout::PlainCheckouts::new(storage.clone()),
         journal: Journal::open(&storage.journal_dir()).unwrap(),
         mcp_bridge_exe: std::env::current_exe().unwrap(),
+        git_socket: None,
         home: None,
         auth_failed: Arc::new(|_: &str| {}),
     });
