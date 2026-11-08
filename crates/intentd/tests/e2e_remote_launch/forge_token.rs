@@ -233,9 +233,23 @@ async fn an_older_machine_starts_its_agents_without_the_token() {
         gh_token_digest(&mut rpc_ws, &mut events, (&ws_id, &agent), 100).await,
         "unset"
     );
-    let traffic = ok(&mut rpc_ws, 200, "remoteLinkTraffic.snapshot", json!({})).await;
-    let captured = traffic.to_string();
-    assert!(captured.contains("launch"), "{captured}");
+    // The capture records in the background: wait for the launch.
+    let deadline = tokio::time::Instant::now() + wait();
+    let mut id = 200;
+    let captured = loop {
+        let traffic = ok(&mut rpc_ws, id, "remoteLinkTraffic.snapshot", json!({})).await;
+        let captured = traffic.to_string();
+        if captured.contains("\"launch\"") {
+            break captured;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no launch captured: {captured}"
+        );
+        id += 1;
+        // timing-guard: poll interval for the capture's background recorder (no event exposes it)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert!(!captured.contains("forgeToken"), "{captured}");
     drop(machine);
 }
