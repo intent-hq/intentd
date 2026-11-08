@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.157] - 2026-11-08
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Word a merge-queue CI failure as a CI failure, not a conflict ([#3159](https://github.com/intent-hq/intentd/pull/3159))
+
+
 ## [0.11.156] - 2026-11-08
 
 ### 🐛 Bug Fixes
