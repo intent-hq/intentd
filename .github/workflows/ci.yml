@@ -2438,21 +2438,6 @@ jobs:
         run: ./scripts/test-e2b-template.mjs
       - name: Test optional Intel cargo-dist network handling (offline)
         run: python3 -I -B scripts/test-optional-intel-dist-network.py
-      # Job-private, unmanaged install: keeps cargo-dist out of a home
-      # directory that a persistent runner may share between jobs. Cached by
-      # the dist config; install-cargo-dist.sh checks the version and builds
-      # from crates.io when the release download fails.
-      - name: Restore the pinned cargo-dist
-        uses: actions/cache@v6
-        with:
-          path: ${{ runner.temp }}/cargo-dist
-          key: cargo-dist-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dist-workspace.toml') }}
-      - name: Test optional Intel cargo-dist publication
-        shell: bash
-        run: |
-          dir="$RUNNER_TEMP/cargo-dist"
-          bash scripts/install-cargo-dist.sh "$dir"
-          PATH="$dir:$PATH" python3 -I -B scripts/test-optional-intel-dist.py
       - name: Test local and CI caller policy
         run: |
           python3 -S scripts/test-test-policy.py
@@ -2504,6 +2489,22 @@ jobs:
           INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
           INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
         run: python3 scripts/setup-sccache.py
+      # Job-private, unmanaged install: keeps cargo-dist out of a home
+      # directory that a persistent runner may share between jobs. Cached by
+      # the dist config; install-cargo-dist.sh checks the version and builds
+      # from crates.io when the release download fails, so it runs after the
+      # toolchain and compiler-cache setup.
+      - name: Restore the pinned cargo-dist
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/cargo-dist
+          key: cargo-dist-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dist-workspace.toml') }}
+      - name: Test optional Intel cargo-dist publication
+        shell: bash
+        run: |
+          dir="$RUNNER_TEMP/cargo-dist"
+          bash scripts/install-cargo-dist.sh "$dir"
+          PATH="$dir:$PATH" python3 -I -B scripts/test-optional-intel-dist.py
       - name: Test WebDAV compiler reuse and source invalidation
         run: python3 -B scripts/test-release-cache-smoke.py
       - name: Test publish-channel-manifest.sh

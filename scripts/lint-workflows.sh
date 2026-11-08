@@ -115,7 +115,7 @@ install_actionlint() {
       --retry-max-time 300 --connect-timeout 30 --max-time 120 \
       --output "$staging/$archive" "$url"; then
     if command -v go >/dev/null 2>&1 &&
-        GOBIN="$staging" GOFLAGS=-mod=mod go install "github.com/rhysd/actionlint/cmd/actionlint@v$ACTIONLINT_VERSION"; then
+        GOBIN="$staging" go install "github.com/rhysd/actionlint/cmd/actionlint@v$ACTIONLINT_VERSION"; then
       mv -f "$staging/actionlint" "$dir/actionlint"
       rm -rf "$staging"
       echo "lint-workflows: $url failed; built actionlint $ACTIONLINT_VERSION with go install at $dir/actionlint"

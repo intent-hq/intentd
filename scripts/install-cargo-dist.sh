@@ -14,17 +14,18 @@ set -euo pipefail
 dir=${1:?usage: scripts/install-cargo-dist.sh DIR}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 root=$(cd "$script_dir/.." && pwd -P)
-version=$(sed -nE 's/^cargo-dist-version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$root/dist-workspace.toml")
+version=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["dist"]["cargo-dist-version"])' "$root/dist-workspace.toml" 2>/dev/null || true)
 if [ -z "$version" ]; then
   echo "::error::install-cargo-dist.sh: no cargo-dist-version in dist-workspace.toml" >&2
   exit 2
 fi
 
 installed() {
-  local found
+  local out
   [ -x "$dir/dist" ] || return 1
-  found=$("$dir/dist" --version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1) || return 1
-  [ "$found" = "$version" ]
+  out=$("$dir/dist" --version 2>/dev/null) || return 1
+  case " $out " in *" $version "*) return 0 ;; esac
+  return 1
 }
 
 if installed; then
@@ -34,9 +35,13 @@ fi
 mkdir -p "$dir"
 url="https://github.com/axodotdev/cargo-dist/releases/download/v${version}/cargo-dist-installer.sh"
 if INSTALL_DIST_SHELL=sh \
-    INSTALL_DIST_RUN="curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused -LsSf '$url' | CARGO_DIST_UNMANAGED_INSTALL='$dir' sh" \
+    INSTALL_DIST_RUN="curl --proto '=https' --tlsv1.2 --retry 2 --retry-connrefused -LsSf '$url' | CARGO_DIST_UNMANAGED_INSTALL='$dir' sh" \
     bash "$script_dir/install-dist.sh" && installed; then
   exit 0
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "::error::install-cargo-dist: the cargo-dist $version release download failed and cargo is not on PATH to build it" >&2
+  exit 1
 fi
 echo "::warning::install-cargo-dist: the cargo-dist $version release download failed; building it from crates.io" >&2
 staging=$(mktemp -d "$dir/.cargo-dist-staging.XXXXXX")
