@@ -801,6 +801,7 @@ fn golden_pr_monitor_unmergeable_queue_entry() {
             state: Some(state.to_string()),
             enqueued_at: None,
             estimated_time_to_merge: None,
+            failed_check: None,
         });
         s
     };
@@ -835,6 +836,79 @@ fn golden_pr_monitor_unmergeable_queue_entry() {
          dequeue it, merge-tree this head against the entry ahead's merge-group branch (or \
          origin/<base>); re-enqueue the same commit if clean, else fix the branch first"
     );
+}
+
+/// intent-hq/intent#8833: a failed merge-group run turns the entry
+/// `unmergeable` minutes before the queue ejects it. With a failed check on
+/// the merge-group commit the change line and the checklist row name that
+/// job and say it is not a conflict; a failed check found after a conflict
+/// line reports again, and staying failed is quiet.
+#[test]
+fn golden_pr_monitor_unmergeable_queue_entry_after_a_merge_group_ci_failure() {
+    let queued = |state: &str, failed: bool| {
+        let mut s = pr_snapshot("open");
+        s.requirements.is_in_merge_queue = Some(true);
+        s.requirements.merge_queue = Some(intent_sourcecontrol::MergeQueueEntry {
+            position: 1,
+            queue_size: Some(2),
+            state: Some(state.to_string()),
+            enqueued_at: None,
+            estimated_time_to_merge: None,
+            failed_check: failed.then(|| {
+                Box::new(intent_sourcecontrol::MergeGroupFailedCheck {
+                    name: "cache-smoke / verify".to_string(),
+                    conclusion: "failure".to_string(),
+                    url: Some("https://github.com/o/r/actions/runs/42473806226/job/7".to_string()),
+                })
+            }),
+        });
+        s
+    };
+    let failed = queued("unmergeable", true);
+    let ci_line = "merge queue entry is UNMERGEABLE because its merge-group CI failed, not \
+                   because of a conflict: `cache-smoke / verify` failed \
+                   (https://github.com/o/r/actions/runs/42473806226/job/7). Read that job's log \
+                   and diagnose it first. The queue ejects the entry once its required checks \
+                   finish; its branch is locked while queued, so to push a fix sooner remove it \
+                   from the queue (GraphQL dequeuePullRequest). If the failure is infrastructure \
+                   (a lost runner, a timeout, a flake), enqueue the same commit again; otherwise \
+                   fix the branch, then enqueue it again";
+    for before in [
+        queued("awaiting_checks", true),
+        queued("unmergeable", false),
+    ] {
+        assert_eq!(
+            crate::pr_monitor::diff_snapshots(&before, &failed),
+            vec![ci_line.to_string()]
+        );
+    }
+    assert!(crate::pr_monitor::diff_snapshots(&failed, &failed).is_empty());
+    assert_eq!(
+        crate::pr_monitor::diff_snapshots(&failed, &queued("queued", false)),
+        vec!["merge queue entry is no longer unmergeable (now queued)".to_string()]
+    );
+    assert!(crate::pr_monitor::diff_snapshots(&failed, &queued("unmergeable", false)).is_empty());
+    assert_eq!(
+        crate::pr_monitor::render_checklist(&failed),
+        "- state: open\n\
+         - head: abcdef12 (checks below are for this commit)\n\
+         - approvals: review_required (0/1 required)\n\
+         - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
+         - unresolved threads: 1 (resolution required to merge)\n\
+         - branch ancestry: unknown\n\
+         - forge branch-update requirement: unknown\n\
+         - in merge queue, but the entry is UNMERGEABLE (merge-group CI failed: \
+         `cache-smoke / verify` failed (https://github.com/o/r/actions/runs/42473806226/job/7)) \
+         — diagnose that job; re-enqueue the same commit if it was infrastructure, else \
+         dequeue and fix the branch first"
+    );
+    // A failed check while the entry is still awaiting checks is not yet
+    // a wake, and the checklist row stays plain.
+    let early = queued("awaiting_checks", true);
+    assert!(
+        crate::pr_monitor::diff_snapshots(&queued("awaiting_checks", false), &early).is_empty()
+    );
+    assert!(crate::pr_monitor::render_checklist(&early).ends_with("\n- in merge queue"));
 }
 
 /// Every checklist names the head commit its check results belong to

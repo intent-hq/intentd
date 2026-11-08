@@ -14,6 +14,7 @@ fn entry(position: u32, estimate: Option<u64>) -> MergeQueueEntry {
         state: Some("queued".into()),
         enqueued_at: Some("2026-10-20T03:50:26Z".into()),
         estimated_time_to_merge: estimate,
+        failed_check: None,
     }
 }
 
@@ -329,4 +330,62 @@ async fn a_queued_pr_turning_unmergeable_wakes_the_owner() {
         .await
         .unwrap();
     assert!(row.pending_changes.is_empty(), "{:?}", row.pending_changes);
+}
+
+/// intent-hq/intent#8833: through the poll, an entry whose merge-group run
+/// failed turns `unmergeable` and wakes the owner with the failed job and
+/// its URL, worded as a CI failure, not a conflict to merge-tree.
+#[intent_test_macros::daemon_test]
+async fn a_merge_group_ci_failure_wakes_the_owner_with_the_failed_job() {
+    let (_db, _root, svc, forge, ws, owner) = setup().await;
+    forge.edit_quiet(|s| {
+        s.folded = Some(FoldedRead::default());
+        s.in_merge_queue = Some(true);
+        s.merge_queue_entry = Some(MergeQueueEntry {
+            state: Some("awaiting_checks".into()),
+            ..entry(1, Some(1500))
+        });
+    });
+    let held = svc.with_pr_monitor_debounce_seconds(3600);
+    let monitor = register(&held, &ws, &owner).await;
+    forge.edit_quiet(|s| {
+        s.merge_queue_entry = Some(MergeQueueEntry {
+            state: Some("unmergeable".into()),
+            failed_check: Some(Box::new(intent_sourcecontrol::MergeGroupFailedCheck {
+                name: "coverage-e2e".into(),
+                conclusion: "failure".into(),
+                url: Some("https://github.com/o/r/actions/runs/42473804877/job/9".into()),
+            })),
+            ..entry(1, Some(1500))
+        });
+    });
+    held.poll_pr_monitors().await;
+    let row = held
+        .store()
+        .get_pr_monitor(&monitor.monitor_id)
+        .await
+        .unwrap();
+    assert_eq!(row.pending_changes.len(), 1, "{:?}", row.pending_changes);
+    assert!(
+        row.pending_changes[0].starts_with(
+            "merge queue entry is UNMERGEABLE because its merge-group CI failed, not because \
+             of a conflict: `coverage-e2e` failed \
+             (https://github.com/o/r/actions/runs/42473804877/job/9)."
+        ),
+        "{:?}",
+        row.pending_changes
+    );
+    assert_eq!(
+        held.pr_monitor_flush_op(&ws, &monitor.monitor_id, false)
+            .await
+            .unwrap()["flushed"],
+        true
+    );
+    let text = owner_messages(&held, &owner).await;
+    assert!(
+        text.contains("merge-group CI failed: `coverage-e2e` failed"),
+        "{text}"
+    );
+    assert!(!text.contains("conflicts with an entry ahead"), "{text}");
+    assert!(!text.contains("merge-tree"), "{text}");
 }

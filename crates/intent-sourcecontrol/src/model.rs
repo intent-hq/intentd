@@ -609,6 +609,30 @@ pub struct MergeQueueEntry {
     /// counting it down, so it is a duration estimate, not a deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_time_to_merge: Option<u64>,
+    /// The first failed check on the entry's merge-group commit (GitHub
+    /// GraphQL `MergeQueueEntry.headCommit`), when one has failed. GitHub
+    /// marks an entry whose merge-group CI failed `unmergeable` before it
+    /// ejects it, so this tells a CI failure from a conflict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_check: Option<Box<MergeGroupFailedCheck>>,
+}
+
+/// A check on a merge-queue entry's merge-group commit that ended in a
+/// failing conclusion. When several failed, this is the one that finished
+/// first: a fail-fast job cancels the rest after it, and a gate job fails
+/// last.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeGroupFailedCheck {
+    /// Check-run name, or the status context.
+    pub name: String,
+    /// The conclusion, lowercased (GitHub: `failure`, `timed_out`,
+    /// `cancelled`, `startup_failure`, `action_required`; a status context's
+    /// `failure` / `error`).
+    pub conclusion: String,
+    /// The check's details link (a GitHub Actions job URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// Per-PR merge-requirement signals a host can report beyond the plain

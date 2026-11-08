@@ -1271,38 +1271,64 @@ impl Harness for V1 {
             }
         }
         // The queue entry's state is otherwise informational (position,
-        // size, estimate), but `unmergeable` strands the PR: it conflicts
-        // with an entry ahead and will never merge on its own, and its
-        // branch is locked while queued (intentd#2897 sat ~55 min). The
-        // forge can also raise the flag with no real conflict (intentd#2937
-        // re-enqueued unchanged and merged), so the advice checks before
-        // fixing anything. Recovery
+        // size, estimate), but `unmergeable` strands the PR. GitHub raises
+        // it for two causes. Usually the entry's merge-group CI failed: the
+        // flag comes minutes after the failure, before the ejection (four
+        // intentd wakes on 2026-11-08, each read as a conflict with a clean
+        // merge-tree). Then the wake names the failed check so the agent
+        // diagnoses it. Otherwise the PR conflicts with an entry ahead, or
+        // the flag is stale (intentd#2937 re-enqueued unchanged and merged),
+        // so the advice checks the conflict before fixing anything; its
+        // branch is locked while queued (intentd#2897 sat ~55 min). A
+        // failed check found after a conflict line reports again. Recovery
         // reports only while the entry is still read with a known state;
         // leaving the queue reports itself.
-        let entry_state = |r: &crate::pr_ops::MergeRequirements| {
+        let queued_entry = |r: &crate::pr_ops::MergeRequirements| {
             r.merge_queue
-                .as_ref()
+                .clone()
                 .filter(|_| r.is_in_merge_queue == Some(true))
-                .and_then(|e| e.state.clone())
         };
-        match (entry_state(o).as_deref(), entry_state(n).as_deref()) {
-            (before, Some("unmergeable")) if before != Some("unmergeable") => {
-                changes.push(
-                    "merge queue entry is UNMERGEABLE: the PR conflicts with an entry ahead of \
-                     it and will not merge. Its branch is locked while queued, so a push is \
-                     rejected — remove it from the queue first (GraphQL dequeuePullRequest), \
-                     then git fetch origin and check the conflict is real: git merge-tree \
-                     --write-tree <entry ahead's merge-group branch \
-                     origin/gh-readonly-queue/<base>/pr-<ahead>-<sha>, or origin/<base> when none is \
-                     ahead> <this head>. If that is clean the flag was stale: enqueue the same \
-                     commit again; otherwise fix the branch, then enqueue it again"
-                        .to_string(),
-                );
-            }
-            (Some("unmergeable"), Some(after)) if after != "unmergeable" => {
+        let (before, after) = (queued_entry(o), queued_entry(n));
+        let state = |e: &Option<intent_sourcecontrol::MergeQueueEntry>| {
+            e.as_ref().and_then(|e| e.state.clone())
+        };
+        let failed = |e: &Option<intent_sourcecontrol::MergeQueueEntry>| {
+            e.as_ref().and_then(|e| e.failed_check.clone())
+        };
+        match (state(&before).as_deref(), state(&after).as_deref()) {
+            (was, Some("unmergeable")) => match failed(&after) {
+                Some(check) if was != Some("unmergeable") || failed(&before).is_none() => {
+                    changes.push(format!(
+                        "merge queue entry is UNMERGEABLE because its merge-group CI failed, \
+                         not because of a conflict: {}. Read that job's log and diagnose it \
+                         first. The queue ejects the entry once its required checks finish; \
+                         its branch is locked while queued, so to push a fix sooner remove it \
+                         from the queue (GraphQL dequeuePullRequest). If the failure is \
+                         infrastructure (a lost runner, a timeout, a flake), enqueue the same \
+                         commit again; otherwise fix the branch, then enqueue it again",
+                        super::review_wake::merge_group_failure(&check)
+                    ));
+                }
+                None if was != Some("unmergeable") => {
+                    changes.push(
+                        "merge queue entry is UNMERGEABLE: the PR conflicts with an entry ahead \
+                         of it and will not merge. Its branch is locked while queued, so a push \
+                         is rejected — remove it from the queue first (GraphQL \
+                         dequeuePullRequest), then git fetch origin and check the conflict is \
+                         real: git merge-tree --write-tree <entry ahead's merge-group branch \
+                         origin/gh-readonly-queue/<base>/pr-<ahead>-<sha>, or origin/<base> when \
+                         none is ahead> <this head>. If that is clean the flag was stale: \
+                         enqueue the same commit again; otherwise fix the branch, then enqueue \
+                         it again"
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            },
+            (Some("unmergeable"), Some(now)) => {
                 changes.push(format!(
                     "merge queue entry is no longer unmergeable (now {})",
-                    after.replace('_', " ")
+                    now.replace('_', " ")
                 ));
             }
             _ => {}

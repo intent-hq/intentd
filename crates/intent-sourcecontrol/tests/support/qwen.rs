@@ -124,13 +124,7 @@ impl State {
         // Do not invent selections absent from the request. Before the fix the
         // old query therefore still returns its (truncated) nodes, without
         // getting a pageInfo the real server would never have supplied.
-        let selection = query
-            .split("contexts(")
-            .nth(1)
-            .unwrap()
-            .split_once(')')
-            .unwrap()
-            .1;
+        let selection = checks_selection(query).split_once(')').unwrap().1;
         if !selection.contains("pageInfo{hasNextPageendCursor}") {
             contexts.as_object_mut().unwrap().remove("pageInfo");
         }
@@ -298,17 +292,21 @@ impl State {
     }
 }
 
+// The head commit's check connection, after `contexts(`. The queue entry's
+// merge-group commit has its own `contexts(` earlier in the query, so the PR's
+// is found after the head commit's `commit{oid`.
+fn checks_selection(query: &str) -> &str {
+    let head = query
+        .split_once("commit{oid")
+        .map_or(query, |(_, rest)| rest);
+    head.split("contexts(").nth(1).unwrap()
+}
+
 // A next page is served ONLY when a declared variable is actually bound to
 // contexts(after:...). An unrelated variable or inline cursor token is not
 // enough to make a broken paginator pass these tests.
 fn bound_check_cursor(query: &str, vars: &Value) -> usize {
-    let args = query
-        .split("contexts(")
-        .nth(1)
-        .unwrap()
-        .split(')')
-        .next()
-        .unwrap();
+    let args = checks_selection(query).split(')').next().unwrap();
     let Some(after) = args.split(',').find_map(|a| a.strip_prefix("after:")) else {
         return 0;
     };
@@ -406,7 +404,7 @@ impl MockQwen {
                 .chars()
                 .filter(|c| !c.is_whitespace())
                 .collect();
-            let selection = query.split("contexts(").nth(1).unwrap();
+            let selection = checks_selection(&query);
             assert!(
                 selection.contains("pageInfo{hasNextPageendCursor}"),
                 "missing page metadata: {query}"

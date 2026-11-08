@@ -996,6 +996,7 @@ async fn pr_monitor_list_carries_merge_queue_position_without_waking_over_wss() 
         state: Some("queued".into()),
         enqueued_at: Some("2026-10-20T03:50:26Z".into()),
         estimated_time_to_merge: Some(estimate),
+        failed_check: None,
     };
 
     let mut rpc = connect(fx.port, fx.cfg.clone()).await;

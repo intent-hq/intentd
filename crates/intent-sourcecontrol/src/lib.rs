@@ -44,12 +44,13 @@ pub use gitlab_token::GitlabTokenSource;
 pub use instance::{GitlabDescriptor, GitlabInstance};
 pub use model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
-    IssueInvolvement, IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueEntry,
-    MergeQueueRemoval, MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams,
-    PrAncestry, PrAncestryIdentity, PrInvolvement, PrObservation, PrPatch, PrQuery, PrState,
-    PullRequest, PullRequestFile, PullRequestFilesPage, PullRequestReview, RateLimitStatus, Repo,
-    RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment,
-    ReviewThreadTally, ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
+    IssueInvolvement, IssueQuery, MergeGroupFailedCheck, MergeMethod, MergeOptions, MergeOutcome,
+    MergeQueueEntry, MergeQueueRemoval, MergeRequirementSignals, Mergeability, NewPullRequest,
+    Page, PageParams, PrAncestry, PrAncestryIdentity, PrInvolvement, PrObservation, PrPatch,
+    PrQuery, PrState, PullRequest, PullRequestFile, PullRequestFilesPage, PullRequestReview,
+    RateLimitStatus, Repo, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread,
+    ReviewThreadComment, ReviewThreadTally, ReviewVerdict, RollupCheck, RollupCheckKind,
+    ScCapabilities, UserIdentity,
 };
 pub use model::{
     ConfirmedReviewState, DiscussionNote, ProviderAvailability, ReviewAvailability,
