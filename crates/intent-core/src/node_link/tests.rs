@@ -85,24 +85,25 @@ fn the_binding_wire_shape_uses_decimal_string_generations() {
 }
 
 #[test]
-fn the_daemon_to_daemon_link_speaks_protocols_7_to_14() {
+fn the_daemon_to_daemon_link_speaks_protocols_7_to_15() {
     // 7 adds the correlated stop acknowledgement. A protocol-6 peer cannot
     // send `stopAck`, so it never links: a backend must not take a stop as
     // confirmed by a machine that cannot confirm it. 8 adds the script
     // frames, 9 final stops, 10 the prepared checkout, 11 the user MCP
     // server proxies, 12 the machine's skills, 13 sub-agent checkouts, 14
-    // agent secrets on the machine; a protocol-7 peer still binds and runs
-    // agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 14 });
+    // agent secrets on the machine, 15 the backend's forge token; a
+    // protocol-7 peer still binds and runs agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 15 });
     assert_eq!(SCRIPT_PROTOCOL, 8);
     assert_eq!(FINAL_STOP_PROTOCOL, 9);
     assert_eq!(PREPARED_CHECKOUT_PROTOCOL, 10);
     assert_eq!(MCP_PROXY_PROTOCOL, 11);
     assert_eq!(SKILLS_PROTOCOL, 12);
     assert_eq!(SHARED_CHECKOUT_PROTOCOL, 13);
-    assert_eq!(SECRETS_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    assert_eq!(SECRETS_PROTOCOL, 14);
+    assert_eq!(FORGE_TOKEN_PROTOCOL, NODE_LINK_PROTOCOLS.max);
     assert!(offers_prepared_checkout());
-    for version in 7..=14 {
+    for version in 7..=15 {
         ensure_protocol(version).unwrap();
     }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
@@ -339,6 +340,7 @@ fn executor_link_requests_golden() {
             "ack",
             "cancel",
             "capabilities",
+            "forgeToken",
             "heartbeat",
             "heartbeatReply",
             "hello",
@@ -391,6 +393,7 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
         [
             "cancelRequest",
             "capabilitiesReply",
+            "forgeTokenReply",
             "journal",
             "pushWipReply",
             "replayComplete",
@@ -607,6 +610,21 @@ fn every_frame() -> Vec<LinkFrame> {
             forgotten: None,
             error: None,
         }),
+        LinkFrame::ForgeToken(ForgeToken {
+            request_id,
+            host: FORGE_HOST_GITHUB.into(),
+            token: Some(SecretValue::from("canary-forge-token")),
+        }),
+        LinkFrame::ForgeToken(ForgeToken {
+            request_id,
+            host: FORGE_HOST_GITHUB.into(),
+            token: None,
+        }),
+        LinkFrame::ForgeTokenReply(ForgeTokenReply {
+            request_id,
+            outcome: SecretOutcome::Failed,
+            error: Some(FORGE_TOKEN_INVALID.into()),
+        }),
     ]
 }
 
@@ -643,7 +661,7 @@ fn frames_are_routed_to_their_lane() {
             Control, Control, Control, Control, Control, Control, Control, Control, Control,
             Control, Journal, Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control,
             Control, Script, Script, Script, Script, Script, Control, Control, Journal, Control,
-            Control, Control, Control, Control, Control
+            Control, Control, Control, Control, Control, Control, Control, Control
         ]
     );
 }
@@ -1121,7 +1139,13 @@ fn script_frames_need_protocol_8_skills_frames_12_and_push_frames_13() {
                 | LinkFrame::SecretList(_)
                 | LinkFrame::SecretReply(_)
         );
-        let expected = if secret {
+        let forge = matches!(
+            frame,
+            LinkFrame::ForgeToken(_) | LinkFrame::ForgeTokenReply(_)
+        );
+        let expected = if forge {
+            FORGE_TOKEN_PROTOCOL
+        } else if secret {
             SECRETS_PROTOCOL
         } else if push {
             SHARED_CHECKOUT_PROTOCOL
@@ -1439,4 +1463,111 @@ fn hello_head_session_is_optional() {
         LinkFrame::decode(value.to_string().as_bytes()).unwrap(),
         LinkFrame::Hello(hello)
     );
+}
+
+/// The forge token frames (`node-link.md` § Forge token on the machine)
+/// have the documented wire names and closed bodies; `token: null` drops
+/// the held value.
+#[test]
+fn forge_token_frames_have_the_documented_shape_and_closed_bodies() {
+    let id = LinkId::new_v4();
+    let put = LinkFrame::ForgeToken(ForgeToken {
+        request_id: id,
+        host: "github.com".into(),
+        token: Some(SecretValue::from("t-1")),
+    });
+    assert_eq!(
+        serde_json::to_value(&put).unwrap(),
+        json!({ "type": "forgeToken", "requestId": id, "host": "github.com", "token": "t-1" })
+    );
+    let drop = LinkFrame::decode(
+        json!({ "type": "forgeToken", "requestId": id, "host": "github.com", "token": null })
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    assert!(
+        matches!(&drop, LinkFrame::ForgeToken(ForgeToken { token: None, .. })),
+        "{drop:?}"
+    );
+    let reply = LinkFrame::ForgeTokenReply(ForgeTokenReply {
+        request_id: id,
+        outcome: SecretOutcome::Ok,
+        error: None,
+    });
+    assert_eq!(
+        serde_json::to_value(&reply).unwrap(),
+        json!({ "type": "forgeTokenReply", "requestId": id, "outcome": "ok" })
+    );
+    for raw in [
+        json!({ "type": "forgeToken", "requestId": id, "host": "github.com", "token": "t", "extra": 1 }),
+        json!({ "type": "forgeToken", "requestId": id, "token": "t" }),
+        json!({ "type": "forgeTokenReply", "requestId": id, "outcome": "ok", "token": "t" }),
+        json!({ "type": "forgeTokenReply", "requestId": id, "outcome": "maybe" }),
+    ] {
+        assert!(
+            LinkFrame::decode(raw.to_string().as_bytes()).is_err(),
+            "{raw}"
+        );
+    }
+}
+
+/// The forge token never shows in `Debug` output, nor in the error for a
+/// malformed frame.
+#[test]
+fn forge_tokens_never_render_in_debug_or_decode_errors() {
+    let frame = LinkFrame::ForgeToken(ForgeToken {
+        request_id: LinkId::new_v4(),
+        host: "github.com".into(),
+        token: Some(SecretValue::from("canary-forge-token")),
+    });
+    let rendered = format!("{frame:?}");
+    assert!(!rendered.contains("canary-forge-token"), "{rendered}");
+    for raw in [
+        json!({ "type": "forgeToken", "requestId": "canary-forge-token", "host": "github.com", "token": "canary-forge-token" }),
+        json!({ "type": "forgeToken", "requestId": LinkId::new_v4(), "host": "github.com", "token": ["canary-forge-token"] }),
+        json!({ "type": "forgeToken", "requestId": LinkId::new_v4(), "host": "github.com", "token": "canary-forge-token", "canary-forge-token": 1 }),
+        json!({ "type": "nope", "value": "canary-forge-token" }),
+    ] {
+        let Err(error) = LinkFrame::decode(raw.to_string().as_bytes()) else {
+            panic!("decoded {raw}");
+        };
+        let message = error.to_string();
+        assert!(!message.contains("canary-forge-token"), "{message}");
+        assert!(message.contains("node-link-frame-invalid"), "{message}");
+    }
+}
+
+/// A launch's `forge` member (protocol 15) is optional and closed, and
+/// raises the launch's protocol only when present.
+#[test]
+fn launch_forge_is_optional_and_needs_protocol_15() {
+    let LinkFrame::Launch(mut command) = every_frame()
+        .into_iter()
+        .find(|frame| matches!(frame, LinkFrame::Launch(c) if c.checkout.is_none() && c.mcp_proxies.is_empty() && c.checkout_of.is_none()))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let plain = LinkFrame::Launch(command.clone());
+    assert!(serde_json::to_value(&plain).unwrap().get("forge").is_none());
+    assert!(plain.min_protocol() < FORGE_TOKEN_PROTOCOL);
+    command.forge = Some(ForgeLaunch {
+        remote_url: "https://github.com/o/r.git".into(),
+        branch: "feat/x".into(),
+    });
+    let forged = LinkFrame::Launch(command);
+    let value = serde_json::to_value(&forged).unwrap();
+    assert_eq!(
+        value["forge"],
+        json!({ "remoteUrl": "https://github.com/o/r.git", "branch": "feat/x" })
+    );
+    assert_eq!(forged.min_protocol(), FORGE_TOKEN_PROTOCOL);
+    assert_eq!(
+        LinkFrame::decode(value.to_string().as_bytes()).unwrap(),
+        forged
+    );
+    let mut open = value;
+    open["forge"]["extra"] = json!(1);
+    assert!(LinkFrame::decode(open.to_string().as_bytes()).is_err());
 }

@@ -13,7 +13,7 @@ use super::*;
 const SECRET_VALUE: &str = "s5-remote-secret-Qx7m2Lk9";
 
 /// Every file under `dir` that contains `needle`.
-fn files_containing(dir: &Path, needle: &str) -> Vec<std::path::PathBuf> {
+pub(super) fn files_containing(dir: &Path, needle: &str) -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(next) = stack.pop() {
@@ -49,7 +49,12 @@ fn exec_prompt(marker: &str) -> String {
     )
 }
 
-async fn create_agent(rpc_ws: &mut common::TlsWs, ws_id: &str, name: &str, id: i64) -> String {
+pub(super) async fn create_agent(
+    rpc_ws: &mut common::TlsWs,
+    ws_id: &str,
+    name: &str,
+    id: i64,
+) -> String {
     let create = json!({
         "workspaceId": ws_id, "name": name, "model": "default", "provider": "mock",
         "placement": { "target": "remote" },
@@ -77,7 +82,7 @@ async fn create_agent(rpc_ws: &mut common::TlsWs, ws_id: &str, name: &str, id: i
 /// [`wsapi_turn`] for one of several agents in the workspace: other
 /// agents' turn ends (the provided notice wakes the owner) are skipped, and
 /// the reply is polled until it carries `marker`.
-async fn agent_turn(
+pub(super) async fn agent_turn(
     rpc_ws: &mut common::TlsWs,
     events: &mut common::TlsWs,
     (ws_id, agent_id): (&str, &str),

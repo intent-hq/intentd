@@ -37,6 +37,7 @@
 // A prompt with a block "echo-raw" streams "raw: {cwd, raw}" with its working
 // directory and the whole raw prompt (instructions included).
 import readline from 'node:readline';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
@@ -306,6 +307,21 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
         },
       });
       if (text === 'auth-required') return send({ id: msg.id, error: AUTH_REQUIRED });
+      // The SHA-256 of a variable, never its value: `unset` without one.
+      // An optional tag marks this turn's reply.
+      const digest = text.match(/^sha-env (\S+)(?: (\S+))?$/);
+      if (digest) {
+        const value = process.env[digest[1]];
+        const shown = value === undefined ? 'unset' : crypto.createHash('sha256').update(value).digest('hex');
+        send({
+          method: 'session/update',
+          params: {
+            sessionId: SESSION,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `sha ${digest[2] ?? '-'} ${shown}` } },
+          },
+        });
+        return send({ id: msg.id, result: { stopReason: 'end_turn' } });
+      }
       const echo = text.match(/^echo-env (\S+)$/);
       if (echo) {
         const value = process.env[echo[1]];

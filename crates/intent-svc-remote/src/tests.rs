@@ -42,6 +42,7 @@ use crate::machine::MachineTarget;
 use crate::RemoteServicesExt as _;
 
 mod cloud;
+mod forge_token;
 mod launch;
 mod methods;
 
@@ -78,6 +79,7 @@ fn tuning() -> Tuning {
         fail_claim_reads: Arc::default(),
         before_publish: crate::connector::BeforePublish::default(),
         before_claim: crate::connector::BeforePublish::default(),
+        forge_resolver: crate::connector::ForgeResolver::default(),
         grace_gate: crate::connector::GraceGate::default(),
     }
 }

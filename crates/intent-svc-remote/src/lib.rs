@@ -125,11 +125,23 @@ impl RemoteFeature {
 
     /// The GitHub token the machines hold, its watcher started.
     fn forge(&self, svc: &Services) -> Arc<forge_token::ForgeTokens> {
+        let tuning = self.tuning();
         let forge = self
             .forge
-            .get_or_init(|| Arc::new(forge_token::ForgeTokens::for_services(svc)))
+            .get_or_init(|| {
+                #[cfg(test)]
+                {
+                    let resolver = tuning.forge_resolver.0.clone().unwrap_or_else(|| {
+                        Arc::new(|| -> intent_core::BoxFuture<'static, _> {
+                            Box::pin(async { None })
+                        })
+                    });
+                    Arc::new(forge_token::ForgeTokens::new(resolver))
+                }
+                #[cfg(not(test))]
+                Arc::new(forge_token::ForgeTokens::for_services(svc))
+            })
             .clone();
-        let tuning = self.tuning();
         forge.watch(svc, tuning.forge_refresh, tuning.forge_check);
         forge
     }

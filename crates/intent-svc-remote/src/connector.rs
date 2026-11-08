@@ -53,6 +53,9 @@ use crate::machine::MachineTarget;
 use crate::rpc::HeadCalls;
 use crate::runtime::RemoteAgentRuntime;
 
+/// Longest a bind waits to resolve the GitHub token afresh.
+const FORGE_BIND_RESOLVE: Duration = Duration::from_secs(10);
+
 /// JSON-RPC "method not found", for machine requests head cannot serve.
 const UNSUPPORTED_CODE: i32 = -32601;
 
@@ -120,10 +123,26 @@ pub(crate) struct Tuning {
     /// welcome's agents are claimed.
     #[cfg(test)]
     pub before_claim: BeforePublish,
+    /// Test seam: resolves the GitHub token the machines get; without one,
+    /// a test backend hands out none (it never reads the host's).
+    #[cfg(test)]
+    pub forge_resolver: ForgeResolver,
     /// Test seam: holds a below-nodeProtocol-9 grace task between dropping
     /// its record and leaving `Shared::in_grace`.
     #[cfg(test)]
     pub grace_gate: GraceGate,
+}
+
+/// See [`Tuning::forge_resolver`].
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct ForgeResolver(pub Option<crate::forge_token::Resolver>);
+
+#[cfg(test)]
+impl std::fmt::Debug for ForgeResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ForgeResolver")
+    }
 }
 
 /// A test gate in a grace task: it notifies the first [`Notify`] on
@@ -186,6 +205,8 @@ impl Default for Tuning {
             before_publish: BeforePublish::default(),
             #[cfg(test)]
             before_claim: BeforePublish::default(),
+            #[cfg(test)]
+            forge_resolver: ForgeResolver::default(),
             #[cfg(test)]
             grace_gate: GraceGate::default(),
         }
@@ -2298,7 +2319,8 @@ async fn run(
         let forge = match &shared.forge {
             Some(forge) if link.protocol() >= FORGE_TOKEN_PROTOCOL => {
                 let mut changes = forge.subscribe();
-                forge.refresh().await;
+                // A slow resolution (a stalled `gh`) leaves the last value.
+                let _ = tokio::time::timeout(FORGE_BIND_RESOLVE, forge.refresh()).await;
                 let held = changes.borrow_and_update().clone();
                 crate::forge_token::send(&link, &held).await;
                 Some(changes)

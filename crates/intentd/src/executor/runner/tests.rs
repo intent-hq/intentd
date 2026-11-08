@@ -9,6 +9,7 @@ use serde_json::json;
 use super::*;
 use crate::executor::storage::Storage;
 
+mod forge;
 mod shared;
 
 const PROVIDER: &str = "mock";

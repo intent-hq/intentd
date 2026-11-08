@@ -926,7 +926,9 @@ impl Runner {
                 error: Some(FORGE_TOKEN_INVALID.to_owned()),
             };
         }
-        let token = frame.token.map(intent_core::node_link::SecretValue::into_inner);
+        let token = frame
+            .token
+            .map(intent_core::node_link::SecretValue::into_inner);
         if let Some(token) = &token {
             let agents: Vec<Arc<Agent>> =
                 lock(&self.inner.state).agents.values().cloned().collect();

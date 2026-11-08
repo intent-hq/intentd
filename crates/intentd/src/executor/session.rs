@@ -12,8 +12,8 @@
 
 use intent_core::node_link::{
     FinalPush, LeaseBinding, LinkChannel, LinkFrame, LinkHello, LinkOutcome, LinkRpcError,
-    MachineCapabilities, PushWipResult, SkillsReply, StopId, StopOutcome, FINAL_STOP_PROTOCOL, FORGE_TOKEN_PROTOCOL,
-    NODE_LINK_PROTOCOLS, SKILLS_PROTOCOL,
+    MachineCapabilities, PushWipResult, SkillsReply, StopId, StopOutcome, FINAL_STOP_PROTOCOL,
+    FORGE_TOKEN_PROTOCOL, NODE_LINK_PROTOCOLS, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::AgentId;
@@ -373,7 +373,8 @@ pub(super) async fn serve_link(
             }
             LinkEvent::Frame(LinkFrame::ForgeToken(frame)) => {
                 // Handled in order, so it precedes any launch sent after it.
-                if let Some(reply) = apply_forge(&runner, &binding, || link.is_closed(), frame).await
+                if let Some(reply) =
+                    apply_forge(&runner, &binding, || link.is_closed(), frame).await
                 {
                     let _ = link.send(&reply).await;
                 }

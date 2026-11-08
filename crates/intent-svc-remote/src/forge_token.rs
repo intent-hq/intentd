@@ -11,9 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use intent_core::node_link::{
-    ForgeToken, LinkFrame, LinkId, SecretValue, FORGE_HOST_GITHUB,
-};
+use intent_core::node_link::{ForgeToken, LinkFrame, LinkId, SecretValue, FORGE_HOST_GITHUB};
 use intent_core::BoxFuture;
 use intent_services::feature_api::Services;
 use intent_transport::node_link::NodeLink;
@@ -73,6 +71,10 @@ impl ForgeTokens {
     }
 
     /// The daemon's own GitHub credential, behind its gate.
+    #[cfg_attr(
+        test,
+        expect(dead_code, reason = "tests resolve through Tuning::forge_resolver")
+    )]
     pub(crate) fn for_services(svc: &Services) -> Self {
         let registry = svc.settings_registry();
         Self::new(Arc::new(move || {
@@ -113,18 +115,32 @@ impl ForgeTokens {
     /// resolves again every `every`, and at once (within `check`) after a
     /// GitHub connect, revoke or token edit, or a change of the gate.
     pub(crate) fn watch(self: &Arc<Self>, svc: &Services, every: Duration, check: Duration) {
-        if self.watching.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let tokens = Arc::downgrade(self);
         let svc = svc.clone();
-        intent_core::spawn_daemon(async move {
-            let state = || {
+        self.watch_with(
+            move || {
                 let gate = intent_services::feature_api::execution_call::expose_git_credential(
                     svc.settings_registry().as_deref(),
                 );
                 (intent_services::github_credential_generation(), gate)
-            };
+            },
+            every,
+            check,
+        );
+    }
+
+    /// [`Self::watch`] over any `state` whose change calls for a fresh
+    /// resolution.
+    pub(crate) fn watch_with<S: PartialEq + Send + 'static>(
+        self: &Arc<Self>,
+        state: impl Fn() -> S + Send + 'static,
+        every: Duration,
+        check: Duration,
+    ) {
+        if self.watching.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let tokens = Arc::downgrade(self);
+        intent_core::spawn_daemon(async move {
             let mut seen = state();
             let mut last = Instant::now();
             loop {
@@ -142,7 +158,9 @@ impl ForgeTokens {
                     seen = now;
                     last = Instant::now();
                     if tokens.refresh().await {
-                        tracing::info!("remote machines: the GitHub token changed; sending it again");
+                        tracing::info!(
+                            "remote machines: the GitHub token changed; sending it again"
+                        );
                     }
                 }
             }
