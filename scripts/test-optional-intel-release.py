@@ -48,7 +48,7 @@ def run_installer(command, env):
     """
     return subprocess.run(command, env={**env, 'INTENTD_DAEMON_MODE': 'full'},
                           stdin=subprocess.DEVNULL, start_new_session=True,
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, timeout=60)
 
 
 def archive(root, target, valid=True):
@@ -354,11 +354,11 @@ shutil.copy(pathlib.Path(os.environ['TEST_RELEASES']) / 'sitter-latest' / url.rs
                 self.assertTrue(module('optional-intel-release').valid_archive(directory, INTEL))
 
 
-INSTALLER_TEST = 'Consumers.test_fixed_sitter_retains_pair_and_installer_resolves_exact_intel'
+INSTALLER_TEST = Consumers.test_fixed_sitter_retains_pair_and_installer_resolves_exact_intel.__qualname__
 
 
 class Hermetic(unittest.TestCase):
-    @unittest.skipUnless(hasattr(os, 'fork') and sys.platform != 'win32', 'needs a POSIX pty')
+    @unittest.skipUnless(hasattr(os, 'fork'), 'needs a POSIX pty')
     def test_installer_run_completes_under_a_controlling_terminal(self):
         """The installer test must finish when a terminal is attached.
 
@@ -369,7 +369,9 @@ class Hermetic(unittest.TestCase):
         import pty
         pid, fd = pty.fork()
         if pid == 0:
-            os.execv(sys.executable, [sys.executable, '-I', '-B', str(Path(__file__).resolve()), INSTALLER_TEST])
+            # A daemon mode inherited from the developer's shell would mask the bug.
+            env = {k: v for k, v in os.environ.items() if k != 'INTENTD_DAEMON_MODE'}
+            os.execve(sys.executable, [sys.executable, '-I', '-B', str(Path(__file__).resolve()), INSTALLER_TEST], env)
         output, deadline = b'', time.monotonic() + 120
         try:
             while time.monotonic() < deadline:
@@ -384,10 +386,16 @@ class Hermetic(unittest.TestCase):
                     break
                 output += chunk
             else:
-                os.killpg(pid, signal.SIGKILL)
                 self.fail('installer test hung under a terminal:\n' + output.decode(errors='replace')[-2000:])
         finally:
-            _, status = os.waitpid(pid, 0)
+            # Never leave the child running (timeout, Ctrl-C, early EOF).
+            reaped, status = os.waitpid(pid, os.WNOHANG)
+            if not reaped:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _, status = os.waitpid(pid, 0)
             os.close(fd)
         text = output.decode(errors='replace')
         self.assertNotIn('Choose 1 or 2', text)
