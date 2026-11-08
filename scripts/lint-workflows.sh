@@ -32,7 +32,8 @@
 #   scripts/lint-workflows.sh [actionlint args...]  lint (e.g. one workflow file)
 #   scripts/lint-workflows.sh --install DIR         download the pinned release
 #       archive, verify its SHA-256 and write DIR/actionlint (CI; also a way to
-#       get the pin outside the monorepo). Needs curl, tar and sha256sum/shasum.
+#       get the pin outside the monorepo). Needs curl, tar and sha256sum/shasum;
+#       when the download fails, `go install` of the same tag is the fallback.
 # Exit 0 clean, 1 findings or a missing tool, 2 usage or install failure;
 # any other status is actionlint's own error exit.
 # Bash 3.2 compatible.
@@ -108,12 +109,20 @@ install_actionlint() {
   # Staged then renamed, so an interrupted or rejected download never leaves
   # a binary behind.
   # GitHub release downloads have returned 504s for minutes at a time
-  # (intentd#3153's queue runs), so retry for up to about five minutes.
-  if ! curl --fail --silent --show-error --location --retry 8 --retry-delay 10 --retry-connrefused \
+  # (intentd#3153's queue runs), so retry for a few minutes, then build the
+  # same tag through the Go module proxy, which sum.golang.org verifies.
+  if ! curl --fail --silent --show-error --location --retry 12 --retry-delay 15 --retry-connrefused \
       --retry-max-time 300 --connect-timeout 30 --max-time 120 \
       --output "$staging/$archive" "$url"; then
+    if command -v go >/dev/null 2>&1 &&
+        GOBIN="$staging" GOFLAGS=-mod=mod go install "github.com/rhysd/actionlint/cmd/actionlint@v$ACTIONLINT_VERSION"; then
+      mv -f "$staging/actionlint" "$dir/actionlint"
+      rm -rf "$staging"
+      echo "lint-workflows: $url failed; built actionlint $ACTIONLINT_VERSION with go install at $dir/actionlint"
+      return 0
+    fi
     rm -rf "$staging"
-    echo "lint-workflows --install: downloading $url failed" >&2
+    echo "lint-workflows --install: downloading $url failed (and no go install fallback succeeded)" >&2
     return 2
   fi
   if ! actual=$(sha256_of "$staging/$archive"); then

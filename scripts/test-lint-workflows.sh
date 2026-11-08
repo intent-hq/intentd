@@ -176,6 +176,23 @@ fi
 STUB_CURL_FAIL=1 LINT_WORKFLOWS_PLATFORM=linux_amd64 run_install --install "$temp_dir/installed"
 expect "--install reports a failed download" 2 "downloading https://github.com/rhysd/actionlint/releases/download/v$pin/actionlint_${pin}_linux_amd64.tar.gz failed"
 
+# Stub go: a GitHub outage falls back to `go install` of the pinned tag.
+cat >"$install_bin/go" <<'SH'
+#!/bin/sh
+[ "$*" = "install github.com/rhysd/actionlint/cmd/actionlint@v$STUB_GO_PIN" ] || exit 1
+printf '#!/bin/sh\necho built\n' >"$GOBIN/actionlint"
+chmod +x "$GOBIN/actionlint"
+SH
+chmod +x "$install_bin/go"
+STUB_GO_PIN=$pin STUB_CURL_FAIL=1 LINT_WORKFLOWS_PLATFORM=linux_amd64 run_install --install "$temp_dir/installed"
+expect "--install falls back to go install when the download fails" 0 "built actionlint $pin with go install"
+if [ -x "$temp_dir/installed/actionlint" ] && [ -z "$(ls -A "$temp_dir/installed" | grep -v '^actionlint$')" ]; then
+  pass "--install go fallback leaves only the binary"
+else
+  fail "--install go fallback left: $(ls -A "$temp_dir/installed")"
+fi
+rm -f "$install_bin/go" "$temp_dir/installed/actionlint"
+
 LINT_WORKFLOWS_PLATFORM=plan9_mips run_install --install "$temp_dir/installed"
 expect "--install refuses a platform with no pinned checksum" 2 "no pinned actionlint $pin release"
 
