@@ -7948,6 +7948,39 @@ mod tests {
         );
     }
 
+    /// The app replays `script.output` into a terminal view, so the service
+    /// keeps escape codes; only the agent-facing binding cleans them.
+    #[intent_test_macros::daemon_test]
+    async fn script_output_keeps_raw_escapes_for_app_replay() {
+        let h = harness().await;
+        let id = create_simple(
+            &h,
+            "colored",
+            "printf '\\033[32mok\\033[0m\\n'",
+            ScriptMode::Command,
+        )
+        .await;
+        h.services
+            .script_run(
+                h.ws.clone(),
+                id.clone(),
+                None,
+                Some(LIVENESS.as_secs().cast_signed()),
+            )
+            .await
+            .expect("run");
+        let out = h
+            .services
+            .script_output(h.ws.clone(), id, None, None, None)
+            .await
+            .expect("output");
+        let text = out.as_str().expect("string");
+        assert!(
+            text.contains("\u{1b}[32mok\u{1b}[0m"),
+            "raw output: {text:?}"
+        );
+    }
+
     #[intent_test_macros::daemon_test]
     async fn script_remove_kills_running_pty_and_drops_definition() {
         let h = harness().await;
