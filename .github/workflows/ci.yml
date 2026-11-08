@@ -2334,8 +2334,10 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
     # About 2 min on a hosted runner (measured on Depot); on a busy shared self-hosted slot it ran 5 min
     # next to a PR's check and coverage-changed (run 39178412485) with every
-    # step passing, so the budget leaves self-hosted headroom.
-    timeout-minutes: 15
+    # step passing, so the budget leaves self-hosted headroom. Release
+    # downloads can fall back to crates.io builds (cargo-dist, release-plz),
+    # which need several more minutes during a GitHub outage.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -2556,9 +2558,26 @@ jobs:
           fi
       - name: Test the release-plz no-op baseline
         run: python3 -S scripts/test-release-plz-noop.py
+      # release-plz comes from a GitHub release download; during a GitHub
+      # outage each 504 took minutes and the job hit its timeout (job
+      # 128709740868). It is cached by version, the action is bounded, and
+      # install-release-plz.sh builds it from crates.io when the action failed.
+      - name: Restore the pinned release-plz
+        id: release-plz-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/release-plz
+          key: release-plz-${{ runner.os }}-${{ runner.arch }}-0.3.162
       - uses: taiki-e/install-action@v2
+        if: steps.release-plz-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 4
+        continue-on-error: true
         with:
           tool: release-plz@0.3.162
+      - name: Stage the pinned release-plz
+        run: |
+          bash scripts/install-release-plz.sh "$RUNNER_TEMP/release-plz" 0.3.162
+          echo "$RUNNER_TEMP/release-plz" >> "$GITHUB_PATH"
       - name: Test new-package release baseline and retirement
         run: python3 -S scripts/test-release-plz-baseline.py
       - name: Test daemon and sitter changelog separation

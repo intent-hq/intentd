@@ -277,6 +277,56 @@ class InstallCargoDist(unittest.TestCase):
         self.assertIn('building it from crates.io', result.stderr)
 
 
+class InstallReleasePlz(unittest.TestCase):
+    """scripts/install-release-plz.sh: cache, then the action's binary, then crates.io."""
+
+    def run_script(self, cached=None, on_path=None, version='0.3.162'):
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            bin_dir, target, fake = temp / 'bin', temp / 'release-plz', temp / 'fake'
+            bin_dir.mkdir()
+            target.mkdir()
+            executable(fake, f'echo "release-plz {version}"\n')
+            if cached:
+                executable(target / 'release-plz', f'echo "release-plz {cached}"\n')
+            if on_path:
+                executable(bin_dir / 'release-plz', f'echo "release-plz {on_path}"\n')
+            executable(bin_dir / 'cargo', f'echo "cargo $*" >> "{temp}/calls"\n'
+                       'while [ "$1" != --root ]; do shift; done\n'
+                       f'mkdir -p "$2/bin" && cp "{fake}" "$2/bin/release-plz"\n')
+            env = {'PATH': f'{bin_dir}:/usr/bin:/bin'}
+            result = subprocess.run(['bash', str(ROOT / 'scripts/install-release-plz.sh'), str(target), version],
+                                    env=env, capture_output=True, text=True)
+            calls = (temp / 'calls').read_text().splitlines() if (temp / 'calls').exists() else []
+            installed = subprocess.run([str(target / 'release-plz'), '--version'], capture_output=True, text=True).stdout.strip()
+            leftovers = sorted(p.name for p in target.iterdir() if p.name != 'release-plz')
+            return result, calls, installed, leftovers
+
+    def test_cache_hit_is_kept(self):
+        result, calls, installed, _ = self.run_script(cached='0.3.162', on_path='0.3.1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((calls, installed), ([], 'release-plz 0.3.162'))
+
+    def test_action_binary_is_copied_over_a_stale_cache(self):
+        result, calls, installed, _ = self.run_script(cached='0.3.1', on_path='0.3.162')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((calls, installed), ([], 'release-plz 0.3.162'))
+
+    def test_failed_action_builds_the_pin_from_crates_io(self):
+        # The action timed out on GitHub 504s, so nothing is on PATH.
+        result, calls, installed, leftovers = self.run_script(on_path='0.3.1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].startswith('cargo install release-plz --locked --version 0.3.162 '), calls)
+        self.assertEqual((installed, leftovers), ('release-plz 0.3.162', []))
+        self.assertIn('building it from crates.io', result.stderr)
+
+    def test_version_must_match_as_a_whole_word(self):
+        result, calls, _, _ = self.run_script(cached='0.3.1620', on_path='10.3.162')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 1)
+
+
 def wget_download_function():
     script = (ROOT / 'scripts/install.sh').read_text()
     start = script.index('wget_download() {')
