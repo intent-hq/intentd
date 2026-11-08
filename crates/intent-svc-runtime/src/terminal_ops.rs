@@ -20,6 +20,7 @@ use base64::Engine as _;
 use intent_acp::{
     AcpError, AcpResult, TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo,
 };
+use intent_core::ansi::strip_ansi;
 use intent_core::events::{TERMINAL_DATA, TERMINAL_EXIT, TERMINAL_PROCESS};
 use intent_core::{now_iso, BoxFuture, Error, Result, WorkspaceId};
 use intent_pty::{
@@ -531,76 +532,6 @@ fn render_output(
     };
     let separator = "\u{2500}".repeat(40);
     Value::String(format!("{header}\n{separator}\n{body}"))
-}
-
-/// Strip ANSI escape sequences from terminal output, mirroring the TS
-/// `readOutput` regex (`CSI`/`OSC`/private-mode sequences).
-fn strip_ansi(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            // ESC
-            match bytes.get(i + 1) {
-                // OSC: ESC ] ... BEL(0x07) or ST(ESC \\)
-                Some(b']') => {
-                    i += 2;
-                    while i < bytes.len() {
-                        if bytes[i] == 0x07 {
-                            i += 1;
-                            break;
-                        }
-                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
-                            i += 2;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    continue;
-                }
-                // CSI: ESC [ (optional '?') params (0-9;) final letter
-                Some(b'[') => {
-                    i += 2;
-                    if i < bytes.len() && bytes[i] == b'?' {
-                        i += 1;
-                    }
-                    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b';') {
-                        i += 1;
-                    }
-                    if i < bytes.len() && bytes[i].is_ascii_alphabetic() {
-                        i += 1; // consume final byte
-                    }
-                    continue;
-                }
-                _ => {
-                    i += 1;
-                    continue;
-                }
-            }
-        }
-        // Copy the next UTF-8 scalar intact.
-        let ch_len = utf8_len(bytes[i]);
-        let end = (i + ch_len).min(bytes.len());
-        out.push_str(&input[i..end]);
-        i = end;
-    }
-    out
-}
-
-/// Length in bytes of the UTF-8 scalar starting with `b`.
-fn utf8_len(b: u8) -> usize {
-    if b < 0x80 {
-        1
-    } else if b >> 5 == 0b110 {
-        2
-    } else if b >> 4 == 0b1110 {
-        3
-    } else if b >> 3 == 0b11110 {
-        4
-    } else {
-        1
-    }
 }
 
 /// Attach to a freshly created PTY and fan its output onto the bus as
@@ -1342,15 +1273,6 @@ mod tests {
         let mut inherited = Vec::new();
         ensure_terminal_term(&mut inherited, Some("tmux-256color"));
         assert!(inherited.is_empty());
-    }
-
-    #[test]
-    fn utf8_len_handles_all_widths() {
-        assert_eq!(utf8_len(b'A'), 1);
-        assert_eq!(utf8_len(0xC3), 2);
-        assert_eq!(utf8_len(0xE2), 3);
-        assert_eq!(utf8_len(0xF0), 4);
-        assert_eq!(utf8_len(0x80), 1); // bare continuation byte
     }
 
     #[test]

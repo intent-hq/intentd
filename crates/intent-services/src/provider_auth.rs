@@ -565,7 +565,7 @@ async fn cursor_stored_login_note(program: &OsStr) -> Option<String> {
 /// present and the status JSON reports a stored access token. Never log the
 /// payload (it carries the account email).
 fn cursor_status_note(key_present: bool, status_json: &str) -> Option<String> {
-    let stored = serde_json::from_str::<Value>(&intent_providers::cursor::strip_ansi(status_json))
+    let stored = serde_json::from_str::<Value>(&intent_core::ansi::strip_ansi(status_json))
         .ok()?
         .get("hasAccessToken")
         .and_then(Value::as_bool)?;

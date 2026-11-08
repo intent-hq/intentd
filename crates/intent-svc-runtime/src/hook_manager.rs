@@ -2537,7 +2537,9 @@ impl HookServicesExt for Services {
             "evicted" => Some(harness.hook_evicted_state_note(&hook.hook_id.0)),
             _ => None,
         };
-        let content = harness.hook_wake_framing(&hook.name, message, state_note.as_deref());
+        // Messages often embed colored script output; deliver plain text.
+        let message = intent_core::ansi::clean_terminal_text(message);
+        let content = harness.hook_wake_framing(&hook.name, &message, state_note.as_deref());
         if let Err(e) = self
             .feature_agent_wake()
             .deliver_wake_message(

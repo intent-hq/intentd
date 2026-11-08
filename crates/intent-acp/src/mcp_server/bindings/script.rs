@@ -371,7 +371,22 @@ async fn output(
     let max_lines = opt_i64(args, "maxLines");
     api.script_output(ws.clone(), script_id, max_lines, None, None)
         .await
+        .map(plain_text)
         .map_err(map_err)
+}
+
+/// Agents get plain text: scripts run with `FORCE_COLOR=1`, so their raw
+/// output (which the app replays in a terminal) carries ANSI escapes and
+/// carriage-return redraws.
+fn plain_text(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(intent_core::ansi::clean_terminal_text(&text)),
+        Value::Array(items) => Value::Array(items.into_iter().map(plain_text).collect()),
+        Value::Object(map) => {
+            Value::Object(map.into_iter().map(|(k, v)| (k, plain_text(v))).collect())
+        }
+        other => other,
+    }
 }
 
 async fn status(
@@ -416,6 +431,7 @@ async fn run(
     };
     api.script_run(ws.clone(), script_id, max_lines, timeout_seconds)
         .await
+        .map(plain_text)
         .map_err(map_err)
 }
 
@@ -446,6 +462,51 @@ mod tests {
 
     struct NoApi;
     impl WorkspaceApi for NoApi {}
+
+    const COLORED: &str = "\u{1b}[32m✓\u{1b}[39m ok\r\nProgress 10%\rProgress 100%\r\n";
+
+    struct ColoredOutputApi;
+    impl WorkspaceApi for ColoredOutputApi {
+        fn script_output(
+            &self,
+            _: WorkspaceId,
+            _: String,
+            _: Option<i64>,
+            _: Option<bool>,
+            _: Option<String>,
+        ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
+            Box::pin(async { Ok(Value::String(COLORED.to_string())) })
+        }
+
+        fn script_run(
+            &self,
+            _: WorkspaceId,
+            _: String,
+            _: Option<i64>,
+            _: Option<i64>,
+        ) -> intent_core::BoxFuture<'_, intent_core::Result<Value>> {
+            Box::pin(async { Ok(serde_json::json!({ "exitCode": 0, "output": COLORED })) })
+        }
+    }
+
+    /// Saved scripts run with `FORCE_COLOR=1`; agents read plain text while
+    /// the app's `script.output` replay keeps the raw bytes.
+    #[tokio::test]
+    async fn output_and_run_return_plain_text_to_agents() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(ColoredOutputApi);
+        let ws = WorkspaceId::from("ws");
+        let args = serde_json::json!({ "scriptId": "s" });
+        assert_eq!(
+            output(&api, &ws, &args).await.unwrap(),
+            serde_json::json!("✓ ok\nProgress 100%\n")
+        );
+        assert_eq!(
+            run(&api, &ws, Duration::from_secs(30), &args)
+                .await
+                .unwrap(),
+            serde_json::json!({ "exitCode": 0, "output": "✓ ok\nProgress 100%\n" })
+        );
+    }
 
     /// `remoteAuthor` is set by the backend only: a local agent supplying
     /// it is refused with the documented code before anything is saved.

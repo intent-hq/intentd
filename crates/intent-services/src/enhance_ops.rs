@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use intent_core::ansi::strip_ansi;
 use intent_core::{Error, Result, WorkspaceId};
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
@@ -58,29 +59,6 @@ pub(crate) fn build_enhancement_prompt(input: &str) -> String {
          ### END RESPONSE ###\n\n\
          Here is my original instruction:\n\n{input}"
     )
-}
-
-/// Remove ANSI SGR escape sequences (`ESC [ … m`), the FE `removeAnsiCodes`.
-fn strip_ansi(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            let mut j = i + 2;
-            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
-                j += 1;
-            }
-            if j < bytes.len() && bytes[j] == b'm' {
-                i = j + 1;
-                continue;
-            }
-        }
-        let ch = text[i..].chars().next().expect("in-bounds char");
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
 }
 
 /// ASCII-case-insensitive substring search starting at `from` (byte offset).

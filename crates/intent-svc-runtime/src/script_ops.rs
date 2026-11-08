@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use intent_core::ansi::strip_ansi;
 use intent_core::events::{SCRIPT_CHANGED, SCRIPT_OUTPUT, SCRIPT_STATE};
 use intent_core::{
     now_iso, Error, Result, Script, ScriptCreateParams, ScriptMode, ScriptRuntimeState,
@@ -3533,37 +3534,6 @@ fn with_runtime(def: &Script, state: &ScriptRuntimeState) -> Value {
         );
     }
     v
-}
-
-/// Strip ANSI CSI (`ESC [ … letter`) and OSC (`ESC ] … BEL`) sequences before
-/// URL matching (mirrors the TS regex pre-clean).
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('[') => {
-                for nc in chars.by_ref() {
-                    if nc.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                for nc in chars.by_ref() {
-                    if nc == '\u{07}' {
-                        break;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 /// Find the first `http(s)://localhost|127.0.0.1:PORT[/path]` URL (ported from
@@ -7975,6 +7945,39 @@ mod tests {
         assert!(
             text.starts_with("[showing last 2 of "),
             "truncation header: {text:?}"
+        );
+    }
+
+    /// The app replays `script.output` into a terminal view, so the service
+    /// keeps escape codes; only the agent-facing binding cleans them.
+    #[intent_test_macros::daemon_test]
+    async fn script_output_keeps_raw_escapes_for_app_replay() {
+        let h = harness().await;
+        let id = create_simple(
+            &h,
+            "colored",
+            "printf '\\033[32mok\\033[0m\\n'",
+            ScriptMode::Command,
+        )
+        .await;
+        h.services
+            .script_run(
+                h.ws.clone(),
+                id.clone(),
+                None,
+                Some(LIVENESS.as_secs().cast_signed()),
+            )
+            .await
+            .expect("run");
+        let out = h
+            .services
+            .script_output(h.ws.clone(), id, None, None, None)
+            .await
+            .expect("output");
+        let text = out.as_str().expect("string");
+        assert!(
+            text.contains("\u{1b}[32mok\u{1b}[0m"),
+            "raw output: {text:?}"
         );
     }
 
