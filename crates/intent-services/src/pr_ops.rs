@@ -1372,11 +1372,12 @@ pub struct MergeRequirements {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_ejection: Option<MergeQueueEjection>,
     /// The PR's place in the merge queue (`{ position, queueSize?, state?,
-    /// enqueuedAt?, estimatedTimeToMerge? }`), present only alongside
-    /// `is_in_merge_queue: Some(true)` when the host reported the entry.
-    /// Informational only: the monitor's diff never compares it and the
-    /// wake checklist never prints it, so queue movement wakes no agent;
-    /// agents read it on request (`ws.pr.snapshot` / `ws.pr.monitors`).
+    /// enqueuedAt?, estimatedTimeToMerge?, failedCheck? }`), present only
+    /// alongside `is_in_merge_queue: Some(true)` when the host reported the
+    /// entry. Informational except an `unmergeable` state (worded as a CI
+    /// failure when `failedCheck` is set, else as a conflict): queue
+    /// movement wakes no agent; agents read it on request (`ws.pr.snapshot`
+    /// / `ws.pr.monitors`).
     /// Serde-defaulted so persisted baselines predating it still parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue: Option<intent_sourcecontrol::MergeQueueEntry>,

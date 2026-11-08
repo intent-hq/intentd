@@ -17,12 +17,12 @@ use serde_json::{json, Value};
 use crate::error::{Error, Result};
 use crate::model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
-    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueEntry, MergeQueueRemoval,
-    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrAncestry,
-    PrAncestryIdentity, PrInvolvement, PrObservation, PrPatch, PrQuery, PrState, PullRequest,
-    PullRequestFile, PullRequestFilesPage, PullRequestReview, RateLimitStatus, Repo, RepoRef,
-    Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
-    ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
+    IssueQuery, MergeGroupFailedCheck, MergeMethod, MergeOptions, MergeOutcome, MergeQueueEntry,
+    MergeQueueRemoval, MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams,
+    PrAncestry, PrAncestryIdentity, PrInvolvement, PrObservation, PrPatch, PrQuery, PrState,
+    PullRequest, PullRequestFile, PullRequestFilesPage, PullRequestReview, RateLimitStatus, Repo,
+    RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment,
+    ReviewThreadTally, ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
 use crate::SourceControl;
 
@@ -1166,6 +1166,17 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!, $ch
         enqueuedAt
         estimatedTimeToMerge
         mergeQueue { entries { totalCount } }
+        headCommit {
+          statusCheckRollup {
+            contexts(first: 100) {
+              nodes {
+                __typename
+                ... on CheckRun { name conclusion completedAt detailsUrl }
+                ... on StatusContext { context state createdAt targetUrl }
+              }
+            }
+          }
+        }
       }
       timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
         nodes {
@@ -1230,8 +1241,9 @@ const MERGE_QUEUE_TIMELINE_SELECTION: &str = "
 /// The merge-queue entry selection of [`MERGE_REQUIREMENTS_QUERY`] and
 /// [`PR_OBSERVATION_QUERY`], verbatim, so the schema fallback can strip it:
 /// the PR's queue position, entry state, enqueue time, the host's
-/// time-to-merge estimate and the queue's size, in the same round trip
-/// (`null` while the PR is not queued; measured `rateLimit.cost` stays 1).
+/// time-to-merge estimate, the queue's size and the merge-group commit's
+/// checks (to name a failed one), in the same round trip (`null` while the
+/// PR is not queued; measured `rateLimit.cost` stays 1).
 const MERGE_QUEUE_ENTRY_SELECTION: &str = "
       mergeQueueEntry {
         position
@@ -1239,6 +1251,17 @@ const MERGE_QUEUE_ENTRY_SELECTION: &str = "
         enqueuedAt
         estimatedTimeToMerge
         mergeQueue { entries { totalCount } }
+        headCommit {
+          statusCheckRollup {
+            contexts(first: 100) {
+              nodes {
+                __typename
+                ... on CheckRun { name conclusion completedAt detailsUrl }
+                ... on StatusContext { context state createdAt targetUrl }
+              }
+            }
+          }
+        }
       }";
 
 /// A per-PR `query` ([`MERGE_REQUIREMENTS_QUERY`] or
@@ -1303,6 +1326,17 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checks
         enqueuedAt
         estimatedTimeToMerge
         mergeQueue { entries { totalCount } }
+        headCommit {
+          statusCheckRollup {
+            contexts(first: 100) {
+              nodes {
+                __typename
+                ... on CheckRun { name conclusion completedAt detailsUrl }
+                ... on StatusContext { context state createdAt targetUrl }
+              }
+            }
+          }
+        }
       }
       timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
         nodes {
@@ -1587,7 +1621,63 @@ fn parse_merge_queue_entry(pr: Option<&Value>) -> Option<MergeQueueEntry> {
             .and_then(Value::as_str)
             .map(String::from),
         estimated_time_to_merge: entry.get("estimatedTimeToMerge").and_then(Value::as_u64),
+        failed_check: parse_merge_group_failed_check(entry),
     })
+}
+
+/// The merge-group commit's first failed check, from the entry's
+/// `headCommit.statusCheckRollup` selection: of the checks with a failing
+/// conclusion, the one that finished earliest (a fail-fast job cancels the
+/// others after it; a gate job fails last). A check without a finish time
+/// sorts after the timed ones, and on a tie a non-cancelled failure wins.
+/// `None` when nothing failed or the rollup is absent.
+fn parse_merge_group_failed_check(entry: &Value) -> Option<MergeGroupFailedCheck> {
+    const FAILING: [&str; 6] = [
+        "failure",
+        "timed_out",
+        "cancelled",
+        "startup_failure",
+        "action_required",
+        "error",
+    ];
+    let nodes = entry
+        .pointer("/headCommit/statusCheckRollup/contexts/nodes")?
+        .as_array()?;
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let str_at = |key: &str| node.get(key).and_then(Value::as_str);
+            let (name, conclusion, at, url) = match str_at("__typename")? {
+                "CheckRun" => (
+                    str_at("name")?,
+                    str_at("conclusion")?,
+                    str_at("completedAt"),
+                    str_at("detailsUrl"),
+                ),
+                "StatusContext" => (
+                    str_at("context")?,
+                    str_at("state")?,
+                    str_at("createdAt"),
+                    str_at("targetUrl"),
+                ),
+                _ => return None,
+            };
+            let conclusion = conclusion.to_ascii_lowercase();
+            FAILING
+                .contains(&conclusion.as_str())
+                .then_some((at, name, conclusion, url))
+        })
+        .min_by(|a, b| {
+            let key = |c: &(Option<&str>, &str, String, Option<&str>)| {
+                (c.0.is_none(), c.0, c.2 == "cancelled")
+            };
+            key(a).cmp(&key(b))
+        })
+        .map(|(_, name, conclusion, url)| MergeGroupFailedCheck {
+            name: name.to_string(),
+            conclusion,
+            url: url.filter(|u| !u.is_empty()).map(String::from),
+        })
 }
 
 /// Extract the PR's latest merge-queue removal event from the probe's
@@ -3548,6 +3638,7 @@ mod tests {
                 state: Some("queued".into()),
                 enqueued_at: None,
                 estimated_time_to_merge: Some(600),
+                failed_check: None,
             }),
         };
         let wire = serde_json::to_value(&signals).unwrap();
@@ -3613,6 +3704,7 @@ mod tests {
                 state: Some("awaiting_checks".into()),
                 enqueued_at: Some("2026-10-20T03:50:26Z".into()),
                 estimated_time_to_merge: Some(2254),
+                failed_check: None,
             })
         );
         // The full signal parse carries it.
@@ -3682,6 +3774,7 @@ mod tests {
                 state: None,
                 enqueued_at: None,
                 estimated_time_to_merge: None,
+                failed_check: None,
             })
         );
         // Not queued (`null`), selection absent (schema fallback), no PR,
@@ -3698,6 +3791,104 @@ mod tests {
         }
     }
 
+    /// intentd#3154 (2026-11-08): the entry turned UNMERGEABLE minutes after
+    /// its merge-group run failed, so the entry carries the job that failed
+    /// first — the cause, not the gate that failed last or the jobs the
+    /// fail-fast watcher cancelled after it.
+    #[test]
+    fn merge_queue_entry_names_the_first_failed_merge_group_check() {
+        let run = |name: &str, conclusion: Value, at: Value| {
+            json!({
+                "__typename": "CheckRun",
+                "name": name,
+                "conclusion": conclusion,
+                "completedAt": at,
+                "detailsUrl": format!("https://github.com/o/r/actions/runs/1/job/{name}"),
+            })
+        };
+        let entry = |nodes: Vec<Value>| {
+            json!({ "mergeQueueEntry": {
+                "position": 1,
+                "state": "UNMERGEABLE",
+                "headCommit": { "statusCheckRollup": { "contexts": { "nodes": nodes } } }
+            } })
+        };
+        let failed = |pr: Value| parse_merge_queue_entry(Some(&pr)).unwrap().failed_check;
+        let check = |name: &str, conclusion: &str| {
+            Some(MergeGroupFailedCheck {
+                name: name.into(),
+                conclusion: conclusion.into(),
+                url: Some(format!("https://github.com/o/r/actions/runs/1/job/{name}")),
+            })
+        };
+
+        // A failed job, then fail-fast cancels the rest, then the gate fails.
+        let fail_fast = entry(vec![
+            run("CI Gate", json!("FAILURE"), json!("2026-11-08T11:08:00Z")),
+            run("check", json!("CANCELLED"), json!("2026-11-08T11:07:00Z")),
+            run("route", json!("SUCCESS"), json!("2026-11-08T11:00:00Z")),
+            run(
+                "cache-smoke / verify",
+                json!("FAILURE"),
+                json!("2026-11-08T11:06:00Z"),
+            ),
+            run("coverage-e2e", Value::Null, Value::Null),
+        ]);
+        assert_eq!(failed(fail_fast), check("cache-smoke / verify", "failure"));
+
+        // A job hits its timeout (reported cancelled) before fail-fast
+        // cancels the others.
+        let timeout = entry(vec![
+            run("check", json!("CANCELLED"), json!("2026-11-08T11:45:30Z")),
+            run(
+                "release-scripts",
+                json!("CANCELLED"),
+                json!("2026-11-08T11:45:00Z"),
+            ),
+            run("CI Gate", json!("FAILURE"), json!("2026-11-08T11:46:00Z")),
+        ]);
+        assert_eq!(failed(timeout), check("release-scripts", "cancelled"));
+
+        // On a tie a real failure beats a cancellation; an untimed failure
+        // sorts after a timed one; a status context counts.
+        let tie = entry(vec![
+            run("a", json!("CANCELLED"), json!("2026-11-08T11:00:00Z")),
+            run("b", json!("TIMED_OUT"), json!("2026-11-08T11:00:00Z")),
+        ]);
+        assert_eq!(failed(tie), check("b", "timed_out"));
+        let untimed = entry(vec![
+            run("late", json!("FAILURE"), Value::Null),
+            json!({
+                "__typename": "StatusContext",
+                "context": "ci/legacy",
+                "state": "ERROR",
+                "createdAt": "2026-11-08T11:00:00Z",
+                "targetUrl": "",
+            }),
+        ]);
+        assert_eq!(
+            failed(untimed),
+            Some(MergeGroupFailedCheck {
+                name: "ci/legacy".into(),
+                conclusion: "error".into(),
+                url: None,
+            })
+        );
+
+        // Nothing failed (yet), no rollup, or no merge-group commit: none.
+        for pr in [
+            entry(vec![
+                run("check", json!("SUCCESS"), json!("2026-11-08T11:00:00Z")),
+                run("CI Gate", Value::Null, Value::Null),
+                json!({ "__typename": "StatusContext", "context": "x", "state": "PENDING" }),
+            ]),
+            json!({ "mergeQueueEntry": { "position": 1, "headCommit": { "statusCheckRollup": null } } }),
+            json!({ "mergeQueueEntry": { "position": 1, "headCommit": null } }),
+        ] {
+            assert_eq!(failed(pr.clone()), None, "{pr}");
+        }
+    }
+
     #[test]
     fn merge_queue_entry_serializes_camel_case_and_omits_unknowns() {
         let wire = serde_json::to_value(MergeQueueEntry {
@@ -3706,6 +3897,7 @@ mod tests {
             state: Some("queued".into()),
             enqueued_at: Some("2026-10-20T03:50:26Z".into()),
             estimated_time_to_merge: Some(2254),
+            failed_check: None,
         })
         .unwrap();
         assert_eq!(
@@ -3724,9 +3916,27 @@ mod tests {
             state: None,
             enqueued_at: None,
             estimated_time_to_merge: None,
+            failed_check: None,
         })
         .unwrap();
         assert_eq!(sparse, json!({ "position": 1 }));
+        let failed = serde_json::to_value(MergeQueueEntry {
+            failed_check: Some(MergeGroupFailedCheck {
+                name: "check".into(),
+                conclusion: "failure".into(),
+                url: None,
+            }),
+            position: 1,
+            queue_size: None,
+            state: None,
+            enqueued_at: None,
+            estimated_time_to_merge: None,
+        })
+        .unwrap();
+        assert_eq!(
+            failed,
+            json!({ "position": 1, "failedCheck": { "name": "check", "conclusion": "failure" } })
+        );
     }
 
     #[test]

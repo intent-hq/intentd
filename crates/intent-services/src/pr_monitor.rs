@@ -7074,6 +7074,7 @@ mod tests {
                     state: Some("awaiting_checks".into()),
                     enqueued_at: enqueued_at.map(Into::into),
                     estimated_time_to_merge: None,
+                    failed_check: None,
                 });
             })
             .requirements
@@ -9365,6 +9366,7 @@ mod tests {
                         pick(b, "2026-10-24T09:30:00Z", "2026-10-25T09:30:00Z").into(),
                     ),
                     estimated_time_to_merge: Some(pick(b, 60, 120)),
+                    failed_check: None,
                 }),
                 checks_not_started: Some(pr_ops::ChecksNotStarted {
                     head_sha: head.into(),
@@ -16186,6 +16188,7 @@ mod tests {
                 state: Some("awaiting_checks".into()),
                 enqueued_at: Some("2026-10-21T13:10:00Z".into()),
                 estimated_time_to_merge: None,
+                failed_check: None,
             });
         });
         let monitor = register(&svc, &ws, &owner).await;
@@ -16277,6 +16280,7 @@ mod tests {
                 state: Some("awaiting_checks".into()),
                 enqueued_at: Some("2026-10-21T13:21:58Z".into()),
                 estimated_time_to_merge: None,
+                failed_check: None,
             });
         });
         svc.poll_pr_monitors().await;

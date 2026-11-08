@@ -1,4 +1,5 @@
 //! Shared review-monitor sentence patterns. Qualified facts preserve unknowns.
+use intent_sourcecontrol::MergeGroupFailedCheck;
 use serde_json::Value;
 use std::fmt::Write as _;
 
@@ -191,13 +192,21 @@ pub(crate) fn checklist(r: &Value, head: Option<&str>, ready: bool) -> String {
         .into(),
     );
     if r["isInMergeQueue"] == true {
-        lines.push(if r["mergeQueue"]["state"] == "unmergeable" {
-            "in merge queue, but the entry is UNMERGEABLE (conflicts with an entry ahead) — \
-             dequeue it, merge-tree this head against the entry ahead's merge-group branch (or \
-             origin/<base>); re-enqueue the same commit if clean, else fix the branch first"
-                .into()
-        } else {
-            "in merge queue".into()
+        let failed =
+            serde_json::from_value::<MergeGroupFailedCheck>(r["mergeQueue"]["failedCheck"].clone());
+        lines.push(match (r["mergeQueue"]["state"] == "unmergeable", failed) {
+            (true, Ok(check)) => format!(
+                "in merge queue, but the entry is UNMERGEABLE (merge-group CI failed: {}) — \
+                 diagnose that job; re-enqueue the same commit if it was infrastructure, else \
+                 dequeue and fix the branch first",
+                merge_group_failure(&check)
+            ),
+            (true, Err(_)) => "in merge queue, but the entry is UNMERGEABLE (conflicts with an \
+                               entry ahead) — dequeue it, merge-tree this head against the entry \
+                               ahead's merge-group branch (or origin/<base>); re-enqueue the \
+                               same commit if clean, else fix the branch first"
+                .into(),
+            (false, _) => "in merge queue".into(),
         });
     }
     if let Some(reason) = r["mergeBlockedReason"].as_str() {
@@ -211,6 +220,23 @@ pub(crate) fn checklist(r: &Value, head: Option<&str>, ready: bool) -> String {
         .map(|line| format!("- {line}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A failed merge-group check as a wake names it: `` `check` failed (url)``.
+pub(crate) fn merge_group_failure(check: &MergeGroupFailedCheck) -> String {
+    let outcome = match check.conclusion.as_str() {
+        "failure" => "failed".to_string(),
+        "timed_out" => "timed out".to_string(),
+        "cancelled" => "was cancelled".to_string(),
+        "startup_failure" => "failed to start".to_string(),
+        "action_required" => "needs action".to_string(),
+        "error" => "errored".to_string(),
+        other => other.replace('_', " "),
+    };
+    match &check.url {
+        Some(url) => format!("`{}` {outcome} ({url})", check.name),
+        None => format!("`{}` {outcome}", check.name),
+    }
 }
 
 pub(crate) fn changed(
