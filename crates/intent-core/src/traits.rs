@@ -9829,7 +9829,6 @@ pub enum ReverseTarget {
     Preferred(Vec<ClientId>),
 }
 
-
 /// Why an agent-initiated reverse RPC could not be delivered (REV-1/REV-2).
 /// Kept as a small named enum so the service layer can distinguish "no client
 /// connected" from a transport-level failure without inspecting error strings.

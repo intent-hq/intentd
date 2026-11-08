@@ -1217,7 +1217,7 @@ async fn discussion_typing_lifecycle_sources_pulses_targets_and_clearing() {
 
 /// intent-hq/intent#7855: browser routing prefers the client that most
 /// recently focused a workspace. Clients focusing it now rank first (latest
-/// focus start first), then clients whose focus left it, latest departure
+/// update naming it first), then clients whose focus left it, latest departure
 /// first; a connection with no bound client names nobody, a client counts
 /// once at its best rank, and a disconnect forgets the connection's history.
 #[tokio::test]
@@ -1232,9 +1232,12 @@ async fn recent_focus_ranks_current_focus_then_latest_departure_per_client() {
         ("two-bis", Some("b")),
         ("unbound", None),
     ] {
-        with_caller(caller.clone(), services.presence_connect_op(connection.into()))
-            .await
-            .unwrap();
+        with_caller(
+            caller.clone(),
+            services.presence_connect_op(connection.into()),
+        )
+        .await
+        .unwrap();
         if let Some(client) = client {
             services.presence_bind_client_op(connection, ClientId::from_string(client));
         }
@@ -1260,10 +1263,23 @@ async fn recent_focus_ranks_current_focus_then_latest_departure_per_client() {
 
     assert!(order(&ws).is_empty());
     focus("unbound", true).await.unwrap();
-    assert!(order(&ws).is_empty(), "an unbound connection names no client");
+    assert!(
+        order(&ws).is_empty(),
+        "an unbound connection names no client"
+    );
     focus("two", true).await.unwrap();
     focus("one", true).await.unwrap();
-    assert_eq!(order(&ws), ["a", "b"], "both focus it now: latest start first");
+    assert_eq!(
+        order(&ws),
+        ["a", "b"],
+        "both focus it now: latest update first"
+    );
+    focus("two", true).await.unwrap();
+    assert_eq!(
+        order(&ws),
+        ["b", "a"],
+        "a repeated update is fresh activity"
+    );
     focus("one", false).await.unwrap();
     assert_eq!(order(&ws), ["b", "a"], "focusing now beats any past focus");
     focus("two", false).await.unwrap();
@@ -1272,7 +1288,11 @@ async fn recent_focus_ranks_current_focus_then_latest_departure_per_client() {
     focus("one", false).await.unwrap();
     assert_eq!(order(&ws), ["a", "b"], "a left last");
     focus("two-bis", true).await.unwrap();
-    assert_eq!(order(&ws), ["b", "a"], "b's other connection focuses it now");
+    assert_eq!(
+        order(&ws),
+        ["b", "a"],
+        "b's other connection focuses it now"
+    );
     assert!(order(&WorkspaceId::new()).is_empty(), "per workspace");
     services.presence_disconnect_op("two-bis".into()).await;
     assert_eq!(order(&ws), ["a", "b"]);

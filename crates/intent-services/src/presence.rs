@@ -245,8 +245,9 @@ impl Conn {
         }
     }
 
-    /// Replace the focus set at `tick`, keeping the routing history: a
-    /// workspace entering focus starts now, one leaving it records now.
+    /// Replace the focus set at `tick`, keeping the routing history: every
+    /// workspace in the new set is marked focused as of now (a repeated
+    /// update is fresh activity in this client), one leaving it records now.
     fn set_focus(&mut self, focus: Vec<Focus>, tick: u64) {
         let now: HashSet<String> = focus.iter().map(|f| f.workspace.clone()).collect();
         self.focus_since.retain(|workspace, _| {
@@ -258,7 +259,7 @@ impl Conn {
         });
         for workspace in now {
             self.focus_left.remove(&workspace);
-            self.focus_since.entry(workspace).or_insert(tick);
+            self.focus_since.insert(workspace, tick);
         }
         while self.focus_left.len() > FOCUS_HISTORY_LIMIT {
             let oldest = self
@@ -275,7 +276,8 @@ impl Conn {
     }
 
     /// This connection's routing rank for `workspace`: focusing it now
-    /// outranks any past focus; within each, the later tick wins.
+    /// outranks any past focus; within each, the later tick (latest update
+    /// still naming it, or latest departure) wins.
     fn focus_rank(&self, workspace: &str) -> Option<(bool, u64)> {
         self.focus_since
             .get(workspace)
@@ -930,10 +932,13 @@ impl Services {
 
     /// The clients whose hello'd connections most recently focused
     /// `workspace_id`, best first (REV-2 rule 5, intent-hq/intent#7855):
-    /// clients focusing it now (latest focus start first), then clients
+    /// clients focusing it now (latest update naming it first), then clients
     /// whose focus left it (latest departure first). Each client appears
     /// once, at its best connection's rank; unbound connections are skipped.
-    pub(crate) fn presence_recent_focus_clients(&self, workspace_id: &WorkspaceId) -> Vec<ClientId> {
+    pub(crate) fn presence_recent_focus_clients(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Vec<ClientId> {
         let state = self.presence.lock();
         let mut best: HashMap<&ClientId, (bool, u64)> = HashMap::new();
         for conn in state.conns.values().filter(|conn| conn.hello) {
@@ -947,7 +952,10 @@ impl Services {
         }
         let mut ranked: Vec<(&ClientId, (bool, u64))> = best.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
-        ranked.into_iter().map(|(client, _)| client.clone()).collect()
+        ranked
+            .into_iter()
+            .map(|(client, _)| client.clone())
+            .collect()
     }
 
     /// Test seam for the shared routing fixture: make `clients` (best first)
@@ -973,7 +981,11 @@ impl Services {
             conn.set_focus(vec![focus], entered);
             conn.set_focus(Vec::new(), left);
             state.conns.insert(
-                format!("focus-fixture-{}-{}", workspace_id.as_str(), client.as_str()),
+                format!(
+                    "focus-fixture-{}-{}",
+                    workspace_id.as_str(),
+                    client.as_str()
+                ),
                 conn,
             );
         }

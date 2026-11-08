@@ -1506,11 +1506,14 @@ async fn agent_browser_exec_prefers_the_client_that_last_focused_the_workspace()
 
     let ws_id = create_workspace(&mut studio, 2, "Created on the studio").await;
     let other_ws = create_workspace(&mut studio, 3, "Never focused").await;
-    for (id, focus) in [
-        (4, json!([{ "workspaceId": ws_id }])),
-        (5, json!([])),
-    ] {
-        let reply = wss_rpc(&mut studio, id, "presence.update", json!({ "focus": focus })).await;
+    for (id, focus) in [(4, json!([{ "workspaceId": ws_id }])), (5, json!([]))] {
+        let reply = wss_rpc(
+            &mut studio,
+            id,
+            "presence.update",
+            json!({ "focus": focus }),
+        )
+        .await;
         assert_eq!(reply["result"]["ok"], true, "presence.update: {reply}");
     }
 

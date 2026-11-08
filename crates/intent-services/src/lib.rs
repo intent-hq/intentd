@@ -5370,6 +5370,18 @@ impl Services {
         }
         let mut workspace = routes.pop().expect("two routes");
         let unpinned = routes.pop().expect("two routes");
+        // The focus label only when a focused client actually serves the
+        // route; a fallback to the first-connected client reads `default`.
+        let source = match &targets[1] {
+            intent_core::ReverseTarget::Preferred(clients)
+                if !workspace["clientId"]
+                    .as_str()
+                    .is_some_and(|id| clients.iter().any(|c| c.as_str() == id)) =>
+            {
+                "default"
+            }
+            _ => source,
+        };
         workspace["source"] = source.into();
         Ok(serde_json::json!({
             "clients": snapshot.clients,
