@@ -453,9 +453,14 @@ fn resolve_entry_capability<'a>(
         // turn the preference into an offline error.
         ReverseTarget::Preferred(clients) => clients
             .iter()
-            .find_map(|client_id| newest_eligible_of(entries, client_id, &allowed))
+            .find_map(|client_id| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.has_client(client_id) && allowed(e))
+            })
             .map_or_else(
-                || resolve_entry_matching(entries, &ReverseTarget::Default, allowed),
+                || resolve_entry_capability(entries, &ReverseTarget::Default, allowed),
                 Ok,
             ),
         // The client of the oldest live eligible registration is the
@@ -546,6 +551,19 @@ fn resolve_navigation_entry<'a>(
     workspace_id: &WorkspaceId,
 ) -> Result<&'a Entry, ReverseDispatchError> {
     let in_scope = |e: &Entry| member_scoped(workspace_id.as_str()) || e.channel.is_administrator();
+    // Focus is a preference among clients capable of this action. If none
+    // remains eligible, use the same desktop-first default as an unfocused open.
+    if let ReverseTarget::Preferred(clients) = target {
+        if let Some(entry) = clients.iter().find_map(|client| {
+            entries
+                .iter()
+                .rev()
+                .find(|e| e.has_client(client) && e.navigation_eligible() && in_scope(e))
+        }) {
+            return Ok(entry);
+        }
+        return resolve_navigation_entry(entries, &ReverseTarget::Default, workspace_id);
+    }
     if matches!(target, ReverseTarget::Default) {
         if let Ok(desktop) = resolve_entry_matching(entries, target, in_scope) {
             return Ok(desktop);

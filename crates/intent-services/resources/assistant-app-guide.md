@@ -1217,7 +1217,9 @@ authenticated tunnel.
 Agent-requested native previews require the companion iOS implementation and are
 not yet a generally released option. On supporting builds, new previews prefer
 the device that sent your latest message in that conversation, when connected
-and capable. Otherwise they use an eligible desktop, then connected iOS.
+and capable. Otherwise they follow the workspace browser assignment, then the
+capable connected app where you last viewed the workspace. With neither, they
+use an eligible desktop, then connected iOS.
 A delegated helper follows its parent's preference until you message the helper
 directly. Unrelated conversations do not share this preference.
 An explicitly pinned browser device takes precedence. Automatic updates and

@@ -1970,3 +1970,54 @@ fn native_navigation_preserves_guest_and_chief_authority() {
         .resolve_navigation(&ReverseTarget::Default, &workspace("ws-1"))
         .is_err());
 }
+
+#[test]
+fn native_navigation_focus_respects_capability_and_default_fallback() {
+    let reg = PrimaryReverseRegistry::new();
+    let (phone, _phone_rx) = idle_channel();
+    let phone_guard = reg.register(phone, ReverseTransport::Wss);
+    let mut native = identity("phone", false);
+    native.capabilities["browserNavigation"] = true.into();
+    phone_guard.bind_hello(native);
+    let (desktop, _desktop_rx) = idle_channel();
+    let desktop_guard = reg.register(desktop, ReverseTransport::Wss);
+    desktop_guard.bind_hello(identity("desktop", true));
+    let (aux, _aux_rx) = idle_channel();
+    let aux_guard = reg.register(aux, ReverseTransport::Wss);
+    aux_guard.bind_hello(identity("phone", false));
+    let ws = workspace("ws-focus");
+    let focus = ReverseTarget::Preferred(vec!["offline".into(), "phone".into()]);
+    assert_eq!(
+        reg.resolve_navigation(&focus, &ws)
+            .unwrap()
+            .client_id
+            .as_str(),
+        "phone"
+    );
+    assert_eq!(reg.resolve(&focus).unwrap().client_id.as_str(), "desktop");
+    let absent = ReverseTarget::Preferred(vec!["offline".into()]);
+    assert_eq!(
+        reg.resolve_navigation(&absent, &ws)
+            .unwrap()
+            .client_id
+            .as_str(),
+        "desktop"
+    );
+    drop(desktop_guard);
+    assert!(
+        reg.resolve(&focus).is_err(),
+        "focus must not enable native automation"
+    );
+    assert_eq!(
+        reg.resolve_navigation(&absent, &ws)
+            .unwrap()
+            .client_id
+            .as_str(),
+        "phone"
+    );
+    drop(phone_guard);
+    assert!(
+        reg.resolve_navigation(&focus, &ws).is_err(),
+        "an auxiliary socket cannot satisfy focus"
+    );
+}

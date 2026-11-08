@@ -469,3 +469,115 @@ async fn browser_sender_delegation_inherits_only_nearest_same_workspace_receipt(
         "lookup is bounded even on an excessively deep chain"
     );
 }
+
+#[intent_test_macros::daemon_test]
+async fn browser_sender_precedes_focus_and_native_tabs_preserve_focus_fallback() {
+    use intent_core::{AgentId, ClientHostInfo};
+    use intent_services::feature_api::test_support::fixtures::session;
+    let registry = Arc::new(NavigationRegistry {
+        desktop: FakeRegistry::new(&[("desktop-a", None, true), ("desktop-b", None, true)]),
+        navigation: FakeRegistry::new(&[
+            ("desktop-a", None, true),
+            ("desktop-b", None, true),
+            ("phone", None, true),
+        ]),
+    });
+    let (_tmp, _root, svc, _bus, ws) = setup(registry.desktop.clone()).await;
+    let svc = svc.with_reverse_dispatch(registry.clone());
+    let agent = AgentId::new();
+    svc.store()
+        .insert_agent_session(&session(&agent, &ws))
+        .await
+        .unwrap();
+    for device in ["phone", "offline"] {
+        svc.store()
+            .upsert_client(
+                &ClientId::from(device),
+                None,
+                None,
+                &ClientHostInfo::default(),
+            )
+            .await
+            .unwrap();
+    }
+    svc.presence_record_focus_for_test(&ws, &[ClientId::from("desktop-b")]);
+    // A claimed native tab must not select the automation host or suppress focus.
+    register_tab(&svc, &ws, "native-focused", "phone", Some(agent.as_str())).await;
+    for (order, sender, expected) in [
+        ("1", None, "desktop-b"),
+        ("2", Some("phone"), "phone"),
+        ("3", Some("desktop-a"), "desktop-a"),
+        ("4", Some("offline"), "desktop-b"),
+        ("5", Some("phone"), "phone"),
+    ] {
+        svc.store()
+            .record_browser_sender(&agent, order, order, sender.map(ClientId::from).as_ref())
+            .await
+            .unwrap();
+        let result = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({"action":"openTab","url":"https://preview.test"})],
+                None,
+                Some(agent.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["result"]["host"], expected);
+    }
+    // Native sender cannot take a mixed automation batch: focus remains the fallback.
+    svc.browser_exec(
+        ws.clone(),
+        vec![
+            json!({"action":"openTab"}),
+            json!({"action":"evaluate","script":"1"}),
+        ],
+        None,
+        Some(agent.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        registry.desktop.calls.lock().unwrap().last().unwrap().2,
+        ReverseTarget::Preferred(vec![ClientId::from("desktop-b")])
+    );
+    svc.store()
+        .record_browser_sender(&agent, "6", "6", Some(&ClientId::from("desktop-a")))
+        .await
+        .unwrap();
+    let named = svc
+        .browser_exec(
+            ws.clone(),
+            vec![json!({"action":"showTab","tabId":"native-focused"})],
+            None,
+            Some(agent.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        named["result"]["host"], "phone",
+        "sender and focus never move named native tabs"
+    );
+    svc.set_workspace_browser_client(ws.clone(), Some(ClientId::from("desktop-b")))
+        .await
+        .unwrap();
+    let pinned = svc
+        .browser_exec(
+            ws.clone(),
+            vec![json!({"action":"openTab"})],
+            None,
+            Some(agent.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pinned["result"]["host"], "desktop-b");
+    svc.set_workspace_browser_client(ws.clone(), Some(ClientId::from("offline")))
+        .await
+        .unwrap();
+    assert!(
+        svc.browser_exec(ws, vec![json!({"action":"openTab"})], None, Some(agent))
+            .await
+            .is_err(),
+        "offline pin cannot use sender or focus fallback"
+    );
+}
