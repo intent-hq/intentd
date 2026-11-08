@@ -1488,3 +1488,72 @@ async fn successful_claim_rehomes_the_tab_to_the_driving_client_and_pin_changes_
 
     fx.ws.stop().await;
 }
+
+/// Regression (intent-hq/intent#7855): two desktops are connected, and the
+/// user creates a workspace on the one that connected second, looks at it,
+/// then looks away. An agent `browser.exec` for that unpinned workspace with
+/// no claimed tabs goes to the client that last focused it, not to the
+/// first-connected one, which never showed it. A client whose focus never
+/// touched the workspace keeps the first-connected fallback.
+#[intent_test_macros::daemon_test]
+async fn agent_browser_exec_prefers_the_client_that_last_focused_the_workspace() {
+    let fx = boot().await;
+    let mut laptop = connect(fx.port).await;
+    let _ = wss_rpc(&mut laptop, 1, "client.hello", hello("laptop", true)).await;
+    let mut studio = connect(fx.port).await;
+    let _ = wss_rpc(&mut studio, 1, "client.hello", hello("studio", true)).await;
+    assert_eq!(fx.registry.len(), 2);
+
+    let ws_id = create_workspace(&mut studio, 2, "Created on the studio").await;
+    let other_ws = create_workspace(&mut studio, 3, "Never focused").await;
+    for (id, focus) in [
+        (4, json!([{ "workspaceId": ws_id }])),
+        (5, json!([])),
+    ] {
+        let reply = wss_rpc(&mut studio, id, "presence.update", json!({ "focus": focus })).await;
+        assert_eq!(reply["result"]["ok"], true, "presence.update: {reply}");
+    }
+
+    let screenshot = |workspace: String| {
+        let api = fx.api.clone();
+        intent_core::spawn_daemon(async move {
+            api.browser_exec(
+                WorkspaceId::from(workspace.as_str()),
+                vec![json!({ "action": "screenshot" })],
+                None,
+                None,
+            )
+            .await
+        })
+    };
+    let fe_result = json!({
+        "success": true,
+        "results": [{ "action": "screenshot", "success": true, "result": { "base64": "..." } }]
+    });
+
+    let call = screenshot(ws_id.clone());
+    let forwarded = answer_reverse(&mut studio, Duration::from_secs(2), fe_result.clone()).await;
+    assert_eq!(forwarded["params"]["workspaceId"], ws_id.as_str());
+    assert!(
+        try_read_text(&mut laptop, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "the first-connected client never focused the workspace and must not get its browser ops",
+    );
+    call.await.expect("join").expect("ok");
+
+    let clients = fx
+        .api
+        .browser_clients(WorkspaceId::from(ws_id.as_str()), None)
+        .await
+        .expect("browser clients");
+    assert_eq!(clients["workspace"]["clientId"], "studio", "{clients}");
+    assert_eq!(clients["workspace"]["source"], "focus", "{clients}");
+
+    let call = screenshot(other_ws.clone());
+    let forwarded = answer_reverse(&mut laptop, Duration::from_secs(2), fe_result).await;
+    assert_eq!(forwarded["params"]["workspaceId"], other_ws.as_str());
+    call.await.expect("join").expect("ok");
+
+    fx.ws.stop().await;
+}

@@ -80,7 +80,7 @@ impl BrowserTabRoutingExt for Services {
     /// on its physical host.
     async fn browser_tab_route_target(&self, tab: &BrowserTab) -> Result<ReverseTarget> {
         if tab.owner_agent_id.is_some() {
-            self.driving_client_target(&tab.workspace_id).await
+            self.browser_client_target(&tab.workspace_id).await
         } else {
             Ok(ReverseTarget::Client(tab.host_client_id.clone()))
         }
@@ -274,7 +274,7 @@ impl BrowserTabRoutingExt for Services {
         workspace_id: &WorkspaceId,
         executed_on: &ClientId,
     ) -> Result<ClientId> {
-        let target = self.driving_client_target(workspace_id).await?;
+        let target = self.browser_client_target(workspace_id).await?;
         let resolved = self
             .feature_reverse_dispatch()
             .and_then(|d| d.resolve(&target).ok())
@@ -284,7 +284,7 @@ impl BrowserTabRoutingExt for Services {
             (ReverseTarget::Pinned(client_id) | ReverseTarget::Client(client_id), None) => {
                 client_id
             }
-            (ReverseTarget::Default, None) => executed_on.clone(),
+            (ReverseTarget::Default | ReverseTarget::Preferred(_), None) => executed_on.clone(),
         })
     }
 

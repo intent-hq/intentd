@@ -1055,7 +1055,7 @@ impl RuntimePort for RuntimeFeature {
                     "browser.exec: no client connected".to_string(),
                 ));
             };
-            let target = svc.driving_client_target(&workspace_id).await?;
+            let target = svc.browser_client_target(&workspace_id).await?;
             // Claims re-home their tab after the dispatch; record which
             // client executed them (the commit re-validates the host).
             let claims: Vec<String> = actions

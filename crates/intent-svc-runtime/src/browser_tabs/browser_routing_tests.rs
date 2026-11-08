@@ -559,7 +559,9 @@ async fn claim_reply_with_tab_id_migrates_through_browser_exec() {
         fn resolve(&self, target: &ReverseTarget) -> Result<ResolvedClient, ReverseDispatchError> {
             Ok(ResolvedClient {
                 client_id: match target {
-                    ReverseTarget::Default => ClientId::from_string("desktop-a"),
+                    ReverseTarget::Default | ReverseTarget::Preferred(_) => {
+                        ClientId::from_string("desktop-a")
+                    }
                     ReverseTarget::Client(c) | ReverseTarget::Pinned(c) => c.clone(),
                 },
                 name: None,
@@ -673,7 +675,9 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
         fn resolve(&self, target: &ReverseTarget) -> Result<ResolvedClient, ReverseDispatchError> {
             Ok(ResolvedClient {
                 client_id: match target {
-                    ReverseTarget::Default => ClientId::from_string("desktop-a"),
+                    ReverseTarget::Default | ReverseTarget::Preferred(_) => {
+                        ClientId::from_string("desktop-a")
+                    }
                     ReverseTarget::Client(c) | ReverseTarget::Pinned(c) => c.clone(),
                 },
                 name: None,

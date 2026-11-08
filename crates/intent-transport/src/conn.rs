@@ -1004,6 +1004,9 @@ async fn process_captured_frame(
             // REV-2: bind the hello'd identity onto the registry entry; the
             // registry queues and publishes any `client:*` transition.
             let hello_ok = bound.is_some();
+            let bound_client = bound
+                .as_ref()
+                .map(|claimed| claimed.identity().client_id.clone());
             let ordinary_source = bound.as_ref().and_then(|claimed| {
                 let principal = crate::context::current_caller()?.principal_id()?.clone();
                 reverse_guard.prepare_ordinary_monitor_source(
@@ -1035,6 +1038,9 @@ async fn process_captured_frame(
                 subs.presence.attach(api);
                 if let Err(e) = api.presence_connect(subs.presence.id().to_string()).await {
                     tracing::debug!(error = %e, "presence: connect skipped");
+                }
+                if let Some(client_id) = bound_client {
+                    api.presence_bind_client(subs.presence.id().to_string(), client_id);
                 }
             }
             subs.setup.authorized = setup_requested

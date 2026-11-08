@@ -5943,6 +5943,14 @@ pub trait WorkspaceApi: Send + Sync {
     // callers and unbound requests are refused (`Forbidden`). Nothing here is
     // persisted: the events are transient only.
 
+    /// Record which logical client a hello'd connection belongs to, so the
+    /// browser router can map its focus history to a client
+    /// (intent-hq/intent#7855). Re-hello rebinds; unknown connections are
+    /// ignored. The default does nothing.
+    fn presence_bind_client(&self, connection_id: String, client_id: ClientId) {
+        let _ = (connection_id, client_id);
+    }
+
     /// A hello'd connection came online for its principal. Publishes
     /// `presence:changed` to every workspace the principal is a member of
     /// when this is its first live connection.
@@ -9804,6 +9812,8 @@ pub trait ContextEngine: Send + Sync {
 /// - [`Default`](Self::Default): the **first-connected** eligible client,
 ///   via its **newest** eligible connection (the same per-client rule as
 ///   `Client` / `Pinned`); none ⇒ [`ReverseDispatchError::NoClient`].
+/// - [`Preferred`](Self::Preferred): the first listed client with an
+///   eligible connection (its newest), else exactly as `Default`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReverseTarget {
     /// A specific logical client (e.g. the host of a browser tab).
@@ -9812,7 +9822,13 @@ pub enum ReverseTarget {
     Pinned(ClientId),
     /// The first-connected eligible client.
     Default,
+    /// The clients that most recently focused the workspace, best first
+    /// (REV-2 rule 5, intent-hq/intent#7855); falls back to `Default` when
+    /// none of them has an eligible connection. Never empty when built by
+    /// the router.
+    Preferred(Vec<ClientId>),
 }
+
 
 /// Why an agent-initiated reverse RPC could not be delivered (REV-1/REV-2).
 /// Kept as a small named enum so the service layer can distinguish "no client
@@ -10079,7 +10095,9 @@ pub trait AgentReverseDispatch: Send + Sync {
         target: &ReverseTarget,
     ) -> std::result::Result<ResolvedClient, ReverseDispatchError> {
         match target {
-            ReverseTarget::Default => Err(ReverseDispatchError::NoClient),
+            ReverseTarget::Default | ReverseTarget::Preferred(_) => {
+                Err(ReverseDispatchError::NoClient)
+            }
             ReverseTarget::Client(client_id) | ReverseTarget::Pinned(client_id) => {
                 Err(ReverseDispatchError::ClientOffline {
                     client_id: client_id.clone(),

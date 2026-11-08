@@ -318,8 +318,9 @@ connected <time> did not accept or answer the request within <s>s`. Call the rea
   host a browser, via its newest connection.
 - `workspace` — where this workspace's `ws.browser.exec` goes, with `source`:
   `workspace` (the workspace's browser-client pin), `desktop` (the client controlling
-  this workspace's desktop), `tabs` (the host of this workspace's claimed tabs) or
-  `default` (same as `unpinned`).
+  this workspace's desktop), `tabs` (the host of this workspace's claimed tabs),
+  `focus` (the connected app that most recently showed this workspace; with none
+  connected it falls back to `unpinned`) or `default` (same as `unpinned`).
 
 A route names `clientId` and `connectionId`; when nothing would answer it has
 `connectionId: null` and an `error` (for example `no client connected`). If the

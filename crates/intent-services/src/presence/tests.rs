@@ -1214,3 +1214,68 @@ async fn discussion_typing_lifecycle_sources_pulses_targets_and_clearing() {
         .unwrap()
         .is_empty());
 }
+
+/// intent-hq/intent#7855: browser routing prefers the client that most
+/// recently focused a workspace. Clients focusing it now rank first (latest
+/// focus start first), then clients whose focus left it, latest departure
+/// first; a connection with no bound client names nobody, a client counts
+/// once at its best rank, and a disconnect forgets the connection's history.
+#[tokio::test]
+async fn recent_focus_ranks_current_focus_then_latest_departure_per_client() {
+    use intent_core::{with_caller, ClientId, WorkspaceId};
+    let tmp = crate::tests::TempDb::new();
+    let root = crate::tests::WorkspacesRoot::new();
+    let (_store, services, ws, caller) = member_services(&tmp, &root).await;
+    for (connection, client) in [
+        ("one", Some("a")),
+        ("two", Some("b")),
+        ("two-bis", Some("b")),
+        ("unbound", None),
+    ] {
+        with_caller(caller.clone(), services.presence_connect_op(connection.into()))
+            .await
+            .unwrap();
+        if let Some(client) = client {
+            services.presence_bind_client_op(connection, ClientId::from_string(client));
+        }
+    }
+    let focus = |connection: &str, on: bool| {
+        let focus = if on {
+            json!({ "focus": [{ "workspaceId": ws }] })
+        } else {
+            json!({ "focus": [] })
+        };
+        with_caller(
+            caller.clone(),
+            services.presence_update_op(connection.into(), focus),
+        )
+    };
+    let order = |workspace: &WorkspaceId| -> Vec<String> {
+        services
+            .presence_recent_focus_clients(workspace)
+            .into_iter()
+            .map(|client| client.as_str().to_string())
+            .collect()
+    };
+
+    assert!(order(&ws).is_empty());
+    focus("unbound", true).await.unwrap();
+    assert!(order(&ws).is_empty(), "an unbound connection names no client");
+    focus("two", true).await.unwrap();
+    focus("one", true).await.unwrap();
+    assert_eq!(order(&ws), ["a", "b"], "both focus it now: latest start first");
+    focus("one", false).await.unwrap();
+    assert_eq!(order(&ws), ["b", "a"], "focusing now beats any past focus");
+    focus("two", false).await.unwrap();
+    assert_eq!(order(&ws), ["b", "a"], "b left after a");
+    focus("one", true).await.unwrap();
+    focus("one", false).await.unwrap();
+    assert_eq!(order(&ws), ["a", "b"], "a left last");
+    focus("two-bis", true).await.unwrap();
+    assert_eq!(order(&ws), ["b", "a"], "b's other connection focuses it now");
+    assert!(order(&WorkspaceId::new()).is_empty(), "per workspace");
+    services.presence_disconnect_op("two-bis".into()).await;
+    assert_eq!(order(&ws), ["a", "b"]);
+    services.presence_disconnect_op("one".into()).await;
+    assert_eq!(order(&ws), ["b"], "a disconnect forgets the connection");
+}

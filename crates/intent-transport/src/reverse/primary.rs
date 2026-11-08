@@ -18,6 +18,8 @@
 //!   socket of that client is skipped). Re-evaluated per request: when that
 //!   registration drops, the next-oldest registration's client wins even if
 //!   the first client still has a newer connection. None → `NoClient`.
+//! - [`ReverseTarget::Preferred`] → the first listed client with an eligible
+//!   connection (its newest), else exactly as `Default`.
 //! - [`ReverseTarget::Client`] / [`ReverseTarget::Pinned`] → the **newest**
 //!   eligible connection of that logical `clientId`; none →
 //!   `ClientOffline { client_id, name, pinned }`.
@@ -421,6 +423,17 @@ fn resolve_entry_matching<'a>(
     allowed: impl Fn(&Entry) -> bool,
 ) -> Result<&'a Entry, ReverseDispatchError> {
     match target {
+        // REV-2 rule 5 focus preference (intent-hq/intent#7855): the first
+        // listed client that still has an eligible connection, resolved
+        // under the same lock as the fallback so a drop in between cannot
+        // turn the preference into an offline error.
+        ReverseTarget::Preferred(clients) => clients
+            .iter()
+            .find_map(|client_id| newest_eligible_of(entries, client_id, &allowed))
+            .map_or_else(
+                || resolve_entry_matching(entries, &ReverseTarget::Default, allowed),
+                Ok,
+            ),
         // The client of the oldest live eligible registration is the
         // primary (re-evaluated per request, so it changes when that
         // registration drops even if the client has a newer connection),
