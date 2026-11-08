@@ -267,6 +267,9 @@ pub(crate) struct Shared {
     /// a load that listed its record before it was dropped, settles nothing
     /// and queues nothing. Never pruned: one id per agent ended for good.
     settled_finals: Mutex<std::collections::HashSet<StopId>>,
+    /// Agents that retired themselves during a turn, whose final stop
+    /// waits for that turn to end: a bind leaves them running meanwhile.
+    deferred_finals: Mutex<std::collections::HashSet<AgentId>>,
     /// This connector's own handle, for tasks that must not keep it alive.
     self_ref: Mutex<std::sync::Weak<Shared>>,
     /// The protocol the current (or last) link negotiated.
@@ -1541,6 +1544,7 @@ impl RemoteNode {
             stops: Mutex::new(BTreeMap::new()),
             in_grace: Mutex::new(std::collections::HashSet::new()),
             settled_finals: Mutex::new(std::collections::HashSet::new()),
+            deferred_finals: Mutex::new(std::collections::HashSet::new()),
             setup_outputs: Mutex::default(),
             self_ref: Mutex::new(std::sync::Weak::new()),
             protocol: std::sync::atomic::AtomicU32::new(0),
@@ -1893,6 +1897,23 @@ impl RemoteNode {
         reason: intent_core::remote_launch::FinalStopReason,
     ) -> StopId {
         self.shared.final_stop(agent_id, reason).await
+    }
+
+    /// Wait, up to `bound`, until no prompt waits for a turn of
+    /// `agent_id`, which retired itself during that turn; a bind meanwhile
+    /// leaves it running. Whether its final stop is still to send: not when
+    /// another final stop (a delete, a machine removal) came first.
+    pub async fn await_turn_before_final_stop(&self, agent_id: &AgentId, bound: Duration) -> bool {
+        lock(&self.shared.deferred_finals).insert(agent_id.clone());
+        let _ = tokio::time::timeout(bound, self.shared.agents.turns_over(agent_id)).await;
+        lock(&self.shared.deferred_finals).remove(agent_id);
+        if self.shared.final_stop_queued(agent_id) {
+            return false;
+        }
+        !matches!(
+            self.shared.store.get_final_stop(agent_id).await,
+            Ok(Some(_))
+        )
     }
 
     /// Agents head counts as running on the machine.
@@ -2619,7 +2640,7 @@ async fn claim(shared: &Arc<Shared>, running_agents: &[AgentId]) -> bool {
                 continue;
             }
         }
-        if shared.final_stop_queued(agent_id) {
+        if shared.final_stop_queued(agent_id) || lock(&shared.deferred_finals).contains(agent_id) {
             continue;
         }
         let Some(record) = records.get(agent_id) else {
