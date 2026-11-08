@@ -15566,6 +15566,50 @@ pub(crate) fn record_setup_finished(
     record.finished_at = Some(now_iso());
 }
 
+/// Rebuild a setup-stage record from the latest persisted
+/// `workspace:setup:started` / `workspace:setup:completed` events, for a
+/// workspace with no record in this daemon lifetime. `started` is published
+/// only when a script was resolved, so a `completed` with no `started` before
+/// it is `skipped`; a `started` with no later `completed` is a run the daemon
+/// never saw finish (it stopped mid-run), read as `failed` with no exit code.
+/// `None` when neither event exists. `terminalId` is never rebuilt: the
+/// terminal did not outlive the daemon that spawned it.
+fn setup_status_from_events(
+    started: Option<&Event>,
+    completed: Option<&Event>,
+) -> Option<WorkspaceSetupStatus> {
+    let ran = |c: &Event| c.data.get("ranScript").and_then(serde_json::Value::as_bool);
+    let exit_code = |c: &Event| {
+        c.data
+            .get("exitCode")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|code| u32::try_from(code).ok())
+    };
+    let (started, completed) = match (started, completed) {
+        (Some(s), Some(c)) if s.timestamp > c.timestamp => (Some(s), None),
+        pair => pair,
+    };
+    let mut record = match (started, completed) {
+        (None, None) => return None,
+        (Some(_), None) => WorkspaceSetupStatus::new(WorkspaceSetupState::Failed),
+        (None, Some(_)) => WorkspaceSetupStatus::new(WorkspaceSetupState::Skipped),
+        (Some(_), Some(c)) => {
+            let code = exit_code(c);
+            let state = if ran(c) == Some(true) && code == Some(0) {
+                WorkspaceSetupState::Completed
+            } else {
+                WorkspaceSetupState::Failed
+            };
+            let mut record = WorkspaceSetupStatus::new(state);
+            record.exit_code = code;
+            record
+        }
+    };
+    record.started_at = started.map(|s| s.timestamp.clone());
+    record.finished_at = completed.map(|c| c.timestamp.clone());
+    Some(record)
+}
+
 /// Publish a `workspace:created` event for a workspace row inserted outside
 /// the `Services` surface (the legacy importer writes through `Store`
 /// directly, so `create_workspace`'s own publish never fires). Best-effort
@@ -22297,6 +22341,32 @@ impl WorkspaceApi for Services {
         self.workspace_setup_states.get(id)
     }
 
+    fn workspace_setup_status_resolved(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, WorkspaceSetupStatus> {
+        Box::pin(async move {
+            let live = self.workspace_setup_states.get(&id);
+            if live.state != WorkspaceSetupState::Unknown {
+                return live;
+            }
+            let latest = |event_type| self.store.events_by_type(&id, event_type, 1);
+            let (started, completed) = match tokio::try_join!(
+                latest(WORKSPACE_SETUP_STARTED),
+                latest(WORKSPACE_SETUP_COMPLETED)
+            ) {
+                Ok((s, c)) => (s.into_iter().next(), c.into_iter().next()),
+                Err(e) => {
+                    tracing::warn!(error = %e, workspace = %id, "setup status: event lookup failed");
+                    return live;
+                }
+            };
+            // Not cached: the live map also drives the turn-start setup
+            // notice, which must not fire for a run from a past lifetime.
+            setup_status_from_events(started.as_ref(), completed.as_ref()).unwrap_or(live)
+        })
+    }
+
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let store = self.store.clone();
         let this = self.clone();
@@ -28310,7 +28380,7 @@ impl WorkspaceApi for Services {
             let note = match store.get_note(&workspace_id, &task_note_id).await {
                 Ok(n) => n,
                 Err(Error::NotFound(_)) => {
-                    return Err(Error::Internal("Task note not found".to_string()))
+                    return Err(Error::NotFound(format!("task note {task_note_id}")))
                 }
                 Err(e) => return Err(e),
             };

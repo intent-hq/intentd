@@ -3360,9 +3360,8 @@ mod mcp_tests {
             self.get_my_task_calls.lock().unwrap().push(key.clone());
             Box::pin(async move {
                 if key == "task-missing" {
-                    // Mirrors the services impl, which wraps the store's
-                    // NotFound as Error::Internal("Task note not found").
-                    return Err(Error::Internal("Task note not found".to_string()));
+                    // Mirrors the services impl: an unknown id is NotFound.
+                    return Err(Error::NotFound("task note task-missing".to_string()));
                 }
                 let task = TaskMetadata {
                     status: TaskStatus::InProgress,
@@ -5399,12 +5398,12 @@ mod _dead_dispatch_unit_tests {
     async fn get_my_task_arm_surfaces_not_found_error() {
         let (srv, api) = server();
         let resp = call(&srv, "get_my_task", json!({ "taskNoteId": "task-missing" })).await;
-        // Error::Internal → -32603 (matches services impl wrapping).
-        assert_eq!(resp["error"]["code"], json!(-32603));
+        // Error::NotFound → -32602 (a plain not-found, not an internal error).
+        assert_eq!(resp["error"]["code"], json!(-32602));
         assert!(resp["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("Task note not found"));
+            .contains("not found: task note task-missing"));
         assert_eq!(
             *api.get_my_task_calls.lock().unwrap(),
             vec!["task-missing".to_string()]
@@ -10249,6 +10248,30 @@ mod wsapi3_bindings_tests {
         let resp = call(&srv, "return await ws.comment.list('n-1');").await;
         assert_eq!(resp["result"]["isError"], json!(false));
         assert_eq!(api.comment_list_calls.lock().unwrap()[0], "n-1");
+    }
+
+    // The help line must advertise the object `comment.list` actually returns.
+    #[tokio::test]
+    async fn comment_list_result_matches_documented_shape() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.comment.list('n-1');").await;
+        let v = body(&resp);
+        let mut keys: Vec<&str> = v
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["threads", "totalComments", "totalThreads"]);
+        let line = crate::mcp_server::WORKSPACE_API_DESCRIPTION
+            .lines()
+            .find(|l| l.trim_start().starts_with("ws.comment.list("))
+            .expect("comment.list help line");
+        assert!(
+            line.contains("→ { threads, totalThreads, totalComments }"),
+            "{line}"
+        );
     }
 
     #[tokio::test]
