@@ -27,7 +27,7 @@ use intent_acp::{
     SinkEvent, SpawnOptions,
 };
 use intent_core::node_link::{
-    ExitFailure, FinalPush, JournalBody, JournalRecord, LaunchCommand, LeaseBinding,
+    ExitFailure, FinalPush, ForgeLaunch, JournalBody, JournalRecord, LaunchCommand, LeaseBinding,
     MachineCapacity, StopOutcome, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
@@ -145,6 +145,10 @@ pub(super) struct RunnerConfig {
     /// The executable providers run as `mcp-bridge` to reach an agent's
     /// workspace MCP server.
     pub mcp_bridge_exe: PathBuf,
+    /// The backend's helper socket, which `intentd git-credential --node`
+    /// asks for the live forge token (nodeProtocol 15); `None` gives no
+    /// agent the credential helper.
+    pub git_socket: Option<PathBuf>,
     /// Told the provider when a launch without a profile fails to
     /// authenticate.
     pub auth_failed: AuthFailed,
@@ -166,6 +170,7 @@ struct Inner {
     checkouts: Arc<dyn Checkouts>,
     home: Option<PathBuf>,
     mcp_bridge_exe: PathBuf,
+    git_socket: Option<PathBuf>,
     auth_failed: AuthFailed,
     /// The newest bound link; agents forward control-plane calls on it.
     head: HeadLink,
@@ -429,6 +434,9 @@ struct Agent {
     /// The owner of the checkout the agent works in, when it is not its own
     /// (nodeProtocol 13): its pushes go to the owner's refs.
     checkout_of: Option<AgentId>,
+    /// Its workspace branch and GitHub remote (nodeProtocol 15): top-level
+    /// agents only.
+    forge: Option<ForgeLaunch>,
     /// Serializes the pushes of the agent's checkout, shared with its owner
     /// and every agent sharing it.
     wip: Arc<tokio::sync::Mutex<()>>,
@@ -868,6 +876,7 @@ impl Runner {
                 checkouts: config.checkouts,
                 home: config.home,
                 mcp_bridge_exe: config.mcp_bridge_exe,
+                git_socket: config.git_socket,
                 auth_failed: config.auth_failed,
                 head: HeadLink::default(),
                 journal: Arc::new(Mutex::new(config.journal)),
@@ -947,6 +956,12 @@ impl Runner {
     /// nodeProtocol 15 never hands one over.
     pub(super) fn drop_forge(&self) {
         self.inner.head.forge().clear();
+    }
+
+    /// The backend's held GitHub token, which the credential helper socket
+    /// serves (nodeProtocol 15).
+    pub(super) fn forge_token(&self) -> Arc<super::forge::ForgeToken> {
+        self.inner.head.forge().clone()
     }
 
     /// Apply one secret frame and build its reply; `None` for any other
@@ -1171,8 +1186,9 @@ impl Runner {
             mcp_proxies,
             compact_tool_descriptions,
             checkout_of,
-            forge: _,
+            forge,
         } = command;
+        let forge = forge.map(|forge| *forge);
         let prepared = checkout.is_some();
         let both = prepared && checkout_of.is_some();
         let setup = checkout
@@ -1207,6 +1223,15 @@ impl Runner {
                 "{}: a launch into another agent's checkout carries no checkout of its own",
                 codes::CHECKOUT
             )));
+        }
+        if let Some(forge) = &forge {
+            if checkout_of.is_some() || is_sub_agent || !forge.is_valid() {
+                drop(state);
+                return Some(exited(format!(
+                    "{}: the launch's forge branch or remote is not usable",
+                    codes::CHECKOUT
+                )));
+            }
         }
         if state.agents.contains_key(&agent_id) {
             // The running agent's own records are what head should see; a
@@ -1290,6 +1315,7 @@ impl Runner {
                 Some(self.inner.head.forge().clone()),
             )),
             forge_lease: Mutex::new(None),
+            forge,
             npx_launch_dir: Mutex::new(None),
             default_account: profile.is_none().then(|| {
                 (
@@ -1466,6 +1492,18 @@ impl Runner {
                 _ = &mut stop => None,
             }
         };
+        // A top-level agent's own checkout gets its forge branch and
+        // `origin`, or loses them on a launch without (nodeProtocol 15).
+        let prepared = match prepared {
+            Some(Ok(ready)) if agent.checkout_of.is_none() => Some(
+                self.inner
+                    .checkouts
+                    .forge(&agent.id, &ready.worktree, agent.forge.as_ref())
+                    .await
+                    .map(|()| ready),
+            ),
+            other => other,
+        };
         let started = match prepared {
             None => Err(None),
             Some(Err(error)) => Err(Some(format!("{}: {error:#}", codes::CHECKOUT))),
@@ -1497,10 +1535,12 @@ impl Runner {
                 if settled.stopped {
                     Err(None)
                 } else {
-                    *lock(&agent.notice) = match (settled.notice, notice) {
-                        (Some(setup), Some(notice)) => Some(format!("{setup}\n\n{notice}")),
-                        (setup, notice) => setup.or(notice),
-                    };
+                    let forge_notice = self.forge_notice(&agent);
+                    *lock(&agent.notice) = [settled.notice, notice, forge_notice]
+                        .into_iter()
+                        .flatten()
+                        .reduce(|all, next| format!("{all}\n\n{next}"));
+                    let helper_env = self.forge_helper_env(&agent, &cwd).await;
                     self.find_skills(&agent, &cwd).await;
                     match workspace_api::serve(
                         &agent.id,
@@ -1522,7 +1562,7 @@ impl Runner {
                                 (&launch, profile.as_ref()),
                                 model.as_deref(),
                                 notes,
-                                (cwd, &tmp),
+                                (cwd, &tmp, helper_env),
                             )
                             .map(|started| (started, bridge, mcp))
                             .map_err(|error| Some(format!("{}: {error}", codes::START))),
@@ -1608,6 +1648,42 @@ impl Runner {
             }
         }
         let _ = agent.marks.send(Mark::Exited { exit_code, error });
+    }
+
+    /// What a remote agent's first turn says about GitHub (nodeProtocol
+    /// 15): a top-level agent with `forge` learns its branch and how to
+    /// push; a sub-agent with the backend's token is told to read only.
+    fn forge_notice(&self, agent: &Agent) -> Option<String> {
+        if let Some(forge) = &agent.forge {
+            let local = intent_core::node_link::forge_agent_branch(&agent.id);
+            let branch = &forge.branch;
+            return Some(format!(
+                "Your checkout is on the local branch `{local}`, which tracks `{branch}` on `origin` ({}). A plain `git push` updates `{branch}` on GitHub, and `git pull` and `git rebase` follow it. Other agents of this workspace can push to `{branch}` too: when a push is rejected, pull or rebase, then push again. To open a pull request, run `gh pr create --head {branch}`.",
+                forge.remote_url
+            ));
+        }
+        let sub_agent = agent.gates.is_sub_agent || agent.checkout_of.is_some();
+        (sub_agent && self.inner.head.forge().get().is_some()).then(|| {
+            "`GH_TOKEN` is set so that `gh` can read from GitHub. Use it only to read: do not push, and do not create or change anything on GitHub. Your work goes back to your parent agent through Intent.".to_owned()
+        })
+    }
+
+    /// The git credential helper environment of an agent with `forge`
+    /// (nodeProtocol 15): none for any other agent, so a sub-agent sharing
+    /// its checkout never gets it.
+    async fn forge_helper_env(&self, agent: &Agent, cwd: &Path) -> Vec<(String, String)> {
+        let (Some(_), Some(socket)) = (&agent.forge, &self.inner.git_socket) else {
+            return Vec::new();
+        };
+        let exe = self.inner.mcp_bridge_exe.to_string_lossy().into_owned();
+        let socket = socket.clone();
+        let cwd = cwd.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
+            intent_git::auth::node_helper_env(&exe, &socket, Some(&cwd), inherited.as_deref())
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Run or account for the setup of a prepared checkout: a fresh one
@@ -1760,7 +1836,7 @@ impl Runner {
         (launch, profile): (&ProviderLaunch, Option<&ProfileEnv>),
         model: Option<&str>,
         notes: mpsc::UnboundedSender<IncomingNotification>,
-        (cwd, tmp): (PathBuf, &Path),
+        (cwd, tmp, helper_env): (PathBuf, &Path, Vec<(String, String)>),
     ) -> anyhow::Result<(Child, Arc<Connection>, tokio::task::JoinHandle<()>, PathBuf)> {
         let (requests_tx, mut requests) = mpsc::unbounded_channel::<IncomingRequest>();
         let hooks = ConnectionHooks {
@@ -1798,6 +1874,9 @@ impl Runner {
                 .insert(GH_TOKEN_ENV.to_owned(), token.as_str().to_owned());
         }
         *lock(&agent.forge_lease) = spawned_with.map(|(_, lease)| lease);
+        // A top-level agent's git asks the machine for the live token
+        // (nodeProtocol 15); only its own process gets the helper.
+        options.extra_env.extend(helper_env);
         let spawned = intent_acp::spawn_provider(&options, hooks)?;
         let (child, connection, npx_launch_dir, agent_tmp_dir) = spawned.into_parts();
         // An npx launch runs from its launch directory; keep it until the

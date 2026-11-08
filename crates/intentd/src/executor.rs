@@ -29,7 +29,7 @@ use intent_core::ExecutorCredentialId;
 use intent_git::node_git::{CheckoutCache, NodeGit};
 use intent_nodes::journal::Journal;
 use intent_transport::node_link::{
-    serve_helpers, ExecutorHost, NodeConnection, NodeGitSessions, NodeLink,
+    serve_helpers_with, ExecutorHost, HelperCredential, NodeConnection, NodeGitSessions, NodeLink,
 };
 
 mod checkout;
@@ -382,11 +382,9 @@ impl ExecutorService {
         let git_listener = tokio::net::UnixListener::bind(&socket)
             .map_err(|e| anyhow::anyhow!("bind the git socket {}: {e}", socket.display()))?;
         let git_sessions = NodeGitSessions::new();
-        // caller-binding: allow — machine-local git helper socket for one backend's agents
-        let helpers = tokio::spawn(serve_helpers(git_listener, git_sessions.clone()));
         let checkouts = (self.make_checkouts)(
             storage.clone(),
-            CheckoutCache::new(storage.cache_dir(), NodeGit::new(helper_dir, socket)),
+            CheckoutCache::new(storage.cache_dir(), NodeGit::new(helper_dir, socket.clone())),
         );
         let runner = Runner::new(RunnerConfig {
             admission: Arc::new(Scoped {
@@ -398,11 +396,27 @@ impl ExecutorService {
             journal,
             home: machine_home(),
             mcp_bridge_exe: self.deps.executable.clone(),
+            git_socket: Some(socket),
             auth_failed: {
                 let report = self.deps.report.clone();
                 Arc::new(move |provider: &str| report.launch_auth_failed(provider))
             },
         });
+        // The live forge token for `intentd git-credential --node`
+        // (nodeProtocol 15); the socket is the user's own.
+        let forge = runner.forge_token();
+        let credential: HelperCredential = Arc::new(move |host: &str| {
+            (host == intent_core::node_link::FORGE_HOST_GITHUB)
+                .then(|| forge.get())
+                .flatten()
+                .map(intent_core::node_link::SecretValue::from)
+        });
+        // caller-binding: allow — machine-local git helper socket for one backend's agents
+        let helpers = tokio::spawn(serve_helpers_with(
+            git_listener,
+            git_sessions.clone(),
+            Some(credential),
+        ));
         Ok(Backend {
             runner,
             owner,
