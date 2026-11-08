@@ -18,15 +18,28 @@ use intent_nodes::e2b::{E2bClient, ProcessSpec, Sandbox, SecretString};
 /// its tailcat address, for a fake E2B that runs the sandbox locally.
 const DIRECT_HOST_ENV: &str = "INTENTD_E2B_DIRECT_HOST";
 
-/// Longest wait for the sandbox daemon (and its tunnel) before the mint.
-const DAEMON_WAIT_SECS: u32 = 180;
+/// Longest wait for the sandbox daemon (and its tunnel) before the mint. A
+/// sandbox daemon has its listener and tunnel address within seconds.
+const DAEMON_WAIT_SECS: u32 = 120;
+
+/// Test seam: a shorter daemon wait, in seconds.
+const DAEMON_WAIT_ENV: &str = "INTENTD_E2B_DAEMON_WAIT_SECS";
+
+/// Longest bootstrap error kept, in characters.
+const MAX_TAIL_CHARS: usize = 600;
 
 /// Write the daemon's first settings (external listener and tunnel on)
 /// unless the sandbox has some, then start it in the background unless it
 /// already answers. The template never runs intentd, so this first start
 /// makes the sandbox's own daemon id, certificate and tailcat key.
+///
+/// Every `intentd` here and in [`MINT_SCRIPT`] runs with the same explicit
+/// data dir: without it the daemon uses its platform default
+/// (`~/.local/share/intentd`) and never reads the settings written here, so
+/// it starts with no listener and no tunnel.
 const START_SCRIPT: &str = r#"set -eu
-dir="${INTENTD_DATA_DIR:-$HOME/.intent}"
+export INTENTD_DATA_DIR="${INTENTD_DATA_DIR:-$HOME/.intent}"
+dir="$INTENTD_DATA_DIR"
 mkdir -p "$dir"
 if [ ! -f "$dir/config.toml" ]; then
   printf '[server.wsApi]\nenabled = true\n\n[server.tunnel]\nenabled = true\n' > "$dir/config.toml"
@@ -42,21 +55,42 @@ fi
 
 /// Wait for the daemon (and its tunnel address unless a direct route is
 /// used), then mint. A mint that fails (listener not up yet) is retried; a
-/// failed mint saves no credential.
+/// failed mint saves no credential. When the wait runs out, stderr says
+/// what was missing, whether tailcat runs, and the daemon's last warnings
+/// and errors (it logs no tokens; the backend scrubs and caps them again).
 const MINT_SCRIPT: &str = r#"set -u
+export INTENTD_DATA_DIR="${INTENTD_DATA_DIR:-$HOME/.intent}"
 i=0
+status=""
+mint_error=""
+errf=$(mktemp)
 while :; do
   if status=$(intentd call system.status 2>/dev/null); then
     if [ -n "${INTENT_DIRECT_ROUTE:-}" ] || printf '%s' "$status" | grep -q '"tcAddress"'; then
-      if out=$(intentd call executor.mint --params "$INTENT_MINT_PARAMS" 2>/dev/null); then
+      if out=$(intentd call executor.mint --params "$INTENT_MINT_PARAMS" 2>"$errf"); then
         printf '%s\n' "$out"
         exit 0
       fi
+      mint_error=$(grep -o '"message": *"[^"]*"' "$errf" | head -n 1)
     fi
+  else
+    status=""
   fi
   i=$((i + 1))
   if [ "$i" -ge "$INTENT_WAIT_SECS" ]; then
-    echo "intentd or its tunnel did not start in the sandbox" >&2
+    if [ -z "$status" ]; then
+      echo "intentd did not answer on its local socket within ${INTENT_WAIT_SECS}s." >&2
+    elif printf '%s' "$status" | grep -q '"port": *null'; then
+      echo "intentd started with no external listener (its settings did not turn it on), so it has no tunnel." >&2
+    elif ! printf '%s' "$status" | grep -q '"tcAddress"'; then
+      echo "intentd has no tunnel address within ${INTENT_WAIT_SECS}s." >&2
+    else
+      echo "the credential mint failed: ${mint_error:-no reason given}." >&2
+    fi
+    if pgrep -x tailcat >/dev/null 2>&1; then echo "tailcat is running." >&2; else echo "tailcat is not running." >&2; fi
+    if [ -f "$INTENTD_DATA_DIR/serve.log" ]; then
+      grep -E ' (WARN|ERROR) ' "$INTENTD_DATA_DIR/serve.log" | tail -n 4 | cut -c 1-220 >&2
+    fi
     exit 3
   fi
   sleep 1
@@ -97,18 +131,34 @@ fn failed(message: impl Into<String>) -> Error {
     )
 }
 
-/// Process stderr made safe for an error message: at most 200 characters,
-/// without control characters. It never holds the token (only a successful
-/// mint prints one, on stdout).
+/// Process stderr made safe for an error message: no control characters,
+/// every token-like run (32 or more letters, digits, `-` or `_`) replaced,
+/// and at most [`MAX_TAIL_CHARS`] characters, the end kept. Only a
+/// successful mint prints a credential, on stdout; this is a second guard
+/// for daemon log lines.
 fn tail(stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
-    let text: String = text
-        .trim()
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let start = text.chars().count().saturating_sub(200);
-    text.chars().skip(start).collect()
+    let mut cleaned = String::with_capacity(text.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, cleaned: &mut String| {
+        if run.chars().count() >= 32 {
+            cleaned.push_str("<redacted>");
+        } else {
+            cleaned.push_str(run);
+        }
+        run.clear();
+    };
+    for c in text.trim().chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            run.push(c);
+            continue;
+        }
+        flush(&mut run, &mut cleaned);
+        cleaned.push(if c.is_control() { ' ' } else { c });
+    }
+    flush(&mut run, &mut cleaned);
+    let start = cleaned.chars().count().saturating_sub(MAX_TAIL_CHARS);
+    cleaned.chars().skip(start).collect()
 }
 
 /// Start intentd in `sandbox` and mint its executor credential for this
@@ -139,7 +189,12 @@ pub(crate) async fn run(client: &E2bClient, sandbox: &Sandbox, backend: &Value) 
         .filter(|host| !host.is_empty());
     let mut mint = ProcessSpec::new("/bin/sh");
     mint.args = vec!["-c".into(), MINT_SCRIPT.into()];
-    mint.timeout = Some(Duration::from_secs(u64::from(DAEMON_WAIT_SECS) + 60));
+    let wait = std::env::var(DAEMON_WAIT_ENV)
+        .ok()
+        .and_then(|secs| secs.parse::<u32>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DAEMON_WAIT_SECS);
+    mint.timeout = Some(Duration::from_secs(u64::from(wait) + 60));
     let mut envs = BTreeMap::new();
     envs.insert(
         "INTENT_MINT_PARAMS".to_owned(),
@@ -147,7 +202,7 @@ pub(crate) async fn run(client: &E2bClient, sandbox: &Sandbox, backend: &Value) 
     );
     envs.insert(
         "INTENT_WAIT_SECS".to_owned(),
-        SecretString::new(DAEMON_WAIT_SECS.to_string()),
+        SecretString::new(wait.to_string()),
     );
     if direct.is_some() {
         envs.insert("INTENT_DIRECT_ROUTE".to_owned(), SecretString::new("1"));
@@ -221,6 +276,22 @@ pub(crate) fn mint_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_errors_keep_the_end_without_tokens_or_control_characters() {
+        let token = "Q".repeat(40);
+        let stderr = format!(
+            "{}intentd started with no external listener.\n\u{1b}[31mWARN token={token} tunnel off",
+            "x ".repeat(400)
+        );
+        let kept = tail(stderr.as_bytes());
+        assert!(kept.chars().count() <= MAX_TAIL_CHARS);
+        assert!(kept.ends_with("tunnel off"), "{kept}");
+        assert!(kept.contains("token=<redacted>"), "{kept}");
+        assert!(!kept.contains(&token));
+        assert!(!kept.chars().any(char::is_control), "{kept}");
+        assert_eq!(tail(b"short-id is kept"), "short-id is kept");
+    }
 
     #[test]
     fn mint_results_need_every_field_and_a_route() {
