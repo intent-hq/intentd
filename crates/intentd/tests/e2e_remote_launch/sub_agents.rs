@@ -493,3 +493,133 @@ async fn a_remote_agents_backend_sub_agent_gets_its_work() {
         "the checkout is untouched"
     );
 }
+
+/// Send `content` to the agent and return its reply carrying `marker`
+/// (its parent's wake turns end in between, so no turn-end event is
+/// awaited).
+async fn child_turn(
+    rpc_ws: &mut common::TlsWs,
+    (ws_id, agent_id): (&str, &str),
+    content: &str,
+    marker: &str,
+    id: i64,
+) -> String {
+    ok(
+        rpc_ws,
+        id,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": content }),
+    )
+    .await;
+    reply_containing(rpc_ws, (ws_id, agent_id), marker, id + 1).await
+}
+
+/// A remote sub-agent answers a follow-up turn after its parent's turn
+/// ended, and a turn in which it retires itself ends normally with its
+/// reply: its machine stops it only once that turn is over, as a local
+/// agent's self-retirement lets its turn finish (probe 3: the follow-up
+/// failed with `node-agent-not-running`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remote_sub_agent_that_retires_itself_finishes_its_turn() {
+    if intent_providers::resolve_on_path("node").is_none()
+        || intent_providers::resolve_on_path("git").is_none()
+    {
+        eprintln!("skipping remote self-retire e2e: node or git not on PATH");
+        return;
+    }
+    let scratch = common::test_tempdir_in("/tmp", "itd-sret-");
+    let repo = repo_with_commit(scratch.path());
+    let (_head, port, cfg, ws_id) = start_backend(&scratch.path().join("head"), &repo).await;
+    let mut rpc_ws = connect(port, cfg.clone()).await;
+    let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
+    let backend_id = backend["backendId"].as_str().unwrap().to_owned();
+    let node_dir = scratch.path().join("node");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    let machine = start_machine(&node_dir, &backend_id).await;
+    ok(
+        &mut rpc_ws,
+        2,
+        "remoteMachines.add",
+        add_params(&machine, "E2E node"),
+    )
+    .await;
+    let mut events = connect(port, cfg.clone()).await;
+    ok(
+        &mut events,
+        3,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    let parent = create_remote(&mut rpc_ws, &ws_id, "Parent", 10).await;
+    let parent_id = parent["agent"]["id"].as_str().unwrap().to_owned();
+
+    let child_prompt = r#"wsapi return JSON.stringify({ marker: "child-1" });"#;
+    let code = format!(
+        r#"wsapi const c = await ws.agent.create("Child", {child_prompt:?}, {{ provider: "mock", model: "default" }}); return JSON.stringify({{ marker: "parent-1", c }});"#
+    );
+    wsapi_turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &parent_id),
+        &code,
+        "parent-1",
+        40,
+    )
+    .await;
+    let child_id = agent_named(&mut rpc_ws, &ws_id, "Child", 60).await;
+    loop {
+        let end = event(&mut events, "agent:stream:end").await;
+        if end["data"]["agentId"] == child_id.as_str() {
+            break;
+        }
+    }
+    reply_containing(&mut rpc_ws, (&ws_id, &child_id), "child-1", 100).await;
+
+    // A follow-up after both turns ended.
+    let reply = child_turn(
+        &mut rpc_ws,
+        (&ws_id, &child_id),
+        r#"wsapi return JSON.stringify({ marker: "child-2" });"#,
+        "child-2",
+        200,
+    )
+    .await;
+    assert!(reply.contains("child-2"), "{reply}");
+
+    // The turn that retires the child ends with its reply, not an error.
+    let reply = child_turn(
+        &mut rpc_ws,
+        (&ws_id, &child_id),
+        r#"wsapi const r = await ws.agent.retire("done"); return JSON.stringify({ marker: "child-3", r });"#,
+        "child-3",
+        300,
+    )
+    .await;
+    assert!(reply.contains("child-3"), "{reply}");
+    let child = ok(
+        &mut rpc_ws,
+        400,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": child_id }),
+    )
+    .await;
+    assert_ne!(child["agent"]["status"], "error", "{child}");
+    assert!(child["agent"]["retiredAt"].is_string(), "{child}");
+
+    // Then the machine stops it; the parent keeps running.
+    let mut id = 500;
+    timeout(wait(), async {
+        loop {
+            id += 1;
+            let head = ok(&mut rpc_ws, id, "remoteMachines.list", json!({})).await;
+            if head["machines"][0]["runningAgents"] == 1 {
+                return;
+            }
+            // timing-guard: poll interval for the machine to stop the retired agent (no event exposes it)
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the machine stops the retired sub-agent after its turn");
+}
