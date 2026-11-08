@@ -507,7 +507,7 @@ could not be received; do not present cached progress as current. For **Daemon
 startup failed**, check the daemon logs.
 
 With matching mobile and daemon support, iPhone and iPad show **Starting Desktop**
-and **Finishing Startup** during initial connection or reconnection over saved
+and **Finishing Startup** during initial connection over saved
 direct or Tailcat routes. **Indexing Notes** appears only when the daemon reports
 that phase. **Startup status unavailable. Reconnecting securely…** means current
 status is unavailable. For **Startup Failed**, use **Retry Connection** after
@@ -521,6 +521,9 @@ last 5 workspaces and the last 10 conversations opened this session stay readabl
 Other content shows **Available when reconnected** and loads when the connection
 returns. Controls that change something on the Mac, such as Send, are disabled.
 Typing a draft and adding attachments still work, and nothing is sent automatically.
+While the desktop restarts, the banner follows its startup instead, for example
+**Desktop is starting… · Read-only** or **Indexing notes… · Read-only**. **Startup
+failed · Read-only** offers **Retry** and does not block reading.
 The banner disappears and data refreshes when the connection returns. If reconnection
 stops, for example because access was removed, **Can't reconnect** shows the reason
 and **Back to Home**. Each window follows its own Mac.
