@@ -522,7 +522,7 @@ Other content shows **Available when reconnected** and loads when the connection
 returns. Controls that change something on the Mac, such as Send, are disabled.
 Typing a draft and adding attachments still work, and nothing is sent automatically.
 While the desktop restarts, the banner follows its startup instead, for example
-**Desktop is starting… · Read-only** or **Indexing notes… · Read-only**. **Startup
+**Desktop is starting… · Read-only** or **Indexing notes (3 of 10)… · Read-only**. **Startup
 failed · Read-only** offers **Retry** and does not block reading.
 The banner disappears and data refreshes when the connection returns. If reconnection
 stops, for example because access was removed, **Can't reconnect** shows the reason
