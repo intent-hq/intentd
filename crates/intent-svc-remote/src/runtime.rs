@@ -96,7 +96,8 @@ impl RemoteAgentRuntime {
     }
 
     fn not_running(&self) -> Option<AcpError> {
-        if self.stopped.load(Ordering::SeqCst) {
+        // A final stop closes the sink without stopping this runtime.
+        if self.stopped.load(Ordering::SeqCst) || self.sink.is_closed() {
             return Some(transport(
                 "node-agent-not-running: the remote agent was stopped",
             ));

@@ -842,27 +842,25 @@ impl RemoteLaunchPort for RemoteLaunch {
                     tracing::info!(agent = %agent_id, "remote agent: placed under an ended lease; no final stop");
                     continue;
                 }
-                node.final_stop(agent_id, reason).await;
-                // The agent a sandbox was started for ends for good: its
-                // sub-agents there get final stops too, then the sandbox
-                // goes.
-                if let Ok(Some(row)) = svc.store().get_exposed_machine(&record.node_id).await {
-                    if row
-                        .cloud
-                        .as_ref()
-                        .is_some_and(|cloud| cloud.agent_id == agent_id.as_str())
-                    {
-                        let svc = svc.clone();
-                        tokio::spawn(async move {
-                            let Some(feature) = svc.remote_feature() else {
-                                return;
-                            };
-                            let client = crate::cloud::saved_client(&svc, &row).await;
-                            crate::cloud::delete_machine(feature, &svc, &row, client.as_ref())
-                                .await;
-                        });
-                    }
+                // An agent that retires itself during a turn finishes that
+                // turn first, as a local agent does: stopping it now would
+                // fail the turn that asked for the stop.
+                let own_turn = reason == intent_core::remote_launch::FinalStopReason::AgentRetired
+                    && matches!(
+                        intent_core::current_caller(),
+                        Some(intent_core::Caller::Agent { agent_id: caller }) if caller == *agent_id
+                    );
+                if own_turn {
+                    let svc = svc.clone();
+                    let agent_id = agent_id.clone();
+                    let node_id = record.node_id.clone();
+                    intent_core::spawn_daemon(async move {
+                        node.turns_over(&agent_id).await;
+                        final_stop_placed(&svc, &node, &agent_id, &node_id, reason).await;
+                    });
+                    continue;
                 }
+                final_stop_placed(svc, &node, agent_id, &record.node_id, reason).await;
             }
         })
     }
@@ -1106,5 +1104,35 @@ impl RemoteLaunchPort for RemoteLaunch {
         params: serde_json::Value,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         Box::pin(crate::cloud::call(svc, method, params))
+    }
+}
+
+/// Send placed agent `agent_id` its final stop on `node`; the agent a cloud
+/// sandbox was started for also takes the sandbox with it.
+async fn final_stop_placed(
+    svc: &Services,
+    node: &RemoteNode,
+    agent_id: &AgentId,
+    node_id: &str,
+    reason: intent_core::remote_launch::FinalStopReason,
+) {
+    node.final_stop(agent_id, reason).await;
+    // The agent a sandbox was started for ends for good: its sub-agents
+    // there get final stops too, then the sandbox goes.
+    if let Ok(Some(row)) = svc.store().get_exposed_machine(node_id).await {
+        if row
+            .cloud
+            .as_ref()
+            .is_some_and(|cloud| cloud.agent_id == agent_id.as_str())
+        {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                let Some(feature) = svc.remote_feature() else {
+                    return;
+                };
+                let client = crate::cloud::saved_client(&svc, &row).await;
+                crate::cloud::delete_machine(feature, &svc, &row, client.as_ref()).await;
+            });
+        }
     }
 }

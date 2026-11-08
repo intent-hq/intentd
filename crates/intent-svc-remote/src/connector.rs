@@ -1895,6 +1895,11 @@ impl RemoteNode {
         self.shared.final_stop(agent_id, reason).await
     }
 
+    /// Returns once no prompt waits for a turn of `agent_id` here.
+    pub async fn turns_over(&self, agent_id: &AgentId) {
+        self.shared.agents.turns_over(agent_id).await;
+    }
+
     /// Agents head counts as running on the machine.
     #[must_use]
     pub fn running(&self) -> usize {

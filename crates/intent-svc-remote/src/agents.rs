@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex as TokioMutex, Notify};
 
 use intent_acp::transport::IncomingNotification;
 use intent_core::node_link::{JournalBody, JournalRecord};
@@ -50,6 +50,8 @@ pub(crate) struct AgentSink {
     /// Records received that may come from provider side effects (prompts
     /// sent and notifications received); the runtime's request watermark.
     pub requests: AtomicU64,
+    /// Signalled whenever a waiting turn goes away.
+    turns_changed: Notify,
 }
 
 impl AgentSink {
@@ -62,6 +64,7 @@ impl AgentSink {
             state: Mutex::new(SinkState::default()),
             responses: watch::channel(0).0,
             requests: AtomicU64::new(0),
+            turns_changed: Notify::new(),
         }
     }
 
@@ -80,6 +83,23 @@ impl AgentSink {
     /// Stop waiting for `turn_id` (its prompt was dropped or gave up).
     pub(crate) fn forget_turn(&self, turn_id: &str) {
         lock(&self.state).turns.remove(turn_id);
+        self.turns_changed.notify_waiters();
+    }
+
+    /// Returns once no prompt waits for a turn of this live agent.
+    pub(crate) async fn turns_over(&self) {
+        loop {
+            let changed = self.turns_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = lock(&self.state);
+                if state.turns.is_empty() || state.exit.is_some() || state.closed {
+                    return;
+                }
+            }
+            changed.await;
+        }
     }
 
     /// Head stopped the agent: fail every waiting prompt and refuse new
@@ -88,6 +108,8 @@ impl AgentSink {
         let mut state = lock(&self.state);
         state.closed = true;
         state.turns.clear();
+        drop(state);
+        self.turns_changed.notify_waiters();
     }
 
     /// The machine ended the agent without an exit record reaching head
@@ -102,6 +124,8 @@ impl AgentSink {
             });
         }
         state.turns.clear();
+        drop(state);
+        self.turns_changed.notify_waiters();
     }
 
     /// Whether head closed the sink (the agent was stopped from here).
@@ -143,6 +167,7 @@ impl AgentSink {
                     let _ = waiter.send(TurnEnd { stop_reason, error });
                 }
                 self.responses.send_modify(|count| *count += 1);
+                self.turns_changed.notify_waiters();
             }
             JournalBody::Exited {
                 exit_code, error, ..
@@ -151,6 +176,8 @@ impl AgentSink {
                 state.exit = Some(Exit { exit_code, error });
                 // Dropping the waiters fails every pending prompt.
                 state.turns.clear();
+                drop(state);
+                self.turns_changed.notify_waiters();
             }
         }
     }
@@ -223,6 +250,15 @@ impl Agents {
     pub(crate) fn close(&self, agent_id: &AgentId) {
         if let Some(sink) = lock(&self.sinks).remove(agent_id) {
             sink.close();
+        }
+    }
+
+    /// Returns once no prompt waits for a turn of `agent_id` (at once when
+    /// it is not attached).
+    pub(crate) async fn turns_over(&self, agent_id: &AgentId) {
+        let sink = lock(&self.sinks).get(agent_id).cloned();
+        if let Some(sink) = sink {
+            sink.turns_over().await;
         }
     }
 
