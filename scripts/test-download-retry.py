@@ -321,6 +321,19 @@ class InstallReleasePlz(unittest.TestCase):
         self.assertEqual((installed, leftovers), ('release-plz 0.3.162', []))
         self.assertIn('building it from crates.io', result.stderr)
 
+    def test_ci_pins_one_release_plz_version(self):
+        # A cache key left on an old version would restore the old binary on
+        # every run and silently rebuild the new one from crates.io.
+        ci = (ROOT / '.github/workflows/ci.yml').read_text()
+        pins = {
+            'tool': re.findall(r'tool: release-plz@(\S+)', ci),
+            'cache key': re.findall(r'key: release-plz-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-(\S+)', ci),
+            'script': re.findall(r'scripts/install-release-plz\.sh "\$RUNNER_TEMP/release-plz" (\S+)', ci),
+        }
+        for name, found in pins.items():
+            self.assertEqual(len(found), 1, f'{name}: {found}')
+        self.assertEqual(len({found[0] for found in pins.values()}), 1, pins)
+
     def test_version_must_match_as_a_whole_word(self):
         result, calls, _, _ = self.run_script(cached='0.3.1620', on_path='10.3.162')
         self.assertEqual(result.returncode, 0, result.stderr)
