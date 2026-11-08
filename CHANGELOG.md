@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.158] - 2026-11-08
+
+### 🚀 Features
+
+- *(plugins)* Let the Assistant link to Settings → Plugins ([#3113](https://github.com/intent-hq/intentd/pull/3113))
+- *(nodes)* Hand the backend's GitHub token to remote agents as GH_TOKEN (nodeProtocol 15) ([#3160](https://github.com/intent-hq/intentd/pull/3160))
+
+
 ## [0.11.157] - 2026-11-08
 
 ### 🐛 Bug Fixes
