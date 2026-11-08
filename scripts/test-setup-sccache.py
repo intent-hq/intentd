@@ -214,6 +214,66 @@ class ServerStartup(unittest.TestCase):
                 self.assertEqual(calls, [])
 
 
+class DownloadOutage(unittest.TestCase):
+    """A release-download outage must leave the job uncached, not failed: the
+    merge queue ejected intentd#3153 on GitHub 504s (runs 42464112397,
+    42464451320, 42465984903) although no test failed."""
+
+    def run_outage(self, error, env=SELF_HOSTED):
+        attempts = []
+        def fetch(url, dest):
+            attempts.append(url)
+            raise error
+        with tempfile.TemporaryDirectory() as temp:
+            env = {'RUNNER_TEMP': temp, 'GITHUB_PATH': temp + '/path', 'GITHUB_ENV': temp + '/env', **env}
+            out = io.StringIO()
+            with patch.dict(cache.os.environ, env, clear=True), patch.object(cache, 'fetch', fetch), \
+                    patch.object(time, 'sleep'), contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                cache.main()
+            written = Path(env['GITHUB_ENV']).read_text().splitlines()
+            self.assertFalse(Path(env['GITHUB_PATH']).exists())
+            return dict(line.split('=', 1) for line in written), out.getvalue(), attempts
+
+    def test_gateway_timeouts_after_retries_compile_uncached(self):
+        written, output, attempts = self.run_outage(http_error(504))
+        self.assertEqual(len(attempts), len(cache.RETRY_DELAYS) + 1)
+        self.assertEqual(written, {'INTENT_SCCACHE_DISABLED': '1'})
+        self.assertIn('::warning::', output)
+        self.assertIn('uncached', output)
+        self.assertNotIn('intent-secret', output)
+
+    def test_network_outage_compiles_uncached(self):
+        written, _, _ = self.run_outage(cache.urllib.error.URLError('connection refused'))
+        self.assertEqual(written['INTENT_SCCACHE_DISABLED'], '1')
+
+    def test_inherited_wrapper_and_endpoint_are_cleared(self):
+        # A runner that already exports them would otherwise call a missing
+        # sccache from cargo or run the managed smoke test against it.
+        written, _, _ = self.run_outage(http_error(503), {**SELF_HOSTED, **INHERITED, 'RUSTC_WRAPPER': 'sccache'})
+        self.assertEqual(written, {'RUSTC_WRAPPER': '', 'SCCACHE_WEBDAV_ENDPOINT': '',
+                                   'INTENT_SCCACHE_DISABLED': '1'})
+
+    def test_wrong_pin_still_fails(self):
+        with self.assertRaises(cache.urllib.error.HTTPError):
+            self.run_outage(http_error(404))
+
+    def test_rejected_certificate_still_fails(self):
+        error = cache.urllib.error.URLError(ssl.SSLCertVerificationError('certificate verify failed'))
+        with self.assertRaises(cache.urllib.error.URLError):
+            self.run_outage(error)
+
+    def test_tampered_asset_still_fails(self):
+        def fetch(url, dest):
+            Path(dest).write_bytes(b'corrupt archive')
+        with tempfile.TemporaryDirectory() as temp, patch.object(cache, 'fetch', fetch), \
+                patch.dict(cache.os.environ, {'RUNNER_TEMP': temp, 'GITHUB_PATH': temp + '/path',
+                                              'GITHUB_ENV': temp + '/env', **SELF_HOSTED}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+                cache.main()
+            self.assertFalse(Path(temp, 'env').exists())
+
+
 class CleanupOrder(unittest.TestCase):
     def test_runner_cleanup_runs_before_the_cache_server_starts(self):
         # setup-sccache.py leaves the job's server running, and the macOS

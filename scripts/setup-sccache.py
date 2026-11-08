@@ -8,6 +8,11 @@ Without the variable or a token (for example fork pull requests) compilation
 is uncached. The job's server is started here; when it cannot start, the
 WebDAV values are still exported but RUSTC_WRAPPER is not (and
 INTENT_SCCACHE_DISABLED=1 is), so compilation runs uncached instead of failing.
+When the release download still fails after its retries (a GitHub 5xx or
+network outage), the same marker is exported, no WebDAV values are, and the
+job compiles uncached: the cache only speeds builds up. A 4xx or a checksum
+mismatch or a rejected TLS certificate still fails, since it means a wrong
+pin or a tampered download.
 """
 import hashlib
 import importlib.util
@@ -16,6 +21,7 @@ from pathlib import Path
 import platform
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -151,11 +157,46 @@ def install(directory):
     return directory
 
 
+def write_env(values):
+    with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+        for key, value in values.items():
+            if "\n" in value or "\r" in value:
+                raise ValueError("Invalid cache configuration")
+            output.write(f"{key}={value}\n")
+
+
+def outage(error):
+    """True for a transient failure; a rejected certificate still fails the job."""
+    reason = getattr(error, "reason", error)
+    if isinstance(error, ssl.SSLCertVerificationError) or isinstance(reason, ssl.SSLCertVerificationError):
+        return False
+    return download_retry.transient(error)
+
+
+def unavailable(env, error):
+    """Values that leave the job uncached when the binary could not be fetched.
+
+    Inherited wrapper or WebDAV values are blanked so neither cargo nor the
+    managed smoke test reaches for a binary that is not on PATH.
+    """
+    values = {key: "" for key in ("RUSTC_WRAPPER", "SCCACHE_WEBDAV_ENDPOINT") if key in env}
+    values["INTENT_SCCACHE_DISABLED"] = "1"
+    print(f"::warning::Could not download sccache {VERSION} ({error}); "
+          "Rust compilation is uncached for this job.")
+    return values
+
+
 def main():
     backend, mode, values = select(os.environ)
     # The local WebDAV fixture smoke test needs the pinned binary even without
     # managed credentials. It supplies its own isolated cache configuration.
-    directory = install(Path(os.environ["RUNNER_TEMP"]) / "intent-sccache")
+    try:
+        directory = install(Path(os.environ["RUNNER_TEMP"]) / "intent-sccache")
+    except Exception as error:
+        if not outage(error):
+            raise
+        write_env(unavailable(os.environ, error))
+        return
     with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as output:
         output.write(str(directory) + "\n")
     if backend == "uncached-self-hosted":
@@ -185,11 +226,7 @@ def main():
         values["INTENT_SCCACHE_DISABLED"] = "1"
         print(f"::warning::The sccache server did not start after {STARTUP_ATTEMPTS} attempts "
               f"(is the self-hosted cache at {host} reachable?); Rust compilation is uncached for this job.")
-    with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
-        for key, value in values.items():
-            if "\n" in value or "\r" in value:
-                raise ValueError("Invalid cache configuration")
-            output.write(f"{key}={value}\n")
+    write_env(values)
     if "RUSTC_WRAPPER" in values:
         print(f"Rust compilation uses self-hosted sccache at {host} ({mode}).")
 
