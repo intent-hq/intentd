@@ -55,6 +55,9 @@ struct FakeState {
     refused_templates: Vec<String>,
     /// Templates whose sandboxes fail the credential mint.
     failed_mint_templates: Vec<String>,
+    /// Templates whose sandboxes come with a settings file that turns the
+    /// external listener off (the bootstrap keeps existing settings).
+    no_listener_templates: Vec<String>,
     /// Templates whose sandboxes take a while to start intentd.
     slow_start_templates: Vec<String>,
     /// Sandboxes paused now (their daemon is stopped with SIGSTOP).
@@ -334,10 +337,19 @@ impl FakeE2b {
                 }
                 let id = format!("sbx{}", self.state().creates.len());
                 let token = format!("envd-token-{id}-a1b2c3d4e5f6");
-                let dir = self.root.join(&id);
+                // As in a real sandbox: a home directory, no data dir set and
+                // no daemon settings yet; the bootstrap must write them where
+                // the daemon reads them (`$HOME/.intent`).
+                let home = self.root.join(&id);
+                let dir = home.join(".intent");
                 std::fs::create_dir_all(dir.join("workspaces")).unwrap();
-                common::enable_ws_api(&dir);
-                let env = self.sandbox_env(&dir);
+                if self.state().no_listener_templates.contains(&template) {
+                    std::fs::write(dir.join("config.toml"), "[server.wsApi]\nenabled = false\n")
+                        .unwrap();
+                }
+                let mut env = self.sandbox_env(&dir);
+                env.retain(|(key, _)| key != "INTENTD_DATA_DIR");
+                env.push(("HOME".into(), home.to_string_lossy().into_owned()));
                 self.state()
                     .metadata
                     .insert(id.clone(), request["metadata"].clone());
@@ -711,6 +723,7 @@ fn stop_sandbox(sandbox: &FakeSandbox) {
         .args(["-c", "intentd stop >/dev/null 2>&1 || true"])
         .env_clear()
         .envs(sandbox.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .env("INTENTD_DATA_DIR", &sandbox.dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -779,6 +792,7 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
             ("INTENTD_E2B_API_URL", &fake.url),
             ("INTENTD_E2B_ENVD_URL", &fake.url),
             ("INTENTD_E2B_DIRECT_HOST", "127.0.0.1"),
+            ("INTENTD_E2B_DAEMON_WAIT_SECS", "30"),
             ("INTENTD_E2B_MANIFEST_BASE_URL", &manifest_base),
         ],
     )
@@ -1171,6 +1185,35 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     let cloud = ok(&mut rpc_ws, 390, "cloudMachines.list", json!({})).await;
     assert_eq!(cloud["machines"].as_array().unwrap().len(), 1, "{cloud}");
 
+    // A daemon that starts without its external listener: the start fails
+    // within the bootstrap's wait, and the error says what was missing and
+    // carries the daemon's own last log lines, never a token.
+    {
+        let mut state = fake.state();
+        let template = state.failed_mint_templates.remove(0);
+        state.no_listener_templates.push(template);
+    }
+    let deaf = ok(&mut rpc_ws, 391, "agent.create", create(&keyed_ref, "Deaf")).await;
+    let deaf_id = deaf["agent"]["id"].as_str().unwrap().to_owned();
+    let failed = agent_until(&mut rpc_ws, (&ws_id, &deaf_id), 392, |a| {
+        a.get("placementError").is_some()
+    })
+    .await;
+    transcript.push(failed.to_string());
+    assert_eq!(
+        failed["placementError"]["data"]["reason"], "bootstrap-failed",
+        "{failed}"
+    );
+    let detail = failed["placementError"]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("no external listener"),
+        "the error names what was missing: {detail}"
+    );
+    assert!(!detail.contains(TOKEN), "{detail}");
+    let deaf_sandbox = format!("sbx{}", fake.state().creates.len());
+    assert!(fake.state().deletes.contains(&deaf_sandbox), "deleted");
+    fake.state().no_listener_templates.clear();
+
     drain_events(&mut events, &mut seen_events).await;
     // A key revoked at E2B: the start fails key-rejected, the provider
     // shows it, and the next placement is refused before any sandbox. A
@@ -1548,6 +1591,7 @@ impl CloudBackend {
             ("INTENTD_E2B_API_URL", fake.url.as_str()),
             ("INTENTD_E2B_ENVD_URL", fake.url.as_str()),
             ("INTENTD_E2B_DIRECT_HOST", "127.0.0.1"),
+            ("INTENTD_E2B_DAEMON_WAIT_SECS", "30"),
             ("INTENTD_E2B_MANIFEST_BASE_URL", manifest_base.as_str()),
         ];
         backend_env.extend_from_slice(env);
@@ -1636,6 +1680,7 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
             ("INTENTD_E2B_API_URL", &fake.url),
             ("INTENTD_E2B_ENVD_URL", &fake.url),
             ("INTENTD_E2B_DIRECT_HOST", "127.0.0.1"),
+            ("INTENTD_E2B_DAEMON_WAIT_SECS", "30"),
             ("INTENTD_E2B_MINUTE_MS", "100"),
             ("INTENTD_E2B_DAY_MS", "3000"),
         ],
