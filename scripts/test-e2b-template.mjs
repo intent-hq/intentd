@@ -164,6 +164,8 @@ describe('defineTemplate', () => {
     assert.match(commands, /pnpm@\d/);
   });
   it('installs a pinned gh release instead of the old Debian package', () => {
+    assert.match(GH.version, /^\d+\.\d+\.\d+$/);
+    assert.match(GH.sha256, /^[0-9a-f]{64}$/);
     const command = installGhCommand();
     assert.ok(command.includes(`https://github.com/cli/cli/releases/download/v${GH.version}/gh_${GH.version}_linux_amd64.tar.gz`));
     assert.ok(command.includes(`${GH.sha256}  `));

@@ -8,8 +8,8 @@
 //
 // gh is installed but never authenticated: the sandbox holds no GitHub
 // credentials, and the backend publishes branches and pull requests itself.
-// Language toolchains are not baked in; a repository's workspace setup script
-// installs what it needs.
+// No toolchains beyond Node, Python and a C compiler are baked in; a
+// repository's workspace setup script installs what it needs.
 //
 // This module has no dependencies so scripts/test-e2b-template.mjs can run it
 // offline; build.mjs and smoke.mjs pass in the e2b SDK.
@@ -182,6 +182,7 @@ export function npmGlobalsCommand() {
   return `npm install --global --no-fund --no-audit ${specs.join(' ')} && npm cache clean --force`;
 }
 
+// amd64, matching ARCHIVE_TARGET. Only the binary: no man pages or completions.
 export function installGhCommand() {
   const name = `gh_${GH.version}_linux_amd64`;
   return [
