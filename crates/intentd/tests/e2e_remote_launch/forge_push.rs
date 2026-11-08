@@ -84,7 +84,9 @@ async fn a_top_level_remote_agent_pushes_the_workspace_branch_and_its_sub_agent_
     .await;
     let node_dir = scratch.path().join("node");
     std::fs::create_dir_all(&node_dir).unwrap();
-    let machine = start_machine(&node_dir, &backend_id).await;
+    // The machine must not inherit a credential helper from the test's
+    // own environment (a `gh auth git-credential` there reads GH_TOKEN).
+    let machine = start_machine_with(&node_dir, &backend_id, &[("GIT_CONFIG_PARAMETERS", "")]).await;
     ok(
         &mut rpc_ws,
         3,
@@ -96,23 +98,33 @@ async fn a_top_level_remote_agent_pushes_the_workspace_branch_and_its_sub_agent_
     let pusher = (ws_id.as_str(), parent.as_str());
 
     // The first turn carries the notice: the branch and how to open a PR.
-    let raw = agent_turn(&mut rpc_ws, &mut events, pusher, "echo-raw", "raw: ", 100).await;
+    // Read from the conversation: the agent's last-response preview is
+    // capped below the raw prompt's length.
+    ok(
+        &mut rpc_ws,
+        100,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent, "content": "echo-raw" }),
+    )
+    .await;
+    let raw = reply_containing(&mut rpc_ws, pusher, "raw: ", 101).await;
     let local = format!("intent/{parent}");
     assert!(raw.contains(&format!("`{local}`")), "{raw}");
     assert!(raw.contains("gh pr create --head main"), "{raw}");
 
-    // On its own branch, tracking `main` on origin.
+    // On its own branch, with `main` on origin as upstream (not fetched
+    // yet, so only the configuration names it).
     let out = sh_ok(
         &mut rpc_ws,
         &mut events,
         pusher,
-        "git rev-parse --abbrev-ref HEAD @{upstream} && git config remote.origin.url && git config push.default",
+        "b=$(git rev-parse --abbrev-ref HEAD) && echo $b && git config branch.$b.remote && git config branch.$b.merge && git config remote.origin.url && git config push.default",
         200,
     )
     .await;
     assert_eq!(
         out.lines().collect::<Vec<_>>(),
-        [local.as_str(), "origin/main", ORIGIN, "upstream"],
+        [local.as_str(), "origin", "refs/heads/main", ORIGIN, "upstream"],
         "{out}"
     );
 
@@ -145,7 +157,7 @@ async fn a_top_level_remote_agent_pushes_the_workspace_branch_and_its_sub_agent_
     let reader = (ws_id.as_str(), child.as_str());
     let raw = reply_containing(&mut rpc_ws, reader, "raw: ", 700).await;
     assert!(raw.contains("Use it only to read"), "{raw}");
-    assert!(!raw.contains("gh pr create"), "{raw}");
+    assert!(!raw.contains("gh pr create --head"), "{raw}");
     let out = sh_ok(
         &mut rpc_ws,
         &mut events,

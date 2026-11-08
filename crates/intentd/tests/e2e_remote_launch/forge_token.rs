@@ -40,7 +40,13 @@ pub(super) async fn backend_with_token(
     intent_core::FileSecretStore::with_path(head_dir.join("secrets.json"))
         .store(TOKEN_ACCOUNT, TOKEN)
         .unwrap();
-    let (head, port, cfg, ws_id) = start_backend(&head_dir, &repo).await;
+    // A closed loopback port: a GitHub origin must not reach github.com.
+    let (head, port, cfg, ws_id) = start_backend_with(
+        &head_dir,
+        &repo,
+        &[("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:1")],
+    )
+    .await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let backend = ok(&mut rpc_ws, 1, "remoteMachines.backendInfo", json!({})).await;
     let backend_id = backend["backendId"].as_str().unwrap().to_owned();

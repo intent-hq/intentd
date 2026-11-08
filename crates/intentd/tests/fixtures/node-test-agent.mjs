@@ -311,7 +311,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
       if (text === 'auth-required') return send({ id: msg.id, error: AUTH_REQUIRED });
       // The SHA-256 of a variable, never its value: `unset` without one.
       // An optional tag marks this turn's reply.
-      const digest = text.match(/^sha-env (\S+)(?: (\S+))?$/);
+      const digest = text.match(/(?:^|\n)sha-env (\S+)(?: (\S+))?$/);
       if (digest) {
         const value = process.env[digest[1]];
         const shown = value === undefined ? 'unset' : crypto.createHash('sha256').update(value).digest('hex');
@@ -324,10 +324,11 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
         });
         return send({ id: msg.id, result: { stopReason: 'end_turn' } });
       }
-      // "sh <tag> <command>" runs <command> with sh in the working directory
+      // "sh <tag> <command>" (the prompt's last line: a wake may prefix
+      // context) runs <command> with sh in the working directory
       // and the agent's own environment (no terminal prompts), and streams
       // "sh-out <tag> {code, out}" with its exit code and combined output.
-      const shell = text.match(/^sh (\S+) ([\s\S]+)$/);
+      const shell = text.match(/(?:^|\n)sh (\S+) ([^\n]+)$/);
       if (shell) {
         const run = spawnSync('sh', ['-c', shell[2]], {
           encoding: 'utf8',
