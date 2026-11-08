@@ -22361,15 +22361,9 @@ impl WorkspaceApi for Services {
                     return live;
                 }
             };
-            let Some(record) = setup_status_from_events(started.as_ref(), completed.as_ref())
-            else {
-                return live;
-            };
-            self.workspace_setup_states
-                .lock()
-                .entry(id)
-                .or_insert(record)
-                .clone()
+            // Not cached: the live map also drives the turn-start setup
+            // notice, which must not fire for a run from a past lifetime.
+            setup_status_from_events(started.as_ref(), completed.as_ref()).unwrap_or(live)
         })
     }
 

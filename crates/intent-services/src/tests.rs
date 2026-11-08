@@ -47905,8 +47905,8 @@ async fn setup_status_falls_back_to_persisted_setup_events() {
     assert_eq!(done.terminal_id, None);
     assert_eq!(
         svc.workspace_setup_status(&ws).state,
-        WorkspaceSetupState::Completed,
-        "the rebuilt record is cached"
+        WorkspaceSetupState::Unknown,
+        "the rebuilt record never enters the live map behind the setup notice"
     );
 
     let (_tmp, _, _, failed) = resolve(|ws| {
@@ -47932,6 +47932,35 @@ async fn setup_status_falls_back_to_persisted_setup_events() {
     );
     assert_eq!(cut_off.exit_code, None);
     assert!(cut_off.started_at.is_some() && cut_off.finished_at.is_none());
+
+    let (_tmp, _, _, spawn_failed) = resolve(|ws| {
+        vec![
+            workspace_setup_started_event(ws),
+            workspace_setup_completed_event(ws, false, None),
+        ]
+    })
+    .await;
+    assert_eq!(
+        spawn_failed.state,
+        WorkspaceSetupState::Failed,
+        "{spawn_failed:?}"
+    );
+    assert_eq!(spawn_failed.exit_code, None);
+    assert!(spawn_failed.finished_at.is_some());
+
+    let (_tmp, _, _, rerun_cut_off) = resolve(|ws| {
+        let done = workspace_setup_completed_event(ws, true, Some(0));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        vec![done, workspace_setup_started_event(ws)]
+    })
+    .await;
+    assert_eq!(
+        rerun_cut_off.state,
+        WorkspaceSetupState::Failed,
+        "a later run the daemon never saw finish: {rerun_cut_off:?}"
+    );
+    assert_eq!(rerun_cut_off.exit_code, None);
+    assert!(rerun_cut_off.started_at.is_some() && rerun_cut_off.finished_at.is_none());
 
     let (_tmp, svc, ws, _id) = setup("# Live").await;
     svc.store()

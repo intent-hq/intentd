@@ -756,9 +756,9 @@ async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value,
     // Daemon-owned setup-stage state (§6.5), rebuilt from the persisted
     // setup events after a restart; `unknown` only when neither exists.
     // Agent-facing only — never part of the wire `Workspace` row.
-    let setup_status = api.workspace_setup_status_resolved(ws.clone()).await;
     match api.get_workspace(ws.clone()).await {
         Ok(w) => {
+            let setup_status = api.workspace_setup_status_resolved(ws.clone()).await;
             let title = w.title.trim();
             let has_title = !title.is_empty() && title != w.id.as_str();
             // Legacy rows persisted before the services-layer clear
@@ -803,7 +803,7 @@ async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value,
             "branch": Value::Null,
             "repositoryName": Value::Null,
             "tags": Vec::<String>::new(),
-            "setupStatus": setup_status,
+            "setupStatus": api.workspace_setup_status(ws),
         })),
         Err(e) => Err(e.to_string()),
     }
