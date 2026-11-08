@@ -384,7 +384,10 @@ impl ExecutorService {
         let git_sessions = NodeGitSessions::new();
         let checkouts = (self.make_checkouts)(
             storage.clone(),
-            CheckoutCache::new(storage.cache_dir(), NodeGit::new(helper_dir, socket.clone())),
+            CheckoutCache::new(
+                storage.cache_dir(),
+                NodeGit::new(helper_dir, socket.clone()),
+            ),
         );
         let runner = Runner::new(RunnerConfig {
             admission: Arc::new(Scoped {

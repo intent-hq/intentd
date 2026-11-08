@@ -39,12 +39,12 @@ pub use executor::{
 pub use git::{GitConnection, GitSender};
 #[cfg(unix)]
 pub use git_helper::run_git_remote_helper;
-#[cfg(unix)]
-pub use git_session::{serve_helpers, serve_helpers_with, HelperCredential, CREDENTIAL_REQUEST};
 pub use git_session::{
     codes as git_codes, serve_git, CloseStatus, GitSession, NodeGitAccess, NodeGitSessions,
     OpenRequest, ATTACH_WAIT, MAX_SESSIONS,
 };
+#[cfg(unix)]
+pub use git_session::{serve_helpers, serve_helpers_with, HelperCredential, CREDENTIAL_REQUEST};
 pub use intent_core::node_link::*;
 pub use link::{IncomingRequest, LinkEvent, LinkEvents, NodeLink, StopAcked};
 pub use pin::CertificatePin;

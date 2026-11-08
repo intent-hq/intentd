@@ -86,7 +86,8 @@ async fn a_top_level_remote_agent_pushes_the_workspace_branch_and_its_sub_agent_
     std::fs::create_dir_all(&node_dir).unwrap();
     // The machine must not inherit a credential helper from the test's
     // own environment (a `gh auth git-credential` there reads GH_TOKEN).
-    let machine = start_machine_with(&node_dir, &backend_id, &[("GIT_CONFIG_PARAMETERS", "")]).await;
+    let machine =
+        start_machine_with(&node_dir, &backend_id, &[("GIT_CONFIG_PARAMETERS", "")]).await;
     ok(
         &mut rpc_ws,
         3,
@@ -124,7 +125,13 @@ async fn a_top_level_remote_agent_pushes_the_workspace_branch_and_its_sub_agent_
     .await;
     assert_eq!(
         out.lines().collect::<Vec<_>>(),
-        [local.as_str(), "origin", "refs/heads/main", ORIGIN, "upstream"],
+        [
+            local.as_str(),
+            "origin",
+            "refs/heads/main",
+            ORIGIN,
+            "upstream"
+        ],
         "{out}"
     );
 

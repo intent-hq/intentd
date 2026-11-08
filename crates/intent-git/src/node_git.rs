@@ -1347,7 +1347,10 @@ impl CheckoutCache {
             ("push.default", "upstream"),
         ] {
             self.git
-                .git(worktree, &["config", "--worktree", "--replace-all", key, value])
+                .git(
+                    worktree,
+                    &["config", "--worktree", "--replace-all", key, value],
+                )
                 .await?;
         }
         Ok(())
@@ -1359,7 +1362,15 @@ impl CheckoutCache {
         let _serial = self.lock.lock().await;
         let Ok(own) = self
             .git
-            .git(worktree, &["rev-parse", "--path-format=absolute", "--git-path", "config.worktree"])
+            .git(
+                worktree,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "config.worktree",
+                ],
+            )
             .await
         else {
             return;

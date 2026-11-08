@@ -542,7 +542,9 @@ pub fn valid_branch_name(name: &str) -> bool {
         && !name.contains("//")
         && !name.contains("@{")
         && !name.chars().any(|c| {
-            c.is_ascii_control() || c.is_whitespace() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+            c.is_ascii_control()
+                || c.is_whitespace()
+                || matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
         })
         && name
             .split('/')
