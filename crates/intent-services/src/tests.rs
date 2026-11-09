@@ -34794,7 +34794,7 @@ mod file_ops_service {
         std::fs::write(external.join("new.txt"), "external λ\n").unwrap();
         for (agent, root, expected) in [
             (None, None, "primary"),
-            (Some(caller.clone()), None, "sandbox"),
+            (Some(caller.clone()), None, "primary"),
             (None, Some(root_id.clone()), "external λ\n"),
             (Some(caller), Some(root_id.clone()), "external λ\n"),
         ] {
@@ -35853,7 +35853,7 @@ mod file_ops_service {
     /// with `Error::IsolationRemoved` before any side effect (no session),
     /// even in a sandbox-eligible direct-mode workspace with
     /// `workspace.cowIsolation` on; `"shared"` / `"direct"` stay no-ops.
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn delegate_refuses_cow_isolation_before_side_effects() {
         use intent_core::AgentDelegateInput;
 

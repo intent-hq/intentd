@@ -1223,14 +1223,14 @@ async fn a_batch_refuses_bad_placements_before_any_task_starts() {
     let first = seed_task(&svc, &ws, "First").await;
     let second = seed_task(&svc, &ws, "Second").await;
     let agents = agent_count(&svc).await;
-    let cow = || Some("cow".to_string());
+    let shared = || Some("shared".to_string());
 
     let cases = [
         (
             "batch remote + isolation",
             AgentDelegateInput {
                 placement: Some(placement(json!({"target": "remote"}))),
-                isolation: cow(),
+                isolation: shared(),
                 tasks: Some(vec![bare(&first), bare(&second)]),
                 ..Default::default()
             },
@@ -1240,7 +1240,7 @@ async fn a_batch_refuses_bad_placements_before_any_task_starts() {
             "entry remote + isolation",
             AgentDelegateInput {
                 placement: Some(placement(json!({"target": "local"}))),
-                isolation: cow(),
+                isolation: shared(),
                 tasks: Some(vec![
                     bare(&first),
                     entry(json!({"taskNoteId": second.0, "placement": {"target": "remote"}})),
@@ -1252,7 +1252,7 @@ async fn a_batch_refuses_bad_placements_before_any_task_starts() {
         (
             "inherited + isolation",
             AgentDelegateInput {
-                isolation: cow(),
+                isolation: shared(),
                 tasks: Some(vec![
                     entry(json!({"taskNoteId": first.0, "placement": {"target": "local"}})),
                     bare(&second),

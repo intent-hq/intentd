@@ -103,7 +103,7 @@ crates/intentd/tests/e2e_wss_unblocked_hints.rs 1
 crates/intentd/tests/e2e_wss_wake_or_create.rs 1
 crates/intentd/tests/e2e_wss_wake_resume.rs 2
 crates/intentd/tests/e2e_wss_workspace_activity_debounce.rs 2
-crates/intentd/tests/e2e_wss_workspace_cow.rs 4
+crates/intentd/tests/e2e_wss_workspace_cow.rs 3
 crates/intentd/tests/e2e_wss_workspace_create_submodule_progress.rs 1
 crates/intentd/tests/e2e_wss_workspace_direct_survival.rs 2
 crates/intentd/tests/e2e_wss_workspace_lifecycle_watchers.rs 2
