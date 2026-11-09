@@ -282,7 +282,9 @@ impl MachineRuns {
             )
             .await;
         }
-        // After the wake is queued, so a watch it defers is not settled early.
+        // After the wake is queued, so a watch it defers is not settled
+        // early. A wake that failed leaves the agent nothing to wait on, so
+        // its watch settles.
         if monitor_ended {
             (self.inner.hooks.ended)(place.agent_id.clone()).await;
         }
