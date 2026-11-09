@@ -1524,4 +1524,10 @@ async fn script_remove_of_running_script_completes_its_monitor_as_cancelled() {
         .active_script_monitors_for_agent(&owner)
         .await
         .is_empty());
+    assert!(h
+        .services
+        .store()
+        .script_monitor_wake_allowed(&mid)
+        .await
+        .unwrap());
 }

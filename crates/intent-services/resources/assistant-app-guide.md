@@ -812,7 +812,7 @@ To delete a saved script, open its **…** menu in the sidebar **Scripts** list 
 the script panel and choose **Delete script**, or use **Delete script** beside its
 play/edit controls in the bottom bar. Each asks **Delete “[name]”?**; confirm with
 **Delete script**, or cancel to keep it. A running script is stopped first, and
-agents monitoring it are woken; the dialog says so. Deletion stays disabled while
+any agents monitoring it are woken; the dialog says so. Deletion stays disabled while
 changes are pending.
 
 To continue work, open its existing card or sidebar entry, then the existing agent's
