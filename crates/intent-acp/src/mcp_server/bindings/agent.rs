@@ -415,21 +415,30 @@ fn check_options(args: &Value, what: &str, accepted: &[&str]) -> Result<(), Stri
 }
 
 /// Where an agent runs, for a create result: `{ target: "local" }` on this
-/// backend, else the placement target with the machine's id and name.
+/// backend, else the placement target with the machine's id and name. A
+/// placed agent whose machine is not bound yet (an E2B sandbox still
+/// starting) reports its target alone, never `local`.
 async fn runs_on(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, agent_id: &str) -> Option<Value> {
     let agent = api
         .agent_get(AgentId::from(agent_id), Some(ws.clone()))
         .await
         .ok()?;
-    let Some(node_id) = agent.node_id else {
-        return Some(json!({ "target": "local" }));
+    let placed = agent
+        .placement
+        .as_ref()
+        .filter(|p| !p.runs_on_backend().unwrap_or(false));
+    let target = match placed {
+        Some(p) if p.is_e2b() => "e2b",
+        Some(_) => "remote",
+        None if agent.node_id.is_some() => "remote",
+        None => return Some(json!({ "target": "local" })),
     };
-    let target = if agent.placement.as_ref().is_some_and(AgentPlacement::is_e2b) {
-        "e2b"
-    } else {
-        "remote"
-    };
-    Some(json!({ "target": target, "nodeId": node_id, "nodeName": agent.node_name }))
+    let mut where_ = json!({ "target": target });
+    if let Some(node_id) = agent.node_id {
+        where_["nodeId"] = json!(node_id);
+        where_["nodeName"] = json!(agent.node_name);
+    }
+    Some(where_)
 }
 
 /// Add `runsOn` to a result (and to each started batch entry) that names a

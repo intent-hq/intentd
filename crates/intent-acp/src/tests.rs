@@ -13930,7 +13930,9 @@ mod wsapi4_bindings_tests {
     async fn create_results_report_the_placement_before_the_machine_is_bound() {
         let (srv, api) = server_with_caller("caller-1");
         let runs_on = |resp: Value| -> Value {
-            let text = resp["result"]["content"][0]["text"].as_str().unwrap_or_default();
+            let text = resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
             serde_json::from_str(text).unwrap_or_else(|_| panic!("{resp}"))
         };
         api.unbound_placed_agents.lock().unwrap().extend([
@@ -13941,8 +13943,8 @@ mod wsapi4_bindings_tests {
             ("agent-woken".to_string(), json!({ "target": "remote" })),
         ]);
         for code in [
-            "const r = await ws.agent.create('n', 'go', { placement: { target: 'e2b', cloudMachineId: 'box' } }); return JSON.stringify(r.runsOn);",
-            "const r = await ws.agent.create('n', 'go', { topLevel: true, placement: { target: 'e2b', cloudMachineId: 'box' } }); return JSON.stringify(r.runsOn);",
+            "const r = await ws.agent.create('n', 'go', { placement: { target: 'e2b', cloudMachineId: 'box' } }); return r.runsOn;",
+            "const r = await ws.agent.create('n', 'go', { topLevel: true, placement: { target: 'e2b', cloudMachineId: 'box' } }); return r.runsOn;",
         ] {
             assert_eq!(
                 runs_on(call(&srv, code).await),
@@ -13952,7 +13954,7 @@ mod wsapi4_bindings_tests {
         }
         let resp = call(
             &srv,
-            "const r = await ws.agent.wakeOrCreate('tn-1', 'ctx'); return JSON.stringify(r.runsOn);",
+            "const r = await ws.agent.wakeOrCreate('tn-1', 'ctx'); return r.runsOn;",
         )
         .await;
         assert_eq!(runs_on(resp), json!({ "target": "remote" }));
@@ -13960,7 +13962,7 @@ mod wsapi4_bindings_tests {
         api.unbound_placed_agents.lock().unwrap().clear();
         let resp = call(
             &srv,
-            "const r = await ws.agent.create('n', 'go'); return JSON.stringify(r.runsOn);",
+            "const r = await ws.agent.create('n', 'go'); return r.runsOn;",
         )
         .await;
         assert_eq!(runs_on(resp), json!({ "target": "local" }));
@@ -13970,7 +13972,7 @@ mod wsapi4_bindings_tests {
             .push(("child-1".to_string(), json!({ "target": "local" })));
         let resp = call(
             &srv,
-            "const r = await ws.agent.create('n', 'go', { placement: { target: 'local' } }); return JSON.stringify(r.runsOn);",
+            "const r = await ws.agent.create('n', 'go', { placement: { target: 'local' } }); return r.runsOn;",
         )
         .await;
         assert_eq!(runs_on(resp), json!({ "target": "local" }));
