@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.161] - 2026-11-09
+
+### 🚀 Features
+
+- *(acp)* Add ws.search for notes and agent messages in the current workspace ([#3172](https://github.com/intent-hq/intentd/pull/3172))
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Stay quiet when a known requirement blips to unknown ([#3169](https://github.com/intent-hq/intentd/pull/3169))
+
+### 📚 Documentation
+
+- *(assistant-guide)* Describe Micro key chat focus and joystick prompt ring ([#3171](https://github.com/intent-hq/intentd/pull/3171))
+
+### 🧪 Testing
+
+- *(scripts)* Cover monitor wake when a running script is deleted ([#3170](https://github.com/intent-hq/intentd/pull/3170))
+
+
 ## [0.11.160] - 2026-11-09
 
 ### 🚀 Features
