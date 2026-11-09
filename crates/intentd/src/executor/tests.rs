@@ -1683,8 +1683,9 @@ async fn a_revoked_credentials_storage_is_removed_and_active_ones_are_kept() {
     // removal) goes at the next bind.
     let stale = dir.path().join("executor").join("stalecredential");
     std::fs::create_dir_all(stale.join("agents").join("a1")).unwrap();
-    let stale_home = dir.path().join("w").join("stale").join("a1home");
+    let stale_home = storage::work_dir(&dir.path().join("w"), "stalecredential").join("a1home");
     std::fs::create_dir_all(stale_home.join("work")).unwrap();
+    std::fs::write(stale_home.join(".agent"), "a1").unwrap();
     std::fs::write(
         stale.join("agents").join("a1").join("home"),
         stale_home.to_str().unwrap(),
