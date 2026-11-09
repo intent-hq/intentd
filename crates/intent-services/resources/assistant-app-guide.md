@@ -990,8 +990,8 @@ count as unpushed, even after the merged branch is deleted on the remote; commit
 made after the merge still do.
 
 To keep one workspace from being archived automatically, right-click it in **Home →
-Workspaces** and turn on **Disable auto-archive**; turn it off the same way. It is
-off for every workspace by default, only the workspace owner sees it, it appears only
+Workspaces** and turn off **Auto-archive**; turn it back on the same way. It is
+on for every workspace by default, only the workspace owner sees it, it appears only
 while **Archive idle workspaces** is on, and it does not stop you archiving the
 workspace yourself.
 
@@ -1312,7 +1312,7 @@ that renders Mermaid diagrams. For files in the main workspace checkout, relativ
 `charts/chart.png` resolve from the Markdown file's folder and cannot reach
 outside the workspace; files from other registered repositories do not resolve them.
 Use the diagram's **View source** action to inspect
-its code, or turn off **Markdown Preview** in the panel menu to edit the file's source.
+its code, or turn off **Markdown preview** in the panel menu to edit the file's source.
 Excel workbooks and other binary files
 without a preview show a binary-file notice; use **Download file** in that panel
 to save the original file on your computer, including from a remote workspace.
