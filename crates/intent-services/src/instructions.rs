@@ -293,10 +293,14 @@ pub(crate) static V3_8: InstructionSet = InstructionSet {
     ..V3_7
 };
 
-/// Harness v3.10 starts from a copy of the v3.8 common guidance; the
-/// context-reduction work edits that copy.
+/// Harness v3.10 cuts per-agent context: `common` drops the development-only
+/// inline-visuals doctrine and the Note Editing, Waiting on External
+/// Conditions and Long-running Processes prose (now rows of the generated
+/// ws.* routing table), and `workspace` names the real `ws.*` methods instead
+/// of retired discrete MCP tools. Both bodies are tightened without new rules.
 pub(crate) static V3_10: InstructionSet = InstructionSet {
     common: instr!("v3.10", "common"),
+    workspace: instr!("v3.10", "workspace"),
     ..V3_8
 };
 
