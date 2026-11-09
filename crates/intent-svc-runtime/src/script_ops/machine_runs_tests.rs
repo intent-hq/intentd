@@ -66,6 +66,7 @@ fn hooks(rec: &Arc<Recorded>) -> Hooks {
             monitors.monitor_events.lock().unwrap().push((kind, row));
             Box::pin(async {})
         }),
+        ended: Arc::new(|_agent| Box::pin(async {})),
         restart_backoff: Duration::from_millis(20),
         stop_wait: Duration::from_millis(500),
     }
