@@ -1,5 +1,8 @@
 //! A scripted HTTP/1.1 server that stands in for the E2B API and envd.
 //! Each connection serves one request with the next queued reply.
+//! Like E2B's edge, it answers 411 to a POST, PUT or PATCH without a
+//! `Content-Length` or `Transfer-Encoding` header (intent-hq/intent#8865),
+//! and that refusal does not consume a queued reply.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -26,6 +29,12 @@ impl Recorded {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    fn lacks_length(&self) -> bool {
+        matches!(self.method.as_str(), "POST" | "PUT" | "PATCH")
+            && self.header("content-length").is_none()
+            && self.header("transfer-encoding").is_none()
     }
 
     pub fn json(&self) -> serde_json::Value {
@@ -133,8 +142,13 @@ impl FakeServer {
         };
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        let length_required = request.lacks_length();
         self.requests.lock().unwrap().push(request);
-        let reply = self.replies.lock().unwrap().pop_front();
+        let reply = if length_required {
+            Some(Reply::error(411, "", "Length Required"))
+        } else {
+            self.replies.lock().unwrap().pop_front()
+        };
         match reply {
             None => write_full(&mut stream, 599, &[], b"no scripted reply").await,
             Some(Reply::Full {

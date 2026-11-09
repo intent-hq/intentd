@@ -307,6 +307,17 @@ async fn pause_succeeds_on_204_and_reports_503_refusal() {
     assert_eq!(reqs[0].target, "/sandboxes/sbx1/pause");
 }
 
+/// intent-hq/intent#8865: E2B answers 411 to a body-less POST without
+/// `Content-Length`, so the pause never happened.
+#[tokio::test]
+async fn pause_sends_content_length() {
+    let server = FakeServer::start(vec![Reply::status(204)]).await;
+    client(&server).pause("sbx1").await.unwrap();
+    let [req] = server.requests().try_into().unwrap();
+    assert_eq!(req.header("content-length"), Some("0"));
+    assert!(req.body.is_empty());
+}
+
 #[tokio::test]
 async fn set_timeout_posts_seconds() {
     let server = FakeServer::start(vec![Reply::status(204)]).await;
