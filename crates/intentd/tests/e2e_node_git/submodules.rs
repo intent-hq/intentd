@@ -599,6 +599,12 @@ async fn fetching_origin_does_not_fail_on_the_submodules() {
     commit(&head, "move a");
     let (ok, stderr) = fetch(&worktree);
     assert!(ok, "git fetch origin: {stderr}");
+    // Nested: `a` given a remote of its own still does not recurse into
+    // `a/b`.
+    git(
+        &worktree.join("a"),
+        &["remote", "add", "origin", layout.a.to_str().unwrap()],
+    );
     let (ok, stderr) = fetch(&worktree.join("a"));
     assert!(ok, "git fetch origin in a: {stderr}");
 

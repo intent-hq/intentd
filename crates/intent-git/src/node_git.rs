@@ -1187,7 +1187,8 @@ impl CheckoutCache {
     /// else its `base`, which must be the pinned commit. A module `wip` is
     /// restored on top, or pinned under `unapplied/` in the module's
     /// repository on head, as [`Self::checkout`] does. Each module is
-    /// activated in its parent's own worktree config; no URL is set. A pin
+    /// activated in its parent's own worktree config with fetch recursion off
+    /// (also when already populated); no URL is set. A pin
     /// that is no longer a gitlink of its parent's index (the agent removed
     /// it in a commit) is skipped. Returns the modules it added.
     ///
@@ -1230,9 +1231,6 @@ impl CheckoutCache {
                 |error: Error| Error::Internal(format!("submodule {}: {error}", pin.path));
             ensure_no_symlink(worktree, &pin.path)?;
             let dir = worktree.join(&pin.path);
-            if populated_here(&dir) {
-                continue;
-            }
             let (parent, rel) = match parent_of(pins, index) {
                 Some(parent) => (
                     worktree.join(&pins[parent].path),
@@ -1240,6 +1238,13 @@ impl CheckoutCache {
                 ),
                 None => (worktree.to_path_buf(), pin.path.as_str()),
             };
+            if populated_here(&dir) {
+                // An earlier launch's checkout gets this launch's config.
+                if let Err(error) = self.no_fetch_recursion(&parent, &pin.name).await {
+                    tracing::warn!(%error, path = %pin.path, "node git: could not turn off fetch recursion");
+                }
+                continue;
+            }
             // A submodule the agent removed in a commit stays removed.
             let pathspec = format!(":(literal){rel}");
             let staged = self
@@ -1279,7 +1284,8 @@ impl CheckoutCache {
             .join(format!("{module_key}.git")))
     }
 
-    /// Set `submodule.<name>.active` in `parent`'s own worktree config. The
+    /// Set `submodule.<name>.active` in `parent`'s own worktree config, and
+    /// turn off its fetch recursion (see [`Self::no_fetch_recursion`]). The
     /// first time, turn on per-worktree config in `parent`'s shared cache,
     /// moving its `core.bare` to the cache's own worktree config first, so
     /// no other worktree of it ever reads itself as bare.
@@ -1288,6 +1294,18 @@ impl CheckoutCache {
         let key = format!("submodule.{name}.active");
         self.git
             .git(parent, &["config", "--worktree", &key, "true"])
+            .await?;
+        self.no_fetch_recursion(parent, name).await
+    }
+
+    /// Set `submodule.<name>.fetchRecurseSubmodules = false` in `parent`'s
+    /// own worktree config: a machine's submodule has no remote, so git's
+    /// on-demand recursion would fail every fetch in `parent` whose commits
+    /// move its gitlink. The per-module key wins over `.gitmodules`.
+    async fn no_fetch_recursion(&self, parent: &Path, name: &str) -> Result<()> {
+        let key = format!("submodule.{name}.fetchRecurseSubmodules");
+        self.git
+            .git(parent, &["config", "--worktree", &key, "false"])
             .await?;
         Ok(())
     }
