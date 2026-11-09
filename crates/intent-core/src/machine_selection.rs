@@ -672,7 +672,8 @@ pub fn exposed_machines_help(inputs: &PlacementHelpInputs<'_>) -> Option<String>
 }
 
 /// The 3.10 lookup binding, as agents call it.
-pub const MACHINE_MODELS_SIGNATURE: &str = "ws.agent.machineModels(nodeId?, { provider?, model? }?)";
+pub const MACHINE_MODELS_SIGNATURE: &str =
+    "ws.agent.machineModels(nodeId?, { provider?, model? }?)";
 
 /// The harness 3.10 prompt text: each exposed machine by stable identity
 /// only (name, nodeId, platform), in name order, plus the instruction to

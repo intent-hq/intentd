@@ -155,7 +155,12 @@ mod tests {
         assert_eq!((previous.hidden_skills)(&inputs), []);
     }
 
-    fn reported(id: &str, observed_at: &str, status: ProviderStatus, models: &[&str]) -> ExposedMachine {
+    fn reported(
+        id: &str,
+        observed_at: &str,
+        status: ProviderStatus,
+        models: &[&str],
+    ) -> ExposedMachine {
         let mut row = machine(id);
         let platform = AgentPlatform {
             os: NodeOs::Macos,
@@ -184,8 +189,18 @@ mod tests {
         let (_db, dir, services, mut session) = fixture().await;
         session.harness_version = "3.10".into();
         let mut before = vec![
-            reported("d-mac", "2026-11-09T12:00:00Z", ProviderStatus::SignedIn, &["opus"]),
-            reported("d-box", "2026-11-09T12:01:00Z", ProviderStatus::SignedOut, &[]),
+            reported(
+                "d-mac",
+                "2026-11-09T12:00:00Z",
+                ProviderStatus::SignedIn,
+                &["opus"],
+            ),
+            reported(
+                "d-box",
+                "2026-11-09T12:01:00Z",
+                ProviderStatus::SignedOut,
+                &[],
+            ),
         ];
         before[1].state = RemoteMachineState::Unreachable;
         let mut after = before.clone();
@@ -207,14 +222,40 @@ mod tests {
         let text_after =
             render(&PlacementHelpInputs::new(&after, &connected_after)).expect("machines listed");
         assert_eq!(text_before, text_after);
-        for live in ["2026-11-09", "signed", "opus", "connected", "unreachable", "last seen"] {
+        for live in [
+            "2026-11-09",
+            "signed",
+            "opus",
+            "connected",
+            "unreachable",
+            "last seen",
+        ] {
             assert!(!text_before.contains(live), "{live} in {text_before}");
         }
-        assert!(text_before.contains("ws.agent.machineModels"), "{text_before}");
+        assert!(
+            text_before.contains("ws.agent.machineModels"),
+            "{text_before}"
+        );
 
         for provider in intent_providers::config::ACP_PROVIDERS {
-            let first = variant(&services, dir.path(), &session, provider, Some(&text_before), false).await;
-            let second = variant(&services, dir.path(), &session, provider, Some(&text_after), false).await;
+            let first = variant(
+                &services,
+                dir.path(),
+                &session,
+                provider,
+                Some(&text_before),
+                false,
+            )
+            .await;
+            let second = variant(
+                &services,
+                dir.path(),
+                &session,
+                provider,
+                Some(&text_after),
+                false,
+            )
+            .await;
             assert_eq!(first, second, "{}", provider.id);
         }
 

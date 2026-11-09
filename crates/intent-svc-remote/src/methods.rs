@@ -224,7 +224,12 @@ async fn models(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         .iter()
         .filter_map(|row| {
             let live = feature.running_node(&row.id);
-            machine_models_json(row, live.as_ref().map(RemoteNode::shared_ref), provider, model)
+            machine_models_json(
+                row,
+                live.as_ref().map(RemoteNode::shared_ref),
+                provider,
+                model,
+            )
         })
         .collect();
     Ok(json!({ "machines": machines }))

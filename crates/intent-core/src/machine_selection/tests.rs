@@ -1048,7 +1048,10 @@ fn stable_help_lists_identity_only_in_name_order() {
          Before you choose a machine, provider or model for a remote agent, confirm it with `ws.agent.machineModels(nodeId?, { provider?, model? }?)`: each machine's state, provider sign-in status and full model list. How to place one: `ws.help(\"agent\")`.\n\
          On a remote machine, run anything over 30 s with `ws.script.start`; shell background jobs never wake you."
     );
-    assert_eq!(stable_machines_help(&rows, &|_| false).as_deref(), Some(text.as_str()));
+    assert_eq!(
+        stable_machines_help(&rows, &|_| false).as_deref(),
+        Some(text.as_str())
+    );
 
     let reference = stable_machines_reference(&rows, &|id| id == "d-mac").unwrap();
     assert!(reference.starts_with(
@@ -1061,7 +1064,15 @@ fn stable_help_lists_identity_only_in_name_order() {
     assert!(reference.contains("`ws.agent.setModel` can switch it"));
     assert_eq!(reference.lines().last(), Some(REMOTE_LONG_COMMANDS_HINT));
     for text in [&text, &reference] {
-        for live in [FRESH, "2026-10-30", "signed-in", "opus", "connected", "last seen", "d-gone"] {
+        for live in [
+            FRESH,
+            "2026-10-30",
+            "signed-in",
+            "opus",
+            "connected",
+            "last seen",
+            "d-gone",
+        ] {
             assert!(!text.contains(live), "{live} in {text}");
         }
         for secret in ["10.0.0.1", "100.64.0.1", "7443", &"ab".repeat(32)] {
@@ -1075,7 +1086,12 @@ fn stable_help_lists_identity_only_in_name_order() {
 #[test]
 fn stable_help_caps_machines_and_points_at_the_lookup() {
     let rows: Vec<ExposedMachine> = (0..12)
-        .map(|i| machine(&format!("m{i:02}"), Some(report(MAC, FRESH, claude(&["opus"])))))
+        .map(|i| {
+            machine(
+                &format!("m{i:02}"),
+                Some(report(MAC, FRESH, claude(&["opus"]))),
+            )
+        })
         .collect();
     let text = stable_machines_help(&rows, &|_| false).unwrap();
     assert_eq!(

@@ -2636,8 +2636,10 @@ mod tests {
             }
         );
         let workspace = WorkspaceId::from_string("ws-hook");
-        let live_prelude = intent_acp::bindings_prelude_for_workspace(&live, false, &workspace, false);
-        let hook_prelude = intent_acp::bindings_prelude_for_workspace(&hook, false, &workspace, false);
+        let live_prelude =
+            intent_acp::bindings_prelude_for_workspace(&live, false, &workspace, false);
+        let hook_prelude =
+            intent_acp::bindings_prelude_for_workspace(&hook, false, &workspace, false);
         for installer in ["ws.secret = {", "ws.desktop = Object"] {
             assert!(live_prelude.contains(installer), "{installer}");
             assert!(!hook_prelude.contains(installer), "{installer}");

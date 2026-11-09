@@ -1679,7 +1679,11 @@ async fn save_reported(
         node_protocol: Some(16),
         cloud: None,
     };
-    backend.store().save_exposed_machine(&row).await.expect("saved");
+    backend
+        .store()
+        .save_exposed_machine(&row)
+        .await
+        .expect("saved");
 }
 
 fn entry(
@@ -1710,7 +1714,11 @@ async fn models_lists_every_machines_providers_and_filters_exactly() {
         "m-zed",
         "Zed box",
         Some(vec![
-            entry("claude-code", ProviderStatus::SignedIn, &["claude-opus-4-1", "sonnet"]),
+            entry(
+                "claude-code",
+                ProviderStatus::SignedIn,
+                &["claude-opus-4-1", "sonnet"],
+            ),
             entry("codex", ProviderStatus::SignedOut, &many),
         ]),
     )
@@ -1726,7 +1734,10 @@ async fn models_lists_every_machines_providers_and_filters_exactly() {
 
     let all = backend.call("models", json!({})).await.unwrap();
     let machines = all["machines"].as_array().unwrap();
-    let names: Vec<&str> = machines.iter().map(|m| m["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = machines
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
     assert_eq!(names, ["Alpha box", "New box", "Zed box"]);
     assert_eq!(
         machines[2],
@@ -1753,15 +1764,28 @@ async fn models_lists_every_machines_providers_and_filters_exactly() {
     assert_eq!(machines[1]["providers"], json!([]));
     assert!(machines[1].get("platform").is_none());
     let text = all.to_string();
-    for hidden in ["10.9.9.9", "7443", &"cd".repeat(32), "capacity", "nodeProtocol", "hosts"] {
+    for hidden in [
+        "10.9.9.9",
+        "7443",
+        &"cd".repeat(32),
+        "capacity",
+        "nodeProtocol",
+        "hosts",
+    ] {
         assert!(!text.contains(hidden), "{hidden} exposed: {text}");
     }
 
-    let one = backend.call("models", json!({ "nodeId": "m-alpha" })).await.unwrap();
+    let one = backend
+        .call("models", json!({ "nodeId": "m-alpha" }))
+        .await
+        .unwrap();
     assert_eq!(one["machines"].as_array().unwrap().len(), 1);
     assert_eq!(one["machines"][0]["nodeId"], "m-alpha");
 
-    let codex = backend.call("models", json!({ "provider": "codex" })).await.unwrap();
+    let codex = backend
+        .call("models", json!({ "provider": "codex" }))
+        .await
+        .unwrap();
     let rows = codex["machines"].as_array().unwrap();
     assert_eq!(rows.len(), 2, "the machine with no report is dropped");
     for row in rows {
@@ -1774,21 +1798,36 @@ async fn models_lists_every_machines_providers_and_filters_exactly() {
         assert_eq!(ids, ["codex"]);
     }
 
-    let listed = backend.call("models", json!({ "model": "model-14" })).await.unwrap();
+    let listed = backend
+        .call("models", json!({ "model": "model-14" }))
+        .await
+        .unwrap();
     assert_eq!(listed["machines"].as_array().unwrap().len(), 1);
     assert_eq!(listed["machines"][0]["providers"][0]["models"], json!(many));
-    let alias = backend.call("models", json!({ "model": "opus" })).await.unwrap();
+    let alias = backend
+        .call("models", json!({ "model": "opus" }))
+        .await
+        .unwrap();
     assert_eq!(alias, json!({ "machines": [] }), "exact match only");
     let both = backend
-        .call("models", json!({ "provider": "claude-code", "model": "gpt-5" }))
+        .call(
+            "models",
+            json!({ "provider": "claude-code", "model": "gpt-5" }),
+        )
         .await
         .unwrap();
     assert_eq!(both, json!({ "machines": [] }));
 
-    let unknown = backend.call("models", json!({ "nodeId": "nope" })).await.unwrap_err();
+    let unknown = backend
+        .call("models", json!({ "nodeId": "nope" }))
+        .await
+        .unwrap_err();
     assert_eq!(data(&unknown)["code"], "machine-unknown");
     assert_eq!(unknown.code(), -32602);
-    let blank = backend.call("models", json!({ "provider": " " })).await.unwrap_err();
+    let blank = backend
+        .call("models", json!({ "provider": " " }))
+        .await
+        .unwrap_err();
     assert_eq!(blank.code(), -32602);
 
     // Agents call it in process, without the wire's owner check.
