@@ -6,9 +6,18 @@ scan covers current bare and rustup-run test commands, not echoed plans or
 command-substitution discovery lists. Current indirect routes have explicit
 registration plus actual stub-child probes below, not a general shell parser.
 Mutation tests ensure removed/disabled step policy and missing wiring fail.
+
+Every test a ci.yml step names (cargo test filters, `NAME: test` listing
+proofs, the tunnel step's Python groups) must exist in the source of the
+target it selects. Queue- and push-only steps otherwise fail late: intentd#3205
+deleted tests a macOS queue step named, and merge-group run 42657324709
+selected 0 tests.
 """
 
+import ast
 import copy
+import fnmatch
+import functools
 import json
 import os
 from pathlib import Path
@@ -18,7 +27,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -47,6 +58,310 @@ def test_steps(workflow):
             run = str(step.get("run", ""))
             if (name, step.get("name")) in INDIRECT_TEST_STEPS or any(COMMAND.search(line.strip()) and "--dry-run" not in line for line in run.splitlines()):
                 yield name, job, step
+
+
+# Source approximation of `cargo test -- --list`: every fn reachable through
+# the module tree, named by its module path. Methods and helpers are included,
+# so a check can only pass loosely, never reject a test that exists.
+# The leading lookahead rejects most positions before trying each branch (5x).
+RUST_TOKEN = re.compile(r"""(?=[/"'#bcrmf{}])(?:
+    (?P<line>//[^\n]*)
+  | (?P<block>/\*)
+  | (?P<raw>\b[bc]?r(?P<hashes>\#*)")
+  | (?P<str>"[^"\\]*(?:\\.[^"\\]*)*")
+  | (?P<char>'(?:[^'\\\n]|\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]{1,6}\}|.))')
+  | (?P<lifetime>'[A-Za-z_]\w*)
+  | \#\[\s*path\s*=\s*"(?P<path>[^"]*)"\s*\]
+  | \bmod\s+(?:r\#)?(?P<mod>\w+)\s*(?P<modend>[;{])
+  | \bfn\s+(?:r\#)?(?P<fn>\w+)
+  | (?P<open>\{)
+  | (?P<close>\})
+)""", re.X | re.S)
+
+BLOCK_COMMENT = re.compile(r"/\*|\*/")
+
+
+def rust_items(text):
+    """Yield (kind, value) for module, fn, path-attribute and brace tokens."""
+    pos = 0
+    while match := RUST_TOKEN.search(text, pos):
+        pos = match.end()
+        kind = match.lastgroup
+        if kind == "block":
+            depth = 1
+            while depth and (inner := BLOCK_COMMENT.search(text, pos)):
+                depth += 1 if inner.group() == "/*" else -1
+                pos = inner.end()
+            if depth:
+                return
+        elif kind == "raw":
+            end = text.find('"' + match.group("hashes"), pos)
+            if end < 0:
+                return
+            pos = end + 1 + len(match.group("hashes"))
+        elif kind == "modend":
+            yield ("mod" + match.group("modend"), match.group("mod"))
+        elif kind in ("path", "fn"):
+            yield kind, match.group(kind)
+        elif kind in ("open", "close"):
+            yield kind, None
+
+
+@functools.lru_cache(maxsize=None)
+def target_fns(root_file):
+    """All fn paths of the crate target rooted at root_file, as libtest names them."""
+    found = set()
+    walked = set()
+
+    def walk(file, prefix, child_dir):
+        if file in walked or not file.is_file():
+            return
+        walked.add(file)
+        stack, path_attr = [], None
+        for kind, value in rust_items(file.read_text(errors="replace")):
+            if kind == "path":
+                path_attr = value
+                continue
+            if kind == "mod;":
+                # #[path] is relative to the file's directory outside inline
+                # modules and to the inline module's directory inside one; a
+                # file loaded through it owns its directory like a mod.rs.
+                if path_attr is not None:
+                    target = (child_dir if any(stack) else file.parent) / path_attr
+                    walk(target, prefix + [value], target.parent)
+                else:
+                    flat = child_dir / (value + ".rs")
+                    walk(flat if flat.is_file() else child_dir / value / "mod.rs", prefix + [value], child_dir / value)
+            elif kind == "mod{":
+                stack.append((prefix, child_dir))
+                prefix, child_dir = prefix + [value], child_dir / value
+            elif kind == "open":
+                stack.append(None)
+            elif kind == "close" and stack:
+                if (saved := stack.pop()) is not None:
+                    prefix, child_dir = saved
+            elif kind == "fn":
+                found.add("::".join(prefix + [value]))
+            path_attr = None
+
+    root_file = Path(root_file)
+    walk(root_file, [], root_file.parent)
+    return frozenset(found)
+
+
+@functools.lru_cache(maxsize=None)
+def crate_targets(root):
+    """Map package name to its lib root and its test targets' roots."""
+    crates = {}
+    for manifest in sorted(Path(root).glob("crates/*/Cargo.toml")):
+        data = tomllib.loads(manifest.read_text())
+        base = manifest.parent
+        lib = base / data.get("lib", {}).get("path", "src/lib.rs")
+        tests = {}
+        if data["package"].get("autotests", True):
+            tests.update({p.stem: p for p in (base / "tests").glob("*.rs")})
+            tests.update({p.parent.name: p for p in (base / "tests").glob("*/main.rs")})
+        for test in data.get("test", []):
+            tests[test["name"]] = base / test.get("path", f"tests/{test['name']}.rs")
+        crates[data["package"]["name"]] = {"lib": lib if lib.is_file() else None, "tests": tests}
+    return crates
+
+
+CARGO_VALUE_FLAGS = {"-p", "--package", "--test", "--target", "--features", "-F", "--bin", "--example",
+                     "--bench", "-j", "--jobs", "--manifest-path", "--profile", "--target-dir",
+                     "--message-format", "--color", "--config", "-Z", "--exclude"}
+LIBTEST_VALUE_FLAGS = {"--test-threads", "--skip", "--format", "--color", "--logfile", "-Z", "--shuffle-seed"}
+SHELL_END = {"|", "||", "&&", ";", ">", ">>", "2>&1", "<", "<<<"}
+
+
+def cargo_test_selection(words):
+    """Parse the words after `cargo test` into the targets and names it selects."""
+    selection = {"packages": [], "lib": False, "tests": [], "workspace": False,
+                 "filters": [], "exact": False, "listed": []}
+    libtest, index = False, 0
+    while index < len(words):
+        word = words[index]
+        index += 1
+        if word == "--" and not libtest:
+            libtest = True
+            continue
+        flag, equals, value = word.partition("=")
+        if flag in (LIBTEST_VALUE_FLAGS if libtest else CARGO_VALUE_FLAGS):
+            if not equals:
+                value = words[index] if index < len(words) else ""
+                index += 1
+            if not libtest and flag in ("-p", "--package"):
+                selection["packages"].append(value)
+            elif not libtest and flag == "--test":
+                selection["tests"].append(value)
+        elif word.startswith("-"):
+            if not libtest and word == "--lib":
+                selection["lib"] = True
+            elif not libtest and word in ("--workspace", "--all"):
+                selection["workspace"] = True
+            elif libtest and word == "--exact":
+                selection["exact"] = True
+        else:
+            selection["filters"].append(word)
+    return selection
+
+
+def shell_lines(run):
+    """Logical shell lines: continuations and multi-line `name=( ... )` arrays joined."""
+    lines = []
+    for raw in re.sub(r"\$\{\{.*?\}\}", "GHA_EXPR", run).replace("\\\n", " ").splitlines():
+        line = raw.strip()
+        if lines and lines[-1].count("(") > lines[-1].count(")") and re.match(r"\w+=\(", lines[-1]):
+            lines[-1] += "\n" + line
+        else:
+            lines.append(line)
+    return lines
+
+
+def shell_selections(run):
+    """Cargo test selections in a shell body, after simple variable expansion.
+
+    Arrays and `for VAR in ...; do` loops are unrolled. `NAME: test` greps of
+    a listing attach to the preceding cargo command.
+    """
+    selections = []
+
+    def expand(line, scalars, arrays):
+        for name, words in arrays.items():
+            line = line.replace(f'"${{{name}[@]}}"', shlex.join(words))
+        return re.sub(r"\$\{(\w+)\}|\$(\w+)",
+                      lambda m: scalars.get(m.group(1) or m.group(2), m.group(0)), line)
+
+    def execute(lines, scalars, arrays):
+        index = 0
+        while index < len(lines):
+            raw = lines[index]
+            index += 1
+            line = expand(raw, scalars, arrays)
+            if line.startswith("#"):
+                continue
+            loop = re.fullmatch(r"for (\w+) in (.*?)(?:;\s*do)?", line)
+            if loop:
+                if not line.endswith("do") and index < len(lines) and lines[index] == "do":
+                    index += 1
+                depth, body = 1, []
+                while index < len(lines) and depth:
+                    inner = lines[index]
+                    index += 1
+                    depth += bool(re.search(r"(?:^|;\s*)do$", inner)) - bool(re.match(r"done\b", inner))
+                    if depth:
+                        body.append(inner)
+                for value in shlex.split(loop.group(2)):
+                    execute(body, {**scalars, loop.group(1): value}, arrays)
+                continue
+            assign = re.fullmatch(r"(\w+)=(.*)", line, re.S)
+            if assign and not assign.group(2).startswith("$("):
+                name, value = assign.groups()
+                try:
+                    if value.startswith("(") and value.endswith(")"):
+                        arrays = {**arrays, name: shlex.split(value[1:-1], comments=True)}
+                        continue
+                    words = shlex.split(value)
+                except ValueError:
+                    words = []
+                if len(words) == 1:
+                    scalars = {**scalars, name: words[0]}
+                    continue
+            cargo = re.search(r"\bcargo\s+test\b", line)
+            if cargo:
+                rest = line[cargo.end():]
+                if "$(" in line[:cargo.start()]:
+                    rest = rest.rstrip().removesuffix(")")
+                try:
+                    words = shlex.split(rest)
+                except ValueError as error:
+                    raise ValueError(f"cannot parse cargo test line {raw!r}: {error}") from None
+                ends = [i for i, word in enumerate(words) if word in SHELL_END]
+                selections.append(cargo_test_selection(words[:ends[0]] if ends else words))
+                continue
+            for flags, _, name in re.findall(r"\bgrep\s+-(F\w*)\s+(['\"])(.*?): test\2", line):
+                if not selections:
+                    raise ValueError(f"listing proof {name!r} follows no cargo test command")
+                selections[-1]["listed"].append((name, "x" in flags))
+
+    execute(shell_lines(run), {}, {})
+    return selections
+
+
+def python_selections(run):
+    """Selections from a Python heredoc's literal `[(cargo args, [exact names])]` groups."""
+    selections = []
+    for _, body in re.findall(r"<<\s*'(\w+)'\n(.*?)\n\1[ \t]*$", run, re.S | re.M):
+        for node in ast.walk(ast.parse(body)):
+            if not isinstance(node, ast.Assign):
+                continue
+            try:
+                value = ast.literal_eval(node.value)
+            except ValueError:
+                continue
+            if (isinstance(value, list) and value
+                    and all(isinstance(g, tuple) and len(g) == 2 and "-p" in g[0] for g in value)):
+                selections += [cargo_test_selection([*args, "--", "--exact", *names]) for args, names in value]
+    return selections
+
+
+def step_selections(run):
+    return [s for s in python_selections(run) + shell_selections(run)
+            if s["filters"] or s["listed"] or s["tests"]]
+
+
+def selection_violations(selection, crates, root):
+    errors, targets = [], []
+    packages = sorted(crates) if selection["workspace"] else selection["packages"]
+    for package in packages:
+        crate = crates.get(package)
+        if crate is None:
+            errors.append(f"names no package {package}")
+            continue
+        if selection["lib"] or not selection["tests"]:
+            if crate["lib"] is not None:
+                targets.append(crate["lib"])
+            elif selection["lib"]:
+                errors.append(f"names no lib target in {package}")
+        if not selection["lib"] and not selection["tests"]:
+            targets += crate["tests"].values()
+        for pattern in selection["tests"]:
+            matched = fnmatch.filter(crate["tests"], pattern)
+            if not matched and not selection["workspace"]:
+                errors.append(f"names no test target {pattern} in {package}")
+            targets += [crate["tests"][name] for name in matched]
+    if not targets:
+        return errors or ["selects no test target"]
+    scope = " / ".join(sorted(str(t.relative_to(root)) for t in set(targets)))
+    paths = set().union(*(target_fns(t) for t in targets))
+    for name in selection["filters"]:
+        if not (name in paths if selection["exact"] else any(name in path for path in paths)):
+            errors.append(f"{name!r} names no test in {scope}")
+    if errors:
+        return errors
+    selected = [p for p in paths if not selection["filters"] or any(
+        (name == p if selection["exact"] else name in p) for name in selection["filters"])]
+    for name, full in selection["listed"]:
+        if not any(path == name if full else path.endswith(name) for path in selected):
+            errors.append(f"listing proof {name!r} names no selected test in {scope}")
+    return errors
+
+
+def named_test_violations(workflow, root=ROOT):
+    """Tests ci.yml names must exist in the targets their steps select."""
+    errors = []
+    crates = crate_targets(Path(root))
+    for job_id, job in workflow["jobs"].items():
+        for step in job.get("steps", []):
+            label = f"{job_id}: {step.get('name')}"
+            try:
+                selections = step_selections(str(step.get("run", "")))
+            except (SyntaxError, ValueError) as error:
+                errors.append(f"{label}: {error}")
+                continue
+            for selection in selections:
+                errors += [f"{label}: {e}" for e in selection_violations(selection, crates, Path(root))]
+    return list(dict.fromkeys(errors))
 
 
 def coverage_budget_violations(workflow):
@@ -137,7 +452,8 @@ def thread_sizing_violations(workflow):
 
 
 def violations(workflow, policy):
-    errors = coverage_budget_violations(workflow) + profile_pool_violations(workflow) + thread_sizing_violations(workflow)
+    errors = (coverage_budget_violations(workflow) + profile_pool_violations(workflow)
+              + thread_sizing_violations(workflow) + named_test_violations(workflow))
     found = set()
     for name, job, step in test_steps(workflow):
         found.add(name)
@@ -602,6 +918,196 @@ else:
             steps = workflow["jobs"]["release-scripts"]["steps"]
             workflow["jobs"]["release-scripts"]["steps"] = [s for s in steps if script not in s.get("run", "")]
             self.assertTrue(any(script in error for error in violations(workflow, "1")))
+
+
+# Independently audited from ci.yml: every step that names tests, and how many
+# names (filters, listing proofs, test targets) the check resolves in it.
+NAMED_TEST_STEPS = {
+    ("check", "Real import and public session contract"): 1,
+    ("check", "Real Claude adapter utility-session contract"): 1,
+    ("check", "Source lints"): 1,
+    ("check", "GitLab auth, invitations and checkout over real sockets with explicit test transports"): 5,
+    ("check", "No provider CLIs on the runner"): 1,
+    ("check", "Coverage-skipped tests (STAB-40/43)"): 3,
+    ("check", "Installer guard tests (install_ps1_owner)"): 1,
+    ("build", "Tunnel deadline and TLS controls (macOS runtime)"): 9,
+    ("build", "Codex focused diagnostics (macOS runtime)"): 8,
+    ("build", "Retained capability gate fixture (macOS runtime)"): 3,
+    ("windows", "Headless workspace setup (Windows runtime)"): 3,
+    ("windows", "Codex diagnostic process ownership (Windows runtime)"): 3,
+}
+
+# The macOS queue step as intentd#3205 first queued it: the PR deleted five of
+# the tests it names, and merge-group run 42657324709 selected 0 tests.
+INCIDENT_3205_DELETED = (
+    "tests::worktree_provisioning::create_provisions_cow_checkout_when_isolation_enabled",
+    "tests::worktree_provisioning::duplicate_provisions_cow_checkout_when_isolation_enabled",
+    "tests::worktree_provisioning::create_cleans_up_empty_ws_dir_when_cow_provisioning_fails",
+    "tests::worktree_provisioning::duplicate_cleans_up_empty_ws_dir_when_cow_provisioning_fails",
+    "tests::clone_orchestration::progress_id_cow_create_streams_cow_copy_milestone",
+)
+INCIDENT_3205_RUN = """\
+set -euo pipefail
+unset INTENTD_TEST_KEEP_TMP
+tests=(
+""" + "".join(f"  {name}\n" for name in INCIDENT_3205_DELETED) + """\
+  capability::tests::unbound_caller_is_forbidden_on_every_gate
+)
+cargo_test=(rustup run "$INTENTD_COW_TOOLCHAIN" cargo test --locked -p intent-services --lib --target ${{ matrix.target }})
+status=0
+for test in "${tests[@]}"; do
+  listed=$("${cargo_test[@]}" "$test" -- --exact --list)
+  printf '%s\\n' "$listed"
+  grep -Fx "$test: test" <<< "$listed" > /dev/null
+  grep -Fx '1 test, 0 benchmarks' <<< "$listed" > /dev/null
+  scratch=$(mktemp -d "$RUNNER_TEMP/cow-${test##*::}.XXXXXX")
+  if ! TMPDIR="$scratch" "${cargo_test[@]}" "$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/cow.log"; then
+    status=1
+  fi
+done
+exit "$status"
+"""
+
+FIXTURE_LIB = r"""// mod commented_out;
+/* outer /* nested */ mod hidden; */
+mod flat;
+mod dir;
+#[cfg(test)]
+#[path = "elsewhere/custom.rs"]
+mod renamed;
+pub(crate) mod inline {
+    const OPEN: char = '{';
+    const QUOTE: char = '\'';
+    const TEXT: &str = "} mod fake { fn not_a_test() {} \" }";
+    const RAW: &str = r#"" } fn raw_fake() {"#;
+    fn lifetime<'a>(value: &'a str) -> &'a str { value }
+    #[path = "inline_path.rs"]
+    mod via_path;
+    mod nested_file;
+    #[test]
+    fn inline_test() {}
+}
+fn after_inline() {}
+"""
+FIXTURE_FILES = {
+    "Cargo.toml": '[package]\nname = "demo"\nautotests = false\n\n[[test]]\nname = "suite"\n',
+    "src/lib.rs": FIXTURE_LIB,
+    "src/flat.rs": 'mod child;\nmod m {\n    #[path = "x.rs"]\n    mod y;\n}\n#[test]\nfn flat_test() {}\n',
+    "src/flat/child.rs": "fn child_test() {}\n",
+    "src/flat/m/x.rs": "fn y_test() {}\n",
+    "src/dir/mod.rs": "mod sub;\nfn dir_test() {}\n",
+    "src/dir/sub.rs": "fn sub_test() {}\n",
+    "src/elsewhere/custom.rs": "mod beside;\nfn renamed_test() {}\n",
+    "src/elsewhere/beside.rs": "fn beside_test() {}\n",
+    "src/inline/inline_path.rs": "fn via_path_test() {}\n",
+    "src/inline/nested_file.rs": "fn nested_test() {}\n",
+    "tests/suite.rs": "mod case;\n",
+    "tests/case.rs": "#[tokio::test]\nasync fn suite_test() {}\n",
+}
+FIXTURE_QUEUE_RUN = """\
+test=inline::inline_test
+listed=$(cargo test -p demo --lib "$test" -- --exact --list)
+grep -Fx "$test: test" <<< "$listed" > /dev/null
+cargo test -p demo --test suite case:: -- --nocapture
+"""
+
+
+class NamedTestTests(unittest.TestCase):
+    """Tests ci.yml names must exist, so queue/push-only steps cannot fail late."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+
+    def step(self, workflow, job, name):
+        return next(s for s in workflow["jobs"][job]["steps"] if s.get("name") == name)
+
+    def test_every_named_test_exists(self):
+        self.assertEqual(named_test_violations(self.workflow), [])
+
+    def test_discovery_matches_independent_named_step_inventory(self):
+        discovered = {}
+        for job_id, job in self.workflow["jobs"].items():
+            for step in job.get("steps", []):
+                selections = step_selections(str(step.get("run", "")))
+                if selections:
+                    discovered[(job_id, step["name"])] = sum(
+                        len(s["filters"]) + len(s["listed"]) + len(s["tests"]) for s in selections)
+        self.assertEqual(discovered, NAMED_TEST_STEPS)
+
+    def test_queue_step_naming_deleted_tests_fails(self):
+        workflow = copy.deepcopy(self.workflow)
+        label = "build: Retained capability gate fixture (macOS runtime)"
+        self.step(workflow, "build", label.split(": ", 1)[1])["run"] = INCIDENT_3205_RUN
+        expected = [f"{label}: {name!r} names no test in crates/intent-services/src/lib.rs"
+                    for name in INCIDENT_3205_DELETED]
+        self.assertEqual(named_test_violations(workflow), expected)
+        self.assertTrue(set(expected).issubset(violations(workflow, "1")))
+
+    def test_removing_any_named_test_fails_its_step(self):
+        real = target_fns
+        for job, step_name in NAMED_TEST_STEPS:
+            for selection in step_selections(self.step(self.workflow, job, step_name)["run"]):
+                names = [(n, "exact" if selection["exact"] else "substring") for n in selection["filters"]]
+                names += [(n, "exact" if full else "suffix") for n, full in selection["listed"]]
+                for name, mode in names:
+                    with self.subTest(job=job, step=step_name, name=name):
+                        def kept(path, name=name, mode=mode):
+                            return not (path == name if mode == "exact" else
+                                        path.endswith(name) if mode == "suffix" else name in path)
+                        lister = lambda root: frozenset(filter(kept, real(root)))
+                        with mock.patch.dict(globals(), target_fns=lister):
+                            errors = named_test_violations(self.workflow)
+                        self.assertTrue(any(e.startswith(f"{job}: {step_name}: ") and repr(name) in e
+                                            for e in errors), errors)
+
+    def test_removing_a_named_test_target_fails_its_step(self):
+        real = crate_targets(ROOT)
+        for job, step_name in NAMED_TEST_STEPS:
+            for selection in step_selections(self.step(self.workflow, job, step_name)["run"]):
+                for package in selection["packages"]:
+                    for target in selection["tests"]:
+                        with self.subTest(job=job, step=step_name, target=target):
+                            crates = copy.deepcopy(real)
+                            del crates[package]["tests"][target]
+                            with mock.patch.dict(globals(), crate_targets=lambda root: crates):
+                                errors = named_test_violations(self.workflow)
+                            self.assertIn(f"{job}: {step_name}: names no test target {target} in {package}", errors)
+
+    def test_source_lister_follows_module_rules_and_sees_deleted_functions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            crate = Path(tmp) / "crates/demo"
+            for name, content in FIXTURE_FILES.items():
+                (crate / name).parent.mkdir(parents=True, exist_ok=True)
+                (crate / name).write_text(content)
+            self.assertEqual(target_fns(crate / "src/lib.rs"), {
+                "flat::flat_test", "flat::child::child_test", "flat::m::y::y_test",
+                "dir::dir_test", "dir::sub::sub_test",
+                "renamed::renamed_test", "renamed::beside::beside_test",
+                "inline::lifetime", "inline::via_path::via_path_test",
+                "inline::nested_file::nested_test", "inline::inline_test", "after_inline",
+            })
+            workflow = {"jobs": {"queue": {"if": "github.event_name == 'merge_group'",
+                                           "steps": [{"name": "Queue-only proof", "run": FIXTURE_QUEUE_RUN}]}}}
+            self.assertEqual(named_test_violations(workflow, tmp), [])
+            prefix = "queue: Queue-only proof: "
+            for path, old, new, error in (
+                ("src/lib.rs", "fn inline_test() {}", "", "'inline::inline_test' names no test in crates/demo/src/lib.rs"),
+                ("tests/case.rs", "suite_test", "", "'case::' names no test in crates/demo/tests/suite.rs"),
+                ("Cargo.toml", 'name = "suite"', 'name = "other"', "names no test target suite in demo"),
+                ("Cargo.toml", 'name = "demo"', 'name = "renamed"', "names no package demo"),
+            ):
+                with self.subTest(error=error):
+                    original = (crate / path).read_text()
+                    (crate / path).write_text(original.replace(old, new))
+                    target_fns.cache_clear()
+                    crate_targets.cache_clear()
+                    try:
+                        self.assertIn(prefix + error, named_test_violations(workflow, tmp))
+                    finally:
+                        (crate / path).write_text(original)
+                        target_fns.cache_clear()
+                        crate_targets.cache_clear()
 
 
 class TunnelArtifactTests(unittest.TestCase):
