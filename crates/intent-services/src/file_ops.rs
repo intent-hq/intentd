@@ -63,8 +63,8 @@ fn chief_root(chief_cwd_root: Option<&Path>) -> String {
     root.to_string_lossy().into_owned()
 }
 
-/// Load the workspace and resolve its filesystem root, preferring the calling
-/// agent's sandbox path when available (`CoW` containment). The Assistant
+/// Load the workspace and resolve its filesystem root: every agent works in
+/// the workspace checkout (per-agent `CoW` sandboxes are retired). The Assistant
 /// (`__chief__`) workspace resolves to `chief_cwd_root` (see [`chief_root`]).
 /// A missing workspace (or any load error) yields an empty root; the guard in
 /// [`is_within`] then fails such a request closed rather than resolving it
@@ -73,17 +73,9 @@ fn chief_root(chief_cwd_root: Option<&Path>) -> String {
 pub(crate) async fn resolve_root(
     store: &Store,
     workspace_id: &WorkspaceId,
-    caller_agent_id: Option<&intent_core::AgentId>,
+    _caller_agent_id: Option<&intent_core::AgentId>,
     chief_cwd_root: Option<&Path>,
 ) -> String {
-    // CoW containment: prefer the calling agent's sandbox path when present.
-    if let Some(agent_id) = caller_agent_id {
-        if let Ok(session) = store.get_agent_session_summary(agent_id).await {
-            if let Some(sandbox_path) = session.sandbox_path.clone() {
-                return sandbox_path;
-            }
-        }
-    }
     if workspace_id.is_chief() {
         return chief_root(chief_cwd_root);
     }
@@ -547,7 +539,7 @@ pub(crate) fn place_attachment(
 /// MCP `ws.file.getAttachment` copy op (PROTOCOL §6.8): copy a registered
 /// attachment from the CANONICAL workspace store (`canonical_root` +
 /// `record.stored_path`) into the caller's working directory (`dest_root`,
-/// which is the sandbox clone for CoW-sandboxed callers) under `dest_dir`
+/// the workspace checkout) under `dest_dir`
 /// (default [`ATTACHMENTS_DIR`] — git-ignored by construction). Returns
 /// `{ path, fileName, mimeType?, size, uploadedAt }` with `path` relative to
 /// `dest_root`. The copy is skipped when the destination already holds an

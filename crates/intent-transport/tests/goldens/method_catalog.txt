@@ -349,8 +349,6 @@ router repoConfig.save
 router rules.get
 router rules.list
 router rules.update
-router sandbox.cow.discard
-router sandbox.cow.merge
 router script.archive
 router script.create
 router script.get

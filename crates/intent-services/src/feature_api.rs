@@ -100,10 +100,10 @@ pub mod delivery_tasks {
 pub mod feature_ports {
     pub use crate::feature_ports::{
         monitor_id, wake_id, AgentWakePort, CancelSettlement, CommandScriptActivity,
-        MachineScriptLink, MachineSecretAnswer, MachineSecretOp, MachineSkills, MergeOutcome,
-        ProvisionOutcome, RemoteLaunchPort, RemoteRuntime, RemoteScriptCaller, RuntimePort,
-        ScriptFrameSender, ScriptsClosing, SetupScriptRun, TransferPort, UnavailableAgentWake,
-        UnavailableRemoteLaunch, IMPORT_MAX_CHUNK_BYTES,
+        MachineScriptLink, MachineSecretAnswer, MachineSecretOp, MachineSkills, RemoteLaunchPort,
+        RemoteRuntime, RemoteScriptCaller, RuntimePort, ScriptFrameSender, ScriptsClosing,
+        SetupScriptRun, TransferPort, UnavailableAgentWake, UnavailableRemoteLaunch,
+        IMPORT_MAX_CHUNK_BYTES,
     };
 }
 

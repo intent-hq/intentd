@@ -17,9 +17,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
-use intent_core::{
-    now_iso, ActorType, AgentId, Event, EventActor, MessageOrigin, Workspace, WorkspaceId,
-};
+use intent_core::{ActorType, AgentId, Event, EventActor, MessageOrigin, WorkspaceId};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -33,19 +31,6 @@ fn sha256_hex(s: &str) -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
-}
-
-/// Minimal workspace row for store-backed goldens.
-fn workspace(id: &WorkspaceId) -> Workspace {
-    let ts = now_iso();
-    Workspace {
-        id: id.clone(),
-        title: "WS".to_string(),
-        branch: "main".to_string(),
-        created_at: ts.clone(),
-        updated_at: ts,
-        ..Default::default()
-    }
 }
 
 /// A child-completion event as `handle_completion_event` sees it.
@@ -1790,97 +1775,6 @@ fn golden_skills_catalog_wrapper() {
          \x20   <location>/repo/x/SKILL.md</location>\n\
          \x20 </skill>\n\
          </available_skills>"
-    );
-}
-
-/// Isolation hints: the sandboxed-implementor and CoW-coordinator layers.
-#[test]
-fn golden_isolation_hints() {
-    let mut session = intent_core::AgentSession {
-        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
-        harness_features: None,
-        id: AgentId::from("agent-iso"),
-        workspace_id: WorkspaceId::from("ws-1"),
-        parent_agent_id: None,
-        backend_session_id: None,
-        acp_session_id: None,
-        name: "Builder".to_string(),
-        name_explicitly_set: false,
-        model: None,
-        reasoning_effort: None,
-        effort_levels: None,
-        provider: None,
-        system_prompt: None,
-        specialist: Some("implementor".to_string()),
-        status: intent_core::AgentStatus::Active,
-        is_active: false,
-        messages: vec![],
-        stats: None,
-        task_note_id: None,
-        skip_auto_commit: false,
-        completion_report: None,
-        completion_report_timestamp: None,
-        attention_request_kind: None,
-        attention_request_reason: None,
-        attention_request_timestamp: None,
-        delegation_depth: None,
-        initial_message: None,
-        context_references: None,
-        image_blocks: None,
-        file_blocks: None,
-        is_background: false,
-        metadata: None,
-        created_at: now_iso(),
-        updated_at: now_iso(),
-        sandbox_id: None,
-        sandbox_path: Some("/sandboxes/sb-1".to_string()),
-        sandbox_branch: Some("sb/one".to_string()),
-        stop_reason: None,
-        stop_reason_timestamp: None,
-        session_corrupted: false,
-        pending_delete_at: None,
-        retired_at: None,
-        notifications_muted: false,
-        pinned: false,
-    };
-    let specialist = crate::rules::SpecialistPromptInjection {
-        behavior_prompt: None,
-        specialist_name: Some("implementor".to_string()),
-        role_reminder: None,
-    };
-    let hint = crate::rules::build_isolation_hint(None, Some(&session), Some(&specialist))
-        .expect("sandboxed implementor hint");
-    assert_eq!(
-        hint,
-        "## Workspace Isolation\n\n\
-         You are working in an **isolated CoW (copy-on-write) sandbox** at `/sandboxes/sb-1` \
-         on branch `sb/one` (base commit tracked in sandbox metadata). Your dependency caches (node_modules, \
-         target/, .venv, etc.) are warm — you inherited them from the canonical workspace.\n\n\
-         **Critical constraints:**\n\
-         - Do NOT switch branches or checkout other refs in your sandbox.\n\
-         - On completion, the system automatically merges your branch back to the canonical workspace.\n\
-         - If your changes conflict with canonical, you will be **woken with the conflicting paths** \
-         and a ref to reconcile against. When that happens, resolve the conflicts **in your sandbox only** \
-         (rebase or merge onto the fetched canonical ref), then end your turn again. The system will \
-         retry the merge. Do NOT attempt to touch other checkouts or the canonical workspace directly.\n\
-         - You have up to 2 conflict-resolution attempts before the merge is deferred to manual intervention."
-    );
-    // Coordinator variant: direct-mode CoW-supported workspace.
-    session.sandbox_path = None;
-    let mut ws = workspace(&WorkspaceId::from("ws-1"));
-    ws.skip_worktree = true;
-    ws.cow_supported = Some(true);
-    let specialist = crate::rules::SpecialistPromptInjection {
-        behavior_prompt: None,
-        specialist_name: Some("spec-writer".to_string()),
-        role_reminder: None,
-    };
-    let hint = crate::rules::build_isolation_hint(Some(&ws), Some(&session), Some(&specialist))
-        .expect("coordinator hint");
-    assert!(hint.starts_with("## Agent Delegation & Isolation\n\n"));
-    assert_eq!(
-        sha256_hex(&hint),
-        "a8efe4d8c64633f524b3fe5846883b84d769857bf39c604ba3c54e74af0dda2a"
     );
 }
 

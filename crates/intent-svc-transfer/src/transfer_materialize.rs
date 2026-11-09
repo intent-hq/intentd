@@ -1,33 +1,22 @@
 //! Target-side git materialization for workspace transfer (spec §4, resolved
-//! decision 1): at import-commit time, recreate the workspace checkout and
-//! every transferred sandbox from the received bundle. The checkout is cloned
+//! decision 1): at import-commit time, recreate the workspace checkout from
+//! the received bundle. The checkout is cloned
 //! from the bundle at the workspace branch, every submodule the archive
 //! bundled (unpublished commits, `git/submodules/<n>.bundle`) is hydrated
-//! from its own bundle, the base ref is fetched as a local branch, sandboxes
-//! are re-provisioned as `CoW` clones of the checkout (plain clone when `CoW`
-//! is unavailable) with their `sb/<agentId>` branches fetched from the
-//! bundle, and the sentinel WIP snapshot commits are unwound so
+//! from its own bundle, the base ref is fetched as a local branch, and the
+//! sentinel WIP snapshot commit is unwound so
 //! staged/unstaged/untracked state lands exactly as it was on the source.
-//! All-or-nothing: any failure removes everything this module created. No
+//! Retired per-agent `CoW` sandboxes are never re-provisioned: an older
+//! archive's `refs.sandboxes` entries are ignored. All-or-nothing: any
+//! failure removes everything this module created. No
 //! wire code lives here.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use intent_core::{CheckoutMode, Error, Result, Workspace};
-use intent_git::{cow_clone, cow_probe, CowSupport};
-use intent_store::Sandbox;
 
 use crate::transfer_git::{run_git, unwind_wip, SubmoduleBundleRef, TransferRefsManifest};
-
-/// One sandbox as re-provisioned on the target.
-#[derive(Debug, Clone)]
-pub(crate) struct MaterializedSandbox {
-    pub agent_id: String,
-    /// Target-side sandbox directory
-    /// (`<workspaces_root>/<wsId>/sandboxes/<agentId>/<repo-slug>`).
-    pub path: PathBuf,
-}
 
 /// Result of a successful materialization: the target-side paths the caller
 /// writes back onto the imported rows (see [`MaterializedGit::apply`]).
@@ -47,27 +36,17 @@ pub(crate) struct MaterializedGit {
     /// backfilling `Workspace.base_commit_sha` when the imported row has
     /// none.
     pub base_sha: Option<String>,
-    /// Sandboxes re-provisioned on the target, in input order.
-    pub sandboxes: Vec<MaterializedSandbox>,
-    /// Agent ids of sandbox rows that had no branch in the bundle (skipped
-    /// at bundle time — missing directory or unbundlable branch). Nothing
-    /// was provisioned for them; [`MaterializedGit::apply`] drops their rows.
-    /// Set by materialization; read by tests.
-    #[cfg_attr(not(test), expect(dead_code))]
-    pub skipped_agent_ids: Vec<String>,
 }
 
 impl MaterializedGit {
     /// Rewrite the imported rows against the materialized target paths: the
     /// workspace becomes a standalone Direct checkout at [`checkout_dir`]
     /// on [`workspace_branch`] (`base_commit_sha` backfilled from the bundle
-    /// when missing), sandbox rows get their target paths, and rows whose
-    /// branch never made it into the bundle are dropped — a row pointing at
-    /// a directory that does not exist would present a broken sandbox.
+    /// when missing).
     ///
     /// [`checkout_dir`]: MaterializedGit::checkout_dir
     /// [`workspace_branch`]: MaterializedGit::workspace_branch
-    pub fn apply(&self, ws: &mut Workspace, sandboxes: &mut Vec<Sandbox>) {
+    pub fn apply(&self, ws: &mut Workspace) {
         let checkout = self.checkout_dir.to_string_lossy().to_string();
         ws.repository_path = Some(checkout);
         ws.worktree_path = None;
@@ -76,15 +55,6 @@ impl MaterializedGit {
         if ws.base_commit_sha.is_none() {
             ws.base_commit_sha.clone_from(&self.base_sha);
         }
-        sandboxes.retain_mut(|sb| {
-            match self.sandboxes.iter().find(|m| m.agent_id == sb.agent_id.0) {
-                Some(m) => {
-                    sb.path = m.path.to_string_lossy().to_string();
-                    true
-                }
-                None => false,
-            }
-        });
     }
 }
 
@@ -99,31 +69,23 @@ pub(crate) async fn materialize_workspace_git(
     bundle_path: PathBuf,
     refs: TransferRefsManifest,
     ws: Workspace,
-    sandboxes: Vec<Sandbox>,
     workspaces_root: PathBuf,
 ) -> Result<MaterializedGit> {
     tokio::task::spawn_blocking(move || {
-        materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &sandboxes, &workspaces_root)
+        materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &workspaces_root)
     })
     .await
     .map_err(|e| Error::Internal(format!("materialize task failed: {e}")))?
 }
 
 /// Every directory a successful materialization created, in
-/// [`rollback_created`] order: the checkout, then each sandbox's agent
-/// directory.
+/// [`rollback_created`] order: the checkout.
 fn created_paths(out: &MaterializedGit) -> Vec<PathBuf> {
-    std::iter::once(out.checkout_dir.clone())
-        .chain(out.sandboxes.iter().map(|s| {
-            s.path
-                .parent()
-                .map_or_else(|| s.path.clone(), Path::to_path_buf)
-        }))
-        .collect()
+    vec![out.checkout_dir.clone()]
 }
 
 /// Undo a SUCCESSFUL materialization after a later commit step fails (e.g.
-/// the row insert): remove the created checkout/sandbox directories,
+/// the row insert): remove the created checkout directory,
 /// restoring the target exactly as found so the staged import can be
 /// retried or aborted. Best-effort — the commit error being unwound takes
 /// precedence.
@@ -139,11 +101,8 @@ pub(crate) fn rollback_materialized(out: &MaterializedGit, ws_dir: &Path) {
 /// `<workspaces_root>/<wsId>/<repo-slug>` (origin removed — the staging
 /// bundle path must not persist), hydrate every submodule listed in
 /// `refs.submodules` from its own bundle (see [`hydrate_submodules`]), fetch
-/// the base ref as a local branch, re-provision each sandbox as a `CoW`
-/// clone of the checkout (plain local clone when `CoW` is unavailable) with
-/// its branch fetched from the bundle and checked out, unwind the WIP
-/// snapshot commits (sandboxes first, then the workspace) so the dirty state
-/// lands exactly as captured, then restore the source's portable remotes,
+/// the base ref as a local branch, unwind the WIP snapshot commit so the
+/// dirty state lands exactly as captured, then restore the source's portable remotes,
 /// remote-tracking refs and workspace-branch upstream from `refs.remotes`
 /// (see `transfer_remotes`).
 ///
@@ -159,19 +118,11 @@ pub(crate) fn materialize_workspace_git_blocking(
     bundle_path: &Path,
     refs: &TransferRefsManifest,
     ws: &Workspace,
-    sandboxes: &[Sandbox],
     workspaces_root: &Path,
 ) -> Result<MaterializedGit> {
     let ws_dir = workspaces_root.join(&ws.id.0);
     let mut created: Vec<PathBuf> = Vec::new();
-    let result = materialize_inner(
-        bundle_path,
-        refs,
-        ws,
-        sandboxes,
-        workspaces_root,
-        &mut created,
-    );
+    let result = materialize_inner(bundle_path, refs, ws, workspaces_root, &mut created);
     if result.is_err() {
         rollback_created(&created, &ws_dir);
     }
@@ -182,7 +133,6 @@ fn materialize_inner(
     bundle_path: &Path,
     refs: &TransferRefsManifest,
     ws: &Workspace,
-    sandboxes: &[Sandbox],
     workspaces_root: &Path,
     created: &mut Vec<PathBuf>,
 ) -> Result<MaterializedGit> {
@@ -198,11 +148,7 @@ fn materialize_inner(
 
     // Same naming as `workspace.create` provisioning: display name from the
     // row (falling back to the source path basename), slugified with
-    // `worktree_folder_slug`. (Live sandbox re-provisioning slugifies with
-    // `sandbox_ops::repo_slug_from_workspace`, which differs on edge cases —
-    // intentional: rows store absolute paths, so a later re-provision naming
-    // its folder differently is harmless, and the checkout and its sandboxes
-    // sharing ONE slug matters more here.) `ws.repository_path` still holds
+    // `worktree_folder_slug`. `ws.repository_path` still holds
     // the SOURCE path — the caller rewrites it via [`MaterializedGit::apply`]
     // after success.
     let repo_name = intent_services::feature_api::known_repo_name(
@@ -225,7 +171,7 @@ fn materialize_inner(
     // 1. Clone the bundle at the workspace branch. The bundle is
     //    self-contained (full history, no prerequisites) so this needs no
     //    other remote; the whole pack lands in the object store, which is
-    //    what makes the later base/sandbox ref fetches cheap.
+    //    what makes the later base ref fetch cheap.
     //    GIT_LFS_SKIP_SMUDGE: bundles carry LFS pointer blobs, not LFS
     //    objects, and this temporary origin is the bundle path — the smudge
     //    filter would fail on any target without a populated LFS cache.
@@ -287,59 +233,7 @@ fn materialize_inner(
         }
     }
 
-    // 3. Re-provision each sandbox row that has a branch in the bundle,
-    //    BEFORE unwinding the workspace WIP: sandboxes clone the checkout,
-    //    and the checkout must still be clean at the bundled tip. Rows the
-    //    bundler skipped (missing directory / unbundlable branch on the
-    //    source) get nothing on disk; the caller drops them via
-    //    [`MaterializedGit::apply`].
-    let mut materialized = Vec::new();
-    let mut skipped = Vec::new();
-    for sb in sandboxes {
-        let Some(entry) = refs.sandboxes.iter().find(|e| e.agent_id == sb.agent_id.0) else {
-            tracing::warn!(
-                agent = %sb.agent_id.0,
-                branch = %sb.branch,
-                "materialize: sandbox has no branch in the bundle; dropping the row"
-            );
-            skipped.push(sb.agent_id.0.clone());
-            continue;
-        };
-        let agent_dir = ws_dir.join("sandboxes").join(&sb.agent_id.0);
-        let sandbox_path = agent_dir.join(intent_services::feature_api::worktree_folder_slug(
-            &repo_name,
-        ));
-        // Only track for rollback what THIS call creates: a pre-existing
-        // agent dir must never be recursively deleted by a later failure, so
-        // in that case track just the sandbox path — which must not itself
-        // pre-exist (same guard as the checkout dir above).
-        if agent_dir.exists() {
-            if sandbox_path.exists() {
-                return Err(Error::Internal(format!(
-                    "materialize sandbox target already exists: {}",
-                    sandbox_path.display()
-                )));
-            }
-            created.push(sandbox_path.clone());
-        } else {
-            created.push(agent_dir.clone());
-        }
-        provision_sandbox_from_bundle(
-            &checkout_dir,
-            bundle,
-            &agent_dir,
-            &sandbox_path,
-            entry,
-            &refs.workspace_branch,
-            refs.workspace_wip_commit_sha.is_some(),
-        )?;
-        materialized.push(MaterializedSandbox {
-            agent_id: sb.agent_id.0.clone(),
-            path: sandbox_path,
-        });
-    }
-
-    // 4. Unwind the workspace WIP snapshot, restoring the exact
+    // 3. Unwind the workspace WIP snapshot, restoring the exact
     //    staged/unstaged/untracked split on the workspace branch.
     if refs.workspace_wip_commit_sha.is_some() && !unwind_wip(&checkout_dir)? {
         return Err(Error::Internal(
@@ -347,20 +241,16 @@ fn materialize_inner(
         ));
     }
 
-    // 5. Reconnect the checkout to the source's portable remotes: recreate
+    // 4. Reconnect the checkout to the source's portable remotes: recreate
     //    each remote, fetch its recorded tracking refs from the bundle, and
-    //    restore the workspace branch's upstream — after the sandboxes were
-    //    provisioned, so they keep the remote-less shape they have on the
-    //    source, and after the bundle origin was removed, so `origin` can be
-    //    recreated with its real URL.
+    //    restore the workspace branch's upstream — after the bundle origin
+    //    was removed, so `origin` can be recreated with its real URL.
     crate::transfer_remotes::restore_remotes(&checkout_dir, bundle, refs, &ws.id.0)?;
 
     Ok(MaterializedGit {
         checkout_dir,
         workspace_branch: refs.workspace_branch.clone(),
         base_sha: refs.base_sha.clone(),
-        sandboxes: materialized,
-        skipped_agent_ids: skipped,
     })
 }
 
@@ -611,303 +501,8 @@ pub(crate) fn git_stdout(
     }
 }
 
-/// Provision one sandbox: CoW-clone the (still clean) workspace checkout when
-/// the filesystem supports it, else a plain local `git clone`; then fetch the
-/// sandbox branch from the bundle, check it out, and unwind its WIP snapshot.
-/// The sandbox's local copy of the workspace branch is reset off the WIP
-/// sentinel (the clone happened while the checkout was still at the sentinel
-/// tip; only the workspace checkout gets the later unwind).
-fn provision_sandbox_from_bundle(
-    checkout_dir: &Path,
-    bundle: &str,
-    agent_dir: &Path,
-    sandbox_path: &Path,
-    entry: &crate::transfer_git::SandboxBundleRef,
-    workspace_branch: &str,
-    workspace_has_wip: bool,
-) -> Result<()> {
-    std::fs::create_dir_all(agent_dir)
-        .map_err(|e| Error::Internal(format!("create sandbox parent dir failed: {e}")))?;
-
-    // CoW first (same preference as source-side provisioning), degrading to
-    // a plain local clone — hardlinked objects, so still cheap — when the
-    // probe or the clone itself reports Unsupported. `sandbox_path` never
-    // pre-exists (the caller rejects that), so the failure cleanup below can
-    // only remove what this cow_clone partially created.
-    let cow = matches!(
-        cow_probe(checkout_dir, agent_dir),
-        Ok(CowSupport::Supported)
-    ) && match cow_clone(checkout_dir, sandbox_path) {
-        Ok(()) => true,
-        Err(e) => {
-            if sandbox_path.exists() {
-                let _ = std::fs::remove_dir_all(sandbox_path);
-            }
-            if matches!(e, Error::Unsupported(_)) {
-                false
-            } else {
-                return Err(e);
-            }
-        }
-    };
-    if !cow {
-        run_git(agent_dir, |cmd| {
-            cmd.arg("clone")
-                .arg("--quiet")
-                .arg(checkout_dir)
-                .arg(sandbox_path)
-                .env("GIT_LFS_SKIP_SMUDGE", "1");
-        })
-        .map_err(|e| Error::Internal(format!("sandbox clone failed: {e}")))?;
-        // Drop the origin pointing at the workspace checkout: sandboxes on
-        // the source have no remote either (CoW copies of a checkout whose
-        // remote is the user's repo, not a sibling path).
-        let _ = run_git(sandbox_path, |cmd| {
-            cmd.arg("remote").arg("remove").arg("origin");
-        });
-    }
-
-    finish_sandbox_from_bundle(
-        sandbox_path,
-        bundle,
-        entry,
-        workspace_branch,
-        workspace_has_wip,
-    )
-}
-
-/// Second half of [`provision_sandbox_from_bundle`], on a sandbox directory
-/// that is already a clone (`CoW` or plain) of the checkout: fetch the
-/// sandbox branch from the bundle, check it out, reset the local workspace
-/// branch off the WIP sentinel, bring the initialized submodules (nested
-/// ones included) in line with the gitlinks the verified tip records, drop
-/// the copied submodule worktrees that tip does not track at all, and
-/// finally unwind the sandbox WIP snapshot.
-fn finish_sandbox_from_bundle(
-    sandbox_path: &Path,
-    bundle: &str,
-    entry: &crate::transfer_git::SandboxBundleRef,
-    workspace_branch: &str,
-    workspace_has_wip: bool,
-) -> Result<()> {
-    // Still at the checkout's tip here: the gitlinks it records (nested
-    // ones included) are the submodule worktrees a CoW copy may carry. An
-    // incomplete inventory prunes nothing.
-    let copied_gitlinks: Vec<String> = tracked_paths_recursive(sandbox_path)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(path, is_gitlink)| is_gitlink.then_some(path))
-        .collect();
-
-    run_git(sandbox_path, |cmd| {
-        cmd.arg("fetch")
-            .arg("--no-tags")
-            .arg("--quiet")
-            .arg(bundle)
-            .arg(format!("+{}:refs/heads/{}", entry.bundle_ref, entry.branch));
-    })
-    .map_err(|e| Error::Internal(format!("fetch sandbox branch from bundle failed: {e}")))?;
-    run_git(sandbox_path, |cmd| {
-        cmd.arg("checkout")
-            .arg("--quiet")
-            .arg(&entry.branch)
-            .env("GIT_LFS_SKIP_SMUDGE", "1");
-    })
-    .map_err(|e| Error::Internal(format!("checkout sandbox branch failed: {e}")))?;
-
-    // The clone was taken at the sentinel tip, so the sandbox's local
-    // workspace branch points at the WIP snapshot commit — a tip that is
-    // unreachable from canonical refs once the workspace unwinds (it would
-    // trip `audit_diverged_sandbox_branches` on every merge-back). Reset it
-    // to the sentinel's parent, the same tip the workspace unwind restores.
-    if workspace_has_wip && workspace_branch != entry.branch {
-        run_git(sandbox_path, |cmd| {
-            cmd.arg("branch")
-                .arg("--force")
-                .arg(workspace_branch)
-                .arg(format!("refs/heads/{workspace_branch}^"));
-        })
-        .map_err(|e| {
-            Error::Internal(format!(
-                "reset sandbox workspace branch off the WIP sentinel failed: {e}"
-            ))
-        })?;
-    }
-
-    let tip = head_sha(sandbox_path)?;
-    if tip != entry.head_sha {
-        return Err(Error::Internal(format!(
-            "materialized sandbox tip {tip} does not match bundled head {}",
-            entry.head_sha
-        )));
-    }
-    // A CoW clone carries the checkout's hydrated submodules, still at the
-    // gitlinks the workspace tip records; the sandbox may have had others
-    // checked out, which would leave every such submodule reading as
-    // modified (intent-hq/intent#4397). Move the initialized ones to the
-    // gitlinks the verified tip records. This runs BEFORE the WIP unwind on
-    // purpose: the snapshot tree captured the source sandbox's *worktree*
-    // gitlinks (what was actually checked out), while the saved index it
-    // restores may deliberately record something else (an unstaged gitlink
-    // change), so normalizing against the restored index would clear that
-    // change. `--checkout`: hydration's `update --init` copies the
-    // `.gitmodules` strategy (`merge`/`rebase`/`none`) into the config the
-    // copy inherits, and a bare `update` honoring it would leave a
-    // descendant in place. `--no-fetch`: only commits already in the copied
-    // module repos count, and the restored submodule URLs may be unreachable
-    // on the target. `--recursive`: the copy also carries hydrated NESTED
-    // submodules at the gitlinks the checkout's parent recorded; once the
-    // parent moves, each initialized nested checkout follows the gitlink
-    // the parent's new commit records (intent-hq/intent#4836), else the
-    // parent keeps reading as modified. Uninitialized gitlinks (the
-    // plain-clone path) are left alone at every level, exactly as
-    // `submodule update` without `--init` does. Best-effort: a gitlink
-    // whose commit is not local keeps the checkout's tip, as before.
-    if let Err(e) = run_git(sandbox_path, |cmd| {
-        cmd.args([
-            "submodule",
-            "update",
-            "--checkout",
-            "--no-fetch",
-            "--recursive",
-            "--quiet",
-        ])
-        .env("GIT_LFS_SKIP_SMUDGE", "1");
-    }) {
-        tracing::warn!(
-            sandbox = %sandbox_path.display(),
-            error = %e,
-            "materialize: could not move initialized submodules to the sandbox gitlinks"
-        );
-    }
-    prune_untracked_submodule_worktrees(sandbox_path, &copied_gitlinks);
-
-    if entry.wip_commit_sha.is_some() && !unwind_wip(sandbox_path)? {
-        return Err(Error::Internal(
-            "manifest records a sandbox WIP snapshot but the sandbox tip is not one".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// `root/rel` when every component of `rel` is a real directory on disk —
-/// `None` when `rel` is not a plain relative path, a component is missing
-/// or not a directory, or any component is a symlink. The guard that keeps
-/// the filesystem operations below from following a symlink the tracked
-/// tree (or a dirty worktree) placed in the way out of `root`.
-fn dir_within_no_symlinks(root: &Path, rel: &str) -> Option<PathBuf> {
-    check_relative_components(rel).ok()?;
-    let mut dir = root.to_path_buf();
-    for component in rel.split('/') {
-        dir.push(component);
-        let meta = std::fs::symlink_metadata(&dir).ok()?;
-        if meta.file_type().is_symlink() || !meta.is_dir() {
-            return None;
-        }
-    }
-    Some(dir)
-}
-
-/// Every path the repository at `repo` tracks at HEAD — blobs, trees and
-/// gitlinks — as `(repo-relative forward-slash path, is_gitlink)`, recursing
-/// into each gitlink whose worktree is initialized (`<path>/.git` exists,
-/// reached without following a symlink) so nested submodules come back as
-/// `sub/inner`. `None` when any repository along the way cannot be listed:
-/// callers prune against this inventory, so an incomplete one must not
-/// pass for "tracks nothing there".
-fn tracked_paths_recursive(repo: &Path) -> Option<Vec<(String, bool)>> {
-    let listing = match git_stdout(repo, |cmd| {
-        cmd.args(["ls-tree", "-r", "-t", "-z", "HEAD"]);
-    }) {
-        Ok(listing) => listing,
-        Err(e) => {
-            tracing::warn!(
-                repo = %repo.display(),
-                error = %e,
-                "materialize: could not list the tracked paths at HEAD"
-            );
-            return None;
-        }
-    };
-    let mut paths = Vec::new();
-    for record in listing.split('\0').filter(|r| !r.is_empty()) {
-        // `<mode> <type> <sha>\t<path>`
-        let Some((meta, path)) = record.split_once('\t') else {
-            continue;
-        };
-        let is_gitlink = meta.starts_with("160000 ");
-        paths.push((path.to_string(), is_gitlink));
-        if !is_gitlink {
-            continue;
-        }
-        let Some(dir) = dir_within_no_symlinks(repo, path) else {
-            continue;
-        };
-        if dir.join(".git").symlink_metadata().is_ok() {
-            for (nested, nested_is_gitlink) in tracked_paths_recursive(&dir)? {
-                paths.push((format!("{path}/{nested}"), nested_is_gitlink));
-            }
-        }
-    }
-    Some(paths)
-}
-
-/// Remove the copied submodule worktrees the sandbox has no place for: each
-/// of `copied_gitlinks` (gitlinks the checkout's tip recorded, nested ones
-/// as `sub/inner`) whose path the sandbox — at its verified tip, with the
-/// initialized submodules already moved to the gitlinks that tip records —
-/// tracks under no mode at all (intent-hq/intent#4838). `git checkout`
-/// cannot rmdir such a directory (it is a non-empty submodule worktree), so
-/// it would linger as untracked content and its parent would read as
-/// modified although the source sandbox was clean. Strictly scoped: a path
-/// the tip does track (gitlink, tree or blob) is never touched, nor is a
-/// directory without a `.git` entry, nor anything reached through a
-/// symlink (a tip that tracks `sub` as a symlink must not turn `sub/inner`
-/// into a removal outside the sandbox); the module repository under
-/// `.git/modules/…` stays. Fails closed: when the sandbox tree cannot be
-/// listed in full nothing is removed. Best-effort like the step before it.
-fn prune_untracked_submodule_worktrees(sandbox_path: &Path, copied_gitlinks: &[String]) {
-    if copied_gitlinks.is_empty() {
-        return;
-    }
-    let Some(tracked) = tracked_paths_recursive(sandbox_path) else {
-        tracing::warn!(
-            sandbox = %sandbox_path.display(),
-            "materialize: sandbox tree not fully listed; leaving copied submodule worktrees in place"
-        );
-        return;
-    };
-    let tracked: std::collections::HashSet<String> =
-        tracked.into_iter().map(|(path, _)| path).collect();
-    for rel in copied_gitlinks {
-        if tracked.contains(rel) {
-            continue;
-        }
-        let Some(dir) = dir_within_no_symlinks(sandbox_path, rel) else {
-            continue;
-        };
-        if dir.join(".git").symlink_metadata().is_err() {
-            continue;
-        }
-        match std::fs::remove_dir_all(&dir) {
-            Ok(()) => tracing::info!(
-                sandbox = %sandbox_path.display(),
-                path = %rel,
-                "materialize: removed copied submodule worktree the sandbox tip does not track"
-            ),
-            Err(e) => tracing::warn!(
-                sandbox = %sandbox_path.display(),
-                path = %rel,
-                error = %e,
-                "materialize: could not remove copied submodule worktree the sandbox tip does not track"
-            ),
-        }
-    }
-}
-
 /// Remove everything a failed materialization created: each created
-/// directory tree, then the (now possibly empty) `sandboxes` and workspace
-/// directories. `remove_dir` refuses non-empty directories, so a workspace
+/// directory tree, then the (now possibly empty) workspace directory. `remove_dir` refuses non-empty directories, so a workspace
 /// dir holding anything else — e.g. one that existed before this call — is
 /// never touched (same guarantee as `remove_workspace_dir_if_empty` on the
 /// create path).
@@ -923,7 +518,6 @@ fn rollback_created(created: &[PathBuf], ws_dir: &Path) {
             }
         }
     }
-    let _ = std::fs::remove_dir(ws_dir.join("sandboxes"));
     let _ = std::fs::remove_dir(ws_dir);
 }
 
@@ -942,8 +536,7 @@ fn head_sha(repo_path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use crate::transfer_git::{create_transfer_bundle, BranchUpstream, TransferBundle};
-    use intent_core::{AgentId, WorkspaceId};
-    use intent_store::SandboxStatus;
+    use intent_core::WorkspaceId;
     use std::fs;
 
     fn now_iso() -> String {
@@ -1039,43 +632,6 @@ mod tests {
         }
     }
 
-    fn sandbox_row(ws: &Workspace, agent_id: &AgentId, path: &Path, branch: &str) -> Sandbox {
-        let now = now_iso();
-        Sandbox {
-            id: format!("sb-{}", agent_id.0),
-            workspace_id: ws.id.clone(),
-            agent_id: agent_id.clone(),
-            path: path.to_string_lossy().to_string(),
-            branch: branch.to_string(),
-            base_commit_sha: repo_head(path),
-            snapshot_commit_sha: None,
-            status: SandboxStatus::Created,
-            retry_count: 0,
-            created_at: now.clone(),
-            updated_at: now,
-        }
-    }
-
-    /// Simulate a sandbox: clone the workspace repo and check out `sb/<agent>`.
-    fn make_sandbox_clone(src: &Path, dst: &Path, branch: &str) {
-        let out = Command::new("git")
-            .arg("clone")
-            .arg("--quiet")
-            .arg(src)
-            .arg(dst)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let repo = git2::Repository::open(dst).unwrap();
-        let head = repo.head().unwrap().peel_to_commit().unwrap();
-        repo.branch(branch, &head, false).unwrap();
-        repo.set_head(&format!("refs/heads/{branch}")).unwrap();
-    }
-
     fn remote_names(repo_path: &Path) -> Vec<String> {
         let repo = git2::Repository::open(repo_path).unwrap();
         let remotes = repo.remotes().unwrap();
@@ -1089,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_dirty_workspace_and_sandbox() {
+    fn roundtrip_dirty_workspace_ignores_legacy_sandbox_refs() {
         let src = tempfile::TempDir::new().unwrap();
         let repo = src.path().join("source-repo");
         init_repo(&repo);
@@ -1120,36 +676,26 @@ mod tests {
         ws.branch = "feature".to_string();
         ws.base_ref = Some("main".to_string());
 
-        // Dirty sandbox with a committed change on its branch.
-        let agent = AgentId::new();
-        let branch = format!("sb/{}", agent.0);
-        let sb_src = src.path().join("sandbox");
-        make_sandbox_clone(&repo, &sb_src, &branch);
-        commit_file(&sb_src, "sb.txt", "sandbox work\n", "feat: sandbox commit");
-        fs::write(sb_src.join("sb-wip.txt"), "sandbox wip\n").unwrap();
-        let sb_fingerprint = status_fingerprint(&sb_src);
-        let sb_committed_tip = {
-            let r = git2::Repository::open(&sb_src).unwrap();
-            let tip = r.head().unwrap().peel_to_commit().unwrap().id().to_string();
-            tip
-        };
-        let sb = sandbox_row(&ws, &agent, &sb_src, &branch);
-
         let staging = src.path().join("staging");
         let TransferBundle {
-            bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
+            bundle_path,
+            mut refs,
+            ..
+        } = create_transfer_bundle(&ws, &staging).unwrap();
+        // What an older daemon recorded for a live sandbox: ignored, never
+        // re-provisioned (per-agent CoW sandboxes are retired).
+        refs.sandboxes.push(serde_json::json!({
+            "agentId": "agent-legacy",
+            "branch": "sb/agent-legacy",
+            "bundleRef": format!("refs/intent/transfer/{}/sandbox/agent-legacy", ws.id.0),
+            "headSha": base,
+            "baseCommitSha": base,
+        }));
 
         // Materialize into a fresh target root.
         let target = tempfile::TempDir::new().unwrap();
-        let out = materialize_workspace_git_blocking(
-            &bundle_path,
-            &refs,
-            &ws,
-            std::slice::from_ref(&sb),
-            target.path(),
-        )
-        .unwrap();
+        let out =
+            materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path()).unwrap();
 
         // Workspace checkout: right path, branch, dirty state, no remotes.
         let expected_checkout = target.path().join(&ws.id.0).join("test-repo");
@@ -1179,52 +725,12 @@ mod tests {
         }
         assert_eq!(out.base_sha.as_deref(), Some(base.as_str()));
 
-        // Sandbox: right path, branch checked out, dirty state restored.
-        assert_eq!(out.sandboxes.len(), 1);
-        let msb = &out.sandboxes[0];
-        assert_eq!(
-            msb.path,
-            target
-                .path()
-                .join(&ws.id.0)
-                .join("sandboxes")
-                .join(&agent.0)
-                .join("test-repo")
-        );
-        assert_eq!(head_branch(&msb.path), branch);
-        assert_eq!(repo_head(&msb.path), sb_committed_tip, "WIP unwound");
-        assert_eq!(status_fingerprint(&msb.path), sb_fingerprint);
-        assert_eq!(
-            fs::read_to_string(msb.path.join("sb.txt")).unwrap(),
-            "sandbox work\n"
-        );
-        assert_eq!(
-            fs::read_to_string(msb.path.join("sb-wip.txt")).unwrap(),
-            "sandbox wip\n"
-        );
-        assert!(out.skipped_agent_ids.is_empty());
-
-        // The sandbox's local workspace branch must not point at the WIP
-        // sentinel (the clone was taken at the sentinel tip; it gets reset
-        // to the unwound tip).
-        {
-            let r = git2::Repository::open(&msb.path).unwrap();
-            let ws_branch_tip = r
-                .find_reference("refs/heads/feature")
-                .unwrap()
-                .peel_to_commit()
-                .unwrap();
-            assert_eq!(
-                ws_branch_tip.id().to_string(),
-                feature_tip,
-                "sandbox workspace branch reset off the WIP sentinel"
-            );
-        }
+        // No sandbox folder for the legacy entry.
+        assert!(!target.path().join(&ws.id.0).join("sandboxes").exists());
 
         // apply(): rows rewritten to target paths.
         let mut ws_row = ws.clone();
-        let mut sb_rows = vec![sb];
-        out.apply(&mut ws_row, &mut sb_rows);
+        out.apply(&mut ws_row);
         assert_eq!(
             ws_row.repository_path.as_deref(),
             Some(expected_checkout.to_string_lossy().as_ref())
@@ -1232,8 +738,6 @@ mod tests {
         assert_eq!(ws_row.worktree_path, None);
         assert_eq!(ws_row.checkout_mode, Some(CheckoutMode::Direct));
         assert_eq!(ws_row.base_commit_sha.as_deref(), Some(base.as_str()));
-        assert_eq!(sb_rows.len(), 1);
-        assert_eq!(sb_rows[0].path, msb.path.to_string_lossy());
     }
 
     #[test]
@@ -1246,49 +750,14 @@ mod tests {
 
         let TransferBundle {
             bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        } = create_transfer_bundle(&ws, &src.path().join("staging")).unwrap();
         assert_eq!(refs.workspace_wip_commit_sha, None);
 
         let target = tempfile::TempDir::new().unwrap();
-        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
-            .unwrap();
+        let out =
+            materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path()).unwrap();
         assert_eq!(repo_head(&out.checkout_dir), tip);
         assert!(status_fingerprint(&out.checkout_dir).is_empty(), "clean");
-    }
-
-    #[test]
-    fn sandbox_row_without_bundle_entry_is_dropped() {
-        let src = tempfile::TempDir::new().unwrap();
-        let repo = src.path().join("source-repo");
-        init_repo(&repo);
-        let ws = workspace_for_repo(&repo);
-
-        // Bundle carries no sandbox branches...
-        let TransferBundle {
-            bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
-
-        // ...but a sandbox row rides in the import anyway.
-        let agent = AgentId::new();
-        let sb = sandbox_row(&ws, &agent, &repo, &format!("sb/{}", agent.0));
-
-        let target = tempfile::TempDir::new().unwrap();
-        let out = materialize_workspace_git_blocking(
-            &bundle_path,
-            &refs,
-            &ws,
-            std::slice::from_ref(&sb),
-            target.path(),
-        )
-        .unwrap();
-        assert!(out.sandboxes.is_empty());
-        assert_eq!(out.skipped_agent_ids, vec![agent.0.clone()]);
-
-        let mut ws_row = ws.clone();
-        let mut sb_rows = vec![sb];
-        out.apply(&mut ws_row, &mut sb_rows);
-        assert!(sb_rows.is_empty(), "row without a directory is dropped");
-        assert!(!target.path().join(&ws.id.0).join("sandboxes").exists());
     }
 
     #[test]
@@ -1302,13 +771,13 @@ mod tests {
             bundle_path,
             mut refs,
             ..
-        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        } = create_transfer_bundle(&ws, &src.path().join("staging")).unwrap();
         // Corrupt the manifest so the post-clone tip check fails AFTER the
         // checkout directory has been created.
         refs.workspace_head_sha = "0".repeat(40);
 
         let target = tempfile::TempDir::new().unwrap();
-        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path());
+        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path());
         assert!(err.is_err());
         assert!(
             !target.path().join(&ws.id.0).exists(),
@@ -1324,11 +793,11 @@ mod tests {
         let ws = workspace_for_repo(&repo);
         let TransferBundle {
             bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        } = create_transfer_bundle(&ws, &src.path().join("staging")).unwrap();
         fs::remove_file(&bundle_path).unwrap();
 
         let target = tempfile::TempDir::new().unwrap();
-        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path());
+        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path());
         assert!(err.is_err());
         assert!(!target.path().join(&ws.id.0).exists());
     }
@@ -1341,94 +810,19 @@ mod tests {
         let ws = workspace_for_repo(&repo);
         let TransferBundle {
             bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        } = create_transfer_bundle(&ws, &src.path().join("staging")).unwrap();
 
         let target = tempfile::TempDir::new().unwrap();
         let existing = target.path().join(&ws.id.0).join("test-repo");
         fs::create_dir_all(&existing).unwrap();
         fs::write(existing.join("keep.txt"), "keep\n").unwrap();
 
-        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path());
+        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path());
         assert!(err.is_err());
         assert_eq!(
             fs::read_to_string(existing.join("keep.txt")).unwrap(),
             "keep\n",
             "pre-existing directory untouched"
-        );
-    }
-
-    /// A pre-existing `sandboxes/<agentId>` directory must survive rollback:
-    /// only what THIS call creates inside it (the sandbox checkout) may be
-    /// removed on failure, and a pre-existing sandbox checkout path is
-    /// rejected outright.
-    #[test]
-    fn rollback_preserves_preexisting_agent_dir() {
-        let src = tempfile::TempDir::new().unwrap();
-        let repo = src.path().join("source-repo");
-        init_repo(&repo);
-        let ws = workspace_for_repo(&repo);
-
-        let agent = AgentId::new();
-        let branch = format!("sb/{}", agent.0);
-        let sb_src = src.path().join("sandbox");
-        make_sandbox_clone(&repo, &sb_src, &branch);
-        let sb = sandbox_row(&ws, &agent, &sb_src, &branch);
-
-        let staging = src.path().join("staging");
-        let TransferBundle {
-            bundle_path,
-            mut refs,
-            ..
-        } = create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
-
-        // Pre-existing agent dir with unrelated content on the target.
-        let target = tempfile::TempDir::new().unwrap();
-        let agent_dir = target
-            .path()
-            .join(&ws.id.0)
-            .join("sandboxes")
-            .join(&agent.0);
-        fs::create_dir_all(&agent_dir).unwrap();
-        fs::write(agent_dir.join("precious.txt"), "precious\n").unwrap();
-
-        // Force a failure AFTER the sandbox is provisioned: corrupt the
-        // sandbox head so its tip check fails.
-        refs.sandboxes[0].head_sha = "0".repeat(40);
-
-        let err = materialize_workspace_git_blocking(
-            &bundle_path,
-            &refs,
-            &ws,
-            std::slice::from_ref(&sb),
-            target.path(),
-        );
-        assert!(err.is_err());
-        assert_eq!(
-            fs::read_to_string(agent_dir.join("precious.txt")).unwrap(),
-            "precious\n",
-            "pre-existing agent dir content survives rollback"
-        );
-        assert!(
-            !agent_dir.join("test-repo").exists(),
-            "the sandbox checkout this call created was rolled back"
-        );
-
-        // A pre-existing sandbox checkout path is rejected without touching it.
-        let sandbox_checkout = agent_dir.join("test-repo");
-        fs::create_dir_all(&sandbox_checkout).unwrap();
-        fs::write(sandbox_checkout.join("keep.txt"), "keep\n").unwrap();
-        let err = materialize_workspace_git_blocking(
-            &bundle_path,
-            &refs,
-            &ws,
-            std::slice::from_ref(&sb),
-            target.path(),
-        );
-        assert!(err.is_err());
-        assert_eq!(
-            fs::read_to_string(sandbox_checkout.join("keep.txt")).unwrap(),
-            "keep\n",
-            "pre-existing sandbox checkout untouched"
         );
     }
 
@@ -1492,13 +886,13 @@ mod tests {
             bundle_path,
             refs,
             submodule_bundles,
-        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        } = create_transfer_bundle(&ws, &staging).unwrap();
         assert_eq!(refs.submodules.len(), 1, "{refs:?}");
         assert_eq!(submodule_bundles[0].0, staging.join("submodules/0.bundle"));
 
         let target = tempfile::tempdir().unwrap();
-        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
-            .unwrap();
+        let out =
+            materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path()).unwrap();
         let dst_sub = out.checkout_dir.join("sub");
 
         assert!(dst_sub.join(".git").exists(), "submodule initialized");
@@ -1550,13 +944,13 @@ mod tests {
             bundle_path,
             refs,
             submodule_bundles,
-        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        } = create_transfer_bundle(&ws, &staging).unwrap();
         assert!(refs.submodules.is_empty(), "{refs:?}");
         assert!(submodule_bundles.is_empty());
 
         let target = tempfile::tempdir().unwrap();
-        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
-            .unwrap();
+        let out =
+            materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path()).unwrap();
         assert_eq!(
             fgit(&out.checkout_dir, &["status", "--porcelain"]),
             "D  sub",
@@ -1605,13 +999,13 @@ mod tests {
         let staging = tmp.path().join("staging");
         let TransferBundle {
             bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        } = create_transfer_bundle(&ws, &staging).unwrap();
         let paths: Vec<&str> = refs.submodules.iter().map(|s| s.path.as_str()).collect();
         assert_eq!(paths, ["sub"], "{refs:?}");
 
         let target = tempfile::tempdir().unwrap();
-        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
-            .unwrap();
+        let out =
+            materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path()).unwrap();
         let dst_sub = out.checkout_dir.join("sub");
         assert_eq!(repo_head(&dst_sub), sub_sha);
         assert_eq!(
@@ -1669,13 +1063,13 @@ mod tests {
         let staging = tmp.path().join("staging");
         let TransferBundle {
             bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        } = create_transfer_bundle(&ws, &staging).unwrap();
         let paths: Vec<&str> = refs.submodules.iter().map(|s| s.path.as_str()).collect();
         assert_eq!(paths, ["sub", "sub/inner"], "{refs:?}");
 
         let target = tempfile::tempdir().unwrap();
-        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
-            .unwrap();
+        let out =
+            materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path()).unwrap();
         let dst_sub = out.checkout_dir.join("sub");
         let dst_inner = dst_sub.join("inner");
 
@@ -1706,613 +1100,6 @@ mod tests {
         assert_no_config_mentions(&out.checkout_dir.join(".git"), staging.to_str().unwrap());
     }
 
-    /// A sandbox still re-provisions (`CoW` or plain clone of the checkout)
-    /// after the checkout's submodule was hydrated: the sandbox lands on its
-    /// branch at its bundled tip with its WIP unwound, the workspace
-    /// checkout keeps the hydrated submodule, and no config under the
-    /// workspace dir mentions the staging bundle.
-    #[test]
-    fn sandbox_provisions_after_submodule_hydration() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (sup, origin) = superproject_with_submodule(tmp.path());
-        let sub = sup.join("sub");
-        fgit(&sub, &["checkout", "-q", "main"]);
-        let sha = local_commit(&sub, "wip.txt");
-
-        let ws = superproject_workspace(&sup);
-        let agent = AgentId::new();
-        let branch = format!("sb/{}", agent.0);
-        let sb_src = tmp.path().join("sandbox");
-        make_sandbox_clone(&sup, &sb_src, &branch);
-        let sb_tip = commit_file(&sb_src, "sb.txt", "sandbox work\n", "feat: sandbox commit");
-        fs::write(sb_src.join("sb-wip.txt"), "sandbox wip\n").unwrap();
-        let sb_fingerprint = status_fingerprint(&sb_src);
-        let sb = sandbox_row(&ws, &agent, &sb_src, &branch);
-
-        let staging = tmp.path().join("staging");
-        let TransferBundle {
-            bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
-        assert_eq!(refs.submodules.len(), 1, "{refs:?}");
-
-        let target = tempfile::tempdir().unwrap();
-        let out = materialize_workspace_git_blocking(
-            &bundle_path,
-            &refs,
-            &ws,
-            std::slice::from_ref(&sb),
-            target.path(),
-        )
-        .unwrap();
-
-        assert_eq!(repo_head(&out.checkout_dir.join("sub")), sha);
-        assert_eq!(
-            fgit(&out.checkout_dir, &["config", "submodule.sub.url"]),
-            origin.to_str().unwrap()
-        );
-        assert_eq!(out.sandboxes.len(), 1);
-        let msb = &out.sandboxes[0];
-        assert_eq!(head_branch(&msb.path), branch);
-        assert_eq!(repo_head(&msb.path), sb_tip, "WIP unwound");
-        assert_eq!(status_fingerprint(&msb.path), sb_fingerprint);
-        assert_eq!(
-            fs::read_to_string(msb.path.join("sb-wip.txt")).unwrap(),
-            "sandbox wip\n"
-        );
-        assert_no_config_mentions(&target.path().join(&ws.id.0), staging.to_str().unwrap());
-    }
-
-    /// Byte-for-byte copy of a directory tree — what a `CoW` clone of the
-    /// checkout produces on a filesystem that supports it (APFS on macOS),
-    /// including the hydrated submodule's worktree and `.git/modules`.
-    fn copy_dir_all(src: &Path, dst: &Path) {
-        fs::create_dir_all(dst).unwrap();
-        for entry in fs::read_dir(src).unwrap() {
-            let entry = entry.unwrap();
-            let to = dst.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy_dir_all(&entry.path(), &to);
-            } else {
-                fs::copy(entry.path(), &to).unwrap();
-            }
-        }
-    }
-
-    /// Outcome of [`cow_copied_sandbox_case`], for the per-case assertions.
-    struct CowCopiedSandbox {
-        /// Gitlink the superproject tip records for `sub` — the seed commit
-        /// unless `prepare_super` advanced it.
-        recorded: String,
-        /// The unpublished local commit the workspace's `sub` sits on.
-        sha: String,
-        sb_tip: String,
-        sb_fingerprint: Vec<(String, bool, bool, bool)>,
-        /// Manifest submodule paths, in bundle order.
-        submodule_paths: Vec<String>,
-        checkout_dir: PathBuf,
-        sandbox_path: PathBuf,
-        _target: tempfile::TempDir,
-        _tmp: tempfile::TempDir,
-    }
-
-    /// Shared driver for the intent-hq/intent#4397 `CoW` regressions: a
-    /// superproject whose `sub` sits on an unpublished commit `sha` while
-    /// the tip records `recorded` (the seed commit unless `prepare_super`
-    /// advanced it), one sandbox (`prepare_sandbox` shapes its branch and
-    /// submodule state before the sandbox commit; it is a plain clone of
-    /// the superproject tip with an uninitialized gitlink otherwise),
-    /// exported and materialized as a checkout alone. The sandbox is then
-    /// stood up as a byte copy of the hydrated checkout — the shape a
-    /// `clonefile` clone produces on APFS, which
-    /// `provision_sandbox_from_bundle` never takes on a Linux test
-    /// filesystem without reflink — and the provisioning tail is run on it.
-    fn cow_copied_sandbox_case(
-        prepare_super: impl FnOnce(&Path),
-        prepare_sandbox: impl FnOnce(&Path, &Path),
-    ) -> CowCopiedSandbox {
-        let tmp = tempfile::tempdir().unwrap();
-        let (sup, _origin) = superproject_with_submodule(tmp.path());
-        prepare_super(&sup);
-        let sub = sup.join("sub");
-        fgit(&sub, &["checkout", "-q", "main"]);
-        let recorded = fgit(&sup, &["rev-parse", "HEAD:sub"]);
-        let sha = local_commit(&sub, "wip.txt");
-        assert_ne!(recorded, sha);
-
-        let ws = superproject_workspace(&sup);
-        let agent = AgentId::new();
-        let branch = format!("sb/{}", agent.0);
-        let sb_src = tmp.path().join("sandbox");
-        make_sandbox_clone(&sup, &sb_src, &branch);
-        prepare_sandbox(&sup, &sb_src);
-        let sb_tip = commit_file(&sb_src, "sb.txt", "sandbox work\n", "feat: sandbox commit");
-        let sandbox_records_sub = !fgit(&sb_src, &["ls-tree", &sb_tip, "--", "sub"]).is_empty();
-        fs::write(sb_src.join("sb-wip.txt"), "sandbox wip\n").unwrap();
-        let sb_fingerprint = status_fingerprint(&sb_src);
-        let sb = sandbox_row(&ws, &agent, &sb_src, &branch);
-
-        let staging = tmp.path().join("staging");
-        let TransferBundle {
-            bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
-        let submodule_paths: Vec<String> = refs.submodules.iter().map(|s| s.path.clone()).collect();
-        assert_eq!(
-            submodule_paths.first().map(String::as_str),
-            Some("sub"),
-            "{refs:?}"
-        );
-        let entry = refs
-            .sandboxes
-            .iter()
-            .find(|e| e.agent_id == agent.0)
-            .unwrap();
-
-        let target = tempfile::tempdir().unwrap();
-        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
-            .unwrap();
-        assert_eq!(repo_head(&out.checkout_dir.join("sub")), sha);
-        let sandbox_path = target
-            .path()
-            .join(&ws.id.0)
-            .join("sandboxes")
-            .join(&agent.0)
-            .join("super");
-        copy_dir_all(&out.checkout_dir, &sandbox_path);
-        assert_eq!(
-            repo_head(&sandbox_path.join("sub")),
-            sha,
-            "copy inherits the hydrated tip"
-        );
-
-        finish_sandbox_from_bundle(
-            &sandbox_path,
-            bundle_path.to_str().unwrap(),
-            entry,
-            &refs.workspace_branch,
-            false,
-        )
-        .unwrap();
-
-        assert_eq!(head_branch(&sandbox_path), branch);
-        assert_eq!(repo_head(&sandbox_path), sb_tip, "WIP unwound");
-        assert_eq!(
-            sandbox_path.join("sub").join(".git").exists(),
-            sandbox_records_sub,
-            "submodule stays initialized iff the sandbox tip records it"
-        );
-        assert_eq!(
-            repo_head(&out.checkout_dir.join("sub")),
-            sha,
-            "workspace checkout keeps its hydrated submodule"
-        );
-        CowCopiedSandbox {
-            recorded,
-            sha,
-            sb_tip,
-            sb_fingerprint,
-            submodule_paths,
-            checkout_dir: out.checkout_dir,
-            sandbox_path,
-            _target: target,
-            _tmp: tmp,
-        }
-    }
-
-    /// Initialize `sb_src/sub` at the workspace submodule's unpublished tip
-    /// without staging the gitlink: the source sandbox then has worktree
-    /// `sha` under an index still recording the seed commit (`M sub`).
-    fn init_sandbox_submodule_at_workspace_tip(sup: &Path, sb_src: &Path) {
-        fgit(
-            sb_src,
-            &[
-                "-c",
-                "protocol.file.allow=always",
-                "submodule",
-                "update",
-                "--init",
-                "--quiet",
-            ],
-        );
-        let sb_sub = sb_src.join("sub");
-        fgit(
-            &sb_sub,
-            &["fetch", "-q", sup.join("sub").to_str().unwrap(), "main"],
-        );
-        fgit(&sb_sub, &["checkout", "-q", "-B", "main", "FETCH_HEAD"]);
-        assert_eq!(
-            fgit(sb_src, &["status", "--porcelain"]),
-            "M sub",
-            "unstaged gitlink change (trimmed)"
-        );
-    }
-
-    /// Regression for intent-hq/intent#4397: when the sandbox is a `CoW`
-    /// copy of the checkout (macOS), it inherits the hydrated submodule at
-    /// the checkout's gitlink, while its own branch records a different one
-    /// — so `sub` showed up as modified in the sandbox status although the
-    /// source sandbox had a clean gitlink. The provisioning tail must bring
-    /// the initialized submodule to the sandbox's recorded gitlink.
-    #[test]
-    fn cow_copied_sandbox_syncs_hydrated_submodule_to_its_gitlink() {
-        let case = cow_copied_sandbox_case(|_| {}, |_, _| {});
-        assert_eq!(status_fingerprint(&case.sandbox_path), case.sb_fingerprint);
-        assert_eq!(
-            repo_head(&case.sandbox_path.join("sub")),
-            case.recorded,
-            "submodule sits at the gitlink the sandbox branch records"
-        );
-    }
-
-    /// The normalization must target the gitlinks the source sandbox had
-    /// *checked out*, not the ones its saved index records: a source sandbox
-    /// with `sub` at the unpublished tip under an index still recording the
-    /// seed commit (an unstaged gitlink change, `M sub`) has to come back
-    /// exactly so — normalizing against the restored index would move `sub`
-    /// to the seed commit and silently clear that change.
-    #[test]
-    fn cow_copied_sandbox_keeps_unstaged_submodule_change() {
-        let case = cow_copied_sandbox_case(|_| {}, init_sandbox_submodule_at_workspace_tip);
-        assert!(
-            case.sb_fingerprint
-                .contains(&("sub".to_string(), false, true, false)),
-            "{:?}",
-            case.sb_fingerprint
-        );
-        assert_eq!(status_fingerprint(&case.sandbox_path), case.sb_fingerprint);
-        assert_eq!(
-            repo_head(&case.sandbox_path.join("sub")),
-            case.sha,
-            "submodule stays at the commit the source sandbox had checked out"
-        );
-        assert_eq!(
-            fgit(
-                &case.sandbox_path,
-                &["rev-parse", &format!("{}:sub", case.sb_tip)]
-            ),
-            case.recorded,
-            "the sandbox tip still records the seed gitlink"
-        );
-    }
-
-    /// `hydrate_submodule` runs `update --init`, which copies the
-    /// `.gitmodules` update strategy into the checkout config the `CoW` copy
-    /// inherits. With `update = merge` a bare `submodule update` merging the
-    /// (ancestor) recorded gitlink into the checked-out descendant is a
-    /// no-op that exits 0 — the mismatch from the issue would survive. The
-    /// normalization must force the checkout strategy.
-    #[test]
-    fn cow_copied_sandbox_normalizes_submodule_despite_merge_update_strategy() {
-        let case = cow_copied_sandbox_case(
-            |sup| {
-                fgit(
-                    sup,
-                    &[
-                        "config",
-                        "-f",
-                        ".gitmodules",
-                        "submodule.sub.update",
-                        "merge",
-                    ],
-                );
-                fgit(sup, &["commit", "-q", "-am", "sub: update=merge"]);
-            },
-            |_, _| {},
-        );
-        for repo in [&case.checkout_dir, &case.sandbox_path] {
-            assert_eq!(
-                fgit(repo, &["config", "--get", "submodule.sub.update"]),
-                "merge",
-                "{}: hydration copied the .gitmodules strategy into the config",
-                repo.display()
-            );
-        }
-        assert_eq!(status_fingerprint(&case.sandbox_path), case.sb_fingerprint);
-        assert_eq!(
-            repo_head(&case.sandbox_path.join("sub")),
-            case.recorded,
-            "submodule sits at the gitlink the sandbox branch records"
-        );
-    }
-
-    /// Regression for intent-hq/intent#4836: the `CoW` copy also carries a
-    /// hydrated NESTED submodule (`sub/inner`) at the gitlink the checkout's
-    /// `sub` records. Once `sub` is moved to the commit the sandbox tip
-    /// records — one whose `inner` gitlink is older — `inner` must follow,
-    /// or `sub` keeps reading as modified (nested gitlink change) while the
-    /// source sandbox was clean. The recorded inner commit is the seed of
-    /// the copied module repository, so no fetch is needed.
-    #[test]
-    fn cow_copied_sandbox_normalizes_nested_submodule() {
-        let mut inner_seed = String::new();
-        let mut inner_tip = String::new();
-        let case = cow_copied_sandbox_case(
-            |sup| {
-                let root = sup.parent().unwrap();
-                let inner_src = root.join("inner-src");
-                finit_repo(&inner_src);
-                fgit(root, &["clone", "-q", "--bare", "inner-src", "inner.git"]);
-                let inner_origin = root.join("inner.git");
-                let sub = sup.join("sub");
-                fgit(&sub, &["checkout", "-q", "main"]);
-                fgit(
-                    &sub,
-                    &[
-                        "submodule",
-                        "add",
-                        "-q",
-                        inner_origin.to_str().unwrap(),
-                        "inner",
-                    ],
-                );
-                fgit(&sub, &["commit", "-q", "-m", "add inner"]);
-                // The superproject tip (and so the sandbox branch) records
-                // `sub` here, with `inner` at its seed commit.
-                fgit(sup, &["add", "sub"]);
-                fgit(sup, &["commit", "-q", "-m", "bump sub: add inner"]);
-                let inner = sub.join("inner");
-                inner_seed = fgit(&inner, &["rev-parse", "HEAD"]);
-                fgit(&inner, &["checkout", "-q", "-b", "feat/x"]);
-                inner_tip = local_commit(&inner, "deep.txt");
-                fgit(&sub, &["add", "inner"]);
-                fgit(&sub, &["commit", "-q", "-m", "bump inner"]);
-            },
-            |_, _| {},
-        );
-        assert_ne!(inner_seed, inner_tip);
-        assert_eq!(case.submodule_paths, ["sub", "sub/inner"]);
-        assert_eq!(
-            fgit(
-                &case.sandbox_path.join("sub"),
-                &["rev-parse", &format!("{}:inner", case.recorded)]
-            ),
-            inner_seed,
-            "the recorded outer gitlink records inner at its seed"
-        );
-        let checkout_inner = case.checkout_dir.join("sub").join("inner");
-        assert_eq!(
-            repo_head(&checkout_inner),
-            inner_tip,
-            "workspace checkout keeps its hydrated nested submodule"
-        );
-        let sandbox_inner = case.sandbox_path.join("sub").join("inner");
-        assert!(
-            sandbox_inner.join(".git").exists(),
-            "nested submodule stays initialized"
-        );
-        assert_eq!(status_fingerprint(&case.sandbox_path), case.sb_fingerprint);
-        assert_eq!(
-            fgit(&case.sandbox_path, &["status", "--porcelain"]),
-            "?? sb-wip.txt"
-        );
-        assert_eq!(
-            repo_head(&case.sandbox_path.join("sub")),
-            case.recorded,
-            "outer submodule sits at the gitlink the sandbox branch records"
-        );
-        assert_eq!(
-            repo_head(&sandbox_inner),
-            inner_seed,
-            "nested submodule sits at the gitlink the outer one records"
-        );
-    }
-
-    /// Regression for intent-hq/intent#4838: the sandbox branch was cut
-    /// BEFORE the workspace added `sub`, so its tip has no gitlink there
-    /// while the `CoW` copy carries the hydrated worktree. `git checkout`
-    /// cannot rmdir the non-empty directory, leaving it as untracked content
-    /// of a sandbox whose source was clean; the provisioning tail must
-    /// remove it. Nothing else the sandbox tip does not track is touched.
-    #[test]
-    fn cow_copied_sandbox_prunes_submodule_worktree_absent_at_its_tip() {
-        let case = cow_copied_sandbox_case(
-            |_| {},
-            |_, sb_src| {
-                // Rewind the sandbox branch to the seed commit, before
-                // `add submodule`; the uninitialized gitlink dir goes away.
-                fgit(sb_src, &["reset", "-q", "--hard", "HEAD~1"]);
-                assert!(fgit(sb_src, &["ls-tree", "HEAD", "--", "sub"]).is_empty());
-                assert!(!sb_src.join("sub").exists());
-                fs::write(sb_src.join("keep.txt"), "untracked, stays\n").unwrap();
-            },
-        );
-        assert_eq!(case.submodule_paths, ["sub"]);
-        assert!(
-            fgit(&case.sandbox_path, &["ls-tree", &case.sb_tip, "--", "sub"]).is_empty(),
-            "the sandbox tip records no gitlink at sub"
-        );
-        assert!(
-            !case.sandbox_path.join("sub").exists(),
-            "copied submodule worktree removed from the sandbox"
-        );
-        assert_eq!(
-            fs::read_to_string(case.sandbox_path.join("keep.txt")).unwrap(),
-            "untracked, stays\n"
-        );
-        assert_eq!(status_fingerprint(&case.sandbox_path), case.sb_fingerprint);
-        assert_eq!(
-            fgit(&case.sandbox_path, &["status", "--porcelain"]),
-            "?? keep.txt\n?? sb-wip.txt"
-        );
-        assert_eq!(
-            repo_head(&case.checkout_dir.join("sub")),
-            case.sha,
-            "workspace checkout keeps its hydrated submodule"
-        );
-    }
-
-    /// intent-hq/intent#4838, one level down: `sub` gained `inner` only in
-    /// commits the sandbox tip does not record (it still records `sub` at
-    /// the seed, which has no `inner` gitlink), yet the `CoW` copy carries
-    /// the hydrated `sub/inner`. Once `sub` is moved to the seed the nested
-    /// worktree is left behind as untracked content and `sub` reads as
-    /// modified; the provisioning tail must remove `sub/inner` while
-    /// keeping `sub` itself, which the sandbox tip does record.
-    #[test]
-    fn cow_copied_sandbox_prunes_nested_submodule_worktree_absent_at_its_tip() {
-        let mut inner_tip = String::new();
-        let case = cow_copied_sandbox_case(
-            |sup| {
-                let root = sup.parent().unwrap();
-                let inner_src = root.join("inner-src");
-                finit_repo(&inner_src);
-                fgit(root, &["clone", "-q", "--bare", "inner-src", "inner.git"]);
-                let inner_origin = root.join("inner.git");
-                let sub = sup.join("sub");
-                fgit(&sub, &["checkout", "-q", "main"]);
-                fgit(
-                    &sub,
-                    &[
-                        "submodule",
-                        "add",
-                        "-q",
-                        inner_origin.to_str().unwrap(),
-                        "inner",
-                    ],
-                );
-                fgit(&sub, &["commit", "-q", "-m", "add inner"]);
-                // The superproject tip is NOT bumped: it (and so the
-                // sandbox branch) keeps recording `sub` at the seed, which
-                // has no `inner`. An unpublished inner commit gets it
-                // bundled and hydrated on the target.
-                let inner = sub.join("inner");
-                fgit(&inner, &["checkout", "-q", "-b", "feat/x"]);
-                inner_tip = local_commit(&inner, "deep.txt");
-                fgit(&sub, &["add", "inner"]);
-                fgit(&sub, &["commit", "-q", "-m", "bump inner"]);
-            },
-            |_, _| {},
-        );
-        assert_eq!(case.submodule_paths, ["sub", "sub/inner"]);
-        assert!(
-            fgit(
-                &case.sandbox_path.join("sub"),
-                &["ls-tree", &case.recorded, "--", "inner"]
-            )
-            .is_empty(),
-            "the recorded outer gitlink has no inner gitlink"
-        );
-        assert_eq!(
-            repo_head(&case.checkout_dir.join("sub").join("inner")),
-            inner_tip,
-            "workspace checkout keeps its hydrated nested submodule"
-        );
-        assert!(
-            !case.sandbox_path.join("sub").join("inner").exists(),
-            "copied nested submodule worktree removed from the sandbox"
-        );
-        assert_eq!(status_fingerprint(&case.sandbox_path), case.sb_fingerprint);
-        assert_eq!(
-            fgit(&case.sandbox_path, &["status", "--porcelain"]),
-            "?? sb-wip.txt"
-        );
-        assert_eq!(
-            fgit(&case.sandbox_path.join("sub"), &["status", "--porcelain"]),
-            ""
-        );
-        assert_eq!(
-            repo_head(&case.sandbox_path.join("sub")),
-            case.recorded,
-            "outer submodule sits at the gitlink the sandbox branch records"
-        );
-    }
-
-    /// The pruning step never follows a symlink: the copied tip had gitlinks
-    /// `sub` and `sub/inner`, the sandbox tip tracks `sub` as a symlink to a
-    /// directory outside the sandbox that holds an `inner/.git`. `sub` is
-    /// tracked (kept) and `sub/inner` is not, yet the outside directory must
-    /// survive — `remove_dir_all` through the symlink would delete it.
-    #[cfg(unix)]
-    #[test]
-    fn prune_untracked_submodule_worktrees_never_follows_symlinks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let outside_inner = tmp.path().join("outside").join("inner");
-        fs::create_dir_all(&outside_inner).unwrap();
-        fs::write(outside_inner.join(".git"), "gitdir: nowhere\n").unwrap();
-        fs::write(outside_inner.join("deep.txt"), "keep\n").unwrap();
-        let sandbox = tmp.path().join("sandbox");
-        finit_repo(&sandbox);
-        std::os::unix::fs::symlink("../outside", sandbox.join("sub")).unwrap();
-        fgit(&sandbox, &["add", "sub"]);
-        fgit(&sandbox, &["commit", "-q", "-m", "sub is a symlink"]);
-        assert!(fgit(&sandbox, &["ls-tree", "HEAD", "--", "sub"]).starts_with("120000 "));
-
-        let tracked = tracked_paths_recursive(&sandbox).unwrap();
-        assert!(tracked.iter().any(|(p, _)| p == "sub"));
-        assert!(
-            !tracked.iter().any(|(p, _)| p == "sub/inner"),
-            "inventory does not descend through a symlink"
-        );
-
-        prune_untracked_submodule_worktrees(
-            &sandbox,
-            &["sub".to_string(), "sub/inner".to_string()],
-        );
-        assert!(
-            outside_inner.join(".git").is_file() && outside_inner.join("deep.txt").is_file(),
-            "nothing outside the sandbox is removed"
-        );
-        assert!(sandbox
-            .join("sub")
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_symlink());
-    }
-
-    /// Fail closed: when the sandbox tree cannot be listed the inventory is
-    /// `None` and pruning removes nothing, even though every candidate
-    /// would otherwise qualify (untracked, carries a `.git` entry).
-    #[test]
-    fn prune_untracked_submodule_worktrees_keeps_everything_when_listing_fails() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sandbox = tmp.path().join("not-a-repo");
-        fs::create_dir_all(sandbox.join("sub")).unwrap();
-        fs::write(sandbox.join("sub").join(".git"), "gitdir: nowhere\n").unwrap();
-        assert!(tracked_paths_recursive(&sandbox).is_none());
-
-        prune_untracked_submodule_worktrees(&sandbox, &["sub".to_string()]);
-        assert!(
-            sandbox.join("sub").join(".git").is_file(),
-            "candidate survives"
-        );
-    }
-
-    /// Fail closed one level down: the sandbox tip tracks `sub` as an
-    /// initialized gitlink whose repository cannot be listed (broken
-    /// `.git` file), so `sub/inner` cannot be proven untracked. The whole
-    /// inventory is `None` and nothing is removed — neither `sub/inner` nor
-    /// `sub`.
-    #[test]
-    fn prune_untracked_submodule_worktrees_keeps_everything_when_nested_listing_fails() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sub_src = tmp.path().join("sub-src");
-        finit_repo(&sub_src);
-        let sandbox = tmp.path().join("sandbox");
-        finit_repo(&sandbox);
-        fgit(
-            &sandbox,
-            &["submodule", "add", "-q", sub_src.to_str().unwrap(), "sub"],
-        );
-        fgit(&sandbox, &["commit", "-q", "-m", "add sub"]);
-        assert!(tracked_paths_recursive(&sandbox).is_some());
-
-        let sub = sandbox.join("sub");
-        fs::write(sub.join(".git"), "gitdir: /nonexistent/gitdir\n").unwrap();
-        fs::create_dir_all(sub.join("inner")).unwrap();
-        fs::write(sub.join("inner").join(".git"), "gitdir: nowhere\n").unwrap();
-        assert!(tracked_paths_recursive(&sandbox).is_none());
-
-        prune_untracked_submodule_worktrees(
-            &sandbox,
-            &["sub".to_string(), "sub/inner".to_string()],
-        );
-        assert!(
-            sub.join("inner").join(".git").is_file(),
-            "nested candidate survives"
-        );
-        assert!(sub.join(".git").is_file());
-    }
-
     /// (c) A corrupt submodule bundle fails the materialization with an
     /// error naming the submodule path, and the rollback leaves nothing
     /// behind under the target root.
@@ -2330,11 +1117,11 @@ mod tests {
             bundle_path,
             refs,
             submodule_bundles,
-        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        } = create_transfer_bundle(&ws, &staging).unwrap();
         fs::write(&submodule_bundles[0].0, b"not a bundle").unwrap();
 
         let target = tempfile::tempdir().unwrap();
-        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
+        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path())
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("hydrate submodule sub failed"), "got {msg}");
@@ -2366,7 +1153,7 @@ mod tests {
         let staging = tmp.path().join("staging");
         let TransferBundle {
             bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        } = create_transfer_bundle(&ws, &staging).unwrap();
         let entries: Vec<(&str, bool)> = refs
             .submodules
             .iter()
@@ -2380,8 +1167,8 @@ mod tests {
         fs::rename(&sub_origin, &sub_origin_hidden).unwrap();
         fs::rename(&inner_origin, &inner_origin_hidden).unwrap();
         let target = tempfile::tempdir().unwrap();
-        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
-            .unwrap();
+        let out =
+            materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path()).unwrap();
         fs::rename(&sub_origin_hidden, &sub_origin).unwrap();
         fs::rename(&inner_origin_hidden, &inner_origin).unwrap();
 
@@ -2424,13 +1211,13 @@ mod tests {
             bundle_path,
             mut refs,
             ..
-        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        } = create_transfer_bundle(&ws, &staging).unwrap();
         refs.submodules.retain(|s| !s.published);
         let paths: Vec<&str> = refs.submodules.iter().map(|s| s.path.as_str()).collect();
         assert_eq!(paths, ["sub/inner"], "{refs:?}");
 
         let target = tempfile::tempdir().unwrap();
-        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
+        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path())
             .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -2465,14 +1252,14 @@ mod tests {
             bundle_path,
             mut refs,
             ..
-        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        } = create_transfer_bundle(&ws, &staging).unwrap();
         assert_eq!(refs.submodules.len(), 1, "{refs:?}");
         refs.submodules[0].path = "evil/sub".to_string();
         let src_url_before = fgit(&sup, &["config", "submodule.sub.url"]);
         assert_eq!(src_url_before, origin.to_str().unwrap());
 
         let target = tempfile::tempdir().unwrap();
-        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
+        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path())
             .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -2510,12 +1297,12 @@ mod tests {
             bundle_path,
             mut refs,
             ..
-        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        } = create_transfer_bundle(&ws, &staging).unwrap();
         assert_eq!(refs.submodules.len(), 1);
         refs.submodules[0].name = "other".to_string();
 
         let target = tempfile::tempdir().unwrap();
-        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
+        let err = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path())
             .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -2541,7 +1328,7 @@ mod tests {
         let staging = tmp.path().join("staging");
         let TransferBundle {
             bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        } = create_transfer_bundle(&ws, &staging).unwrap();
         assert_eq!(refs.submodules.len(), 1);
         fs::remove_dir_all(staging.join("submodules")).unwrap();
 
@@ -2556,8 +1343,7 @@ mod tests {
 
         let target = tempfile::tempdir().unwrap();
         let out =
-            materialize_workspace_git_blocking(&bundle_path, &legacy, &ws, &[], target.path())
-                .unwrap();
+            materialize_workspace_git_blocking(&bundle_path, &legacy, &ws, target.path()).unwrap();
         let dst_sub = out.checkout_dir.join("sub");
         assert!(dst_sub.is_dir());
         assert!(!dst_sub.join(".git").exists(), "gitlink left uninitialized");
@@ -2581,18 +1367,13 @@ mod tests {
         let ws = workspace_for_repo(&repo);
         let TransferBundle {
             bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        } = create_transfer_bundle(&ws, &src.path().join("staging")).unwrap();
 
         let target = tempfile::TempDir::new().unwrap();
-        let out = materialize_workspace_git(
-            bundle_path,
-            refs,
-            ws.clone(),
-            vec![],
-            target.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let out =
+            materialize_workspace_git(bundle_path, refs, ws.clone(), target.path().to_path_buf())
+                .await
+                .unwrap();
 
         assert!(out.checkout_dir.join(".git").exists(), "checkout created");
         assert_eq!(
@@ -2667,12 +1448,12 @@ mod tests {
         let staging = src.path().join("staging");
         let TransferBundle {
             bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        } = create_transfer_bundle(&ws, &staging).unwrap();
         assert!(refs.workspace_wip_commit_sha.is_some());
 
         let target = tempfile::TempDir::new().unwrap();
-        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path())
-            .unwrap();
+        let out =
+            materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path()).unwrap();
         let dst = &out.checkout_dir;
 
         assert_eq!(remote_names(dst), vec!["origin".to_string()]);
@@ -2717,10 +1498,9 @@ mod tests {
         ws.base_ref = Some("main".to_string());
         let TransferBundle {
             bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, &[], &tmp.join("staging")).unwrap();
+        } = create_transfer_bundle(&ws, &tmp.join("staging")).unwrap();
         let target = tmp.join("target");
-        let out =
-            materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], &target).unwrap();
+        let out = materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &target).unwrap();
         (out.checkout_dir, refs)
     }
 
@@ -2953,7 +1733,7 @@ mod tests {
             let before = intent_git::local_changes(&repo).unwrap();
             let ws = workspace_for_repo(&repo);
             let staging = tmp.path().join("staging");
-            let error = create_transfer_bundle(&ws, &[], &staging).unwrap_err();
+            let error = create_transfer_bundle(&ws, &staging).unwrap_err();
             assert!(!error.to_string().contains("PUBLIC_TEST_MARKER"));
             assert_eq!(repo_head(&repo), head);
             assert_eq!(intent_git::local_changes(&repo).unwrap(), before);
@@ -3018,8 +1798,8 @@ mod tests {
 
     /// Two non-origin remotes (scp-like and ssh URLs, one with a push URL),
     /// tracking tips ahead of and diverged from HEAD, and the branch tracking
-    /// the fork: everything is restored as configured on the source, the
-    /// sandbox stays remote-less, and no `origin` is invented.
+    /// the fork: everything is restored as configured on the source, and no
+    /// `origin` is invented.
     #[test]
     fn multiple_non_origin_remotes_roundtrip() {
         let src = tempfile::TempDir::new().unwrap();
@@ -3065,16 +1845,10 @@ mod tests {
         let mut ws = workspace_for_repo(&repo);
         ws.branch = "feature".to_string();
         ws.base_ref = Some("main".to_string());
-        let agent = AgentId::new();
-        let branch = format!("sb/{}", agent.0);
-        let sb_src = src.path().join("sandbox");
-        make_sandbox_clone(&repo, &sb_src, &branch);
-        fgit(&sb_src, &["remote", "remove", "origin"]);
-        let sb = sandbox_row(&ws, &agent, &sb_src, &branch);
         let staging = src.path().join("staging");
         let TransferBundle {
             bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, std::slice::from_ref(&sb), &staging).unwrap();
+        } = create_transfer_bundle(&ws, &staging).unwrap();
         let names: Vec<&str> = refs.remotes.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["fork", "upstream"]);
         assert_eq!(
@@ -3087,14 +1861,8 @@ mod tests {
         );
 
         let target = tempfile::TempDir::new().unwrap();
-        let out = materialize_workspace_git_blocking(
-            &bundle_path,
-            &refs,
-            &ws,
-            std::slice::from_ref(&sb),
-            target.path(),
-        )
-        .unwrap();
+        let out =
+            materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path()).unwrap();
         let dst = &out.checkout_dir;
         assert_eq!(
             remote_names(dst),
@@ -3130,11 +1898,6 @@ mod tests {
             "fork/feature"
         );
         assert_eq!(intent_git::local_changes(dst).unwrap(), src_changes);
-        assert_eq!(out.sandboxes.len(), 1);
-        assert!(
-            remote_names(&out.sandboxes[0].path).is_empty(),
-            "sandboxes stay remote-less"
-        );
         assert_no_config_mentions(&dst.join(".git"), staging.to_str().unwrap());
     }
 
@@ -3210,7 +1973,7 @@ mod tests {
         assert_eq!(intent_git::local_changes(&dst).unwrap().unpushed_count, 1);
     }
 
-    fn assert_local_anchor_tamper_rolls_back(use_sandbox: bool) {
+    fn assert_local_anchor_tamper_rolls_back() {
         let src = tempfile::tempdir().unwrap();
         let repo = src.path().join("source-repo");
         init_repo(&repo);
@@ -3226,18 +1989,10 @@ mod tests {
         let mut ws = workspace_for_repo(&repo);
         ws.branch = "feature".into();
         ws.base_commit_sha = Some(local.clone());
-        let agent = AgentId::new();
-        let branch = format!("sb/{}", agent.0);
-        let sandbox = src.path().join("sandbox");
-        make_sandbox_clone(&repo, &sandbox, &branch);
-        let sb = sandbox_row(&ws, &agent, &sandbox, &branch);
-        let sandboxes = std::slice::from_ref(&sb);
-        let bundle = create_transfer_bundle(&ws, sandboxes, &src.path().join("staging")).unwrap();
+        let bundle = create_transfer_bundle(&ws, &src.path().join("staging")).unwrap();
         assert_eq!(bundle.refs.base_sha.as_deref(), Some(local.as_str()));
-        assert_eq!(bundle.refs.sandboxes[0].head_sha, local);
         assert_eq!(bundle.refs.remotes[0].tracking_refs[0].sha, published);
         assert!(bundle.refs.workspace_wip_commit_sha.is_none());
-        assert!(bundle.refs.sandboxes[0].wip_commit_sha.is_none());
         assert_eq!(intent_git::local_changes(&repo).unwrap().unpushed_count, 1);
 
         let valid_target = tempfile::tempdir().unwrap();
@@ -3245,7 +2000,6 @@ mod tests {
             &bundle.bundle_path,
             &bundle.refs,
             &ws,
-            sandboxes,
             valid_target.path(),
         )
         .unwrap();
@@ -3257,11 +2011,7 @@ mod tests {
             1
         );
 
-        let anchor = if use_sandbox {
-            bundle.refs.sandboxes[0].bundle_ref.clone()
-        } else {
-            bundle.refs.base_bundle_ref.clone().unwrap()
-        };
+        let anchor = bundle.refs.base_bundle_ref.clone().unwrap();
         assert!(fgit(
             &repo,
             &["bundle", "list-heads", bundle.bundle_path.to_str().unwrap()]
@@ -3275,13 +2025,8 @@ mod tests {
         let tampered: TransferRefsManifest = serde_json::from_value(metadata).unwrap();
         let target = tempfile::tempdir().unwrap();
         fs::write(target.path().join("keep.txt"), "untouched").unwrap();
-        let result = materialize_workspace_git_blocking(
-            &bundle.bundle_path,
-            &tampered,
-            &ws,
-            sandboxes,
-            target.path(),
-        );
+        let result =
+            materialize_workspace_git_blocking(&bundle.bundle_path, &tampered, &ws, target.path());
         if let Ok(out) = result {
             let unpushed = intent_git::local_changes(&out.checkout_dir)
                 .unwrap()
@@ -3303,12 +2048,7 @@ mod tests {
 
     #[test]
     fn review_r5_base_anchor_tamper_rejects_and_rolls_back() {
-        assert_local_anchor_tamper_rolls_back(false);
-    }
-
-    #[test]
-    fn review_r5_sandbox_anchor_tamper_rejects_and_rolls_back() {
-        assert_local_anchor_tamper_rolls_back(true);
+        assert_local_anchor_tamper_rolls_back();
     }
 
     /// Source with the published commit at `refs/remotes/origin/main`, one
@@ -3365,7 +2105,7 @@ mod tests {
         case: &str,
     ) {
         let target = tempfile::tempdir().unwrap();
-        let out = materialize_workspace_git_blocking(bundle, refs, &src.ws, &[], target.path())
+        let out = materialize_workspace_git_blocking(bundle, refs, &src.ws, target.path())
             .unwrap_or_else(|e| panic!("{case}: {e}"));
         assert_eq!(repo_head(&out.checkout_dir), src.local, "{case}");
         assert_eq!(
@@ -3395,16 +2135,15 @@ mod tests {
         let bundle_bytes = fs::read(bundle).unwrap();
         let target = tempfile::tempdir().unwrap();
         fs::write(target.path().join("keep.txt"), "untouched").unwrap();
-        let err =
-            match materialize_workspace_git_blocking(bundle, refs, &src.ws, &[], target.path()) {
-                Ok(out) => {
-                    let unpushed = intent_git::local_changes(&out.checkout_dir)
-                        .unwrap()
-                        .unpushed_count;
-                    panic!("{case}: local-only commit accepted as published: unpushed={unpushed}");
-                }
-                Err(e) => e.to_string(),
-            };
+        let err = match materialize_workspace_git_blocking(bundle, refs, &src.ws, target.path()) {
+            Ok(out) => {
+                let unpushed = intent_git::local_changes(&out.checkout_dir)
+                    .unwrap()
+                    .unpushed_count;
+                panic!("{case}: local-only commit accepted as published: unpushed={unpushed}");
+            }
+            Err(e) => e.to_string(),
+        };
         assert!(
             err.contains("remote transfer cannot safely preserve configured Git behavior"),
             "{case}: {err}"
@@ -3448,7 +2187,7 @@ mod tests {
     fn review_r6_legacy_fallback_branch_alias_rejects_and_rolls_back() {
         let alias = "refs/remotes/origin/forged";
         let src = alias_source(|_| alias.to_string());
-        let bundle = create_transfer_bundle(&src.ws, &[], &src.tmp.path().join("staging")).unwrap();
+        let bundle = create_transfer_bundle(&src.ws, &src.tmp.path().join("staging")).unwrap();
         let tracking = &bundle.refs.remotes[0].tracking_refs[0];
         assert_eq!(tracking.ref_name, "refs/remotes/origin/main");
         assert_eq!(tracking.sha, src.published);
@@ -3523,7 +2262,7 @@ mod tests {
             )
         });
         let alias = src.ws.branch.clone();
-        let bundle = create_transfer_bundle(&src.ws, &[], &src.tmp.path().join("staging")).unwrap();
+        let bundle = create_transfer_bundle(&src.ws, &src.tmp.path().join("staging")).unwrap();
         let tracking = &bundle.refs.remotes[0].tracking_refs[0];
         assert_ne!(tracking.bundle_ref.as_deref(), Some(alias.as_str()));
         let heads = bundle_heads(&src.repo, &bundle.bundle_path);
@@ -3579,7 +2318,7 @@ mod tests {
         let ws = workspace_for_repo(&repo);
         let TransferBundle {
             bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        } = create_transfer_bundle(&ws, &src.path().join("staging")).unwrap();
         let wip = refs.workspace_wip_commit_sha.clone().unwrap();
 
         let tamper: Vec<(&str, Tamper)> = vec![
@@ -3732,8 +2471,7 @@ mod tests {
             let mut bad = refs.clone();
             mutate(&mut bad);
             let target = tempfile::TempDir::new().unwrap();
-            let err =
-                materialize_workspace_git_blocking(&bundle_path, &bad, &ws, &[], target.path());
+            let err = materialize_workspace_git_blocking(&bundle_path, &bad, &ws, target.path());
             assert!(err.is_err(), "{case}: import must fail");
             assert!(!err.unwrap_err().to_string().contains("PUBLIC_TEST_MARKER"));
             assert!(
@@ -3746,8 +2484,8 @@ mod tests {
         let mut cred = refs.clone();
         cred.remotes[0].url = "ssh://u:s3cret@example.com/r.git".to_string();
         let target = tempfile::TempDir::new().unwrap();
-        let out = materialize_workspace_git_blocking(&bundle_path, &cred, &ws, &[], target.path())
-            .unwrap();
+        let out =
+            materialize_workspace_git_blocking(&bundle_path, &cred, &ws, target.path()).unwrap();
         assert_eq!(
             fgit(&out.checkout_dir, &["remote", "get-url", "origin"]),
             "ssh://u@example.com/r.git"
@@ -3756,7 +2494,7 @@ mod tests {
 
         // The untampered manifest still imports.
         let target = tempfile::TempDir::new().unwrap();
-        materialize_workspace_git_blocking(&bundle_path, &refs, &ws, &[], target.path()).unwrap();
+        materialize_workspace_git_blocking(&bundle_path, &refs, &ws, target.path()).unwrap();
     }
 
     #[test]
@@ -3774,7 +2512,7 @@ mod tests {
         fgit(&source, &["branch", "-u", "origin/main", "main"]);
         let local = commit_file(&source, "local.txt", "local\n", "unpublished legacy commit");
         let ws = workspace_for_repo(&source);
-        let bundle = create_transfer_bundle(&ws, &[], &tmp.path().join("staging")).unwrap();
+        let bundle = create_transfer_bundle(&ws, &tmp.path().join("staging")).unwrap();
         let mut json = serde_json::to_value(bundle.refs).unwrap();
         for key in ["workspacePushRemote", "remotePushDefault", "pushDefault"] {
             json.as_object_mut().unwrap().remove(key);
@@ -3812,7 +2550,6 @@ mod tests {
             &legacy_bundle,
             &refs,
             &ws,
-            &[],
             &tmp.path().join("target"),
         )
         .unwrap();
@@ -3843,7 +2580,7 @@ mod tests {
         let ws = workspace_for_repo(&repo);
         let TransferBundle {
             bundle_path, refs, ..
-        } = create_transfer_bundle(&ws, &[], &src.path().join("staging")).unwrap();
+        } = create_transfer_bundle(&ws, &src.path().join("staging")).unwrap();
         let mut json: serde_json::Value = serde_json::to_value(&refs).unwrap();
         let obj = json.as_object_mut().unwrap();
         assert!(obj.remove("remotes").is_some());
@@ -3854,8 +2591,7 @@ mod tests {
 
         let target = tempfile::TempDir::new().unwrap();
         let out =
-            materialize_workspace_git_blocking(&bundle_path, &legacy, &ws, &[], target.path())
-                .unwrap();
+            materialize_workspace_git_blocking(&bundle_path, &legacy, &ws, target.path()).unwrap();
         assert!(remote_names(&out.checkout_dir).is_empty());
         assert_eq!(ref_sha(&out.checkout_dir, "refs/remotes/origin/main"), None);
     }

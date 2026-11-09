@@ -1,6 +1,6 @@
-//! The in-crate runtime feature: the `script.*`, `hook.*`, `terminal.*`,
-//! `browser.*` and `sandbox.*` RPCs behind [`RuntimePort`], the sandbox,
-//! browser-client and setup-script entry points core code calls through it,
+//! The in-crate runtime feature: the `script.*`, `hook.*`, `terminal.*`
+//! and `browser.*` RPCs behind [`RuntimePort`], the browser-client and
+//! setup-script entry points core code calls through it,
 //! and the shared script/hook registries the feature owns.
 //!
 //! Core reaches the feature only through the port (the `WorkspaceApi`
@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use intent_core::execution::HostExecutionContext;
 use intent_core::{
-    now_iso, AgentId, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, HookId, Result,
+    AgentId, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, HookId, Result,
     ReverseDispatchError, ScriptCreateParams, WorkspaceApi, WorkspaceId,
 };
 
@@ -28,12 +28,10 @@ use crate::host_execution::HostExecutionExt;
 use crate::script_monitor::ScriptMonitorExt;
 use crate::script_output_cleanup::ScriptOutputCleanupExt;
 use crate::{
-    browser_tabs, hook_manager, sandbox_ops, script_ops, script_output_store, setup_runner,
-    terminal_ops,
+    browser_tabs, hook_manager, script_ops, script_output_store, setup_runner, terminal_ops,
 };
 use intent_services::feature_api::feature_ports::{
-    CommandScriptActivity, MergeOutcome, ProvisionOutcome, RuntimePort, ScriptsClosing,
-    SetupScriptRun,
+    CommandScriptActivity, RuntimePort, ScriptsClosing, SetupScriptRun,
 };
 use intent_services::feature_api::{
     browser_ops, capability, record_setup_running, write_private_script, Services,
@@ -1303,145 +1301,6 @@ impl RuntimePort for RuntimeFeature {
         })
     }
 
-    fn sandbox_merge<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: WorkspaceId,
-        sandbox_id: AgentId,
-    ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        let store = svc.store().clone();
-        Box::pin(async move {
-            use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
-            use intent_store::SandboxStatus;
-
-            svc.require_agent_member(&sandbox_id).await?;
-
-            // Claim the merge atomically (current status → merging) so the RPC
-            // never merges concurrently with the completion path or the
-            // background retry sweep — every merge path goes through the same
-            // compare-and-swap claim protocol.
-            let sandbox = store
-                .get_sandbox(&workspace_id, &sandbox_id)
-                .await?
-                .ok_or_else(|| Error::Internal("Sandbox not found".to_string()))?;
-            if sandbox.status == SandboxStatus::Merging {
-                return Err(Error::Internal(
-                    "Sandbox merge already in progress".to_string(),
-                ));
-            }
-            let claimed = store
-                .try_transition_sandbox_status(
-                    &workspace_id,
-                    &sandbox_id,
-                    sandbox.status,
-                    SandboxStatus::Merging,
-                    &now_iso(),
-                )
-                .await?;
-            if !claimed {
-                return Err(Error::Internal(
-                    "Sandbox merge already in progress".to_string(),
-                ));
-            }
-
-            // Attempt merge. On a hard error return the sandbox to
-            // merge_pending so it stays visible to the retry sweep and
-            // retryable via this RPC rather than stranded `merging`.
-            let outcome = match merge_sandbox(&store, &workspace_id, &sandbox_id).await {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    let _ = store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &sandbox_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-                    return Err(e);
-                }
-            };
-
-            match outcome {
-                MergeOutcome::Merged {
-                    commit_range,
-                    canonical_head,
-                } => {
-                    // Shared bookkeeping: mark merged, discard sandbox, emit
-                    // sandbox:cow:merged, clear retry count.
-                    svc.finalize_sandbox_merged(
-                        &workspace_id,
-                        &sandbox_id,
-                        &commit_range,
-                        &canonical_head,
-                    )
-                    .await;
-
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "status": "merged",
-                        "commitRange": commit_range,
-                        "canonicalHead": canonical_head,
-                    }))
-                }
-                MergeOutcome::Conflict {
-                    conflicting_paths,
-                    canonical_head,
-                } => {
-                    let _ = store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &sandbox_id,
-                            SandboxStatus::ConflictBounced,
-                            &now_iso(),
-                        )
-                        .await;
-
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "status": "conflict",
-                        "conflictingPaths": conflicting_paths,
-                        "canonicalHead": canonical_head,
-                    }))
-                }
-                MergeOutcome::Blocked {
-                    reason,
-                    overlapping_paths,
-                } => {
-                    let _ = store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &sandbox_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "status": "blocked",
-                        "reason": reason,
-                        "overlappingPaths": overlapping_paths,
-                    }))
-                }
-            }
-        })
-    }
-
-    fn sandbox_discard<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: WorkspaceId,
-        sandbox_id: AgentId,
-    ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        let store = svc.store().clone();
-        Box::pin(async move {
-            svc.require_agent_member(&sandbox_id).await?;
-            crate::sandbox_ops::discard_sandbox(&store, &workspace_id, &sandbox_id).await?;
-            Ok(serde_json::json!({ "ok": true }))
-        })
-    }
-
     fn migrate_claimed_browser_tabs<'a>(
         &'a self,
         svc: &'a Services,
@@ -1461,45 +1320,6 @@ impl RuntimePort for RuntimeFeature {
             svc.browser_tabs_rehome_superseded(&client_id, superseded)
                 .await
         })
-    }
-
-    fn provision_sandbox<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: &'a WorkspaceId,
-        agent_id: &'a AgentId,
-        workspaces_root: PathBuf,
-    ) -> BoxFuture<'a, Result<ProvisionOutcome>> {
-        Box::pin(async move {
-            let config = sandbox_ops::ProvisionConfig { workspaces_root };
-            sandbox_ops::provision_sandbox(svc.store(), workspace_id, agent_id, &config).await
-        })
-    }
-
-    fn merge_sandbox<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: &'a WorkspaceId,
-        agent_id: &'a AgentId,
-    ) -> BoxFuture<'a, Result<MergeOutcome>> {
-        Box::pin(sandbox_ops::merge_sandbox(
-            svc.store(),
-            workspace_id,
-            agent_id,
-        ))
-    }
-
-    fn discard_sandbox<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: &'a WorkspaceId,
-        agent_id: &'a AgentId,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(sandbox_ops::discard_sandbox(
-            svc.store(),
-            workspace_id,
-            agent_id,
-        ))
     }
 
     fn run_setup_script(
@@ -1948,9 +1768,6 @@ mod remote_script_monitor_watch_tests;
 
 #[cfg(test)]
 mod retire_workspace_tests;
-
-#[cfg(test)]
-mod sandbox_file_write_tests;
 
 #[cfg(test)]
 mod script_monitor_cancel_race_tests;

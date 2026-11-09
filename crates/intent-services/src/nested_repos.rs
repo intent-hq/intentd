@@ -3,8 +3,7 @@
 //! skips embedded repos, but libgit2's `add_all` rejects their paths outright
 //! (`invalid path ... class=Index`), so every whole-tree `add_all` over a
 //! user-controlled directory must filter them via the matched-path callback.
-//! Used by the transfer/export WIP snapshot (`transfer_git`) and the sandbox
-//! staging paths (`sandbox_ops`).
+//! Used by the transfer/export WIP snapshot (`transfer_git`).
 
 use std::path::{Path, PathBuf};
 

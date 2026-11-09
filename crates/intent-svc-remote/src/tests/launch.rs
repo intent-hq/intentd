@@ -1816,13 +1816,13 @@ async fn target_local_runs_a_remote_agents_sub_agent_on_the_backend() {
             &link,
             &parent,
             "agent.delegate",
-            json!({ "taskText": "do it", "provider": "mock", "isolation": "cow" }),
+            json!({ "taskText": "do it", "provider": "mock", "isolation": "shared" }),
         )
         .await,
     );
     assert!(
         isolated.message.contains(
-            "agent.delegate: a remote agent's sub-agents run on its machine, so isolation does not apply; pass placement { target: \"local\" } to use isolation on the backend"
+            "agent.delegate: a remote agent's sub-agents run on its machine, so isolation does not apply"
         ),
         "{isolated:?}"
     );
@@ -1831,7 +1831,7 @@ async fn target_local_runs_a_remote_agents_sub_agent_on_the_backend() {
             &link,
             &parent,
             "agent.delegate",
-            json!({ "tasks": ["note-1"], "isolation": "cow" }),
+            json!({ "tasks": ["note-1"], "isolation": "shared" }),
         )
         .await,
     );

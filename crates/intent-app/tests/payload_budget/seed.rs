@@ -97,6 +97,9 @@ pub const AGENT_FILE_EVENTS: usize = 300;
 pub const HOT_FILE: &str = "src/large_state/hot_file.rs";
 /// Tracked changes owned by the big agent.
 pub const AGENT_TRACKED_CHANGES: usize = 500;
+// The big agent's tracked paths are the worktree's dirty history modules
+// and its 300 untracked files.
+const _: () = assert!(AGENT_TRACKED_CHANGES <= GIT_COMMITS + 300);
 /// Provider profiles per base provider (the daemon's cap is 32).
 pub const PROFILES_PER_PROVIDER: usize = 32;
 /// Pending host invites.
@@ -517,8 +520,8 @@ pub async fn store(state: &LargeState) -> Seeded {
             .expect("interrupted agent");
     }
 
-    // Agents actively working in sandboxes on tracked files, with
-    // auto-commit on: the lock snapshot names them and their paths.
+    // Agents actively working on tracked files, with auto-commit on: the
+    // lock snapshot names them and their paths.
     store
         .set_workspace_auto_commit(big_ws, true)
         .await
@@ -536,7 +539,6 @@ pub async fn store(state: &LargeState) -> Seeded {
             continue;
         }
         s.status = AgentStatus::Active;
-        s.sandbox_path = Some(format!("/tmp/large-state-sandbox/{}", agent.0));
         store
             .update_agent_session(big_ws, &s)
             .await
@@ -757,12 +759,19 @@ pub async fn store(state: &LargeState) -> Seeded {
         .await
         .expect("agent file events");
 
-    // Tracked changes owned by the big agent.
+    // Tracked changes owned by the big agent, on paths the seeded worktree
+    // really has dirty (edited history modules, then untracked files): the
+    // lock snapshot judges every agent's paths against the worktree.
     for i in 0..AGENT_TRACKED_CHANGES {
+        let path = if i < GIT_COMMITS {
+            format!("src/history/module_{i}.rs")
+        } else {
+            format!("src/history/untracked_{}.rs", i - GIT_COMMITS)
+        };
         store
             .upsert_tracked_change(&intent_store::NewTrackedChange {
                 workspace_id: big_ws.clone(),
-                path: format!("packages/app/src/agent_zero/module_{i}.tsx"),
+                path,
                 stage: "unstaged".into(),
                 status: "modified".into(),
                 agent_id: Some(ids.big_agent.0.clone()),

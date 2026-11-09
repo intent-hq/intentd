@@ -362,29 +362,6 @@ async fn prune_keeps_a_row_committed_between_passes() {
     assert_eq!(paths(&svc, &ws).await, owned(&[("done.rs", "committed")]));
 }
 
-/// A sandboxed (copy-on-write) agent's rows describe files in its sandbox, which the
-/// workspace worktree cannot judge: the sweep leaves them alone and the lock
-/// filter keeps them.
-#[tokio::test]
-async fn sandboxed_agent_rows_are_left_alone() {
-    let repo = init_repo();
-    let (_t, svc, ws) = svc_for(Some(&repo.dir)).await;
-    let mut agent = crate::agent_locks::tests::session("agent-1", &ws, AgentStatus::Active, None);
-    agent.sandbox_path = Some(repo.dir.join("sandbox").to_string_lossy().to_string());
-    svc.store().insert_agent_session(&agent).await.unwrap();
-    track(&svc, &ws, "src/in-sandbox.rs", "unstaged").await;
-
-    assert_eq!(prune_confirmed(&svc, &ws).await, 0);
-    assert_eq!(
-        paths(&svc, &ws).await,
-        owned(&[("src/in-sandbox.rs", "unstaged")])
-    );
-    assert_eq!(
-        svc.compute_agent_locks(&ws).await.locked_file_paths,
-        vec!["src/in-sandbox.rs".to_string()]
-    );
-}
-
 /// A workspace whose worktree cannot be scanned, or that has no local
 /// worktree, deletes nothing; the multi-workspace pass prunes the rest.
 #[tokio::test]

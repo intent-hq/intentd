@@ -1932,10 +1932,10 @@ async fn cmd_serve(
     let locality_override = parse_locality_mode(mode)?;
     let config = resolve_config()?;
     std::fs::create_dir_all(&config.data_dir)?;
-    // CoW isolation startup probe: probe the workspaces root once at daemon startup
+    // CoW startup probe: probe the workspaces root once at daemon startup
     // so the result is cached for future cow_probe calls. This runs before the
-    // store/services are initialized so the cache is ready when sandbox provisioning
-    // needs it. The probe result is also reported by `intentd doctor`.
+    // store/services are initialized so the cache is ready when CoW workspace
+    // checkouts need it. The probe result is also reported by `intentd doctor`.
     probe_cow_at_startup(&config);
     // Prewarm the login-shell PATH capture (`$SHELL -ilc`, ~5-10s cold: an
     // interactive-shell attempt plus a non-interactive fallback, each up to
@@ -2924,13 +2924,6 @@ async fn cmd_serve_owned(
             intent_core::agent_logs_root(&config.data_dir),
         )
     });
-    // Merge-pending retry sweep: periodically retry merge-back for sandboxes
-    // stranded `merge_pending` (daemon restart mid-merge, historical failures
-    // like the pre-#592 fetch bug). First tick fires immediately so stuck
-    // sandboxes self-heal on startup. Shutdown stops new ticks and joins the active sweep.
-    let (stop_merge_retry, merge_retry_stopping) = tokio::sync::watch::channel(false);
-    let merge_retry_task = orchestration
-        .spawn(|| spawn_sandbox_merge_retry_loop(services.clone(), merge_retry_stopping));
     // External MCP servers (§18.3): the health monitor (periodic ping +
     // auto-restart pushing `mcp.servers:status-changed`) starts immediately;
     // starting the enabled servers themselves is deferred to the background
@@ -3264,7 +3257,6 @@ async fn cmd_serve_owned(
         let host_exec_runtime = host_exec_runtime.clone();
         let reverse_registry = reverse_registry.clone();
         let startup_stop = startup_stop.clone();
-        let stop_merge_retry = stop_merge_retry.clone();
         let mcp_hub = mcp_hub.clone();
         let notify = shutdown_notify.clone();
         let cancellation = bootstrap.cancellation.clone();
@@ -3281,7 +3273,6 @@ async fn cmd_serve_owned(
             intent_services::host_exec_stream::registry().begin_shutdown();
             reverse_registry.begin_shutdown();
             let _ = startup_stop.send(true);
-            let _ = stop_merge_retry.send(true);
             mcp_hub.begin_background_shutdown();
             // Latch the cause at the decision point, before any teardown
             // await: a staged restart that fires later must not overwrite a
@@ -3532,7 +3523,6 @@ async fn cmd_serve_owned(
     // let the current service operation commit/reset its claim, skip later
     // candidates, then let manager.shutdown capture any admitted turns.
     let _ = startup_stop.send(true);
-    let _ = stop_merge_retry.send(true);
     mcp_hub.begin_background_shutdown();
     // A config reload can restart a listener. Finish its admitted hook before
     // the final listener teardown, while request admission is already fenced.
@@ -3640,7 +3630,6 @@ async fn cmd_serve_owned(
     let _ = note_paging_cleanup_task.await;
     idempotency_reap_task.abort();
     let _ = idempotency_reap_task.await;
-    let _ = merge_retry_task.await;
     // Stop watcher lifecycle admission and flush its finite publishers, then
     // finish any admitted git-status branch reconciliation.
     let _ = stop_watchers.send(());
@@ -7067,75 +7056,6 @@ fn spawn_idempotency_reap_loop(
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => tracing::warn!(error = %e, "agent stderr log sweep failed"),
                 Err(e) => tracing::warn!(error = %e, "agent stderr log sweep task failed"),
-            }
-        }
-    })
-}
-
-/// Interval between merge-pending retry sweeps.
-const SANDBOX_MERGE_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
-
-/// Spawn the periodic merge-pending retry sweep. Merge-back otherwise only
-/// triggers on agent completion or the manual `sandbox.cow.merge` RPC, so a
-/// sandbox stranded `merge_pending` (daemon restart mid-merge, or historical
-/// failures like the pre-#592 fetch bug) never self-heals. Each tick calls
-/// [`Services::sweep_merge_pending_sandboxes`]: retries every `merge_pending`
-/// sandbox (up to the per-sandbox retry cap), skipping agents that are
-/// mid-turn. The first tick fires immediately so stuck sandboxes recover on
-/// startup; a no-op sweep is silent, an active one logs its tally. Shutdown
-/// stops between ticks and joins an admitted sweep through cleanup and events.
-fn spawn_sandbox_merge_retry_loop(
-    services: Services,
-    mut stopping: tokio::sync::watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
-    tracing::info!(
-        interval_secs = SANDBOX_MERGE_SWEEP_INTERVAL.as_secs(),
-        "merge-pending retry sweep enabled"
-    );
-    intent_core::spawn_daemon(async move {
-        if *stopping.borrow() {
-            return;
-        }
-        // Crash recovery: a daemon that died mid-merge leaves sandboxes
-        // stranded `merging` — invisible to the sweep. No merge can be in
-        // flight on a fresh daemon, so reset them to `merge_pending` before
-        // the first tick picks them up.
-        services.recover_stranded_merging_sandboxes().await;
-        let mut ticker = tokio::time::interval(SANDBOX_MERGE_SWEEP_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                biased;
-                _ = stopping.changed() => break,
-                _ = ticker.tick() => {}
-            }
-            if *stopping.borrow() {
-                break;
-            }
-            let summary = services.sweep_merge_pending_sandboxes().await;
-            // INFO only when the sweep attempted work; skip-only passes
-            // (e.g. a permanently capped sandbox every tick) log at debug so
-            // they do not spam the log forever.
-            let attempted =
-                summary.merged + summary.conflicts + summary.blocked + summary.errors > 0;
-            if attempted {
-                tracing::info!(
-                    merged = summary.merged,
-                    conflicts = summary.conflicts,
-                    blocked = summary.blocked,
-                    skipped_capped = summary.skipped_capped,
-                    skipped_busy = summary.skipped_busy,
-                    skipped_raced = summary.skipped_raced,
-                    errors = summary.errors,
-                    "merge-pending retry sweep completed"
-                );
-            } else if !summary.is_empty() {
-                tracing::debug!(
-                    skipped_capped = summary.skipped_capped,
-                    skipped_busy = summary.skipped_busy,
-                    skipped_raced = summary.skipped_raced,
-                    "merge-pending retry sweep: skips only, nothing attempted"
-                );
             }
         }
     })
