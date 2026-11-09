@@ -82,7 +82,7 @@ NATIVE_STEPS = (
     "Clippy (target-gated code)",
     "Tunnel deadline and TLS controls (macOS runtime)",
     "Codex focused diagnostics (macOS runtime)",
-    "Retained workspace CoW fixtures (macOS runtime)",
+    "Retained capability gate fixture (macOS runtime)",
     "Native lifecycle runtime proof (macOS)",
 )
 MACOS_LIFECYCLE_STEP = "Native lifecycle runtime proof (macOS)"

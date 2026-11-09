@@ -30,7 +30,7 @@ JOBS = ("check", "build", "windows", "coverage-e2e", "coverage-all", "coverage-c
 # workflow bodies with a stub rustup in test_indirect_workflow_child_environments.
 INDIRECT_TEST_STEPS = {
     ("build", "Tunnel deadline and TLS controls (macOS runtime)"),
-    ("build", "Retained workspace CoW fixtures (macOS runtime)"),
+    ("build", "Retained capability gate fixture (macOS runtime)"),
 }
 # ci-killed-rustc-retry.sh is a transparent prefix: it runs the same cargo
 # command (once more only when the runner killed rustc).
@@ -143,7 +143,7 @@ def violations(workflow, policy):
         found.add(name)
         env = {**workflow.get("env", {}), **job.get("env", {}), **step.get("env", {})}
         command_policies = [str(env.get("INTENTD_ASSERT_BOUND_CALLER", ""))]
-        # A step-wide unset previously disabled every retained CoW fixture.
+        # A step-wide unset previously disabled every retained fixture.
         if re.search(r"^\s*unset\b[^\n]*\bINTENTD_ASSERT_BOUND_CALLER\b", str(step.get("run", "")), re.M):
             command_policies.append("")
         for line in str(step.get("run", "")).splitlines():
@@ -187,7 +187,7 @@ REQUIRED_TEST_STEPS = {
     ("check", "Installer guard tests (install_ps1_owner)"): 1,
     # None: indirect Python/Bash-array routes are executed with a stub below.
     ("build", "Tunnel deadline and TLS controls (macOS runtime)"): None,
-    ("build", "Retained workspace CoW fixtures (macOS runtime)"): None,
+    ("build", "Retained capability gate fixture (macOS runtime)"): None,
     # Post-merge only (push); see the `windows` job.
     ("windows", "Headless workspace setup (Windows runtime)"): 2,
     ("windows", "Codex diagnostic process ownership (Windows runtime)"): 1,
@@ -240,7 +240,7 @@ class CiPolicyTests(unittest.TestCase):
 
     def test_indirect_route_cannot_unset_policy(self):
         for step_name in ("Tunnel deadline and TLS controls (macOS runtime)",
-                          "Retained workspace CoW fixtures (macOS runtime)"):
+                          "Retained capability gate fixture (macOS runtime)"):
             with self.subTest(step=step_name):
                 workflow = copy.deepcopy(self.workflow)
                 owner = "build"
@@ -536,7 +536,7 @@ else:
 
     def test_indirect_workflow_child_environments(self):
         for step_name, expected_tests in (
-            ("Retained workspace CoW fixtures (macOS runtime)", 6),
+            ("Retained capability gate fixture (macOS runtime)", 1),
         ):
             with self.subTest(step=step_name), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -553,9 +553,6 @@ else:
                     " print(test+': test'); print('1 test, 0 benchmarks'); sys.exit(0)\n"
                     "print('running 1 test')\n"
                     "print('test result: ok. 1 passed; 0 failed; 0 ignored;')\n"
-                    "print('CoW fixture clone and independent contents verified')\n"
-                    "print('CoW fixture proof scratch cleaned')\n"
-                    "print('CoW fixture assertions passed: '+test.split('::')[-1])\n"
                 )
                 stub.chmod(0o755)
                 step = next(s for s in self.workflow['jobs']['build']['steps'] if s.get('name') == step_name)
