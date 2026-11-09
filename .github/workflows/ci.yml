@@ -2337,8 +2337,8 @@ jobs:
     # it queues), after queueing and on main pushes. Fork PRs skip it with
     # the route job. Release-metadata PRs and pushes (release-fast-path)
     # skip it: their diff touches only versions, Cargo.lock and the
-    # changelog, never the scripts/ and .github/ files it tests, and the
-    # same tree already passed it in the merge queue. `!cancelled()` lets an
+    # changelog, never the scripts/ and .github/ files it tests, on a
+    # parent tree that already passed it. `!cancelled()` lets an
     # ordinary PR or queue run start once release-fast-path skips.
     if: ${{ !cancelled() && needs.route.result == 'success' && ((github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true') || github.event_name == 'merge_group' || (github.event_name == 'push' && needs.release-fast-path.outputs.release_push != 'true')) }}
     # About 2 min on a hosted runner (measured on Depot); on a busy shared self-hosted slot it ran 5 min
