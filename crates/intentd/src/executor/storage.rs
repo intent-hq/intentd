@@ -29,6 +29,8 @@ const REPOS: &str = "repos";
 const GIT_SOCKET: &str = "git.sock";
 const PULLS: &str = "pulls";
 const HOME: &str = "home";
+/// In an agent's home: the id of the agent that owns it.
+const OWNER: &str = ".agent";
 const WORK: &str = "work";
 const TMP: &str = "tmp";
 
@@ -156,6 +158,7 @@ pub(super) fn work_base(
 }
 
 /// `credential`'s work dir under `base`: 8 hex digits of its id.
+#[cfg(test)]
 pub(super) fn work_dir(base: &Path, credential: &str) -> PathBuf {
     base.join(hex_digest(credential.as_bytes(), 4))
 }
@@ -174,31 +177,71 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// The home named by the agent record `record`, if it names a safe one.
-fn read_home(record: &Path) -> Option<PathBuf> {
+/// The 8 hex digits naming the work dir of the credential whose root is
+/// `root`.
+fn credential_tag(root: &Path) -> String {
     use std::os::unix::ffi::OsStrExt as _;
-    let body = std::fs::read(record.join(HOME)).ok()?;
-    let home = PathBuf::from(std::ffi::OsStr::from_bytes(&body));
-    let name = home.file_name()?.to_str()?;
-    (home.is_absolute() && valid_id(name)).then_some(home)
+    hex_digest(root.file_name().unwrap_or_default().as_bytes(), 4)
 }
 
-/// Make a new owner-only home for `agent_id` in `work`: named by 12 hex
-/// digits of its id, or by the whole id when that name is taken.
+/// The home named by the agent record `record`: only a plain absolute
+/// path into a work dir named `tag`, to a directory `agent_id` owns.
+fn read_home(record: &Path, tag: &str, agent_id: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Component;
+    let body = std::fs::read(record.join(HOME)).ok()?;
+    let home = PathBuf::from(std::ffi::OsStr::from_bytes(&body));
+    let mut parts = home.components();
+    let plain = parts.next() == Some(Component::RootDir)
+        && parts.all(|part| matches!(part, Component::Normal(_)));
+    let name = home.file_name()?.to_str()?;
+    let in_tag = home.parent()?.file_name()? == std::ffi::OsStr::new(tag);
+    (plain && valid_id(name) && in_tag && owned_by(&home, agent_id)).then_some(home)
+}
+
+/// Whether `dir` is a real directory whose owner file names `agent_id`.
+fn owned_by(dir: &Path, agent_id: &str) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+        && std::fs::read(dir.join(OWNER)).is_ok_and(|owner| owner == agent_id.as_bytes())
+}
+
+/// The names `agent_id`'s home may have in a work dir: 12 hex digits of
+/// its id, or the whole id when that name is taken.
+fn home_names(work: &Path, agent_id: &AgentId) -> [PathBuf; 2] {
+    [
+        work.join(hex_digest(agent_id.0.as_bytes(), 6)),
+        work.join(&agent_id.0),
+    ]
+}
+
+/// Make (or take back, after a crash) an owner-only home for `agent_id` in
+/// `work`. A name another agent owns is never touched.
 fn reserve_home(work: &Path, agent_id: &AgentId) -> anyhow::Result<PathBuf> {
-    let short = work.join(hex_digest(agent_id.0.as_bytes(), 6));
-    let create = |dir: &Path| std::fs::DirBuilder::new().mode(0o700).create(dir);
-    match create(&short) {
-        Ok(()) => return Ok(short),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e).with_context(|| format!("create {}", short.display())),
+    for dir in home_names(work, agent_id) {
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if owned_by(&dir, &agent_id.0) {
+                    return Ok(dir);
+                }
+                // Empty and unowned: a crash right after its creation.
+                if std::fs::remove_dir(&dir).is_err() {
+                    continue;
+                }
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&dir)
+                    .with_context(|| format!("create {}", dir.display()))?;
+            }
+            Err(e) => return Err(e).with_context(|| format!("create {}", dir.display())),
+        }
+        if let Err(e) = std::fs::write(dir.join(OWNER), &agent_id.0) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e).with_context(|| format!("claim {}", dir.display()));
+        }
+        return Ok(dir);
     }
-    let full = work.join(&agent_id.0);
-    // A home under the whole id that no record names is this agent's own,
-    // left by a crash: it starts over.
-    remove_dir(&full)?;
-    create(&full).with_context(|| format!("create {}", full.display()))?;
-    Ok(full)
+    anyhow::bail!("no free home for the agent in {}", work.display())
 }
 
 /// Remove `dir`; a missing one is already removed.
@@ -210,19 +253,35 @@ fn remove_dir(dir: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// Remove the homes the agent records under `root` name, before the root
-/// itself goes (a revoked credential's purge). Best effort.
-pub(super) fn remove_agent_homes(root: &Path) {
-    let Ok(entries) = std::fs::read_dir(root.join(AGENTS)) else {
-        return;
+/// Remove the homes of the credential whose root is `root`, before the
+/// root itself goes (a revoked credential's purge): those its records
+/// name, then its whole work dir under `work_base`. False when one stays,
+/// so the caller keeps the root (and its records) for a later retry.
+pub(super) fn remove_agent_homes(root: &Path, work_base: Option<&Path>) -> bool {
+    let tag = credential_tag(root);
+    let mut removed = true;
+    let mut fail = |error: anyhow::Error| {
+        tracing::warn!(%error, "executor: could not remove an agent's home");
+        removed = false;
     };
-    for entry in entries.filter_map(std::result::Result::ok) {
-        if let Some(home) = read_home(&entry.path()) {
-            if let Err(error) = remove_dir(&home) {
-                tracing::warn!(%error, "executor: could not remove an agent's home");
+    if let Ok(entries) = std::fs::read_dir(root.join(AGENTS)) {
+        for entry in entries.filter_map(std::result::Result::ok) {
+            let Ok(agent_id) = entry.file_name().into_string() else {
+                continue;
+            };
+            if let Some(home) = read_home(&entry.path(), &tag, &agent_id) {
+                if let Err(error) = remove_dir(&home) {
+                    fail(error);
+                }
             }
         }
     }
+    if let Some(base) = work_base {
+        if let Err(error) = remove_dir(&base.join(&tag)) {
+            fail(error);
+        }
+    }
+    removed
 }
 
 /// Whether `id` is safe as one path component.
@@ -242,6 +301,8 @@ pub(super) struct Storage {
     git_socket: PathBuf,
     /// Where new agents' homes go; `None` keeps them in `agents/`.
     work: Option<PathBuf>,
+    /// Held while a home is looked up, made or removed.
+    homes: std::sync::Mutex<()>,
     _lock: nix::fcntl::Flock<File>,
 }
 
@@ -291,6 +352,7 @@ impl Storage {
             root: root.to_owned(),
             git_socket: git_socket.unwrap_or_else(|| root.join(GIT_SOCKET)),
             work: None,
+            homes: std::sync::Mutex::default(),
             _lock: lock,
         })
     }
@@ -299,10 +361,17 @@ impl Storage {
         self.root.join(JOURNAL)
     }
 
-    /// Where new agents' homes go, instead of the root's `agents/`.
-    pub(super) fn with_work_dir(mut self, work: Option<PathBuf>) -> Self {
-        self.work = work;
+    /// Put new agents' homes in this credential's work dir under `base`
+    /// ([`work_dir`]), instead of the root's `agents/`.
+    pub(super) fn with_work_base(mut self, base: Option<&Path>) -> Self {
+        self.work = base.map(|base| base.join(credential_tag(&self.root)));
         self
+    }
+
+    fn lock_homes(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.homes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn record_dir(&self, agent_id: &AgentId) -> PathBuf {
@@ -311,13 +380,23 @@ impl Storage {
 
     /// `agent_id`'s home, if it has one: the directory named by its
     /// record's `home` file, else (an agent from before the work dir) the
-    /// record itself.
+    /// record itself when it holds a checkout or temp folder.
     fn find_home(&self, agent_id: &AgentId) -> Option<PathBuf> {
         if !valid_id(&agent_id.0) {
             return None;
         }
         let record = self.record_dir(agent_id);
-        read_home(&record).or_else(|| record.is_dir().then_some(record))
+        if let Some(home) = read_home(&record, &credential_tag(&self.root), &agent_id.0) {
+            return Some(home);
+        }
+        let legacy = match self.work {
+            None => record.is_dir(),
+            Some(_) => {
+                !record.join(HOME).exists()
+                    && (record.join(WORK).exists() || record.join(TMP).exists())
+            }
+        };
+        legacy.then_some(record)
     }
 
     /// `agent_id`'s home, made on first use: owner-only, in the work dir
@@ -328,6 +407,7 @@ impl Storage {
             valid_id(&agent_id.0),
             "agent id is not a safe path component"
         );
+        let _homes = self.lock_homes();
         if let Some(home) = self.find_home(agent_id) {
             return Ok(home);
         }
@@ -337,10 +417,12 @@ impl Storage {
             builder.recursive(true).mode(0o700);
             builder
         };
+        // The record comes first, so the orphan sweep (which lists records)
+        // finds a home reserved just before a crash.
+        private()
+            .create(&record)
+            .context("create agent directory")?;
         let Some(work) = &self.work else {
-            private()
-                .create(&record)
-                .context("create agent directory")?;
             return Ok(record);
         };
         private()
@@ -359,17 +441,19 @@ impl Storage {
             work.display()
         );
         let home = reserve_home(work, agent_id)?;
-        private()
-            .create(&record)
-            .context("create agent directory")?;
         let pointer = record.join(HOME);
         let scratch = record.join("home.tmp");
-        std::fs::write(
+        let written = std::fs::write(
             &scratch,
             std::os::unix::ffi::OsStrExt::as_bytes(home.as_os_str()),
         )
-        .and_then(|()| std::fs::rename(&scratch, &pointer))
-        .context("record the agent's home")?;
+        .and_then(|()| std::fs::rename(&scratch, &pointer));
+        if let Err(e) = written {
+            // The owned home is taken back on the next try, or removed with
+            // the record.
+            let _ = std::fs::remove_file(&scratch);
+            return Err(e).context("record the agent's home");
+        }
         Ok(home)
     }
 
@@ -421,9 +505,17 @@ impl Storage {
             valid_id(&agent_id.0),
             "agent id is not a safe path component"
         );
+        let _homes = self.lock_homes();
         let record = self.record_dir(agent_id);
-        if let Some(home) = read_home(&record) {
+        if let Some(home) = read_home(&record, &credential_tag(&self.root), &agent_id.0) {
             remove_dir(&home)?;
+        }
+        if let Some(work) = &self.work {
+            for dir in home_names(work, agent_id) {
+                if owned_by(&dir, &agent_id.0) {
+                    remove_dir(&dir)?;
+                }
+            }
         }
         remove_dir(&record)
     }
@@ -620,10 +712,15 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let storage = Storage::open(&parent.path().join("Application Support/node"), None)
             .unwrap()
-            .with_work_dir(Some(parent.path().join("w").join("0f6c1b52")));
+            .with_work_base(Some(&parent.path().join("w")));
         let agent = AgentId::from("agent-081a6de9-213a-4f30-9fb7-6df75e5be8e3");
         let worktree = storage.agent_worktree(&agent).unwrap();
         let name = worktree.strip_prefix(parent.path().join("w")).unwrap();
+        assert!(
+            name.starts_with(hex_digest(b"node", 4)),
+            "{}",
+            name.display()
+        );
         let on_mac = Path::new("/Users/username/.intentd/w").join(name);
         assert!(on_mac.as_os_str().len() <= 60, "{}", on_mac.display());
         assert!(!worktree.to_string_lossy().contains(' '));
@@ -639,6 +736,7 @@ mod tests {
         assert_eq!(storage.agent_ids(), vec![agent]);
     }
 
+    #[track_caller]
     fn private_dirs(path: &Path) {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
@@ -648,17 +746,143 @@ mod tests {
             .unwrap();
     }
 
+    #[track_caller]
+    fn short_storage(parent: &Path) -> (Storage, PathBuf) {
+        let base = parent.join("w");
+        let storage = Storage::open(&parent.join("node"), None)
+            .unwrap()
+            .with_work_base(Some(&base));
+        (storage, work_dir(&base, "node"))
+    }
+
+    #[track_caller]
+    fn write_record(parent: &Path, agent: &str, home: &Path) {
+        let record = parent.join("node").join(AGENTS).join(agent);
+        private_dirs(&record);
+        std::fs::write(
+            record.join(HOME),
+            std::os::unix::ffi::OsStrExt::as_bytes(home.as_os_str()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_record_naming_a_folder_outside_the_work_dir_never_removes_it() {
+        let parent = tempfile::tempdir().unwrap();
+        let (storage, work) = short_storage(parent.path());
+        let victim = parent.path().join("victim");
+        private_dirs(&victim);
+        std::fs::write(victim.join("keep"), "x").unwrap();
+        let sneaky = work.join("..").join("..").join("victim");
+        for (agent, home) in [("a1", victim.clone()), ("a2", sneaky)] {
+            write_record(parent.path(), agent, &home);
+            let agent = AgentId::from(agent);
+            assert_ne!(storage.existing_worktree(&agent), Some(home.join(WORK)));
+            assert!(storage.agent_worktree(&agent).unwrap().starts_with(&work));
+            storage.remove_agent(&agent).unwrap();
+        }
+        write_record(parent.path(), "a3", &victim);
+        drop(storage);
+        remove_agent_homes(&parent.path().join("node"), Some(&parent.path().join("w")));
+        assert!(victim.join("keep").is_file());
+    }
+
+    #[test]
+    fn a_home_reserved_before_its_record_was_written_is_reused_then_removed() {
+        let parent = tempfile::tempdir().unwrap();
+        let (storage, work) = short_storage(parent.path());
+        let agent = AgentId::from("a1");
+        let reserved = work.join(hex_digest(b"a1", 6));
+        private_dirs(&reserved);
+        std::fs::write(reserved.join(OWNER), "a1").unwrap();
+        private_dirs(&parent.path().join("node").join(AGENTS).join("a1"));
+        assert_eq!(storage.existing_worktree(&agent), None);
+        assert_eq!(storage.agent_worktree(&agent).unwrap(), reserved.join(WORK));
+
+        std::fs::remove_file(
+            parent
+                .path()
+                .join("node")
+                .join(AGENTS)
+                .join("a1")
+                .join(HOME),
+        )
+        .unwrap();
+        assert_eq!(storage.agent_ids(), vec![agent.clone()]);
+        storage.remove_agent(&agent).unwrap();
+        assert!(!reserved.exists(), "the sweep finds a home its record lost");
+    }
+
+    #[test]
+    fn a_record_whose_home_is_gone_gets_a_fresh_private_home() {
+        let parent = tempfile::tempdir().unwrap();
+        let (storage, _) = short_storage(parent.path());
+        let agent = AgentId::from("a1");
+        let worktree = storage.agent_worktree(&agent).unwrap();
+        let home = worktree.parent().unwrap().to_owned();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert_eq!(storage.existing_worktree(&agent), None);
+        let again = storage.agent_worktree(&agent).unwrap();
+        let home = again.parent().unwrap();
+        assert!(home.is_dir());
+        let mode = std::fs::metadata(home).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+        assert_eq!(storage.existing_worktree(&agent), Some(again));
+    }
+
+    #[test]
+    fn concurrent_lookups_give_one_agent_one_home() {
+        let parent = tempfile::tempdir().unwrap();
+        let (storage, work) = short_storage(parent.path());
+        let agent = AgentId::from("a1");
+        let homes: Vec<PathBuf> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| storage.agent_worktree(&agent).unwrap()))
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        assert!(homes.iter().all(|home| home == &homes[0]), "{homes:?}");
+        assert_eq!(std::fs::read_dir(&work).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_purge_that_cannot_remove_a_home_reports_it() {
+        let parent = tempfile::tempdir().unwrap();
+        let (storage, work) = short_storage(parent.path());
+        let worktree = storage.agent_worktree(&AgentId::from("a1")).unwrap();
+        private_dirs(&worktree);
+        drop(storage);
+        let mut locked = std::fs::metadata(&work).unwrap().permissions();
+        locked.set_mode(0o500);
+        std::fs::set_permissions(&work, locked).unwrap();
+        let removed =
+            remove_agent_homes(&parent.path().join("node"), Some(&parent.path().join("w")));
+        let mut open = std::fs::metadata(&work).unwrap().permissions();
+        open.set_mode(0o700);
+        std::fs::set_permissions(&work, open).unwrap();
+        assert!(!removed);
+        assert!(
+            worktree.parent().unwrap().is_dir(),
+            "the home stays for a retry"
+        );
+    }
+
     #[test]
     fn a_taken_short_name_falls_back_to_the_full_agent_id() {
         let parent = tempfile::tempdir().unwrap();
-        let work = parent.path().join("w").join("cred");
+        let base = parent.path().join("w");
+        let work = work_dir(&base, "node");
         let storage = Storage::open(&parent.path().join("node"), None)
             .unwrap()
-            .with_work_dir(Some(work.clone()));
+            .with_work_base(Some(&base));
         let agent = AgentId::from("agent-1");
-        private_dirs(&work.join(hex_digest(b"agent-1", 6)));
+        let taken = work.join(hex_digest(b"agent-1", 6));
+        private_dirs(&taken);
+        std::fs::write(taken.join(OWNER), "agent-2").unwrap();
         let worktree = storage.agent_worktree(&agent).unwrap();
         assert_eq!(worktree, work.join("agent-1").join(WORK));
+        storage.remove_agent(&agent).unwrap();
+        assert!(taken.join(OWNER).is_file(), "another agent's home stays");
     }
 
     #[test]
@@ -669,7 +893,7 @@ mod tests {
         private_dirs(&legacy.join(".git"));
         let storage = Storage::open(&root, None)
             .unwrap()
-            .with_work_dir(Some(parent.path().join("w")));
+            .with_work_base(Some(&parent.path().join("w")));
         let agent = AgentId::from("a1");
         assert_eq!(storage.existing_worktree(&agent), Some(legacy.clone()));
         assert_eq!(storage.agent_worktree(&agent).unwrap(), legacy);
@@ -688,7 +912,7 @@ mod tests {
         let root = parent.path().join("node");
         let storage = Storage::open(&root, None)
             .unwrap()
-            .with_work_dir(Some(parent.path().join("w")));
+            .with_work_base(Some(&parent.path().join("w")));
         let agent = AgentId::from("a1");
         assert_eq!(storage.existing_worktree(&agent), None);
         let worktree = storage.agent_worktree(&agent).unwrap();
@@ -707,12 +931,16 @@ mod tests {
         let root = parent.path().join("node");
         let storage = Storage::open(&root, None)
             .unwrap()
-            .with_work_dir(Some(parent.path().join("w")));
+            .with_work_base(Some(&parent.path().join("w")));
         let home = storage.agent_tmp(&AgentId::from("a1")).unwrap();
         let home = home.parent().unwrap().to_owned();
         drop(storage);
-        remove_agent_homes(&root);
+        assert!(remove_agent_homes(&root, Some(&parent.path().join("w"))));
         assert!(!home.exists());
+        assert!(
+            !home.parent().unwrap().exists(),
+            "the credential's work dir goes too"
+        );
         assert!(
             root.join(AGENTS).join("a1").exists(),
             "the root is the caller's"

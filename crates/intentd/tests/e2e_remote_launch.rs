@@ -55,6 +55,7 @@ fn agent_record(node_dir: &Path, credential_id: &str, agent_id: &str) -> PathBuf
 
 /// `agent_id`'s home on that machine: the short work dir its record names,
 /// never under the data dir.
+#[track_caller]
 fn agent_home(node_dir: &Path, credential_id: &str, agent_id: &str) -> PathBuf {
     let record = agent_record(node_dir, credential_id, agent_id);
     let home = PathBuf::from(

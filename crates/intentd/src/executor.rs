@@ -365,15 +365,13 @@ impl ExecutorService {
         let base = self.deps.data_dir.join(EXECUTOR_DIR);
         let root = base.join(&credential.0);
         let id = credential.0.clone();
-        let work = self
-            .deps
-            .work_base
-            .as_deref()
-            .map(|work_base| storage::work_dir(work_base, &id));
+        let work_base = self.deps.work_base.clone();
         let storage = Arc::new(
             tokio::task::spawn_blocking(move || {
                 let socket = storage::git_socket_path(&base, &id, &storage::runtime_base())?;
-                Ok::<_, anyhow::Error>(Storage::open(&root, Some(socket))?.with_work_dir(work))
+                Ok::<_, anyhow::Error>(
+                    Storage::open(&root, Some(socket))?.with_work_base(work_base.as_deref()),
+                )
             })
             .await??,
         );
@@ -551,6 +549,7 @@ impl ExecutorService {
         let backend = lock(&self.backends).remove(credential);
         let root = (forget && storage::valid_id(&credential.0))
             .then(|| self.deps.data_dir.join(EXECUTOR_DIR).join(&credential.0));
+        let work_base = self.deps.work_base.clone();
         #[cfg(test)]
         if backend.is_some() {
             let pause = lock(&self.revoke_pause).take();
@@ -571,7 +570,7 @@ impl ExecutorService {
                 stop_backend(backend).await;
             }
             if let Some(root) = root {
-                remove_storage(root).await;
+                remove_storage(root, work_base).await;
             }
         }));
     }
@@ -604,15 +603,21 @@ impl ExecutorService {
                 continue;
             }
             tracing::info!("executor: removing a revoked credential's storage");
-            remove_storage(base.join(name)).await;
+            remove_storage(base.join(name), self.deps.work_base.clone()).await;
         }
     }
 }
 
-/// Remove a revoked credential's storage root.
-async fn remove_storage(root: PathBuf) {
+/// Remove a revoked credential's storage root. Its agents' homes go
+/// first; when one stays, the root (with the records naming them) stays
+/// too, for the next purge.
+async fn remove_storage(root: PathBuf, work_base: Option<PathBuf>) {
     let removed = tokio::task::spawn_blocking(move || {
-        storage::remove_agent_homes(&root);
+        if !storage::remove_agent_homes(&root, work_base.as_deref()) {
+            return Err(std::io::Error::other(
+                "an agent's home could not be removed",
+            ));
+        }
         match std::fs::remove_dir_all(&root) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
