@@ -2005,8 +2005,12 @@ This is a test skill.
             let cli = claude(Some("2.1.303 (Claude Code)"));
             let new = prompt(dir.path(), "3.10", Some(&cli), false).await;
             assert!(!new.contains(AGENTS), "Claude Code loads it natively");
-            let old = prompt(dir.path(), "3.9", Some(&cli), false).await;
-            assert_eq!(old.matches(AGENTS).count(), 1, "3.9 keeps injecting");
+            let old = prompt(dir.path(), "3.8", Some(&cli), false).await;
+            assert_eq!(
+                old.matches(AGENTS).count(),
+                1,
+                "older harnesses keep injecting"
+            );
         }
 
         #[tokio::test]
