@@ -549,6 +549,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_trust_matches_a_symlinked_workspace_and_fails_safe_on_a_broken_worktree() {
         let main = repo(&[]);
