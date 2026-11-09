@@ -97,6 +97,7 @@ fn launch(id: &str) -> LinkFrame {
         compact_tool_descriptions: false,
         checkout_of: None,
         forge: None,
+        git_identity: None,
     })
 }
 

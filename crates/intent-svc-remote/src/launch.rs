@@ -20,8 +20,9 @@ use intent_core::machine_selection::{
 use intent_core::machines::ExposedMachine;
 use intent_core::node_link::MachineCapabilities;
 use intent_core::node_link::{
-    FinalPush, ForgeLaunch, LaunchCommand, LaunchProfileEnv, PreparedCheckout, SetupCommand,
-    SubmodulePin, MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL, SHARED_CHECKOUT_PROTOCOL,
+    FinalPush, ForgeLaunch, GitIdentity, LaunchCommand, LaunchProfileEnv, PreparedCheckout,
+    SetupCommand, SubmodulePin, MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL,
+    SHARED_CHECKOUT_PROTOCOL,
 };
 use intent_core::placement::{
     AgentPlacement, MachineRef, PlacementCheckout, PlacementTarget, PlacementUnavailable,
@@ -108,6 +109,15 @@ async fn forge_launch(svc: &Services, workspace_id: &WorkspaceId) -> Option<Box<
         .await
         .ok()??;
     ForgeLaunch::for_github(&origin, &workspace.branch).map(Box::new)
+}
+
+/// The `launch.gitIdentity` for a workspace whose checkout is `checkout`:
+/// the identity a local agent's spawn there would get, or `None`.
+async fn git_identity(checkout: PathBuf) -> Option<GitIdentity> {
+    let (name, email) = blocking(move || Ok(intent_git::identity::commit_identity(&checkout)))
+        .await
+        .ok()??;
+    Some(GitIdentity { name, email })
 }
 
 /// Whether an agent with `submodules` and `setup` starts from a checkout a
@@ -1082,6 +1092,9 @@ impl RemoteLaunchPort for RemoteLaunch {
                 intent_providers::find_provider(intent_providers::base_provider_id(&provider))
                     .is_some_and(|entry| entry.truncates_tool_descriptions);
             let checkout_dir = workspace_checkout(svc, &record.workspace_id).await?;
+            // Every agent commits as one on this backend would: resolved
+            // from the workspace checkout's config at each start.
+            let git_identity = git_identity(checkout_dir.clone()).await;
             let repo_key = blocking(move || node_git::repo_key(&checkout_dir)).await?;
             // Only a top-level agent gets the workspace branch and `origin`.
             let forge = if is_sub_agent || checkout_of.is_some() {
@@ -1105,6 +1118,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     compact_tool_descriptions,
                     checkout_of,
                     forge,
+                    git_identity,
                 })
                 .await?;
             Ok(runtime as Arc<RemoteRuntime>)

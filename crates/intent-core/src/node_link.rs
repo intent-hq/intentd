@@ -473,6 +473,31 @@ pub struct LaunchCommand {
     /// [`FORGE_TOKEN_PROTOCOL`] or later, never for a sub-agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forge: Option<Box<ForgeLaunch>>,
+    /// The commit identity the backend resolves for the workspace's
+    /// checkout at this start, for every agent; absent when none resolves.
+    /// Needs no protocol: a machine from before ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_identity: Option<GitIdentity>,
+}
+
+/// [`LaunchCommand::git_identity`]: the `user.name` and `user.email` the
+/// machine sets as the agent's `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
+/// environment. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GitIdentity {
+    pub name: String,
+    pub email: String,
+}
+
+impl GitIdentity {
+    /// The identity, or `None` when either value is empty: the machine then
+    /// sets nothing.
+    #[must_use]
+    pub fn usable(&self) -> Option<(&str, &str)> {
+        (!self.name.is_empty() && !self.email.is_empty())
+            .then_some((self.name.as_str(), self.email.as_str()))
+    }
 }
 
 /// [`LaunchCommand::forge`] (nodeProtocol 15): the workspace branch a

@@ -36,6 +36,7 @@ use crate::common;
 mod cloud;
 mod forge_push;
 mod forge_token;
+mod git_identity;
 mod secrets;
 mod sub_agents;
 
@@ -234,6 +235,11 @@ async fn start_machine_with(dir: &Path, backend_id: &str, env: &[(&str, &str)]) 
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env("INTENTD_AUTH_TOKEN", TOKEN)
         .env("MOCK_AGENT_SCRIPT_PATH", &fixture)
+        // An identity the test runner inherited must not reach the agents.
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL")
         .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::from(

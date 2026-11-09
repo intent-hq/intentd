@@ -156,6 +156,7 @@ fn launch(id: &str) -> LaunchCommand {
         compact_tool_descriptions: false,
         checkout_of: None,
         forge: None,
+        git_identity: None,
     }
 }
 
