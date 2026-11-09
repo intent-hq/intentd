@@ -1,0 +1,444 @@
+# Agent Workflow Guide
+
+Instructions for AI agents working in this monorepo.
+
+**Assistant app guide:** When adding, changing, moving, renaming, or removing a
+user-facing feature, update the affected section of
+[`packages/intentd/crates/intent-services/resources/assistant-app-guide.md`](packages/intentd/crates/intent-services/resources/assistant-app-guide.md)
+in the same change (coordinate the companion intentd change for frontend work).
+Keep this single bundled guide concise; replace obsolete paths, labels, and prerequisites.
+Keep the guide and user-facing help focused on features ready for users. Do not promote
+unfinished, experimental, Labs-only, internal, or unreleased features as normal options;
+code or tool availability is not proof of readiness. When explicitly asked about such
+a feature, or assigned to develop or test it, discuss it honestly and label its status.
+Update the guide and its source pointers when readiness or UI behavior changes.
+Before opening a PR, record the affected guide section (and companion intentd PR
+for frontend changes), or explain why the change has no user-help impact. Coordinate
+companion releases; this checkpoint does not require simultaneous cross-repo merges.
+
+## Repository Structure
+
+This monorepo references the Intent component repositories as git
+submodules:
+
+- `packages/intentd` → [intent-hq/intentd](https://github.com/intent-hq/intentd) — Rust backend daemon
+- `packages/cloudlands-fe` → [intent-hq/cloudlands-fe](https://github.com/intent-hq/cloudlands-fe) — Electron + SvelteKit desktop frontend
+- `packages/ios` → [intent-hq/ios](https://github.com/intent-hq/ios) — SwiftUI iOS companion app (private)
+
+Code lives in the submodule repos. The monorepo tracks specific commits of each submodule.
+`packages/ios` is private and marked `update = none` in `.gitmodules`: recursive clones and
+`git submodule update --init --recursive` skip it by design, and internal devs initialize it
+on demand with `make ensure-ios-submodule`.
+The durable engineering docs live in `docs/ARCHITECTURE.md` (backend architecture) and
+`docs/protocol/` (canonical wire contract); see `docs/README.md` for the docs index.
+
+## Developing on a remote host
+
+Each Intent workspace is a git worktree on the daemon host. The desktop client runs the
+embedded Chromium tabs and tunnels ports that listen on the daemon's loopback interface.
+Always use `http://daemon.localhost:<port>` in the embedded browser.
+
+### Situate
+
+Run `STATUS_JSON=1 make status` first. It reports host gaps, resolved ports, live sandboxes
+and health, the monorepo and component branches (`repos.<name>.gitlinkDirty` flags a submodule
+moved off its pin; `repos.<name>.behindOriginMain` counts commits HEAD lags the local
+`origin/main` — branch component work from `origin/main` when > 0), and branch PR checks
+when `gh` is authenticated. If `repos.monorepo.protocolDocsStale`, read the contract via
+`git show origin/main:docs/protocol/<file>` (a stale copy produced false findings on
+[cloudlands-fe#3572](https://github.com/intent-hq/cloudlands-fe/pull/3572)).
+While `setup.running` is true (or your first message carried the setup-in-progress
+notice) the workspace setup script is still provisioning the worktree, so treat the whole
+report as provisional and wait with a hook on `ws.workspace.details().setupStatus` before
+acting on it.
+Use `make status` for the human-readable form. If `host.doctorOk` is false, run
+`make bootstrap-dev-host`, then `make doctor`; automation can set `BOOTSTRAP_YES=1`, but
+system packages may require privilege. Do not discover prerequisites during a build: the
+dev and sandbox targets preflight the frontend toolchain and exit naming the missing item
+and `make bootstrap-dev-host`.
+
+### Act
+
+Run `make sandbox-status` before starting anything. State is keyed only by mode, so one
+worktree can track at most one `ui`, one `app`, and one `stack` sandbox; different ports
+do not isolate a second sandbox of the same mode. Coordinate with its owner or use another
+worktree instead.
+
+Start the smallest long-running target as a workspace service:
+
+- `make dev-sandbox-ui` — named component previews only.
+- `make dev-sandbox-app` — complete web renderer against the installed daemon or
+  `INTENTD_SOCKET`.
+- `make dev-sandbox-stack` — isolated intentd plus renderer (`INTENTD_PROFILE=release`,
+  `INTENTD_BIN=/path`); `MOCK_AGENT=1` swaps in a scripted agent, no provider sign-in.
+
+Each ready sandbox records `.dev/sandbox/<mode>.json`. Use `make sandbox-stop` only for
+an unmanaged or orphaned sandbox;
+stop a workspace service with `ws.script.stop(id)` so its supervisor does not restart it.
+
+### Observe
+
+For app or stack readiness, schedule this one canonical health wait after replacing the
+port. It polls on the daemon host and retires when `/__sandbox/health` returns `ok: true`:
+
+```javascript
+await ws.hook.schedule({
+  name: "Wait for sandbox health",
+  delayMs: 10_000,
+  ttlMs: 600_000,
+  code: `const probe = await ws.host.exec({
+  command: "curl",
+  args: ["--silent", "--max-time", "2", "http://127.0.0.1:<DEV_PORT>/__sandbox/health"],
+});
+if (probe.exitCode !== 0) return { dispatch: false };
+try { if (JSON.parse(probe.stdout).ok === true) return { dispatch: true, message: "Sandbox health is ok." }; } catch {}
+return { dispatch: false };`,
+});
+```
+
+Call `ws.browser.listTabs` and reuse a matching tab; otherwise open
+`http://daemon.localhost:<DEV_PORT>/`. A first tunneled open of a fresh, pre-warmed app
+takes roughly one to three minutes to hydrate depending on host load. Keep waiting if the
+splash remains; do not restart. Keep the tab open for HMR.
+
+### Prove
+
+Capture a named preview with `make sandbox-shot PREVIEW=<id> STATE=<state>` (`THEME`, `WIDTH`, `OUT`);
+use `ws.browser.screenshot` only for the full app. Append evidence to the task note:
+
+| Claim | Command | Result | Artifact |
+|---|---|---|---|
+| What behavior was verified | Exact command or tool call | Pass/fail plus key observation | Asset, commit, PR, or log |
+
+### Hand off
+
+Stop what you started, then rerun `STATUS_JSON=1 make status` to confirm no listener,
+state, or `gitlinkDirty` submodule remains (`git submodule update --checkout <path>` resets
+one). Keep app and stack on loopback: their Vite origin exposes the full
+unauthenticated daemon API and is safe only through the client's authenticated tunnel.
+
+Remote browser sandboxes cannot exercise Electron main/preload, native dialogs, window
+management, or `workspace-file://` media; verify those in an Electron build. See the
+[frontend recipes](packages/cloudlands-fe/AGENTS.md#dogfooding-a-dev-fe-against-a-daemon)
+and [sandbox internals](docs/fe/DEVELOPER_GUIDE.md#remote-sandbox-internals) for detail.
+
+## Commit & PR Workflow
+
+When changes span a submodule and the monorepo, land the submodule PR (Phase 1); the
+monorepo pin advance (Phase 2) then happens automatically. Exception: monorepo protocol
+docs that the consumer checks read (`docs/protocol/`) land first when the change is an
+addition — see Phase 2 → Docs lead the pin.
+
+### Phase 1 — Submodule PRs
+
+1. **Make scoped commits in the submodule** on a feature branch. Group related changes into
+   logical commits with conventional commit messages (`feat:`, `fix:`, `chore:`, etc.).
+2. **Push the feature branch** in the submodule repo.
+3. **File a PR** on the submodule's repo (e.g., `intent-hq/intentd`). On every PR (intent, intentd,
+   cloudlands-fe) request the `intent-hq-service` review in the Reviewers picker or with
+   `gh pr edit <PR> --repo intent-hq/<repo> --add-reviewer intent-hq-service`: requested PRs get priority,
+   unrequested ones depend on discovery and spare review capacity (timing varies), and a request doesn't guarantee immediate completion.
+4. **Merge the PR** (squash merge preferred) — **only after explicit permission from a
+   human** (see Conventions → Merging). Approved + green checks is not enough.
+
+When the change fixes a monorepo issue, reference it with the full cross-repo form —
+`Fixes intent-hq/intent#N` — in the PR body or squash-commit message, on **every** PR of
+a cross-component fix (intentd and cloudlands-fe alike); never downgrade to `Refs` /
+`Part of` to avoid an early close. GitHub closing the issue when the first PR merges is
+expected: the cloudlands-fe release notifier (see Release Process) holds its shipped-version
+comment until every *linked* fix PR is merged and contained, and mention-only references
+are invisible to it — an all-`Refs` fix gets no auto-close and no comment (as happened to
+[intent-hq/intent#5383](https://github.com/intent-hq/intent/issues/5383): intentd#2001 +
+cloudlands-fe#2687), and a mixed one can be announced before it has fully shipped.
+
+### Phase 2 — Monorepo pin advance (automated)
+
+Submodule pins are advanced automatically by the `auto-bump-submodules` workflow
+(`.github/workflows/auto-bump-submodules.yml`) through a single rolling PR on the
+`auto/submodule-bump` branch with auto-merge armed. Submodule `main` pushes dispatch it, a
+30-minute cron is the backstop, and every token it uses is fail-soft
+([triggers and credentials](docs/RELEASING.md#submodule-pin-auto-bump)).
+
+The workflow owns pin advancement: the `submodule-pins` CI job fails any monorepo PR
+whose diff moves a `packages/*` gitlink unless its head branch is `auto/submodule-bump`
+or it carries the `submodule-pin-intended` label. The consumer checks — `make consumer-checks`
+(method and event catalogs, protocol→FE field parity, docs-check, check-makefile-targets) —
+run against the pins in the monorepo `docs-check` job and, through the reusable
+`.github/workflows/consumer-checks.yml`, as `monorepo-consumer-checks` on every intentd and
+cloudlands-fe PR against that PR's head. Docs lead the pin, by direction: for an
+**addition** the monorepo docs PR its table names lands first (the checks only warn until
+the component catches up), then start a new run (or Re-run all jobs); for a **removal**
+the component PR lands first (the upstream check warns about the now-extra docs entry; a docs-first
+removal is rejected as a component extra) and the docs entry is removed after the bump. A
+**rename** is an addition: document the new name first, keeping the old entry, rename in
+the component, then drop the old entry after the bump. `check-mcp-bindings` is advisory
+upstream (the auto-bump regenerates its index in the bump commit, so a help-line change
+needs no manual pin PR). A monorepo PR that calls a component change (a Makefile flag or
+target, a documented method) merges only once the auto-bump pins that change
+([intent#8512](https://github.com/intent-hq/intent/pull/8512) waited on
+[cloudlands-fe#4146](https://github.com/intent-hq/cloudlands-fe/pull/4146);
+`check-makefile-targets` catches only missing targets). `scripts/pin-includes.sh
+<component> <merge-sha>` (`make pin-includes`) exits 0 once main's pin includes the
+component's merge commit, 3 until then and 4 on a transient GitHub error; wait with:
+
+```javascript
+await ws.hook.schedule({
+  name: "Wait for component pin",
+  delayMs: 300_000,
+  ttlMs: 14_400_000,
+  code: `const run = await ws.host.exec({
+  command: "scripts/pin-includes.sh", args: ["cloudlands-fe", "<FE_MERGE_SHA>"], timeoutMs: 60_000,
+});
+if (run.exitCode === 0) return { dispatch: true, message: "Pinned: " + run.stdout.trim() };
+if (run.exitCode === 3 || run.exitCode === 4) return { dispatch: false };
+throw new Error("pin-includes failed (exit " + run.exitCode + "): " + run.stderr.trim());`,
+});
+```
+
+For an urgent bump, dispatch the workflow instead of filing a PR:
+
+```bash
+gh workflow run auto-bump-submodules.yml
+```
+
+### Cross-component features (intentd + cloudlands-fe)
+
+For features that need changes in both intentd and cloudlands-fe, develop and file PRs
+on both repos in parallel. Both merges need explicit human permission. When the feature
+touches the protocol (the daemon↔fe wire contract, `docs/protocol/`), **do not merge the
+cloudlands-fe PR (or arm auto-merge on it, or enqueue it) until the intentd PR is
+confirmed merged** — approved/green is not enough, because an fe-first merge can ship
+against a contract that does not exist yet. After both merge, the auto-bump advances
+both pins; do not file a manual bump PR.
+
+### Manual test builds (optional, for complex changes)
+
+For **complex features/fixes** (intentd and/or cloudlands-fe), a manual signed test
+build is available to test the full stack from the PR branches: dispatch
+cloudlands-fe's `manual-signed-build.yml` on the cloudlands-fe PR branch to produce a
+manual `.dmg` carrying the full stack:
+
+```bash
+gh workflow run manual-signed-build.yml --repo intent-hq/cloudlands-fe \
+  --ref <fe-pr-branch> -f build_macos=true -f intentd_ref=<intentd PR head SHA>
+```
+
+`intentd_ref` accepts any intent-hq/intentd git ref (full 40-char commit SHA, branch,
+or tag) and compiles the intentd sidecar from source in-workflow; see
+[docs/fe/DEPLOYING.md](./docs/fe/DEPLOYING.md#manual-signed-build-pr-test-builds).
+The same route works for **complex cloudlands-fe-only changes** — omit `intentd_ref`
+to get the pinned intentd.
+
+**Exception — SQLite schema changes:** features/fixes that add or change intent-store
+migrations must **not** be tested via this manual-install route: running the
+hash-built daemon applies its migrations and mutates the tester's local database,
+with no rollback.
+
+## Conventions
+
+- **Conventional commits** are required. PR titles are validated by CI
+  (`amannn/action-semantic-pull-request`) against: `feat`, `fix`, `chore`, `docs`,
+  `refactor`, `test`, `ci`, `perf`.
+- **Never quote the literal breaking-change footer token.** release-please/release-plz
+  treat `BREAKING CHANGE:` / `BREAKING-CHANGE:` (and `Release-As:`) appearing anywhere
+  in a commit body as a real footer — a commit that merely *quotes* the token causes a
+  false major bump (or, for `Release-As:`, a forced pinned version); this accidentally
+  cut cloudlands-fe v3.0.0 — see intent-hq/intent#2988. Squash merges include every
+  branch commit message in the squash body, so the token in any branch commit still
+  lands on main. Never write the
+  literal token in commit messages, PR titles/bodies, or review comments unless an
+  actual breaking change is intended; when describing the mechanism, write "the
+  breaking-change footer token" or similar instead.
+- **Merging**: agents must **NEVER merge a PR, arm auto-merge, or add a PR to the
+  merge queue — in this repo or any submodule repo — without explicit permission from
+  a human**. Approved + green checks is not enough. Repo-owned automation is exempt
+  (auto-bump-submodules, auto-pin-intentd, intentd's auto-pin-acp-adapters,
+  auto-cut-alpha, and the release PR workflows merge their own rolling PRs). Component
+  auto-cut and fe auto-pin may merge validated release metadata or sidecar pins directly
+  under the approved CI exemption and readiness guards
+  ([guarded direct release merges](docs/RELEASING.md#guarded-direct-release-merges)).
+  - Ordinary `main` PRs in all three repos use a **merge queue**: after human
+    permission, `gh pr merge --squash --auto` enqueues once pending checks pass (its
+    "merge strategy … is set by the merge queue" output is informational). A red gate
+    cannot enter, and the queue reruns CI on the merged tree (`merge_group`).
+  - A monorepo PR with any unresolved review thread stays BLOCKED outside the queue
+    ([intent-hq/intent#4959](https://github.com/intent-hq/intent/issues/4959)): confirm
+    `ws.pr.snapshot(N).requirements.threads.unresolved` is 0 before enqueueing.
+  - A `merge_group` failure ejects the PR without landing it (`mergeQueueEjection` in
+    `ws.pr.snapshot` / `ws.pr.monitor`; a check that times out counts as failed). It is
+    not re-queued on its own: fix the cause and re-enqueue.
+  - The squash title is the commit headline on a single-commit PR and the PR title on a
+    multi-commit PR, and the body includes every branch commit message. Make that title
+    a valid conventional commit (amend auto-commits like "Coordinator" before pushing;
+    PR #102 incident).
+  - Branch rules live in `.github/rulesets/*.main.json` and `*.bypass.json`; after an
+    intended ruleset change run `make check-rulesets UPDATE=1` and commit the result in
+    the same PR ([ruleset drift details](docs/RELEASING.md#ruleset-snapshots-and-drift)).
+- **Changelogs** are generated with `git-cliff` (see `cliff.toml`).
+- **Rust**: run the package gates before opening a PR — `make check` / `make test`
+  also run from `packages/intentd` (its Makefile forwards them to the root); see
+  `packages/intentd/AGENTS.md` → Gates. Coverage runs on CI (intentd ci.yml's
+  `coverage-e2e` / `coverage-all` jobs); `make coverage-e2e` / `make coverage-all` from
+  the monorepo root reproduce it locally — `make test` excludes these slow runs.
+
+### Resuming local Rust gates
+
+- `make gate` runs `make check` then the full nextest suite; `make test` is
+  test-only (resume records apply only to nextest — `gate` always reruns the lints).
+- When the full suite is impractical, run the changed-tests target before enqueueing, never
+  a hand-picked list (one missed a two-window test that failed CI on cloudlands-fe#3876):
+  Rust `make test-changed` (intentd's `scripts/changed-tests.sh` vs `origin/main`, full
+  suite on manifest/lockfile/nextest-config changes; `make coverage-changed` = the PR job),
+  frontend `make fe-verify-changed` (cloudlands-fe `verify:changed`, working tree first), or
+  `make test-scripts-changed` for `scripts/`, the Makefile or ci.yml (PR CI skips its shell suites).
+  All take `BASE=<ref>` and `DRY_RUN=1` (prints the plan), the first two `RESUME=1`. Iterate on Rust
+  tests with `make test-select E='<filterset>'`, not raw `cargo nextest`, which skips fixture setup
+  (95 bogus failures, intentd#2559); to prove a flake, its fix, or that a CI failure is not yours,
+  use `make test-stress E=... COUNT=200 LOAD=1` (retries off, optional CPU + fsync load; `STALL=1`
+  freezes the tests at random like a stalled CI runner, which LOAD missed for intentd#2917).
+- `make test` / `test-changed` / `test-select` print a unique `record:` attempt path, including
+  fully resumed runs. [Receipt and coverage details](CONTRIBUTING.md#test-attempt-receipts-and-resume-coverage)
+  explain evidence, interruption and seven-day tree retention. `RESUME=1` skips verified passes for
+  the same worktree, submodule pointers, toolchain, lockfile and effective settings (`GATE_FORCE=1`
+  ignores them). To continue past a known flake, `RESUME=1 NO_FAIL_FAST=1 make test-changed` (or
+  `make test`, `make fe-verify-changed`) runs the rest to completion, records them, and exits non-zero if anything failed ([intent-hq/intent#5645](https://github.com/intent-hq/intent/issues/5645)).
+- Run long gates as saved command-mode `ws.script` entries: `ws.script.start`, then
+  `ws.script.monitor(scriptId, { ttlMs, runId })` with the start reply's `runId` and a TTL
+  of expected runtime plus margin. End the turn only once registration succeeds; on a
+  `run-finished` refusal, read the result right away. After the wake, read
+  `ws.script.output` and `ws.script.status`: `exitCode === -1` means the supervisor could
+  not observe the exit (process lost, or a command script running when the daemon
+  stopped) — read `s.error` and treat it as failure. Details: `ws.help("script")`.
+  `ws.script.run` rejects `timeoutSeconds` above budget − 5s (25s default). Saved scripts
+  are PTY-backed, so use the `make` targets (no progress bars or pagers; `make list-tests`
+  for nextest discovery) — bare `cargo`/`git`/`gh` without `--no-pager` or that env
+  flood the buffer or stall on `less`.
+
+## Release Process
+
+The full pipeline detail (workflows, secrets, dispatch types, fail-soft semantics,
+guardrails) lives in [docs/RELEASING.md](./docs/RELEASING.md). The agent-facing rules:
+
+- Releases are per-component and channel-based: merging a release PR publishes to the
+  rolling **alpha** channel automatically; **beta** and **stable** are manual
+  promotions of existing releases (no new build).
+- The pipeline is event-chained (intentd alpha publish → fe pin bump → fe alpha cut),
+  with hourly pin-bump and ten-minute cut crons under the hourly release floor.
+- **Never file routine pin-bump PRs** — the workflows own pin advancement (the monorepo
+  `submodule-pins` check enforces this; see Phase 2 above). The one sanctioned exception
+  is the cloudlands-fe `intentd.version` pin under the emergency-release procedure
+  in [docs/RELEASING.md](./docs/RELEASING.md).
+- **Track shipped work**: a workspace that changed intentd and/or cloudlands-fe is NOT
+  done when the PRs merge — monitor until the work ships in a cloudlands-fe alpha, then
+  set the final workspace status message to the carrying version (e.g. "Shipped in
+  cloudlands-fe vX.Y.Z (alpha)."; intentd-only changes ride the chained fe alpha, so the
+  version is always the cloudlands-fe tag). `make release-status` (`STATUS_JSON=1`)
+  prints the whole train, including why auto-cut last skipped. `scripts/shipped-in.sh <component> <sha>...`
+  (one or more pairs; or `make shipped-in COMPONENT=... SHA=...` /
+  `PAIRS="intentd:<sha> cloudlands-fe:<sha>"`) is the canonical detector: it prints the
+  first [intent-hq/cloudlands-releases](https://github.com/intent-hq/cloudlands-releases)
+  tag carrying every listed commit (for intentd, via the `intentdVersion` pin in that
+  tag's `release-manifest.json`); exits 3 while any is uncarried; exits 4 on a transient
+  GitHub failure (rate limit, 5xx, network) the next poll retries; exits 5 when a human
+  must re-run the run named on stderr — a failed intentd Release-plz run (intentd#2726
+  waited ~6 h on run 40430078531) or a Release Alpha job queued over 30 min
+  (`SHIPPED_IN_STALL_MINUTES`); exits 6 when release-plz confirmed the intentd commit
+  needs no release — close with a status saying it rides the next one. Never block a turn polling —
+  schedule this hook after replacing the placeholders (drop the pair for a component
+  you did not change):
+
+  ```javascript
+  await ws.hook.schedule({
+    name: "Wait for shipped alpha",
+    delayMs: 600_000,
+    ttlMs: 21_600_000,
+    code: `const run = await ws.host.exec({
+    command: "scripts/shipped-in.sh", args: ["intentd", "<INTENTD_SHA>", "cloudlands-fe", "<FE_SHA>"], timeoutMs: 120_000,
+  });
+  if (run.exitCode === 0) return { dispatch: true, message: "Shipped in cloudlands-fe " + run.stdout.trim() };
+  if (run.exitCode === 5) return { dispatch: true, message: "Release pipeline stuck — ask someone with Actions access to re-run the run named here: " + run.stderr.trim() };
+  if (run.exitCode === 6) return { dispatch: true, message: "No intentd release coming — the change rides the next intentd release: " + run.stderr.trim() };
+  if (run.exitCode === 3 || run.exitCode === 4) return { dispatch: false };
+  throw new Error("shipped-in failed (exit " + run.exitCode + "): " + run.stderr.trim());`,
+  });
+  ```
+
+  Before the final status, complete the [ergonomics retrospective](#closing-a-workspace--ergonomics-retrospective).
+- Monorepo-only work (docs, Makefile, CI, scripts) ships nothing to the alpha channel,
+  so it needs no release monitoring or shipped-version status message.
+- **Website release notes after a stable promotion**: a cloudlands-fe stable promotion
+  is followed by a PR on `intent-hq/intentapp.dev` updating the docs Updates section
+  (Latest Release + Release History in `src/pages/docs.astro`). Agents propose that PR
+  for review and never merge it (the never-merge-without-permission rule above
+  applies); the procedure and copy prompt are in
+  [docs/fe/RELEASING.md § Promoting to Stable](./docs/fe/RELEASING.md#promoting-to-stable).
+
+## Closing a workspace — ergonomics retrospective
+
+Once work is merged or shipping, and before the final workspace status message, run the
+[repo-retrospective skill](.agents/skills/repo-retrospective/SKILL.md) for the full prompt.
+
+Land each finding on the strongest available enforcement rung:
+1. Make the mistake impossible with types, goldens, or a protocol contract.
+2. Catch it mechanically before merge with a lint, CI check, or test.
+3. Make the right path discoverable with a "Where to look" row, Makefile target, or script.
+4. Add an AGENTS.md prose rule only as a last resort, citing the linked incident.
+
+**Channel:** Propose one follow-up workspace per coherent improvement; give its prompt the
+goal, evidence, proposed rung, and verification. In Intent use `ws.workspace.proposeSibling`;
+delegated/background agents hand the finding to their parent. Outside Intent, file an
+`intent-hq/intent` issue with `agent-workflow` and `agent-filed`. Never bundle the improvement
+into the feature PR.
+
+**Budget:** AGENTS.md prose must replace or compress existing text or be justified by a linked
+incident. Prefer mechanizing an existing prose rule over adding another.
+
+## Filing Issues
+
+File intentd and cloudlands-fe issues on [intent-hq/intent](https://github.com/intent-hq/intent/issues),
+only for problems affecting released builds. iOS issues go to
+[intent-hq/ios](https://github.com/intent-hq/ios/issues) instead (see
+`packages/ios/AGENTS.md` → Issues and pull requests). Do not file
+issues discovered during PR reviews. Every issue filed must include the affected
+released version and corresponding commit hash in its body.
+
+- **Type**: classification is the GitHub issue **Type** field — `Bug`, `Feature`,
+  or `Task` — not a label. The `bug` and `enhancement` type labels are retired: do
+  not apply them (triage retires them — on the issue's open / edit / reopen, or as
+  soon as the label is applied — after setting the matching Type; the `question`
+  label stays a regular label). Set the Type when filing:
+  `gh issue create --repo intent-hq/intent --type Bug ...`. `make doctor` enforces
+  gh >= 2.94.0; if `--type` is unrecognized, run `make bootstrap-dev-host` to upgrade.
+- **Labels**: apply the appropriate `component:*` label (`component:intentd` or
+  `component:fe`) plus `agent-filed`.
+- **Aggressive dedup**: search existing issues first
+  (`gh issue list --repo intent-hq/intent --search "<keywords>" --state all`) and
+  comment on / link the existing issue instead of filing a duplicate.
+- **Cross-reference**: reference the issue number in related commits/PRs (e.g.
+  `fix: correct panel focus (#123)`); in submodule PRs use the closing keyword on
+  every PR of the fix, per Phase 1 — Submodule PRs.
+
+## Working on Issues
+
+- **Assign on start**: when you begin work on an `intent-hq/intent` issue, assign it to
+  the human driving the work before the first commit:
+  `gh issue edit <N> --repo intent-hq/intent --add-assignee @me`.
+- **Already assigned to someone else**: leave it and tell the user.
+
+## Terminology
+
+Do **not** leak coordinator-internal sequencing labels from a single agent's delegation
+flow into committed documentation. Describe progress as capabilities or milestones instead
+(e.g. "Repo & CI bootstrap", "Crate skeleton", "Core + SQLite store", "UDS JSON-RPC slice").
+
+## Local Setup
+
+```bash
+git submodule update --init --recursive   # skips the private packages/ios (update = none)
+make doctor   # report gaps; BOOTSTRAP_YES=1 make bootstrap-dev-host installs missing prerequisites
+export PATH="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}/bin:$PATH"
+command -v cargo-sweep >/dev/null 2>&1 || cargo install cargo-sweep --locked
+command -v cargo-nextest >/dev/null 2>&1 || cargo install cargo-nextest --locked
+make check
+make test
+```
