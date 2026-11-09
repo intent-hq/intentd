@@ -217,7 +217,13 @@ fn server(
     gates: &Gates,
     head: HeadLink,
 ) -> std::io::Result<WorkspaceMcpServer> {
-    server_with_setup(agent_id, workspace_id, worktree, (gates, None), (head, None))
+    server_with_setup(
+        agent_id,
+        workspace_id,
+        worktree,
+        (gates, None),
+        (head, None),
+    )
 }
 
 /// [`server`] whose `workspace.details` shows `setup_status`.

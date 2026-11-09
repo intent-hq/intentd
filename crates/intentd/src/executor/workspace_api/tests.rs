@@ -940,9 +940,15 @@ async fn placement_help_comes_from_head() {
                 }
             }
         });
-        let server = described_server(&agent(), &workspace(), dir.path(), (&gates(), None), (head, None))
-            .await
-            .unwrap();
+        let server = described_server(
+            &agent(),
+            &workspace(),
+            dir.path(),
+            (&gates(), None),
+            (head, None),
+        )
+        .await
+        .unwrap();
         assert_eq!(asked.try_recv().unwrap(), json!(PLACEMENT_HELP_METHOD));
         let description = server.full_workspace_api_description();
         assert_eq!(description.contains(HELP), answers, "{description}");
