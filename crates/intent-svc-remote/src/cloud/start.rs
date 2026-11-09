@@ -97,6 +97,7 @@ fn view(node: Option<(&crate::RemoteNode, &str)>, entry: &EntryRef) -> RemotePla
         skills: None,
         shared_checkout_of: None,
         parent_work: None,
+        launched_on: None,
     }
 }
 

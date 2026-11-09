@@ -2924,10 +2924,18 @@ async fn record_placement(shared: &Shared, record: &intent_core::node_link::Jour
     }
     let update: Box<dyn FnOnce(&mut intent_core::remote_launch::RemotePlacementView) + Send> =
         match &record.body {
-            JournalBody::Started { .. } => Box::new(|view| {
-                view.effective_isolation = EffectiveIsolation::Isolated;
-                view.placement_error = None;
-            }),
+            JournalBody::Started { .. } => {
+                let machine = shared.machine_id();
+                Box::new(move |view| {
+                    view.effective_isolation = EffectiveIsolation::Isolated;
+                    view.placement_error = None;
+                    // Only for the machine the agent is placed on now: a
+                    // record replayed by one it left never points back.
+                    if !machine.is_empty() && view.node_id == machine {
+                        view.launched_on = Some(machine);
+                    }
+                })
+            }
             JournalBody::SetupStarted { started_at } => {
                 let started_at = started_at.clone();
                 Box::new(move |view| {

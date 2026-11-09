@@ -464,6 +464,7 @@ fn launch_of(id: &str, provider: &str) -> LinkFrame {
         checkout_of: None,
         forge: None,
         git_identity: None,
+        new_machine: None,
     })
 }
 
@@ -820,6 +821,7 @@ async fn executor_shutdown_settles_launches_arriving_on_a_live_link() {
             checkout_of: None,
             forge: None,
             git_identity: None,
+            new_machine: None,
         })
     };
     dialed.link.send(&launch("a0".into())).await.unwrap();

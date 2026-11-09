@@ -158,6 +158,7 @@ fn launch(id: &str) -> LaunchCommand {
         checkout_of: None,
         forge: None,
         git_identity: None,
+        new_machine: None,
     }
 }
 
@@ -2065,7 +2066,7 @@ async fn node_runner_prepends_the_checkout_notice_to_the_first_turn_only() {
         })
     };
     assert!(
-        echoed(&all, "t1", "echo: wip-not-restored.hello"),
+        echoed(&all, "t1", "echo: Note from Intent: wip-not-restored.hello"),
         "{all:#?}"
     );
     h.runner

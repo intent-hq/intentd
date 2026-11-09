@@ -10644,6 +10644,7 @@ async fn worst_case_agent_list_row(
         skills: None,
         shared_checkout_of: None,
         parent_work: None,
+        launched_on: None,
         cloud_start: Some(intent_core::machines::CloudStart {
             step: intent_core::machines::CloudStartStep::CreatingSandbox,
         }),
