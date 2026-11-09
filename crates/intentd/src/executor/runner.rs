@@ -233,6 +233,32 @@ struct Inner {
     /// Serves pieces of the agents' checkout files to other agents'
     /// `ws.file.pull` (nodeProtocol 16).
     pulls: Arc<intent_services::checkout_transfer::PieceSource>,
+    /// How long a provider may take to answer `initialize`.
+    start_timeouts: Mutex<StartTimeouts>,
+}
+
+/// The longest a provider's first start after a link binds may take to
+/// answer `initialize`: the machine has often just woken, and its first
+/// provider start loads it cold.
+const COLD_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// See [`Inner::start_timeouts`].
+struct StartTimeouts {
+    warm: Duration,
+    cold: Duration,
+    /// A link bound and no provider has started since.
+    cold_pending: bool,
+}
+
+impl Default for StartTimeouts {
+    fn default() -> Self {
+        let warm = intent_acp::initialize_timeout();
+        Self {
+            warm,
+            cold: warm.max(COLD_INITIALIZE_TIMEOUT),
+            cold_pending: false,
+        }
+    }
 }
 
 /// See [`Inner::head_session`].
@@ -945,6 +971,7 @@ impl Runner {
                 closing_signal: watch::channel(false).0,
                 head_session: Mutex::new(HeadSession::default()),
                 pulls,
+                start_timeouts: Mutex::new(StartTimeouts::default()),
             }),
         }
     }
@@ -960,6 +987,27 @@ impl Runner {
         }
         head.session = session.map(str::to_owned);
         head.lease_agents = lease_agents.iter().cloned().collect();
+        drop(head);
+        lock(&self.inner.start_timeouts).cold_pending = true;
+    }
+
+    /// The `initialize` timeout for a provider starting now: the cold one
+    /// for the first start since a link bound, never for a second start.
+    fn initialize_timeout(&self, second: bool) -> Duration {
+        let mut timeouts = lock(&self.inner.start_timeouts);
+        if !second && std::mem::take(&mut timeouts.cold_pending) {
+            timeouts.cold
+        } else {
+            timeouts.warm
+        }
+    }
+
+    /// Replace the `initialize` timeouts.
+    #[cfg(test)]
+    pub(super) fn set_initialize_timeouts(&self, warm: Duration, cold: Duration) {
+        let mut timeouts = lock(&self.inner.start_timeouts);
+        timeouts.warm = warm;
+        timeouts.cold = cold;
     }
 
     /// `agent_id` ended here for good: drop its secrets and refuse any
@@ -1661,74 +1709,66 @@ impl Runner {
                             "{}: the workspace API server did not start: {error}",
                             codes::START
                         ))),
-                        Ok((bridge, mcp)) => self
-                            .start(
-                                &agent,
-                                (&launch, profile.as_ref()),
-                                model.as_deref(),
-                                notes,
-                                (cwd, &tmp, helper_env),
-                            )
-                            .map(|started| (started, bridge, mcp))
-                            .map_err(|error| Some(format!("{}: {error}", codes::START))),
+                        Ok((bridge, mcp)) => Ok((bridge, mcp, cwd, tmp, helper_env)),
                     }
                 }
             }
         };
         let (exit_code, error) = match started {
             Err(error) => (None, error),
-            Ok(((mut child, connection, serve, cwd), bridge, mcp)) => {
-                // Read before waiting: a reaped child no longer reports it,
-                // and its process group can outlive it.
-                let pid = child.id();
-                *lock(&agent.root_pid) = pid;
-                let tracker = pid.map(|pid| {
-                    let descendants = agent.descendants.clone();
-                    // caller-binding: allow — node-local process snapshot; the node has no service layer
-                    tokio::spawn(async move {
-                        let mut tick = tokio::time::interval(TRACK_INTERVAL);
-                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                        loop {
-                            tick.tick().await;
-                            let scan = descendants.begin();
-                            let found = intent_acp::descendant_pids(pid).await;
-                            descendants.publish(scan, found);
-                        }
-                    })
-                });
-                let outcome = self
-                    .supervise(
+            Ok((bridge, mcp, cwd, tmp, helper_env)) => {
+                let mut retried = false;
+                let result = loop {
+                    let spawned = self.start(
                         &agent,
-                        &launch,
-                        &connection,
-                        &mut child,
-                        &mut stop,
-                        &ready,
-                        (&cwd, mcp),
-                        (pid, &agent.descendants),
-                    )
-                    .await;
+                        (&launch, profile.as_ref()),
+                        model.as_deref(),
+                        notes.clone(),
+                        (cwd.clone(), &tmp, helper_env.clone()),
+                    );
+                    let (child, connection, serve, cwd) = match spawned {
+                        Ok(spawned) => spawned,
+                        Err(error) => break (None, Some(format!("{}: {error}", codes::START))),
+                    };
+                    let timeout = self.initialize_timeout(retried);
+                    let outcome = self
+                        .attempt(
+                            &agent,
+                            (&launch, timeout),
+                            (&connection, child),
+                            &mut stop,
+                            &ready,
+                            (&cwd, mcp.clone()),
+                        )
+                        .await;
+                    serve.abort();
+                    // One more start for a provider that did not come up in
+                    // time or exited before it was ready: a machine that has
+                    // just woken is often still slow to start one.
+                    if !retried && outcome.start_may_recover() {
+                        retried = true;
+                        // Not the outcome itself: its error can echo a credential.
+                        let timed_out = matches!(outcome, Outcome::StartFailed(..));
+                        tracing::info!(agent = %agent.id, timed_out, "node: provider did not start; starting it once more");
+                        // The first start's processes are gone.
+                        agent
+                            .descendants
+                            .publish(agent.descendants.begin(), Vec::new());
+                        continue;
+                    }
+                    break match outcome {
+                        Outcome::Exited(code) | Outcome::ExitedAtStart(code, None) => (code, None),
+                        Outcome::ExitedAtStart(code, Some(error)) => {
+                            (code, Some(format!("{}: {error}", codes::START)))
+                        }
+                        Outcome::Stopped => (None, None),
+                        Outcome::StartFailed(error, _) => {
+                            (None, Some(format!("{}: {error}", codes::START)))
+                        }
+                    };
+                };
                 // The agent's workspace API stops with its provider.
                 drop(bridge);
-                if let Some(tracker) = tracker {
-                    tracker.abort();
-                }
-                // Whatever the provider left behind goes too, also when it
-                // exited by itself: its process group, the helpers last seen
-                // as its descendants (and theirs), and on Linux every process
-                // still carrying this run's marker.
-                let mut known = agent.descendants.pids();
-                known.extend(marked_processes(&agent.run_marker).await);
-                kill_tree(child, pid, &known).await;
-                *lock(&agent.root_pid) = None;
-                let result = match outcome {
-                    Outcome::Exited(code) => (code, None),
-                    Outcome::Stopped => (None, None),
-                    Outcome::StartFailed(error) => {
-                        (None, Some(format!("{}: {error}", codes::START)))
-                    }
-                };
-                serve.abort();
                 result
             }
         };
@@ -2096,6 +2136,61 @@ impl Runner {
         Ok((child, connection, serve, cwd))
     }
 
+    /// Supervise one start of the provider, then clean up after it: its
+    /// process tree, and whatever it left behind.
+    async fn attempt(
+        &self,
+        agent: &Agent,
+        launch: (&ProviderLaunch, Duration),
+        (connection, mut child): (&Arc<Connection>, Child),
+        stop: &mut oneshot::Receiver<()>,
+        ready: &watch::Sender<Option<Arc<Ready>>>,
+        (cwd, mcp): (&std::path::Path, Vec<intent_acp::session::McpServer>),
+    ) -> Outcome {
+        // Read before waiting: a reaped child no longer reports it, and its
+        // process group can outlive it.
+        let pid = child.id();
+        *lock(&agent.root_pid) = pid;
+        let tracker = pid.map(|pid| {
+            let descendants = agent.descendants.clone();
+            // caller-binding: allow — node-local process snapshot; the node has no service layer
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(TRACK_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let scan = descendants.begin();
+                    let found = intent_acp::descendant_pids(pid).await;
+                    descendants.publish(scan, found);
+                }
+            })
+        });
+        let outcome = self
+            .supervise(
+                agent,
+                launch,
+                connection,
+                &mut child,
+                stop,
+                ready,
+                (cwd, mcp),
+                (pid, &agent.descendants),
+            )
+            .await;
+        if let Some(tracker) = tracker {
+            tracker.abort();
+        }
+        // Whatever the provider left behind goes too, also when it exited by
+        // itself: its process group, the helpers last seen as its
+        // descendants (and theirs), and on Linux every process still
+        // carrying this run's marker.
+        let mut known = agent.descendants.pids();
+        known.extend(marked_processes(&agent.run_marker).await);
+        kill_tree(child, pid, &known).await;
+        *lock(&agent.root_pid) = None;
+        outcome
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "private step of run_agent over its locals"
@@ -2103,7 +2198,7 @@ impl Runner {
     async fn supervise(
         &self,
         agent: &Agent,
-        launch: &ProviderLaunch,
+        (launch, initialize_timeout): (&ProviderLaunch, Duration),
         connection: &Arc<Connection>,
         child: &mut Child,
         stop: &mut oneshot::Receiver<()>,
@@ -2114,7 +2209,7 @@ impl Runner {
         // The agent's workspace MCP server and its proxied user servers ride
         // `session/new`, which every ACP agent accepts stdio servers on.
         let setup = async {
-            intent_acp::handshake(connection, &launch.config).await?;
+            intent_acp::handshake_within(connection, &launch.config, initialize_timeout).await?;
             intent_acp::session::new_session(connection, cwd, mcp, None).await
         };
         let session = tokio::select! {
@@ -2122,10 +2217,22 @@ impl Runner {
                 Ok(session) => session,
                 Err(error) => {
                     agent.note_auth_failure(&error);
-                    return Outcome::StartFailed(error.to_string());
+                    if intent_services::provider_auth::is_auth_required(&error) {
+                        return Outcome::StartFailed(error.to_string(), false);
+                    }
+                    // A provider that exits at start often closes its output
+                    // before its exit is seen: it exited, not failed setup.
+                    if let Ok(status) = tokio::time::timeout(EXIT_SETTLE, child.wait()).await {
+                        let code = status.ok().and_then(|s| s.code());
+                        return Outcome::ExitedAtStart(code, Some(error.to_string()));
+                    }
+                    let timed_out = matches!(&error, intent_acp::AcpError::Timeout(method) if method == "initialize");
+                    return Outcome::StartFailed(error.to_string(), timed_out);
                 }
             },
-            status = child.wait() => return Outcome::Exited(status.ok().and_then(|s| s.code())),
+            status = child.wait() => {
+                return Outcome::ExitedAtStart(status.ok().and_then(|s| s.code()), None);
+            }
             _ = &mut *stop => return Outcome::Stopped,
         };
         // Record what the provider started during setup before any prompt
@@ -2835,10 +2942,26 @@ enum Push {
     Exit,
 }
 
+/// How long a provider whose setup failed is given to exit, so an exit at
+/// start is told apart from a setup error.
+const EXIT_SETTLE: Duration = Duration::from_millis(500);
+
 enum Outcome {
     Exited(Option<i32>),
+    /// The provider exited before its session was ready, with the setup
+    /// error it caused, if any.
+    ExitedAtStart(Option<i32>, Option<String>),
     Stopped,
-    StartFailed(String),
+    /// Its setup failed; `true` when `initialize` timed out.
+    StartFailed(String, bool),
+}
+
+impl Outcome {
+    /// Whether a second start may succeed: the provider exited before it
+    /// was ready, or did not answer `initialize` in time.
+    fn start_may_recover(&self) -> bool {
+        matches!(self, Self::ExitedAtStart(..) | Self::StartFailed(_, true))
+    }
 }
 
 /// What every remote agent's first turn on this machine starts with: the
