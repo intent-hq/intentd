@@ -573,6 +573,15 @@ pub fn launch_workspace_api_docs(
     launch_context(harness_version).workspace_api
 }
 
+/// The registered version the local path serves for a session's stamp —
+/// the stamp itself when registered, else the latest (as
+/// [`resolve_entry`]). The backend sends this in a launch so a machine
+/// renders what a local spawn would, even for an empty or corrupt stamp.
+#[must_use]
+pub fn launch_harness_version(stamp: &str) -> &'static str {
+    resolve_entry(stamp).version
+}
+
 /// The context row [`launch_workspace_api_docs`] reads.
 fn launch_context(harness_version: Option<&str>) -> &'static ContextSurfaces {
     let Some(requested) = harness_version.and_then(parse_major_minor) else {
@@ -884,6 +893,24 @@ mod tests {
             legacy,
             "an unknown older version is legacy"
         );
+    }
+
+    /// What the backend sends, the machine renders as the local path does:
+    /// an empty or corrupt stamp gets the local fallback, not legacy text.
+    #[test]
+    fn a_launch_names_the_version_the_local_path_serves() {
+        for stamp in REGISTRY
+            .iter()
+            .map(|e| e.version)
+            .chain(["", "corrupt", "0.5"])
+        {
+            let sent = launch_harness_version(stamp);
+            assert_eq!(
+                std::ptr::from_ref(launch_context(Some(sent))),
+                std::ptr::from_ref(resolve_entry(stamp).context),
+                "{stamp:?}"
+            );
+        }
     }
 
     #[test]

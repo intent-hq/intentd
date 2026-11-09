@@ -37,7 +37,7 @@ use intent_core::{AgentId, BoxFuture, Error, Result, Workspace, WorkspaceId};
 use intent_git::hub::AgentRef;
 use intent_git::node_git::{self, AgentRemote};
 use intent_services::feature_api::feature_ports::{RemoteLaunchPort, RemoteRuntime};
-use intent_services::feature_api::Services;
+use intent_services::feature_api::{harness, Services};
 
 use intent_core::machines::{MachineUpdateRequired, RemoteMachineState};
 
@@ -1234,8 +1234,11 @@ impl RemoteLaunchPort for RemoteLaunch {
                     git_identity,
                     new_machine,
                     // Every launch, relaunches included: the machine builds
-                    // the agent's `workspace_api` description for this stamp.
-                    harness_version: Some(session.harness_version.as_str().into()),
+                    // the agent's `workspace_api` description for the version
+                    // the local path would serve this stamp.
+                    harness_version: Some(
+                        harness::launch_harness_version(session.harness_version.as_str()).into(),
+                    ),
                 })
                 .await?;
             Ok(runtime as Arc<RemoteRuntime>)

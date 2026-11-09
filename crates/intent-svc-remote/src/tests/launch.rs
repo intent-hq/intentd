@@ -321,10 +321,14 @@ async fn a_placed_agent_launches_on_its_first_runtime() {
     );
     assert!(!launch.is_sub_agent);
     // The machine builds the agent's workspace_api description for the
-    // session's stamped harness version.
+    // version the local path serves the session's stamp.
     assert_eq!(
         launch.harness_version.as_deref(),
-        Some(session.harness_version.as_str())
+        Some(
+            intent_services::feature_api::harness::launch_harness_version(
+                session.harness_version.as_str()
+            )
+        )
     );
     assert!(runtime.is_alive());
 
