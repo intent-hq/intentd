@@ -277,6 +277,28 @@ fn availability_for(
     )
 }
 
+/// One provider's availability from injected lookups instead of the host:
+/// `resolve` finds a `(provider_id, command)` binary (npx-only providers ask
+/// it for `("npx", "npx")`), `env_has` answers the env-var gate. Lets other
+/// crates' tests build discovery rows from a fake set of CLIs, so their
+/// result does not depend on what the test machine has installed.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn provider_availability_with(
+    provider: &ProviderConfig,
+    resolve: &dyn Fn(&str, &str) -> Option<PathBuf>,
+    env_has: &dyn Fn(&str) -> bool,
+    override_path: &dyn Fn(&str) -> Option<String>,
+) -> ProviderAvailability {
+    availability_for_with_npx(
+        provider,
+        gated_reason_with_env(provider, env_has),
+        resolve,
+        override_path,
+        &|| resolve("npx", "npx"),
+    )
+}
+
 fn availability_for_with_npx(
     provider: &ProviderConfig,
     gated_off: Option<String>,

@@ -51,6 +51,12 @@ pub struct PiCliStatus {
 pub fn probe_pi_cli() -> PiCliStatus {
     let command = resolve_real_pi_command();
     let resolved_path = intent_providers::find_pi_cli(&command);
+    probe_pi_cli_at(command, resolved_path)
+}
+
+/// [`probe_pi_cli`] on an already resolved `command`: `--version` on
+/// `resolved_path`, then the gate. Blocking.
+pub(crate) fn probe_pi_cli_at(command: String, resolved_path: Option<PathBuf>) -> PiCliStatus {
     let (version_output, probe) = match &resolved_path {
         // A RELATIVE separator-carrying override (e.g. `./bin/pi`) validates
         // against the daemon's CWD, but the wrapper/child may exec it from a

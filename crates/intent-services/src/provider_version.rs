@@ -17,6 +17,10 @@ const MAX_VERSION_CHARS: usize = 80;
 
 type Fingerprint = (u64, Option<SystemTime>);
 
+/// Finds a row's binaries: `(provider_id, command, providers.paths value)`
+/// → candidates in precedence order.
+pub(crate) type Locate<'a> = &'a dyn Fn(&str, &str, Option<&str>) -> Vec<PathBuf>;
+
 /// Where a row's version comes from.
 enum Target {
     Binary(PathBuf),
@@ -32,6 +36,7 @@ enum Target {
 fn probe_target<S: std::hash::BuildHasher>(
     p: &ProviderAvailability,
     provider_paths: &HashMap<String, String, S>,
+    locate: Locate<'_>,
 ) -> Option<Target> {
     if p.gated_off.is_some()
         || !p.installed
@@ -42,17 +47,31 @@ fn probe_target<S: std::hash::BuildHasher>(
     }
     let explicit = provider_paths.get(p.id).map(String::as_str);
     if p.id == "auggie" {
-        return Some(Target::AuggieCandidates(
-            intent_providers::find_auggie_candidates(explicit),
-        ));
+        return Some(Target::AuggieCandidates(locate(p.id, p.command, explicit)));
     }
-    match &p.secondary_binary {
-        Some(secondary) => {
-            intent_providers::find_provider_binary(secondary.command, secondary.command, explicit)
-        }
-        None => intent_providers::find_provider_binary(p.id, p.command, explicit),
+    let (id, command) = match &p.secondary_binary {
+        Some(secondary) => (secondary.command, secondary.command),
+        None => (p.id, p.command),
+    };
+    locate(id, command, explicit)
+        .into_iter()
+        .next()
+        .map(Target::Binary)
+}
+
+/// The host's binary lookup for [`probe_display_versions`]: every auggie
+/// candidate in launch order, or the one binary any other provider resolves.
+pub(crate) fn host_locate(
+    provider_id: &str,
+    command: &str,
+    explicit: Option<&str>,
+) -> Vec<PathBuf> {
+    if provider_id == "auggie" {
+        return intent_providers::find_auggie_candidates(explicit);
     }
-    .map(Target::Binary)
+    intent_providers::find_provider_binary(provider_id, command, explicit)
+        .into_iter()
+        .collect()
 }
 
 fn target_version(target: &Target) -> Option<String> {
@@ -114,14 +133,17 @@ fn cached_version_with(path: &Path, failure_ttl: Duration) -> Option<String> {
     version
 }
 
-/// Probe every eligible row in parallel; keyed by provider id.
+/// Probe every eligible row in parallel; keyed by provider id. `locate`
+/// finds a row's binaries (`(provider_id, command, providers.paths value)`
+/// → candidates in precedence order); production passes [`host_locate`].
 pub(crate) fn probe_display_versions<S: std::hash::BuildHasher>(
     providers: &[ProviderAvailability],
     provider_paths: &HashMap<String, String, S>,
+    locate: Locate<'_>,
 ) -> HashMap<&'static str, String> {
     let targets: Vec<(&'static str, Target)> = providers
         .iter()
-        .filter_map(|p| probe_target(p, provider_paths).map(|target| (p.id, target)))
+        .filter_map(|p| probe_target(p, provider_paths, locate).map(|target| (p.id, target)))
         .collect();
     std::thread::scope(|scope| {
         let handles: Vec<_> = targets

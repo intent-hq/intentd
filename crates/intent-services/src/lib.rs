@@ -38346,31 +38346,71 @@ fn extract_markdown_image_urls(content: &str) -> Vec<String> {
     urls
 }
 
-/// Provider discovery with npx version probing (host.providerDiscovery support).
-/// Returns JSON payload with providers array and npx status.
-///
-/// This entry point passes no `providers.paths` overrides; callers with
-/// settings access (the transport's host.providerDiscovery arm) should use
-/// [`discover_providers_with_npx_overrides`] so `installed` matches what the
-/// spawn path would actually resolve (monorepo#1065).
-#[cfg(test)]
-pub(crate) fn discover_providers_with_npx() -> serde_json::Value {
-    discover_providers_with_npx_overrides(&std::collections::HashMap::new())
+/// The machine lookups behind the `host.providerDiscovery` payload.
+/// Production uses [`HostDiscovery`]; tests pass a fake set of CLIs so the
+/// payload does not depend on what the test machine has installed.
+pub(crate) trait DiscoveryHost {
+    /// Every registered provider's availability, in registry order.
+    fn providers<S: std::hash::BuildHasher>(
+        &self,
+        provider_paths: &std::collections::HashMap<String, String, S>,
+    ) -> Vec<intent_providers::ProviderAvailability>;
+    /// The `npx` a launch would use.
+    fn npx(&self) -> Option<PathBuf>;
+    /// The resolved and probed `pi` CLI.
+    fn pi_cli(&self) -> crate::pi_cli::PiCliStatus;
+    /// The resolved and probed `cursor-agent`.
+    fn cursor_cli(&self, override_path: Option<&str>) -> crate::cursor_cli::CursorCliStatus;
+    /// A row's binaries for its display version, in precedence order.
+    fn locate(&self, provider_id: &str, command: &str, explicit: Option<&str>) -> Vec<PathBuf>;
 }
 
-/// [`discover_providers_with_npx`] with the `providers.paths` settings map
-/// threaded through to the override-aware discovery (monorepo#1065): a valid
-/// override flips `installed` / `secondaryResolved`, while `resolvedPath` /
+/// The real machine: cached `PATH` / home-directory discovery and probes.
+pub(crate) struct HostDiscovery;
+
+impl DiscoveryHost for HostDiscovery {
+    fn providers<S: std::hash::BuildHasher>(
+        &self,
+        provider_paths: &std::collections::HashMap<String, String, S>,
+    ) -> Vec<intent_providers::ProviderAvailability> {
+        discovery_cache::discover_providers_cached(provider_paths)
+    }
+    fn npx(&self) -> Option<PathBuf> {
+        intent_providers::probe_npx().resolved_path
+    }
+    fn pi_cli(&self) -> crate::pi_cli::PiCliStatus {
+        crate::pi_cli::probe_pi_cli()
+    }
+    fn cursor_cli(&self, override_path: Option<&str>) -> crate::cursor_cli::CursorCliStatus {
+        crate::cursor_cli::probe_cursor_cli(override_path)
+    }
+    fn locate(&self, provider_id: &str, command: &str, explicit: Option<&str>) -> Vec<PathBuf> {
+        provider_version::host_locate(provider_id, command, explicit)
+    }
+}
+
+/// Provider discovery with npx version probing (host.providerDiscovery
+/// support), with the `providers.paths` settings map threaded through to the
+/// override-aware discovery (monorepo#1065): a valid override flips
+/// `installed` / `secondaryResolved`, while `resolvedPath` /
 /// `secondaryResolvedPath` stay auto-detected (a `secondaryResolved: true`
 /// entry can therefore omit `secondaryResolvedPath`).
 pub fn discover_providers_with_npx_overrides<S: std::hash::BuildHasher>(
     provider_paths: &std::collections::HashMap<String, String, S>,
 ) -> serde_json::Value {
-    let providers = discovery_cache::discover_providers_cached(provider_paths);
-    let npx_status = intent_providers::probe_npx();
+    discovery_payload(&HostDiscovery, provider_paths)
+}
+
+/// [`discover_providers_with_npx_overrides`] against any [`DiscoveryHost`].
+pub(crate) fn discovery_payload<H: DiscoveryHost, S: std::hash::BuildHasher>(
+    host: &H,
+    provider_paths: &std::collections::HashMap<String, String, S>,
+) -> serde_json::Value {
+    let providers = host.providers(provider_paths);
+    let npx_path = host.npx();
 
     // Probe npx version if we found the binary
-    let (version, version_ok) = if let Some(ref npx_path) = npx_status.resolved_path {
+    let (version, version_ok) = if let Some(ref npx_path) = npx_path {
         match probe_npx_version_internal(npx_path) {
             Some(v) => {
                 let ok = parse_npx_version_ok(&v);
@@ -38390,7 +38430,7 @@ pub fn discover_providers_with_npx_overrides<S: std::hash::BuildHasher>(
     let pi_cli_status = providers
         .iter()
         .any(|p| p.id == "pi" && p.gated_off.is_none())
-        .then(crate::pi_cli::probe_pi_cli);
+        .then(|| host.pi_cli());
 
     // Cursor: report the CLI version and refuse the Grok agent host channel,
     // probed on the binary a launch would exec (`providers.paths.cursor`
@@ -38409,11 +38449,13 @@ pub fn discover_providers_with_npx_overrides<S: std::hash::BuildHasher>(
                 && p.installed
                 && cursor_override_reason.is_none()
         })
-        .then(|| {
-            crate::cursor_cli::probe_cursor_cli(provider_paths.get("cursor").map(String::as_str))
-        });
+        .then(|| host.cursor_cli(provider_paths.get("cursor").map(String::as_str)));
 
-    let display_versions = provider_version::probe_display_versions(&providers, provider_paths);
+    let display_versions = provider_version::probe_display_versions(
+        &providers,
+        provider_paths,
+        &|id, cmd, explicit| host.locate(id, cmd, explicit),
+    );
 
     let provider_array: Vec<serde_json::Value> = providers
         .iter()
@@ -38495,7 +38537,7 @@ pub fn discover_providers_with_npx_overrides<S: std::hash::BuildHasher>(
         .collect();
 
     let mut npx_obj = serde_json::Map::new();
-    if let Some(ref path) = npx_status.resolved_path {
+    if let Some(ref path) = npx_path {
         npx_obj.insert(
             "resolvedPath".to_string(),
             serde_json::json!(path.display().to_string()),
