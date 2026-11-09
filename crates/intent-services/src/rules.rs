@@ -215,7 +215,9 @@ fn select_rule_files(files: &[WorkspaceRuleFile]) -> RuleSelection {
     if let Some(i) = files.iter().position(|f| !is_rules_dir_file(f)) {
         return RuleSelection::Single(i);
     }
-    let joined: Vec<usize> = (0..files.len()).filter(|&i| is_rules_dir_file(&files[i])).collect();
+    let joined: Vec<usize> = (0..files.len())
+        .filter(|&i| is_rules_dir_file(&files[i]))
+        .collect();
     if joined.is_empty() {
         RuleSelection::None
     } else {
@@ -1876,48 +1878,48 @@ This is a test skill.
 
         fn session_on(version: &str, provider: &str) -> intent_core::AgentSession {
             intent_core::AgentSession {
-            harness_version: version.to_owned(),
-            harness_features: None,
-            id: intent_core::AgentId::from("agent-skip"),
-            workspace_id: intent_core::WorkspaceId::from("ws-skip"),
-            parent_agent_id: None,
-            backend_session_id: None,
-            acp_session_id: None,
-            name: "Skip Agent".into(),
-            name_explicitly_set: false,
-            model: None,
-            reasoning_effort: None,
-            effort_levels: None,
-            provider: Some(provider.to_owned()),
-            system_prompt: None,
-            specialist: None,
-            status: intent_core::AgentStatus::Active,
-            is_active: false,
-            messages: vec![],
-            stats: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            attention_request_kind: None,
-            attention_request_reason: None,
-            attention_request_timestamp: None,
-            delegation_depth: None,
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            file_blocks: None,
-            stop_reason: None,
-            stop_reason_timestamp: None,
-            session_corrupted: false,
-            pending_delete_at: None,
-            retired_at: None,
-            notifications_muted: false,
-            pinned: false,
-            is_background: false,
-            metadata: None,
-            created_at: intent_core::now_iso(),
-            updated_at: intent_core::now_iso(),
+                harness_version: version.to_owned(),
+                harness_features: None,
+                id: intent_core::AgentId::from("agent-skip"),
+                workspace_id: intent_core::WorkspaceId::from("ws-skip"),
+                parent_agent_id: None,
+                backend_session_id: None,
+                acp_session_id: None,
+                name: "Skip Agent".into(),
+                name_explicitly_set: false,
+                model: None,
+                reasoning_effort: None,
+                effort_levels: None,
+                provider: Some(provider.to_owned()),
+                system_prompt: None,
+                specialist: None,
+                status: intent_core::AgentStatus::Active,
+                is_active: false,
+                messages: vec![],
+                stats: None,
+                task_note_id: None,
+                skip_auto_commit: false,
+                completion_report: None,
+                completion_report_timestamp: None,
+                attention_request_kind: None,
+                attention_request_reason: None,
+                attention_request_timestamp: None,
+                delegation_depth: None,
+                initial_message: None,
+                context_references: None,
+                image_blocks: None,
+                file_blocks: None,
+                stop_reason: None,
+                stop_reason_timestamp: None,
+                session_corrupted: false,
+                pending_delete_at: None,
+                retired_at: None,
+                notifications_muted: false,
+                pinned: false,
+                is_background: false,
+                metadata: None,
+                created_at: intent_core::now_iso(),
+                updated_at: intent_core::now_iso(),
             }
         }
 
@@ -1959,14 +1961,33 @@ This is a test skill.
             let features = intent_core::settings_file::AgentFeaturesSettings::default();
             let assembled = if remote {
                 assemble_remote_system_prompt(
-                    &store, Some(dir), "workspace", None, false, false, false, &features,
-                    None, Some(&session), None,
+                    &store,
+                    Some(dir),
+                    "workspace",
+                    None,
+                    false,
+                    false,
+                    false,
+                    &features,
+                    None,
+                    Some(&session),
+                    None,
                 )
                 .await
             } else {
                 assemble_agent_system_prompt(
-                    &store, Some(dir), "workspace", None, false, false, false, &features,
-                    None, Some(&session), None, executor,
+                    &store,
+                    Some(dir),
+                    "workspace",
+                    None,
+                    false,
+                    false,
+                    false,
+                    &features,
+                    None,
+                    Some(&session),
+                    None,
+                    executor,
                 )
                 .await
             };
@@ -2010,7 +2031,9 @@ This is a test skill.
             let big = format!("{AGENTS}\n{}", "x".repeat(cap));
             let small = repo(&[("AGENTS.md", AGENTS)]);
             let large = repo(&[("AGENTS.md", &big)]);
-            assert!(!prompt(small.path(), "3.10", Some(&codex()), false).await.contains(AGENTS));
+            assert!(!prompt(small.path(), "3.10", Some(&codex()), false)
+                .await
+                .contains(AGENTS));
             let p = prompt(large.path(), "3.10", Some(&codex()), false).await;
             assert_eq!(p.matches(AGENTS).count(), 1);
         }
@@ -2045,7 +2068,11 @@ This is a test skill.
                 rows,
                 [
                     ("CLAUDE.md", CLAUDE.len(), "injected".to_owned()),
-                    ("AGENTS.md", AGENTS.len(), "loaded natively by Codex".to_owned()),
+                    (
+                        "AGENTS.md",
+                        AGENTS.len(),
+                        "loaded natively by Codex".to_owned()
+                    ),
                 ]
             );
             let cli = claude(Some("2.1.303 (Claude Code)"));
@@ -2056,7 +2083,10 @@ This is a test skill.
             assert_eq!(rules.injected, None);
             assert_eq!(
                 rules.files.iter().map(|f| f.loading).collect::<Vec<_>>(),
-                [RuleLoading::LoadedNatively("Claude Code"), RuleLoading::NotLoaded]
+                [
+                    RuleLoading::LoadedNatively("Claude Code"),
+                    RuleLoading::NotLoaded
+                ]
             );
         }
 
@@ -2069,7 +2099,10 @@ This is a test skill.
                 workspace_path: dir.path(),
                 executor: None,
             };
-            assert_eq!(workspace_rules_native_aware(&inputs), workspace_rules_v1(&inputs));
+            assert_eq!(
+                workspace_rules_native_aware(&inputs),
+                workspace_rules_v1(&inputs)
+            );
         }
     }
 }

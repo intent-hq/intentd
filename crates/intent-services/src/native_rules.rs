@@ -23,7 +23,8 @@ const CLAUDE_AGENTS_MD_MIN: (u64, u64, u64) = (2, 1, 281);
 pub(crate) const CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
 
 /// Env switches that stop Claude Code from loading instruction files.
-const CLAUDE_INSTRUCTION_OFF_ENV: [&str; 2] = ["CLAUDE_CODE_DISABLE_CLAUDE_MDS", "CLAUDE_CODE_SIMPLE"];
+const CLAUDE_INSTRUCTION_OFF_ENV: [&str; 2] =
+    ["CLAUDE_CODE_DISABLE_CLAUDE_MDS", "CLAUDE_CODE_SIMPLE"];
 
 /// What runs the agent, as far as rule loading goes. Built once per spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,8 +68,9 @@ pub(crate) fn native_loader(
             Some("Claude Code")
         }
         ("claude-code", "AGENTS.md") => {
-            let version =
-                intent_providers::version_gate::parse_cli_version(executor.cli_version.as_deref()?)?;
+            let version = intent_providers::version_gate::parse_cli_version(
+                executor.cli_version.as_deref()?,
+            )?;
             (version >= CLAUDE_AGENTS_MD_MIN && !has_claude_instructions_above(workspace_path))
                 .then_some("Claude Code")
         }
@@ -130,22 +132,22 @@ pub(crate) async fn local_executor(
                     .any(|key| std::env::var_os(key).is_some_and(|v| env_truthy(&v)));
             if !off {
                 let path = context.runtime.path().to_owned();
-                executor.cli_version =
-                    tokio::task::spawn_blocking(move || crate::provider_version::cached_version(&path))
-                        .await
-                        .ok()
-                        .flatten();
+                executor.cli_version = tokio::task::spawn_blocking(move || {
+                    crate::provider_version::cached_version(&path)
+                })
+                .await
+                .ok()
+                .flatten();
             }
         }
         InstalledCli::Codex => {
             let home = context.codex_home();
             let workspace = workspace_path.to_owned();
-            executor.codex_doc_cap = tokio::task::spawn_blocking(move || {
-                codex_doc_cap(home.as_deref()?, &workspace)
-            })
-            .await
-            .ok()
-            .flatten();
+            executor.codex_doc_cap =
+                tokio::task::spawn_blocking(move || codex_doc_cap(home.as_deref()?, &workspace))
+                    .await
+                    .ok()
+                    .flatten();
         }
     }
     Some(executor)
@@ -154,7 +156,11 @@ pub(crate) async fn local_executor(
 fn env_truthy(value: &std::ffi::OsStr) -> bool {
     let value = value.to_string_lossy();
     let value = value.trim();
-    !value.is_empty() && !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+    !value.is_empty()
+        && !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
 }
 
 /// Codex's effective doc cap for `workspace` from the user config in
@@ -262,7 +268,11 @@ mod tests {
         for other in ["CLAUDE.local.md", ".claude/CLAUDE.md"] {
             let dir = repo(&[("AGENTS.md", 100), (other, 10)]);
             let cli = claude(Some("2.1.303 (Claude Code)"));
-            assert_eq!(native_loader("AGENTS.md", dir.path(), Some(&cli)), None, "{other}");
+            assert_eq!(
+                native_loader("AGENTS.md", dir.path(), Some(&cli)),
+                None,
+                "{other}"
+            );
         }
         let parent = repo(&[("CLAUDE.md", 10)]);
         let nested = parent.path().join("ws");
@@ -276,8 +286,14 @@ mod tests {
     fn claude_md_is_native_on_any_known_claude_cli_and_never_on_codex() {
         let dir = repo(&[("CLAUDE.md", 100)]);
         let old = claude(Some("2.1.0 (Claude Code)"));
-        assert_eq!(native_loader("CLAUDE.md", dir.path(), Some(&old)), Some("Claude Code"));
-        assert_eq!(native_loader("CLAUDE.md", dir.path(), Some(&claude(None))), None);
+        assert_eq!(
+            native_loader("CLAUDE.md", dir.path(), Some(&old)),
+            Some("Claude Code")
+        );
+        assert_eq!(
+            native_loader("CLAUDE.md", dir.path(), Some(&claude(None))),
+            None
+        );
         let cx = codex(Some(CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES));
         assert_eq!(native_loader("CLAUDE.md", dir.path(), Some(&cx)), None);
     }
@@ -288,16 +304,25 @@ mod tests {
         let under = repo(&[("AGENTS.md", cap)]);
         let over = repo(&[("AGENTS.md", cap + 1)]);
         let cx = codex(Some(cap));
-        assert_eq!(native_loader("AGENTS.md", under.path(), Some(&cx)), Some("Codex"));
+        assert_eq!(
+            native_loader("AGENTS.md", under.path(), Some(&cx)),
+            Some("Codex")
+        );
         assert_eq!(native_loader("AGENTS.md", over.path(), Some(&cx)), None);
-        assert_eq!(native_loader("AGENTS.md", under.path(), Some(&codex(None))), None);
+        assert_eq!(
+            native_loader("AGENTS.md", under.path(), Some(&codex(None))),
+            None
+        );
     }
 
     #[test]
     fn codex_needs_the_project_root_and_no_override() {
         let cx = codex(Some(CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES));
         let overridden = repo(&[("AGENTS.md", 10), ("AGENTS.override.md", 10)]);
-        assert_eq!(native_loader("AGENTS.md", overridden.path(), Some(&cx)), None);
+        assert_eq!(
+            native_loader("AGENTS.md", overridden.path(), Some(&cx)),
+            None
+        );
         let no_root = repo(&[("AGENTS.md", 10)]);
         std::fs::remove_dir(no_root.path().join(".git")).unwrap();
         assert_eq!(native_loader("AGENTS.md", no_root.path(), Some(&cx)), None);
@@ -307,7 +332,10 @@ mod tests {
     fn other_files_and_providers_are_never_native() {
         let dir = repo(&[(".intent/guidelines.md", 10), ("AGENTS.md", 10)]);
         let cli = claude(Some("2.1.303 (Claude Code)"));
-        assert_eq!(native_loader(".intent/guidelines.md", dir.path(), Some(&cli)), None);
+        assert_eq!(
+            native_loader(".intent/guidelines.md", dir.path(), Some(&cli)),
+            None
+        );
         let other = RuleExecutor {
             provider_id: "opencode".into(),
             cli_version: Some("1.0.0".into()),
@@ -322,7 +350,11 @@ mod tests {
         for provider in ["claude-code", "codex"] {
             let remote = RuleExecutor::remote(provider);
             for file in ["AGENTS.md", "CLAUDE.md"] {
-                assert_eq!(native_loader(file, dir.path(), Some(&remote)), None, "{provider} {file}");
+                assert_eq!(
+                    native_loader(file, dir.path(), Some(&remote)),
+                    None,
+                    "{provider} {file}"
+                );
             }
         }
     }
@@ -331,7 +363,8 @@ mod tests {
     #[test]
     fn a_symlinked_rule_file_is_injected() {
         let dir = repo(&[("real.md", 10)]);
-        std::os::unix::fs::symlink(dir.path().join("real.md"), dir.path().join("AGENTS.md")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real.md"), dir.path().join("AGENTS.md"))
+            .unwrap();
         let cli = claude(Some("2.1.303 (Claude Code)"));
         assert_eq!(native_loader("AGENTS.md", dir.path(), Some(&cli)), None);
     }
@@ -351,7 +384,11 @@ mod tests {
         .unwrap();
         assert_eq!(codex_doc_cap(home.path(), ws.path()), Some(4096));
         std::fs::create_dir(ws.path().join(".codex")).unwrap();
-        std::fs::write(ws.path().join(".codex/config.toml"), "project_doc_max_bytes = 100\n").unwrap();
+        std::fs::write(
+            ws.path().join(".codex/config.toml"),
+            "project_doc_max_bytes = 100\n",
+        )
+        .unwrap();
         assert_eq!(codex_doc_cap(home.path(), ws.path()), Some(100));
     }
 
@@ -375,7 +412,10 @@ mod tests {
         let home = crate::test_support::test_tempdir("codex-home-");
         std::fs::write(
             home.path().join("config.toml"),
-            format!("[projects.\"{}\"]\ntrust_level = \"trusted\"\n", ws.path().display()),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                ws.path().display()
+            ),
         )
         .unwrap();
         assert_eq!(
