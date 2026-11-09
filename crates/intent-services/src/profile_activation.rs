@@ -18,7 +18,7 @@
 //! The registry is value-free: it holds references and opaque fingerprints,
 //! never environment keys or values.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 
 use intent_core::{AgentId, WorkspaceId};
@@ -53,6 +53,9 @@ struct State {
     /// that starts (its overlay was read fresh) and replaced by every saved
     /// edit; removed on delete.
     saved: HashMap<String, String>,
+    /// Profile ids deleted since the daemon started: settings read before a
+    /// delete are never current again.
+    deleted: HashSet<String>,
     next_token: u64,
 }
 
@@ -191,13 +194,12 @@ impl ProfileActivation {
     ) -> ActivationChanges {
         let mut state = self.state.lock().unwrap();
         let before = vec![(profile_id.to_owned(), state.snapshot(profile_id))];
-        match fingerprint {
-            Some(fp) => {
-                state.saved.insert(profile_id.to_owned(), fp.to_owned());
-            }
-            None => {
-                state.saved.remove(profile_id);
-            }
+        if let Some(fp) = fingerprint {
+            state.saved.insert(profile_id.to_owned(), fp.to_owned());
+            state.deleted.remove(profile_id);
+        } else {
+            state.saved.remove(profile_id);
+            state.deleted.insert(profile_id.to_owned());
         }
         Self::collect(&state, before)
     }
@@ -246,18 +248,18 @@ impl ProfileActivation {
 
     /// Whether a process that read `reference`'s settings under
     /// `fingerprint` (a quick action, which registers no live process) still
-    /// runs the saved ones: false once an edit moved the saved fingerprint.
-    /// True when no saved fingerprint is recorded.
+    /// runs the saved ones: false once an edit moved the saved fingerprint
+    /// or the profile was deleted. True when nothing is recorded.
     pub(crate) fn fingerprint_is_saved(&self, reference: &str, fingerprint: &str) -> bool {
         let Some(profile_id) = profile_id_of(reference) else {
             return true;
         };
-        self.state
-            .lock()
-            .unwrap()
-            .saved
-            .get(&profile_id)
-            .is_none_or(|saved| saved == fingerprint)
+        let state = self.state.lock().unwrap();
+        !state.deleted.contains(&profile_id)
+            && state
+                .saved
+                .get(&profile_id)
+                .is_none_or(|saved| saved == fingerprint)
     }
 
     /// The fingerprint `agent_id`'s live process started with, when it runs
@@ -324,6 +326,36 @@ mod tests {
 
     /// Both supported base providers behave the same.
     const BASES: [&str; 2] = ["codex", "claude-code"];
+
+    /// A quick action holds no live process: its observation applies only
+    /// while the settings it read are still saved, never after an edit or a
+    /// delete.
+    #[test]
+    fn a_read_fingerprint_is_saved_until_an_edit_or_a_delete() {
+        for base in BASES {
+            let reg = ProfileActivation::default();
+            let work = format!("{base}@pwork");
+            assert!(
+                reg.fingerprint_is_saved(&work, "f1"),
+                "{base}: nothing recorded"
+            );
+            reg.saved_changed("pwork", Some("f2"));
+            assert!(!reg.fingerprint_is_saved(&work, "f1"), "{base}: edited");
+            assert!(reg.fingerprint_is_saved(&work, "f2"), "{base}");
+            reg.saved_changed("pwork", None);
+            assert!(!reg.fingerprint_is_saved(&work, "f2"), "{base}: deleted");
+
+            // A Default configuration with no overrides reads as "": adding
+            // overrides moves it on.
+            let key = crate::provider_profiles::default_activation_key(base);
+            assert!(reg.fingerprint_is_saved(base, ""), "{base}");
+            reg.saved_changed(&key, Some("f3"));
+            assert!(
+                !reg.fingerprint_is_saved(base, ""),
+                "{base}: overrides added"
+            );
+        }
+    }
 
     #[test]
     fn an_edit_marks_running_processes_and_new_processes_use_saved_settings() {

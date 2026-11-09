@@ -1253,5 +1253,97 @@ async fn quick_actions_fail_over_to_backup_profiles_over_wss() {
     assert!(reply.get("result").is_none(), "{reply}");
     assert!(reply["error"]["code"].is_i64(), "{reply}");
     assert_eq!(prompt_count(&prompts), 6, "Default and Drained, once each");
+
+    // Too little budget left after a quota failure: no backup is started
+    // (it could not finish, yet its account would pay for the prompt) and
+    // the quota error comes back.
+    let reply = rpc(
+        &mut ws,
+        14,
+        "agent.completeOnce",
+        json!({ "prompt": "write a commit message", "timeoutMs": 4000 }),
+    )
+    .await;
+    assert!(reply.get("result").is_none(), "{reply}");
+    assert_eq!(prompt_count(&prompts), 7, "only the configured reference");
+    drop(daemon);
+}
+
+/// A backup started after a quota failure is bounded by the call's
+/// `timeoutMs` as a whole, setup included (PROTOCOL §5.54 Quick actions,
+/// Budget): a backup whose adapter never finishes starting is abandoned at
+/// the deadline and the quota error comes back, instead of the call waiting
+/// out the adapter's own setup budget.
+#[tokio::test]
+async fn a_backup_that_cannot_start_in_time_returns_the_quota_error_over_wss() {
+    let script = format!(
+        "{}/tests/fixtures/mock-acp-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping quick-action failover e2e: node not on PATH");
+        return;
+    }
+    let root = scratch_dir("qa-deadline");
+    let data_dir = root.path().join("data");
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data");
+    std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+    let toolchain = common::codex_npx::install(&data_dir, &script);
+    let prompts = scratch.join("prompts.jsonl");
+    let quota = quota_behavior();
+    let mut env: Vec<(&str, &str)> = toolchain
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    env.extend([
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_BEHAVIOR", quota.as_str()),
+        (
+            "MOCK_AGENT_PROMPT_LOG",
+            prompts.to_str().expect("utf-8 path"),
+        ),
+    ]);
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, &env),
+        data_dir: data_dir.clone(),
+        scratch,
+    };
+    let (mut ws, _sub) = connect(&data_dir).await;
+    ok(
+        &mut ws,
+        1,
+        "settings.update",
+        json!({ "changes": [{ "path": "model.defaultProvider", "value": "codex" }] }),
+    )
+    .await;
+    let stuck = json!({ "initializeDelayMs": 600_000, "response": "🤖\nfrom-stuck" }).to_string();
+    ok(
+        &mut ws,
+        2,
+        "providers.profiles.create",
+        json!({
+            "baseProviderId": "codex",
+            "name": "Stuck",
+            "backup": true,
+            "env": [{ "key": "MOCK_AGENT_BEHAVIOR", "kind": "set", "value": stuck }],
+        }),
+    )
+    .await;
+
+    let reply = rpc(
+        &mut ws,
+        3,
+        "agent.completeOnce",
+        json!({ "prompt": "write a commit message", "timeoutMs": 8000 }),
+    )
+    .await;
+    assert!(reply.get("result").is_none(), "{reply}");
+    assert!(reply["error"]["code"].is_i64(), "{reply}");
+    assert_eq!(
+        prompt_count(&prompts),
+        1,
+        "the backup never reached its prompt"
+    );
     drop(daemon);
 }
