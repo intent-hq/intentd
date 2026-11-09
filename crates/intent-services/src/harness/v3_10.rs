@@ -2,12 +2,14 @@
 //! (`intent_core::STAGED_HARNESS_VERSION`) until it becomes current; only
 //! the eval-only override stamps it. Each spawn-time builder below is the
 //! extension point its work fills; until then each renders 3.9's bytes.
+//! Its specialist bundle is 3.9's with the UI Designer's completion step
+//! moved from the retired `report_to_parent` tool to `ws.agent.reportToParent`.
 
 use super::{ContextSurfaces, Doctrine, HarnessEntry, RepoRulesInputs, SkillsBlockInputs};
 
 static DOCTRINE: Doctrine = Doctrine {
     instructions: &crate::instructions::V3_10,
-    specialists: crate::specialists::EMBEDDED_BUNDLED_V3_9,
+    specialists: crate::specialists::EMBEDDED_BUNDLED_V3_10,
 };
 
 static CONTEXT: ContextSurfaces = ContextSurfaces {
@@ -84,7 +86,6 @@ mod tests {
         let current = super::super::resolve_entry("3.10");
         let previous = super::super::resolve_entry("3.9");
         assert_eq!(current.version, "3.10");
-        assert_eq!(current.doctrine.specialists, previous.doctrine.specialists);
         assert!(std::ptr::addr_eq(current.harness, previous.harness));
         assert_eq!((current.default_features)(), (previous.default_features)());
         assert_eq!(current.feature_labels, previous.feature_labels);
@@ -92,6 +93,41 @@ mod tests {
             Some(current.version),
             intent_core::STAGED_HARNESS_VERSION,
             "3.10 is staged until it becomes current"
+        );
+    }
+
+    /// 3.10 changes one bundled specialist: the UI Designer reports through
+    /// `ws.agent.reportToParent`, since agents no longer get a discrete
+    /// `report_to_parent` tool.
+    #[test]
+    fn v3_10_bundle_only_fixes_the_ui_designer_report() {
+        let current: &[(&str, &str)] = super::super::resolve_entry("3.10").doctrine.specialists;
+        let previous: &[(&str, &str)] = super::super::resolve_entry("3.9").doctrine.specialists;
+        let ids = |bundle: &[(&'static str, &'static str)]| -> Vec<&'static str> {
+            bundle.iter().map(|(id, _)| *id).collect()
+        };
+        assert_eq!(ids(current), ids(previous));
+        for ((id, now), (_, before)) in current.iter().zip(previous) {
+            if *id == "ui-designer" {
+                continue;
+            }
+            assert_eq!(now, before, "{id} is unchanged in 3.10");
+        }
+        let find = |bundle: &[(&str, &'static str)]| {
+            bundle
+                .iter()
+                .find_map(|(id, content)| (*id == "ui-designer").then_some(*content))
+                .expect("ui designer specialist")
+        };
+        let (now, before) = (find(current), find(previous));
+        assert!(before.contains("Call `report_to_parent` with:"));
+        assert!(!now.contains("report_to_parent"));
+        assert_eq!(
+            now,
+            before.replace(
+                "Call `report_to_parent` with:",
+                "Call `ws.agent.reportToParent` via the `workspace_api` tool with:",
+            )
         );
     }
 
