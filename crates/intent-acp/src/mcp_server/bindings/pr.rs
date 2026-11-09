@@ -549,8 +549,8 @@ mod tests {
             let server = bridge(api.clone(), true, true);
             for ns in ["pr", "mr"] {
                 assert_eq!(
-                    body(&call(&server, &format!("return typeof ws.{ns}.create;")).await),
-                    "undefined"
+                    body(&call(&server, &format!("return 'create' in ws.{ns};")).await),
+                    false
                 );
                 let result = call(
                     &server,

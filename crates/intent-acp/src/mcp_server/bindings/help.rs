@@ -60,6 +60,12 @@ pub(crate) fn dispatch(
                 None => Ok(shape(help_index(is_chief, features))),
             }
         }
+        "suggest" => Err(super::suggest::unknown_method_message(
+            workspace_id.is_chief(),
+            features,
+            is_sub_agent,
+            args,
+        )),
         other => Err(format!("host: unknown method `help.{other}`")),
     }
 }

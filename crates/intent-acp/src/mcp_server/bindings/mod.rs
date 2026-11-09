@@ -38,6 +38,9 @@ pub(crate) mod primitive;
 pub(crate) mod script;
 pub(crate) mod search;
 pub(crate) mod secret;
+pub(crate) mod suggest;
+#[cfg(test)]
+mod suggest_tests;
 pub(crate) mod task;
 pub(crate) mod terminal;
 pub(crate) mod workspace;
@@ -72,6 +75,13 @@ pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> String {
 /// sessions.
 #[must_use]
 pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) -> String {
+    let mut out = namespaces_prelude(features, is_sub_agent);
+    out.push_str(suggest::guard_prelude());
+    out
+}
+
+/// Every namespace installer, without the closing [`suggest::guard_prelude`].
+fn namespaces_prelude(features: &AgentFeaturesSettings, is_sub_agent: bool) -> String {
     let forced;
     let features = if (is_sub_agent && (features.structured_questions || features.secret_requests))
         || (features.secret_requests && !features.host_exec)
@@ -150,11 +160,12 @@ pub fn prelude_for_workspace(
     } else {
         features
     };
-    let mut prelude = prelude_for_bridge(features, is_sub_agent);
+    let mut prelude = namespaces_prelude(features, is_sub_agent);
     if workspace_id.is_chief() {
         prelude.push_str(app::mcp::PRELUDE);
         prelude.push_str(app::chats::PRELUDE);
     }
+    prelude.push_str(suggest::guard_prelude());
     prelude
 }
 
@@ -287,8 +298,41 @@ pub(crate) const RETIRED_ALLOWED_METHODS: &[&str] = &[
 /// transport could never honor, and `ws.agent.send` / `sendToTask` can bound
 /// their wait on the (spawned, cancellation-safe) daemon-side delivery by
 /// the budget's REMAINING time.
+/// Argument errors gain the method's signature ([`suggest::with_signature`]).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn try_dispatch(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
+    turn_attachments: Option<&Arc<TurnAttachmentRegistry>>,
+    features: &AgentFeaturesSettings,
+    is_sub_agent: bool,
+    eval_budget: EvalBudget,
+    method: &str,
+    args: &Value,
+) -> Result<Option<Value>, String> {
+    dispatch_binding(
+        api,
+        workspace_id,
+        caller_agent_id,
+        turn_attachments,
+        features,
+        is_sub_agent,
+        eval_budget,
+        method,
+        args,
+    )
+    .await
+    .map_err(|err| {
+        if method.starts_with("help.") {
+            return err;
+        }
+        suggest::with_signature(workspace_id.is_chief(), features, is_sub_agent, method, err)
+    })
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn dispatch_binding(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
     caller_agent_id: Option<&AgentId>,
