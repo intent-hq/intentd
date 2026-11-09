@@ -114,3 +114,20 @@ crates/intent-services/src/agent_manager/runtime.rs  intentd::suite_wss_agents e
 # in head's relay, exercised by the two-daemon e2e and head's link tests.
 crates/intent-services/src/checkout_transfer*         intentd::suite_e2e        e2e_remote_launch::file_pull
 crates/intent-services/src/checkout_transfer*         intent-svc-remote::lib    tests::launch::file_pull
+
+# Note writes: note_ops.rs holds the pure ws.note.* content helpers (the
+# setContent cleaner, add/edit/editLines, comment anchoring) and note_merge.rs
+# the setContent three-way merge. Their end-to-end expectations live in
+# intentd's suites, so a note_ops.rs change ran only intent-services and the
+# merge queue caught the broken e2e expectations instead (intentd#3204).
+# lib.rs's note write paths are not mapped: more than half of intent-services
+# PRs edit lib.rs, so a lib.rs glob would add these suites to most of them. A
+# note-write change made only in lib.rs still relies on coverage-e2e.
+# uds_note_subscription is not mapped: it proves the subscription engine's
+# delta ordering, not note content.
+crates/intent-services/src/note_ops.rs               intentd::suite_e2e        e2e_note_comment_ops_bindings
+crates/intent-services/src/note_ops.rs               intentd::suite_e2e        e2e_services_note_ops
+crates/intent-services/src/note_ops.rs               intentd::suite_wss_g_r    e2e_wss_note_truncated_read
+crates/intent-services/src/note_ops.rs               intentd::suite_wss_g_r    e2e_wss_note_set_content_merge
+crates/intent-services/src/note_merge.rs             intentd::suite_wss_g_r    e2e_wss_note_set_content_merge
+crates/intent-services/src/note_merge.rs             intentd::suite_wss_g_r    e2e_wss_note_truncated_read
