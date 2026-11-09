@@ -222,9 +222,10 @@ async fn retire_refuses_chief() {
     assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
 }
 
-/// Retire only admits daemon-owned git worktrees: `cow` / `direct`
-/// checkouts, `skipIsolation`, remote and checkout-less workspaces are
-/// refused with `retire-unsupported` and left untouched.
+/// Retire only admits daemon-owned checkouts: a `cow` / `direct` row whose
+/// repository is not its own folder (`repositoryPath != worktreePath`),
+/// `skipIsolation`, remote and checkout-less workspaces are refused with
+/// `retire-unsupported` and left untouched.
 #[intent_test_macros::daemon_test]
 async fn retire_refuses_non_worktree_checkouts() {
     let f = fixture().await;
@@ -797,9 +798,9 @@ async fn auto_retire_is_fail_soft_per_workspace() {
     );
 }
 
-/// Remote and retire-unsupported workspaces (here a `direct` checkout, whose
-/// folder is the repository) are skipped without an attempt, and an
-/// archived row without `archivedAt` is never treated as overdue.
+/// Remote and retire-unsupported workspaces (here a `direct` row whose
+/// folder is not a repository of its own) are skipped without an attempt,
+/// and an archived row without `archivedAt` is never treated as overdue.
 #[intent_test_macros::daemon_test]
 async fn auto_retire_skips_remote_unsupported_and_undated_workspaces() {
     let f = fixture().await;
@@ -1592,4 +1593,441 @@ async fn auto_purge_reads_the_live_purge_setting() {
         .expect("set");
     assert_eq!(svc.sweep_auto_retire_at(days_from_now(8)).await.retired, 1);
     assert!(f.store.get_workspace(&ws.id).await.unwrap().is_retired());
+}
+
+// ---------------------------------------------------------------------------
+// Standalone (`direct` / `cow`) checkouts: the folder IS the repository, so
+// the purge removes it only when nothing in it exists solely there
+// (`LocalWorkRule::PurgeStandalone`).
+// ---------------------------------------------------------------------------
+
+use crate::test_support::submodule_fixture::git;
+
+/// A daemon-owned standalone checkout laid out like cache hydration:
+/// `<root>/<id>/repo`, cloned from a bare `origin.git`, with
+/// `repositoryPath == worktreePath`, archived now. `with_sub` adds a pushed
+/// submodule `sub` (bare origin `sub.git`).
+struct Standalone {
+    _remotes: tempfile::TempDir,
+    remotes: std::path::PathBuf,
+    ws: intent_core::Workspace,
+    folder: std::path::PathBuf,
+}
+
+async fn insert_standalone(
+    f: &Fixture,
+    name: &str,
+    mode: intent_core::CheckoutMode,
+    with_sub: bool,
+) -> Standalone {
+    insert_standalone_with(f, name, mode, with_sub, |_| {}).await
+}
+
+async fn insert_standalone_with(
+    f: &Fixture,
+    name: &str,
+    mode: intent_core::CheckoutMode,
+    with_sub: bool,
+    tweak: impl FnOnce(&mut intent_core::Workspace),
+) -> Standalone {
+    let remotes_dir = test_tempdir("intentd-standalone-remotes-");
+    let remotes = remotes_dir.path().to_path_buf();
+    git(
+        &remotes,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            f.repo.to_str().unwrap(),
+            "origin.git",
+        ],
+    );
+    let id = WorkspaceId::from(name);
+    let ws_dir = f.root.join(id.as_str());
+    std::fs::create_dir_all(ws_dir.join(".workspace")).unwrap();
+    let origin = remotes.join("origin.git");
+    git(&ws_dir, &["clone", "-q", origin.to_str().unwrap(), "repo"]);
+    let folder = ws_dir.join("repo");
+    if with_sub {
+        let sub_src = remotes.join("sub-src");
+        crate::test_support::submodule_fixture::init_repo(&sub_src);
+        git(&remotes, &["clone", "-q", "--bare", "sub-src", "sub.git"]);
+        let sub_url = remotes.join("sub.git");
+        git(
+            &folder,
+            &["submodule", "add", "-q", sub_url.to_str().unwrap(), "sub"],
+        );
+        git(&folder, &["commit", "-q", "-m", "add sub"]);
+        git(&folder, &["push", "-q", "origin", "HEAD"]);
+    }
+    let mut ws = super::workspace(&id);
+    ws.repository_path = Some(folder.to_string_lossy().to_string());
+    ws.worktree_path = ws.repository_path.clone();
+    ws.repository_owner = Some("o".to_string());
+    ws.repository_name = Some("repo".to_string());
+    ws.branch = git(&folder, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    ws.checkout_mode = Some(mode);
+    ws.archived = true;
+    ws.archived_at = Some(crate::now_iso());
+    tweak(&mut ws);
+    f.store.insert_workspace(&ws).await.expect("insert");
+    Standalone {
+        _remotes: remotes_dir,
+        remotes,
+        ws,
+        folder,
+    }
+}
+
+fn commit_file(dir: &std::path::Path, name: &str) -> String {
+    std::fs::write(dir.join(name), format!("{name}\n")).unwrap();
+    git(dir, &["add", name]);
+    git(dir, &["commit", "-q", "-m", name]);
+    git(dir, &["rev-parse", "HEAD"])
+}
+
+fn purge_sweep(f: &Fixture) -> impl std::future::Future<Output = crate::AutoRetireReport> + '_ {
+    f.svc.sweep_auto_retire_after(Some(7), days_from_now(8))
+}
+
+/// A clean `direct` checkout (and a clean `cow` one) archived before the
+/// cutoff — pushed primary, pushed submodule — is retired through the
+/// retire path: one retired delta, and the whole `<root>/<id>` folder is
+/// removed.
+#[intent_test_macros::daemon_test]
+async fn auto_purge_removes_a_clean_standalone_checkout() {
+    let f = fixture().await;
+    let direct = insert_standalone(
+        &f,
+        "ws-direct-clean",
+        intent_core::CheckoutMode::Direct,
+        true,
+    )
+    .await;
+    let cow = insert_standalone(&f, "ws-cow-clean", intent_core::CheckoutMode::Cow, false).await;
+    let mut sub = subscribe_updates(&f, &direct.ws.id);
+
+    let report = purge_sweep(&f).await;
+    assert_eq!(
+        (report.retired, report.skipped, report.failed),
+        (2, 0, 0),
+        "{report:?}"
+    );
+    for s in [&direct, &cow] {
+        assert!(f.store.get_workspace(&s.ws.id).await.unwrap().is_retired());
+        assert!(!s.folder.exists(), "checkout gone when retire returns");
+        wait_gone(&f.root.join(s.ws.id.as_str())).await;
+    }
+    let changes = drain_changes(&mut sub).await;
+    assert!(
+        changes
+            .iter()
+            .any(|c| c["status"] == "Retired" && c["archived"] == true),
+        "retire delta published: {changes:?}"
+    );
+}
+
+/// Work that exists only in the folder blocks the purge, and the folder
+/// survives: uncommitted changes, an unpushed commit on a local branch
+/// other than `HEAD`, a stash, and an unpushed commit in a nested `.dev`
+/// clone. Each is counted as a local-work skip.
+#[intent_test_macros::daemon_test]
+async fn auto_purge_keeps_a_standalone_checkout_with_work_only_in_the_folder() {
+    let f = fixture().await;
+    let dirty = insert_standalone(
+        &f,
+        "ws-direct-dirty",
+        intent_core::CheckoutMode::Direct,
+        false,
+    )
+    .await;
+    std::fs::write(dirty.folder.join("draft.txt"), "unsaved").unwrap();
+
+    let branch = insert_standalone(
+        &f,
+        "ws-direct-branch",
+        intent_core::CheckoutMode::Direct,
+        false,
+    )
+    .await;
+    git(&branch.folder, &["checkout", "-q", "-b", "side"]);
+    commit_file(&branch.folder, "side.txt");
+    git(&branch.folder, &["checkout", "-q", "-"]);
+
+    let stash = insert_standalone(
+        &f,
+        "ws-direct-stash",
+        intent_core::CheckoutMode::Direct,
+        false,
+    )
+    .await;
+    std::fs::write(stash.folder.join("README.md"), "wip").unwrap();
+    git(&stash.folder, &["stash", "-q"]);
+
+    let nested = insert_standalone(
+        &f,
+        "ws-direct-nested",
+        intent_core::CheckoutMode::Direct,
+        false,
+    )
+    .await;
+    std::fs::write(nested.folder.join(".git/info/exclude"), ".dev/\n").unwrap();
+    let dev = nested.folder.join(".dev");
+    std::fs::create_dir_all(&dev).unwrap();
+    git(
+        &dev,
+        &[
+            "clone",
+            "-q",
+            nested.remotes.join("origin.git").to_str().unwrap(),
+            "wt",
+        ],
+    );
+    commit_file(&dev.join("wt"), "nested.txt");
+
+    let report = purge_sweep(&f).await;
+    assert_eq!((report.retired, report.failed), (0, 0), "{report:?}");
+    assert_eq!(report.skipped, 4, "{report:?}");
+    assert_eq!(report.skipped_local_work, 4, "{report:?}");
+    for s in [&dirty, &branch, &stash, &nested] {
+        let row = f.store.get_workspace(&s.ws.id).await.unwrap();
+        assert!(!row.is_retired(), "{}", s.ws.id);
+        assert!(row.archived, "{}", s.ws.id);
+        assert!(
+            s.folder.join("README.md").is_file(),
+            "{} folder kept",
+            s.ws.id
+        );
+    }
+    assert!(dev.join("wt/nested.txt").is_file());
+}
+
+/// A gitlink-only change — the submodule moved to a commit its remote has —
+/// does not block the purge.
+#[intent_test_macros::daemon_test]
+async fn auto_purge_allows_a_gitlink_moved_to_a_pushed_commit() {
+    let f = fixture().await;
+    let s = insert_standalone(
+        &f,
+        "ws-direct-gitlink",
+        intent_core::CheckoutMode::Direct,
+        true,
+    )
+    .await;
+    let sub_src = s.remotes.join("sub-src");
+    commit_file(&sub_src, "next.txt");
+    git(
+        &sub_src,
+        &[
+            "push",
+            "-q",
+            s.remotes.join("sub.git").to_str().unwrap(),
+            "main",
+        ],
+    );
+    let sub = s.folder.join("sub");
+    git(&sub, &["fetch", "-q", "origin"]);
+    git(&sub, &["merge", "-q", "--ff-only", "origin/main"]);
+    assert!(
+        !git(&s.folder, &["status", "--porcelain"]).is_empty(),
+        "the gitlink moved"
+    );
+
+    let report = purge_sweep(&f).await;
+    assert_eq!(report.retired, 1, "{report:?}");
+    wait_gone(&f.root.join(s.ws.id.as_str())).await;
+}
+
+/// Unpushed commits on `HEAD` block until a merged PR covers `HEAD` — the
+/// commits survive on the forge.
+#[intent_test_macros::daemon_test]
+async fn auto_purge_lets_a_merged_pr_cover_standalone_head() {
+    let f = fixture().await;
+    let s = insert_standalone(
+        &f,
+        "ws-direct-merged",
+        intent_core::CheckoutMode::Direct,
+        false,
+    )
+    .await;
+    let head = commit_file(&s.folder, "feature.txt");
+    let report = purge_sweep(&f).await;
+    assert_eq!(
+        (report.retired, report.skipped_local_work),
+        (0, 1),
+        "{report:?}"
+    );
+
+    let mut ws = f.store.get_workspace(&s.ws.id).await.unwrap();
+    ws.pull_requests = Some(vec![serde_json::from_value(serde_json::json!({
+        "id": "PR_7",
+        "number": 7,
+        "url": "https://github.com/o/repo/pull/7",
+        "title": "feat: feature",
+        "status": "Merged",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "updatedAt": "2026-01-02T00:00:00Z",
+        "headSha": head,
+    }))
+    .expect("pr record")]);
+    f.store
+        .update_workspace(&ws)
+        .await
+        .expect("store merged PR");
+    let report = purge_sweep(&f).await;
+    assert_eq!(report.retired, 1, "{report:?}");
+    wait_gone(&f.root.join(s.ws.id.as_str())).await;
+}
+
+/// The sweep summary counts skips per reason, so a purge that cannot act
+/// is visible: unsupported (remote, skipIsolation, a standalone folder that
+/// is a linked worktree), local work and undated rows.
+#[intent_test_macros::daemon_test]
+async fn auto_purge_reports_skip_counts_per_reason() {
+    let f = fixture().await;
+    let dirty = insert_standalone(
+        &f,
+        "ws-count-dirty",
+        intent_core::CheckoutMode::Direct,
+        false,
+    )
+    .await;
+    std::fs::write(dirty.folder.join("draft.txt"), "x").unwrap();
+    let mut rows = Vec::new();
+    for (name, remote, skip, dated) in [
+        ("ws-count-remote", true, false, true),
+        ("ws-count-skip", false, true, true),
+        ("ws-count-undated", false, false, false),
+    ] {
+        let s = insert_standalone_with(&f, name, intent_core::CheckoutMode::Direct, false, |ws| {
+            ws.is_remote = remote;
+            ws.skip_worktree = skip;
+            ws.archived_at = dated.then(crate::now_iso);
+        })
+        .await;
+        rows.push(s);
+    }
+    let gitfile = insert_standalone(
+        &f,
+        "ws-count-gitfile",
+        intent_core::CheckoutMode::Direct,
+        false,
+    )
+    .await;
+    std::fs::remove_dir_all(&gitfile.folder).unwrap();
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            gitfile.folder.to_str().unwrap(),
+        ],
+    );
+
+    let report = purge_sweep(&f).await;
+    assert_eq!((report.retired, report.failed), (0, 0), "{report:?}");
+    assert_eq!(report.skipped, 5, "{report:?}");
+    assert_eq!(report.skipped_unsupported, 3, "{report:?}");
+    assert_eq!(report.skipped_local_work, 1, "{report:?}");
+    assert_eq!(report.skipped_undated, 1, "{report:?}");
+    for s in rows.iter().chain([&dirty, &gitfile]) {
+        assert!(s.folder.join("README.md").is_file(), "{} kept", s.ws.id);
+    }
+}
+
+/// A manual `workspace.retire` of a standalone checkout uses the same gate:
+/// refused while a commit exists only in the folder (folder kept, still
+/// archived), retired once it is pushed.
+#[intent_test_macros::daemon_test]
+async fn manual_retire_of_a_standalone_checkout_refuses_unpushed_work() {
+    let f = fixture().await;
+    let s = insert_standalone(
+        &f,
+        "ws-direct-manual",
+        intent_core::CheckoutMode::Direct,
+        false,
+    )
+    .await;
+    commit_file(&s.folder, "local.txt");
+    let err = f
+        .svc
+        .retire_workspace(s.ws.id.clone(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+    assert!(s.folder.join("local.txt").is_file(), "folder kept");
+    let row = f.store.get_workspace(&s.ws.id).await.unwrap();
+    assert!(!row.is_retired() && row.archived);
+
+    git(&s.folder, &["push", "-q", "origin", "HEAD"]);
+    let retired = f
+        .svc
+        .retire_workspace(s.ws.id.clone(), None)
+        .await
+        .expect("retire");
+    assert_eq!(retired.status, WorkspaceStatus::Retired);
+    wait_gone(&f.root.join(s.ws.id.as_str())).await;
+}
+
+/// Revive of a retired standalone checkout: a fresh clone from the repo
+/// cache at the same path, on a new branch cut from the default branch,
+/// with `origin` pointing at the cache's upstream. Without a cache the
+/// revive is refused and the workspace stays retired.
+#[intent_test_macros::daemon_test]
+async fn revive_reclones_a_standalone_checkout_from_the_repo_cache() {
+    let f = fixture().await;
+    let s = insert_standalone(
+        &f,
+        "ws-direct-revive",
+        intent_core::CheckoutMode::Direct,
+        false,
+    )
+    .await;
+    f.svc
+        .retire_workspace(s.ws.id.clone(), None)
+        .await
+        .expect("retire");
+    wait_gone(&f.root.join(s.ws.id.as_str())).await;
+
+    let err = f
+        .svc
+        .unarchive_workspace(s.ws.id.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+    assert!(f.store.get_workspace(&s.ws.id).await.unwrap().is_retired());
+
+    let cache = intent_git::repo_cache::cache_path_for(
+        &intent_git::repo_cache::cache_root_for(&f.root),
+        "o",
+        "repo",
+    );
+    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    let origin = s.remotes.join("origin.git");
+    git(
+        cache.parent().unwrap(),
+        &["clone", "-q", origin.to_str().unwrap(), "repo"],
+    );
+
+    let revived = f
+        .svc
+        .unarchive_workspace(s.ws.id.clone())
+        .await
+        .expect("revive");
+    assert_eq!(revived.status, WorkspaceStatus::Active);
+    assert_ne!(revived.branch, s.ws.branch, "revive uses a new branch");
+    assert_eq!(revived.worktree_path, s.ws.worktree_path);
+    assert!(s.folder.join("README.md").is_file(), "fresh checkout");
+    assert!(
+        s.folder.join(".git").is_dir(),
+        "a standalone repository again"
+    );
+    assert_eq!(head_branch(&s.folder), revived.branch);
+    assert_eq!(
+        git(&s.folder, &["remote", "get-url", "origin"]),
+        origin.to_string_lossy(),
+        "origin is the cache's upstream, never the cache"
+    );
 }

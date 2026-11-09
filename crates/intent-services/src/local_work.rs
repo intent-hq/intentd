@@ -21,7 +21,16 @@
 //!   nested secondary root (the primary branch is kept) unless a merged PR
 //!   covers that root's `HEAD` — those commits survive on the forge.
 //!
-//! Under either rule a relevant root that could not be evaluated, or a row
+//! - [`LocalWorkRule::PurgeStandalone`] — the purge of a standalone `cow` /
+//!   `direct` checkout, whose folder IS the repository: its branches exist
+//!   nowhere else. It does not read `workspace.localChanges`: a deep scan of
+//!   the whole workspace folder ([`intent_git::standalone_work`]) blocks on
+//!   uncommitted changes, a commit on `HEAD` or any local branch that no
+//!   remote ref reaches (a merged PR covering `HEAD` lifts the commits `HEAD`
+//!   reaches), a stash, or a linked worktree outside the folder — in every
+//!   repository the folder holds, nested and unregistered ones included.
+//!
+//! Under every rule a relevant root that could not be evaluated, or a row
 //! missing a field the rule needs, blocks, so the sweep retries on its next
 //! run instead of guessing.
 
@@ -36,8 +45,12 @@ use crate::Services;
 pub(crate) enum LocalWorkRule {
     /// Idle auto-archive: any uncommitted or unpushed work blocks.
     Archive,
-    /// Automatic purge: only work that lives solely in the folder blocks.
+    /// Automatic purge of a linked worktree: only work that lives solely in
+    /// the folder blocks.
     Purge,
+    /// Purge of a standalone (`cow` / `direct`) checkout: anything not on a
+    /// remote blocks, in every repository of the folder.
+    PurgeStandalone,
 }
 
 /// The blocker reported for unpushed commits under [`LocalWorkRule::Archive`].
@@ -51,7 +64,7 @@ impl LocalWorkRule {
     /// The unpushed-commits verdict a merged PR can lift under this rule.
     fn liftable_verdict(self) -> &'static str {
         match self {
-            Self::Archive => UNPUSHED_COMMITS,
+            Self::Archive | Self::PurgeStandalone => UNPUSHED_COMMITS,
             Self::Purge => NESTED_UNPUSHED_COMMITS,
         }
     }
@@ -103,7 +116,10 @@ pub(crate) fn local_work_blocker(
             continue;
         }
         match rule {
-            LocalWorkRule::Archive => {
+            // `PurgeStandalone` is evaluated by the deep scan
+            // ([`Services::blocked_by_local_work`]); on this summary it is
+            // at least as strict as auto-archive.
+            LocalWorkRule::Archive | LocalWorkRule::PurgeStandalone => {
                 match root
                     .get("hasRemoteRefs")
                     .and_then(serde_json::Value::as_bool)
@@ -149,6 +165,9 @@ impl Services {
         ws: &Workspace,
         rule: LocalWorkRule,
     ) -> Option<&'static str> {
+        if rule == LocalWorkRule::PurgeStandalone {
+            return self.standalone_work_blocker(ws).await;
+        }
         let folder = crate::git_ops::worktree_path(ws);
         let changes = match self.workspace_local_changes_op(ws.id.clone()).await {
             Ok(changes) => changes,
@@ -176,6 +195,47 @@ impl Services {
         })
         .await
         .unwrap_or(verdict)
+    }
+
+    /// The [`LocalWorkRule::PurgeStandalone`] verdict: a deep scan of the
+    /// folder the purge removes — the checkout's `<root>/<id>` parent when
+    /// it is named after the workspace, else the checkout itself. Merged PR
+    /// heads ([`Services::merged_pr_heads`]) can lift `HEAD`'s commits. A
+    /// failed scan blocks (retried next sweep). Each block is logged at info
+    /// with the repository that holds the work.
+    async fn standalone_work_blocker(&self, ws: &Workspace) -> Option<&'static str> {
+        let Some(checkout) = crate::git_ops::worktree_path(ws) else {
+            return Some("local changes could not be evaluated");
+        };
+        let scan_root = checkout
+            .parent()
+            .filter(|p| p.file_name() == Some(std::ffi::OsStr::new(ws.id.as_str())))
+            .map_or_else(|| checkout.clone(), Path::to_path_buf);
+        let heads = self.merged_pr_heads(ws).await;
+        let scan = tokio::task::spawn_blocking(move || {
+            intent_git::standalone_work::standalone_work(&scan_root, &heads)
+        })
+        .await;
+        match scan {
+            Ok(Ok(None)) => None,
+            Ok(Ok(Some(work))) => {
+                tracing::info!(
+                    workspace = %ws.id,
+                    repo = %work.repo.display(),
+                    reason = work.kind.as_str(),
+                    "purge: work exists only in the workspace folder; kept"
+                );
+                Some(work.kind.as_str())
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(workspace = %ws.id, error = %e, "purge: workspace folder could not be evaluated; kept");
+                Some("local changes could not be evaluated")
+            }
+            Err(e) => {
+                tracing::warn!(workspace = %ws.id, error = %e, "purge: folder scan task failed; kept");
+                Some("local changes could not be evaluated")
+            }
+        }
     }
 
     /// Head commits of the workspace's merged PRs, from daemon-known data

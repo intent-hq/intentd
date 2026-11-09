@@ -60,7 +60,51 @@ pub fn remove_dir_all_parallel(path: &Path) -> io::Result<()> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        #[cfg(unix)]
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            // A read-only directory (a Go module cache, a `chmod -R a-w`
+            // build tree) cannot have its entries unlinked: make every
+            // directory owner-writable, then retry once.
+            make_dirs_writable(path);
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(e),
+            }
+        }
         Err(e) => Err(e),
+    }
+}
+
+/// Best-effort: add owner `rwx` to `root` and every directory beneath it.
+/// Each directory is opened with `O_NOFOLLOW | O_DIRECTORY` and changed
+/// through its descriptor (`fchmod`), so a symlink — or a directory swapped
+/// for one — is never followed and its target keeps its mode.
+#[cfg(unix)]
+fn make_dirs_writable(root: &Path) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(handle) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(&dir)
+        else {
+            continue;
+        };
+        if let Ok(meta) = handle.metadata() {
+            let mode = meta.permissions().mode();
+            if mode & 0o700 != 0o700 {
+                let _ = handle.set_permissions(std::fs::Permissions::from_mode(mode | 0o700));
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push(entry.path());
+                }
+            }
+        }
     }
 }
 
@@ -169,6 +213,36 @@ mod tests {
             target.join("keep.txt").exists(),
             "symlink target untouched — links unlinked, never followed"
         );
+        std::fs::remove_dir_all(&target).unwrap();
+    }
+
+    /// Read-only directories (a Go module cache, a `chmod -R a-w` build
+    /// tree) are made writable and removed; a symlinked directory's target
+    /// keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn removes_read_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let target = temp_dir("read-only-target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let root = temp_dir("read-only");
+        for top in ["a", "b"] {
+            let deep = root.join(top).join("pkg").join("mod");
+            std::fs::create_dir_all(&deep).unwrap();
+            std::fs::write(deep.join("f.go"), "x").unwrap();
+            for dir in [deep.clone(), deep.parent().unwrap().to_path_buf()] {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            }
+        }
+        std::fs::write(root.join("top.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        remove_dir_all_parallel(&root).unwrap();
+        assert!(!root.exists(), "read-only tree removed");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o555, "symlink target untouched");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::remove_dir_all(&target).unwrap();
     }
 
