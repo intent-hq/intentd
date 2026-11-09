@@ -654,6 +654,21 @@ pub(crate) struct PrMonitorSnapshot {
     pub merge_state_status_last_known: Option<String>,
 }
 
+/// `baseline` (a serialized snapshot) with the last known values of
+/// `previous` carried over the facts it reads unknown. Either side failing
+/// to parse leaves the baseline as it is.
+fn carry_last_known_from_row(baseline: String, previous: Option<&str>) -> String {
+    let Some(previous) = previous.and_then(|p| serde_json::from_str::<PrMonitorSnapshot>(p).ok())
+    else {
+        return baseline;
+    };
+    let Ok(mut snapshot) = serde_json::from_str::<PrMonitorSnapshot>(&baseline) else {
+        return baseline;
+    };
+    snapshot.carry_last_known(Some(&previous));
+    serde_json::to_string(&snapshot).unwrap_or(baseline)
+}
+
 /// A merge state that carries a verdict: GitHub reports `UNKNOWN` (or
 /// nothing) while it recomputes.
 pub(crate) fn known_merge_state(status: Option<&str>) -> Option<&str> {
@@ -3354,6 +3369,11 @@ impl Services {
     /// registration fetch (forge rate limited): the snapshots are cleared
     /// and `lastPolledAt` is NOT stamped, so the first post-pause sweep
     /// polls the row first and adopts the PR's state then.
+    ///
+    /// The same owner already knew the row's last known values, so a
+    /// baseline read mid-blip carries them: settling back at them is not
+    /// news. An adoption does not carry them, since the adopter was never
+    /// told them.
     async fn rearm_pr_monitor(
         &self,
         mut m: PrMonitor,
@@ -3361,6 +3381,7 @@ impl Services {
         baseline: Option<String>,
         now: &str,
     ) -> Result<Option<PrMonitor>> {
+        let baseline = baseline.map(|b| carry_last_known_from_row(b, m.last_snapshot.as_deref()));
         let polled_at = baseline.is_some().then_some(now);
         let _reconcile = self.sweep_rate_limit.reconcile().await;
         let pause = self

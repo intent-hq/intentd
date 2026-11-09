@@ -223,3 +223,36 @@ async fn merge_state_blip_settling_after_an_unrelated_wake_reports_only_a_change
         "{changes:?}"
     );
 }
+
+/// A re-register re-arms the row on a fresh read. When that read lands
+/// mid-blip, the agent's last known values survive it: settling back at
+/// them is not news.
+#[tokio::test]
+async fn re_register_mid_blip_keeps_the_last_known_values() {
+    let (_db, _root, svc, forge, ws, owner) = setup().await;
+    let id = register(&svc, &ws, &owner).await.monitor_id;
+    forge.edit(full_blip);
+    svc.poll_pr_monitors().await;
+    assert_eq!(register(&svc, &ws, &owner).await.monitor_id, id);
+    forge.edit(|s| full_settle(s, "clean", true));
+    svc.poll_pr_monitors().await;
+    assert_eq!(pending(&svc, &id).await, Vec::<String>::new());
+
+    // Last known "required": a re-register mid-blip, then settling back at
+    // "required", reports no branch-update or merge-state line.
+    forge.edit(|s| full_settle(s, "behind", true));
+    svc.poll_pr_monitors().await;
+    assert!(flush(&svc, &ws, &id).await);
+    forge.edit(full_blip);
+    assert_eq!(register(&svc, &ws, &owner).await.monitor_id, id);
+    forge.edit(|s| full_settle(s, "behind", true));
+    svc.poll_pr_monitors().await;
+    let changes = pending(&svc, &id).await;
+    assert!(
+        !changes.iter().any(|c| c.contains("branch-update")
+            || c.contains("branch update")
+            || c.starts_with("mergeable:")
+            || c.starts_with("merge state:")),
+        "{changes:?}"
+    );
+}
