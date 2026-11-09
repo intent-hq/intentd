@@ -172,7 +172,7 @@ async fn unguarded_writes_to_large_notes_still_work() {
         .set_note_content(ws.clone(), id.clone(), replaced.clone(), false, None, None)
         .await
         .expect("unguarded setContent");
-    assert_eq!(r.new_content, replaced);
+    assert_eq!(r.new_content, replaced.trim_end());
     let r = guarded_set(&svc, &ws, &id, "small\n", None, None).await;
     assert!(
         matches!(r, Err(Error::Internal(ref m)) if m.contains("CONTENT REDUCTION")),

@@ -4943,12 +4943,13 @@ async fn convert_blocks_racing_real_user_save_converts_once() {
     assert!(!parked);
 
     let user = other
-        .set_note_content(
+        .set_note_content_guarded(
             ws.clone(),
             id.clone(),
             "intro TYPED\n\n@@@task\n# Do it\nbody\n@@@\n".into(),
             false,
             Some(0),
+            None,
             None,
         )
         .await
@@ -35788,7 +35789,7 @@ mod primitive_ops_service {
             .rsplit_once(&fence)
             .expect("ws-block fence present")
             .1
-            .rsplit_once("\n```\n")
+            .rsplit_once("\n```")
             .expect("closing fence")
             .0;
         serde_json::from_str(body).expect("block parses as JSON")
