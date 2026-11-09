@@ -10,6 +10,8 @@ use super::tools::{self, SpecialistModelOptions, WORKSPACE_API_SYSTEM_PROMPT_HEA
 
 /// One bridge's captured spawn state, the input every docs version renders
 /// from.
+// Independent spawn-time captures, as on `WorkspaceMcpServer`.
+#[expect(clippy::struct_excessive_bools)]
 pub struct WorkspaceApiDocsInputs<'a> {
     pub is_chief: bool,
     /// The bridge's effective `[agentFeatures]` (sub-agent gates folded in).

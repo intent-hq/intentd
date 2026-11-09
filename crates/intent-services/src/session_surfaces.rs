@@ -35,12 +35,6 @@ impl SessionSurfaces {
             .with_workspace_api_docs(self.workspace_api)
     }
 
-    /// The `workspace_api` reference the session's system prompt carries,
-    /// from a server built by [`Self::configure`].
-    pub(crate) fn prompt_docs(&self, server: &WorkspaceMcpServer) -> Option<String> {
-        server.workspace_api_prompt_reference()
-    }
-
     /// The session's remote-placement renderer.
     pub(crate) fn placement_help(&self) -> PlacementHelpRenderer {
         self.placement_help

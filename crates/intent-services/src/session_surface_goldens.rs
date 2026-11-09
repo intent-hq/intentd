@@ -26,86 +26,86 @@ const FROZEN_VERSIONS: &[&str] = &["3.8", "3.9"];
 const FROZEN_SURFACES: &[(&str, usize, &str, usize, &str)] = &[
     (
         "auggie",
-        373602,
+        373_602,
         "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96897,
+        96_897,
         "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
     ),
     (
         "claude-code",
-        7704,
+        7_704,
         "a35deab89ba2ae13aec1efaecf88cefc46ed652d7aa0f6e2fc4d7934c1e57c5a",
-        195279,
+        195_279,
         "7635c3d168cda224a22183b22e16c5eb402b57884b7e9c60299f979cbe45ad8d",
     ),
     (
         "codex",
-        373602,
+        373_602,
         "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96897,
+        96_897,
         "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
     ),
     (
         "cortex",
-        373602,
+        373_602,
         "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96897,
+        96_897,
         "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
     ),
     (
         "opencode",
-        373602,
+        373_602,
         "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96897,
+        96_897,
         "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
     ),
     (
         "unsloth",
-        373602,
+        373_602,
         "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96897,
+        96_897,
         "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
     ),
     (
         "pi",
-        373602,
+        373_602,
         "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96897,
+        96_897,
         "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
     ),
     (
         "droid",
-        7704,
+        7_704,
         "a35deab89ba2ae13aec1efaecf88cefc46ed652d7aa0f6e2fc4d7934c1e57c5a",
-        195279,
+        195_279,
         "7635c3d168cda224a22183b22e16c5eb402b57884b7e9c60299f979cbe45ad8d",
     ),
     (
         "grok",
-        7704,
+        7_704,
         "a35deab89ba2ae13aec1efaecf88cefc46ed652d7aa0f6e2fc4d7934c1e57c5a",
-        195279,
+        195_279,
         "7635c3d168cda224a22183b22e16c5eb402b57884b7e9c60299f979cbe45ad8d",
     ),
     (
         "antigravity",
-        373602,
+        373_602,
         "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96897,
+        96_897,
         "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
     ),
     (
         "cursor",
-        373602,
+        373_602,
         "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        97809,
+        97_809,
         "d3ff4c1bdb59ba7fdc7caa9930ed134beb352714f2e68038808e5bf2f43bdd1c",
     ),
     (
         "mock",
-        373602,
+        373_602,
         "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96897,
+        96_897,
         "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
     ),
 ];
@@ -113,6 +113,19 @@ const FROZEN_SURFACES: &[(&str, usize, &str, usize, &str)] = &[
 const RULES: &str = "# Repo rules\n\nKeep changes small.\n";
 const PLACEMENT: &str = "Remote placement (experimental): fixture machine list.\n";
 const SEPARATOR: &str = "\n\u{0}\n";
+
+/// `n` with `_` thousands separators, as the table spells it.
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push('_');
+        }
+        out.push(digit);
+    }
+    out
+}
 
 fn sha256_hex(text: &str) -> String {
     Sha256::digest(text.as_bytes())
@@ -142,7 +155,7 @@ async fn variant(
             .with_sub_agent(is_sub_agent)
             .with_remote_placement_help(placement.map(str::to_owned)),
     );
-    let docs = surfaces.prompt_docs(&server);
+    let docs = server.workspace_api_prompt_reference();
     let prompt = crate::rules::assemble_system_prompt(
         services.store(),
         Some(workspace_path),
@@ -257,8 +270,10 @@ async fn frozen_sessions_keep_tool_description_and_system_prompt() {
             mismatches.push(provider.id);
         }
         actual.push(format!(
-            "    (\"{}\", {tool_len}, \"{tool_sha}\", {prompt_len}, \"{prompt_sha}\"),",
-            provider.id
+            "    (\"{}\", {}, \"{tool_sha}\", {}, \"{prompt_sha}\"),",
+            provider.id,
+            grouped(tool_len),
+            grouped(prompt_len)
         ));
     }
     let registered: Vec<&str> = intent_providers::config::ACP_PROVIDERS

@@ -3928,7 +3928,7 @@ impl AgentManager {
             // unconditionally, so a caller-supplied rules file would leave
             // its "Workspace API Reference" pointer dangling (ws.help() as
             // the only fallback).
-            let workspace_api_docs = surfaces.prompt_docs(&server);
+            let workspace_api_docs = server.workspace_api_prompt_reference();
             if let Some(prompt) = crate::rules::assemble_system_prompt(
                 &self.services.store,
                 Some(&cwd),
@@ -14906,13 +14906,13 @@ fn remote_workspace_api_docs(
     ))?;
     let surfaces = crate::session_surfaces::SessionSurfaces::new(session, provider);
     let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
-    surfaces.prompt_docs(
-        &surfaces.configure(
+    surfaces
+        .configure(
             WorkspaceMcpServer::new(api, workspace_id.clone())
                 .with_agent_features(agent_features.clone())
                 .with_sub_agent(is_sub_agent),
-        ),
-    )
+        )
+        .workspace_api_prompt_reference()
 }
 
 /// Resolve `provider_id` (a base provider or a profile of one) the way a
