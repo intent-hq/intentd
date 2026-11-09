@@ -9230,7 +9230,7 @@ impl Services {
         reference: String,
         force_refresh: bool,
     ) -> Result<Value> {
-        let profile = self.resolve_selected_profile(&reference).await?;
+        let profile = self.resolve_selected_profile(&reference).await?.overlay;
         let resolved = self
             .models_catalog
             .resolve_installed_for(&reference, profile, force_refresh)

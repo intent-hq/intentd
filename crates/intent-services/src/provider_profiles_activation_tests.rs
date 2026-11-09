@@ -143,6 +143,7 @@ impl Fixture {
             .resolve_selected_profile(reference)
             .await
             .expect("selectable")
+            .overlay
             .expect("a profile overlay");
         let lease = self
             .svc

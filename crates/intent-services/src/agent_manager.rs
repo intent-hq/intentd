@@ -12228,7 +12228,9 @@ impl AgentManager {
         // (it re-checks the profile still exists and its base is enabled).
         // Boxed: keeps this turn-start future's stack frame unchanged.
         let profile_env = if crate::provider_profiles::may_have_overlay(&resolved.selection) {
-            boxed_await(|| self.services.resolve_selected_profile(&resolved.selection)).await?
+            boxed_await(|| self.services.resolve_selected_profile(&resolved.selection))
+                .await?
+                .overlay
         } else {
             None
         };

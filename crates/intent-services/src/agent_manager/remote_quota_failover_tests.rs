@@ -306,9 +306,11 @@ async fn a_remote_agent_skips_a_marked_configuration_onto_a_backup_its_node_star
     assert!(mgr.contains(&id), "the first run stays live");
 
     let now = chrono::Utc::now();
-    mgr.services
-        .provider_quota_cache
-        .mark_exhausted("claude-code", None, now, || true);
+    mgr.services.provider_quota_cache.mark_exhausted(
+        &crate::profile_activation::SettingsRead::elsewhere("claude-code"),
+        None,
+        now,
+    );
     send(&mgr, &id, &ws, "second").await;
     backup_run.wait_prompts(1).await;
     backup_run.finish.add_permits(1);
@@ -395,9 +397,11 @@ async fn a_remote_agent_never_fails_over_to_an_account_folder_backup() {
 /// home's quota reset (the failover marked it exhausted for everyone).
 async fn make_return_due(mgr: &AgentManager, id: &AgentId, ws: &WorkspaceId) {
     let later = chrono::Utc::now() + chrono::Duration::seconds(1);
-    mgr.services
-        .provider_quota_cache
-        .mark_working("claude-code", later, later, || true);
+    mgr.services.provider_quota_cache.mark_working(
+        &crate::profile_activation::SettingsRead::elsewhere("claude-code"),
+        later,
+        later,
+    );
     let session = mgr
         .services
         .store

@@ -324,17 +324,16 @@ impl Services {
             attempt.working_noted = true;
             (attempt.selection.clone(), attempt.started_at)
         };
+        let read = self.profile_activation().process_read(agent_id, &noted.0);
         self.provider_quota_cache
-            .mark_working(&noted.0, noted.1, chrono::Utc::now(), || {
-                self.profile_activation()
-                    .runs_saved_settings(agent_id, &noted.0)
-            });
+            .mark_working(&read, noted.1, chrono::Utc::now());
     }
 
     /// Record `agent_id`'s quota failure on `selection` in the shared cache,
     /// so every other conversation skips it until `reported` (the error's
     /// reset time, when usable) or the default mark duration. Ignored when
-    /// the agent's process runs settings edited or deleted since it started.
+    /// the agent's process runs settings edited or deleted since it started
+    /// (see [`crate::profile_activation::ProfileActivation::process_read`]).
     pub(crate) fn note_provider_exhausted(
         &self,
         agent_id: &AgentId,
@@ -342,11 +341,9 @@ impl Services {
         reported: Option<chrono::DateTime<chrono::Utc>>,
         now: chrono::DateTime<chrono::Utc>,
     ) {
+        let read = self.profile_activation().process_read(agent_id, selection);
         self.provider_quota_cache
-            .mark_exhausted(selection, reported, now, || {
-                self.profile_activation()
-                    .runs_saved_settings(agent_id, selection)
-            });
+            .mark_exhausted(&read, reported, now);
     }
 
     /// Configurations the shared cache marks exhausted right now.

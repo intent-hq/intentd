@@ -14,10 +14,9 @@ impl Fixture {
 
     fn mark_exhausted(&self, selection: &str) {
         self.cache().mark_exhausted(
-            selection,
+            &crate::profile_activation::SettingsRead::elsewhere(selection),
             None,
             Utc::now() - ChronoDuration::seconds(1),
-            || true,
         );
     }
 
@@ -89,7 +88,11 @@ async fn a_working_mark_is_cleared_too() {
     let fx = Fixture::new().await;
     let (id, reference) = fx.profile_ref("codex", "Work").await;
     let now = Utc::now();
-    fx.cache().mark_working(&reference, now, now, || true);
+    fx.cache().mark_working(
+        &crate::profile_activation::SettingsRead::elsewhere(&reference),
+        now,
+        now,
+    );
     assert!(fx.cache().is_known_working(&reference));
 
     fx.svc
