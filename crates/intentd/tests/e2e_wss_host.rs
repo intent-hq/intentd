@@ -2136,6 +2136,84 @@ async fn host_provider_discovery_honors_path_overrides_over_wss() {
     drop(daemon);
 }
 
+/// WSS e2e for display versions on host.providerDiscovery: installed
+/// local-binary providers report their CLI's `--version` line as
+/// `cliVersion` (unsloth: its own `unsloth` CLI, not the opencode primary),
+/// and a CLI that hangs is cut off without a version.
+#[cfg(unix)]
+#[tokio::test]
+async fn host_provider_discovery_reports_cli_versions_over_wss() {
+    use std::fmt::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+
+    let bin_dir = data_dir.join("override-bins");
+    std::fs::create_dir_all(&bin_dir).expect("mkdir override bins");
+    let fakes = [
+        ("auggie", "#!/bin/sh\necho '0.35.0 (commit 9a7f3836)'\n"),
+        ("opencode", "#!/bin/sh\necho 1.18.18\n"),
+        ("unsloth", "#!/bin/sh\necho 'unsloth 2026.8.18'\n"),
+        ("grok", "#!/bin/sh\nsleep 30\n"),
+    ];
+    let mut config = String::from("[providers.paths]\n");
+    for (name, script) in fakes {
+        let bin = bin_dir.join(name);
+        std::fs::write(&bin, script).expect("write fake bin");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake bin");
+        writeln!(config, "{name} = \"{}\"", bin.display()).expect("write config line");
+    }
+    std::fs::write(data_dir.join("config.toml"), config).expect("seed config.toml");
+
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let daemon = Daemon {
+        child,
+        _data_dir_guard: data_dir_guard,
+        data_dir: data_dir.clone(),
+    };
+
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let mut ws = connect_ws(port, client_config(&fingerprint)).await;
+
+    // The hanging grok CLI (sleep 30) must be cut off for this call to
+    // return within the RPC helper's own timeout.
+    let result = wss_rpc(&mut ws, 2, "host.providerDiscovery", json!({})).await;
+    let row = |id: &str| {
+        result["providers"]
+            .as_array()
+            .expect("providers array")
+            .iter()
+            .find(|p| p["id"] == id)
+            .unwrap_or_else(|| panic!("{id} must be in the discovery payload"))
+            .clone()
+    };
+
+    for (id, version) in [
+        ("auggie", "0.35.0 (commit 9a7f3836)"),
+        ("opencode", "1.18.18"),
+        ("unsloth", "unsloth 2026.8.18"),
+    ] {
+        let p = row(id);
+        assert_eq!(p["installed"], true, "{p}");
+        assert_eq!(p["cliVersion"], version, "{p}");
+    }
+    let grok = row("grok");
+    assert_eq!(grok["installed"], true, "{grok}");
+    assert!(grok.get("cliVersion").is_none(), "{grok}");
+
+    drop(daemon);
+}
+
 /// WSS e2e for the default-provider self-heal (monorepo#3044): calling
 /// `host.providerDiscovery` on a daemon with UNSET default settings and a
 /// provider forced installed (via a `providers.paths` override, as in the

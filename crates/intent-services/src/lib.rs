@@ -258,6 +258,7 @@ mod provider_profiles;
 mod provider_quota_cache;
 mod provider_return;
 pub mod provider_test_prompt;
+mod provider_version;
 mod quota_failover;
 mod rate_limit;
 pub mod repo_config;
@@ -39988,11 +39989,16 @@ pub fn discover_providers_with_npx_overrides<S: std::hash::BuildHasher>(
             crate::cursor_cli::probe_cursor_cli(provider_paths.get("cursor").map(String::as_str))
         });
 
+    let display_versions = provider_version::probe_display_versions(&providers, provider_paths);
+
     let provider_array: Vec<serde_json::Value> = providers
         .iter()
         .map(|p| {
             let mut obj = serde_json::Map::new();
             obj.insert("id".to_string(), serde_json::json!(p.id));
+            if let Some(version) = display_versions.get(p.id) {
+                obj.insert("cliVersion".to_string(), serde_json::json!(version));
+            }
             obj.insert("displayName".to_string(), serde_json::json!(p.display_name));
             obj.insert("command".to_string(), serde_json::json!(p.command));
             let mut installed = p.installed;
