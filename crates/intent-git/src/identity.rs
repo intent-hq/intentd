@@ -54,19 +54,26 @@ pub fn commit_identity_env_with(
     cwd: Option<&Path>,
     inherited: impl Fn(&str) -> bool,
 ) -> Vec<(String, String)> {
-    let Some(cwd) = cwd else {
+    let Some((name, email)) = cwd.and_then(commit_identity) else {
         return Vec::new();
     };
-    let Ok(repo) = git2::Repository::discover(cwd) else {
-        return Vec::new();
-    };
-    let Ok(sig) = repo.signature() else {
-        return Vec::new();
-    };
-    identity_pairs(sig.name().ok(), sig.email().ok())
+    identity_pairs(Some(&name), Some(&email))
         .into_iter()
         .filter(|(key, _)| !inherited(key))
         .collect()
+}
+
+/// The `user.name` and `user.email` git resolves for a repository
+/// containing `cwd`, read fresh from its config chain on every call: `None`
+/// when `cwd` is in no repository or either value is missing or empty. The
+/// daemon's own environment is not consulted.
+#[must_use]
+pub fn commit_identity(cwd: &Path) -> Option<(String, String)> {
+    let repo = git2::Repository::discover(cwd).ok()?;
+    let sig = repo.signature().ok()?;
+    let name = sig.name().ok()?.to_owned();
+    let email = sig.email().ok()?.to_owned();
+    (!name.is_empty() && !email.is_empty()).then_some((name, email))
 }
 
 /// Pure pairing seam: both a non-empty name AND email are required (git

@@ -461,6 +461,7 @@ fn every_frame() -> Vec<LinkFrame> {
             compact_tool_descriptions: false,
             checkout_of: None,
             forge: None,
+            git_identity: None,
         }),
         LinkFrame::Prompt {
             agent_id: agent_id.clone(),
@@ -870,6 +871,7 @@ fn launch_profile_env_never_debug_renders_its_values() {
         compact_tool_descriptions: false,
         checkout_of: None,
         forge: None,
+        git_identity: None,
     };
     let rendered = format!("{command:?} {:?}", LinkFrame::Launch(command.clone()));
     assert!(!rendered.contains("canary-secret-7f3a"), "{rendered}");
@@ -898,6 +900,7 @@ fn launch_without_a_profile_omits_profile_env() {
         compact_tool_descriptions: false,
         checkout_of: None,
         forge: None,
+        git_identity: None,
     };
     let wire = serde_json::to_value(&command).unwrap();
     assert!(wire.get("profileEnv").is_none(), "{wire}");
@@ -1233,6 +1236,7 @@ fn a_launch_with_a_checkout_needs_protocol_10() {
             compact_tool_descriptions: false,
             checkout_of: None,
             forge: None,
+            git_identity: None,
         })
     };
     assert_eq!(launch(None).min_protocol(), NODE_LINK_PROTOCOLS.min);
@@ -1263,6 +1267,7 @@ fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
             compact_tool_descriptions: false,
             checkout_of: None,
             forge: None,
+            git_identity: None,
         };
     let proxy = McpProxy {
         name: "Linear".into(),
@@ -1311,6 +1316,7 @@ fn a_launch_into_another_agents_checkout_needs_protocol_13() {
         checkout: None,
         checkout_of: Some(AgentId::from("parent")),
         forge: None,
+        git_identity: None,
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
     };
@@ -1609,4 +1615,71 @@ fn forge_launch_normalizes_github_origins_and_refuses_the_rest() {
         branch: "main".into(),
     };
     assert!(!bad_url.is_valid());
+}
+
+/// `launch.gitIdentity` is optional on the open launch body: absent from the
+/// wire when no identity resolved, a closed `{ name, email }` when sent, and
+/// ignored by a machine that does not know it (as an unknown member is).
+#[test]
+fn a_launchs_git_identity_is_optional_and_closed() {
+    let mut command = LaunchCommand {
+        agent_id: AgentId::from("a1"),
+        workspace_id: WorkspaceId::from("ws-1"),
+        provider: "codex".into(),
+        model: None,
+        base_commit: "base".into(),
+        repo_key: "repo".into(),
+        agent_features: json!({}),
+        is_sub_agent: false,
+        profile_env: None,
+        checkout: None,
+        checkout_of: None,
+        forge: None,
+        git_identity: None,
+        mcp_proxies: Vec::new(),
+        compact_tool_descriptions: false,
+    };
+    let bare = serde_json::to_value(&command).unwrap();
+    assert!(bare.get("gitIdentity").is_none(), "{bare}");
+
+    command.git_identity = Some(Box::new(GitIdentity {
+        name: "Ada".into(),
+        email: "ada@example.invalid".into(),
+    }));
+    let wire = serde_json::to_value(&command).unwrap();
+    assert_eq!(
+        wire["gitIdentity"],
+        json!({ "name": "Ada", "email": "ada@example.invalid" })
+    );
+    assert_eq!(
+        LinkFrame::Launch(command.clone()).min_protocol(),
+        LinkFrame::Launch(LaunchCommand {
+            git_identity: None,
+            ..command.clone()
+        })
+        .min_protocol()
+    );
+    let decoded: LaunchCommand = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(decoded, command);
+
+    let mut extra = wire.clone();
+    extra["gitIdentity"]["signingKey"] = json!("k");
+    assert!(serde_json::from_value::<LaunchCommand>(extra).is_err());
+
+    // An older machine meets the member as an unknown one and starts as
+    // before.
+    let mut older = bare;
+    older["laterMember"] = wire["gitIdentity"].clone();
+    let decoded: LaunchCommand = serde_json::from_value(older).unwrap();
+    assert_eq!(decoded.git_identity, None);
+
+    let empty = GitIdentity {
+        name: String::new(),
+        email: "ada@example.invalid".into(),
+    };
+    assert_eq!(empty.usable(), None);
+    assert_eq!(
+        command.git_identity.as_ref().unwrap().usable(),
+        Some(("Ada", "ada@example.invalid"))
+    );
 }

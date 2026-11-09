@@ -23,7 +23,7 @@ const ROTATED: &str = "ghp_forgeE2eRotated3Kx8Vb5Nm1";
 const CREDENTIAL_DIGEST: &str = "printf 'protocol=https\\nhost=github.com\\n\\n' | env -u XDG_CONFIG_HOME HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 git credential fill 2>/dev/null | sed -n 's/^password=//p' | tr -d '\\n' | sha256sum | cut -c1-64";
 
 /// Run `command` in the agent's environment; its `{ code, out }`.
-async fn sh(
+pub(super) async fn sh(
     rpc_ws: &mut common::TlsWs,
     events: &mut common::TlsWs,
     agent: (&str, &str),
@@ -46,7 +46,7 @@ async fn sh(
 }
 
 /// The output of a command that must succeed.
-async fn sh_ok(
+pub(super) async fn sh_ok(
     rpc_ws: &mut common::TlsWs,
     events: &mut common::TlsWs,
     agent: (&str, &str),
@@ -247,7 +247,12 @@ async fn a_top_level_remote_agent_pushes_the_workspace_branch_and_its_sub_agent_
 }
 
 /// The id of the workspace's agent named `name`.
-async fn child_named(rpc_ws: &mut common::TlsWs, ws_id: &str, name: &str, id: i64) -> String {
+pub(super) async fn child_named(
+    rpc_ws: &mut common::TlsWs,
+    ws_id: &str,
+    name: &str,
+    id: i64,
+) -> String {
     let deadline = tokio::time::Instant::now() + wait();
     let mut id = id;
     loop {

@@ -27,8 +27,8 @@ use intent_acp::{
     SinkEvent, SpawnOptions,
 };
 use intent_core::node_link::{
-    ExitFailure, FinalPush, ForgeLaunch, JournalBody, JournalRecord, LaunchCommand, LeaseBinding,
-    MachineCapacity, StopOutcome, SKILLS_PROTOCOL,
+    ExitFailure, FinalPush, ForgeLaunch, GitIdentity, JournalBody, JournalRecord, LaunchCommand,
+    LeaseBinding, MachineCapacity, StopOutcome, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::CapacityRefusal;
@@ -437,6 +437,9 @@ struct Agent {
     /// Its workspace branch and GitHub remote (nodeProtocol 15): top-level
     /// agents only.
     forge: Option<ForgeLaunch>,
+    /// The backend's commit identity for the workspace, set as the
+    /// provider's `GIT_AUTHOR_*` / `GIT_COMMITTER_*`.
+    git_identity: Option<intent_core::node_link::GitIdentity>,
     /// Serializes the pushes of the agent's checkout, shared with its owner
     /// and every agent sharing it.
     wip: Arc<tokio::sync::Mutex<()>>,
@@ -1187,7 +1190,9 @@ impl Runner {
             compact_tool_descriptions,
             checkout_of,
             forge,
+            git_identity,
         } = command;
+        let git_identity = git_identity.map(|identity| *identity);
         let forge = forge.map(|forge| *forge);
         let prepared = checkout.is_some();
         let both = prepared && checkout_of.is_some();
@@ -1316,6 +1321,7 @@ impl Runner {
             )),
             forge_lease: Mutex::new(None),
             forge,
+            git_identity,
             npx_launch_dir: Mutex::new(None),
             default_account: profile.is_none().then(|| {
                 (
@@ -1857,6 +1863,15 @@ impl Runner {
             options
                 .extra_env
                 .insert(key.to_owned(), tmp.to_string_lossy().into_owned());
+        }
+        // The backend's commit identity, as Intent wiring over inherited
+        // values (a profile cannot set these keys); only in this process's
+        // environment, never in git config.
+        if let Some((name, email)) = agent.git_identity.as_ref().and_then(GitIdentity::usable) {
+            for key in intent_git::identity::GIT_IDENTITY_ENV_VARS {
+                let value = if key.ends_with("EMAIL") { email } else { name };
+                options.extra_env.insert(key.to_owned(), value.to_owned());
+            }
         }
         // The backend's GitHub token (nodeProtocol 15) for every agent:
         // Intent wiring, so it beats a profile's value. The lease keeps it

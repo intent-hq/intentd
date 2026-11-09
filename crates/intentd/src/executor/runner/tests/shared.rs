@@ -11,6 +11,7 @@ fn sharing(id: &str, owner: &str) -> LaunchCommand {
         is_sub_agent: true,
         checkout_of: Some(AgentId::from(owner)),
         forge: None,
+        git_identity: None,
         ..launch(id)
     }
 }

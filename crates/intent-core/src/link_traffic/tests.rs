@@ -52,6 +52,7 @@ fn launch_frame() -> LinkFrame {
         compact_tool_descriptions: false,
         checkout_of: None,
         forge: None,
+        git_identity: None,
         profile_env: Some(LaunchProfileEnv(json!({
             "providerRef": "claude-code@work",
             "fingerprint": "fp-1",

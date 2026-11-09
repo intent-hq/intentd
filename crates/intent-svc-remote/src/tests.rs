@@ -1367,6 +1367,7 @@ mod stop_acks {
             compact_tool_descriptions: false,
             checkout_of: None,
             forge: None,
+            git_identity: None,
             profile_env: None,
         }
     }
