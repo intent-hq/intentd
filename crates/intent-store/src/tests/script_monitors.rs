@@ -1069,3 +1069,85 @@ async fn hook_or_script_monitor_waiting_lookup_is_one_union_over_both_tables() {
         .unwrap()
         .is_empty());
 }
+
+/// A machine-run wake (`remoteAgentId`) has no notification job: the message
+/// and queue fences let it through as an ordinary message, while a home-run
+/// wake with no job stays fenced.
+#[tokio::test]
+async fn machine_run_wakes_pass_the_message_and_queue_fences() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let (ws, agent) = seed(&store, "machine").await;
+    let blocks = json!([{"type":"text","text":"wake"}]);
+    let machine = json!({
+        "type": "script_monitor_wake",
+        "monitorId": "machine-monitor",
+        "workspaceId": ws,
+        "remoteAgentId": agent,
+        "nodeId": "mac",
+    });
+    let home = json!({"type":"script_monitor_wake","monitorId":"home-monitor","workspaceId":ws});
+    store
+        .append_agent_message_with_provenance(
+            &agent,
+            "machine-wake",
+            "user",
+            &blocks,
+            Some(&machine),
+            &now_iso(),
+            crate::UsageMessageOrigin::Excluded,
+        )
+        .await
+        .expect("a machine-run wake persists");
+    let refused = store
+        .append_agent_message_with_provenance(
+            &agent,
+            "home-wake",
+            "user",
+            &blocks,
+            Some(&home),
+            &now_iso(),
+            crate::UsageMessageOrigin::Excluded,
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "a home-run wake without a job stays fenced"
+    );
+
+    let row = |id: &str, md: &serde_json::Value| crate::AgentQueueRow {
+        id: id.into(),
+        agent_id: agent.clone(),
+        position: 0,
+        payload: json!({"id":id,"turnId":id,"messageMetadata":md}),
+        created_at: now_iso(),
+        turn_id: id.into(),
+    };
+    store
+        .replace_agent_queue(&agent, &[row("machine-q", &machine)])
+        .await
+        .unwrap();
+    store
+        .replace_agent_queue(
+            &agent,
+            &[row("machine-q", &machine), {
+                let mut r = row("home-q", &home);
+                r.position = 1;
+                r
+            }],
+        )
+        .await
+        .unwrap();
+    let ids: Vec<String> = store
+        .load_all_agent_queues()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["machine-q".to_owned()],
+        "only the home wake is dropped"
+    );
+}

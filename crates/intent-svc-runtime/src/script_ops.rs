@@ -604,12 +604,12 @@ impl ScriptManager {
                 let publisher = publisher.clone();
                 Box::pin(async move { publisher.publish_machine_change(&ws, &id).await })
             }),
-            wake: Arc::new(move |ws, agent, content| {
+            wake: Arc::new(move |ws, agent, content, metadata| {
                 let svc = wake_svc.clone();
                 let port = wake_port.clone();
                 Box::pin(async move {
                     if let Err(error) = port
-                        .deliver_wake_message(&svc, &ws, &agent, &content, None)
+                        .deliver_wake_message(&svc, &ws, &agent, &content, metadata.as_ref())
                         .await
                     {
                         tracing::warn!(%error, "machine run: could not wake the monitor's agent");

@@ -1936,6 +1936,10 @@ fn explicit_metadata(args: &Value) -> Option<Value> {
     args.get("messageMetadata")
         .filter(|v| !v.is_null())
         .cloned()
+        .map(|mut md| {
+            intent_core::script_monitor::strip_machine_wake_markers(&mut md);
+            md
+        })
 }
 
 /// Combine explicit caller-supplied metadata with the daemon-derived sender
@@ -2295,6 +2299,27 @@ fn merge_ok(mut v: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Agent sends (`ws.agent.send`, `sendToTask`, `create`, `wakeOrCreate`)
+    /// cannot mark a machine-run script wake: the daemon-only `remoteAgentId`
+    /// and `nodeId` are stripped, so a forged wake stays fenced.
+    #[test]
+    fn agent_sends_strip_machine_run_wake_markers() {
+        let args = json!({ "messageMetadata": {
+            "type": "script_monitor_wake", "monitorId": "m",
+            "remoteAgentId": "agent-x", "nodeId": "mac", "note": "kept",
+        }});
+        let caller = AgentId::from("agent-caller");
+        let merged =
+            merge_sender_attribution(explicit_metadata(&args), Some(&caller), Some("Caller"))
+                .expect("metadata");
+        assert!(merged.get("remoteAgentId").is_none(), "{merged}");
+        assert!(merged.get("nodeId").is_none(), "{merged}");
+        assert_eq!(merged["note"], "kept");
+        assert_eq!(merged["fromAgentId"], "agent-caller");
+        let other = json!({ "messageMetadata": { "type": "custom", "nodeId": "n" } });
+        assert_eq!(explicit_metadata(&other).unwrap()["nodeId"], "n");
+    }
 
     #[test]
     fn message_block_page_defaults_and_clamps_to_agent_page_size() {

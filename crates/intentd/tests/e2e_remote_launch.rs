@@ -1273,6 +1273,40 @@ async fn machine_runs(
         .unwrap_or_default()
         .to_owned();
     assert!(woken.contains("exited with code 0"), "{woken}");
+    // It arrived once, as a script-run card naming the machine run.
+    let convo = ok(
+        rpc_ws,
+        207,
+        "agent.getConversation",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let cards: Vec<&Value> = convo["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["metadata"]["type"] == "script_monitor_wake")
+        .collect();
+    assert_eq!(cards.len(), 1, "{convo}");
+    let card = &cards[0]["metadata"];
+    assert_eq!(
+        card["monitorId"], body["m"]["monitor"]["monitorId"],
+        "{card}"
+    );
+    assert_eq!(card["scriptId"], script_id.as_str(), "{card}");
+    assert_eq!(card["scriptName"], "mrun", "{card}");
+    assert_eq!(card["reason"], "finished", "{card}");
+    assert_eq!(card["result"]["outcome"], "succeeded", "{card}");
+    assert!(card["runId"].is_string(), "{card}");
+    assert_eq!(card["remoteAgentId"], agent_id, "{card}");
+    assert_eq!(card["nodeId"], node_id, "{card}");
+    assert!(
+        cards[0]["contentBlocks"]
+            .to_string()
+            .contains("(machine run on "),
+        "{}",
+        cards[0]
+    );
 
     // Definition reads run on head as the agent (intent#8630): head runs
     // with the bound-caller assertion armed, so an unbound gate aborts it.

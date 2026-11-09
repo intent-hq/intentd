@@ -1134,7 +1134,7 @@ pub struct CommandScriptActivity {
 )]
 pub fn wake_id(metadata: Option<&serde_json::Value>) -> Option<String> {
     let md = metadata?;
-    (md["type"] == "script_monitor_wake")
+    is_durable_monitor_wake(md)
         .then(|| {
             md["monitorId"]
                 .as_str()
@@ -1143,16 +1143,23 @@ pub fn wake_id(metadata: Option<&serde_json::Value>) -> Option<String> {
         .flatten()
 }
 
-/// The monitor id of a script-monitor wake, if `metadata` describes one.
+/// The monitor id of a durable script-monitor wake, if `metadata` describes one.
 #[expect(
     clippy::must_use_candidate,
     reason = "internal doc-hidden feature API, not a public library API"
 )]
 pub fn monitor_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
     let md = metadata?;
-    (md["type"] == "script_monitor_wake")
+    is_durable_monitor_wake(md)
         .then(|| md["monitorId"].as_str())
         .flatten()
+}
+
+/// A home-run monitor wake, backed by a stored notification. A machine-run
+/// wake (`remoteAgentId`) carries the same card metadata but no stored
+/// record, so it is delivered as an ordinary message.
+fn is_durable_monitor_wake(md: &serde_json::Value) -> bool {
+    md["type"] == "script_monitor_wake" && md.get("remoteAgentId").is_none()
 }
 
 /// How a cancel transition (the runtime's `HookServicesExt::cancel_active_hook`,
@@ -2698,9 +2705,9 @@ mod tests {
     use intent_core::{Error, WorkspaceApi, WorkspaceId};
 
     use super::{
-        AgentWakePort, FeaturePorts, RemoteLaunchPort, RuntimePort, TransferPort,
-        UnavailableAgentWake, UnavailableRemoteLaunch, UnavailableRuntime, UnavailableTransfer,
-        DEFAULT_WORKSPACE_API,
+        monitor_id, wake_id, AgentWakePort, FeaturePorts, RemoteLaunchPort, RuntimePort,
+        TransferPort, UnavailableAgentWake, UnavailableRemoteLaunch, UnavailableRuntime,
+        UnavailableTransfer, DEFAULT_WORKSPACE_API,
     };
 
     use crate::test_support::fixtures::TempDb;
@@ -2941,6 +2948,24 @@ mod tests {
         );
         assert_eq!(receipt.turn_id, receipt.payload["turnId"]);
         assert_eq!(receipt.created_at, receipt.payload["queuedAt"]);
+    }
+
+    /// Only a home-run wake is a durable monitor wake: a machine-run wake
+    /// (`remoteAgentId`) has no stored notification, so the delivery gates
+    /// keyed on these ids treat it as an ordinary message.
+    #[test]
+    fn machine_run_wakes_are_not_durable_monitor_wakes() {
+        let home = serde_json::json!({"type": "script_monitor_wake", "monitorId": "m1"});
+        assert_eq!(monitor_id(Some(&home)), Some("m1"));
+        assert_eq!(wake_id(Some(&home)).as_deref(), Some("script-monitor:m1"));
+        let machine = serde_json::json!({
+            "type": "script_monitor_wake",
+            "monitorId": "m2",
+            "remoteAgentId": "a",
+            "nodeId": "n",
+        });
+        assert_eq!(monitor_id(Some(&machine)), None);
+        assert_eq!(wake_id(Some(&machine)), None);
     }
 
     #[tokio::test]

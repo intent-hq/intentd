@@ -6192,7 +6192,9 @@ fn strip_sender_attribution(message_metadata: Option<Value>) -> Option<Value> {
         Some(Value::Object(mut obj)) => {
             obj.remove("fromAgentId");
             obj.remove("fromAgentName");
-            Some(Value::Object(obj))
+            let mut md = Value::Object(obj);
+            intent_core::script_monitor::strip_machine_wake_markers(&mut md);
+            Some(md)
         }
         other => other,
     }
