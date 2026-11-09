@@ -462,6 +462,7 @@ fn every_frame() -> Vec<LinkFrame> {
             checkout_of: None,
             forge: None,
             git_identity: None,
+            new_machine: None,
         }),
         LinkFrame::Prompt {
             agent_id: agent_id.clone(),
@@ -872,6 +873,7 @@ fn launch_profile_env_never_debug_renders_its_values() {
         checkout_of: None,
         forge: None,
         git_identity: None,
+        new_machine: None,
     };
     let rendered = format!("{command:?} {:?}", LinkFrame::Launch(command.clone()));
     assert!(!rendered.contains("canary-secret-7f3a"), "{rendered}");
@@ -901,6 +903,7 @@ fn launch_without_a_profile_omits_profile_env() {
         checkout_of: None,
         forge: None,
         git_identity: None,
+        new_machine: None,
     };
     let wire = serde_json::to_value(&command).unwrap();
     assert!(wire.get("profileEnv").is_none(), "{wire}");
@@ -1237,6 +1240,7 @@ fn a_launch_with_a_checkout_needs_protocol_10() {
             checkout_of: None,
             forge: None,
             git_identity: None,
+            new_machine: None,
         })
     };
     assert_eq!(launch(None).min_protocol(), NODE_LINK_PROTOCOLS.min);
@@ -1268,6 +1272,7 @@ fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
             checkout_of: None,
             forge: None,
             git_identity: None,
+            new_machine: None,
         };
     let proxy = McpProxy {
         name: "Linear".into(),
@@ -1317,6 +1322,7 @@ fn a_launch_into_another_agents_checkout_needs_protocol_13() {
         checkout_of: Some(AgentId::from("parent")),
         forge: None,
         git_identity: None,
+        new_machine: None,
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
     };
@@ -1636,6 +1642,7 @@ fn a_launchs_git_identity_is_optional_and_closed() {
         checkout_of: None,
         forge: None,
         git_identity: None,
+        new_machine: None,
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
     };
@@ -1655,6 +1662,7 @@ fn a_launchs_git_identity_is_optional_and_closed() {
         LinkFrame::Launch(command.clone()).min_protocol(),
         LinkFrame::Launch(LaunchCommand {
             git_identity: None,
+            new_machine: None,
             ..command.clone()
         })
         .min_protocol()

@@ -313,12 +313,43 @@ fn read_pins(file: &Path) -> Vec<SubmodulePin> {
     }
 }
 
+const NOTE: &str = "Note from Intent: ";
+
+/// What an agent's first turn on another machine than its last run is told:
+/// one notice, carrying the checkout's own notice (`restore`) of saved work
+/// that did not apply.
+pub(super) fn new_machine_notice(machine: &str, restore: Option<&str>) -> String {
+    let restored = if restore.is_some() {
+        "Your conversation and your saved commits were restored, but not all of your \
+         uncommitted changes (see below)."
+    } else {
+        "Your conversation and your saved work (commits and uncommitted changes from your last \
+         push) were restored."
+    };
+    let mut notice = format!(
+        "{NOTE}You're on a new machine ({machine}). {restored} Anything else from your previous \
+         machine is gone: installed tools, caches, running processes, and files outside your \
+         checkout. Re-run any setup you need."
+    );
+    for part in restore
+        .into_iter()
+        .flat_map(|restore| restore.split("\n\n"))
+    {
+        let part = part.strip_prefix(NOTE).unwrap_or(part);
+        let mut chars = part.chars();
+        notice.push_str("\n\n");
+        notice.extend(chars.next().map(|first| first.to_ascii_uppercase()));
+        notice.push_str(chars.as_str());
+    }
+    notice
+}
+
 /// [`unrestored_wip_notice`] for the submodule at `path`, whose wip is
 /// pinned in that submodule's repository.
 fn unrestored_module_notice(remote: &AgentRemote, path: &str, at: &str, wip: &str) -> String {
     let pinned = remote.unapplied_ref(wip);
     format!(
-        "Note from Intent: the submodule {path} of this agent's checkout was recreated at its \
+        "{NOTE}the submodule {path} of this agent's checkout was recreated at its \
          saved head commit {at}. Its uncommitted work (commit {wip}) could not be applied on top \
          of it and is kept in {pinned} in that submodule's repository. Inspect it with \
          `git -C {path} diff {wip}^ {wip}` and reapply what you need."
@@ -330,7 +361,7 @@ fn unrestored_module_notice(remote: &AgentRemote, path: &str, at: &str, wip: &st
 fn unrestored_wip_notice(remote: &AgentRemote, at: &str, wip: &str) -> String {
     let pinned = remote.unapplied_ref(wip);
     format!(
-        "Note from Intent: this agent's checkout on this machine was removed and has been \
+        "{NOTE}this agent's checkout on this machine was removed and has been \
          recreated at its saved head commit {at}. Its uncommitted work (commit {wip}) could \
          not be applied on top of it and is kept in {pinned}. Inspect it with \
          `git diff {wip}^ {wip}` in this checkout and reapply what you need."

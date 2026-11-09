@@ -98,6 +98,7 @@ fn launch(id: &str) -> LinkFrame {
         checkout_of: None,
         forge: None,
         git_identity: None,
+        new_machine: None,
     })
 }
 

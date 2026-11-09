@@ -429,6 +429,9 @@ struct Agent {
     worktree: Mutex<Option<PathBuf>>,
     /// Prepended to the agent's first turn (see [`Prepared::notice`]).
     notice: Mutex<Option<String>>,
+    /// The machine's name, when head says the agent's last run was on
+    /// another machine: its first turn's notice says so.
+    new_machine: Option<String>,
     /// The machine's skills catalog block, added to the agent's first turn.
     skills_catalog: Mutex<Option<String>>,
     /// The owner of the checkout the agent works in, when it is not its own
@@ -1191,6 +1194,7 @@ impl Runner {
             checkout_of,
             forge,
             git_identity,
+            new_machine,
         } = command;
         let git_identity = git_identity.map(|identity| *identity);
         let forge = forge.map(|forge| *forge);
@@ -1302,6 +1306,7 @@ impl Runner {
             },
             worktree: Mutex::new(None),
             notice: Mutex::new(None),
+            new_machine,
             skills_catalog: Mutex::new(None),
             wip: self.push_lock(checkout_of.as_ref().unwrap_or(&agent_id)),
             checkout_of: checkout_of.clone(),
@@ -1542,6 +1547,13 @@ impl Runner {
                     Err(None)
                 } else {
                     let forge_notice = self.forge_notice(&agent);
+                    let notice = match &agent.new_machine {
+                        Some(machine) => Some(super::checkout::new_machine_notice(
+                            machine,
+                            notice.as_deref(),
+                        )),
+                        None => notice,
+                    };
                     *lock(&agent.notice) = [settled.notice, notice, forge_notice]
                         .into_iter()
                         .flatten()

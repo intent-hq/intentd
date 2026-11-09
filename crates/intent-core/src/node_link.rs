@@ -478,6 +478,12 @@ pub struct LaunchCommand {
     /// Needs no protocol: a machine from before ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_identity: Option<Box<GitIdentity>>,
+    /// The name of this machine, sent when the agent's previous launch was
+    /// on another machine (a new sandbox, or another remote machine): its
+    /// first turn is told what came with it. Needs no protocol: a machine
+    /// from before ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_machine: Option<String>,
 }
 
 /// [`LaunchCommand::git_identity`]: the `user.name` and `user.email` the

@@ -300,6 +300,10 @@ pub struct RemotePlacementView {
     /// parent's, starts from (nodeProtocol 13); never projected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_work: Option<ParentWork>,
+    /// The machine (`nodeId`) of the agent's last launch, kept without a
+    /// machine, so a launch on another one tells the agent; never projected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched_on: Option<String>,
     /// While the agent's cloud machine starts (`AgentLite.cloudStart`).
     /// `node_id` and `lease_id` stay empty until its link binds.
     #[serde(default, skip_serializing_if = "Option::is_none")]

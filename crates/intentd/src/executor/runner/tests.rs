@@ -157,6 +157,7 @@ fn launch(id: &str) -> LaunchCommand {
         checkout_of: None,
         forge: None,
         git_identity: None,
+        new_machine: None,
     }
 }
 

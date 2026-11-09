@@ -1368,6 +1368,7 @@ mod stop_acks {
             checkout_of: None,
             forge: None,
             git_identity: None,
+            new_machine: None,
             profile_env: None,
         }
     }
