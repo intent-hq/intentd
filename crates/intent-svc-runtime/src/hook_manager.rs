@@ -2745,8 +2745,8 @@ mod tests {
 
     /// Store + Services + workspace + owning agent, with an event bus wired
     /// so `hook:*` lifecycle events persist to the event log. The temp
-    /// workspaces root keeps `ws.workspace.*` bindings hermetic (the
-    /// cowSupported probe must never touch `~/intent/workspaces`).
+    /// workspaces root keeps `ws.workspace.*` bindings hermetic (tests must
+    /// never touch `~/intent/workspaces`).
     async fn setup() -> (TempDb, tempfile::TempDir, Services, WorkspaceId, AgentId) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");

@@ -438,7 +438,6 @@ workspace.delete
 workspace.detectProjectType
 workspace.diskUsage
 workspace.dismissAttention
-workspace.duplicate
 workspace.export.abort
 workspace.export.finalize
 workspace.export.read

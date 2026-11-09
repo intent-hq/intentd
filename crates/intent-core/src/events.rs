@@ -343,8 +343,7 @@ pub const WORKSPACE_CLOSED: &str = "workspace:closed";
 // `workspace:setup:completed` `{ workspaceId, ranScript, exitCode? }` fires
 // exactly once per logical create on every terminal path (no script, spawn
 // failure, script exit) — including create paths that never reach the setup
-// stage (`skipWorktree`, no worktree) and `workspace.duplicate`, which runs
-// no setup. Idempotent replays publish nothing (same as `workspace:created`).
+// stage (`skipWorktree`, no worktree). Idempotent replays publish nothing (same as `workspace:created`).
 pub const WORKSPACE_SETUP_STARTED: &str = "workspace:setup:started";
 pub const WORKSPACE_SETUP_COMPLETED: &str = "workspace:setup:completed";
 pub(crate) const WORKSPACE_ACTIVITY: &str = "workspace:activity";

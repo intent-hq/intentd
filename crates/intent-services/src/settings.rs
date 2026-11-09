@@ -54,6 +54,14 @@ pub(crate) const REDACTED_PLACEHOLDER: &str = "********";
 /// and stripping remain supported independently of settings writes.
 pub(crate) const RETIRED_WORKSPACE_OVERRIDES_PATH: &str = "model.workspaceOverrides";
 
+/// The retired `CoW` workspace-checkout preference. Local-repository creates
+/// always provision a linked worktree; `CoW` is used only to hydrate from the
+/// repo cache. No catalog entry remains: `settings.get`/`settings.reset`
+/// reject it as unknown, old clients still writing it via `settings.update`
+/// are tolerated-and-ignored, [`cleanup_retired_settings`] deletes its stale
+/// `SQLite` row on boot, and the config.toml key is stripped as a legacy key.
+pub(crate) const RETIRED_COW_ISOLATION_PATH: &str = "workspace.cowIsolation";
+
 /// The retired `backgroundAgents.*` paths, renamed to `quickActions.*`
 /// (monorepo#1729). No catalog entry remains: `settings.get`/`settings.reset`
 /// reject them as unknown, but old clients still writing them via
@@ -1892,13 +1900,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "git",
             true,
         ),
-        boolean(
-            "workspace.cowIsolation",
-            "Copy-on-Write Isolation",
-            "CoW workspace checkouts (requires CoW filesystem support on the workspaces root)",
-            "workspace",
-            false,
-        ),
         // Whole days; 0 (the default) turns the idle auto-archive sweep off.
         number(
             AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH,
@@ -3156,22 +3157,19 @@ pub fn migrate_active_provider_setting(registry: &SettingsRegistry) -> Result<()
 
 /// One-time boot cleanup of stale `SQLite` rows for retired settings. The
 /// per-workspace override blob (`model.workspaceOverrides`, monorepo#1000)
-/// no longer has a catalog entry or any reader; delete its row so stale
-/// state cannot resurface if the key ever returns. Idempotent — deleting an
-/// absent row is a no-op.
+/// and the `CoW` checkout preference (`workspace.cowIsolation`) no longer
+/// have a catalog entry or any reader; delete their rows so stale state
+/// cannot resurface if a key ever returns. Idempotent — deleting an absent
+/// row is a no-op.
 ///
 /// # Errors
 ///
 /// Returns `Error::Internal` if deleting the settings row fails.
 pub async fn cleanup_retired_settings(store: &Store) -> Result<()> {
-    if store
-        .delete_setting(RETIRED_WORKSPACE_OVERRIDES_PATH)
-        .await?
-    {
-        tracing::info!(
-            path = RETIRED_WORKSPACE_OVERRIDES_PATH,
-            "deleted stale settings row for retired setting"
-        );
+    for path in [RETIRED_WORKSPACE_OVERRIDES_PATH, RETIRED_COW_ISOLATION_PATH] {
+        if store.delete_setting(path).await? {
+            tracing::info!(path, "deleted stale settings row for retired setting");
+        }
     }
     Ok(())
 }
@@ -3638,6 +3636,7 @@ impl<'a> SettingsService<'a> {
                 || path == DEPRECATED_ACTIVE_PROVIDER_PATH
                 || path == DEPRECATED_AUTO_RETIRE_PATH
                 || path == "agents.flushQueuedMessages"
+                || path == RETIRED_COW_ISOLATION_PATH
             {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
                 continue;
@@ -4465,7 +4464,6 @@ mod tests {
             "specialists.default",
             "workspace.branchPrefix",
             "git.autoCommit",
-            "workspace.cowIsolation",
             "workspace.autoArchiveIdleAfterDays",
             "workspace.purgeArchivedAfterDays",
             "mcp.enableUserServers",
@@ -8823,6 +8821,49 @@ mod tests {
         ));
     }
 
+    /// The retired `workspace.cowIsolation` preference is tolerated and
+    /// ignored by `settings.update` (old clients still write it), never
+    /// persisted, and rejected as unknown by `settings.get`/`settings.reset`.
+    #[tokio::test]
+    async fn cow_isolation_update_is_tolerated_and_ignored() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-cowiso-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-cowiso-{tag}.toml"));
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let applied = svc
+            .update(&json!([
+                { "path": RETIRED_COW_ISOLATION_PATH, "value": true },
+                { "path": "git.autoCommit", "value": false },
+            ]))
+            .await
+            .expect("retired path must be tolerated");
+        assert_eq!(applied.len(), 1, "only the live entry applies: {applied:?}");
+        assert_eq!(applied[0]["path"], json!("git.autoCommit"));
+        let text = std::fs::read_to_string(&config_path).unwrap_or_default();
+        assert!(!text.contains("cowIsolation"), "{text}");
+        assert_eq!(
+            store
+                .get_setting(RETIRED_COW_ISOLATION_PATH)
+                .await
+                .expect("read"),
+            None
+        );
+        assert!(matches!(
+            svc.get(RETIRED_COW_ISOLATION_PATH).await,
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            svc.reset(RETIRED_COW_ISOLATION_PATH).await,
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(find_definition(RETIRED_COW_ISOLATION_PATH).is_none());
+    }
+
     /// monorepo#1729: the renamed `backgroundAgents.*` paths are tolerated-
     /// and-ignored by `settings.update` (pre-rename clients keep writing them)
     /// and rejected as unknown by `settings.get`/`settings.reset`.
@@ -9289,7 +9330,19 @@ mod tests {
             .set_setting("model.workspaceOverrides", r#"{"ws1":"m1"}"#)
             .await
             .expect("seed stale row");
+        store
+            .set_setting(RETIRED_COW_ISOLATION_PATH, "true")
+            .await
+            .expect("seed stale cowIsolation row");
         cleanup_retired_settings(&store).await.expect("cleanup");
+        assert_eq!(
+            store
+                .get_setting(RETIRED_COW_ISOLATION_PATH)
+                .await
+                .expect("read settings table"),
+            None,
+            "stale cowIsolation row must be deleted"
+        );
         assert_eq!(
             store
                 .get_setting("model.workspaceOverrides")

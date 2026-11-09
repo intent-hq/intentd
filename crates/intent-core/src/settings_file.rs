@@ -191,13 +191,6 @@ pub struct WorkspaceSettings {
     pub ssh_key_path: Option<String>,
     /// `workspace.defaultShell` — shell used for terminals/scripts.
     pub default_shell: Option<String>,
-    /// `workspace.cowIsolation` — `CoW` workspace checkouts (requires `CoW`
-    /// filesystem support on the workspaces root). It no longer puts
-    /// delegated agents in per-agent sandboxes (retired in protocol 16).
-    /// A preference, not a guarantee: when the filesystem cannot `CoW`-clone,
-    /// `workspace.create` falls back to a linked worktree (local repository)
-    /// or a plain local clone (repo-cache hydration) instead of failing.
-    pub cow_isolation: bool,
     /// `workspace.autoArchiveIdleAfterDays` — archive workspaces idle for
     /// this many days (PROTOCOL §5.12). Defaults to
     /// [`DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS`] (`0`, off).
@@ -221,7 +214,6 @@ impl Default for WorkspaceSettings {
             worktrees_location: None,
             ssh_key_path: None,
             default_shell: None,
-            cow_isolation: false,
             auto_archive_idle_after_days: DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS,
             purge_archived_after_days: None,
             auto_retire_archived_after_days: None,
@@ -1409,6 +1401,9 @@ where
 /// then stripped. `remoteAgents.enabled` and the `[experimental]` table (its
 /// only key was `remoteAgents`) are the retired remote-agent switches: remote
 /// agents need no daemon setting, so both are discarded and stripped.
+/// `workspace.cowIsolation` is retired outright too: local-repository
+/// workspaces are always linked worktrees and `CoW` is used only to hydrate
+/// from the repo cache — discarded and stripped.
 pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "model.workspaceOverrides",
     "ai",
@@ -1418,6 +1413,7 @@ pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "agents.flushQueuedMessages",
     "remoteAgents.enabled",
     "experimental",
+    "workspace.cowIsolation",
 ];
 
 /// Whether `key` is a valid `providers.fastMode` key: a Fast mode capable
@@ -1893,9 +1889,6 @@ providerSettings = {}
 # sshKeyPath = "~/.ssh/id_ed25519"
 # Default shell -- shell used for terminals/scripts.
 # defaultShell = "/bin/zsh"
-# Copy-on-Write Isolation -- CoW workspace checkouts (requires CoW filesystem
-# support on the workspaces root).
-cowIsolation = false
 # Auto-archive -- archive workspaces idle for this many days (0 = off);
 # workspaces with uncommitted changes or unpushed commits are skipped.
 autoArchiveIdleAfterDays = 0
@@ -2341,7 +2334,6 @@ mod tests {
         assert_eq!(d.model.default_provider, None);
         assert_eq!(d.model.default_reasoning_effort, None);
         assert!(d.quick_actions.provider_settings.is_empty());
-        assert!(!d.workspace.cow_isolation);
         assert!(d.git.auto_commit);
         assert!(d.mcp.enable_user_servers);
         assert!(d.mcp.disabled_servers.is_empty());
@@ -2943,14 +2935,31 @@ mod tests {
 
     #[test]
     fn legacy_parse_captures_and_tolerates_auto_fetch() {
-        let text = "[workspace]\nautoFetch = false\ncowIsolation = true\n";
+        let text = "[workspace]\nautoFetch = false\nbranchPrefix = \"me/\"\n";
         let (file, legacy) = SettingsFile::parse_str_with_legacy(text).expect("tolerant parse");
-        assert!(file.workspace.cow_isolation);
+        assert_eq!(file.workspace.branch_prefix.as_deref(), Some("me/"));
         assert_eq!(
             legacy.get("workspace.autoFetch"),
             Some(&serde_json::json!(false))
         );
         assert_eq!(legacy.len(), 1);
+    }
+
+    /// The retired `workspace.cowIsolation` preference still loads from an
+    /// older file as a legacy key (stripped at boot) and is gone from the
+    /// template; the strict parse refuses it like any other unknown key.
+    #[test]
+    fn legacy_parse_captures_and_tolerates_cow_isolation() {
+        let text = "[workspace]\ncowIsolation = true\nbranchPrefix = \"me/\"\n";
+        let (file, legacy) = SettingsFile::parse_str_with_legacy(text).expect("tolerant parse");
+        assert_eq!(file.workspace.branch_prefix.as_deref(), Some("me/"));
+        assert_eq!(
+            legacy.get("workspace.cowIsolation"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(legacy.len(), 1);
+        assert!(SettingsFile::parse_str(text).is_err());
+        assert!(!DEFAULT_CONFIG_TEMPLATE.contains("cowIsolation"));
     }
 
     /// The retired remote-agent switches (`remoteAgents.enabled`,

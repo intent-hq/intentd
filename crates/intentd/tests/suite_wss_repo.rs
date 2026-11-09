@@ -37,7 +37,6 @@ mod e2e_wss_workspace_create_is_new_repo;
 mod e2e_wss_workspace_create_progress;
 mod e2e_wss_workspace_create_submodule_progress;
 mod e2e_wss_workspace_create_worktree_errors;
-mod e2e_wss_workspace_direct_survival;
 mod e2e_wss_workspace_lifecycle_watchers;
 mod e2e_wss_workspace_owner_derivation;
 mod e2e_wss_workspace_worktree;

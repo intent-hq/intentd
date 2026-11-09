@@ -10792,14 +10792,10 @@ async fn wss_agent_create_pins_the_catalog_default_model() {
 }
 
 /// `system.capabilities` (PROTOCOL §5.7): machine-level capabilities with no
-/// params and no workspaceId. The result is a plain object whose optional
-/// `cowSupported` mirrors the cached workspaces-root `CoW` probe that fills
-/// `Workspace.cowSupported` (§5.1). The harness injects an existing hermetic
-/// workspaces root, so the probe always runs and the field is present as a
-/// boolean (true on `CoW` filesystems like APFS, false on e.g. ext4); when the
-/// probe cannot run the field is omitted, never null.
+/// params and no workspaceId. The result is a plain object of feature flags;
+/// the retired `cowSupported` capability (protocol 17) is never reported.
 #[intent_test_macros::daemon_test]
-async fn wss_system_capabilities_reports_cow_supported() {
+async fn wss_system_capabilities_omits_retired_cow_supported() {
     let srv = start(WsOptions::default()).await;
     let resp = wss_call(
         srv.port,
@@ -10810,10 +10806,12 @@ async fn wss_system_capabilities_reports_cow_supported() {
     assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["id"], 1);
     let result = resp["result"].as_object().expect("result is an object");
-    assert!(
-        result.get("cowSupported").is_some_and(Value::is_boolean),
-        "cowSupported present as a boolean when the probe ran (hermetic root exists): {resp}"
+    assert_eq!(
+        result.get("boundedReads"),
+        Some(&serde_json::json!(1)),
+        "{resp}"
     );
+    assert!(result.get("cowSupported").is_none(), "{resp}");
     srv.ws.stop().await;
 }
 
@@ -17547,7 +17545,7 @@ async fn wss_repo_remove_round_trip() {
 }
 
 /// End-to-end WSS coverage for the workspace lifecycle helpers added by the
-/// thin-FE remediation (docs/protocol/methods/workspace.md §5.1): `workspace.duplicate`,
+/// thin-FE remediation (docs/protocol/methods/workspace.md §5.1):
 /// `workspace.restore`, `workspace.cleanup`, `workspace.findRepositories`,
 /// and `workspace.initializeRepository`. Every method is driven over the
 /// real pinned-TLS WebSocket transport and its response envelope is asserted
@@ -17556,7 +17554,7 @@ async fn wss_repo_remove_round_trip() {
 async fn wss_workspace_lifecycle_helpers_round_trip() {
     let srv = start(WsOptions::default()).await;
 
-    // Seed a workspace to duplicate/restore/clean up.
+    // Seed a workspace to restore/clean up.
     let created = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -17568,8 +17566,7 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
         .expect("created id")
         .to_string();
 
-    // workspace.duplicate returns { workspace }, defaulting the title to the
-    // "<source> (Copy)" convention.
+    // workspace.duplicate was removed in protocol 17: method not found.
     let dup = wss_call(
         srv.port,
         srv.cfg.clone(),
@@ -17578,24 +17575,7 @@ async fn wss_workspace_lifecycle_helpers_round_trip() {
         ),
     )
     .await;
-    assert!(dup["result"]["workspace"].is_object(), "workspace object");
-    assert_eq!(dup["result"]["workspace"]["title"], "Source WS (Copy)");
-    let dup_id = dup["result"]["workspace"]["id"]
-        .as_str()
-        .expect("dup id")
-        .to_string();
-    assert_ne!(dup_id, ws_id, "duplicate must mint a fresh id");
-
-    // Explicit newTitle overrides the auto-suffix.
-    let dup2 = wss_call(
-        srv.port,
-        srv.cfg.clone(),
-        &format!(
-            r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.duplicate","params":{{"workspaceId":"{ws_id}","newTitle":"Custom Copy"}}}}"#
-        ),
-    )
-    .await;
-    assert_eq!(dup2["result"]["workspace"]["title"], "Custom Copy");
+    assert_eq!(dup["error"]["code"], -32601, "{dup}");
 
     // workspace.restore alias of unarchive: archive first, then restore.
     let _ = wss_call(

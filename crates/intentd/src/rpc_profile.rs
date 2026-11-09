@@ -1136,7 +1136,6 @@ mod tests {
         assert!(!is_compound_statement_method("workspace.list"));
         assert!(!is_compound_statement_method("workspace.get"));
         assert!(!is_compound_statement_method("workspace.archive"));
-        assert!(!is_compound_statement_method("workspace.duplicate"));
         assert!(!is_compound_statement_method("workspace.import.begin"));
         assert!(!is_compound_statement_method("workspace"));
     }

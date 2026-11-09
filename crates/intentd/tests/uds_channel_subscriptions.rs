@@ -624,7 +624,7 @@ async fn workspace_channel_snapshot_then_updated_delta() {
         "workspace entities carry no rev (R3 scopes rev to Note/Task)"
     );
     // The seq-0 lite snapshot is self-sufficient for client status rendering:
-    // rows carry taskStats + displayStatus + cowSupported while the heavy
+    // rows carry taskStats + displayStatus while the heavy
     // aggregates (agentSummary/diffSummary) stay omitted.
     assert!(
         ws_entry["taskStats"]["total"].is_number(),
@@ -635,8 +635,8 @@ async fn workspace_channel_snapshot_then_updated_delta() {
         "snapshot rows carry displayStatus: {ws_entry}"
     );
     assert!(
-        ws_entry["cowSupported"].is_boolean(),
-        "snapshot rows carry cowSupported: {ws_entry}"
+        ws_entry.get("cowSupported").is_none(),
+        "cowSupported is retired: {ws_entry}"
     );
     assert!(
         ws_entry.get("agentSummary").is_none(),

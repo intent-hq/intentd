@@ -373,20 +373,19 @@ async fn host_member_lifecycle_uses_existing_archive_and_incremental_delete() {
         let restored = svc.unarchive_workspace(created.id.clone()).await.unwrap();
         assert!(!restored.archived);
         assert!(restored.membership.unwrap().can_manage);
-        let duplicate = svc
-            .duplicate_workspace(created.id.clone(), Some("Copy".into()))
+        let summary = svc
+            .get_workspace(created.id.clone())
             .await
+            .unwrap()
+            .membership
             .unwrap();
-        let summary = duplicate.membership.unwrap();
         assert_eq!(summary.owner_principal_id, Some(owner));
         assert_eq!(summary.my_role, Some(WorkspaceRole::Collaborator));
-        assert!(summary.can_manage);
-        svc.delete_workspace(duplicate.id.clone()).await.unwrap();
+        svc.delete_workspace(created.id.clone()).await.unwrap();
         assert!(matches!(
-            svc.get_workspace(duplicate.id).await,
+            svc.get_workspace(created.id).await,
             Err(Error::NotFound(_))
         ));
-        assert!(svc.get_workspace(created.id).await.is_ok());
     })
     .await;
 }

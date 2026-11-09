@@ -986,13 +986,8 @@ pub fn provision_direct_checkout_with_progress(
     base_ref: Option<&str>,
     on_submodule_chunk: Option<ProgressChunkFn>,
 ) -> Result<String> {
-    let sha = provision_plain_clone_checkout(
-        cache_path,
-        checkout_path,
-        &OriginTarget::Url(origin_url),
-        branch,
-        base_ref,
-    )?;
+    let sha =
+        provision_plain_clone_checkout(cache_path, checkout_path, origin_url, branch, base_ref)?;
     if let Err(e) = hydrate_submodules_from_cache(cache_path, checkout_path, on_submodule_chunk) {
         tracing::warn!(
             checkout = %checkout_path.display(),
@@ -1350,17 +1345,6 @@ fn copy_module_dir(src: &Path, dst: &Path, nested: &ModuleLiveness) -> std::io::
     Ok(())
 }
 
-/// What the provisioned clone's `origin` remote must point at once the local
-/// clone has served its purpose as the object source. Either way the clone
-/// never keeps a reference to `source_path`.
-pub(crate) enum OriginTarget<'a> {
-    /// Retarget `origin` at this URL (the real upstream).
-    Url(&'a str),
-    /// Drop the `origin` remote: the source has no upstream of its own, so
-    /// leaving the clone's `origin` in place would pin it to the source path.
-    Remove,
-}
-
 /// Remove remote `name` from `repo`, editing only the repository's own
 /// (local) config. libgit2's `remote_delete` walks `remote.<name>.*` across
 /// every config level but deletes from the repository level, so an entry
@@ -1486,11 +1470,12 @@ fn refspec_pattern_matches(pattern: &[u8], name: &[u8]) -> bool {
     }
 }
 
-/// Shared body of the standalone plain-clone provisioners: local `git clone`
-/// of `source_path`, overlay of the source's remote-tracking refs, branch +
-/// checkout + hard reset, then `origin` retargeted per `origin`. The origin
-/// step runs last because [`OriginTarget::Remove`] drops the remote's
-/// tracking refs along with it, and `base_ref` resolution needs them.
+/// Body of the Direct plain-clone provisioner: local `git clone` of
+/// `source_path`, overlay of the source's remote-tracking refs, branch +
+/// checkout + hard reset, then `origin` retargeted at `origin_url` (the real
+/// upstream) so the clone never keeps a reference to `source_path`. The
+/// origin step runs last so `base_ref` resolution still sees the source's
+/// remote-tracking refs.
 ///
 /// Returns the SHA the checkout lands on. On failure after the clone, the
 /// partially provisioned `checkout_path` is removed best-effort. Blocking —
@@ -1498,7 +1483,7 @@ fn refspec_pattern_matches(pattern: &[u8], name: &[u8]) -> bool {
 pub(crate) fn provision_plain_clone_checkout(
     source_path: &Path,
     checkout_path: &Path,
-    origin: &OriginTarget<'_>,
+    origin_url: &str,
     branch: &str,
     base_ref: Option<&str>,
 ) -> Result<String> {
@@ -1566,10 +1551,8 @@ pub(crate) fn provision_plain_clone_checkout(
         let sha =
             crate::cow_checkout::checkout_in_clone(checkout_path, branch, base_ref, "origin")?;
         let repo = Repository::open(checkout_path).map_err(map_git_err)?;
-        match origin {
-            OriginTarget::Url(url) => repo.remote_set_url("origin", url).map_err(map_git_err)?,
-            OriginTarget::Remove => remove_remote_local_only(&repo, "origin")?,
-        }
+        repo.remote_set_url("origin", origin_url)
+            .map_err(map_git_err)?;
         Ok(sha)
     })()
     .inspect_err(|_| {

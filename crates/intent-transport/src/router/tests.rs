@@ -411,20 +411,6 @@ impl WorkspaceApi for FakeApi {
             Ok(ws_with(&id))
         })
     }
-    fn duplicate_workspace(
-        &self,
-        id: WorkspaceId,
-        new_title: Option<String>,
-    ) -> BoxFuture<'_, Result<Workspace>> {
-        Box::pin(async move {
-            if id.as_str() == "missing" {
-                return Err(Error::NotFound("workspace".to_string()));
-            }
-            let mut ws = ws_with(&WorkspaceId::from(format!("{}-copy", id.as_str())));
-            ws.title = new_title.unwrap_or_else(|| format!("{} (Copy)", ws.title));
-            Ok(ws)
-        })
-    }
     fn cleanup_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             if id.as_str() == "missing" {
@@ -3772,19 +3758,19 @@ fn workspace_retired_error_maps_to_machine_readable_code() {
 #[test]
 fn plain_folder_unsupported_maps_to_machine_readable_code() {
     let rpc = super::domain_to_rpc(Error::PlainFolderUnsupported {
-        operation: "workspace.duplicate",
+        operation: "git.push",
     });
     assert_eq!(rpc.code, -32602);
     assert_eq!(
         rpc.data,
         Some(serde_json::json!({
             "code": "plain-folder-unsupported",
-            "operation": "workspace.duplicate",
+            "operation": "git.push",
         }))
     );
     assert_eq!(
         rpc.message,
-        "workspace.duplicate is not available in plain-folder workspaces"
+        "git.push is not available in plain-folder workspaces"
     );
 }
 
@@ -3989,7 +3975,6 @@ async fn workspace_mutations_missing_id_is_minus_32602() {
         "workspace.unarchive",
         "workspace.dismissAttention",
         "workspace.markSeen",
-        "workspace.duplicate",
         "workspace.restore",
         "workspace.cleanup",
     ] {
@@ -3999,48 +3984,16 @@ async fn workspace_mutations_missing_id_is_minus_32602() {
     }
 }
 
+/// `workspace.duplicate` was removed in protocol 17: it is no longer
+/// routed, so callers get `-32601` (method not found).
 #[tokio::test]
-async fn workspace_duplicate_returns_workspace_with_new_title() {
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.duplicate","params":{"workspaceId":"ws-1","newTitle":"My Copy"}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        v["result"]["workspace"]["title"],
-        serde_json::json!("My Copy")
-    );
-    assert_eq!(
-        v["result"]["workspace"]["id"],
-        serde_json::json!("ws-1-copy")
-    );
-}
-
-#[tokio::test]
-async fn workspace_duplicate_defaults_to_copy_suffix() {
+async fn workspace_duplicate_is_method_not_found() {
     let v = call(
         r#"{"jsonrpc":"2.0","id":1,"method":"workspace.duplicate","params":{"workspaceId":"ws-1"}}"#,
     )
     .await
     .unwrap();
-    assert_eq!(
-        v["result"]["workspace"]["title"],
-        serde_json::json!("WS One (Copy)")
-    );
-}
-
-#[tokio::test]
-async fn workspace_duplicate_not_found_is_minus_32602() {
-    let v = call(
-        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.duplicate","params":{"workspaceId":"missing"}}"#,
-    )
-    .await
-    .unwrap();
-    assert_eq!(err_code(&v), -32602);
-    assert_eq!(
-        v["error"]["message"],
-        serde_json::json!("Workspace not found")
-    );
+    assert_eq!(err_code(&v), -32601);
 }
 
 #[tokio::test]

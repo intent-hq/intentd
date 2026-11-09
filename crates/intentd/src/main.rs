@@ -2444,12 +2444,6 @@ async fn cmd_serve_owned(
         Some(query) => services.with_suspend_tracker(query),
         None => services,
     };
-    // Seed the service-owned capability cache off the RPC path. The earlier
-    // process-wide probe warms intent-git's low-level result; this detached
-    // handoff makes workspace/list capability reads cache-only.
-    if startup_error.is_none() && !bootstrap.cancellation.stopping() {
-        services.prewarm_cow_supported();
-    }
     // The AgentManager multiplexes spawned agent processes over the ACP client
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming

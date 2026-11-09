@@ -2873,8 +2873,7 @@ mod tests {
 
     /// Store + Services + workspace with a top-level parent (`agent-parent`)
     /// and its delegated child (`agent-child`). The temp workspaces root
-    /// keeps the cowSupported probe hermetic (mirrors the `hook_manager` test
-    /// setup).
+    /// keeps the setup hermetic (mirrors the `hook_manager` test setup).
     async fn setup() -> (TempDb, tempfile::TempDir, Services, WorkspaceId) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");

@@ -475,8 +475,8 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// Store-backed workspace rows plus live `activity` and the cheap status
-    /// aggregates (`taskStats` via a counting query, derived `displayStatus`,
-    /// lifetime-cached `cowSupported`) — no notes/sessions enrichment. Used by
+    /// aggregates (`taskStats` via a counting query, derived `displayStatus`)
+    /// — no notes/sessions enrichment. Used by
     /// the workspace subscription snapshot so seq-0 cannot emit multi-MB
     /// enriched payloads that HOL the connection writer (observed ~4.5 MiB /
     /// 80 workspaces) while staying self-sufficient for client status
@@ -1232,33 +1232,6 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::list_task_agent_links not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// Duplicate a workspace (PROTOCOL §5.1): clone the persisted metadata into
-    /// a freshly minted id, seed the well-known `spec` note, and copy over any
-    /// non-`spec` notes from the source. Runtime-only fields (`activity`, card
-    /// aggregates, timeline, changesets) are not carried over; the new
-    /// workspace starts on a fresh branch derived from its id (uniquified with
-    /// a `-N` suffix against the source repo's local/remote-tracking refs on
-    /// collision, same as `workspace.create`). When the source carries a
-    /// local `repositoryPath` and is not `skipWorktree`/`isRemote`, the daemon
-    /// provisions a linked worktree at `<root>/<newId>/<repo-slug>` on that
-    /// branch (mirroring the `workspace.create` flow); provisioning failures
-    /// are logged and the duplicate still returns without a `worktreePath`
-    /// (FE parity: "user can create it manually"). `newTitle` overrides the
-    /// auto-suffixed `"<source> (Copy)"` title. `NotFound` if the source
-    /// workspace is absent.
-    fn duplicate_workspace(
-        &self,
-        id: WorkspaceId,
-        new_title: Option<String>,
-    ) -> BoxFuture<'_, Result<Workspace>> {
-        let _ = (id, new_title);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::duplicate_workspace not implemented".to_string(),
             ))
         })
     }
@@ -7079,13 +7052,9 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `system.capabilities`: machine-level capabilities independent of any
-    /// workspace — `{ cowSupported?: boolean }` (PROTOCOL §5.7). `cowSupported`
-    /// reports the `CoW` probe of the workspaces root (`true`/`false` for a
-    /// supported/unsupported filesystem, omitted when the probe cannot run) —
-    /// the same cached probe that fills `Workspace.cowSupported` (§5.1).
-    /// Unlike the `system.status`/`system.shutdown` control fast-path, this is
-    /// a router method: it needs the service layer's workspaces-root
-    /// resolution and aggregate cache, not composition-root daemon state.
+    /// workspace — a map of feature flags (PROTOCOL §5.7). Unlike the
+    /// `system.status`/`system.shutdown` control fast-path, this is a router
+    /// method served by the service layer, not composition-root daemon state.
     fn system_capabilities(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async {
             Err(Error::Internal(

@@ -164,7 +164,7 @@ async fn mints_client_id_when_omitted() {
         server["capabilities"]["agentIsolation"], 2,
         "per-agent CoW sandboxes are retired (protocol 16)"
     );
-    assert_eq!(crate::protocol::PROTOCOL_VERSION, "16.0");
+    assert_eq!(crate::protocol::PROTOCOL_VERSION, "17.0");
     assert_eq!(server["locality"], json!("local"));
     assert_eq!(
         server["version"],

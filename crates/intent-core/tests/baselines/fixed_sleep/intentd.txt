@@ -103,12 +103,11 @@ crates/intentd/tests/e2e_wss_unblocked_hints.rs 1
 crates/intentd/tests/e2e_wss_wake_or_create.rs 1
 crates/intentd/tests/e2e_wss_wake_resume.rs 2
 crates/intentd/tests/e2e_wss_workspace_activity_debounce.rs 2
-crates/intentd/tests/e2e_wss_workspace_cow.rs 3
+crates/intentd/tests/e2e_wss_workspace_cow.rs 2
 crates/intentd/tests/e2e_wss_workspace_create_submodule_progress.rs 1
-crates/intentd/tests/e2e_wss_workspace_direct_survival.rs 2
 crates/intentd/tests/e2e_wss_workspace_lifecycle_watchers.rs 2
 crates/intentd/tests/e2e_wss_workspace_owner_derivation.rs 1
-crates/intentd/tests/e2e_wss_workspace_worktree.rs 8
+crates/intentd/tests/e2e_wss_workspace_worktree.rs 6
 crates/intentd/tests/security_hardening.rs 1
 crates/intentd/tests/uds_accept_changes.rs 1
 crates/intentd/tests/uds_agent_runtime.rs 1

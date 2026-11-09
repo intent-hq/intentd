@@ -172,26 +172,3 @@ async fn home_isolation_default_services_redirect_away_from_forbidden_home() {
 
     assert_eq!(home.snapshot(), before, "sentinel home must stay untouched");
 }
-
-/// The machine-level `CoW` probe resolves the workspaces root through the
-/// non-panicking `try_default_workspaces_root`; with no injected root it must
-/// not create `~/intent/workspaces` in the real home (caught by the CI
-/// backstop: `created workspaces` under the runner's home).
-#[tokio::test]
-async fn home_isolation_cow_probe_never_creates_the_default_workspaces_root() {
-    let home = SentinelHome::new();
-    let before = home.snapshot();
-
-    assert_eq!(
-        crate::try_default_workspaces_root(),
-        None,
-        "the default workspaces root must be unavailable inside the forbidden home"
-    );
-    let (_db, services, _ws, _note) = setup("body").await;
-    services.prewarm_cow_supported();
-    let _ = services.compute_cow_supported().await;
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    drop(services);
-
-    assert_eq!(home.snapshot(), before, "sentinel home must stay untouched");
-}

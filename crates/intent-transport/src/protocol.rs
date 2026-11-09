@@ -762,9 +762,13 @@ use std::time::{Duration, Instant};
 // isolation "cow" with isolation-removed, sandbox.cow.merge / sandbox.cow.discard are
 // removed (-32601), sandbox:cow:* events and the session sandboxId / sandboxPath /
 // sandboxBranch fields are no longer emitted. Workspace checkoutMode "cow" stays.
+// 17.0 removes workspace.duplicate (-32601), Workspace.cowSupported and
+// system.capabilities.cowSupported, and retires the workspace.cowIsolation setting:
+// local-repository creates always provision a linked worktree, and CoW is used only
+// to hydrate from the repo cache.
 // The 13.9/13.10 note paging, annotation and cancellable deletion surface was
 // later removed without a version bump: no client ever adopted it.
-pub const PROTOCOL_VERSION: &str = "16.0";
+pub const PROTOCOL_VERSION: &str = "17.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

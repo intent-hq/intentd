@@ -2155,15 +2155,6 @@ async fn dispatch(
                 .map_err(workspace_err)?;
             Ok(json!({ "uiContext": persisted }))
         }
-        "workspace.duplicate" => {
-            let id = require_workspace_id(params)?;
-            let new_title = opt_str(params, "newTitle");
-            let ws = api
-                .duplicate_workspace(id, new_title)
-                .await
-                .map_err(workspace_err)?;
-            Ok(json!({ "workspace": ws }))
-        }
         "workspace.restore" => {
             let id = require_workspace_id(params)?;
             let ws = api.restore_workspace(id).await.map_err(workspace_err)?;
@@ -5056,7 +5047,7 @@ async fn dispatch(
         "system.capabilities" => {
             // Machine-level capabilities; optional workspaceId is routing-only (§5.7).
             // Router method (unlike the system.* control fast-path): the
-            // cowSupported probe lives in the service layer's aggregate cache.
+            // capability map is built by the service layer.
             let r = api.system_capabilities().await.map_err(domain_to_rpc)?;
             Ok(r)
         }

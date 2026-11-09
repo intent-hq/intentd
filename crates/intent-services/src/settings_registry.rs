@@ -70,7 +70,6 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "workspace.worktreesLocation",
     "workspace.sshKeyPath",
     "workspace.defaultShell",
-    "workspace.cowIsolation",
     "workspace.autoArchiveIdleAfterDays",
     "workspace.purgeArchivedAfterDays",
     "workspace.autoRetireArchivedAfterDays",

@@ -456,7 +456,6 @@ router workspace.delete
 router workspace.detectProjectType
 router workspace.diskUsage
 router workspace.dismissAttention
-router workspace.duplicate
 router workspace.export.abort
 router workspace.export.finalize
 router workspace.export.read

@@ -5014,8 +5014,7 @@ mod display_status_events {
     #[intent_test_macros::daemon_test]
     async fn lite_list_seeds_baseline_then_first_mutation_emits() {
         let h = harness().await;
-        // Hermetic root: the lite path probes the workspaces root for
-        // `cowSupported`, and tests must never touch `~/intent/workspaces`.
+        // Hermetic root: tests must never touch `~/intent/workspaces`.
         let root = crate::tests::WorkspacesRoot::new();
         let services = h
             .services
@@ -5128,8 +5127,7 @@ mod display_status_events {
     #[tokio::test]
     async fn enrich_omits_display_status_when_task_stats_unavailable() {
         let h = harness().await;
-        // Hermetic root: enrichment probes the workspaces root for
-        // `cowSupported`, and tests must never touch `~/intent/workspaces`.
+        // Hermetic root: tests must never touch `~/intent/workspaces`.
         let root = tempfile::tempdir().expect("temp workspaces root");
         let services = h
             .services
