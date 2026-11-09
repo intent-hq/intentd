@@ -894,6 +894,17 @@ fn validate_aliases_spec(value: Option<&Value>) -> Result<Option<Vec<Value>>> {
     Ok(Some(out))
 }
 
+/// Fields of a base-tier definition carried in an override's `bundled`
+/// baseline (PROTOCOL §5.11): the content a user edits, not the model pin.
+const BUNDLED_BASELINE_KEYS: &[&str] = &[
+    "name",
+    "description",
+    "behaviorPrompt",
+    "roleReminder",
+    "reasoningEffort",
+    MODEL_OPTIONS_KEY,
+];
+
 /// Retired frontmatter/wire keys, tolerated-and-ignored (PROTOCOL §5.11): old files and
 /// old-client `specialist.create`/`edit` specs may still carry them, but they
 /// are stripped on parse (never echoed by `get`/`list`), silently skipped by
@@ -1718,10 +1729,9 @@ impl SpecialistsService {
             .definitions
     }
 
-    fn collect_native_catalog(
-        &self,
-        workspace_path: Option<&Path>,
-    ) -> std::collections::BTreeMap<String, Value> {
+    /// The base (`bundled`) tier alone: the embedded bundle, then the bundled
+    /// directory — or only the replacement directory in replacement mode.
+    fn collect_base_catalog(&self) -> std::collections::BTreeMap<String, Value> {
         let mut acc = std::collections::BTreeMap::new();
         for (id, content) in self.embedded {
             acc.insert(
@@ -1732,6 +1742,14 @@ impl SpecialistsService {
         if let Some(dir) = &self.bundled_dir {
             Self::collect_dir(dir, "bundled", &mut acc);
         }
+        acc
+    }
+
+    fn collect_native_catalog(
+        &self,
+        workspace_path: Option<&Path>,
+    ) -> std::collections::BTreeMap<String, Value> {
+        let mut acc = self.collect_base_catalog();
         if let Some(dir) = &self.user_dir {
             Self::collect_dir(dir, "user", &mut acc);
         }
@@ -1853,6 +1871,33 @@ impl SpecialistsService {
             result["importDiagnostics"] = json!(catalog.diagnostics);
         }
         Ok(result)
+    }
+
+    /// Attach `bundled` (PROTOCOL §5.11) to each user/project Intent
+    /// definition whose id also resolves in the base tier: that base
+    /// definition's [`BUNDLED_BASELINE_KEYS`], so a client can tell whether an
+    /// override still matches its built-in without a copy of the bundle.
+    pub(crate) fn attach_bundled_baselines<'a>(
+        &self,
+        defs: impl IntoIterator<Item = &'a mut Value>,
+    ) {
+        let mut base: Option<std::collections::BTreeMap<String, Value>> = None;
+        for def in defs {
+            let overrides = matches!(def["source"].as_str(), Some("user" | "project"))
+                && def.get("importedFrom").is_none();
+            let Some(id) = def["id"].as_str().filter(|_| overrides) else {
+                continue;
+            };
+            let base = base.get_or_insert_with(|| self.collect_base_catalog());
+            let Some(builtin) = base.get(id).and_then(Value::as_object) else {
+                continue;
+            };
+            let baseline: Map<String, Value> = BUNDLED_BASELINE_KEYS
+                .iter()
+                .filter_map(|&key| builtin.get(key).map(|v| (key.to_string(), v.clone())))
+                .collect();
+            def["bundled"] = Value::Object(baseline);
+        }
     }
 
     /// `specialist.get` → `{ specialist: SpecialistDef }`, the resolved view;

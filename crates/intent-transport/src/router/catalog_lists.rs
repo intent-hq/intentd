@@ -141,6 +141,11 @@ pub(super) fn page_specialist_list(
     let page = page_rows(rows, params, "specialist.list", budget, |row| {
         omit_body(row, "behaviorPrompt");
         omit_body(row, "prompt");
+        if let Some(obj) = row.as_object_mut() {
+            if obj.remove("bundled").is_some() {
+                obj.insert("bundledOmitted".into(), Value::Bool(true));
+            }
+        }
     })?;
     obj.insert("specialists".into(), Value::Array(page.rows));
     obj.insert("nextToken".into(), token_value(page.next_token));

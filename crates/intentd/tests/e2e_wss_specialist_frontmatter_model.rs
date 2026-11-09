@@ -965,6 +965,108 @@ async fn specialist_config_scalars_inherit_over_wss() {
     drop(daemon);
 }
 
+/// WSS e2e for the `bundled` baseline (PROTOCOL §5.11): a user-tier override
+/// of a base-tier id carries the base definition's content fields on
+/// `specialist.get` and `specialist.list`, without the model pin; base-tier
+/// rows and user specialists with no base definition carry none.
+#[tokio::test]
+async fn specialist_bundled_baseline_over_wss() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let socket = data_dir.join("intentd.sock");
+
+    let bundled_dir = data_dir.join("bundled-specialists");
+    std::fs::create_dir_all(&bundled_dir).expect("mkdir bundled dir");
+    std::fs::write(
+        bundled_dir.join("zeta.md"),
+        "---\nname: \"Zeta\"\ndescription: \"Bundled\"\nmodel: \"opus\"\nroleReminder: \"Bundled reminder.\"\nreasoningEffort: \"high\"\nmodelOptions: [{\"model\":\"opus\",\"hint\":\"deep\"}]\n---\n\nBundled body.",
+    )
+    .expect("write bundled zeta");
+    std::fs::write(
+        bundled_dir.join("kappa.md"),
+        "---\nname: \"Kappa\"\ndescription: \"Bundled only\"\n---\n\nKappa body.",
+    )
+    .expect("write bundled kappa");
+
+    let specialists_dir = data_dir.join(".intent").join("specialists");
+    std::fs::create_dir_all(&specialists_dir).expect("mkdir specialists dir");
+    std::fs::write(
+        specialists_dir.join("zeta.md"),
+        "---\nname: \"Zeta\"\ndescription: \"User override\"\nmodel: \"sonnet\"\n---\n\nUser body.",
+    )
+    .expect("write user zeta");
+    std::fs::write(
+        specialists_dir.join("solo.md"),
+        "---\nname: \"Solo\"\ndescription: \"Custom\"\n---\n\nSolo body.",
+    )
+    .expect("write user solo");
+
+    let bundled_dir_str = bundled_dir
+        .to_str()
+        .expect("bundled dir to str")
+        .to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("HOME", data_dir.to_str().expect("data_dir to str")),
+        ("INTENTD_BUNDLED_SPECIALISTS_DIR", &bundled_dir_str),
+    ];
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "both", &env),
+        _data_dir: data_dir_guard,
+    };
+    assert!(await_uds(&socket).await, "daemon did not boot");
+
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fp = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let mut ws = connect_ws(port, client_config(&fp)).await;
+
+    let expected = json!({
+        "name": "Zeta",
+        "description": "Bundled",
+        "behaviorPrompt": "Bundled body.",
+        "roleReminder": "Bundled reminder.",
+        "reasoningEffort": "high",
+        "modelOptions": [{ "model": "opus", "hint": "deep" }],
+    });
+
+    let got = wss_rpc(&mut ws, 2, "specialist.get", json!({ "id": "zeta" })).await;
+    assert_eq!(got["specialist"]["source"], "user", "user tier wins");
+    assert_eq!(got["specialist"]["behaviorPrompt"], "User body.");
+    assert_eq!(
+        got["specialist"]["bundled"], expected,
+        "specialist.get carries the base definition's content as `bundled`"
+    );
+
+    let list = wss_rpc(&mut ws, 3, "specialist.list", json!({})).await;
+    let specs = list["specialists"].as_array().expect("specialists array");
+    let row = |id: &str| {
+        specs
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap_or_else(|| panic!("{id} listed"))
+    };
+    assert_eq!(
+        row("zeta")["bundled"],
+        expected,
+        "specialist.list carries the same baseline"
+    );
+    assert!(
+        row("kappa").get("bundled").is_none(),
+        "a base-tier row carries no baseline"
+    );
+    assert!(
+        row("solo").get("bundled").is_none(),
+        "a user specialist with no base definition carries no baseline"
+    );
+
+    drop(daemon);
+}
+
 /// Like [`wss_rpc`] but returns the full response envelope so callers can
 /// assert JSON-RPC error codes (PROTOCOL §9).
 async fn wss_rpc_raw<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
