@@ -28,7 +28,9 @@
 //!   uncommitted changes, a commit on `HEAD` or any local branch that no
 //!   remote ref reaches (a merged PR covering `HEAD` lifts the commits `HEAD`
 //!   reaches), a stash, or a linked worktree outside the folder — in every
-//!   repository the folder holds, nested and unregistered ones included.
+//!   repository the folder holds, nested and unregistered ones included —
+//!   and on any remote agent in the workspace (its machine pushes work refs
+//!   into the folder).
 //!
 //! Under every rule a relevant root that could not be evaluated, or a row
 //! missing a field the rule needs, blocks, so the sweep retries on its next
@@ -52,6 +54,10 @@ pub(crate) enum LocalWorkRule {
     /// remote blocks, in every repository of the folder.
     PurgeStandalone,
 }
+
+/// The [`LocalWorkRule::PurgeStandalone`] blocker for a workspace with remote
+/// agents, whose machines push work refs into the folder.
+const REMOTE_AGENTS: &str = "remote agents that push into the folder";
 
 /// The blocker reported for unpushed commits under [`LocalWorkRule::Archive`].
 const UNPUSHED_COMMITS: &str = "unpushed commits";
@@ -207,6 +213,30 @@ impl Services {
         let Some(checkout) = crate::git_ops::worktree_path(ws) else {
             return Some("local changes could not be evaluated");
         };
+        // A remote agent pushes its work refs into the workspace's own
+        // repository — for a standalone checkout, this folder — and its
+        // machine may still push a last time.
+        let agents = match self.store.list_agent_session_summaries(&ws.id).await {
+            Ok(sessions) => sessions
+                .into_iter()
+                .map(|s| s.id.clone())
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::warn!(workspace = %ws.id, error = %e, "purge: agent lookup failed; kept");
+                return Some("local changes could not be evaluated");
+            }
+        };
+        match self.store.get_remote_agents(&agents).await {
+            Ok(remote) if remote.is_empty() => {}
+            Ok(_) => {
+                tracing::info!(workspace = %ws.id, "purge: remote agents push into the workspace folder; kept");
+                return Some(REMOTE_AGENTS);
+            }
+            Err(e) => {
+                tracing::warn!(workspace = %ws.id, error = %e, "purge: remote agent lookup failed; kept");
+                return Some("local changes could not be evaluated");
+            }
+        }
         let scan_root = checkout
             .parent()
             .filter(|p| p.file_name() == Some(std::ffi::OsStr::new(ws.id.as_str())))

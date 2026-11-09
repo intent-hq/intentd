@@ -13,19 +13,23 @@
 //!   A submodule entry is not itself a change: the submodule's own checkout
 //!   is evaluated as a repository of its own, and a staged gitlink must name
 //!   a commit some remote ref reaches;
-//! - a commit reachable from `HEAD` or any local branch but from no
+//! - a commit reachable from `HEAD` or any local ref — branches, tags,
+//!   notes, a remote agent's `refs/intent/...` work refs — but from no
 //!   `refs/remotes/*` ref ([`StandaloneWorkKind::Unpushed`]). A merged PR
 //!   head covering `HEAD` ([`crate::head_reached_by`]) lifts the commits
-//!   `HEAD` reaches, never those only another branch reaches;
+//!   `HEAD` reaches, never those only another ref reaches;
 //! - a stash ([`StandaloneWorkKind::Stash`]);
 //! - a linked worktree registered in a repository of the folder that lives
 //!   outside it ([`StandaloneWorkKind::ExternalWorktree`]): removing the
 //!   repository would orphan it.
 //!
-//! The walk never follows symlinks and skips `.git` directories,
-//! `node_modules` and cache directories tagged with `CACHEDIR.TAG` (build
-//! output such as Cargo's `target/`). Anything it cannot read or evaluate is
-//! an error, which the caller treats as blocking.
+//! The walk never follows symlinks and skips `.git` directories (a
+//! repository's `.git/modules/*` submodule repositories, deinitialized ones
+//! included, are evaluated for stashes and unpushed commits), `node_modules`
+//! and cache directories tagged with `CACHEDIR.TAG` (build output such as
+//! Cargo's `target/`). Ignored files are not changes: they are lost with the
+//! folder, as with any purge. Anything it cannot read or evaluate is an
+//! error, which the caller treats as blocking.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -175,6 +179,59 @@ fn evaluate_repo(
     if has_external_worktree(&repo, root)? {
         return found(StandaloneWorkKind::ExternalWorktree);
     }
+    let modules = repo.commondir().join("modules");
+    if !bare
+        && modules.is_dir()
+        && std::fs::canonicalize(&modules).is_ok_and(|m| m.starts_with(root))
+    {
+        return evaluate_module_gitdirs(&modules, merged_heads);
+    }
+    Ok(None)
+}
+
+/// Submodule repositories under a `.git/modules` directory (a name such as
+/// `packages/sub` is a directory of directories; a submodule's own
+/// submodules sit in its `modules/`): stashes and unpushed commits block,
+/// whether or not the submodule is checked out.
+fn evaluate_module_gitdirs(dir: &Path, merged_heads: &[String]) -> Result<Option<StandaloneWork>> {
+    for entry in std::fs::read_dir(dir).map_err(|e| io_err(dir, &e))? {
+        let entry = entry.map_err(|e| io_err(dir, &e))?;
+        if !entry
+            .file_type()
+            .map_err(|e| io_err(&entry.path(), &e))?
+            .is_dir()
+        {
+            continue;
+        }
+        let path = entry.path();
+        let gitdir = path.join("HEAD").is_file()
+            && path.join("objects").is_dir()
+            && path.join("refs").is_dir();
+        if !gitdir {
+            if let Some(work) = evaluate_module_gitdirs(&path, merged_heads)? {
+                return Ok(Some(work));
+            }
+            continue;
+        }
+        let repo = Repository::open(&path)
+            .map_err(|e| Error::Internal(format!("{}: {}", path.display(), e.message())))?;
+        let kind = if repo.find_reference("refs/stash").is_ok() {
+            Some(StandaloneWorkKind::Stash)
+        } else if has_unpushed(&repo, &path, merged_heads)? {
+            Some(StandaloneWorkKind::Unpushed)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            return Ok(Some(StandaloneWork { kind, repo: path }));
+        }
+        let nested = path.join("modules");
+        if nested.is_dir() {
+            if let Some(work) = evaluate_module_gitdirs(&nested, merged_heads)? {
+                return Ok(Some(work));
+            }
+        }
+    }
     Ok(None)
 }
 
@@ -239,9 +296,11 @@ fn gitlink_is_safe(repo: &Repository, dir: &Path, path: &str) -> Result<bool> {
     }
 }
 
-/// Commits reachable from `HEAD` or a local branch that no remote ref
+/// Commits reachable from `HEAD` or a local ref (anything outside
+/// `refs/remotes/`; the stash is checked on its own) that no remote ref
 /// reaches; a merged PR head covering `HEAD` lifts the commits `HEAD`
-/// reaches.
+/// reaches. A branch that does not resolve to a commit is an error; a tag
+/// or other ref on a non-commit object holds no commits and is skipped.
 fn has_unpushed(repo: &Repository, dir: &Path, merged_heads: &[String]) -> Result<bool> {
     let head = repo
         .head()
@@ -249,10 +308,17 @@ fn has_unpushed(repo: &Repository, dir: &Path, merged_heads: &[String]) -> Resul
         .and_then(|h| h.peel_to_commit().ok())
         .map(|c| c.id());
     let mut tips: Vec<Oid> = head.into_iter().collect();
-    for reference in repo.references_glob("refs/heads/*").map_err(map_git_err)? {
+    for reference in repo.references().map_err(map_git_err)? {
         let reference = reference.map_err(map_git_err)?;
-        let commit = reference.peel_to_commit().map_err(map_git_err)?;
-        tips.push(commit.id());
+        let name = reference.name().map_err(map_git_err)?;
+        if name.starts_with("refs/remotes/") || name == "refs/stash" {
+            continue;
+        }
+        match reference.peel_to_commit() {
+            Ok(commit) => tips.push(commit.id()),
+            Err(e) if name.starts_with("refs/heads/") => return Err(map_git_err(e)),
+            Err(_) => {}
+        }
     }
     if count_unreached(repo, &tips, &[])? == 0 {
         return Ok(false);
@@ -535,6 +601,62 @@ mod tests {
         git(&sub, &["reset", "-q", "--hard", "origin/main"]);
         std::fs::write(sub.join("a.txt"), "dirty").unwrap();
         assert_eq!(kind(&l), Some(StandaloneWorkKind::Uncommitted));
+    }
+
+    /// Every local ref counts, not only branches: a remote agent's
+    /// `refs/intent/...` work ref, or a tag, on a commit no remote has.
+    #[test]
+    fn a_commit_only_a_non_branch_ref_reaches_blocks() {
+        let l = layout("standalone-intent-ref");
+        for name in ["refs/intent/ws/ws-1/agents/a/head", "refs/tags/v-local"] {
+            let work = commit(&l.repo, "agent.txt");
+            git(&l.repo, &["update-ref", name, &work]);
+            git(&l.repo, &["reset", "-q", "--hard", "origin/main"]);
+            assert_eq!(kind(&l), Some(StandaloneWorkKind::Unpushed), "{name}");
+            git(&l.repo, &["update-ref", "-d", name]);
+            assert_eq!(scan(&l), None, "{name} removed");
+        }
+    }
+
+    /// A deinitialized submodule keeps its repository in `.git/modules`:
+    /// its unpushed commits block.
+    #[test]
+    fn a_deinitialized_submodule_with_unpushed_commits_blocks() {
+        allow_file_submodules();
+        let l = layout("standalone-deinit");
+        let sub_src = l.tmp.path().join("sub-src");
+        std::fs::create_dir_all(&sub_src).unwrap();
+        git(&sub_src, &["init", "-q", "-b", "main"]);
+        commit(&sub_src, "a.txt");
+        git(
+            l.tmp.path(),
+            &["clone", "-q", "--bare", "sub-src", "sub.git"],
+        );
+        let sub_url = l.tmp.path().join("sub.git");
+        git(
+            &l.repo,
+            &[
+                "submodule",
+                "add",
+                "-q",
+                sub_url.to_str().unwrap(),
+                "libs/sub",
+            ],
+        );
+        git(&l.repo, &["commit", "-q", "-m", "add sub"]);
+        git(&l.repo, &["push", "-q", "origin", "HEAD"]);
+        git(&l.repo, &["submodule", "deinit", "-q", "-f", "libs/sub"]);
+        assert_eq!(scan(&l), None, "a pushed deinitialized submodule");
+        git(
+            &l.repo,
+            &["submodule", "update", "-q", "--init", "libs/sub"],
+        );
+        let sub = l.repo.join("libs/sub");
+        git(&sub, &["checkout", "-q", "main"]);
+        commit(&sub, "local.txt");
+        git(&l.repo, &["submodule", "deinit", "-q", "-f", "libs/sub"]);
+        assert!(!sub.join(".git").exists(), "the checkout is gone");
+        assert_eq!(kind(&l), Some(StandaloneWorkKind::Unpushed));
     }
 
     #[test]

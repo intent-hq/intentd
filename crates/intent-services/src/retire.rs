@@ -207,14 +207,6 @@ impl Services {
             retire_supported(&fresh)?;
             self.require_owned_worktree(&fresh)?;
             self.refuse_checkout_in_plain_folder(&fresh).await?;
-            // Re-checked under the fence, right before anything is torn
-            // down: a standalone checkout's branches exist only here.
-            if self
-                .refuse_standalone_work(&fresh, archived_before.is_some())
-                .await?
-            {
-                return Ok(None);
-            }
         }
         // Stop every running script and refuse new launches until the folder
         // is gone, so nothing writes into the checkout being removed. After
@@ -235,6 +227,22 @@ impl Services {
                  retire aborted, the workspace stays archived",
                 scripts_closed.unsettled()
             )));
+        }
+        // A standalone checkout's branches exist only in its folder: the work
+        // gate is re-run here, under the fence, once the writers that can
+        // still commit into an archived workspace are stopped (scripts above,
+        // terminals here), and before the flip. A refusal leaves the
+        // workspace archived; dropping the guard reopens script launches.
+        if !fresh.is_retired() && is_standalone_checkout(&fresh) {
+            for terminal in self.pty.list_scope(id.as_str()) {
+                self.pty.kill(terminal).await;
+            }
+            if self
+                .refuse_standalone_work(&fresh, archived_before.is_some())
+                .await?
+            {
+                return Ok(None);
+            }
         }
         let retired_at = now_iso();
         let ws = {
@@ -290,6 +298,8 @@ impl Services {
             // Remote agents get final stops, recorded before the checkout
             // goes: their machines push to the workspace's repository, which
             // retire keeps, then remove their checkouts.
+            // A standalone checkout IS that repository, so it never retires
+            // while it has remote agents (`refuse_standalone_work`).
             self.feature_remote_launch_port()
                 .final_stop(
                     self,
@@ -576,8 +586,8 @@ impl Services {
             None => Ok(false),
             Some(_) if auto => Ok(true),
             Some(reason) => Err(Error::InvalidInput(format!(
-                "workspace {} cannot be retired: its folder is its own repository and holds {reason} \
-                 that no remote has; push or discard them first",
+                "workspace {} cannot be retired: its folder is its own repository and still \
+                 holds work no remote has ({reason}); push or discard it first",
                 ws.id
             ))),
         }
@@ -631,12 +641,23 @@ impl Services {
                             "workspace {name} cannot be revived: the repository cache has no origin"
                         ))
                     })?;
-                    let desired = if previous.is_empty() {
-                        "revived".to_string()
+                    // The old branch is on the remote (the purge required
+                    // it) but not necessarily in the cache: never reuse its
+                    // name, start at `<previous>-2`.
+                    let branch = if previous.is_empty() {
+                        intent_git::branches::ensure_unique_branch_name(&cache, "revived")?
                     } else {
-                        previous
+                        let mut n = 2u32;
+                        loop {
+                            let candidate = format!("{previous}-{n}");
+                            if intent_git::branches::ensure_unique_branch_name(&cache, &candidate)?
+                                == candidate
+                            {
+                                break candidate;
+                            }
+                            n += 1;
+                        }
                     };
-                    let branch = intent_git::branches::ensure_unique_branch_name(&cache, &desired)?;
                     let sha = intent_git::repo_cache::provision_direct_checkout_with_progress(
                         &cache,
                         &wt,

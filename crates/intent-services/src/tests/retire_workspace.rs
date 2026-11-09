@@ -2017,7 +2017,11 @@ async fn revive_reclones_a_standalone_checkout_from_the_repo_cache() {
         .await
         .expect("revive");
     assert_eq!(revived.status, WorkspaceStatus::Active);
-    assert_ne!(revived.branch, s.ws.branch, "revive uses a new branch");
+    assert_eq!(
+        revived.branch,
+        format!("{}-2", s.ws.branch),
+        "never the old branch name, which the remote still holds"
+    );
     assert_eq!(revived.worktree_path, s.ws.worktree_path);
     assert!(s.folder.join("README.md").is_file(), "fresh checkout");
     assert!(
@@ -2030,4 +2034,95 @@ async fn revive_reclones_a_standalone_checkout_from_the_repo_cache() {
         origin.to_string_lossy(),
         "origin is the cache's upstream, never the cache"
     );
+}
+
+/// A remote agent pushes its work refs into the workspace's own repository,
+/// which for a standalone checkout is the folder: while the workspace has a
+/// remote agent, neither the purge nor a manual retire removes it.
+#[intent_test_macros::daemon_test]
+async fn a_standalone_checkout_with_a_remote_agent_is_kept() {
+    use intent_core::nodes::{
+        LeaseOwner, LeaseState, NodeArch, NodeCapacity, NodeCounter, NodeKind, NodeLease, NodeOs,
+        NodeRecord, NodeState,
+    };
+    let f = fixture().await;
+    let s = insert_standalone(
+        &f,
+        "ws-direct-remote-agent",
+        intent_core::CheckoutMode::Direct,
+        false,
+    )
+    .await;
+    let agent = intent_core::AgentId::from("agent-remote");
+    f.store
+        .insert_agent_session(&crate::test_support::fixtures::session(&agent, &s.ws.id))
+        .await
+        .expect("session");
+    let node = NodeRecord {
+        id: "node-test".into(),
+        head_id: "head-test".into(),
+        node_identity: "identity-test".into(),
+        name: "Build host".into(),
+        kind: NodeKind::Static,
+        os: NodeOs::Linux,
+        arch: NodeArch::X86_64,
+        state: NodeState::Ready,
+        draining: false,
+        capacity: NodeCapacity {
+            max_agents: 4,
+            reserved_agents: 0,
+            memory_budget_bytes: 1 << 30,
+            used_memory_bytes: 0,
+            exclusive_reserved: false,
+        },
+        version: "test".into(),
+        endpoint: Some("wss://node.example:443/node".into()),
+        certificate_sha256: Some("a".repeat(64)),
+        last_seen_at: None,
+    };
+    let lease = NodeLease {
+        owner: LeaseOwner {
+            head_id: node.head_id.clone(),
+            node_id: node.id.clone(),
+            node_identity: node.node_identity.clone(),
+            lease_id: "lease-test".into(),
+            incarnation: uuid::Uuid::new_v4().to_string(),
+        },
+        state: LeaseState::Acquiring,
+        created_at: crate::now_iso(),
+        last_seen_at: None,
+        ack_seq: NodeCounter(0),
+        link_generation: NodeCounter(0),
+        release_requested: false,
+        fence: None,
+    };
+    f.store
+        .enroll_node(&node, &lease)
+        .await
+        .expect("enroll node");
+    f.store
+        .record_remote_agent(&intent_core::remote_launch::RemoteAgentRecord {
+            agent_id: agent.clone(),
+            workspace_id: s.ws.id.clone(),
+            node_id: node.id.clone(),
+            lease_id: lease.owner.lease_id.clone(),
+            created_at: crate::now_iso(),
+        })
+        .await
+        .expect("record remote agent");
+
+    let report = purge_sweep(&f).await;
+    assert_eq!(
+        (report.retired, report.skipped_local_work),
+        (0, 1),
+        "{report:?}"
+    );
+    let err = f
+        .svc
+        .retire_workspace(s.ws.id.clone(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+    assert!(s.folder.join("README.md").is_file(), "folder kept");
+    assert!(!f.store.get_workspace(&s.ws.id).await.unwrap().is_retired());
 }
