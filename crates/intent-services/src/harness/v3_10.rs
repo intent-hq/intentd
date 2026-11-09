@@ -14,6 +14,7 @@ static DOCTRINE: Doctrine = Doctrine {
 static CONTEXT: ContextSurfaces = ContextSurfaces {
     workspace_api: &intent_acp::WORKSPACE_API_DOCS_V3_10,
     repo_rules,
+    repo_rules_reads_executor: true,
     skills_block,
     placement_help,
 };
@@ -27,9 +28,10 @@ pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
     feature_labels: super::v1::FEATURE_LABELS,
 };
 
-/// Repo-rule injection: which rule files the provider already loads.
-fn repo_rules(inputs: &RepoRulesInputs<'_>) -> Option<(String, String)> {
-    crate::rules::workspace_rules_v1(inputs)
+/// Repo-rule injection: skip the picked rule file when the provider
+/// running the agent loads it by itself.
+fn repo_rules(inputs: &RepoRulesInputs<'_>) -> crate::rules::RepoRules {
+    crate::rules::workspace_rules_native_aware(inputs)
 }
 
 /// The skills block: budget and hidden skills.
@@ -109,6 +111,7 @@ mod tests {
         );
         let rules = super::RepoRulesInputs {
             workspace_path: dir.path(),
+            executor: None,
         };
         assert_eq!((current.repo_rules)(&rules), (previous.repo_rules)(&rules));
         let skills = [crate::skills::SkillMetadata {

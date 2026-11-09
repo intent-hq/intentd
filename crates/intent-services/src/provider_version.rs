@@ -89,7 +89,7 @@ fn cache() -> &'static Mutex<HashMap<PathBuf, Cached>> {
 
 /// `--version` of `path`, cached until the binary changes. A failure is
 /// cached for [`FAILURE_TTL`] only, so a transient timeout recovers.
-fn cached_version(path: &Path) -> Option<String> {
+pub(crate) fn cached_version(path: &Path) -> Option<String> {
     cached_version_with(path, FAILURE_TTL)
 }
 

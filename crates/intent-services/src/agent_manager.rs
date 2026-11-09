@@ -3929,7 +3929,17 @@ impl AgentManager {
             // its "Workspace API Reference" pointer dangling (ws.help() as
             // the only fallback).
             let workspace_api_docs = server.workspace_api_prompt_reference();
-            if let Some(prompt) = crate::rules::assemble_system_prompt(
+            // Harness 3.10+ skips rule files the provider loads by itself,
+            // which depends on the CLI this spawn will run.
+            let rule_executor = if crate::harness::resolve_entry(&session.harness_version)
+                .context
+                .repo_rules_reads_executor
+            {
+                crate::native_rules::local_executor(opts.provider.id, opts.profile_env, &cwd).await
+            } else {
+                None
+            };
+            if let Some(prompt) = crate::rules::assemble_agent_system_prompt(
                 &self.services.store,
                 Some(&cwd),
                 agent_type,
@@ -3941,6 +3951,7 @@ impl AgentManager {
                 workspace.as_ref(),
                 Some(&session),
                 workspace_api_docs.as_deref(),
+                rule_executor.as_ref(),
             )
             .await
             {

@@ -512,10 +512,11 @@ pub(crate) struct Doctrine {
     pub specialists: &'static [(&'static str, &'static str)],
 }
 
-/// What the repo-rule policy decides from. Later versions add the provider
-/// and its CLI version here.
+/// What the repo-rule policy decides from.
 pub(crate) struct RepoRulesInputs<'a> {
     pub workspace_path: &'a std::path::Path,
+    /// What runs the agent; `None` when unknown (previews, goldens).
+    pub executor: Option<&'a crate::native_rules::RuleExecutor>,
 }
 
 /// What the skills block is built from.
@@ -530,9 +531,12 @@ pub(crate) struct ContextSurfaces {
     /// The `workspace_api` tool description, the system-prompt reference
     /// and the section around it.
     pub workspace_api: &'static dyn intent_acp::WorkspaceApiDocs,
-    /// The workspace rule text injected as user rules, with its source;
-    /// `None` injects none.
-    pub repo_rules: fn(&RepoRulesInputs<'_>) -> Option<(String, String)>,
+    /// The workspace rule text injected as user rules, with its source,
+    /// and how the agent gets each rule file.
+    pub repo_rules: fn(&RepoRulesInputs<'_>) -> crate::rules::RepoRules,
+    /// Whether `repo_rules` reads [`RepoRulesInputs::executor`]; when not,
+    /// a spawn does not probe the provider CLI for it.
+    pub repo_rules_reads_executor: bool,
     /// The `<available_skills>` block; empty adds no layer.
     pub skills_block: fn(&SkillsBlockInputs<'_>) -> String,
     /// The remote-placement text in the `ws.agent` docs.
@@ -543,6 +547,7 @@ pub(crate) struct ContextSurfaces {
 pub(crate) static CONTEXT_V1: ContextSurfaces = ContextSurfaces {
     workspace_api: &intent_acp::WORKSPACE_API_DOCS_V1,
     repo_rules: crate::rules::workspace_rules_v1,
+    repo_rules_reads_executor: false,
     skills_block: skills_block_v1,
     placement_help: intent_core::machine_selection::exposed_machines_help,
 };

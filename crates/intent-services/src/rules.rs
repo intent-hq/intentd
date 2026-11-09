@@ -152,58 +152,173 @@ fn list_workspace_rule_files(workspace_path: &Path) -> Vec<WorkspaceRuleFile> {
     out
 }
 
-/// Resolve the single live workspace rule source for prompt injection — the
-/// first match in `rules-loader.ts` precedence (custom `--rules` path then
-/// `CLAUDE.md` / `AGENTS.md` / `.intent/guidelines.md` / `.augment/guidelines.md`),
-/// else every `.md` under `.intent/rules/` and `.augment/rules/` joined.
-/// Returns `(content, source)` or `None`.
-fn load_workspace_rules(
-    workspace_path: &Path,
-    custom_rules_path: Option<&Path>,
-) -> Option<(String, String)> {
-    if let Some(custom) = custom_rules_path {
-        if let Ok(content) = std::fs::read_to_string(custom) {
-            return Some((content, custom.to_string_lossy().into_owned()));
+/// The repo rules a harness gives an agent: the text injected as user
+/// rules, and what happens to each workspace rule file (for the prompt
+/// breakdown).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RepoRules {
+    /// The injected text and its source; `None` injects none.
+    pub injected: Option<(String, String)>,
+    /// Every workspace rule file found, in precedence order.
+    pub files: Vec<RepoRuleFile>,
+}
+
+/// One workspace rule file and how the agent gets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoRuleFile {
+    /// Path relative to the workspace, e.g. `AGENTS.md`.
+    pub source: String,
+    /// File size in bytes.
+    pub bytes: usize,
+    pub loading: RuleLoading,
+}
+
+/// How an agent gets a workspace rule file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuleLoading {
+    /// Intent injects it into the system prompt.
+    Injected,
+    /// The provider loads it by itself (its display name), so Intent does
+    /// not inject it.
+    LoadedNatively(&'static str),
+    /// A lower-precedence file: neither Intent nor the provider loads it.
+    NotLoaded,
+}
+
+impl RuleLoading {
+    /// The breakdown wording, e.g. "loaded natively by Claude Code".
+    #[must_use]
+    pub(crate) fn describe(self) -> String {
+        match self {
+            Self::Injected => "injected".to_owned(),
+            Self::LoadedNatively(provider) => format!("loaded natively by {provider}"),
+            Self::NotLoaded => "not loaded".to_owned(),
         }
     }
-    let files = list_workspace_rule_files(workspace_path);
-    // First single-file match (CLAUDE.md/AGENTS.md/.intent or .augment guidelines) wins.
-    for f in &files {
-        if !f.source.starts_with(".intent/rules/") && !f.source.starts_with(".augment/rules/") {
-            return Some((f.content.clone(), f.path.clone()));
-        }
+}
+
+/// Which rule files the `rules-loader.ts` precedence picks: the first
+/// single file (`CLAUDE.md` / `AGENTS.md` / `.intent` or `.augment`
+/// guidelines), else every `.md` under `.intent/rules/` and
+/// `.augment/rules/`.
+enum RuleSelection {
+    Single(usize),
+    Joined(Vec<usize>),
+    None,
+}
+
+fn is_rules_dir_file(f: &WorkspaceRuleFile) -> bool {
+    f.source.starts_with(".intent/rules/") || f.source.starts_with(".augment/rules/")
+}
+
+fn select_rule_files(files: &[WorkspaceRuleFile]) -> RuleSelection {
+    if let Some(i) = files.iter().position(|f| !is_rules_dir_file(f)) {
+        return RuleSelection::Single(i);
     }
-    // Otherwise concatenate every `.intent/rules/*.md` and `.augment/rules/*.md` body.
-    let parts: Vec<String> = files
-        .iter()
-        .filter(|f| {
-            f.source.starts_with(".intent/rules/") || f.source.starts_with(".augment/rules/")
-        })
-        .map(|f| strip_frontmatter(&f.content).to_string())
-        .collect();
-    if parts.is_empty() {
-        None
+    let joined: Vec<usize> = (0..files.len()).filter(|&i| is_rules_dir_file(&files[i])).collect();
+    if joined.is_empty() {
+        RuleSelection::None
     } else {
-        // Report the dir that actually contributed content; prefer .intent/rules
-        // when both tiers contributed.
-        let dir = if files.iter().any(|f| f.source.starts_with(".intent/rules/")) {
-            workspace_path.join(".intent").join("rules")
-        } else {
-            workspace_path.join(".augment").join("rules")
-        };
-        Some((
-            parts.join("\n\n---\n\n"),
-            dir.to_string_lossy().into_owned(),
-        ))
+        RuleSelection::Joined(joined)
+    }
+}
+
+/// The injected `(content, source)` for `selection`.
+fn render_rule_selection(
+    workspace_path: &Path,
+    files: &[WorkspaceRuleFile],
+    selection: &RuleSelection,
+) -> Option<(String, String)> {
+    match selection {
+        RuleSelection::Single(i) => Some((files[*i].content.clone(), files[*i].path.clone())),
+        RuleSelection::Joined(indices) => {
+            let parts: Vec<String> = indices
+                .iter()
+                .map(|&i| strip_frontmatter(&files[i].content).to_string())
+                .collect();
+            // Report the dir that actually contributed content; prefer .intent/rules
+            // when both tiers contributed.
+            let dir = if files.iter().any(|f| f.source.starts_with(".intent/rules/")) {
+                workspace_path.join(".intent").join("rules")
+            } else {
+                workspace_path.join(".augment").join("rules")
+            };
+            Some((
+                parts.join("\n\n---\n\n"),
+                dir.to_string_lossy().into_owned(),
+            ))
+        }
+        RuleSelection::None => None,
+    }
+}
+
+fn is_selected(selection: &RuleSelection, i: usize) -> bool {
+    match selection {
+        RuleSelection::Single(s) => *s == i,
+        RuleSelection::Joined(indices) => indices.contains(&i),
+        RuleSelection::None => false,
     }
 }
 
 /// The repo-rule policy of harness 1.0 through 3.9: the first live rule
 /// source, injected whatever the provider loads itself.
-pub(crate) fn workspace_rules_v1(
+pub(crate) fn workspace_rules_v1(inputs: &crate::harness::RepoRulesInputs<'_>) -> RepoRules {
+    let files = list_workspace_rule_files(inputs.workspace_path);
+    let selection = select_rule_files(&files);
+    RepoRules {
+        injected: render_rule_selection(inputs.workspace_path, &files, &selection),
+        files: files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| RepoRuleFile {
+                source: f.source.clone(),
+                bytes: f.content.len(),
+                loading: if is_selected(&selection, i) {
+                    RuleLoading::Injected
+                } else {
+                    RuleLoading::NotLoaded
+                },
+            })
+            .collect(),
+    }
+}
+
+/// The repo-rule policy of harness 3.10: [`workspace_rules_v1`]'s pick,
+/// except that a picked file the executing provider loads by itself
+/// ([`crate::native_rules::native_loader`]) is not injected. Skipping it
+/// does not promote the next file: that one was not injected before either.
+pub(crate) fn workspace_rules_native_aware(
     inputs: &crate::harness::RepoRulesInputs<'_>,
-) -> Option<(String, String)> {
-    load_workspace_rules(inputs.workspace_path, None)
+) -> RepoRules {
+    let path = inputs.workspace_path;
+    let files = list_workspace_rule_files(path);
+    let selection = select_rule_files(&files);
+    let native: Vec<Option<&'static str>> = files
+        .iter()
+        .map(|f| crate::native_rules::native_loader(&f.source, path, inputs.executor))
+        .collect();
+    let injected = match selection {
+        RuleSelection::Single(i) if native[i].is_some() => None,
+        _ => render_rule_selection(path, &files, &selection),
+    };
+    RepoRules {
+        files: files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| RepoRuleFile {
+                source: f.source.clone(),
+                bytes: f.content.len(),
+                loading: match native[i] {
+                    Some(provider) => RuleLoading::LoadedNatively(provider),
+                    None if injected.is_some() && is_selected(&selection, i) => {
+                        RuleLoading::Injected
+                    }
+                    None => RuleLoading::NotLoaded,
+                },
+            })
+            .collect(),
+        injected,
+    }
 }
 
 /// Read the `endUserRules` overrides map (`{ ruleType: { enabled, content,
@@ -448,13 +563,51 @@ pub(crate) async fn assemble_system_prompt(
         agent_session,
         workspace_api_docs,
         true,
+        None,
+    )
+    .await
+}
+
+/// [`assemble_system_prompt`] for a local agent spawn: `rule_executor` says
+/// what runs the agent, so the session's harness can skip rule files the
+/// provider loads by itself ([`crate::native_rules`]).
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn assemble_agent_system_prompt(
+    store: &Store,
+    workspace_path: Option<&Path>,
+    agent_type: &str,
+    specialist: Option<&SpecialistPromptInjection>,
+    is_sub_agent: bool,
+    auto_commit_enabled: bool,
+    rtk_enabled: bool,
+    agent_features: &intent_core::settings_file::AgentFeaturesSettings,
+    workspace: Option<&intent_core::Workspace>,
+    agent_session: Option<&intent_core::AgentSession>,
+    workspace_api_docs: Option<&str>,
+    rule_executor: Option<&crate::native_rules::RuleExecutor>,
+) -> Option<String> {
+    assemble_system_prompt_layers(
+        store,
+        workspace_path,
+        agent_type,
+        specialist,
+        is_sub_agent,
+        auto_commit_enabled,
+        rtk_enabled,
+        agent_features,
+        workspace,
+        agent_session,
+        workspace_api_docs,
+        true,
+        rule_executor,
     )
     .await
 }
 
 /// [`assemble_system_prompt`] for an agent that runs on another machine:
 /// the same layers without the skills catalog, whose paths are on this
-/// host and cannot be read there.
+/// host and cannot be read there. The machine reports no CLI version, so
+/// every rule file stays injected ([`crate::native_rules::RuleExecutor::remote`]).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn assemble_remote_system_prompt(
     store: &Store,
@@ -469,6 +622,9 @@ pub(crate) async fn assemble_remote_system_prompt(
     agent_session: Option<&intent_core::AgentSession>,
     workspace_api_docs: Option<&str>,
 ) -> Option<String> {
+    let remote = agent_session
+        .and_then(|s| s.provider.as_deref())
+        .map(|p| crate::native_rules::RuleExecutor::remote(intent_providers::base_provider_id(p)));
     assemble_system_prompt_layers(
         store,
         workspace_path,
@@ -482,6 +638,7 @@ pub(crate) async fn assemble_remote_system_prompt(
         agent_session,
         workspace_api_docs,
         false,
+        remote.as_ref(),
     )
     .await
 }
@@ -500,6 +657,7 @@ async fn assemble_system_prompt_layers(
     agent_session: Option<&intent_core::AgentSession>,
     workspace_api_docs: Option<&str>,
     skills_catalog: bool,
+    rule_executor: Option<&crate::native_rules::RuleExecutor>,
 ) -> Option<String> {
     // The session's pinned harness + doctrine (H2): a stamped session keeps
     // assembling the exact version it was created with; session-less calls
@@ -542,8 +700,9 @@ async fn assemble_system_prompt_layers(
         if let Some(path) = workspace_path {
             let rules = crate::harness::RepoRulesInputs {
                 workspace_path: path,
+                executor: rule_executor,
             };
-            if let Some((content, source)) = (entry.context.repo_rules)(&rules) {
+            if let Some((content, source)) = (entry.context.repo_rules)(&rules).injected {
                 if !content.trim().is_empty() {
                     parts.push(harness.user_rules_wrapper(&content, &source));
                 }
@@ -1703,5 +1862,214 @@ This is a test skill.
             leaks.len(),
             leaks.join("\n")
         );
+    }
+
+    /// Native repo-rule dedupe (harness 3.10): what the assembled prompt of
+    /// a session on `version`, run by `executor`, carries from the
+    /// workspace rule files.
+    mod native_repo_rules {
+        use super::*;
+        use crate::native_rules::RuleExecutor;
+
+        const AGENTS: &str = "AGENTS-RULE-TEXT: run make gate before a PR.";
+        const CLAUDE: &str = "CLAUDE-RULE-TEXT: prefer small commits.";
+
+        fn session_on(version: &str, provider: &str) -> intent_core::AgentSession {
+            intent_core::AgentSession {
+            harness_version: version.to_owned(),
+            harness_features: None,
+            id: intent_core::AgentId::from("agent-skip"),
+            workspace_id: intent_core::WorkspaceId::from("ws-skip"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Skip Agent".into(),
+            name_explicitly_set: false,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: Some(provider.to_owned()),
+            system_prompt: None,
+            specialist: None,
+            status: intent_core::AgentStatus::Active,
+            is_active: false,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            retired_at: None,
+            notifications_muted: false,
+            pinned: false,
+            is_background: false,
+            metadata: None,
+            created_at: intent_core::now_iso(),
+            updated_at: intent_core::now_iso(),
+            }
+        }
+
+        fn claude(version: Option<&str>) -> RuleExecutor {
+            RuleExecutor {
+                provider_id: "claude-code".into(),
+                cli_version: version.map(str::to_owned),
+                codex_doc_cap: None,
+            }
+        }
+
+        fn codex() -> RuleExecutor {
+            RuleExecutor {
+                provider_id: "codex".into(),
+                cli_version: None,
+                codex_doc_cap: Some(crate::native_rules::CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES),
+            }
+        }
+
+        fn repo(files: &[(&str, &str)]) -> TempDir {
+            let dir = TempDir::new().unwrap();
+            std::fs::create_dir(dir.path().join(".git")).unwrap();
+            for (name, body) in files {
+                std::fs::write(dir.path().join(name), body).unwrap();
+            }
+            dir
+        }
+
+        async fn prompt(
+            dir: &Path,
+            version: &str,
+            executor: Option<&RuleExecutor>,
+            remote: bool,
+        ) -> String {
+            let tmp_db = TempDb::new();
+            let store = Store::open(&tmp_db.path).await.unwrap();
+            let provider = executor.map_or("claude-code", |e| e.provider_id.as_str());
+            let session = session_on(version, provider);
+            let features = intent_core::settings_file::AgentFeaturesSettings::default();
+            let assembled = if remote {
+                assemble_remote_system_prompt(
+                    &store, Some(dir), "workspace", None, false, false, false, &features,
+                    None, Some(&session), None,
+                )
+                .await
+            } else {
+                assemble_agent_system_prompt(
+                    &store, Some(dir), "workspace", None, false, false, false, &features,
+                    None, Some(&session), None, executor,
+                )
+                .await
+            };
+            assembled.unwrap()
+        }
+
+        #[tokio::test]
+        async fn known_good_claude_cli_gets_a_small_agents_md_once() {
+            let dir = repo(&[("AGENTS.md", AGENTS)]);
+            let cli = claude(Some("2.1.303 (Claude Code)"));
+            let new = prompt(dir.path(), "3.10", Some(&cli), false).await;
+            assert!(!new.contains(AGENTS), "Claude Code loads it natively");
+            let old = prompt(dir.path(), "3.9", Some(&cli), false).await;
+            assert_eq!(old.matches(AGENTS).count(), 1, "3.9 keeps injecting");
+        }
+
+        #[tokio::test]
+        async fn unknown_or_old_claude_cli_keeps_the_injection() {
+            let dir = repo(&[("AGENTS.md", AGENTS)]);
+            for cli in [claude(None), claude(Some("2.1.280 (Claude Code)"))] {
+                let p = prompt(dir.path(), "3.10", Some(&cli), false).await;
+                assert_eq!(p.matches(AGENTS).count(), 1, "{cli:?}");
+            }
+            let p = prompt(dir.path(), "3.10", None, false).await;
+            assert_eq!(p.matches(AGENTS).count(), 1, "no executor");
+        }
+
+        #[tokio::test]
+        async fn remote_agents_keep_the_injection() {
+            let dir = repo(&[("AGENTS.md", AGENTS)]);
+            for provider in ["claude-code", "codex"] {
+                let exec = RuleExecutor::remote(provider);
+                let p = prompt(dir.path(), "3.10", Some(&exec), true).await;
+                assert_eq!(p.matches(AGENTS).count(), 1, "{provider}");
+            }
+        }
+
+        #[tokio::test]
+        async fn codex_injects_an_agents_md_over_its_cap() {
+            let cap = crate::native_rules::CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES;
+            let big = format!("{AGENTS}\n{}", "x".repeat(cap));
+            let small = repo(&[("AGENTS.md", AGENTS)]);
+            let large = repo(&[("AGENTS.md", &big)]);
+            assert!(!prompt(small.path(), "3.10", Some(&codex()), false).await.contains(AGENTS));
+            let p = prompt(large.path(), "3.10", Some(&codex()), false).await;
+            assert_eq!(p.matches(AGENTS).count(), 1);
+        }
+
+        #[tokio::test]
+        async fn skipping_a_file_does_not_promote_the_next() {
+            let dir = repo(&[("CLAUDE.md", CLAUDE), ("AGENTS.md", AGENTS)]);
+            let cli = claude(Some("2.1.303 (Claude Code)"));
+            let p = prompt(dir.path(), "3.10", Some(&cli), false).await;
+            assert!(!p.contains(CLAUDE) && !p.contains(AGENTS), "{p}");
+            // Codex never loads CLAUDE.md: it stays injected, and AGENTS.md
+            // (loaded by Codex) is not added.
+            let p = prompt(dir.path(), "3.10", Some(&codex()), false).await;
+            assert_eq!(p.matches(CLAUDE).count(), 1);
+            assert!(!p.contains(AGENTS));
+        }
+
+        #[test]
+        fn the_breakdown_names_each_file_and_who_loads_it() {
+            let dir = repo(&[("CLAUDE.md", CLAUDE), ("AGENTS.md", AGENTS)]);
+            let cx = codex();
+            let rules = workspace_rules_native_aware(&crate::harness::RepoRulesInputs {
+                workspace_path: dir.path(),
+                executor: Some(&cx),
+            });
+            let rows: Vec<_> = rules
+                .files
+                .iter()
+                .map(|f| (f.source.as_str(), f.bytes, f.loading.describe()))
+                .collect();
+            assert_eq!(
+                rows,
+                [
+                    ("CLAUDE.md", CLAUDE.len(), "injected".to_owned()),
+                    ("AGENTS.md", AGENTS.len(), "loaded natively by Codex".to_owned()),
+                ]
+            );
+            let cli = claude(Some("2.1.303 (Claude Code)"));
+            let rules = workspace_rules_native_aware(&crate::harness::RepoRulesInputs {
+                workspace_path: dir.path(),
+                executor: Some(&cli),
+            });
+            assert_eq!(rules.injected, None);
+            assert_eq!(
+                rules.files.iter().map(|f| f.loading).collect::<Vec<_>>(),
+                [RuleLoading::LoadedNatively("Claude Code"), RuleLoading::NotLoaded]
+            );
+        }
+
+        #[test]
+        fn without_an_executor_3_10_picks_what_3_9_picks() {
+            let dir = repo(&[("AGENTS.md", AGENTS)]);
+            std::fs::create_dir_all(dir.path().join(".intent/rules")).unwrap();
+            std::fs::write(dir.path().join(".intent/rules/a.md"), "a").unwrap();
+            let inputs = crate::harness::RepoRulesInputs {
+                workspace_path: dir.path(),
+                executor: None,
+            };
+            assert_eq!(workspace_rules_native_aware(&inputs), workspace_rules_v1(&inputs));
+        }
     }
 }
