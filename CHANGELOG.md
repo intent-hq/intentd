@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.162] - 2026-11-09
+
+### 🚀 Features
+
+- *(providers)* Report display CLI versions in provider discovery ([#3176](https://github.com/intent-hq/intentd/pull/3176))
+- *(services)* Fail quick actions over to backup profiles on quota ([#3180](https://github.com/intent-hq/intentd/pull/3180))
+- *(scripts)* Render remote agents' script wakes as script-run cards ([#3183](https://github.com/intent-hq/intentd/pull/3183))
+- *(remote)* Agents pull workspace files from each other ([#3181](https://github.com/intent-hq/intentd/pull/3181))
+- *(specialists)* Add bundled Product Manager specialist (harness 3.9) ([#3188](https://github.com/intent-hq/intentd/pull/3188))
+
+### 🐛 Bug Fixes
+
+- *(scripts)* Settle a remote agent's deferred watch when its script monitor ends silently ([#3189](https://github.com/intent-hq/intentd/pull/3189))
+- *(pr-monitor)* Stay quiet when mergeability settles back after an unknown blip ([#3179](https://github.com/intent-hq/intentd/pull/3179))
+- Bump Codex ACP fallback to v2.6.0 ([#3187](https://github.com/intent-hq/intentd/pull/3187))
+- *(retire)* Purge archived standalone (cow/direct) checkouts ([#3174](https://github.com/intent-hq/intentd/pull/3174))
+- *(settings)* Drop quick tasks from quick-action help text ([#3178](https://github.com/intent-hq/intentd/pull/3178))
+- *(scripts)* Show remote agents' script monitors with the workspace's ([#3177](https://github.com/intent-hq/intentd/pull/3177))
+- Retire per-agent CoW sandboxes (protocol 16) ([#3186](https://github.com/intent-hq/intentd/pull/3186))
+
+### 📚 Documentation
+
+- *(guide)* Agent browser tabs open beside the agent's chat ([#3184](https://github.com/intent-hq/intentd/pull/3184))
+
+
 ## [0.11.161] - 2026-11-09
 
 ### 🚀 Features
