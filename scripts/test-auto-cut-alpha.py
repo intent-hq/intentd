@@ -31,7 +31,7 @@ if a[:2] == ['pr', 'list']:
     emit([s['pr']])
 elif a[:2] == ['pr', 'view']:
     fields = a[a.index('--json') + 1].split(',')
-    emit({k: s['detail'][k] for k in fields})
+    emit({k: s.get('pr_state', 'OPEN') if k == 'state' else s['detail'][k] for k in fields})
 elif a[:2] == ['api', 'graphql']:
     query = a[a.index('-f') + 1]
     if 'viewer' in query:
@@ -596,7 +596,22 @@ path.write_text(json.dumps(s))
         self.state['close_error'] = True
         self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='0')
         self.assertEqual(self.last_decision, ('defer', 'ci-gate-missing'))
+        self.assertEqual([c['args'][1] for c in self.restart_calls()], ['close'])
         self.assertEqual(self.merge_calls(), [])
+
+    def test_close_that_failed_but_took_effect_is_reopened(self):
+        # The close reported an error yet the PR reads CLOSED: reopen it, and
+        # fail loudly when that does not work either.
+        self.no_ci_runs()
+        self.state.update(close_error=True, pr_state='CLOSED')
+        self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='0')
+        self.assertEqual([c['args'][1] for c in self.restart_calls()], ['close', 'reopen'])
+        self.assertEqual(self.last_decision, ('defer', 'ci-gate-missing'))
+        self.reset()
+        self.no_ci_runs()
+        self.state.update(close_error=True, reopen_error=True, pr_state='CLOSED')
+        self.run_workflow(expect_status=1, EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='0')
+        self.assertEqual(self.last_decision, ('error', 'ci-restart-failed'))
 
     def test_failed_reopen_fails_loudly(self):
         # A closed Release PR stalls every later run; a red run asks a human
