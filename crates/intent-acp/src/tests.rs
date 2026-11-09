@@ -14079,14 +14079,25 @@ mod wsapi4_bindings_tests {
 
     /// `ws.agent.machineModels` exists only where the backend serves
     /// `remoteMachines.models`, and maps `(nodeId?, { provider?, model? })`
-    /// (or the options object alone) onto its params.
+    /// (or the options object alone) onto its params. Through the `ws.*`
+    /// guard, an absent binding fails with an explanation instead of a
+    /// closest-match guess, and the installed one is the real binding.
     #[tokio::test]
     async fn machine_models_follows_the_capability_and_maps_its_arguments() {
         let (srv, api) = server_with_caller("caller-1");
-        let resp = call(&srv, "return typeof ws.agent.machineModels;").await;
-        assert_eq!(text(&resp), "\"undefined\"", "{resp}");
+        let resp = call(&srv, "return 'machineModels' in ws.agent;").await;
+        assert_eq!(text(&resp), "false", "{resp}");
+        let resp = call(&srv, "return await ws.agent.machineModels('m-1');").await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        assert!(
+            text(&resp).contains("this daemon does not serve remote machine model lookups"),
+            "{resp}"
+        );
+        assert!(api.machine_models_calls.lock().unwrap().is_empty());
 
         *api.machine_models.lock().unwrap() = true;
+        let resp = call(&srv, "return 'machineModels' in ws.agent;").await;
+        assert_eq!(text(&resp), "true", "{resp}");
         for code in [
             "return await ws.agent.machineModels();",
             "return await ws.agent.machineModels('m-1');",
