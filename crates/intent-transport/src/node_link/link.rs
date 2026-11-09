@@ -223,6 +223,10 @@ impl std::fmt::Debug for NodeLink {
 
 /// What the peer sent that the owner must handle.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "each event moves once through the link's channel; boxing every frame would allocate per frame"
+)]
 pub enum LinkEvent {
     /// A control or journal frame.
     Frame(LinkFrame),
