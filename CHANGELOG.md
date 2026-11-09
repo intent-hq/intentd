@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.164] - 2026-11-09
+
+### 🚀 Features
+
+- *(harness)* Stage harness 3.10 and gate spawn context on the session's version ([#3199](https://github.com/intent-hq/intentd/pull/3199))
+- *(nodes)* Sub-agents fetch GitHub through the backend; their push is refused (nodeProtocol 17) ([#3190](https://github.com/intent-hq/intentd/pull/3190))
+
+### 🔧 Refactor
+
+- *(quota)* Tie quota marks to the settings they read ([#3203](https://github.com/intent-hq/intentd/pull/3203))
+
+### 📚 Documentation
+
+- *(guide)* Describe hiding repositories on Home ([#3194](https://github.com/intent-hq/intentd/pull/3194))
+- *(guide)* Note the sidebar token total excludes cached tokens ([#3195](https://github.com/intent-hq/intentd/pull/3195))
+
+
 ## [0.11.163] - 2026-11-09
 
 ### 🚀 Features
