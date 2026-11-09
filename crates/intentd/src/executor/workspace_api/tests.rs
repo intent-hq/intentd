@@ -1276,7 +1276,7 @@ async fn proxied_user_mcp_servers_ride_session_new_and_call_head() {
         &workspace(),
         dir.path(),
         (&gates, None),
-        (head, Arc::new(|| Box::pin(async { false }))),
+        (head, Arc::new(|_| Box::pin(async { false }))),
         Path::new("/opt/intent/intentd"),
     )
     .await

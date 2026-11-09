@@ -116,7 +116,6 @@ fn in_call_push_budget(script_budget: Duration) -> Duration {
 
 /// The agent's MCP listeners: its workspace server's and one per proxied
 /// user server. They stop when this is dropped.
-
 pub(super) struct Bridges(#[expect(dead_code, reason = "held for its drop")] Vec<McpBridge>);
 
 /// Start `agent_id`'s workspace MCP server and one listener per proxied
