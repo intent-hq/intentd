@@ -369,6 +369,7 @@ mod tests {
                     None,
                     Some(session),
                     docs.as_deref(),
+                    &crate::skill_catalog::SkillEnvironment::default(),
                     None,
                 )
                 .await

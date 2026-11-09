@@ -3939,6 +3939,9 @@ impl AgentManager {
             } else {
                 None
             };
+            let skills_environment = self
+                .skill_environment(agent_type, &cwd, opts.profile_env.cloned())
+                .await;
             if let Some(mut assembled) = crate::rules::assemble_system_prompt_sections(
                 &self.services.store,
                 Some(&cwd),
@@ -3951,6 +3954,7 @@ impl AgentManager {
                 workspace.as_ref(),
                 Some(&session),
                 workspace_api_docs.as_deref(),
+                &skills_environment,
                 rule_executor.as_ref(),
             )
             .await
@@ -4388,6 +4392,43 @@ impl AgentManager {
         self.merge_user_mcp_servers(&mut servers).await?;
         let baseline = build_baseline_mcp_env_from_process();
         Ok(apply_baseline_env_to_stdio_servers(&servers, &baseline))
+    }
+
+    /// The provider and the MCP servers Intent delivers, which decide the
+    /// skills an agent's prompt lists.
+    async fn skill_environment(
+        &self,
+        agent_type: &str,
+        cwd: &std::path::Path,
+        profile_env: Option<intent_acp::ProfileEnv>,
+    ) -> crate::skill_catalog::SkillEnvironment {
+        let settings = self.services.effective_settings();
+        let configs = crate::mcp_servers::read_all_configs(
+            &self.services.secrets,
+            &crate::mcp_servers::disabled_servers(&settings),
+        )
+        .await;
+        let mut environment = crate::skill_catalog::SkillEnvironment::new(
+            agent_type,
+            Some(crate::skill_catalog::intent_mcp_servers(
+                &settings, &configs,
+            )),
+        );
+        if let Some(cli) = intent_providers::installed_cli::InstalledCli::for_provider(agent_type) {
+            if let Ok(context) =
+                crate::installed_cli::InstalledContext::discover_for(cli, profile_env.map(Arc::new))
+                    .await
+            {
+                let (config_file, cwd) = (context.mcp_config_file(), cwd.to_path_buf());
+                let provider_servers = tokio::task::spawn_blocking(move || {
+                    crate::skill_catalog::provider_mcp_servers(cli, config_file.as_deref(), &cwd)
+                })
+                .await
+                .unwrap_or_default();
+                environment.add_provider_servers(provider_servers);
+            }
+        }
+        environment
     }
 
     /// Fold user-configured MCP servers (sensitive `mcp.servers` secret) into
