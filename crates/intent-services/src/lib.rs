@@ -31028,7 +31028,25 @@ impl WorkspaceApi for Services {
             };
             self.ports
                 .remote_launch()
-                .placement_help(self, &workspace_id, entry.context.placement_help)
+                .placement_help(self, &workspace_id, entry.context.placement_reference)
+                .await
+        })
+    }
+
+    fn agent_machine_models(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&workspace_id).await?;
+            if !self.remote_machines_capability() {
+                return Err(Error::Unsupported(
+                    "ws.agent.machineModels: this daemon has no exposed machines".into(),
+                ));
+            }
+            self.feature_remote_launch_port()
+                .remote_machines(self, "models", params)
                 .await
         })
     }

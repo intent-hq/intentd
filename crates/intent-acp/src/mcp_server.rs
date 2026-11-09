@@ -113,6 +113,10 @@ pub struct WorkspaceMcpServer {
     /// at bridge creation: present only when the daemon has a configured
     /// execution node, so the default description stays byte-identical.
     remote_placement_help: Option<String>,
+    /// Whether to install `ws.agent.machineModels` when this server's API
+    /// does not itself serve `remoteMachines.models`: a remote agent's
+    /// machine forwards the call to its backend. Defaults to `false`.
+    machine_models: bool,
     /// Whether this server front-doors a sub-agent (a session with a
     /// `parent_agent_id` or `is_background`), captured once at bridge
     /// creation like `agent_features`. Sub-agents don't own a user-facing
@@ -195,6 +199,7 @@ impl WorkspaceMcpServer {
             agent_features: AgentFeaturesSettings::default(),
             specialist_model_options: Vec::new(),
             remote_placement_help: None,
+            machine_models: false,
             is_sub_agent: false,
             compact_tool_descriptions: false,
             plain_folder: false,
@@ -329,6 +334,15 @@ impl WorkspaceMcpServer {
     #[must_use]
     pub fn with_remote_placement_help(mut self, help: Option<String>) -> Self {
         self.remote_placement_help = help;
+        self
+    }
+
+    /// Install `ws.agent.machineModels` even though this server's API does
+    /// not serve `remoteMachines.models` itself (a remote agent's machine,
+    /// whose `ws.agent.*` calls its backend answers).
+    #[must_use]
+    pub fn with_machine_models(mut self, machine_models: bool) -> Self {
+        self.machine_models = machine_models;
         self
     }
 

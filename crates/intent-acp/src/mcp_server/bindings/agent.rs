@@ -243,6 +243,17 @@ pub(crate) const PRELUDE: &str = r"
     };
 ";
 
+/// The experimental `ws.agent.machineModels` installer, added after
+/// [`PRELUDE`] only where the backend serves `remoteMachines.models`
+/// (`remoteMachineModels: 1`); elsewhere the binding is absent. Takes
+/// `(nodeId?, { provider?, model? }?)` or the options object alone.
+pub(crate) const MACHINE_MODELS_PRELUDE: &str = r"
+    ws.agent.machineModels = (nodeId, opts) => {
+        const o = nodeId !== null && typeof nodeId === 'object' ? nodeId : { ...(opts || {}), nodeId };
+        return host({ method: 'agent.machineModels', args: { nodeId: o.nodeId, provider: o.provider, model: o.model } });
+    };
+";
+
 /// The `ws.agent.requestDiscussion` / `ws.agent.reportBlocker` installer
 /// lines inside [`PRELUDE`], removed when `agentFeatures.attentionRequests`
 /// is off (a unit test guards that this segment still matches the prelude
@@ -313,6 +324,7 @@ async fn dispatch_inner(
         "unwatch" => unwatch(api, ws, caller, args).await,
         "list" => list(api, ws, args).await,
         "listSpecialists" => list_specialists(api, ws).await,
+        "machineModels" => machine_models(api, ws, args).await,
         "status" => status(api, ws, caller, args).await,
         "getQueue" => get_queue(api, ws, caller, args).await,
         "removeQueuedMessage" => remove_queued_message(api, ws, caller, args).await,
@@ -338,6 +350,32 @@ async fn dispatch_inner(
         "delete" => end_descendant(api, ws, caller, args, true).await,
         other => Err(format!("host: unknown method `agent.{other}`")),
     }
+}
+
+/// `ws.agent.machineModels`: the backend's `remoteMachines.models` for
+/// this workspace's agent, in process. Refused as unknown where the backend
+/// does not serve it.
+async fn machine_models(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    if !api.remote_machines_capability() {
+        return Err("host: unknown method `agent.machineModels`".to_string());
+    }
+    let mut params = serde_json::Map::new();
+    for key in ["nodeId", "provider", "model"] {
+        match args.get(key) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(value)) => {
+                params.insert(key.to_owned(), Value::String(value.clone()));
+            }
+            Some(_) => return Err(format!("{key} must be a string")),
+        }
+    }
+    api.agent_machine_models(ws.clone(), Value::Object(params))
+        .await
+        .map_err(map_err)
 }
 
 /// The optional `placement` argument: absent means a local agent; `null`

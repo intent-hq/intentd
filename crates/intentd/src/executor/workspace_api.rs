@@ -316,9 +316,13 @@ async fn described_server(
     }
     .placement_help()
     .await;
+    // Head answers the agent's `ws.agent.*` calls, `machineModels` among
+    // them, wherever it lists machines for it.
+    let machine_models = help.is_some();
     Ok(
         server_with_setup(agent_id, workspace_id, worktree, gates, (head, push))?
-            .with_remote_placement_help(help),
+            .with_remote_placement_help(help)
+            .with_machine_models(machine_models),
     )
 }
 

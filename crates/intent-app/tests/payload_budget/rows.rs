@@ -1524,6 +1524,10 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             vec![v("default", json!({}), Items("/machines", seed::EXPOSED_MACHINES))],
         ),
         row(
+            "remoteMachines.models",
+            vec![v("default", json!({}), Items("/machines", seed::EXPOSED_MACHINES))],
+        ),
+        row(
             "repo.list",
             vec![v("default", json!({}), Items("/repos", seed::KNOWN_REPOS))],
         ),

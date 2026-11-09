@@ -317,6 +317,7 @@ remoteLinkTraffic.stop
 remoteMachines.add
 remoteMachines.backendInfo
 remoteMachines.list
+remoteMachines.models
 remoteMachines.refresh
 remoteMachines.remove
 repo.list

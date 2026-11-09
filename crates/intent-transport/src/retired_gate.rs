@@ -362,6 +362,7 @@ pub(crate) const RETIRED_UNGATED_METHODS: &[&str] = &[
     "remoteMachines.add",
     "remoteMachines.backendInfo",
     "remoteMachines.list",
+    "remoteMachines.models",
     "remoteMachines.refresh",
     "remoteMachines.remove",
     "repo.list",

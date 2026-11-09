@@ -612,6 +612,11 @@ impl<'a> PlacementHelpInputs<'a> {
     }
 }
 
+/// How to place an agent on an exposed machine: the end of the 1.0–3.9
+/// prompt text, and of the 3.10 `ws.help("agent")` text.
+const PLACEMENT_HOW_TO: &str = "To run an agent on one, pass `placement: { target: \"remote\" }` (optionally `nodeId`, `os`, `arch`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, { create: { placement } })`. Without `nodeId` the backend picks a machine that runs the platform, has the provider signed in (or unknown) and the model listed, with free capacity. When none lists the model the call fails with `model-unavailable`; other refusals are `placement-unavailable` or `machine-update-required`. A remote agent's own sub-agents (`ws.agent.create`, `ws.agent.delegate`, `ws.agent.wakeOrCreate`) run on its machine when no `placement` is given, with the same checks and no fallback; pass `placement: { target: \"local\" }` to run one on the backend. A batch `ws.agent.delegate({ tasks })` takes one `placement` for all its tasks, and an object entry `{ taskNoteId, placement }` its own.\n\
+         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment, or the provider's Default configuration settings when no profile is selected (an API key or other settings; a profile or Default that sets an account folder such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR` is refused with `profile-not-remote-compatible`), uses the machine's own provider login only when that configuration sets nothing, and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree): right after each `ws.git.commit` (its result has `pushed`) and before each `ws.agent.reportToParent` is delivered, and at the end of each turn, which is when a plain `git commit` reaches the backend. `ws.agent.setModel` can switch it to another model or remote-compatible profile its machine offers; its next turn relaunches it there with the conversation history.\n";
+
 /// Renders the remote-placement text. Each harness version picks one;
 /// [`exposed_machines_help`] is the renderer of harness 1.0 through 3.9.
 pub type PlacementHelpRenderer = fn(inputs: &PlacementHelpInputs<'_>) -> Option<String>;
@@ -661,9 +666,26 @@ pub fn exposed_machines_help(inputs: &PlacementHelpInputs<'_>) -> Option<String>
         );
     }
     push_profiles(&mut text, inputs);
-    text.push_str(
-        "To run an agent on one, pass `placement: { target: \"remote\" }` (optionally `nodeId`, `os`, `arch`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, { create: { placement } })`. Without `nodeId` the backend picks a machine that runs the platform, has the provider signed in (or unknown) and the model listed, with free capacity. When none lists the model the call fails with `model-unavailable`; other refusals are `placement-unavailable` or `machine-update-required`. A remote agent's own sub-agents (`ws.agent.create`, `ws.agent.delegate`, `ws.agent.wakeOrCreate`) run on its machine when no `placement` is given, with the same checks and no fallback; pass `placement: { target: \"local\" }` to run one on the backend. A batch `ws.agent.delegate({ tasks })` takes one `placement` for all its tasks, and an object entry `{ taskNoteId, placement }` its own.\n\
-         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment, or the provider's Default configuration settings when no profile is selected (an API key or other settings; a profile or Default that sets an account folder such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR` is refused with `profile-not-remote-compatible`), uses the machine's own provider login only when that configuration sets nothing, and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree): right after each `ws.git.commit` (its result has `pushed`) and before each `ws.agent.reportToParent` is delivered, and at the end of each turn, which is when a plain `git commit` reaches the backend. `ws.agent.setModel` can switch it to another model or remote-compatible profile its machine offers; its next turn relaunches it there with the conversation history.\n",
+    text.push_str(PLACEMENT_HOW_TO);
+    text.push_str(REMOTE_LONG_COMMANDS_HINT);
+    Some(text)
+}
+
+/// The 3.10 lookup binding, as agents call it.
+pub const MACHINE_MODELS_SIGNATURE: &str = "ws.agent.machineModels(nodeId?, { provider?, model? }?)";
+
+/// The harness 3.10 prompt text: each exposed machine by stable identity
+/// only (name, nodeId, platform), in name order, plus the instruction to
+/// confirm with [`MACHINE_MODELS_SIGNATURE`] and a pointer to
+/// `ws.help("agent")`. No state, times, sign-in status or models, so it
+/// changes only when a machine is added, removed or first reports its
+/// platform. `None` with no usable machine.
+#[must_use]
+pub fn stable_machines_help(inputs: &PlacementHelpInputs<'_>) -> Option<String> {
+    let mut text = identity_list(inputs.machines)?;
+    let _ = writeln!(
+        text,
+        "Before you choose a machine, provider or model for a remote agent, confirm it with `{MACHINE_MODELS_SIGNATURE}`: each machine's state, provider sign-in status and full model list. How to place one: `ws.help(\"agent\")`."
     );
     text.push_str(REMOTE_LONG_COMMANDS_HINT);
     Some(text)
@@ -715,6 +737,59 @@ fn push_remote(text: &mut String, remote: &ProfileRemote) {
             text.push_str(": remote compatibility unknown (settings unreadable)");
         }
     }
+}
+
+/// The harness 3.10 `ws.help("agent")` text: the same identity list as
+/// [`stable_machines_help`], the lookup's doc line, the backend's provider
+/// profiles and the placement how-to.
+/// No live facts: those come only from the lookup.
+#[must_use]
+pub fn stable_machines_reference(inputs: &PlacementHelpInputs<'_>) -> Option<String> {
+    let mut text = identity_list(inputs.machines)?;
+    let _ = writeln!(
+        text,
+        "  {MACHINE_MODELS_SIGNATURE} → {{ machines }}  // Experimental. Per machine: `nodeId`, `name`, `platform`, `state`, `lastConnectedAt`, `observedAt`, `runningAgents`, `providers: [{{ id, status, models, modelsStale }}]` and `disabledProviders`, from its last report (up to 1 hour old; no connect). `nodeId` keeps one machine (unknown → `machine-unknown`); `provider` keeps that provider; `model` (exact id) keeps providers listing it. Each kept provider has its full model list. Confirm the machine, provider and model here before placing a remote agent."
+    );
+    push_profiles(&mut text, inputs);
+    text.push_str(PLACEMENT_HOW_TO);
+    text.push_str(REMOTE_LONG_COMMANDS_HINT);
+    Some(text)
+}
+
+/// The header and one identity line per listed machine (not revoked), in
+/// name order, within [`HELP_MAX_MACHINES`] and [`HELP_MAX_BYTES`].
+fn identity_list(machines: &[ExposedMachine]) -> Option<String> {
+    let mut listed: Vec<&ExposedMachine> = machines
+        .iter()
+        .filter(|row| row.state != RemoteMachineState::Revoked)
+        .collect();
+    if listed.is_empty() {
+        return None;
+    }
+    listed.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    let mut lines = String::new();
+    let mut shown = 0;
+    for row in &listed {
+        let platform = row
+            .platform
+            .map_or_else(|| "platform unknown".to_owned(), |p| p.to_string());
+        let line = format!("- \"{}\" (nodeId `{}`, {platform})\n", row.name, row.id);
+        if shown == HELP_MAX_MACHINES || lines.len() + line.len() > HELP_MAX_BYTES {
+            break;
+        }
+        lines.push_str(&line);
+        shown += 1;
+    }
+    let mut text =
+        format!("Remote placement (experimental): machines exposed to this backend:\n{lines}");
+    if shown < listed.len() {
+        let _ = writeln!(
+            text,
+            "- … {} more; `ws.agent.machineModels()` lists them all.",
+            listed.len() - shown
+        );
+    }
+    Some(text)
 }
 
 fn help_line(row: &ExposedMachine, connected: bool, disabled: &dyn Fn(&str) -> bool) -> String {

@@ -4,7 +4,6 @@
 //! extension point its work fills; until then each renders 3.9's bytes.
 
 use super::{ContextSurfaces, Doctrine, HarnessEntry, RepoRulesInputs, SkillsBlockInputs};
-use intent_core::machine_selection::PlacementHelpInputs;
 
 static DOCTRINE: Doctrine = Doctrine {
     instructions: &crate::instructions::V3_10,
@@ -17,7 +16,8 @@ static CONTEXT: ContextSurfaces = ContextSurfaces {
     repo_rules_reads_executor: true,
     skills_block,
     hidden_skills,
-    placement_help,
+    placement_help: intent_core::machine_selection::stable_machines_help,
+    placement_reference: intent_core::machine_selection::stable_machines_reference,
 };
 
 pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
@@ -48,17 +48,16 @@ fn hidden_skills(
     crate::skill_catalog::build(inputs.skills, inputs.environment).hidden
 }
 
-/// The remote-placement text: stable machine identity only.
-fn placement_help(inputs: &PlacementHelpInputs<'_>) -> Option<String> {
-    intent_core::machine_selection::exposed_machines_help(inputs)
-}
-
 #[cfg(test)]
 mod tests {
     use intent_core::ids::ExecutorCredentialId;
+    use intent_core::machine_selection::PlacementHelpInputs;
     use intent_core::machines::{ExposedMachine, RemoteMachineState};
+    use intent_core::node_link::{MachineCapabilities, ProviderCapability, ProviderStatus};
+    use intent_core::nodes::{NodeArch, NodeOs};
+    use intent_core::placement::AgentPlatform;
 
-    use crate::session_surface_goldens::fixture;
+    use crate::session_surface_goldens::{fixture, surfaces_for, variant};
 
     fn machine(id: &str) -> ExposedMachine {
         ExposedMachine {
@@ -111,14 +110,6 @@ mod tests {
             executor: None,
         };
         assert_eq!((current.repo_rules)(&rules), (previous.repo_rules)(&rules));
-        let machines = [machine("d-mac"), machine("d-box")];
-        let connected = |id: &str| id == "d-mac";
-        let inputs =
-            intent_core::machine_selection::PlacementHelpInputs::new(&machines, &connected);
-        assert_eq!(
-            (current.placement_help)(&inputs),
-            (previous.placement_help)(&inputs)
-        );
     }
 
     /// 3.10 hides the skills an agent cannot use and budgets the rest;
@@ -162,5 +153,76 @@ mod tests {
             crate::skills::build_skills_catalog(&skills)
         );
         assert_eq!((previous.hidden_skills)(&inputs), []);
+    }
+
+    fn reported(id: &str, observed_at: &str, status: ProviderStatus, models: &[&str]) -> ExposedMachine {
+        let mut row = machine(id);
+        let platform = AgentPlatform {
+            os: NodeOs::Macos,
+            arch: NodeArch::Aarch64,
+        };
+        let mut caps = MachineCapabilities::new(platform, "0.11.163", 4, observed_at);
+        caps.providers.push(ProviderCapability {
+            id: "claude-code".into(),
+            visible: true,
+            status,
+            models: models.iter().map(|m| (*m).to_owned()).collect(),
+            models_stale: false,
+        });
+        row.platform = Some(platform);
+        row.observed_at = Some(observed_at.into());
+        row.capabilities = Some(caps);
+        row
+    }
+
+    /// Two spawns minutes apart get byte-identical surfaces on every
+    /// provider while the machines' state, last-seen time, report time,
+    /// sign-in status and model lists change. The same change does show in
+    /// a 3.9 session's text, so the check would catch a regression.
+    #[tokio::test]
+    async fn v3_10_surfaces_stay_byte_identical_while_machines_change() {
+        let (_db, dir, services, mut session) = fixture().await;
+        session.harness_version = "3.10".into();
+        let mut before = vec![
+            reported("d-mac", "2026-11-09T12:00:00Z", ProviderStatus::SignedIn, &["opus"]),
+            reported("d-box", "2026-11-09T12:01:00Z", ProviderStatus::SignedOut, &[]),
+        ];
+        before[1].state = RemoteMachineState::Unreachable;
+        let mut after = before.clone();
+        after[0] = reported(
+            "d-mac",
+            "2026-11-09T12:07:00Z",
+            ProviderStatus::AuthFailed,
+            &["opus", "sonnet", "haiku"],
+        );
+        after[0].last_connected_at = Some("2026-11-09T12:06:30Z".into());
+        after[1].state = RemoteMachineState::Connected;
+        after[1].last_connected_at = Some("2026-11-09T12:05:00Z".into());
+        let connected_before = |id: &str| id == "d-mac";
+        let connected_after = |id: &str| id == "d-box";
+
+        let render = super::super::resolve_entry("3.10").context.placement_help;
+        let text_before =
+            render(&PlacementHelpInputs::new(&before, &connected_before)).expect("machines listed");
+        let text_after =
+            render(&PlacementHelpInputs::new(&after, &connected_after)).expect("machines listed");
+        assert_eq!(text_before, text_after);
+        for live in ["2026-11-09", "signed", "opus", "connected", "unreachable", "last seen"] {
+            assert!(!text_before.contains(live), "{live} in {text_before}");
+        }
+        assert!(text_before.contains("ws.agent.machineModels"), "{text_before}");
+
+        for provider in intent_providers::config::ACP_PROVIDERS {
+            let first = variant(&services, dir.path(), &session, provider, Some(&text_before), false).await;
+            let second = variant(&services, dir.path(), &session, provider, Some(&text_after), false).await;
+            assert_eq!(first, second, "{}", provider.id);
+        }
+
+        let old = super::super::resolve_entry("3.9").context.placement_help;
+        assert_ne!(
+            old(&PlacementHelpInputs::new(&before, &connected_before)),
+            old(&PlacementHelpInputs::new(&after, &connected_after)),
+            "3.9 text carries live machine facts"
+        );
     }
 }

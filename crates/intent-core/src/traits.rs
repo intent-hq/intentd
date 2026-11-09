@@ -2489,6 +2489,23 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { None })
     }
 
+    /// `ws.agent.machineModels` for agents in `workspace_id`: the backend's
+    /// `remoteMachines.models` with `params` (`nodeId`, `provider`, `model`),
+    /// called in process without the wire's owner check. Only where
+    /// [`Self::remote_machines_capability`] holds; unsupported by default.
+    fn agent_machine_models(
+        &self,
+        workspace_id: WorkspaceId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, params);
+        Box::pin(async {
+            Err(Error::Unsupported(
+                "ws.agent.machineModels: this daemon has no exposed machines".into(),
+            ))
+        })
+    }
+
     /// Read the workspace's last explicitly remembered manual specialist.
     fn agent_get_creation_preferences(
         &self,

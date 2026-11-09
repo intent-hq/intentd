@@ -143,12 +143,15 @@ fn namespaces_prelude(features: &AgentFeaturesSettings, is_sub_agent: bool) -> S
     out
 }
 
-/// Install Assistant management tools only in the daemon-selected Assistant workspace.
+/// Install Assistant management tools only in the daemon-selected Assistant
+/// workspace, and `ws.agent.machineModels` only with `machine_models` (the
+/// backend serves `remoteMachines.models`).
 #[must_use]
 pub fn prelude_for_workspace(
     features: &AgentFeaturesSettings,
     is_sub_agent: bool,
     workspace_id: &WorkspaceId,
+    machine_models: bool,
 ) -> String {
     let chief_features;
     let features = if workspace_id.is_chief() && features.secret_requests {
@@ -161,6 +164,9 @@ pub fn prelude_for_workspace(
         features
     };
     let mut prelude = namespaces_prelude(features, is_sub_agent);
+    if machine_models {
+        prelude.push_str(agent::MACHINE_MODELS_PRELUDE);
+    }
     if workspace_id.is_chief() {
         prelude.push_str(app::mcp::PRELUDE);
         prelude.push_str(app::chats::PRELUDE);

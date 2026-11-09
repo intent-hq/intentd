@@ -545,8 +545,12 @@ pub(crate) struct ContextSurfaces {
     /// the session's prompt breakdown (3.10+).
     pub hidden_skills:
         fn(&SkillsBlockInputs<'_>) -> Vec<intent_core::prompt_breakdown::HiddenSkill>,
-    /// The remote-placement text in the `ws.agent` docs.
+    /// The remote-placement text in the `ws.agent` docs of the tool
+    /// description and system prompt.
     pub placement_help: intent_core::machine_selection::PlacementHelpRenderer,
+    /// The remote-placement text `ws.help("agent")` appends, and a remote
+    /// agent's machine serves for both.
+    pub placement_reference: intent_core::machine_selection::PlacementHelpRenderer,
 }
 
 /// The context builders of harness 1.0 through 3.9.
@@ -557,6 +561,7 @@ pub(crate) static CONTEXT_V1: ContextSurfaces = ContextSurfaces {
     skills_block: skills_block_v1,
     hidden_skills: no_hidden_skills,
     placement_help: intent_core::machine_selection::exposed_machines_help,
+    placement_reference: intent_core::machine_selection::exposed_machines_help,
 };
 
 /// No skill is ever hidden (harness 1.0 through 3.9).
@@ -570,13 +575,14 @@ fn skills_block_v1(inputs: &SkillsBlockInputs<'_>) -> String {
     crate::skills::build_skills_catalog(inputs.skills)
 }
 
-/// The placement renderer of the harness version a session is stamped
-/// with, for the backend's answer to a remote agent's machine.
+/// The `ws.help("agent")` placement renderer of the harness version a
+/// session is stamped with, for the backend's answer to a remote agent's
+/// machine (its tool description and `ws.help("agent")` both use it).
 #[must_use]
 pub fn placement_help_renderer(
     harness_version: &str,
 ) -> intent_core::machine_selection::PlacementHelpRenderer {
-    resolve_entry(harness_version).context.placement_help
+    resolve_entry(harness_version).context.placement_reference
 }
 
 /// The `workspace_api` docs a remote machine renders for the harness
