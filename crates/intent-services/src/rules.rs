@@ -188,6 +188,10 @@ pub(crate) enum RuleLoading {
 impl RuleLoading {
     /// The breakdown wording, e.g. "loaded natively by Claude Code".
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the prompt breakdown (section map)")
+    )]
     pub(crate) fn describe(self) -> String {
         match self {
             Self::Injected => "injected".to_owned(),
@@ -538,6 +542,7 @@ pub(crate) fn with_provider_prompt_note(
 /// the prompt under [`intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING`] (the
 /// section the compact header points at). `None` — every non-flagged
 /// provider — leaves the prompt byte-identical to before.
+#[cfg(test)]
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn assemble_system_prompt(
     store: &Store,
