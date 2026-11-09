@@ -11424,6 +11424,9 @@ mod wsapi4_bindings_tests {
         agent_send_message_ids: Mutex<Vec<Option<String>>>,
         /// Agent ids `agent_get` serves as running on an E2B sandbox.
         e2b_agent_ids: Mutex<Vec<String>>,
+        /// `(agent id, placement)` pairs `agent_get` serves as placed but
+        /// not yet bound to a machine (no node id).
+        unbound_placed_agents: Mutex<Vec<(String, Value)>>,
         /// `(caller, target, delete, reason)` of every `agent_end_descendant`.
         end_descendant_calls: Mutex<Vec<EndDescendantCall>>,
     }
@@ -11617,6 +11620,13 @@ mod wsapi4_bindings_tests {
             let is_background = self.background_agent_ids.lock().unwrap().contains(&id);
             let muted = self.muted_agent_ids.lock().unwrap().contains(&id);
             let e2b = self.e2b_agent_ids.lock().unwrap().contains(&id);
+            let unbound = self
+                .unbound_placed_agents
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(agent, _)| *agent == id)
+                .map(|(_, placement)| placement.clone());
             Box::pin(async move {
                 if let Some(e) = error {
                     return Err(Error::NotFound(e));
@@ -11629,6 +11639,9 @@ mod wsapi4_bindings_tests {
                     agent.node_name = Some("E2B sandbox".into());
                     agent.placement =
                         Some(serde_json::from_value(json!({ "target": "e2b" })).unwrap());
+                }
+                if let Some(placement) = unbound {
+                    agent.placement = Some(serde_json::from_value(placement).unwrap());
                 }
                 Ok(agent)
             })
@@ -13908,6 +13921,59 @@ mod wsapi4_bindings_tests {
             .as_str()
             .unwrap_or_default();
         assert!(text.contains("e2b") && text.contains("node-e2b"), "{text}");
+    }
+
+    /// A placed agent whose machine is not bound yet (an E2B sandbox still
+    /// starting, a remote machine not yet chosen) reports its placement
+    /// target, never `local`, and omits the unknown node.
+    #[tokio::test]
+    async fn create_results_report_the_placement_before_the_machine_is_bound() {
+        let (srv, api) = server_with_caller("caller-1");
+        let runs_on = |resp: Value| -> Value {
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap_or_default();
+            serde_json::from_str(text).unwrap_or_else(|_| panic!("{resp}"))
+        };
+        api.unbound_placed_agents.lock().unwrap().extend([
+            (
+                "child-1".to_string(),
+                json!({ "target": "e2b", "cloudMachineId": "box" }),
+            ),
+            ("agent-woken".to_string(), json!({ "target": "remote" })),
+        ]);
+        for code in [
+            "const r = await ws.agent.create('n', 'go', { placement: { target: 'e2b', cloudMachineId: 'box' } }); return JSON.stringify(r.runsOn);",
+            "const r = await ws.agent.create('n', 'go', { topLevel: true, placement: { target: 'e2b', cloudMachineId: 'box' } }); return JSON.stringify(r.runsOn);",
+        ] {
+            assert_eq!(
+                runs_on(call(&srv, code).await),
+                json!({ "target": "e2b" }),
+                "{code}"
+            );
+        }
+        let resp = call(
+            &srv,
+            "const r = await ws.agent.wakeOrCreate('tn-1', 'ctx'); return JSON.stringify(r.runsOn);",
+        )
+        .await;
+        assert_eq!(runs_on(resp), json!({ "target": "remote" }));
+
+        api.unbound_placed_agents.lock().unwrap().clear();
+        let resp = call(
+            &srv,
+            "const r = await ws.agent.create('n', 'go'); return JSON.stringify(r.runsOn);",
+        )
+        .await;
+        assert_eq!(runs_on(resp), json!({ "target": "local" }));
+        api.unbound_placed_agents
+            .lock()
+            .unwrap()
+            .push(("child-1".to_string(), json!({ "target": "local" })));
+        let resp = call(
+            &srv,
+            "const r = await ws.agent.create('n', 'go', { placement: { target: 'local' } }); return JSON.stringify(r.runsOn);",
+        )
+        .await;
+        assert_eq!(runs_on(resp), json!({ "target": "local" }));
     }
 
     /// `ws.agent.stop` / `ws.agent.delete` reach the service as the caller,
