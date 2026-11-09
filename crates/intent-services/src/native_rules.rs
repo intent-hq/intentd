@@ -26,6 +26,12 @@ pub(crate) const CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
 const CLAUDE_INSTRUCTION_OFF_ENV: [&str; 2] =
     ["CLAUDE_CODE_DISABLE_CLAUDE_MDS", "CLAUDE_CODE_SIMPLE"];
 
+/// Claude Code's managed (system) settings file on Linux.
+const CLAUDE_MANAGED_SETTINGS: &str = "/etc/claude-code/managed-settings.json";
+
+/// Codex's system config file.
+const CODEX_SYSTEM_CONFIG: &str = "/etc/codex/config.toml";
+
 /// What runs the agent, as far as rule loading goes. Built once per spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuleExecutor {
@@ -124,12 +130,17 @@ pub(crate) async fn local_executor(
     let mut executor = RuleExecutor::remote(provider_id);
     match cli {
         InstalledCli::Claude => {
-            let off = CLAUDE_INSTRUCTION_OFF_ENV
-                .iter()
-                .any(|key| context.env_value(key).is_some_and(env_truthy))
-                || CLAUDE_INSTRUCTION_OFF_ENV
-                    .iter()
-                    .any(|key| std::env::var_os(key).is_some_and(|v| env_truthy(&v)));
+            let mut settings = vec![
+                workspace_path.join(".claude").join("settings.json"),
+                workspace_path.join(".claude").join("settings.local.json"),
+                PathBuf::from(CLAUDE_MANAGED_SETTINGS),
+            ];
+            settings.extend(context.claude_config_dir().map(|d| d.join("settings.json")));
+            let off = claude_native_off(
+                |key| context.env_value(key).map(ToOwned::to_owned),
+                |key| std::env::var_os(key),
+                &settings,
+            );
             if !off {
                 let path = context.runtime.path().to_owned();
                 executor.cli_version = tokio::task::spawn_blocking(move || {
@@ -153,6 +164,27 @@ pub(crate) async fn local_executor(
     Some(executor)
 }
 
+/// Whether Claude Code may skip workspace instruction files: an off switch in
+/// the launch or daemon environment, or a `claudeMdExcludes` setting (or an
+/// unreadable settings file) in any tier.
+fn claude_native_off(
+    launch_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    daemon_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    settings: &[PathBuf],
+) -> bool {
+    let env_off = CLAUDE_INSTRUCTION_OFF_ENV.iter().any(|key| {
+        launch_env(key).is_some_and(|v| env_truthy(&v))
+            || daemon_env(key).is_some_and(|v| env_truthy(&v))
+    });
+    env_off
+        || settings
+            .iter()
+            .any(|path| match std::fs::read_to_string(path) {
+                Ok(text) => text.contains("claudeMdExcludes"),
+                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+            })
+}
+
 fn env_truthy(value: &std::ffi::OsStr) -> bool {
     let value = value.to_string_lossy();
     let value = value.trim();
@@ -164,23 +196,32 @@ fn env_truthy(value: &std::ffi::OsStr) -> bool {
 }
 
 /// Codex's effective doc cap for `workspace` from the user config in
-/// `codex_home` and the project's `.codex/config.toml`: the smallest
+/// `codex_home`, the system config and the project's `.codex/config.toml`: the smallest
 /// `project_doc_max_bytes` set anywhere (top level or a profile), else the
 /// default. `None` when a config cannot be read, sets custom project root
 /// markers, or marks the workspace (or a parent) untrusted.
 pub(crate) fn codex_doc_cap(codex_home: &Path, workspace: &Path) -> Option<usize> {
+    codex_doc_cap_with(
+        &[
+            PathBuf::from(CODEX_SYSTEM_CONFIG),
+            codex_home.join("config.toml"),
+        ],
+        workspace,
+    )
+}
+
+fn codex_doc_cap_with(configs: &[PathBuf], workspace: &Path) -> Option<usize> {
+    let trust_paths = codex_trust_paths(workspace)?;
     let mut cap = CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES;
-    for config in [
-        codex_home.join("config.toml"),
-        workspace.join(".codex").join("config.toml"),
-    ] {
-        let text = match std::fs::read_to_string(&config) {
+    let project = workspace.join(".codex").join("config.toml");
+    for config in configs.iter().chain([&project]) {
+        let text = match std::fs::read_to_string(config) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return None,
         };
         let doc: toml_edit::DocumentMut = text.parse().ok()?;
-        if untrusted(&doc, workspace) {
+        if untrusted(&doc, &trust_paths) {
             return None;
         }
         cap = cap.min(smallest_cap(doc.as_item())?);
@@ -208,15 +249,38 @@ fn smallest_cap(item: &toml_edit::Item) -> Option<usize> {
     Some(cap)
 }
 
-/// Whether `[projects."<path>"]` marks `workspace` or one of its parents
+/// The paths Codex may key a trust entry on for `workspace`: the path as
+/// given, its canonical form and, for a git worktree, the main repository
+/// root (Codex resolves a worktree's trust there). `None` when a worktree's
+/// main root cannot be resolved.
+fn codex_trust_paths(workspace: &Path) -> Option<Vec<PathBuf>> {
+    let mut paths = vec![workspace.to_owned()];
+    paths.extend(std::fs::canonicalize(workspace).ok());
+    let dot_git = workspace.join(".git");
+    if std::fs::symlink_metadata(&dot_git).is_ok_and(|m| !m.is_dir()) {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        let gitdir = workspace.join(text.trim().strip_prefix("gitdir:")?.trim());
+        let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+        let common = std::fs::canonicalize(gitdir.join(common.trim())).ok()?;
+        paths.push(common.parent()?.to_owned());
+    }
+    Some(paths)
+}
+
+/// Whether `[projects."<path>"]` marks any of `paths` (or a parent)
 /// `trust_level = "untrusted"`.
-fn untrusted(doc: &toml_edit::DocumentMut, workspace: &Path) -> bool {
+fn untrusted(doc: &toml_edit::DocumentMut, paths: &[PathBuf]) -> bool {
     let Some(projects) = doc.get("projects").and_then(toml_edit::Item::as_table_like) else {
         return false;
     };
-    projects.iter().any(|(path, entry)| {
+    projects.iter().any(|(key, entry)| {
         let level = entry.get("trust_level").and_then(toml_edit::Item::as_str);
-        level == Some("untrusted") && workspace.starts_with(PathBuf::from(path))
+        let key = PathBuf::from(key);
+        let canonical = std::fs::canonicalize(&key).unwrap_or_else(|_| key.clone());
+        level == Some("untrusted")
+            && paths
+                .iter()
+                .any(|p| p.starts_with(&key) || p.starts_with(&canonical))
     })
 }
 
@@ -387,7 +451,7 @@ mod tests {
         let home = crate::test_support::test_tempdir("codex-home-");
         let ws = repo(&[]);
         assert_eq!(
-            codex_doc_cap(home.path(), ws.path()),
+            codex_doc_cap_with(&[home.path().join("config.toml")], ws.path()),
             Some(CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES)
         );
         std::fs::write(
@@ -395,14 +459,20 @@ mod tests {
             "project_doc_max_bytes = 65536\n[profiles.small]\nproject_doc_max_bytes = 4096\n",
         )
         .unwrap();
-        assert_eq!(codex_doc_cap(home.path(), ws.path()), Some(4096));
+        assert_eq!(
+            codex_doc_cap_with(&[home.path().join("config.toml")], ws.path()),
+            Some(4096)
+        );
         std::fs::create_dir(ws.path().join(".codex")).unwrap();
         std::fs::write(
             ws.path().join(".codex/config.toml"),
             "project_doc_max_bytes = 100\n",
         )
         .unwrap();
-        assert_eq!(codex_doc_cap(home.path(), ws.path()), Some(100));
+        assert_eq!(
+            codex_doc_cap_with(&[home.path().join("config.toml")], ws.path()),
+            Some(100)
+        );
     }
 
     #[test]
@@ -420,7 +490,11 @@ mod tests {
         for config in cases {
             let home = crate::test_support::test_tempdir("codex-home-");
             std::fs::write(home.path().join("config.toml"), &config).unwrap();
-            assert_eq!(codex_doc_cap(home.path(), ws.path()), None, "{config}");
+            assert_eq!(
+                codex_doc_cap_with(&[home.path().join("config.toml")], ws.path()),
+                None,
+                "{config}"
+            );
         }
         let home = crate::test_support::test_tempdir("codex-home-");
         std::fs::write(
@@ -432,8 +506,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            codex_doc_cap(home.path(), ws.path()),
+            codex_doc_cap_with(&[home.path().join("config.toml")], ws.path()),
             Some(CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES)
         );
+    }
+
+    fn worktree_of(main: &Path) -> tempfile::TempDir {
+        let gitdir = main.join(".git/worktrees/ws");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        let ws = crate::test_support::test_tempdir("codex-wt-");
+        std::fs::write(
+            ws.path().join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        ws
+    }
+
+    #[test]
+    fn codex_worktree_inherits_the_main_repository_trust() {
+        let main = repo(&[]);
+        let ws = worktree_of(main.path());
+        let home = crate::test_support::test_tempdir("codex-home-");
+        let config = home.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"untrusted\"\n",
+                main.path().display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            codex_doc_cap_with(std::slice::from_ref(&config), ws.path()),
+            None
+        );
+        std::fs::write(&config, "").unwrap();
+        assert_eq!(
+            codex_doc_cap_with(&[config], ws.path()),
+            Some(CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES)
+        );
+    }
+
+    #[test]
+    fn codex_trust_matches_a_symlinked_workspace_and_fails_safe_on_a_broken_worktree() {
+        let main = repo(&[]);
+        let link_parent = crate::test_support::test_tempdir("codex-link-");
+        let link = link_parent.path().join("ws");
+        std::os::unix::fs::symlink(main.path(), &link).unwrap();
+        let home = crate::test_support::test_tempdir("codex-home-");
+        let config = home.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"untrusted\"\n",
+                std::fs::canonicalize(main.path()).unwrap().display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            codex_doc_cap_with(std::slice::from_ref(&config), &link),
+            None
+        );
+
+        let broken = crate::test_support::test_tempdir("codex-wt-");
+        std::fs::write(
+            broken.path().join(".git"),
+            "gitdir: /nonexistent/worktrees/x\n",
+        )
+        .unwrap();
+        std::fs::write(&config, "").unwrap();
+        assert_eq!(codex_doc_cap_with(&[config], broken.path()), None);
+    }
+
+    #[test]
+    fn claude_native_is_off_for_env_switches_excludes_and_unreadable_settings() {
+        let none = |_: &str| None;
+        let on = |key: &str| (key == "CLAUDE_CODE_SIMPLE").then(|| "1".into());
+        let falsy = |_: &str| Some("0".into());
+        assert!(!claude_native_off(none, none, &[]));
+        assert!(claude_native_off(on, none, &[]));
+        assert!(claude_native_off(none, on, &[]));
+        assert!(!claude_native_off(falsy, falsy, &[]));
+
+        let dir = crate::test_support::test_tempdir("claude-settings-");
+        let missing = dir.path().join("missing.json");
+        let plain = dir.path().join("plain.json");
+        let excludes = dir.path().join("excludes.json");
+        std::fs::write(&plain, r#"{"model":"opus"}"#).unwrap();
+        std::fs::write(&excludes, r#"{"claudeMdExcludes":["**/AGENTS.md"]}"#).unwrap();
+        assert!(!claude_native_off(none, none, &[missing, plain.clone()]));
+        assert!(claude_native_off(none, none, &[plain, excludes]));
+        assert!(claude_native_off(none, none, &[dir.path().to_owned()]));
     }
 }

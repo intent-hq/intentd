@@ -261,6 +261,12 @@ impl InstalledContext {
             .or_else(|| self.home().map(|p| p.join(".codex")))
     }
 
+    pub fn claude_config_dir(&self) -> Option<PathBuf> {
+        nonempty(&self.env, "CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(|| self.home().map(|p| p.join(".claude")))
+    }
+
     fn home(&self) -> Option<PathBuf> {
         nonempty(&self.env, "HOME")
             .or_else(|| nonempty(&self.env, "USERPROFILE"))
