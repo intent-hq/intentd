@@ -120,6 +120,7 @@ pub struct TunnelSupervisor {
 struct Running {
     address: String,
     up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    recycle: std::sync::Arc<tokio::sync::Notify>,
     stop_tx: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -163,6 +164,7 @@ impl TunnelSupervisor {
         .await?;
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let recycle = std::sync::Arc::new(tokio::sync::Notify::new());
         let task = intent_core::spawn_daemon(supervise(
             self.bin.clone(),
             self.key_path.clone(),
@@ -173,10 +175,12 @@ impl TunnelSupervisor {
             child,
             stop_rx,
             std::sync::Arc::clone(&up),
+            std::sync::Arc::clone(&recycle),
         ));
         *state = Some(Running {
             address: address.clone(),
             up,
+            recycle,
             stop_tx,
             task,
         });
@@ -196,6 +200,13 @@ impl TunnelSupervisor {
             {
                 running.task.abort();
             }
+        }
+    }
+
+    /// Replace the running child with a new one at once. No-op when stopped.
+    pub async fn recycle(&self) {
+        if let Some(running) = self.state.lock().await.as_ref() {
+            running.recycle.notify_one();
         }
     }
 
@@ -381,9 +392,11 @@ async fn supervise(
     mut child: Child,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
     up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    recycle: std::sync::Arc<tokio::sync::Notify>,
 ) {
     let mut backoff = RESTART_BACKOFF_INITIAL;
     loop {
+        let mut delay = backoff;
         // Own the live child until it exits or a stop arrives.
         let started = tokio::time::Instant::now();
         tokio::select! {
@@ -405,6 +418,13 @@ async fn supervise(
                     backoff = RESTART_BACKOFF_INITIAL;
                 }
             }
+            () = recycle.notified() => {
+                up.store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = child.kill().await;
+                tracing::info!("tailcat tunnel sidecar restarting after a host resume");
+                backoff = RESTART_BACKOFF_INITIAL;
+                delay = Duration::ZERO;
+            }
             _ = stop_rx.changed() => {
                 let _ = child.kill().await;
                 return;
@@ -415,9 +435,10 @@ async fn supervise(
         // a stop arrives.
         child = loop {
             tokio::select! {
-                () = tokio::time::sleep(backoff) => {}
+                () = tokio::time::sleep(delay) => {}
                 _ = stop_rx.changed() => return,
             }
+            delay = backoff;
             backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
             match spawn_and_read_address(
                 &bin,
@@ -448,6 +469,25 @@ async fn supervise(
             }
         };
     }
+}
+
+/// Restart `tunnel`'s child on every host resume from `resumes`, until the
+/// stream closes. A paused VM or a sleeping host thaws the same tailcat
+/// process with stale relay and peer state: it stays alive, but no dial
+/// reaches it until it restarts.
+pub fn recycle_on_resume(
+    tunnel: std::sync::Arc<TunnelSupervisor>,
+    mut resumes: tokio::sync::broadcast::Receiver<crate::suspend::ResumeEvent>,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::sync::broadcast::error::RecvError;
+    intent_core::spawn_daemon(async move {
+        loop {
+            match resumes.recv().await {
+                Ok(_) | Err(RecvError::Lagged(_)) => tunnel.recycle().await,
+                Err(RecvError::Closed) => return,
+            }
+        }
+    })
 }
 
 #[cfg(all(test, unix))]
@@ -600,11 +640,8 @@ esac
         let now = std::time::Instant::now();
         tracker.record_suspend(now, now, Duration::from_secs(60));
 
-        let runs = || {
-            std::fs::read_to_string(dir.path().join("runs"))
-                .map(|s| s.lines().count())
-                .unwrap_or(0)
-        };
+        let runs =
+            || std::fs::read_to_string(dir.path().join("runs")).map_or(0, |s| s.lines().count());
         let deadline = tokio::time::Instant::now()
             + intentd_test_support::test_timeout(Duration::from_secs(10));
         while runs() < 2 || sup.address().await.is_none() {
