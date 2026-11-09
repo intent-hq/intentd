@@ -79,15 +79,19 @@ struct Fixture {
     skills: Option<&'static [&'static str]>,
     /// One remote machine is exposed to the backend.
     remote_machine: bool,
+    /// The local Claude Code CLI's `--version` (`None`: unknown, so every
+    /// rule file stays injected).
+    claude_cli_version: Option<&'static str>,
 }
 
-/// Repo rules have no "CLI loads AGENTS.md natively" input yet; the change
-/// that adds one must set it here, or the 50% gate keeps counting AGENTS.md.
+/// The developer runs a Claude Code CLI that loads AGENTS.md by itself, so
+/// the newest harness does not inject it for claude-code.
 const REALISTIC: Fixture = Fixture {
     name: "realistic",
     repo_rules: true,
     skills: None,
     remote_machine: true,
+    claude_cli_version: Some(crate::native_rules::test_versions::FIRST),
 };
 
 const CLEAN: Fixture = Fixture {
@@ -95,6 +99,7 @@ const CLEAN: Fixture = Fixture {
     repo_rules: false,
     skills: Some(&["docx", "pdf", "xlsx"]),
     remote_machine: false,
+    claude_cli_version: None,
 };
 
 fn fixture_dir() -> PathBuf {
@@ -104,6 +109,7 @@ fn fixture_dir() -> PathBuf {
 /// A fixture laid out on disk the way a developer's machine has it.
 struct Materialized {
     _dir: tempfile::TempDir,
+    claude_cli_version: Option<&'static str>,
     root: PathBuf,
     repo: PathBuf,
     skills: Vec<SkillMetadata>,
@@ -169,6 +175,7 @@ fn materialize(fixture: &Fixture) -> Materialized {
     };
     Materialized {
         _dir: dir,
+        claude_cli_version: fixture.claude_cli_version,
         root,
         repo,
         skills,
@@ -306,7 +313,12 @@ async fn measure(
             .with_remote_placement_help(placement),
     );
     let docs = server.workspace_api_prompt_reference();
-    let prompt = crate::rules::assemble_system_prompt(
+    let executor = (provider.id == "claude-code").then(|| crate::native_rules::RuleExecutor {
+        provider_id: provider.id.to_owned(),
+        cli_version: fixture.claude_cli_version.map(str::to_owned),
+        codex_doc_cap: None,
+    });
+    let prompt = crate::rules::assemble_agent_system_prompt(
         services.store(),
         Some(&fixture.repo),
         "interactive",
@@ -318,6 +330,7 @@ async fn measure(
         None,
         Some(&session),
         docs.as_deref(),
+        executor.as_ref(),
     )
     .await
     .expect("assembled prompt");
@@ -707,6 +720,21 @@ fn assert_realistic_baseline(measured: &Measured, fixture: &Materialized) {
     }
 }
 
+/// On the newest harness, claude-code (whose CLI loads AGENTS.md by itself)
+/// gets no injected copy; every other provider still gets one.
+fn assert_native_rules_skipped(measured: &Measured) {
+    let rules = std::fs::read_to_string(fixture_dir().join("monorepo-AGENTS.md")).expect("rules");
+    for ((provider, role), (_, candidate)) in &measured.rows {
+        let expected = usize::from(provider != "claude-code");
+        assert_eq!(
+            candidate.prompt.matches(rules.trim()).count(),
+            expected,
+            "{provider} {}: injected AGENTS.md copies on harness {CANDIDATE}",
+            role.label()
+        );
+    }
+}
+
 /// Measures both fixtures on every provider and prints the breakdown; the
 /// clean fixture's newest-harness numbers must stay under the ceiling.
 #[tokio::test]
@@ -717,6 +745,7 @@ async fn context_budget_report() {
         report(&REALISTIC, &realistic, realistic_fixture.skills.len())
     );
     assert_realistic_baseline(&realistic, &realistic_fixture);
+    assert_native_rules_skipped(&realistic);
 
     let (clean, clean_fixture) = measure_fixture(&CLEAN).await;
     let clean_report = report(&CLEAN, &clean, clean_fixture.skills.len());
