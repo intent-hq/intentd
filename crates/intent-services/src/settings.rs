@@ -1816,7 +1816,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         string(
             "quickActions.defaultModel",
             "Default quick action model",
-            "Model for single-shot quick actions (commit messages, PR descriptions, quick tasks); never applied to agent sessions",
+            "Model for single-shot quick actions (commit messages and PR descriptions); never applied to agent sessions",
             "providers",
             None,
         ),
