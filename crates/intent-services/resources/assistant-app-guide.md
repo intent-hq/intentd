@@ -1222,7 +1222,8 @@ is tight. Faded edges show where more tabs are hidden and clear when you reach
 that end. **Agents** opens by default; your selected section is remembered. Its
 tab shows the main agent's avatar, or a robot while no main agent is available.
 **People** follows **Agents** in both the expanded row and collapsed rail.
-A token-usage total appears beside **Agents** once tokens have been used.
+A token-usage total appears beside **Agents** once tokens have been used. It
+excludes cached tokens; its details list cached context as a separate row.
 The workspace status image appears as a compact thumbnail in **Context**; click
 it to view the full image.
 When collapsed, the sidebar leaves a slim vertical icon rail. Hover over or focus
