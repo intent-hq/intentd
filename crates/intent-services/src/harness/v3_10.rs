@@ -259,7 +259,9 @@ mod tests {
             assert_eq!(first, second, "{}", provider.id);
         }
 
-        let old = super::super::resolve_entry("3.9").context.placement_help;
+        let old = super::super::resolve_entry(intent_core::CURRENT_HARNESS_VERSION)
+            .context
+            .placement_help;
         assert_ne!(
             old(&PlacementHelpInputs::new(&before, &connected_before)),
             old(&PlacementHelpInputs::new(&after, &connected_after)),
