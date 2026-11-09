@@ -31786,9 +31786,20 @@ impl WorkspaceApi for Services {
     fn agent_placement_help(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Option<String>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await.ok()?;
+            // The calling agent's stamped harness renders it, as its tool
+            // description does; other callers get the latest.
+            let entry = match intent_core::current_caller() {
+                Some(intent_core::Caller::Agent { agent_id }) => {
+                    match self.store.get_agent_session_summary(&agent_id).await {
+                        Ok(session) => crate::harness::resolve_entry(&session.harness_version),
+                        Err(_) => crate::harness::latest_entry(),
+                    }
+                }
+                _ => crate::harness::latest_entry(),
+            };
             self.ports
                 .remote_launch()
-                .placement_help(self, crate::harness::latest_entry().context.placement_help)
+                .placement_help(self, entry.context.placement_help)
                 .await
         })
     }

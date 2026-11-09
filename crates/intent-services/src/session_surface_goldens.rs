@@ -1,9 +1,9 @@
 //! Old sessions keep their context surfaces (harness gating M0). For every
 //! provider in the registry, a session stamped 3.8 or 3.9 and respawned on
 //! this build gets a byte-identical `workspace_api` tool description and
-//! system prompt. Each row pins the bytes (length + SHA-256) of four
-//! variants joined: top-level, sub-agent, chief, and top-level with remote
-//! placement text.
+//! system prompt. Each row pins the bytes (length + SHA-256) of five
+//! variants joined: top-level, sub-agent, chief, top-level with remote
+//! placement text, and a plain folder with placement text (dropped there).
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -26,87 +26,87 @@ const FROZEN_VERSIONS: &[&str] = &["3.8", "3.9"];
 const FROZEN_SURFACES: &[(&str, usize, &str, usize, &str)] = &[
     (
         "auggie",
-        373_602,
-        "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96_897,
-        "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
+        442_904,
+        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        128_784,
+        "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
     (
         "claude-code",
-        7_704,
-        "a35deab89ba2ae13aec1efaecf88cefc46ed652d7aa0f6e2fc4d7934c1e57c5a",
-        195_279,
-        "7635c3d168cda224a22183b22e16c5eb402b57884b7e9c60299f979cbe45ad8d",
+        9_486,
+        "3493bceb2c12efa2442451acb19eb4523d1797d4acbc562f4d5142127e455ad9",
+        249_125,
+        "d235d02687553c886adf13393a8ad63b4a3264c7a168dd1731bd2a4f20120d22",
     ),
     (
         "codex",
-        373_602,
-        "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96_897,
-        "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
+        442_904,
+        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        128_784,
+        "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
     (
         "cortex",
-        373_602,
-        "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96_897,
-        "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
+        442_904,
+        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        128_784,
+        "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
     (
         "opencode",
-        373_602,
-        "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96_897,
-        "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
+        442_904,
+        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        128_784,
+        "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
     (
         "unsloth",
-        373_602,
-        "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96_897,
-        "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
+        442_904,
+        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        128_784,
+        "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
     (
         "pi",
-        373_602,
-        "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96_897,
-        "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
+        442_904,
+        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        128_784,
+        "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
     (
         "droid",
-        7_704,
-        "a35deab89ba2ae13aec1efaecf88cefc46ed652d7aa0f6e2fc4d7934c1e57c5a",
-        195_279,
-        "7635c3d168cda224a22183b22e16c5eb402b57884b7e9c60299f979cbe45ad8d",
+        9_486,
+        "3493bceb2c12efa2442451acb19eb4523d1797d4acbc562f4d5142127e455ad9",
+        249_125,
+        "d235d02687553c886adf13393a8ad63b4a3264c7a168dd1731bd2a4f20120d22",
     ),
     (
         "grok",
-        7_704,
-        "a35deab89ba2ae13aec1efaecf88cefc46ed652d7aa0f6e2fc4d7934c1e57c5a",
-        195_279,
-        "7635c3d168cda224a22183b22e16c5eb402b57884b7e9c60299f979cbe45ad8d",
+        9_486,
+        "3493bceb2c12efa2442451acb19eb4523d1797d4acbc562f4d5142127e455ad9",
+        249_125,
+        "d235d02687553c886adf13393a8ad63b4a3264c7a168dd1731bd2a4f20120d22",
     ),
     (
         "antigravity",
-        373_602,
-        "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96_897,
-        "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
+        442_904,
+        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        128_784,
+        "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
     (
         "cursor",
-        373_602,
-        "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        97_809,
-        "d3ff4c1bdb59ba7fdc7caa9930ed134beb352714f2e68038808e5bf2f43bdd1c",
+        442_904,
+        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        129_924,
+        "220273303306a122e130b914bd99d4067fa16d8536f3840210ce6d24576633b5",
     ),
     (
         "mock",
-        373_602,
-        "e9f8b4649f75bd119a73828db99c4a04954e45c0c0bcb956bab92da5c05f2667",
-        96_897,
-        "feb9cb81916a6181ee44c8555d017d727102b49c3ef0d696371f53f583073d54",
+        442_904,
+        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        128_784,
+        "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
 ];
 
@@ -144,6 +144,7 @@ async fn variant(
     session: &AgentSession,
     provider: &ProviderConfig,
     placement: Option<&str>,
+    plain_folder: bool,
 ) -> (String, String) {
     let is_sub_agent = session.parent_agent_id.is_some();
     let features = AgentFeaturesSettings::default();
@@ -153,7 +154,8 @@ async fn variant(
         WorkspaceMcpServer::for_agent_type(api, session.workspace_id.clone(), "interactive")
             .with_agent_features(features.clone())
             .with_sub_agent(is_sub_agent)
-            .with_remote_placement_help(placement.map(str::to_owned)),
+            .with_remote_placement_help(placement.map(str::to_owned))
+            .with_plain_folder(plain_folder),
     );
     let docs = server.workspace_api_prompt_reference();
     let prompt = crate::rules::assemble_system_prompt(
@@ -194,13 +196,22 @@ pub(crate) async fn surfaces_for(
     chief.workspace_id = WorkspaceId::chief();
     let mut tools = Vec::new();
     let mut prompts = Vec::new();
-    for (session, placement) in [
-        (&top, None),
-        (&sub, None),
-        (&chief, None),
-        (&top, Some(PLACEMENT)),
+    for (session, placement, plain_folder) in [
+        (&top, None, false),
+        (&sub, None, false),
+        (&chief, None, false),
+        (&top, Some(PLACEMENT), false),
+        (&top, Some(PLACEMENT), true),
     ] {
-        let (tool, prompt) = variant(services, workspace_path, session, provider, placement).await;
+        let (tool, prompt) = variant(
+            services,
+            workspace_path,
+            session,
+            provider,
+            placement,
+            plain_folder,
+        )
+        .await;
         tools.push(tool);
         prompts.push(prompt);
     }
@@ -291,4 +302,41 @@ async fn frozen_sessions_keep_tool_description_and_system_prompt() {
          adds its row; an existing row never changes. Actual:\n{}",
         actual.join("\n")
     );
+}
+
+/// The frozen versions keep the original builders for the surfaces the
+/// prompt fixture above does not reach (skills, placement), whose bytes
+/// `v1_goldens` and the machine-selection tests pin.
+#[test]
+fn frozen_sessions_keep_the_original_builders() {
+    for version in FROZEN_VERSIONS {
+        let context = crate::harness::resolve_entry(version).context;
+        assert!(
+            std::ptr::eq(context, &crate::harness::CONTEXT_V1),
+            "{version}"
+        );
+    }
+    let context = &crate::harness::CONTEXT_V1;
+    let skills = [crate::skills::SkillMetadata {
+        name: "pdf".into(),
+        description: "Read & write <PDF> files.".into(),
+        location: "/skills/pdf/SKILL.md".into(),
+        resource_directory: Some("/skills/pdf".into()),
+        scope: "user".into(),
+        allowed_tools: None,
+        compatibility: None,
+    }];
+    assert_eq!(
+        (context.skills_block)(&crate::harness::SkillsBlockInputs { skills: &skills }),
+        crate::skills::build_skills_catalog(&skills)
+    );
+    assert!(std::ptr::fn_addr_eq(
+        context.placement_help,
+        intent_core::machine_selection::exposed_machines_help
+            as intent_core::machine_selection::PlacementHelpRenderer
+    ));
+    assert!(std::ptr::addr_eq(
+        context.workspace_api,
+        &intent_acp::WORKSPACE_API_DOCS_V1
+    ));
 }
