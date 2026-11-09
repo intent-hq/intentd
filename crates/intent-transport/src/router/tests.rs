@@ -7530,6 +7530,30 @@ mod send_message_payload_forwarding {
             "attribution fields must be stripped, other fields preserved"
         );
     }
+
+    /// Only the daemon marks a machine-run script wake (`remoteAgentId` /
+    /// `nodeId`), which lets it past the script monitor fences. A wire
+    /// caller's copy is stripped, so a forged wake is still fenced.
+    #[tokio::test]
+    async fn send_message_strips_machine_run_wake_markers() {
+        let api = RecordingApi::default();
+        let send = r#"{
+            "jsonrpc":"2.0","id":14,"method":"agent.sendMessage",
+            "params":{
+                "workspaceId":"ws-1","agentId":"agent-1","content":"hi",
+                "messageMetadata":{
+                    "type":"script_monitor_wake","monitorId":"m",
+                    "remoteAgentId":"agent-1","nodeId":"mac"
+                }
+            }
+        }"#;
+        handle_message(&api, send).await.expect("send response");
+        let cap = api.send.lock().unwrap().clone();
+        assert_eq!(
+            cap.message_metadata,
+            Some(json!({"type": "script_monitor_wake", "monitorId": "m"}))
+        );
+    }
 }
 
 /// `agent.dismissQuestions` (PROTOCOL §5.5, pending questions): the dispatch arm

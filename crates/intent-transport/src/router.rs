@@ -6192,6 +6192,12 @@ fn strip_sender_attribution(message_metadata: Option<Value>) -> Option<Value> {
         Some(Value::Object(mut obj)) => {
             obj.remove("fromAgentId");
             obj.remove("fromAgentName");
+            // Daemon-only: marks a machine-run wake, which skips the script
+            // monitor fences.
+            if obj.get("type").and_then(Value::as_str) == Some("script_monitor_wake") {
+                obj.remove("remoteAgentId");
+                obj.remove("nodeId");
+            }
             Some(Value::Object(obj))
         }
         other => other,
