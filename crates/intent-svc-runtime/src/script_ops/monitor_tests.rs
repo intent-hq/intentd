@@ -1492,3 +1492,36 @@ async fn script_monitor_maintenance_loop_exits_once_settings_tasks_close() {
     .await
     .expect("the maintenance loop exits after settings tasks close");
 }
+
+// Deleting a running script from the app stops it first; its monitors must
+// settle as a cancelled run so the watching agent is woken, not orphaned.
+#[intent_test_macros::daemon_test]
+async fn script_remove_of_running_script_completes_its_monitor_as_cancelled() {
+    let h = harness().await;
+    let owner = monitor_owner(&h, "owner").await;
+    let id = create_simple(&h, "removed while running", "read value", ScriptMode::Command).await;
+    h.services
+        .script_start(h.ws.clone(), id.clone())
+        .await
+        .unwrap();
+    let value = h
+        .services
+        .script_monitor(h.ws.clone(), owner.clone(), id.clone(), json!({"ttlMs":60000}))
+        .await
+        .unwrap();
+    let mid = value["monitor"]["monitorId"].as_str().unwrap().to_owned();
+    h.services
+        .script_remove(h.ws.clone(), id.clone())
+        .await
+        .unwrap();
+    let row = monitor_row(&h, &mid, "completed").await;
+    assert_eq!(
+        row.result.unwrap().outcome,
+        intent_core::ScriptRunOutcome::Cancelled
+    );
+    assert!(h
+        .services
+        .active_script_monitors_for_agent(&owner)
+        .await
+        .is_empty());
+}
