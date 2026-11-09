@@ -60,13 +60,17 @@ PR_METADATA = {"pr-title", "docs-pr-scope", "conflict-markers"}
 # Release-metadata PRs (release-fast-path reports fast_path=true) skip these
 # slow jobs; the queue still requires them (intentd#2493).
 FAST_PATH_SKIPS = {"check", "windows-cross-lint", "macos-cross-lint", "coverage-changed"}
+# release-scripts tests only scripts/ and .github/, which a release-metadata
+# diff cannot touch, so both a fast-path PR and a release push skip it. The
+# queue always runs it, and so does every other PR and push.
+RELEASE_METADATA_SKIPS = {"release-scripts"}
 # Main pushes skip the Windows post-merge job and the paid macOS build when
 # release-fast-path reports release_push=true (a tree auto-cut-alpha just
 # required green plus release metadata; see
 # test_release_push_skips_macos_release_build) or `supersede` reports
 # superseded=true (main's live tip is already strictly ahead of this commit,
 # and only the tip's proof is read). Every other push job still runs.
-RELEASE_PUSH_SKIPS = {"windows", "build"}
+RELEASE_PUSH_SKIPS = {"windows", "build"} | RELEASE_METADATA_SKIPS
 SUPERSEDED_SKIPS = {"windows", "build"}
 # Advisory gate dependencies: any result is accepted (the gate reads only
 # their outputs), so a failed classifier or scan degrades to full CI.
@@ -412,12 +416,12 @@ def fast_path_gate_errors(workflow, expected):
             reported = fast_path == "true" and classifier == "success"
             baseline = {name: "success" if name in required else "skipped" for name in expected}
             baseline["release-fast-path"] = classifier
-            for name in FAST_PATH_SKIPS:
+            for name in FAST_PATH_SKIPS | RELEASE_METADATA_SKIPS:
                 baseline[name] = "skipped" if reported else "success"
             label = f"pull_request/fast_path={fast_path or '-'}/release-fast-path={classifier}"
             if not gate_passes(workflow, "pull_request", baseline, fast_path):
                 errors.append(f"{label}: baseline")
-            for name in FAST_PATH_SKIPS:
+            for name in FAST_PATH_SKIPS | RELEASE_METADATA_SKIPS:
                 for result in RESULTS:
                     accepted = result == "success" or (result == "skipped" and reported)
                     if gate_passes(workflow, "pull_request", {**baseline, name: result}, fast_path) != accepted:
@@ -443,7 +447,7 @@ def routing_errors(workflow):
                 if head_ref == RELEASE_BRANCH:
                     expected |= {"release-fast-path"}
                 if fast_path == "true":
-                    expected -= FAST_PATH_SKIPS
+                    expected -= FAST_PATH_SKIPS | RELEASE_METADATA_SKIPS
             if event == "merge_group":
                 expected |= QUEUE_WATCHERS
             if event == "push":
@@ -1701,6 +1705,40 @@ class NativeRoutingTests(unittest.TestCase):
             self.assertTrue(all(jobs[name] == "skipped" for name in FAST_PATH_SKIPS))
             self.assertFalse(gate_passes(self.workflow, "pull_request", jobs))
 
+    def test_release_metadata_skips_release_scripts_on_prs_and_pushes(self):
+        # A fast-path PR and a release push skip release-scripts; a failed or
+        # cancelled classifier reports nothing, so it still runs, and the
+        # queue never consults the classifier.
+        cases = [
+            ("pull_request", {"head_ref": RELEASE_BRANCH, "fast_path": "true"}, "skipped"),
+            ("pull_request", {"head_ref": RELEASE_BRANCH, "fast_path": "false"}, "success"),
+            ("pull_request", {}, "success"),
+            ("push", {"release_push": "true"}, "skipped"),
+            ("push", {"release_push": "false"}, "success"),
+            ("push", {"superseded": "true"}, "success"),
+            ("merge_group", {}, "success"),
+        ]
+        cases += [("push", {"classifier": result}, "success") for result in ("failure", "cancelled")]
+        cases += [("pull_request", {"head_ref": RELEASE_BRANCH, "classifier": result}, "success")
+                  for result in ("failure", "cancelled")]
+        for event, kwargs, expected in cases:
+            with self.subTest(event=event, **kwargs):
+                self.assertEqual(scheduled(self.workflow, event, **kwargs)["release-scripts"], expected)
+        for clause in (" && needs.release-fast-path.outputs.fast_path != 'true'",
+                       " && needs.release-fast-path.outputs.release_push != 'true'"):
+            with self.subTest(clause=clause):
+                workflow = copy.deepcopy(self.workflow)
+                job = workflow["jobs"]["release-scripts"]
+                self.assertIn(clause, job["if"])
+                job["if"] = job["if"].replace(clause, "")
+                self.assertTrue(routing_errors(workflow))
+        workflow = copy.deepcopy(self.workflow)
+        step = next(s for s in workflow["jobs"]["gate"]["steps"] if s.get("name") == "Check results")
+        old = '"$scripts" release-scripts'
+        self.assertIn(old, step["run"])
+        step["run"] = step["run"].replace(old, "optional release-scripts", 1)
+        self.assertTrue(gate_errors(workflow))
+
     def test_classifier_runs_only_on_release_plz_branches(self):
         # Ordinary PRs skip the classifier at once, so the slow jobs that
         # need it start right after route, and a failed classifier on a
@@ -1723,6 +1761,7 @@ class NativeRoutingTests(unittest.TestCase):
             "optional-coverage": ('"$slow" coverage-changed', "optional coverage-changed"),
             "optional-windows-cross-lint": ('"$slow" windows-cross-lint', "optional windows-cross-lint"),
             "optional-macos-cross-lint": ('"$slow" macos-cross-lint', "optional macos-cross-lint"),
+            "optional-release-scripts": ('"$slow" release-scripts', "optional release-scripts"),
         }
         for label, (old, new) in mutations.items():
             with self.subTest(mutation=label):

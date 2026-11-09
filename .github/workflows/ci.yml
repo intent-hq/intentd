@@ -1052,7 +1052,8 @@ jobs:
     # A main push compares against the previous tip (`github.event.before`):
     # a release-metadata push (`chore: release vX.Y.Z`) is a tree auto-cut
     # just required green plus release metadata, so it skips the Windows
-    # post-merge job and the macOS `build` job (`release_push`). Each event
+    # post-merge job, the macOS `build` job and `release-scripts`
+    # (`release_push`). Each event
     # gets only its own output, so a push never trips the `fast_path` guards
     # on the `build` steps.
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-'))
@@ -2330,12 +2331,16 @@ jobs:
   # tracked Python bytecode (scripts/check-no-python-cache.sh). Seconds-long
   # like the other utility jobs, it uses the shared self-hosted-first route.
   release-scripts:
-    needs: [route]
+    needs: [route, release-fast-path]
     runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['release-scripts'] || fromJSON('["ubuntu-24.04"]') }}
     # Runs on same-repo PRs (so a change to these scripts is proven before
     # it queues), after queueing and on main pushes. Fork PRs skip it with
-    # the route job.
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
+    # the route job. Release-metadata PRs and pushes (release-fast-path)
+    # skip it: their diff touches only versions, Cargo.lock and the
+    # changelog, never the scripts/ and .github/ files it tests, on a
+    # parent tree that already passed it. `!cancelled()` lets an
+    # ordinary PR or queue run start once release-fast-path skips.
+    if: ${{ !cancelled() && needs.route.result == 'success' && ((github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true') || github.event_name == 'merge_group' || (github.event_name == 'push' && needs.release-fast-path.outputs.release_push != 'true')) }}
     # About 2 min on a hosted runner (measured on Depot); on a busy shared self-hosted slot it ran 5 min
     # next to a PR's check and coverage-changed (run 39178412485) with every
     # step passing, so the budget leaves self-hosted headroom. Release
@@ -2814,7 +2819,8 @@ jobs:
               # release-fast-path itself is advisory: a failed classifier must
               # degrade to full CI, never block the PR. Release-metadata PRs
               # skip the slow compile jobs (`check`, `windows-cross-lint`,
-              # `macos-cross-lint`, `coverage-changed`; see `check`); the skip is accepted
+              # `macos-cross-lint`, `coverage-changed`; see `check`) and
+              # `release-scripts`; the skip is accepted
               # only when the classifier job succeeded and reported the fast
               # path. Any other PR must run them.
               slow=require
@@ -2836,7 +2842,7 @@ jobs:
               require conflict-markers "${{ needs.conflict-markers.result }}"
               require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
               optional deb-packaging "${{ needs.deb-packaging.result }}"
-              require release-scripts "${{ needs.release-scripts.result }}"
+              "$slow" release-scripts "${{ needs.release-scripts.result }}"
               optional install-ps1 "${{ needs.install-ps1.result }}"
               optional pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;
@@ -2864,14 +2870,17 @@ jobs:
               ;;
             push)
               # Release-metadata and superseded pushes skip the Windows
-              # post-merge job and the macOS release build; the skip is
-              # accepted only when the reporting job succeeded (see
-              # `release-fast-path` and `supersede`).
+              # post-merge job and the macOS release build; release-metadata
+              # pushes also skip `release-scripts`. The skip is accepted only
+              # when the reporting job succeeded (see `release-fast-path` and
+              # `supersede`).
               windows=require
               build=require
+              scripts=require
               if [ "${{ needs.release-fast-path.result }}" = success ] && [ "${{ needs.release-fast-path.outputs.release_push }}" = true ]; then
                 windows=optional
                 build=optional
+                scripts=optional
               fi
               if [ "${{ needs.supersede.result }}" = success ] && [ "${{ needs.supersede.outputs.superseded }}" = true ]; then
                 windows=optional
@@ -2894,7 +2903,7 @@ jobs:
               optional conflict-markers "${{ needs.conflict-markers.result }}"
               optional monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
               require deb-packaging "${{ needs.deb-packaging.result }}"
-              require release-scripts "${{ needs.release-scripts.result }}"
+              "$scripts" release-scripts "${{ needs.release-scripts.result }}"
               require install-ps1 "${{ needs.install-ps1.result }}"
               require pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;
