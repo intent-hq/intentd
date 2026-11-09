@@ -95,9 +95,13 @@ pub struct AgentRemote {
     workspace_id: String,
     agent_id: String,
     module_key: Option<String>,
+    forge: bool,
 }
 
 const MODULES: &str = "/modules/";
+
+/// Suffix of a sub-agent's forge remote (nodeProtocol 17).
+const FORGE: &str = "/forge";
 
 fn invalid_remote() -> Error {
     Error::InvalidParams("node-git-invalid-remote".into())
@@ -115,7 +119,25 @@ impl AgentRemote {
             workspace_id: workspace_id.into(),
             agent_id: agent_id.into(),
             module_key: None,
+            forge: false,
         })
+    }
+
+    /// The same agent's forge remote (nodeProtocol 17): the workspace's
+    /// GitHub repository, fetched through head.
+    #[must_use]
+    pub fn forge(&self) -> Self {
+        Self {
+            module_key: None,
+            forge: true,
+            ..self.clone()
+        }
+    }
+
+    /// Whether this is a forge remote.
+    #[must_use]
+    pub fn is_forge(&self) -> bool {
+        self.forge
     }
 
     /// The same agent's remote in the submodule repository `module_key`
@@ -128,12 +150,14 @@ impl AgentRemote {
         hub::component(module_key).map_err(|_| invalid_remote())?;
         Ok(Self {
             module_key: Some(module_key.into()),
+            forge: false,
             ..self.clone()
         })
     }
 
-    /// Parse the canonical `intent://ws/<wsId>/agents/<agentId>` URL, or
-    /// `…/modules/<moduleKey>` for a submodule.
+    /// Parse the canonical `intent://ws/<wsId>/agents/<agentId>` URL,
+    /// `…/modules/<moduleKey>` for a submodule, or `…/forge` for the forge
+    /// remote.
     ///
     /// # Errors
     ///
@@ -143,7 +167,10 @@ impl AgentRemote {
         let (workspace, agent) = rest.split_once("/agents/").ok_or_else(invalid_remote)?;
         let remote = match agent.split_once(MODULES) {
             Some((agent, module_key)) => Self::new(workspace, agent)?.with_module(module_key)?,
-            None => Self::new(workspace, agent)?,
+            None => match agent.strip_suffix(FORGE) {
+                Some(agent) => Self::new(workspace, agent)?.forge(),
+                None => Self::new(workspace, agent)?,
+            },
         };
         if remote.url() != url {
             return Err(invalid_remote());
@@ -156,6 +183,7 @@ impl AgentRemote {
         let url = format!("{URL_PREFIX}{}/agents/{}", self.workspace_id, self.agent_id);
         match &self.module_key {
             Some(key) => format!("{url}{MODULES}{key}"),
+            None if self.forge => format!("{url}{FORGE}"),
             None => url,
         }
     }
@@ -1392,6 +1420,38 @@ impl CheckoutCache {
         false
     }
 
+    /// Node side (nodeProtocol 17): give `worktree` an `origin` at
+    /// `remote_url` with the usual fetch refspec, worktree-scoped and with
+    /// no upstream branch, unless it already has one.
+    ///
+    /// # Errors
+    ///
+    /// When a git step fails.
+    pub async fn ensure_origin(&self, worktree: &Path, remote_url: &str) -> Result<()> {
+        let _serial = self.lock.lock().await;
+        let has = self
+            .git
+            .git(worktree, &["config", "--get", "remote.origin.url"])
+            .await
+            .is_ok_and(|url| !url.is_empty());
+        if has {
+            return Ok(());
+        }
+        self.enable_worktree_config(worktree).await?;
+        for (key, value) in [
+            ("remote.origin.url", remote_url),
+            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+        ] {
+            self.git
+                .git(
+                    worktree,
+                    &["config", "--worktree", "--replace-all", key, value],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Undo [`Self::set_forge`]'s config in `worktree` (a relaunch without
     /// `forge`): it then has no `origin`. Missing entries are fine.
     pub async fn clear_forge(&self, worktree: &Path, local: &str) {
@@ -1674,6 +1734,8 @@ async fn run(mut command: Command) -> Result<String> {
     let detail: String = stderr.chars().skip(skip).collect();
     Err(Error::Internal(format!("node-git-failed: {detail}")))
 }
+
+pub mod forge;
 
 #[cfg(test)]
 mod tests;

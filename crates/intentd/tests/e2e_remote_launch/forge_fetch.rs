@@ -1,5 +1,5 @@
 //! Sub-agents fetch the workspace's GitHub repository through the backend
-//! (nodeProtocol 16, monorepo `docs/protocol/node-link.md` § Sub-agent fetch
+//! (nodeProtocol 17, monorepo `docs/protocol/node-link.md` § Sub-agent fetch
 //! through the backend). A sub-agent with its own checkout on another
 //! machine, and one that shares its parent's checkout, both `git fetch
 //! origin` a commit that reached "GitHub" after they started. Their
@@ -71,7 +71,10 @@ async fn sub_agents_fetch_github_through_the_backend_and_cannot_push() {
     let forge_root = scratch.path().join("github");
     let github = forge_root.join("acme").join("widget.git");
     std::fs::create_dir_all(&github).unwrap();
-    git(&github, &["init", "--quiet", "--bare", "--initial-branch=main"]);
+    git(
+        &github,
+        &["init", "--quiet", "--bare", "--initial-branch=main"],
+    );
     let base = format!("file://{}/", forge_root.display());
     let (_head, port, cfg, ws_id, backend_id) = backend_with_token_env(
         scratch.path(),
@@ -80,7 +83,10 @@ async fn sub_agents_fetch_github_through_the_backend_and_cannot_push() {
     )
     .await;
     let repo = scratch.path().join("repo");
-    git(&repo, &["push", "--quiet", github.to_str().unwrap(), "main"]);
+    git(
+        &repo,
+        &["push", "--quiet", github.to_str().unwrap(), "main"],
+    );
 
     let mut rpc_ws = connect(port, cfg.clone()).await;
     let mut events = connect(port, cfg.clone()).await;

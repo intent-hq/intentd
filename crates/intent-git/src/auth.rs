@@ -418,6 +418,27 @@ pub fn node_helper_env(
     )]
 }
 
+/// The [`GIT_CONFIG_PARAMETERS_ENV`] pair for a sub-agent that fetches
+/// GitHub through the backend (nodeProtocol 17): `url.<forge>.insteadOf`
+/// for `remote_url` (`https://github.com/<owner>/<repo>.git`) and its
+/// `git@github.com:<owner>/<repo>.git` form, appended to any
+/// `inherited_config_parameters`. No credential helper.
+#[must_use]
+pub fn forge_fetch_env(
+    forge_url: &str,
+    remote_url: &str,
+    inherited_config_parameters: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut entries = vec![format!("url.{forge_url}.insteadOf={remote_url}")];
+    if let Some(path) = remote_url.strip_prefix("https://github.com/") {
+        entries.push(format!("url.{forge_url}.insteadOf=git@github.com:{path}"));
+    }
+    vec![(
+        GIT_CONFIG_PARAMETERS_ENV.to_string(),
+        config_parameters(inherited_config_parameters, &entries),
+    )]
+}
+
 /// Offer the on-demand GitLab helper for one full HTTPS instance. An unset or
 /// disabled daemon policy answers silently. Existing helpers keep their order;
 /// no credentials are placed in environment, config, URLs or arguments.

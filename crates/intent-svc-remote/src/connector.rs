@@ -27,7 +27,8 @@ use intent_core::node_link::{
     JournalBody, LaunchCommand, LinkFrame, LinkId, LinkOutcome, LinkRpcError, LinkWelcome,
     MachineCapabilities, MachineSkill, PushWipRequest, PushWipResult, SecretForget, SecretList,
     SecretOutcome, SecretPut, SecretReply, SetupState, SkillsQuery, StopId, StopOutcome,
-    FINAL_STOP_PROTOCOL, FORGE_TOKEN_PROTOCOL, SECRETS_PROTOCOL, SKILLS_PROTOCOL,
+    FINAL_STOP_PROTOCOL, FORGE_FETCH_PROTOCOL, FORGE_TOKEN_PROTOCOL, SECRETS_PROTOCOL,
+    SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::{AgentPlatform, PlatformAvailability};
@@ -386,6 +387,11 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    /// The backend's services, when this connector has them.
+    pub(crate) fn services(&self) -> Option<&Services> {
+        self.services.as_ref()
+    }
+
     /// The current link, if one is up.
     pub(crate) fn current_link(&self) -> Option<NodeLink> {
         self.link.borrow().clone().filter(|link| !link.is_closed())
@@ -2116,6 +2122,9 @@ impl RemoteNode {
             command.forge = None;
             link
         };
+        if link.protocol() < FORGE_FETCH_PROTOCOL || command.forge.is_some() {
+            command.forge_fetch = None;
+        }
         link.send(&LinkFrame::Launch(command)).await?;
         Ok(runtime)
     }

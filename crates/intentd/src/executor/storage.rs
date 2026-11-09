@@ -51,13 +51,24 @@ pub(super) fn git_socket_path(
     credential: &str,
     runtime_base: &Path,
 ) -> anyhow::Result<PathBuf> {
-    use sha2::Digest as _;
-    use std::os::unix::ffi::OsStrExt as _;
-
     let beside = executor_dir.join(format!("{}.sock", &credential[..credential.len().min(12)]));
     if beside.as_os_str().len() <= MAX_SOCKET_PATH {
         return Ok(beside);
     }
+    let dir = private_socket_dir(runtime_base)?;
+    let socket = dir.join(format!("{}.sock", short_hash(executor_dir, credential)));
+    ensure!(
+        socket.as_os_str().len() <= MAX_SOCKET_PATH,
+        "the executor's git socket path {} is longer than a Unix socket allows \
+         ({MAX_SOCKET_PATH} bytes); use a shorter XDG_RUNTIME_DIR",
+        socket.display()
+    );
+    Ok(socket)
+}
+
+/// The user's private socket directory under `runtime_base`, closed to
+/// group and others.
+fn private_socket_dir(runtime_base: &Path) -> anyhow::Result<PathBuf> {
     let uid = nix::unistd::getuid();
     let dir = runtime_base.join(format!("intentd-{uid}"));
     match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
@@ -79,21 +90,45 @@ pub(super) fn git_socket_path(
         "socket directory {} must not be accessible to group or others (chmod 700)",
         dir.display()
     );
+    Ok(dir)
+}
+
+/// 16 hex digits of the SHA-256 of `path` and `id`.
+fn short_hash(path: &Path, id: &str) -> String {
+    use sha2::Digest as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
     let mut hasher = sha2::Sha256::new();
-    hasher.update(executor_dir.as_os_str().as_bytes());
+    hasher.update(path.as_os_str().as_bytes());
     hasher.update([0]);
-    hasher.update(credential.as_bytes());
+    hasher.update(id.as_bytes());
     let digest = hasher.finalize();
-    let name = digest[..8].iter().fold(String::new(), |mut name, b| {
+    digest[..8].iter().fold(String::new(), |mut name, b| {
         use std::fmt::Write as _;
         let _ = write!(name, "{b:02x}");
         name
-    });
-    let socket = dir.join(format!("{name}.sock"));
+    })
+}
+
+/// Where a sub-agent's own forge helper socket goes (nodeProtocol 17):
+/// beside the machine's `git_socket` when that path fits, else in the
+/// private directory under `runtime_base`.
+pub(super) fn forge_socket_path(
+    git_socket: &Path,
+    agent_id: &str,
+    runtime_base: &Path,
+) -> anyhow::Result<PathBuf> {
+    let name = format!("f{}.sock", short_hash(git_socket, agent_id));
+    if let Some(parent) = git_socket.parent() {
+        let beside = parent.join(&name);
+        if beside.as_os_str().len() <= MAX_SOCKET_PATH {
+            return Ok(beside);
+        }
+    }
+    let socket = private_socket_dir(runtime_base)?.join(name);
     ensure!(
         socket.as_os_str().len() <= MAX_SOCKET_PATH,
-        "the executor's git socket path {} is longer than a Unix socket allows \
-         ({MAX_SOCKET_PATH} bytes); use a shorter XDG_RUNTIME_DIR",
+        "the agent's git socket path {} is longer than a Unix socket allows",
         socket.display()
     );
     Ok(socket)

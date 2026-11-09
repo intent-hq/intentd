@@ -27,9 +27,9 @@ use intent_acp::{
     SinkEvent, SpawnOptions,
 };
 use intent_core::node_link::{
-    CheckoutRead, CheckoutReadOutcome, CheckoutReadReply, ExitFailure, FinalPush, ForgeLaunch,
-    GitIdentity, JournalBody, JournalRecord, LaunchCommand, LeaseBinding, MachineCapacity,
-    StopOutcome, SKILLS_PROTOCOL,
+    CheckoutRead, CheckoutReadOutcome, CheckoutReadReply, ExitFailure, FinalPush,
+    ForgeFetchLaunch, ForgeLaunch, GitIdentity, JournalBody, JournalRecord, LaunchCommand,
+    LeaseBinding, MachineCapacity, StopOutcome, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::CapacityRefusal;
@@ -151,11 +151,35 @@ pub(super) struct RunnerConfig {
     /// asks for the live forge token (nodeProtocol 15); `None` gives no
     /// agent the credential helper.
     pub git_socket: Option<PathBuf>,
+    /// What a sub-agent's own forge helper socket needs (nodeProtocol 17);
+    /// `None` gives no sub-agent a fetch path.
+    pub forge_git: Option<ForgeGit>,
     /// Told the provider when a launch without a profile fails to
     /// authenticate.
     pub auth_failed: AuthFailed,
     /// Where folders other agents pull are packed (nodeProtocol 16).
     pub pull_staging: PathBuf,
+}
+
+/// The machine's git sessions and `git-remote-intent` directory, for the
+/// forge helper socket of a sub-agent (nodeProtocol 17).
+#[derive(Clone)]
+pub(super) struct ForgeGit {
+    pub helper_dir: PathBuf,
+    pub sessions: intent_transport::node_link::NodeGitSessions,
+}
+
+/// A sub-agent's own forge helper socket, served until dropped.
+struct ForgeSocket {
+    path: PathBuf,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ForgeSocket {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Told a provider id when that provider's default account (a launch
@@ -175,6 +199,7 @@ struct Inner {
     home: Option<PathBuf>,
     mcp_bridge_exe: PathBuf,
     git_socket: Option<PathBuf>,
+    forge_git: Option<ForgeGit>,
     auth_failed: AuthFailed,
     /// The newest bound link; agents forward control-plane calls on it.
     head: HeadLink,
@@ -447,6 +472,9 @@ struct Agent {
     /// Its workspace branch and GitHub remote (nodeProtocol 15): top-level
     /// agents only.
     forge: Option<ForgeLaunch>,
+    /// Its GitHub repository, fetched through the backend (nodeProtocol
+    /// 16): sub-agents only.
+    forge_fetch: Option<ForgeFetchLaunch>,
     /// The backend's commit identity for the workspace, set as the
     /// provider's `GIT_AUTHOR_*` / `GIT_COMMITTER_*`.
     git_identity: Option<intent_core::node_link::GitIdentity>,
@@ -894,6 +922,7 @@ impl Runner {
                 home: config.home,
                 mcp_bridge_exe: config.mcp_bridge_exe,
                 git_socket: config.git_socket,
+                forge_git: config.forge_git,
                 auth_failed: config.auth_failed,
                 head: HeadLink::default(),
                 journal: Arc::new(Mutex::new(config.journal)),
@@ -1206,11 +1235,13 @@ impl Runner {
             compact_tool_descriptions,
             checkout_of,
             forge,
+            forge_fetch,
             git_identity,
             new_machine,
         } = command;
         let git_identity = git_identity.map(|identity| *identity);
         let forge = forge.map(|forge| *forge);
+        let forge_fetch = forge_fetch.map(|fetch| *fetch);
         let prepared = checkout.is_some();
         let both = prepared && checkout_of.is_some();
         let setup = checkout
@@ -1251,6 +1282,16 @@ impl Runner {
                 drop(state);
                 return Some(exited(format!(
                     "{}: the launch's forge branch or remote is not usable",
+                    codes::CHECKOUT
+                )));
+            }
+        }
+        if let Some(fetch) = &forge_fetch {
+            let sub_agent = is_sub_agent || checkout_of.is_some();
+            if forge.is_some() || !sub_agent || fetch.owner_repo().is_none() {
+                drop(state);
+                return Some(exited(format!(
+                    "{}: the launch's forge fetch remote is not usable",
                     codes::CHECKOUT
                 )));
             }
@@ -1339,6 +1380,7 @@ impl Runner {
             )),
             forge_lease: Mutex::new(None),
             forge,
+            forge_fetch,
             git_identity,
             npx_launch_dir: Mutex::new(None),
             default_account: profile.is_none().then(|| {
@@ -1518,16 +1560,33 @@ impl Runner {
         };
         // A top-level agent's own checkout gets its forge branch and
         // `origin`, or loses them on a launch without (nodeProtocol 15).
+        // A sub-agent that fetches through the backend gets an `origin`
+        // when its checkout has none (nodeProtocol 17).
         let prepared = match prepared {
-            Some(Ok(ready)) if agent.checkout_of.is_none() => Some(
-                self.inner
-                    .checkouts
-                    .forge(&agent.id, &ready.worktree, agent.forge.as_ref())
-                    .await
-                    .map(|()| ready),
-            ),
+            Some(Ok(ready)) => {
+                let configured = async {
+                    if agent.checkout_of.is_none() {
+                        self.inner
+                            .checkouts
+                            .forge(&agent.id, &ready.worktree, agent.forge.as_ref())
+                            .await?;
+                    }
+                    if let Some(fetch) = &agent.forge_fetch {
+                        self.inner
+                            .checkouts
+                            .forge_origin(&ready.worktree, &fetch.remote_url)
+                            .await?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                };
+                Some(configured.await.map(|()| ready))
+            }
             other => other,
         };
+        let forge_socket = self.forge_socket(&agent).unwrap_or_else(|error| {
+            tracing::warn!(agent = %agent.id, %error, "node: no forge fetch path for the sub-agent");
+            None
+        });
         let started = match prepared {
             None => Err(None),
             Some(Err(error)) => Err(Some(format!("{}: {error:#}", codes::CHECKOUT))),
@@ -1569,7 +1628,10 @@ impl Runner {
                         .into_iter()
                         .flatten()
                         .reduce(|all, next| format!("{all}\n\n{next}"));
-                    let helper_env = self.forge_helper_env(&agent);
+                    let mut helper_env = self.forge_helper_env(&agent);
+                    if let Some(socket) = &forge_socket {
+                        helper_env.extend(self.forge_fetch_env(&agent, socket));
+                    }
                     self.find_skills(&agent, &cwd).await;
                     match workspace_api::serve(
                         &agent.id,
@@ -1692,9 +1754,72 @@ impl Runner {
             ));
         }
         let sub_agent = agent.gates.is_sub_agent || agent.checkout_of.is_some();
-        (sub_agent && self.inner.head.forge().get().is_some()).then(|| {
+        let token = (sub_agent && self.inner.head.forge().get().is_some()).then(|| {
             "`GH_TOKEN` is set so that `gh` can read from GitHub. Use it only to read: do not push, and do not create or change anything on GitHub. Your work goes back to your parent agent through Intent.".to_owned()
-        })
+        });
+        let fetch = (agent.forge_fetch.is_some() && self.inner.forge_git.is_some()).then(|| {
+            "`git fetch origin` gets the current branches from GitHub through Intent. `git push` to GitHub is refused: your work goes back to your parent agent through Intent.".to_owned()
+        });
+        [token, fetch]
+            .into_iter()
+            .flatten()
+            .reduce(|all, next| format!("{all} {next}"))
+    }
+
+    /// A sub-agent's own forge helper socket (nodeProtocol 17), when it
+    /// fetches GitHub through the backend.
+    fn forge_socket(&self, agent: &Agent) -> anyhow::Result<Option<ForgeSocket>> {
+        let (Some(_), Some(git), Some(main)) = (
+            &agent.forge_fetch,
+            &self.inner.forge_git,
+            &self.inner.git_socket,
+        ) else {
+            return Ok(None);
+        };
+        let path =
+            super::storage::forge_socket_path(main, &agent.id.0, &super::storage::runtime_base())?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        let remote =
+            intent_git::node_git::AgentRemote::new(agent.workspace_id.as_str(), &agent.id.0)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .forge();
+        // caller-binding: allow — machine-local git helper socket for one sub-agent
+        let task = tokio::spawn(intent_transport::node_link::serve_forge_helpers(
+            listener,
+            git.sessions.clone(),
+            remote,
+        ));
+        Ok(Some(ForgeSocket { path, task }))
+    }
+
+    /// The git environment of a sub-agent that fetches GitHub through the
+    /// backend (nodeProtocol 17): its GitHub URLs rewritten to its forge
+    /// remote, reached through its own socket.
+    fn forge_fetch_env(&self, agent: &Agent, socket: &ForgeSocket) -> Vec<(String, String)> {
+        let Some(fetch) = &agent.forge_fetch else {
+            return Vec::new();
+        };
+        let Ok(remote) =
+            intent_git::node_git::AgentRemote::new(agent.workspace_id.as_str(), &agent.id.0)
+        else {
+            return Vec::new();
+        };
+        let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
+        let mut env = intent_git::auth::forge_fetch_env(
+            &remote.forge().url(),
+            &fetch.remote_url,
+            inherited.as_deref(),
+        );
+        env.push((
+            intent_git::node_git::SOCKET_ENV.to_owned(),
+            socket.path.to_string_lossy().into_owned(),
+        ));
+        env
     }
 
     /// The git credential helper environment of an agent with `forge`
@@ -1875,6 +2000,13 @@ impl Runner {
         options.npx_fallback_package = launch.npx_fallback_package;
         options.model = model;
         options.profile_env = profile;
+        if agent.forge_fetch.is_some() {
+            options.path_prefix = self
+                .inner
+                .forge_git
+                .as_ref()
+                .map(|git| git.helper_dir.as_path());
+        }
         options.extra_env.clone_from(&launch.extra_env);
         options
             .extra_env

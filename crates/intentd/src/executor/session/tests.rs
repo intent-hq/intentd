@@ -68,6 +68,7 @@ fn harness() -> Harness {
         mcp_bridge_exe: std::env::current_exe().unwrap(),
         git_socket: None,
         pull_staging: storage.pull_staging_dir(),
+        forge_git: None,
         auth_failed: Arc::new(|_: &str| {}),
     });
     Harness { runner, _dir: dir }
@@ -98,6 +99,7 @@ fn launch(id: &str) -> LinkFrame {
         compact_tool_descriptions: false,
         checkout_of: None,
         forge: None,
+        forge_fetch: None,
         git_identity: None,
         new_machine: None,
     })

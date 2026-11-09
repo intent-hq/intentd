@@ -66,6 +66,44 @@ pub mod codes {
     pub const FAILED: &str = "node-git-failed";
     /// No git connection, or it closed during the session.
     pub const UNAVAILABLE: &str = "node-git-unavailable";
+    /// A push on a forge remote (nodeProtocol 17): sub-agents hand work
+    /// back through their agent refs.
+    pub const PUSH_REFUSED: &str = "node-git-push-refused";
+}
+
+/// What the helper prints when head refuses a push on a forge remote.
+pub const PUSH_REFUSED_MESSAGE: &str =
+    "sub-agents hand work back through intent1; ask your parent to push";
+
+/// The warning a forge ACCEPT carries when head served the last fetched
+/// refs because the GitHub refresh failed.
+pub const FORGE_REFRESH_FAILED: &str = "forge-refresh-failed";
+
+/// What the helper prints for [`FORGE_REFRESH_FAILED`].
+pub const FORGE_REFRESH_FAILED_MESSAGE: &str =
+    "could not refresh from GitHub; showing the last fetched refs";
+
+/// Forge sessions the node opens at a time; more wait for a slot.
+pub const MAX_FORGE_SESSIONS: usize = 2;
+
+/// How long a forge session waits on the node for a slot before it fails
+/// with [`codes::BUSY`].
+pub const FORGE_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A forge ACCEPT's payload (nodeProtocol 17).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// The repository head serves a forge remote from, and the warning its
+/// ACCEPT carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeServe {
+    pub repository: PathBuf,
+    pub warning: Option<&'static str>,
 }
 
 /// What a node asks head to run.
@@ -108,6 +146,7 @@ fn session_error(code: &str) -> Error {
         codes::BUSY => Error::Internal(codes::BUSY.into()),
         codes::INVALID => Error::InvalidParams(codes::INVALID.into()),
         codes::UNAVAILABLE => Error::Internal(codes::UNAVAILABLE.into()),
+        codes::PUSH_REFUSED => Error::Forbidden(codes::PUSH_REFUSED.into()),
         _ => Error::Internal(codes::FAILED.into()),
     }
 }
@@ -146,6 +185,18 @@ pub trait NodeGitAccess: Send + Sync {
         remote: &'a AgentRemote,
         service: GitService,
     ) -> BoxFuture<'a, Result<PathBuf>>;
+
+    /// The repository serving `remote`'s forge upload-pack (nodeProtocol
+    /// 16), refreshed from GitHub, under the same authority as
+    /// [`Self::repository`]. Errors map to codes as there.
+    fn forge<'a>(
+        &'a self,
+        binding: &'a LeaseBinding,
+        remote: &'a AgentRemote,
+    ) -> BoxFuture<'a, Result<ForgeServe>> {
+        let _ = (binding, remote);
+        Box::pin(async { Err(Error::InvalidParams(codes::INVALID.into())) })
+    }
 }
 
 struct HeadSession {
@@ -258,19 +309,41 @@ async fn run_service(
     let open: OpenRequest = serde_json::from_slice(open).map_err(|_| codes::INVALID)?;
     let service = GitService::parse(&open.service).map_err(|_| codes::INVALID)?;
     let remote = AgentRemote::parse(&open.url).map_err(|_| codes::INVALID)?;
-    let repository = access
-        .repository(binding, &remote, service)
-        .await
-        .map_err(|error| access_code(&error))?;
-    let mut child = service_command(service, &repository, &remote)
-        .map_err(|_| codes::FAILED)?
-        .spawn()
-        .map_err(|_| codes::FAILED)?;
+    let (command, accept) = if remote.is_forge() {
+        if service == GitService::ReceivePack {
+            return Err(codes::PUSH_REFUSED);
+        }
+        let served = access
+            .forge(binding, &remote)
+            .await
+            .map_err(|error| access_code(&error))?;
+        let accept = served.warning.map(|warning| {
+            serde_json::to_vec(&AcceptStatus {
+                warning: Some(warning.to_owned()),
+            })
+            .unwrap_or_default()
+        });
+        (
+            intent_git::node_git::forge::upload_pack_command(&served.repository),
+            accept.unwrap_or_default(),
+        )
+    } else {
+        let repository = access
+            .repository(binding, &remote, service)
+            .await
+            .map_err(|error| access_code(&error))?;
+        (
+            service_command(service, &repository, &remote).map_err(|_| codes::FAILED)?,
+            Vec::new(),
+        )
+    };
+    let mut command = command;
+    let mut child = command.spawn().map_err(|_| codes::FAILED)?;
     let (Some(mut stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
         return Err(codes::FAILED);
     };
     sender
-        .send(encode(ACCEPT, id, &[]))
+        .send(encode(ACCEPT, id, &accept))
         .await
         .map_err(|_| codes::UNAVAILABLE)?;
     let input = async move {
@@ -314,7 +387,9 @@ async fn run_service(
 /// An event for one node-side session.
 #[derive(Debug)]
 enum SessionEvent {
-    Accepted,
+    /// With a forge ACCEPT's warning; `Err` for a payload that is not an
+    /// [`AcceptStatus`].
+    Accepted(std::result::Result<Option<String>, ()>),
     Data(Vec<u8>),
     Closed(Option<String>),
 }
@@ -331,6 +406,8 @@ struct NodeState {
 #[derive(Clone)]
 pub struct NodeGitSessions {
     state: Arc<Mutex<NodeState>>,
+    /// [`MAX_FORGE_SESSIONS`] slots for forge sessions.
+    forge_slots: Arc<tokio::sync::Semaphore>,
     /// Bumped on every attach, so an open waiting for a connection wakes.
     attached: tokio::sync::watch::Sender<u64>,
 }
@@ -339,6 +416,7 @@ impl Default for NodeGitSessions {
     fn default() -> Self {
         Self {
             state: Arc::default(),
+            forge_slots: Arc::new(tokio::sync::Semaphore::new(MAX_FORGE_SESSIONS)),
             attached: tokio::sync::watch::channel(0).0,
         }
     }
@@ -385,7 +463,12 @@ impl NodeGitSessions {
         tokio::spawn(async move {
             while let Some((kind, id, payload)) = connection.recv().await.and_then(decode) {
                 let event = match kind {
-                    ACCEPT => SessionEvent::Accepted,
+                    ACCEPT if payload.is_empty() => SessionEvent::Accepted(Ok(None)),
+                    ACCEPT => SessionEvent::Accepted(
+                        serde_json::from_slice::<AcceptStatus>(&payload)
+                            .map(|status| status.warning)
+                            .map_err(|_| ()),
+                    ),
                     DATA => SessionEvent::Data(payload),
                     CLOSE => SessionEvent::Closed(
                         serde_json::from_slice::<CloseStatus>(&payload)
@@ -430,6 +513,16 @@ impl NodeGitSessions {
     /// A [`codes`] error: unavailable when no connection attaches within
     /// [`ATTACH_WAIT`], or head's refusal.
     pub async fn open(&self, service: GitService, remote: &AgentRemote) -> Result<GitSession> {
+        let slot = if remote.is_forge() {
+            match tokio::time::timeout(FORGE_SLOT_WAIT, self.forge_slots.clone().acquire_owned())
+                .await
+            {
+                Ok(Ok(slot)) => Some(slot),
+                _ => return Err(session_error(codes::BUSY)),
+            }
+        } else {
+            None
+        };
         let (events_tx, mut events) = mpsc::channel(SESSION_QUEUE);
         let mut attached = self.attached.subscribe();
         let deadline = tokio::time::Instant::now() + ATTACH_WAIT;
@@ -457,6 +550,8 @@ impl NodeGitSessions {
             events: None,
             state: self.state.clone(),
             closed: false,
+            warning: None,
+            _slot: slot,
         };
         let open = OpenRequest {
             service: service.as_str().to_owned(),
@@ -469,10 +564,14 @@ impl NodeGitSessions {
             .await
             .map_err(|_| session_error(codes::UNAVAILABLE))?;
         match events.recv().await {
-            Some(SessionEvent::Accepted) => {
+            Some(SessionEvent::Accepted(Ok(warning))) if warning.is_none() || remote.is_forge() => {
                 session.events = Some(events);
+                session.warning = warning;
                 Ok(session)
             }
+            // A payload on another remote, or one that does not decode:
+            // dropping the session closes it.
+            Some(SessionEvent::Accepted(_)) => Err(session_error(codes::INVALID)),
             Some(SessionEvent::Closed(error)) => {
                 session.closed = true;
                 Err(session_error(error.as_deref().unwrap_or(codes::FAILED)))
@@ -491,9 +590,17 @@ pub struct GitSession {
     events: Option<mpsc::Receiver<SessionEvent>>,
     state: Arc<Mutex<NodeState>>,
     closed: bool,
+    warning: Option<String>,
+    _slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl GitSession {
+    /// The warning head's ACCEPT carried (a forge session only).
+    #[must_use]
+    pub fn warning(&self) -> Option<&str> {
+        self.warning.as_deref()
+    }
+
     /// Send bytes to the service's stdin.
     ///
     /// # Errors
@@ -544,7 +651,7 @@ impl GitSession {
                 self.closed = true;
                 Err(session_error(&code))
             }
-            Some(SessionEvent::Accepted) | None => {
+            Some(SessionEvent::Accepted(_)) | None => {
                 self.closed = true;
                 Err(session_error(codes::UNAVAILABLE))
             }
@@ -582,7 +689,9 @@ impl Drop for GitSession {
 /// Node side: serve `git-remote-intent` helpers on the node's local socket.
 /// Each helper connection writes one `<service> <url>\n` line, gets back one
 /// status byte (`0` accepted, `1` refused followed by an error code line),
-/// then carries the session's bytes both ways.
+/// then carries the session's bytes both ways. A forge session whose ACCEPT
+/// carried a warning answers `2` followed by the warning line instead of
+/// `0`.
 #[cfg(unix)]
 pub async fn serve_helpers(listener: tokio::net::UnixListener, sessions: NodeGitSessions) {
     serve_helpers_with(listener, sessions, None).await;
@@ -612,7 +721,27 @@ pub async fn serve_helpers_with(
         let sessions = sessions.clone();
         let credential = credential.clone();
         tokio::spawn(async move {
-            let _ = serve_helper(stream, &sessions, credential.as_ref()).await;
+            let _ = serve_helper(stream, &sessions, credential.as_ref(), None).await;
+        });
+    }
+}
+
+/// One sub-agent's own helper socket (nodeProtocol 17): it opens only
+/// `forge`, that agent's forge remote, and answers no credential request.
+/// Another agent's forge remote is [`codes::DENIED`]; any other request is
+/// [`codes::INVALID`].
+#[cfg(unix)]
+pub async fn serve_forge_helpers(
+    listener: tokio::net::UnixListener,
+    sessions: NodeGitSessions,
+    forge: AgentRemote,
+) {
+    let forge = Arc::new(forge);
+    while let Ok((stream, _)) = listener.accept().await {
+        let sessions = sessions.clone();
+        let forge = forge.clone();
+        tokio::spawn(async move {
+            let _ = serve_helper(stream, &sessions, None, Some(&forge)).await;
         });
     }
 }
@@ -622,6 +751,7 @@ async fn serve_helper(
     stream: tokio::net::UnixStream,
     sessions: &NodeGitSessions,
     credential: Option<&HelperCredential>,
+    only: Option<&AgentRemote>,
 ) -> Result<()> {
     use tokio::io::AsyncBufReadExt as _;
 
@@ -637,7 +767,7 @@ async fn serve_helper(
         .ok()
         .and_then(|line| line.strip_suffix('\n'))
         .and_then(|line| line.split_once(' '));
-    if let Some((CREDENTIAL_REQUEST, host)) = request {
+    if let (Some((CREDENTIAL_REQUEST, host)), None) = (request, only) {
         let token = credential.and_then(|credential| credential(host));
         let reply = match &token {
             Some(token) => zeroize::Zeroizing::new(format!("\x00{}\n", token.expose())),
@@ -649,6 +779,12 @@ async fn serve_helper(
     }
     let opened = match request {
         Some((service, url)) => match (GitService::parse(service), AgentRemote::parse(url)) {
+            (Ok(_), Ok(remote)) if only.is_some() && !remote.is_forge() => {
+                Err(session_error(codes::INVALID))
+            }
+            (Ok(_), Ok(remote)) if only.is_some_and(|only| *only != remote) => {
+                Err(session_error(codes::DENIED))
+            }
             (Ok(service), Ok(remote)) => sessions.open(service, &remote).await,
             _ => Err(session_error(codes::INVALID)),
         },
@@ -662,8 +798,12 @@ async fn serve_helper(
             return Err(error);
         }
     };
+    let status = match session.warning() {
+        Some(warning) => format!("\x02{warning}\n").into_bytes(),
+        None => vec![0],
+    };
     write
-        .write_all(&[0])
+        .write_all(&status)
         .await
         .map_err(|_| session_error(codes::UNAVAILABLE))?;
     let mut buffer = vec![0; CHUNK];

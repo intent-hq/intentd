@@ -94,6 +94,17 @@ pub(super) trait Checkouts: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
+    /// Give `worktree` an `origin` at `remote_url` when it has none, for a
+    /// sub-agent that fetches GitHub through the backend (nodeProtocol 17).
+    fn forge_origin<'a>(
+        &'a self,
+        worktree: &'a Path,
+        remote_url: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        let _ = (worktree, remote_url);
+        Box::pin(async { Ok(()) })
+    }
+
     /// Test seam: runs as the bind sweep is about to remove a checkout.
     #[cfg(test)]
     fn before_sweep_removal<'a>(&'a self, agent_id: &'a AgentId) -> BoxFuture<'a, ()> {
@@ -264,6 +275,19 @@ impl Checkouts for GitCheckouts {
             }
             self.cache.clear_forge(worktree, &local).await;
             Ok(())
+        })
+    }
+
+    fn forge_origin<'a>(
+        &'a self,
+        worktree: &'a Path,
+        remote_url: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.cache
+                .ensure_origin(worktree, remote_url)
+                .await
+                .map_err(|e| anyhow::anyhow!("set up the sub-agent's origin: {e}"))
         })
     }
 }

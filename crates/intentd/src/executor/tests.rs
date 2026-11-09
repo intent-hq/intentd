@@ -463,6 +463,7 @@ fn launch_of(id: &str, provider: &str) -> LinkFrame {
         compact_tool_descriptions: false,
         checkout_of: None,
         forge: None,
+        forge_fetch: None,
         git_identity: None,
         new_machine: None,
     })
@@ -820,6 +821,7 @@ async fn executor_shutdown_settles_launches_arriving_on_a_live_link() {
             compact_tool_descriptions: false,
             checkout_of: None,
             forge: None,
+            forge_fetch: None,
             git_identity: None,
             new_machine: None,
         })

@@ -15518,6 +15518,15 @@ pub async fn github_git_credential(
     ))
 }
 
+/// The daemon's own GitHub token for its own git operations (by
+/// `sourceControl.github.tokenSource`), whatever
+/// `exposeGitCredentialToChildren` says: that setting gates only what
+/// children get. `None` when no usable token resolves.
+pub async fn github_backend_token(registry: Option<&SettingsRegistry>) -> Option<String> {
+    let token = intent_sourcecontrol::token::resolve(&github_token_source(registry)).await;
+    intent_git::auth::usable_token(token.as_deref()).map(str::to_owned)
+}
+
 /// The running daemon's own binary path, for spawn sites that configure the
 /// `intentd git-credential` helper in child environments (monorepo#884 Phase
 /// 2.2). `None` when `current_exe` fails or the path is not valid UTF-8

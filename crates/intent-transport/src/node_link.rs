@@ -40,11 +40,14 @@ pub use git::{GitConnection, GitSender};
 #[cfg(unix)]
 pub use git_helper::run_git_remote_helper;
 pub use git_session::{
-    codes as git_codes, serve_git, CloseStatus, GitSession, NodeGitAccess, NodeGitSessions,
-    OpenRequest, ATTACH_WAIT, MAX_SESSIONS,
+    codes as git_codes, serve_git, AcceptStatus, CloseStatus, ForgeServe, GitSession,
+    NodeGitAccess, NodeGitSessions, OpenRequest, ATTACH_WAIT, FORGE_REFRESH_FAILED,
+    FORGE_REFRESH_FAILED_MESSAGE, MAX_FORGE_SESSIONS, MAX_SESSIONS, PUSH_REFUSED_MESSAGE,
 };
 #[cfg(unix)]
-pub use git_session::{serve_helpers, serve_helpers_with, HelperCredential, CREDENTIAL_REQUEST};
+pub use git_session::{
+    serve_forge_helpers, serve_helpers, serve_helpers_with, HelperCredential, CREDENTIAL_REQUEST,
+};
 pub use intent_core::node_link::*;
 pub use link::{IncomingRequest, LinkEvent, LinkEvents, NodeLink, StopAcked};
 pub use pin::CertificatePin;

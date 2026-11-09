@@ -54,7 +54,11 @@ pub(super) async fn backend_with_token_env(
     let (head, port, cfg, ws_id) = start_backend_with(
         &head_dir,
         &repo,
-        &[&[("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:1")], env].concat(),
+        &[
+            &[("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:1")],
+            env,
+        ]
+        .concat(),
     )
     .await;
     let mut rpc_ws = connect(port, cfg.clone()).await;

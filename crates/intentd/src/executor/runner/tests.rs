@@ -123,6 +123,7 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
         mcp_bridge_exe: std::env::current_exe().unwrap(),
         git_socket: None,
         pull_staging: storage.pull_staging_dir(),
+        forge_git: None,
         home: Some(dir.path().join("home")),
         auth_failed: {
             let auth_failures = auth_failures.clone();
@@ -157,6 +158,7 @@ fn launch(id: &str) -> LaunchCommand {
         compact_tool_descriptions: false,
         checkout_of: None,
         forge: None,
+        forge_fetch: None,
         git_identity: None,
         new_machine: None,
     }
@@ -437,6 +439,7 @@ async fn a_pump_ending_without_an_exit_record_settles_it_as_lost() {
         mcp_bridge_exe: std::env::current_exe().unwrap(),
         git_socket: None,
         pull_staging: storage.pull_staging_dir(),
+        forge_git: None,
         home: None,
         auth_failed: Arc::new(|_: &str| {}),
     });
