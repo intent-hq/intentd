@@ -51,6 +51,7 @@ tempfile = "3"
 reqwest.workspace = true
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 sha2 = "0.11"
+tar = "0.4.46"
 getrandom = "0.4"
 zip = { version = "9.4.2", default-features = false, features = ["deflate"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
@@ -73,7 +74,7 @@ intent-store = { path = "../intent-store", version = "0.11.161", features = ["te
 intent-acp = { path = "../intent-acp", version = "0.11.161", features = ["test-hooks"] }
 
 [target."cfg(unix)".dependencies]
-nix = { workspace = true, features = ["signal", "process", "fs"] }
+nix = { workspace = true, features = ["signal", "process", "fs", "dir"] }
 pprof = "0.15"
 libc = { workspace = true }
 

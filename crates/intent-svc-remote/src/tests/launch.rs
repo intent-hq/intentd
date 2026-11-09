@@ -18,6 +18,7 @@ use intent_transport::node_link::NodeGitAccess;
 
 use super::*;
 
+mod file_pull;
 mod mcp_proxies;
 #[cfg(unix)]
 mod submodules;

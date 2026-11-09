@@ -122,6 +122,7 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
         journal,
         mcp_bridge_exe: std::env::current_exe().unwrap(),
         git_socket: None,
+        pull_staging: storage.pull_staging_dir(),
         home: Some(dir.path().join("home")),
         auth_failed: {
             let auth_failures = auth_failures.clone();
@@ -434,6 +435,7 @@ async fn a_pump_ending_without_an_exit_record_settles_it_as_lost() {
         journal: Journal::open(&storage.journal_dir()).unwrap(),
         mcp_bridge_exe: std::env::current_exe().unwrap(),
         git_socket: None,
+        pull_staging: storage.pull_staging_dir(),
         home: None,
         auth_failed: Arc::new(|_: &str| {}),
     });

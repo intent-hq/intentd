@@ -21,6 +21,7 @@ const CACHE: &str = "cache";
 const BIN: &str = "bin";
 const REPOS: &str = "repos";
 const GIT_SOCKET: &str = "git.sock";
+const PULLS: &str = "pulls";
 
 /// Longest Unix socket path in bytes, without the trailing NUL
 /// (`sun_path` holds 104 bytes on macOS, 108 on Linux).
@@ -246,6 +247,15 @@ impl Storage {
             .create(&dir)
             .context("create the main checkout directory")?;
         Ok(dir)
+    }
+
+    /// Where folders another agent pulls from this machine are packed
+    /// (`ws.file.pull`, nodeProtocol 16), outside every checkout. Emptied
+    /// here: a packed folder never outlives its daemon.
+    pub(super) fn pull_staging_dir(&self) -> PathBuf {
+        let dir = self.root.join(PULLS);
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
     }
 
     /// The per-repository bare caches holding agent worktrees.

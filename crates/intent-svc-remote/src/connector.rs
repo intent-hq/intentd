@@ -347,6 +347,13 @@ pub(crate) struct Shared {
     /// Waiting for the machine's `pushWipReply`, by request id
     /// (nodeProtocol 13).
     push_waiters: Mutex<HashMap<intent_core::node_link::LinkId, oneshot::Sender<PushWipResult>>>,
+    /// `checkoutRead`s waiting for their reply (nodeProtocol 16).
+    checkout_waiters: Mutex<
+        HashMap<
+            intent_core::node_link::LinkId,
+            oneshot::Sender<intent_core::node_link::CheckoutReadReply>,
+        >,
+    >,
     /// Waiting for the machine's `secretReply`, by request id
     /// (nodeProtocol 14).
     secret_waiters: Mutex<HashMap<LinkId, oneshot::Sender<SecretReply>>>,
@@ -495,6 +502,7 @@ impl Shared {
             || !lock(&self.capability_waiters).is_empty()
             || !lock(&self.skills_waiters).is_empty()
             || !lock(&self.push_waiters).is_empty()
+            || !lock(&self.checkout_waiters).is_empty()
             || !lock(&self.secret_waiters).is_empty()
             || (self
                 .survivors_unclaimed
@@ -512,6 +520,7 @@ impl Shared {
             || !lock(&self.capability_waiters).is_empty()
             || !lock(&self.skills_waiters).is_empty()
             || !lock(&self.push_waiters).is_empty()
+            || !lock(&self.checkout_waiters).is_empty()
             || !lock(&self.secret_waiters).is_empty()
     }
 
@@ -1634,6 +1643,7 @@ impl RemoteNode {
             capability_waiters: Mutex::new(Vec::new()),
             skills_waiters: Mutex::new(HashMap::new()),
             push_waiters: Mutex::new(HashMap::new()),
+            checkout_waiters: Mutex::new(HashMap::new()),
             secret_waiters: Mutex::new(HashMap::new()),
             secret_forgets: Mutex::new(Vec::new()),
             secret_locks: Mutex::new(HashMap::new()),
@@ -1944,6 +1954,40 @@ impl RemoteNode {
         }
         .await;
         lock(&self.shared.push_waiters).remove(&request_id);
+        reply
+    }
+
+    /// Read one piece of a file in `read.agent_id`'s checkout on the machine
+    /// (`checkoutRead`, nodeProtocol 16), waiting up to `wait` for the
+    /// answer. Connecting resumes a paused cloud machine.
+    ///
+    /// # Errors
+    ///
+    /// As [`RemoteNode::connect`]; `node-link-timeout` when the machine
+    /// does not answer in time.
+    pub(crate) async fn checkout_read(
+        &self,
+        read: intent_core::node_link::CheckoutRead,
+        wait: Duration,
+    ) -> Result<intent_core::node_link::CheckoutReadReply> {
+        let request_id = read.request_id;
+        let (tx, rx) = oneshot::channel();
+        lock(&self.shared.checkout_waiters).insert(request_id, tx);
+        let reply = async {
+            self.connect().await?;
+            self.shared.send(&LinkFrame::CheckoutRead(read)).await?;
+            tokio::time::timeout(wait, rx)
+                .await
+                .map_err(|_| {
+                    Error::Internal(format!(
+                        "{}: the machine did not answer the file read",
+                        link::codes::TIMEOUT
+                    ))
+                })?
+                .map_err(|_| Error::Internal(link::codes::CLOSED.into()))
+        }
+        .await;
+        lock(&self.shared.checkout_waiters).remove(&request_id);
         reply
     }
 
@@ -2268,6 +2312,7 @@ async fn run(
                 lock(&shared.capability_waiters).clear();
                 lock(&shared.skills_waiters).clear();
                 lock(&shared.push_waiters).clear();
+                lock(&shared.checkout_waiters).clear();
                 lock(&shared.secret_waiters).clear();
                 retry = shared.wants_link();
                 if retry {
@@ -2341,6 +2386,7 @@ async fn run(
             lock(&shared.capability_waiters).clear();
             lock(&shared.skills_waiters).clear();
             lock(&shared.push_waiters).clear();
+            lock(&shared.checkout_waiters).clear();
             lock(&shared.secret_waiters).clear();
             shared.announce().await;
             retry = shared.wants_link();
@@ -2460,6 +2506,7 @@ async fn run(
         lock(&shared.capability_waiters).clear();
         lock(&shared.skills_waiters).clear();
         lock(&shared.push_waiters).clear();
+        lock(&shared.checkout_waiters).clear();
         lock(&shared.secret_waiters).clear();
         // The machine stops this binding's scripts when its link closes.
         shared
@@ -2576,6 +2623,13 @@ async fn serve(
                     LinkEvent::Frame(LinkFrame::SkillsReply(reply)) => {
                         if let Some(waiter) = lock(&shared.skills_waiters).remove(&reply.query_id) {
                             let _ = waiter.send(reply.skills);
+                        }
+                    }
+                    LinkEvent::Frame(LinkFrame::CheckoutReadReply(reply)) => {
+                        if let Some(waiter) =
+                            lock(&shared.checkout_waiters).remove(&reply.request_id)
+                        {
+                            let _ = waiter.send(reply);
                         }
                     }
                     LinkEvent::Frame(LinkFrame::PushWipReply(reply)) => {
