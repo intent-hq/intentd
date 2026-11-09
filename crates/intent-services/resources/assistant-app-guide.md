@@ -630,7 +630,12 @@ available. The footer shows specialist and harness metadata when present; select
 the harness version for details. **Move panel** opens the pane movement controls.
 Other panel menus place **Rename** under **Actions** when renaming is available.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/layout/tab-types/{AgentTabType,AgentViewSettingsDropdown}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte. -->
+When an agent shows a browser tab while its chat is on screen, the tab opens in the
+column next to that chat (right first, then left). If the chat is the only column,
+the view splits. Keyboard focus stays where it was. When the chat is not on screen,
+Intent picks a panel for the tab without moving focus.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/layout/tab-types/{AgentTabType,AgentViewSettingsDropdown}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/store/renderer/slices/panel-layout/panel-layout-slice.ts. -->
 
 **Retire Agent** stops an agent and keeps its conversation so it can be restored later.
 You can retire any agent, including a workspace's last top-level agent. An agent
