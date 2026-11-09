@@ -25,8 +25,9 @@ use std::path::{Path, PathBuf};
 use intent_core::{AgentId, Error, Result, Workspace, WorkspaceId, WorkspaceStatus};
 
 use crate::{
-    cleanup_detached_worktree, cleanup_workspace_worktree_locked, default_workspaces_root, git_ops,
-    now_iso, publish_event, workspace_dir_candidates, workspace_updated_event, Services,
+    cleanup_detached_worktree, cleanup_workspace_cow_checkout_locked,
+    cleanup_workspace_worktree_locked, default_workspaces_root, git_ops, now_iso, publish_event,
+    workspace_dir_candidates, workspace_updated_event, Services,
 };
 
 /// What an unarchive call did (`workspace.unarchive` / `workspace.restore` /
@@ -141,6 +142,11 @@ impl Services {
             retire_supported(&current)?;
             self.require_owned_worktree(&current)?;
             self.refuse_checkout_in_plain_folder(&current).await?;
+            // The automatic sweep already ran this scan; it re-runs under
+            // the fence below.
+            if archived_before.is_none() {
+                self.refuse_standalone_work(&current, false).await?;
+            }
             // A workspace inside its delete grace window is on its way out:
             // retiring it would race the committed delete.
             if self
@@ -222,6 +228,22 @@ impl Services {
                 scripts_closed.unsettled()
             )));
         }
+        // A standalone checkout's branches exist only in its folder: the work
+        // gate is re-run here, under the fence, once the writers that can
+        // still commit into an archived workspace are stopped (scripts above,
+        // terminals here), and before the flip. A refusal leaves the
+        // workspace archived; dropping the guard reopens script launches.
+        if !fresh.is_retired() && is_standalone_checkout(&fresh) {
+            for terminal in self.pty.list_scope(id.as_str()) {
+                self.pty.kill(terminal).await;
+            }
+            if self
+                .refuse_standalone_work(&fresh, archived_before.is_some())
+                .await?
+            {
+                return Ok(None);
+            }
+        }
         let retired_at = now_iso();
         let ws = {
             let flipped = self
@@ -276,6 +298,8 @@ impl Services {
             // Remote agents get final stops, recorded before the checkout
             // goes: their machines push to the workspace's repository, which
             // retire keeps, then remove their checkouts.
+            // A standalone checkout IS that repository, so it never retires
+            // while it has remote agents (`refuse_standalone_work`).
             self.feature_remote_launch_port()
                 .final_stop(
                     self,
@@ -342,7 +366,11 @@ impl Services {
         let previous_branch = ws.branch.clone();
         let name = ws.id.0.clone();
         let checkout_mode = ws.checkout_mode;
-        let (branch, sha, trash) = {
+        let standalone = is_standalone_checkout(ws);
+        let (branch, sha, trash) = if standalone {
+            self.provision_standalone_revive(ws, &wt, &previous_branch)
+                .await?
+        } else {
             let repo = repo.clone();
             let wt = wt.clone();
             let previous = previous_branch.clone();
@@ -417,8 +445,11 @@ impl Services {
             self.worktree_locks
                 .with_lock(&repo.clone(), move || async move {
                     let _ = tokio::task::spawn_blocking(move || {
-                        let (trash, _) =
-                            cleanup_workspace_worktree_locked(&repo, &wt, &branch, true);
+                        let (trash, _) = if standalone {
+                            cleanup_workspace_cow_checkout_locked(&wt)
+                        } else {
+                            cleanup_workspace_worktree_locked(&repo, &wt, &branch, true)
+                        };
                         if let Some(trash) = trash {
                             cleanup_detached_worktree(&trash);
                         }
@@ -429,7 +460,8 @@ impl Services {
             return flipped.map(|_| None);
         }
         // The new branch is daemon-generated: `workspace.delete` may remove
-        // it (best-effort, like workspace.create's flag write).
+        // it (best-effort, like workspace.create's flag write). A standalone
+        // checkout's delete never touches branches; the flag is harmless.
         if let Err(e) = self
             .store
             .set_workspace_branch_auto_generated(&ws.id, true)
@@ -447,17 +479,6 @@ impl Services {
         }))
     }
 
-    /// Ownership proof before anything is deleted (the `workspace.delete`
-    /// root-anchored rule): the checkout's parent directory is named after
-    /// the workspace id AND sits under a root the daemon provisions into
-    /// (the boot workspaces root or the configured
-    /// `workspace.worktreesLocation`), checked on the canonical path
-    /// ([`resolve_within_root`]: no `..`, no symlinked ancestor escaping the
-    /// root, a missing checkout judged by its nearest existing ancestor). A
-    /// persisted path that fails it is a
-    /// folder the daemon cannot prove it created, so retire is refused with
-    /// `retire-unsupported` and nothing changes. A present folder must also
-    /// be a linked worktree registered in the source repository.
     /// Refuse to retire a workspace whose checkout, or its `<root>/<id>`
     /// parent, overlaps a plain-folder workspace's folder (§5.1): the purge
     /// would delete the user's files. `retire-unsupported` with
@@ -482,7 +503,20 @@ impl Services {
         Ok(())
     }
 
-    fn require_owned_worktree(&self, ws: &Workspace) -> Result<()> {
+    /// Ownership proof before anything is deleted (the `workspace.delete`
+    /// root-anchored rule): the checkout's parent directory is named after
+    /// the workspace id AND sits under a root the daemon provisions into
+    /// (the boot workspaces root or the configured
+    /// `workspace.worktreesLocation`), checked on the canonical path
+    /// ([`resolve_within_root`]: no `..`, no symlinked ancestor escaping the
+    /// root, a missing checkout judged by its nearest existing ancestor). A
+    /// persisted path that fails it is a
+    /// folder the daemon cannot prove it created, so retire is refused with
+    /// `retire-unsupported` and nothing changes. A present folder must also
+    /// be a linked worktree registered in the source repository — or, for a
+    /// standalone (`cow` / `direct`) checkout, its own repository
+    /// (`repositoryPath == worktreePath`, a real `.git` directory).
+    pub(crate) fn require_owned_worktree(&self, ws: &Workspace) -> Result<()> {
         let workspaces_root = self
             .workspaces_root
             .clone()
@@ -508,10 +542,17 @@ impl Services {
                     })
         });
         // …and the folder must be a linked worktree registered in its source
-        // repository (a folder that is already gone has nothing to delete).
+        // repository, or a standalone checkout that is its own repository (a
+        // folder that is already gone has nothing to delete).
         let registered = owned
             && ws.worktree_path.as_deref().is_some_and(|wt| {
                 let wt = std::path::Path::new(wt);
+                if is_standalone_checkout(ws) {
+                    return ws.repository_path.as_deref() == ws.worktree_path.as_deref()
+                        && (!wt.exists()
+                            || std::fs::symlink_metadata(wt.join(".git"))
+                                .is_ok_and(|m| m.file_type().is_dir()));
+                }
                 !wt.exists()
                     || ws.repository_path.as_deref().is_some_and(|repo| {
                         intent_git::worktree::is_registered_worktree(std::path::Path::new(repo), wt)
@@ -526,6 +567,110 @@ impl Services {
                 plain_folder: false,
             })
         }
+    }
+
+    /// The work gate for retiring a standalone (`cow` / `direct`) checkout,
+    /// whose branches exist only in its folder
+    /// ([`crate::local_work::LocalWorkRule::PurgeStandalone`]); a linked
+    /// worktree passes. Blocking work refuses a manual retire with
+    /// `InvalidInput`; for the automatic purge (`auto`) it returns
+    /// `Ok(true)` so the sweep skips the workspace and retries next time.
+    pub(crate) async fn refuse_standalone_work(&self, ws: &Workspace, auto: bool) -> Result<bool> {
+        if !is_standalone_checkout(ws) {
+            return Ok(false);
+        }
+        match self
+            .blocked_by_local_work(ws, crate::local_work::LocalWorkRule::PurgeStandalone)
+            .await
+        {
+            None => Ok(false),
+            Some(_) if auto => Ok(true),
+            Some(reason) => Err(Error::InvalidInput(format!(
+                "workspace {} cannot be retired: its folder is its own repository and still \
+                 holds work no remote has ({reason}); push or discard it first",
+                ws.id
+            ))),
+        }
+    }
+
+    /// Provision the fresh checkout for reviving a standalone (`cow` /
+    /// `direct`) workspace: its folder was its repository, so the new one is
+    /// a plain clone of the repository cache the workspace was hydrated from
+    /// ([`standalone_revive_cache`]), with `origin` set to the cache's
+    /// upstream, on a new branch cut from the cache's default branch. A
+    /// leftover standalone checkout at the path is renamed to trash first
+    /// (returned for removal). No cache refuses with `InvalidInput`; the
+    /// workspace stays retired.
+    async fn provision_standalone_revive(
+        &self,
+        ws: &Workspace,
+        wt: &Path,
+        previous_branch: &str,
+    ) -> Result<(String, String, Option<PathBuf>)> {
+        let cache = standalone_revive_cache(ws, wt).ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "workspace {} cannot be revived: its folder was its own repository and no \
+                 repository cache holds that repository; create a new workspace instead",
+                ws.id
+            ))
+        })?;
+        let name = ws.id.0.clone();
+        let checkout_mode = ws.checkout_mode;
+        let wt = wt.to_path_buf();
+        let previous = previous_branch.to_string();
+        self.worktree_locks
+            .with_lock(&wt.clone(), move || async move {
+                intent_git::repo_cache::with_cache_lock_blocking(&cache.clone(), move || {
+                    let trash = if wt.exists() {
+                        if !std::fs::symlink_metadata(wt.join(".git"))
+                            .is_ok_and(|m| m.file_type().is_dir())
+                        {
+                            return Err(Error::RetireUnsupported {
+                                workspace_id: name,
+                                checkout_mode,
+                                plain_folder: false,
+                            });
+                        }
+                        intent_git::worktree::detach_checkout_dir(&wt)?
+                    } else {
+                        None
+                    };
+                    let base = intent_git::branches::repo_default_branch(&cache)?;
+                    let origin = intent_git::remote::origin_url(&cache)?.ok_or_else(|| {
+                        Error::InvalidInput(format!(
+                            "workspace {name} cannot be revived: the repository cache has no origin"
+                        ))
+                    })?;
+                    // The old branch is on the remote (the purge required
+                    // it) but not necessarily in the cache: never reuse its
+                    // name, start at `<previous>-2`.
+                    let branch = if previous.is_empty() {
+                        intent_git::branches::ensure_unique_branch_name(&cache, "revived")?
+                    } else {
+                        let mut n = 2u32;
+                        loop {
+                            let candidate = format!("{previous}-{n}");
+                            if intent_git::branches::ensure_unique_branch_name(&cache, &candidate)?
+                                == candidate
+                            {
+                                break candidate;
+                            }
+                            n += 1;
+                        }
+                    };
+                    let sha = intent_git::repo_cache::provision_direct_checkout_with_progress(
+                        &cache,
+                        &wt,
+                        &origin,
+                        &branch,
+                        Some(&base),
+                        None,
+                    )?;
+                    Ok((branch, sha, trash))
+                })
+                .await
+            })
+            .await
     }
 
     /// Remove a retired workspace's worktree from disk: under the per-repo
@@ -553,9 +698,9 @@ impl Services {
             .clone()
             .unwrap_or_else(default_workspaces_root);
         let worktrees_location = self.configured_worktrees_location();
-        // [`retire_supported`] admitted only a daemon-owned git worktree
-        // (`checkoutMode` worktree, not skipIsolation / remote), so both
-        // paths are present.
+        // [`retire_supported`] admitted only a daemon-owned checkout (a
+        // linked worktree or a standalone `cow` / `direct` clone, not
+        // skipIsolation / remote), so both paths are present.
         // Never a plain folder (§5.1 "Plain-folder workspaces"): loaded
         // BEFORE anything is detached, renamed or removed. A checkout (or its
         // `<root>/<id>` parent: trash sibling, metadata, empty-parent removal)
@@ -590,13 +735,21 @@ impl Services {
         {
             let branch = ws.branch.clone();
             let repo = repo_dir.clone();
+            let standalone = is_standalone_checkout(ws);
             trash = self
                 .worktree_locks
                 .with_lock(&repo_dir, move || async move {
-                    // `branch_auto_generated = false`: the branch is kept on
-                    // retire (only a delete removes it).
+                    // A standalone checkout is its own repository: rename it
+                    // to trash, with no worktree prune against a source
+                    // repository. A linked worktree is detached keeping its
+                    // branch (`branch_auto_generated = false`: only a delete
+                    // removes it).
                     let task = tokio::task::spawn_blocking(move || {
-                        cleanup_workspace_worktree_locked(&repo, &wt, &branch, false)
+                        if standalone {
+                            cleanup_workspace_cow_checkout_locked(&wt)
+                        } else {
+                            cleanup_workspace_worktree_locked(&repo, &wt, &branch, false)
+                        }
                     })
                     .await;
                     match task {
@@ -699,14 +852,15 @@ pub(crate) fn resolve_within_root(
     (resolved != root && resolved.starts_with(&root)).then_some(resolved)
 }
 
-/// Retire is only for daemon-owned git worktrees: plain-folder workspaces
-/// (the folder is the user's, §5.1 "Plain-folder workspaces" — checked
-/// first, from the persisted flag, whatever else the row holds), `cow` /
-/// `direct` checkouts (the folder IS the repository — deleting it loses the
-/// branch), `skipIsolation` workspaces (the folder is the user's
-/// repository), remote workspaces and checkout-less rows are refused with
-/// [`Error::RetireUnsupported`] before anything changes. The automatic
-/// purge skips every refused workspace.
+/// Retire is only for daemon-owned checkouts — linked worktrees and
+/// standalone `cow` / `direct` clones (whose ownership and work gate are
+/// checked separately: [`Services::require_owned_worktree`],
+/// [`Services::refuse_standalone_work`]). Plain-folder workspaces (the
+/// folder is the user's, §5.1 "Plain-folder workspaces" — checked first,
+/// from the persisted flag, whatever else the row holds), `skipIsolation`
+/// workspaces (the folder is the user's repository), remote workspaces and
+/// checkout-less rows are refused with [`Error::RetireUnsupported`] before
+/// anything changes. The automatic purge skips every refused workspace.
 pub(crate) fn retire_supported(ws: &Workspace) -> Result<()> {
     if ws.plain_folder {
         return Err(Error::RetireUnsupported {
@@ -725,11 +879,6 @@ pub(crate) fn retire_supported(ws: &Workspace) -> Result<()> {
     if ws.is_remote {
         return refuse(None);
     }
-    if let Some(mode @ (intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)) =
-        ws.checkout_mode
-    {
-        return refuse(Some(mode));
-    }
     if ws.skip_worktree
         || ws.worktree_path.as_deref().is_none_or(str::is_empty)
         || ws.repository_path.as_deref().is_none_or(str::is_empty)
@@ -737,6 +886,35 @@ pub(crate) fn retire_supported(ws: &Workspace) -> Result<()> {
         return refuse(None);
     }
     Ok(())
+}
+
+/// Whether `ws` is a standalone checkout (`cow` / `direct`): the folder is
+/// its own repository, not a linked worktree of a source repository.
+pub(crate) fn is_standalone_checkout(ws: &Workspace) -> bool {
+    matches!(
+        ws.checkout_mode,
+        Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
+    )
+}
+
+/// The repository cache a standalone checkout at `wt`
+/// (`<root>/<id>/<slug>`) was hydrated from: `<root>/.repo-cache/<owner>/<name>`
+/// from the row's repository owner and name, when that cache is a present
+/// repository. `None` without a usable owner / name or cache.
+fn standalone_revive_cache(ws: &Workspace, wt: &Path) -> Option<PathBuf> {
+    let segment = |s: Option<&str>| {
+        s.filter(|s| !s.is_empty() && *s != "." && *s != ".." && !s.contains(['/', '\\']))
+            .map(str::to_string)
+    };
+    let owner = segment(ws.repository_owner.as_deref())?;
+    let name = segment(ws.repository_name.as_deref())?;
+    let root = wt.parent()?.parent()?;
+    let cache = intent_git::repo_cache::cache_path_for(
+        &intent_git::repo_cache::cache_root_for(root),
+        &owner,
+        &name,
+    );
+    cache.join(".git").exists().then_some(cache)
 }
 
 /// Whether `ws` is due for automatic retire at `cutoff`: archived, not

@@ -60,8 +60,127 @@ pub fn remove_dir_all_parallel(path: &Path) -> io::Result<()> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        #[cfg(unix)]
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            // A read-only directory (a Go module cache, a `chmod -R a-w`
+            // build tree) cannot have its entries unlinked: make every
+            // directory owner-writable, then retry once.
+            make_dirs_writable(path);
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(e),
+            }
+        }
         Err(e) => Err(e),
     }
+}
+
+/// Best-effort: add owner `rwx` to `root` and every directory beneath it.
+///
+/// The walk is anchored on directory descriptors: every directory below
+/// `root` is opened with `openat(parent_fd, name, O_DIRECTORY | O_NOFOLLOW)`
+/// relative to its already-open parent, listed through its own descriptor,
+/// and changed with `fchmod`. No accumulated path is ever resolved again, so
+/// a directory (or an ancestor) swapped for a symlink mid-walk is never
+/// followed and nothing outside `root` changes mode. A directory that cannot
+/// be opened for reading (no `r` bit) is skipped; the caller's removal then
+/// reports the failure. Open descriptors stay bounded by the tree depth: a
+/// pending entry holds only its parent.
+#[cfg(unix)]
+fn make_dirs_writable(root: &Path) {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::rc::Rc;
+
+    const FLAGS: libc::c_int =
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let Ok(path) = CString::new(root.as_os_str().as_bytes()) else {
+        return;
+    };
+    // SAFETY: `path` is a valid NUL-terminated string; `open` returns a new
+    // descriptor or -1.
+    let fd = unsafe { libc::open(path.as_ptr(), FLAGS) };
+    if fd < 0 {
+        return;
+    }
+    // SAFETY: `fd` was just returned by `open` and is owned by nothing else.
+    let root_fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+    let mut pending: Vec<(Rc<OwnedFd>, CString)> = Vec::new();
+    let visit = |dir: &Rc<OwnedFd>, pending: &mut Vec<(Rc<OwnedFd>, CString)>| {
+        add_owner_rwx(dir.as_raw_fd());
+        for name in entry_names(dir.as_raw_fd()) {
+            pending.push((Rc::clone(dir), name));
+        }
+    };
+    visit(&root_fd, &mut pending);
+    drop(root_fd);
+    while let Some((parent, name)) = pending.pop() {
+        // SAFETY: `parent` is an open directory descriptor and `name` a
+        // NUL-terminated single path component; `openat` returns a new
+        // descriptor or -1 (ENOTDIR for files, ELOOP for symlinks).
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), FLAGS) };
+        drop(parent);
+        if fd < 0 {
+            continue;
+        }
+        // SAFETY: `fd` was just returned by `openat` and is owned by nothing
+        // else.
+        let dir = Rc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+        visit(&dir, &mut pending);
+    }
+}
+
+/// `fchmod` the directory open at `fd` to add owner `rwx`, if missing.
+#[cfg(unix)]
+fn add_owner_rwx(fd: std::os::fd::RawFd) {
+    let rwx: libc::mode_t = 0o700;
+    // SAFETY: `libc::stat` is plain old data; all-zero is a valid value.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is an open descriptor and `stat` a valid out-pointer.
+    let status = unsafe { libc::fstat(fd, &raw mut stat) };
+    if status != 0 || stat.st_mode & rwx == rwx {
+        return;
+    }
+    // SAFETY: `fd` is an open descriptor; a failure leaves the mode as is.
+    let _ = unsafe { libc::fchmod(fd, (stat.st_mode | rwx) & 0o7777) };
+}
+
+/// The entry names of the directory open at `fd` (without `.` and `..`),
+/// read through a duplicate descriptor so `fd` stays open.
+#[cfg(unix)]
+fn entry_names(fd: std::os::fd::RawFd) -> Vec<std::ffi::CString> {
+    // SAFETY: `fd` is an open descriptor; `dup` returns a new one or -1.
+    let dup = unsafe { libc::dup(fd) };
+    if dup < 0 {
+        return Vec::new();
+    }
+    // SAFETY: `dup` is an open directory descriptor we own; on success
+    // `fdopendir` takes ownership of it (released by `closedir`).
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        // SAFETY: `fdopendir` failed, so `dup` is still ours to close.
+        unsafe { libc::close(dup) };
+        return Vec::new();
+    }
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: `stream` is a valid open `DIR*`.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `readdir` returned a valid entry whose `d_name` is
+        // NUL-terminated; it is copied before the next `readdir` call.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    // SAFETY: `stream` is a valid open `DIR*`, closed exactly once.
+    unsafe { libc::closedir(stream) };
+    names
 }
 
 /// Phase 1 of [`remove_dir_all_parallel`]: best-effort parallel removal of
@@ -169,6 +288,36 @@ mod tests {
             target.join("keep.txt").exists(),
             "symlink target untouched — links unlinked, never followed"
         );
+        std::fs::remove_dir_all(&target).unwrap();
+    }
+
+    /// Read-only directories (a Go module cache, a `chmod -R a-w` build
+    /// tree) are made writable and removed; a symlinked directory's target
+    /// keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn removes_read_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let target = temp_dir("read-only-target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let root = temp_dir("read-only");
+        for top in ["a", "b"] {
+            let deep = root.join(top).join("pkg").join("mod");
+            std::fs::create_dir_all(&deep).unwrap();
+            std::fs::write(deep.join("f.go"), "x").unwrap();
+            for dir in [deep.clone(), deep.parent().unwrap().to_path_buf()] {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            }
+        }
+        std::fs::write(root.join("top.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        remove_dir_all_parallel(&root).unwrap();
+        assert!(!root.exists(), "read-only tree removed");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o555, "symlink target untouched");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::remove_dir_all(&target).unwrap();
     }
 

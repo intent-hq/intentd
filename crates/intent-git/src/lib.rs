@@ -45,6 +45,7 @@ pub mod reset;
 pub mod show;
 pub mod squash;
 pub mod stage;
+pub mod standalone_work;
 pub mod stash;
 pub mod status;
 pub mod submodule;

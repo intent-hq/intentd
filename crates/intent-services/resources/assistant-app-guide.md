@@ -981,18 +981,24 @@ untracked files, but keeps conversations, notes, tasks and the git branch. The
 workspace card's status then reads "Workspace folder purged to free disk space.",
 and under the **Archived** filter its row and board card show a **Workspace purged**
 pill.
-Workspaces whose folder is the repository itself and remote workspaces cannot be
-purged. To purge automatically, turn on **Workspace setup → Free disk space for
+Remote workspaces and workspaces opened on your own folder cannot be purged. A
+workspace whose folder is its own copy of the repository (CoW or Direct) can be
+purged only when nothing in it is missing from a remote: no uncommitted or untracked
+files, no stash, and no commits on any branch, submodule or nested repository that
+were not pushed (commits Intent saw merged in a pull request count as pushed).
+To purge automatically, turn on **Workspace setup → Free disk space for
 archived workspaces** and set the number of days (7 when first turned on), or set
 `purgeArchivedAfterDays` in `config.toml`. It is off by default, runs about once an
 hour, and skips workspaces with uncommitted changes or with unpushed commits in a
 nested repository (such as a submodule), unless Intent saw those commits merged in a
-pull request.
+pull request; CoW and Direct workspaces get the stricter check above.
 
 A purged workspace still shows as archived and its history stays readable.
 Unarchiving it, or sending a message, recreates it from a fresh checkout of the
-default branch on a new branch; the old branch still holds the earlier work, and
-the agents are told the folder was purged.
+default branch on a new branch; the old branch still holds the earlier work (for a
+CoW or Direct workspace, on the remote), and the agents are told the folder was
+purged. A CoW or Direct workspace is recreated from Intent's repository cache; if
+the cache is gone, create a new workspace instead.
 
 ## Home workspace status icons
 
