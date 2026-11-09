@@ -31780,51 +31780,6 @@ mod known_repo {
     }
 }
 
-/// Keep the caller regression observable even on hosts that skip `CoW` tests.
-/// Native acceptance additionally requires a real clone and independent contents
-/// on the same volume pair used by the workspace fixture.
-fn cow_fixture_supported(source: &std::path::Path, root: &std::path::Path) -> bool {
-    let support = intent_git::cow_probe(source, root).expect("probe fixture CoW support");
-    eprintln!("CoW fixture probe: {support:?}; source={source:?}; root={root:?}");
-    if support == intent_git::CowSupport::Supported {
-        let src = crate::test_support::test_tempdir_in(
-            source.to_str().expect("fixture source path"),
-            "cow-proof-source-",
-        );
-        let dst = crate::test_support::test_tempdir_in(
-            root.to_str().expect("fixture root path"),
-            "cow-proof-destination-",
-        );
-        let original = src.path().join("payload");
-        let cloned = dst.path().join("clone");
-        std::fs::write(&original, b"original").unwrap();
-        intent_git::cow_clone(src.path(), &cloned).expect("real fixture CoW clone");
-        let copy = cloned.join("payload");
-        assert_eq!(std::fs::read(&copy).unwrap(), b"original");
-        std::fs::write(&copy, b"clone changed").unwrap();
-        assert_eq!(std::fs::read(&original).unwrap(), b"original");
-        std::fs::write(&original, b"source changed").unwrap();
-        assert_eq!(std::fs::read(&copy).unwrap(), b"clone changed");
-        dst.close().expect("remove CoW proof destination");
-        src.close().expect("remove CoW proof source");
-        eprintln!("CoW fixture clone and independent contents verified");
-        eprintln!("CoW fixture proof scratch cleaned");
-    } else {
-        assert!(
-            std::env::var_os("INTENTD_TEST_REQUIRE_COW").is_none(),
-            "native CoW acceptance requires a supported fixture volume"
-        );
-        // Supplemental regression on unsupported hosts only. Supported-volume
-        // baselines must reach the original service gate and its real refusal.
-        assert_eq!(
-            intent_core::current_caller(),
-            Some(intent_core::Caller::Daemon),
-            "workspace CoW fixture must bind its daemon caller"
-        );
-    }
-    support == intent_git::CowSupport::Supported
-}
-
 mod worktree_provisioning {
     use super::*;
     use intent_core::WorkspaceCreate;

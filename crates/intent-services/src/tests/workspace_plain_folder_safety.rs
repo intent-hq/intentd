@@ -11,10 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use intent_core::{
-    Error, Workspace, WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceListFilter,
-    WorkspaceStatus,
-};
+use intent_core::{Error, Workspace, WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceStatus};
 use intent_store::Store;
 
 use super::{TempDb, WorkspacesRoot};
@@ -134,19 +131,6 @@ impl Harness {
             std::fs::write(folder.join("notes.md"), SENTINEL).expect("sentinel");
         }
         (ws, folder)
-    }
-
-    async fn row_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .store
-            .list_workspaces(WorkspaceListFilter::WITH_ARCHIVED)
-            .await
-            .expect("list")
-            .into_iter()
-            .map(|w| w.id.0)
-            .collect();
-        ids.sort();
-        ids
     }
 }
 
