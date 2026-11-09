@@ -399,7 +399,7 @@ impl HostFrameRouter for Router {
                 // Its own task: when the script's budget ends first, the
                 // push and the report still finish.
                 Some(Box::pin(async move {
-                    tokio::spawn(async move {
+                    intent_core::caller::spawn_with_current_caller(async move {
                         if let Some((push, budget)) = push {
                             push(budget).await;
                         }
@@ -968,7 +968,8 @@ impl WorkspaceApi for NodeApi {
             if let Some((push, budget)) = &self.push {
                 // Its own task, so the push still finishes when the
                 // script's budget ends first.
-                result.pushed = Some(tokio::spawn(push(*budget)).await.unwrap_or(false));
+                let task = intent_core::caller::spawn_with_current_caller(push(*budget));
+                result.pushed = Some(task.await.unwrap_or(false));
             }
             Ok(result)
         })
