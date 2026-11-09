@@ -318,11 +318,15 @@ Verifier are no longer built-in choices for new sessions. Developer defers verif
 until work is complete, minimizes runs, and prefers end-to-end tests with repeatable
 artifacts for complex features. For isolated testing, it identifies failure modes first.
 For UI work, Developer reuses app patterns, preserves user context, and shows
-screenshots of the rendered result. A new harness version
+screenshots of the rendered result. Planner never edits code: it asks clarifying
+questions, explores the code, and writes the plan in the workspace **Spec** note. A
+second Planner critiques the spec; after you approve it, Planner starts a top-level
+Developer to implement it (this uses **Top-level agent spawning & retirement**, on by
+default). A new harness version
 applies to new sessions; existing sessions keep their captured behavior, and
 custom specialist instructions can override the defaults.
 
-<!-- Sources: packages/intentd/crates/intent-services/resources/specialists/v3.8/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_8.rs}. -->
+<!-- Sources: packages/intentd/crates/intent-services/resources/specialists/{v3.8,v3.9}/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_8.rs,harness/v3_9.rs}. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/agent-feature-definitions.ts; src/lib/components/chat/secrets/SecretRequestCards.svelte. Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
 

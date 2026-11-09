@@ -638,7 +638,7 @@ async fn specialist_hidden_round_trips_over_wss() {
 }
 
 /// WSS e2e for the embedded bundled catalog: with an empty user tier and no
-/// bundled-dir override, `specialist.list` over WSS returns exactly the eight
+/// bundled-dir override, `specialist.list` over WSS returns exactly the
 /// catalog-visible embedded reference specialists. Retired Ralph stays directly
 /// resolvable for pinned v1 sessions, while `pr-shepherd` remains gone.
 #[tokio::test]
@@ -681,6 +681,7 @@ async fn embedded_bundled_catalog_over_wss() {
         [
             "chief-of-staff",
             "developer",
+            "planner",
             "pr-reviewer",
             "ui-designer",
             "vulnerability-scanner",
@@ -712,7 +713,18 @@ async fn embedded_bundled_catalog_over_wss() {
         .as_str()
         .is_some_and(|body| body.starts_with("## Vulnerability Scanner\n")));
 
-    let ralph = wss_rpc(&mut ws, 4, "specialist.get", json!({ "id": "ralph" })).await;
+    let planner = wss_rpc(&mut ws, 4, "specialist.get", json!({ "id": "planner" })).await;
+    let planner = &planner["specialist"];
+    assert_eq!(planner["name"], "Planner");
+    assert_eq!(planner["source"], "bundled");
+    assert_eq!(planner["icon"], "coordinator");
+    assert!(planner.get("codingAgent").is_none());
+    assert!(planner.get("model").is_none());
+    assert!(planner["prompt"]
+        .as_str()
+        .is_some_and(|body| body.starts_with("## Planner\n")));
+
+    let ralph = wss_rpc(&mut ws, 5, "specialist.get", json!({ "id": "ralph" })).await;
     assert_eq!(ralph["specialist"]["source"], "bundled");
     assert_eq!(ralph["specialist"]["hidden"], true);
     assert_eq!(ralph["specialist"]["agentType"], "ralph-loop");
