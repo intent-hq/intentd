@@ -1267,9 +1267,11 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
     /// the configured node, its platforms and how to place an agent on it.
     /// `None` when no node is configured. `render` is the session's
     /// harness version's renderer (`harness::placement_help_renderer`).
+    /// Profile rows are left out for a workspace shared with guests.
     fn placement_help<'a>(
         &'a self,
         svc: &'a Services,
+        workspace_id: &'a intent_core::WorkspaceId,
         render: intent_core::machine_selection::PlacementHelpRenderer,
     ) -> BoxFuture<'a, Option<String>>;
 
@@ -1664,6 +1666,7 @@ impl RemoteLaunchPort for UnavailableRemoteLaunch {
     fn placement_help<'a>(
         &'a self,
         _svc: &'a Services,
+        _workspace_id: &'a intent_core::WorkspaceId,
         _render: intent_core::machine_selection::PlacementHelpRenderer,
     ) -> BoxFuture<'a, Option<String>> {
         Box::pin(async { None })
@@ -2735,8 +2738,12 @@ mod tests {
         assert!(placements.available_platforms.is_empty());
         assert!(placements.available_os.is_empty());
         assert_eq!(
-            port.placement_help(&svc, intent_core::machine_selection::exposed_machines_help)
-                .await,
+            port.placement_help(
+                &svc,
+                &WorkspaceId::from("ws-none"),
+                intent_core::machine_selection::exposed_machines_help
+            )
+            .await,
             None
         );
 

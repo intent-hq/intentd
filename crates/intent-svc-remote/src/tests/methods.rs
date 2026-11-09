@@ -352,6 +352,7 @@ async fn help_lists_provider_profiles_without_their_values() {
         .feature_remote_launch_port()
         .placement_help(
             services,
+            &intent_core::WorkspaceId::from("ws-help"),
             intent_core::machine_selection::exposed_machines_help,
         )
         .await
@@ -373,6 +374,25 @@ async fn help_lists_provider_profiles_without_their_values() {
     for value in [API_KEY, "/accounts/laptop"] {
         assert!(!help.contains(value), "{value} leaked: {help}");
     }
+    // Profile names are host settings a guest never reads (§5.54).
+    let guest = intent_core::caller::with_caller(
+        intent_core::caller::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Guest,
+        },
+        services.feature_remote_launch_port().placement_help(
+            services,
+            &intent_core::WorkspaceId::from("ws-help"),
+            intent_core::machine_selection::exposed_machines_help,
+        ),
+    )
+    .await
+    .expect("machines are still listed");
+    assert!(!guest.contains("Provider profiles"), "{guest}");
+    assert!(
+        !guest.contains(&keyed_ref) && !guest.contains("Laptop"),
+        "{guest}"
+    );
 }
 
 /// No setting gates the backend side: on a fresh config the capability is
@@ -388,6 +408,7 @@ async fn backend_side_needs_no_setting_and_help_follows_exposed_machines() {
     assert_eq!(
         port.placement_help(
             &backend.services,
+            &intent_core::WorkspaceId::from("ws-help"),
             intent_core::machine_selection::exposed_machines_help
         )
         .await,
@@ -405,6 +426,7 @@ async fn backend_side_needs_no_setting_and_help_follows_exposed_machines() {
     let help = port
         .placement_help(
             &backend.services,
+            &intent_core::WorkspaceId::from("ws-help"),
             intent_core::machine_selection::exposed_machines_help,
         )
         .await
@@ -419,6 +441,7 @@ async fn backend_side_needs_no_setting_and_help_follows_exposed_machines() {
     assert_eq!(
         port.placement_help(
             &backend.services,
+            &intent_core::WorkspaceId::from("ws-help"),
             intent_core::machine_selection::exposed_machines_help
         )
         .await,

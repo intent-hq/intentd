@@ -47,9 +47,10 @@ impl RemoteLaunchPort for FakeMachine {
     fn placement_help<'a>(
         &'a self,
         svc: &'a Services,
+        workspace_id: &'a intent_core::WorkspaceId,
         render: intent_core::machine_selection::PlacementHelpRenderer,
     ) -> BoxFuture<'a, Option<String>> {
-        self.0.placement_help(svc, render)
+        self.0.placement_help(svc, workspace_id, render)
     }
     fn admit<'a>(
         &'a self,

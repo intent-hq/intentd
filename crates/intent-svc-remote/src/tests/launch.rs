@@ -241,6 +241,7 @@ async fn admission_matches_the_machines_platform_and_capacity() {
         .port()
         .placement_help(
             &f.services,
+            &intent_core::WorkspaceId::from("ws-help"),
             intent_core::machine_selection::exposed_machines_help,
         )
         .await
@@ -1351,6 +1352,7 @@ async fn head_answers_placement_help_for_lease_agents() {
         .port()
         .placement_help(
             &f.services,
+            &intent_core::WorkspaceId::from("ws-help"),
             intent_core::machine_selection::exposed_machines_help,
         )
         .await

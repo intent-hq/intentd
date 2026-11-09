@@ -887,10 +887,15 @@ fn help_lists_profiles_with_their_syntax_and_remote_compatibility() {
         ),
         profile("claude-code", "pu3", "Unread", ProfileRemote::Unknown),
     ];
-    let defaults = [(
-        "claude-code".to_owned(),
-        vec!["CLAUDE_CONFIG_DIR".to_owned()],
-    )];
+    let defaults = [
+        (
+            "claude-code".to_owned(),
+            ProfileRemote::Incompatible {
+                keys: vec!["CLAUDE_CONFIG_DIR".to_owned()],
+            },
+        ),
+        ("codex".to_owned(), ProfileRemote::Unknown),
+    ];
     let inputs = PlacementHelpInputs {
         profiles: &profiles,
         incompatible_defaults: &defaults,
@@ -911,13 +916,20 @@ fn help_lists_profiles_with_their_syntax_and_remote_compatibility() {
         lines[at + 2],
         "- `codex@px2` \"Personal\": not remote-compatible (sets `CODEX_HOME`, an account folder on this backend)"
     );
-    assert_eq!(lines[at + 3], "- `claude-code@pu3` \"Unread\"");
+    assert_eq!(
+        lines[at + 3],
+        "- `claude-code@pu3` \"Unread\": remote compatibility unknown (settings unreadable)"
+    );
     assert_eq!(
         lines[at + 4],
         "- Default `claude-code`: not remote-compatible (sets `CLAUDE_CONFIG_DIR`, an account folder on this backend)"
     );
+    assert_eq!(
+        lines[at + 5],
+        "- Default `codex`: remote compatibility unknown (settings unreadable)"
+    );
     assert!(
-        lines[at + 5].starts_with("To run an agent on one"),
+        lines[at + 6].starts_with("To run an agent on one"),
         "{text}"
     );
 }

@@ -166,6 +166,7 @@ impl HeadCalls {
                 .feature_remote_launch_port()
                 .placement_help(
                     &self.services,
+                    &record.workspace_id,
                     intent_services::feature_api::harness::placement_help_renderer(
                         &session.harness_version,
                     ),

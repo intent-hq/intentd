@@ -580,7 +580,7 @@ pub struct PlacementProfile {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlacementBackendFacts {
     pub profiles: Vec<PlacementProfile>,
-    pub incompatible_defaults: Vec<(String, Vec<String>)>,
+    pub incompatible_defaults: Vec<(String, ProfileRemote)>,
     pub disabled_providers: Vec<String>,
 }
 
@@ -593,9 +593,9 @@ pub struct PlacementHelpInputs<'a> {
     /// Whether this backend has a provider turned off (Settings → Providers).
     pub disabled: &'a dyn Fn(&str) -> bool,
     pub profiles: &'a [PlacementProfile],
-    /// Base providers whose Default configuration sets these account-folder
-    /// keys.
-    pub incompatible_defaults: &'a [(String, Vec<String>)],
+    /// Base providers whose Default configuration is not remote-compatible
+    /// (or could not be read).
+    pub incompatible_defaults: &'a [(String, ProfileRemote)],
 }
 
 impl<'a> PlacementHelpInputs<'a> {
@@ -683,9 +683,7 @@ fn push_profiles(text: &mut String, inputs: &PlacementHelpInputs<'_>) {
         if profile.backup {
             text.push_str(" (backup)");
         }
-        if let ProfileRemote::Incompatible { keys } = &profile.remote {
-            push_incompatible(text, keys);
-        }
+        push_remote(text, &profile.remote);
         text.push('\n');
     }
     if inputs.profiles.len() > HELP_MAX_PROFILES {
@@ -695,20 +693,28 @@ fn push_profiles(text: &mut String, inputs: &PlacementHelpInputs<'_>) {
             inputs.profiles.len() - HELP_MAX_PROFILES
         );
     }
-    for (base, keys) in inputs.incompatible_defaults {
+    for (base, remote) in inputs.incompatible_defaults {
         let _ = write!(text, "- Default `{base}`");
-        push_incompatible(text, keys);
+        push_remote(text, remote);
         text.push('\n');
     }
 }
 
-fn push_incompatible(text: &mut String, keys: &[String]) {
-    let keys: Vec<String> = keys.iter().map(|key| format!("`{key}`")).collect();
-    let _ = write!(
-        text,
-        ": not remote-compatible (sets {}, an account folder on this backend)",
-        keys.join(", ")
-    );
+fn push_remote(text: &mut String, remote: &ProfileRemote) {
+    match remote {
+        ProfileRemote::Compatible => {}
+        ProfileRemote::Incompatible { keys } => {
+            let keys: Vec<String> = keys.iter().map(|key| format!("`{key}`")).collect();
+            let _ = write!(
+                text,
+                ": not remote-compatible (sets {}, an account folder on this backend)",
+                keys.join(", ")
+            );
+        }
+        ProfileRemote::Unknown => {
+            text.push_str(": remote compatibility unknown (settings unreadable)");
+        }
+    }
 }
 
 fn help_line(row: &ExposedMachine, connected: bool, disabled: &dyn Fn(&str) -> bool) -> String {
