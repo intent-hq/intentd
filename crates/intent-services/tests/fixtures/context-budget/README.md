@@ -16,9 +16,10 @@ Each skill keeps its frontmatter (`name`, `description`, `compatibility`,
 every `mcp__<server>__…` tool name the original body names, so skill hiding
 by MCP server sees the same references.
 
-The **realistic** fixture uses all 15 skills, the AGENTS.md, one exposed
-remote machine and a provider CLI mocked as one that loads AGENTS.md
-natively. The **clean** fixture uses `docx`, `pdf` and `xlsx` only, with no
+The **realistic** fixture uses all 15 skills, the AGENTS.md and one exposed
+remote machine. Repo rules have no "the CLI loads AGENTS.md natively" input
+yet; the change that adds it must also set it here, or the 50% gate keeps
+counting the AGENTS.md. Account and machine IDs are made up. The **clean** fixture uses `docx`, `pdf` and `xlsx` only, with no
 repo rules and no remote machine.
 
 To refresh a skill, copy its `SKILL.md` frontmatter and rebuild the stub the

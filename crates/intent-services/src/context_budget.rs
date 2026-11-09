@@ -64,7 +64,7 @@ const CLEAN_CEILING: &[(&str, usize, usize)] = &[
 const FIXTURE_HOME: &str = "/home/dev";
 /// The developer's synced skills folder (`~/.claude/skills/synced/<id>`).
 const SYNCED_SKILLS: &str =
-    ".claude/skills/synced/7bb596ec-f319-49da-8c2f-2f6497e366b2_c2685722-da8e-48dc-8ab9-db853f6788a1";
+    ".claude/skills/synced/00000000-0000-4000-8000-000000000001_00000000-0000-4000-8000-000000000002";
 /// The repository checkout, under the fixture home.
 const REPO_DIR: &str = "intent/workspaces/project/repo";
 /// Skills that live in the repository (`<repo>/.agents/skills`).
@@ -79,16 +79,15 @@ struct Fixture {
     skills: Option<&'static [&'static str]>,
     /// One remote machine is exposed to the backend.
     remote_machine: bool,
-    /// The provider CLI is mocked as one that loads AGENTS.md natively.
-    cli_loads_agents_md: bool,
 }
 
+/// Repo rules have no "CLI loads AGENTS.md natively" input yet; the change
+/// that adds one must set it here, or the 50% gate keeps counting AGENTS.md.
 const REALISTIC: Fixture = Fixture {
     name: "realistic",
     repo_rules: true,
     skills: None,
     remote_machine: true,
-    cli_loads_agents_md: true,
 };
 
 const CLEAN: Fixture = Fixture {
@@ -96,7 +95,6 @@ const CLEAN: Fixture = Fixture {
     repo_rules: false,
     skills: Some(&["docx", "pdf", "xlsx"]),
     remote_machine: false,
-    cli_loads_agents_md: true,
 };
 
 fn fixture_dir() -> PathBuf {
@@ -222,7 +220,7 @@ fn mac_studio() -> ExposedMachine {
         provider("unsloth", ProviderStatus::Unknown, unsloth),
     ];
     ExposedMachine {
-        id: "ae529e1b-98e4-4644-98c5-a949d24f0fd9".into(),
+        id: "00000000-0000-4000-8000-000000000003".into(),
         name: "Developer’s Mac Studio".into(),
         hosts: vec!["10.0.0.7".into()],
         port: 7443,
@@ -567,7 +565,7 @@ fn report(fixture: &Fixture, measured: &Measured, skills: usize) -> String {
         out,
         "\n=== Context budget: {} fixture ({BASELINE} vs {CANDIDATE}) ===\n\
          repo rules: {}; skills: {skills}; remote machines: {}; \
-         CLI loads AGENTS.md natively: {}; [agentFeatures]: default\n",
+         [agentFeatures]: default\n",
         fixture.name,
         if fixture.repo_rules {
             "monorepo AGENTS.md"
@@ -575,7 +573,6 @@ fn report(fixture: &Fixture, measured: &Measured, skills: usize) -> String {
             "none"
         },
         u8::from(fixture.remote_machine),
-        fixture.cli_loads_agents_md,
     );
     let _ = writeln!(
         out,
