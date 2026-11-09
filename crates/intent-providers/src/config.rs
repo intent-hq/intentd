@@ -295,6 +295,12 @@ pub struct ProviderConfig {
     /// `workspace_api` tool is served a compact description and the full
     /// `ws.*` API reference is appended to the system prompt instead.
     pub truncates_tool_descriptions: bool,
+    /// Variables set on every launch of this provider on a remote machine
+    /// (never locally), as Intent wiring a profile cannot override. Claude
+    /// Code's background shells end the turn with nothing to wake the agent
+    /// there (the node does not forward async-task reports), so they are
+    /// off and long commands go through `ws.script`.
+    pub remote_launch_env: &'static [(&'static str, &'static str)],
     /// When true, the keep-alive interrupt (`agent.stop` / message
     /// preemption) tears the child process down AFTER sending the polite
     /// `session/cancel`, instead of keeping it alive for an in-place resume.
@@ -388,6 +394,7 @@ impl ProviderConfig {
             terminal_requires_shell: false,
             requests_agent_workers: false,
             truncates_tool_descriptions: false,
+            remote_launch_env: &[],
             kills_child_on_interrupt: false,
             supports_test_prompt: true,
             auto_allow_once: false,
@@ -491,6 +498,9 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // claude-agent-acp gates each AIR capability on its own flag, so
         // requesting `asyncTasks` changes nothing but the worker reports.
         requests_agent_workers: true,
+        // The pinned CLI drops `run_in_background` from its Bash and Agent
+        // tools and their prompt text when this is set.
+        remote_launch_env: &[("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")],
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {

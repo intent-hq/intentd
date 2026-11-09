@@ -552,6 +552,11 @@ pub const HELP_MAX_BYTES: usize = 4096;
 pub type PlacementHelpRenderer =
     fn(machines: &[ExposedMachine], connected: &dyn Fn(&str) -> bool) -> Option<String>;
 
+/// What a remote agent is told about long commands, in the placement help
+/// and its first turn on the machine: its provider's own background shells
+/// are off there, and nothing reports them back to wake it.
+pub const REMOTE_LONG_COMMANDS_HINT: &str = "On a remote machine, run anything over 30 s with `ws.script.start`; shell background jobs never wake you.";
+
 /// The `ws.agent` discovery text for the exposed machines: name, id,
 /// platform, connected or last seen, each usable provider with its sign-in
 /// status and up to [`HELP_MAX_MODELS`] models, and when the report was
@@ -593,8 +598,9 @@ pub fn exposed_machines_help(
     }
     text.push_str(
         "To run an agent on one, pass `placement: { target: \"remote\" }` (optionally `nodeId`, `os`, `arch`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, { create: { placement } })`. Without `nodeId` the backend picks a machine that runs the platform, has the provider signed in (or unknown) and the model listed, with free capacity. When none lists the model the call fails with `model-unavailable`; other refusals are `placement-unavailable` or `machine-update-required`. A remote agent's own sub-agents (`ws.agent.create`, `ws.agent.delegate`, `ws.agent.wakeOrCreate`) run on its machine when no `placement` is given, with the same checks and no fallback; pass `placement: { target: \"local\" }` to run one on the backend. A batch `ws.agent.delegate({ tasks })` takes one `placement` for all its tasks, and an object entry `{ taskNoteId, placement }` its own.\n\
-         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment (an API key or other settings; a profile or Default that sets an account folder such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR` is refused with `profile-not-remote-compatible`), or with the machine's own provider login when no profile is selected, and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree). `ws.agent.setModel` can switch it to another model or remote-compatible profile its machine offers; its next turn relaunches it there with the conversation history.",
+         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment (an API key or other settings; a profile or Default that sets an account folder such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR` is refused with `profile-not-remote-compatible`), or with the machine's own provider login when no profile is selected, and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree). `ws.agent.setModel` can switch it to another model or remote-compatible profile its machine offers; its next turn relaunches it there with the conversation history.\n",
     );
+    text.push_str(REMOTE_LONG_COMMANDS_HINT);
     Some(text)
 }
 

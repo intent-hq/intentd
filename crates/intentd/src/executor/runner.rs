@@ -1624,10 +1624,11 @@ impl Runner {
                         &unrestored,
                         agent.setup.is_some(),
                     );
-                    *lock(&agent.notice) = [notice, settled.notice, forge_notice]
+                    let notices = [notice, settled.notice, forge_notice]
                         .into_iter()
                         .flatten()
                         .reduce(|all, next| format!("{all}\n\n{next}"));
+                    *lock(&agent.notice) = Some(first_turn_preamble(notices.as_deref()));
                     let mut helper_env = self.forge_helper_env(&agent);
                     if let Some(socket) = &forge_socket {
                         helper_env.extend(Self::forge_fetch_env(&agent, socket));
@@ -2013,6 +2014,7 @@ impl Runner {
                 .map(|git| git.helper_dir.as_path());
         }
         options.extra_env.clone_from(&launch.extra_env);
+        options.extra_env.extend(remote_launch_env(&launch.config));
         options
             .extra_env
             .insert(RUN_MARKER_ENV.to_owned(), agent.run_marker.clone());
@@ -2786,6 +2788,27 @@ enum Outcome {
     Exited(Option<i32>),
     Stopped,
     StartFailed(String),
+}
+
+/// What every remote agent's first turn on this machine starts with: the
+/// long-commands hint as a `<system>` block, then the checkout notices.
+pub(super) fn first_turn_preamble(notices: Option<&str>) -> String {
+    format!(
+        "<system>{}</system>{}",
+        intent_core::machine_selection::REMOTE_LONG_COMMANDS_HINT,
+        notices.unwrap_or_default()
+    )
+}
+
+/// The provider's [`remote_launch_env`](ProviderConfig::remote_launch_env),
+/// applied as Intent wiring on every launch on this machine.
+pub(super) fn remote_launch_env(
+    config: &ProviderConfig,
+) -> impl Iterator<Item = (String, String)> + '_ {
+    config
+        .remote_launch_env
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
 }
 
 /// Wait for the session, then run one ACP prompt and report its stop reason
