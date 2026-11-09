@@ -1630,7 +1630,7 @@ impl Runner {
                         .reduce(|all, next| format!("{all}\n\n{next}"));
                     let mut helper_env = self.forge_helper_env(&agent);
                     if let Some(socket) = &forge_socket {
-                        helper_env.extend(self.forge_fetch_env(&agent, socket));
+                        helper_env.extend(Self::forge_fetch_env(&agent, socket));
                     }
                     self.find_skills(&agent, &cwd).await;
                     match workspace_api::serve(
@@ -1800,7 +1800,7 @@ impl Runner {
     /// The git environment of a sub-agent that fetches GitHub through the
     /// backend (nodeProtocol 17): its GitHub URLs rewritten to its forge
     /// remote, reached through its own socket.
-    fn forge_fetch_env(&self, agent: &Agent, socket: &ForgeSocket) -> Vec<(String, String)> {
+    fn forge_fetch_env(agent: &Agent, socket: &ForgeSocket) -> Vec<(String, String)> {
         let Some(fetch) = &agent.forge_fetch else {
             return Vec::new();
         };

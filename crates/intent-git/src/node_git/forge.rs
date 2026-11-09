@@ -8,6 +8,7 @@
 //! then advertises exactly those refs as `refs/heads/*`, `refs/tags/*` and
 //! `HEAD`, so a sub-agent's `origin/<branch>` is the branch on GitHub.
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -143,9 +144,9 @@ pub async fn seed_from_origin(repository: &Path) -> Result<bool> {
                     .map(|target| format!("refs/heads/{target}"));
                 continue;
             }
-            updates.push_str(&format!("update {PREFIX}refs/heads/{branch} {oid}\n"));
+            let _ = writeln!(updates, "update {PREFIX}refs/heads/{branch} {oid}");
         } else if name.starts_with("refs/tags/") {
-            updates.push_str(&format!("update {PREFIX}{name} {oid}\n"));
+            let _ = writeln!(updates, "update {PREFIX}{name} {oid}");
         }
     }
     if updates.is_empty() {

@@ -21,6 +21,7 @@ const WARNING: &str = "could not refresh from GitHub";
 
 /// Commit `subject` on `main` of the GitHub stand-in, through a scratch
 /// clone.
+#[track_caller]
 fn push_to_github(github: &Path, scratch: &Path, subject: &str) {
     let clone = scratch.join(format!("clone-{subject}"));
     let output = Command::new("git")
