@@ -57,7 +57,11 @@ async fn list(api: &Arc<dyn WorkspaceApi>, _args: &Value) -> Result<Value, Strin
     // The wire shape already matches the TS reference (id, name, description,
     // model, prompt, behaviorPrompt, source, isCustomized, etc.)
     Ok(Value::Array(
-        specialists.iter().cloned().map(without_bundled_baseline).collect(),
+        specialists
+            .iter()
+            .cloned()
+            .map(without_bundled_baseline)
+            .collect(),
     ))
 }
 
