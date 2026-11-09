@@ -966,7 +966,7 @@ async fn placement_help_comes_from_head() {
         let help = help.as_str().unwrap_or_default();
         assert_eq!(help.contains(HELP), answers, "{help}");
         assert!(help.contains("ws.agent.create"), "{help}");
-        let bound = ok_json(call(&server, r#"return 'machineModels' in ws.agent;"#).await);
+        let bound = ok_json(call(&server, "return 'machineModels' in ws.agent;").await);
         assert_eq!(
             bound,
             json!(lookup),
