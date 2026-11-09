@@ -14,7 +14,7 @@ use intent_core::{
     HookState, Note, NoteId, PrMonitor, PrMonitorId, PrMonitorState, Script, ScriptMode,
     WorkspaceId, WorkspaceStatus,
 };
-use intent_store::{AgentQueueRow, PersistedEventSubscription, Sandbox, SandboxStatus, Store};
+use intent_store::{AgentQueueRow, PersistedEventSubscription, Store};
 
 use crate::transfer::TransferPlanExt;
 use crate::transfer::TransferStateExt;
@@ -443,9 +443,6 @@ fn session(agent_id: &AgentId, ws: &WorkspaceId, status: AgentStatus) -> AgentSe
         is_background: false,
         metadata: None,
         stats: None,
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -791,24 +788,6 @@ async fn seed_source(
         })
         .await
         .expect("script");
-
-    // Sandbox row for the clone above.
-    svc.store()
-        .insert_sandbox(&Sandbox {
-            id: "sb-rt".to_string(),
-            workspace_id: id.clone(),
-            agent_id: sb_agent.clone(),
-            path: sandbox.to_string_lossy().into_owned(),
-            branch: sb_branch,
-            base_commit_sha: main_tip.clone(),
-            snapshot_commit_sha: None,
-            status: SandboxStatus::Created,
-            retry_count: 0,
-            created_at: t.clone(),
-            updated_at: t.clone(),
-        })
-        .await
-        .expect("sandbox");
 
     // Draft (FKs onto client; dropped by the import transform).
     let client = ClientId::from("client-rt");
@@ -1339,17 +1318,9 @@ async fn transfer_round_trip_between_two_stacks() {
         "dirty.txt untracked again"
     );
 
-    // The legacy sandbox is not transferred: no row, no folder, and the
-    // owning session carries no sandbox link on the target.
-    let sandboxes = target.store().list_sandboxes(&id).await.expect("sandboxes");
-    assert!(sandboxes.is_empty(), "{sandboxes:?}");
+    // A leftover sandbox folder under the source workspace dir is not
+    // transferred.
     assert!(!dst_ws_root.0.join(&id.0).join("sandboxes").exists());
-    let sb_session = target
-        .store()
-        .get_agent_session_without_messages(&AgentId::from(AGENT_SB))
-        .await
-        .expect("sandbox owner imported");
-    assert_eq!(sb_session.sandbox_path, None);
 
     // Script cwd re-rooted under the target workspace dir.
     let scripts = target.store().list_all_scripts().await.expect("scripts");

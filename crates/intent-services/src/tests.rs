@@ -378,9 +378,6 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             metadata: None,
             created_at: created_at.to_string(),
             updated_at: now_iso(),
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -606,9 +603,6 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -893,9 +887,6 @@ async fn worst_case_workspace_list_row() -> Workspace {
                 metadata: None,
                 created_at: now_iso(),
                 updated_at: now_iso(),
-                sandbox_id: None,
-                sandbox_path: None,
-                sandbox_branch: None,
                 stop_reason: None,
                 stop_reason_timestamp: None,
                 session_corrupted: false,
@@ -1196,9 +1187,6 @@ async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
         metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -1447,9 +1435,6 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
         metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -1800,9 +1785,6 @@ async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
         metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -2153,9 +2135,6 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -2987,9 +2966,6 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
         metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -5764,9 +5740,6 @@ async fn flipped_completion_recorded_on_agent_complete_boundary() {
             metadata: None,
             created_at: ts.clone(),
             updated_at: ts,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -7944,9 +7917,6 @@ async fn note_add_stamps_agent_author_with_session_name() {
         metadata: None,
         created_at: now_iso(),
         updated_at: now_iso(),
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -10537,9 +10507,6 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
             is_background: false,
             metadata: None,
             stats: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -10926,9 +10893,6 @@ mod change_event_parity {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -11011,9 +10975,6 @@ mod change_event_parity {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -11337,9 +11298,6 @@ mod change_event_parity {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -11493,9 +11451,6 @@ mod change_event_parity {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -13711,9 +13666,6 @@ mod change_event_parity {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -17548,9 +17500,6 @@ mod mcp_callback {
             metadata: None,
             created_at: now_iso(),
             updated_at: now_iso(),
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -29146,9 +29095,6 @@ mod search_adapters {
             metadata: None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -30605,152 +30551,6 @@ mod rules {
         sub.recv().await.expect("subscription open")
     }
 
-    /// Per-agent `CoW` sandboxes are retired: a legacy session that still
-    /// carries `sandbox_path` gets a retirement notice naming the kept
-    /// sandbox path and branch, and none of the old sandbox instructions.
-    #[tokio::test]
-    async fn assembly_names_retained_sandbox_for_legacy_sandboxed_session() {
-        let tree = worktree();
-        let (_tmp, store, _svc, ws_id) = setup(&tree.0).await;
-
-        // Create a mock workspace (direct mode + CoW supported)
-        let workspace = intent_core::Workspace {
-            id: ws_id.clone(),
-            title: "Test".into(),
-            branch: "main".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            path: Some("/test/path".into()),
-            repository_path: Some("/test/repo".into()),
-            repository_name: Some("test-repo".into()),
-            skip_worktree: true,
-            cow_supported: Some(true),
-            ..Default::default()
-        };
-
-        // Create a mock agent session with sandbox fields
-        let agent_session = intent_core::AgentSession {
-            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
-            harness_features: None,
-            id: intent_core::AgentId::from("agent-1"),
-            workspace_id: ws_id.clone(),
-            parent_agent_id: None,
-            backend_session_id: None,
-            acp_session_id: None,
-            name: "Test Agent".into(),
-            name_explicitly_set: false,
-            model: None,
-            reasoning_effort: None,
-            effort_levels: None,
-            provider: None,
-            system_prompt: None,
-            specialist: None,
-            status: intent_core::AgentStatus::Active,
-            is_active: false,
-            messages: vec![],
-            stats: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            attention_request_kind: None,
-            attention_request_reason: None,
-            attention_request_timestamp: None,
-            delegation_depth: None,
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            file_blocks: None,
-            sandbox_id: Some("sandbox-123".into()),
-            sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()),
-            sandbox_branch: Some("sb/agent-1".into()),
-            stop_reason: None,
-            stop_reason_timestamp: None,
-            session_corrupted: false,
-            pending_delete_at: None,
-            retired_at: None,
-            notifications_muted: false,
-            pinned: false,
-            is_background: false,
-            metadata: None,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-        };
-
-        store
-            .insert_agent_session(&agent_session)
-            .await
-            .expect("session");
-        let sandbox = intent_store::Sandbox {
-            id: "sandbox-123".into(),
-            workspace_id: ws_id.clone(),
-            agent_id: agent_session.id.clone(),
-            path: "/test/sandboxes/agent-1/test-repo".into(),
-            branch: "sb/agent-1".into(),
-            base_commit_sha: "0".repeat(40),
-            snapshot_commit_sha: None,
-            status: intent_store::SandboxStatus::ConflictBounced,
-            retry_count: 0,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-        };
-        store.insert_sandbox(&sandbox).await.expect("sandbox");
-        let features = intent_core::settings_file::AgentFeaturesSettings::default();
-        let assemble = || {
-            crate::rules::assemble_system_prompt(
-                &store,
-                Some(&tree.0),
-                "task-loop",
-                None,
-                true,
-                false,
-                false,
-                &features,
-                Some(&workspace),
-                Some(&agent_session),
-                None,
-            )
-        };
-        let prompt = assemble().await.expect("assembled prompt");
-        assert!(
-            prompt.contains("## Retired Agent Sandbox"),
-            "retirement notice header: {prompt}"
-        );
-        assert!(
-            prompt.contains("`/test/sandboxes/agent-1/test-repo`"),
-            "notice names the retained sandbox path"
-        );
-        assert!(prompt.contains("`sb/agent-1`"), "notice names the branch");
-        assert!(
-            prompt.contains("workspace checkout"),
-            "notice says where the agent works now"
-        );
-        for gone in [
-            "## Workspace Isolation",
-            "isolated CoW",
-            "Do NOT switch branches",
-            "woken with the conflicting paths",
-            "merges your branch back",
-        ] {
-            assert!(
-                !prompt.contains(gone),
-                "retired sandbox text {gone:?} remains"
-            );
-        }
-
-        // A sandbox that was merged back (its row is deleted on merge) gets
-        // no notice, even though the session still records the old path.
-        store
-            .delete_sandbox(&ws_id, &agent_session.id)
-            .await
-            .expect("delete sandbox");
-        let prompt = assemble().await.expect("assembled prompt");
-        assert!(
-            !prompt.contains("## Retired Agent Sandbox"),
-            "no notice without a live sandbox row"
-        );
-    }
-
     /// A coordinator in a CoW-capable direct-mode workspace no longer gets
     /// the per-agent sandbox delegation hint: sandboxes are retired, and the
     /// hint fired even with `workspace.cowIsolation` off.
@@ -30813,9 +30613,6 @@ mod rules {
             context_references: None,
             image_blocks: None,
             file_blocks: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -30917,9 +30714,6 @@ mod rules {
             context_references: None,
             image_blocks: None,
             file_blocks: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -31020,9 +30814,6 @@ mod rules {
             context_references: None,
             image_blocks: None,
             file_blocks: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -31121,9 +30912,6 @@ mod rules {
             context_references: None,
             image_blocks: None,
             file_blocks: None,
-            sandbox_id: None,
-            sandbox_path: None, // NO sandbox — explicit "shared" override!
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -34776,8 +34564,7 @@ mod file_ops_service {
         w.worktree_path = Some(primary.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.unwrap();
         let caller = AgentId::new();
-        let mut session = crate::test_support::fixtures::session(&caller, &ws);
-        session.sandbox_path = Some(sandbox.to_string_lossy().into_owned());
+        let session = crate::test_support::fixtures::session(&caller, &ws);
         store.insert_agent_session(&session).await.unwrap();
         let svc = Services::new_isolated(store);
         let root = svc
@@ -36723,9 +36510,6 @@ mod heal_stale_agent_sessions {
             metadata: None,
             created_at: ts.clone(),
             updated_at: ts,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -38965,9 +38749,6 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         context_references: None,
         image_blocks: None,
         file_blocks: None,
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -39013,9 +38794,6 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         context_references: None,
         image_blocks: None,
         file_blocks: None,
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -39140,9 +38918,6 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         context_references: None,
         image_blocks: None,
         file_blocks: None,
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -40499,9 +40274,6 @@ mod last_activity_events {
             is_background: false,
             metadata: None,
             stats: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -41197,9 +40969,6 @@ mod turn_token_usage {
             is_background: false,
             metadata: None,
             stats: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -44977,9 +44746,6 @@ mod agent_delete_grace_window {
             file_blocks: None,
             is_background: false,
             metadata: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -46188,9 +45954,6 @@ mod derived_workspace_unread {
             metadata: None,
             created_at: ts.clone(),
             updated_at: ts,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,

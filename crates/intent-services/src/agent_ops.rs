@@ -6979,9 +6979,6 @@ impl Services {
             harness_features: Some(harness_features),
             created_at: now.clone(),
             updated_at: now,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
         };
         // The legacy per-session taskGraph pin (0095) keeps being written for
         // fallback reads; its value equals the snapshot's `taskGraph`.

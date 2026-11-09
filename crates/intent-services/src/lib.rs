@@ -121,8 +121,6 @@ mod git_status_singleflight;
 pub mod host_exec;
 pub mod host_exec_stream;
 mod installed_cli;
-#[cfg(test)]
-mod retained_sandboxes_tests;
 mod workspace_mutations;
 
 mod github_ops;
@@ -10499,49 +10497,6 @@ impl Services {
         // breaks the try_fire_group → redeliver → deliver → try_fire_group
         // async-recursion cycle this edge closes.
         Box::pin(self.redeliver_completion_after_queue_mutation(&group.parent_agent_id)).await;
-    }
-
-    /// Boot recovery notice for legacy per-agent `CoW` sandboxes (retired in
-    /// protocol 16, `methods/nodes.md` "Landing sequence" step 2). Logs one
-    /// warning per sandbox row still in a live status (`created`, `merging`,
-    /// `merge_pending`, `conflict_bounced`) naming its retained path and
-    /// branch, and returns those rows. Nothing is resumed, merged, migrated,
-    /// transitioned or deleted: the folder, branch and row stay for explicit
-    /// recovery by the user. The owning agent's next-turn instructions name
-    /// the same path and branch (`rules::build_retired_sandbox_notice`).
-    pub async fn report_retained_sandboxes(&self) -> Vec<intent_store::Sandbox> {
-        use intent_store::SandboxStatus;
-
-        let all = match self.store.list_all_sandboxes().await {
-            Ok(all) => all,
-            Err(e) => {
-                tracing::warn!(error = %e, "retained-sandbox notice: listing sandboxes failed");
-                return Vec::new();
-            }
-        };
-        let live: Vec<_> = all
-            .into_iter()
-            .filter(|sb| {
-                matches!(
-                    sb.status,
-                    SandboxStatus::Created
-                        | SandboxStatus::Merging
-                        | SandboxStatus::MergePending
-                        | SandboxStatus::ConflictBounced
-                )
-            })
-            .collect();
-        for sb in &live {
-            tracing::warn!(
-                workspace = %sb.workspace_id.0,
-                agent = %sb.agent_id.0,
-                path = %sb.path,
-                branch = %sb.branch,
-                status = ?sb.status,
-                "per-agent CoW sandboxes are retired: this sandbox was not merged back and is kept as is (nothing is deleted or reused); recover its work from the folder or the branch by hand"
-            );
-        }
-        live
     }
 
     /// Deliver an internal parent wake through the runtime [`AgentManager`]

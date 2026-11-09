@@ -64,8 +64,7 @@ fn chief_root(chief_cwd_root: Option<&Path>) -> String {
 }
 
 /// Load the workspace and resolve its filesystem root: every agent works in
-/// the workspace checkout (per-agent `CoW` sandboxes are retired, so a
-/// legacy session's retained sandbox path is never used). The Assistant
+/// the workspace checkout (per-agent `CoW` sandboxes are retired). The Assistant
 /// (`__chief__`) workspace resolves to `chief_cwd_root` (see [`chief_root`]).
 /// A missing workspace (or any load error) yields an empty root; the guard in
 /// [`is_within`] then fails such a request closed rather than resolving it
@@ -540,7 +539,7 @@ pub(crate) fn place_attachment(
 /// MCP `ws.file.getAttachment` copy op (PROTOCOL §6.8): copy a registered
 /// attachment from the CANONICAL workspace store (`canonical_root` +
 /// `record.stored_path`) into the caller's working directory (`dest_root`,
-/// which is the sandbox clone for CoW-sandboxed callers) under `dest_dir`
+/// the workspace checkout) under `dest_dir`
 /// (default [`ATTACHMENTS_DIR`] — git-ignored by construction). Returns
 /// `{ path, fileName, mimeType?, size, uploadedAt }` with `path` relative to
 /// `dest_root`. The copy is skipped when the destination already holds an

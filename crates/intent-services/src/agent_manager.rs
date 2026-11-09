@@ -14638,9 +14638,6 @@ fn resolve_spawn(
     // data dir spawns fine; a creation failure falls through to the temp-dir
     // catch-all rather than blocking the spawn.
     //
-    // A legacy session's retained per-agent sandbox path is never the cwd:
-    // per-agent CoW sandboxes are retired.
-    //
     // Workspace chain (TS agent-factory parity): `path` → `worktree_path` →
     // `repository_path`. Each candidate is `is_dir()`-checked individually so
     // a stale entry (e.g. an obsolete `path` on a legacy row) never suppresses
@@ -20030,9 +20027,6 @@ mod role_reminder_tests {
             metadata: None,
             created_at: ts.clone(),
             updated_at: ts,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -24990,9 +24984,6 @@ mod agent_retry_tests {
             metadata: None,
             created_at: ts.clone(),
             updated_at: ts,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,

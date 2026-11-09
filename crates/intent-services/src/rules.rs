@@ -322,47 +322,6 @@ pub(crate) struct SpecialistPromptInjection {
     pub role_reminder: Option<String>,
 }
 
-/// Recovery notice for a legacy session that ran in a per-agent `CoW`
-/// sandbox before they were retired (protocol 16, `methods/nodes.md`
-/// "Landing sequence" step 2). Returns `Some(notice)` only when the session
-/// still owns a sandbox row in a live status (`created`, `merging`,
-/// `merge_pending`, `conflict_bounced`; a merged or discarded sandbox's row
-/// is gone): it names the retained folder and branch (kept as is, never
-/// reused or deleted) and says the agent now works in the workspace
-/// checkout. Every other session gets nothing.
-pub(crate) async fn build_retired_sandbox_notice(
-    store: &Store,
-    agent_session: Option<&intent_core::AgentSession>,
-) -> Option<String> {
-    use intent_store::SandboxStatus;
-
-    let session = agent_session?;
-    session.sandbox_path.as_ref()?;
-    let sandbox = store
-        .get_sandbox(&session.workspace_id, &session.id)
-        .await
-        .ok()
-        .flatten()?;
-    if !matches!(
-        sandbox.status,
-        SandboxStatus::Created
-            | SandboxStatus::Merging
-            | SandboxStatus::MergePending
-            | SandboxStatus::ConflictBounced
-    ) {
-        return None;
-    }
-    let (path, branch) = (sandbox.path, sandbox.branch);
-    Some(format!(
-        "## Retired Agent Sandbox\n\n\
-         You previously worked in a per-agent copy-on-write sandbox at `{path}` on branch \
-         `{branch}`. Per-agent sandboxes are retired: you now work in the workspace checkout, \
-         and the sandbox's work was not merged back. Its folder and branch are kept as they \
-         were; nothing is deleted or reused. If you need work from it, read it from that folder \
-         or branch (for example `git -C {path} log {branch}`) and carry it over by hand."
-    ))
-}
-
 /// Format the RTK instruction line for the given usable subcommands. Wording
 /// owned by the given harness (H5); session-scoped assembly passes the
 /// session's pinned harness, session-less callers pass
@@ -628,13 +587,6 @@ async fn assemble_system_prompt_layers(
              same surface; call ws.help(\"<namespace>\") for one namespace's full docs.\n\n{docs}",
             intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING
         ));
-    }
-    // A legacy session that ran in a retired per-agent CoW sandbox: name
-    // the retained folder and branch, and where the agent works now.
-    if assistant.is_none() {
-        if let Some(notice) = build_retired_sandbox_notice(store, agent_session).await {
-            parts.push(notice);
-        }
     }
     // A backend sub-agent of a remote agent: where its parent's work is.
     if let Some(session) = agent_session {
@@ -1266,9 +1218,6 @@ This is a test skill.
             context_references: None,
             image_blocks: None,
             file_blocks: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,

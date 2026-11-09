@@ -4569,19 +4569,6 @@ pub struct AgentSession {
     /// legacy inline entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_blocks: Option<serde_json::Value>,
-    /// Stored id of the retired per-agent `CoW` sandbox this agent ran in
-    /// before protocol 16. Never written now and never emitted on the wire;
-    /// read only for the retained-sandbox recovery notice.
-    #[serde(default, skip_serializing)]
-    pub sandbox_id: Option<String>,
-    /// Retained folder of that retired sandbox (kept, never reused), named
-    /// by the agent's next-turn recovery notice. Never emitted on the wire.
-    #[serde(default, skip_serializing)]
-    pub sandbox_path: Option<String>,
-    /// Retained branch of that retired sandbox (`sb/<agentId>`), named by the
-    /// recovery notice. Never emitted on the wire.
-    #[serde(default, skip_serializing)]
-    pub sandbox_branch: Option<String>,
     /// Whether the agent runs in the background (FE `metadata.isBackground`;
     /// G-A1/P3-1.2c). Persisted at `agent.create`/`agent.delegate` and served
     /// as `metadata.isBackground` in the [`AgentLite`] projection — the FE
@@ -8844,9 +8831,6 @@ mod tests {
             pinned: false,
             created_at: "t0".to_string(),
             updated_at: ts.clone(),
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
         };
         let lite = AgentLite::from_session(
             session,
@@ -8943,9 +8927,6 @@ mod tests {
             pinned: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
         };
         let mut lite = AgentLite::from_session(
             session,
@@ -9089,9 +9070,6 @@ mod tests {
                 pinned: false,
                 created_at: "t0".to_string(),
                 updated_at: "t1".to_string(),
-                sandbox_id: None,
-                sandbox_path: None,
-                sandbox_branch: None,
             };
             let mut lite = AgentLite::from_session(session, 1, None, None, None, None, None);
             lite.last_tool_use = Some(tool_use);
@@ -9180,9 +9158,6 @@ mod tests {
             pinned: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
         };
         let mut lite = AgentLite::from_session(
             session,
@@ -9213,9 +9188,8 @@ mod tests {
         );
     }
 
-    /// Per-agent `CoW` sandboxes are retired (protocol 16): a session that
-    /// still carries the stored sandbox link emits no sandbox field on the
-    /// wire, neither on the session nor in the `AgentLite` metadata.
+    /// Per-agent `CoW` sandboxes are retired (protocol 16): neither a session
+    /// nor its `AgentLite` row emits a sandbox field on the wire.
     #[test]
     fn retired_sandbox_fields_are_not_emitted() {
         let session = AgentSession {
@@ -9261,9 +9235,6 @@ mod tests {
             pinned: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
-            sandbox_id: Some("sandbox-1".to_string()),
-            sandbox_path: Some("/ws/sandboxes/agent-1/repo".to_string()),
-            sandbox_branch: Some("sb/agent-1".to_string()),
         };
         let wire = serde_json::to_string(&session).unwrap();
         let lite = serde_json::to_string(&AgentLite::from_session(
@@ -9334,9 +9305,6 @@ mod tests {
                 pinned: false,
                 created_at: "2026-09-21T04:00:00.000000000Z".to_string(),
                 updated_at: "2026-09-21T05:00:00.000000000Z".to_string(),
-                sandbox_id: None,
-                sandbox_path: None,
-                sandbox_branch: None,
             };
             let mut lite = AgentLite::from_session(
                 session,
@@ -9487,9 +9455,6 @@ mod tests {
             pinned: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
         };
         let project = |metadata: Option<serde_json::Value>| {
             let lite = AgentLite::from_session(session(metadata), 0, None, None, None, None, None);
@@ -9748,9 +9713,6 @@ mod tests {
             pinned: false,
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
         };
         assert_eq!(
             serde_json::to_value(&session).unwrap(),

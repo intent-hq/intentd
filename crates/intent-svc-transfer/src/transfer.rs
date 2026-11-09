@@ -14,7 +14,6 @@ use intent_core::transfer::{
     TRANSFER_FORMAT_VERSION,
 };
 use intent_core::{clock::now_iso, BoxFuture, Error, Result, Workspace, WorkspaceId};
-use intent_store::SandboxStatus;
 
 use crate::transfer_export::TransferExportExt;
 use crate::transfer_import::TransferImportExt;
@@ -255,22 +254,6 @@ impl TransferPlanExt for Services {
         let assets = self.transfer_assets(&id).await;
         let attachments = self.transfer_attachments(&id, &ws).await?;
 
-        // Retired per-agent CoW sandboxes that were never merged back are
-        // not transferred: their folders and branches stay on this machine.
-        let sandboxes = self.store().list_sandboxes(&id).await?;
-        let retained_sandboxes = sandboxes
-            .iter()
-            .filter(|s| {
-                matches!(
-                    s.status,
-                    SandboxStatus::Created
-                        | SandboxStatus::Merging
-                        | SandboxStatus::MergePending
-                        | SandboxStatus::ConflictBounced
-                )
-            })
-            .count();
-
         let worktree = git_ops::worktree_path(&ws);
         let (git, estimated_git_bundle_bytes, nested_repo_dirs, submodule_bundle_bytes) =
             match worktree {
@@ -345,15 +328,6 @@ impl TransferPlanExt for Services {
                 message: format!(
                     "{} uncommitted file(s) will be snapshotted as a WIP commit in the bundle",
                     git.dirty_files.len()
-                ),
-            });
-        }
-        if retained_sandboxes > 0 {
-            warnings.push(TransferWarning {
-                code: "unmerged-sandboxes".to_string(),
-                message: format!(
-                    "{retained_sandboxes} retired agent sandbox(es) were never merged back and \
-                     are not transferred; their folders and branches stay on this machine"
                 ),
             });
         }
@@ -599,7 +573,7 @@ fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use intent_core::{AgentId, AgentSession, AgentStatus, NoteId, WorkspaceId};
-    use intent_store::{Sandbox, SandboxStatus, Store};
+    use intent_store::Store;
 
     use intent_services::feature_api::tests::{workspace, TempDb};
     use intent_services::feature_api::Services;
@@ -675,9 +649,6 @@ mod tests {
             is_background: false,
             metadata: None,
             stats: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -713,7 +684,8 @@ mod tests {
     /// Full plan over a seeded workspace: versioned manifest, `event`
     /// excluded, assets listed with sizes, git summary (branch, dirty files,
     /// no sandbox branches), bundle estimate > 0, size breakdown sums to total,
-    /// and all three pre-flight warnings raised.
+    /// and both pre-flight warnings raised (never the retired
+    /// `unmerged-sandboxes` one).
     #[tokio::test]
     async fn transfer_plan_manifest_and_sizes() {
         let tmp = TempDb::new();
@@ -725,7 +697,6 @@ mod tests {
         std::fs::write(repo.0.join("a.txt"), "committed content").expect("write");
         run_git(&repo.0, &["add", "."]);
         run_git(&repo.0, &["commit", "-m", "init"]);
-        run_git(&repo.0, &["branch", "sandbox/agent-1"]);
         // Stage dirty.txt, then modify it again so the path has both staged and
         // unstaged changes — it must still appear once in dirtyFiles.
         std::fs::write(repo.0.join("dirty.txt"), "uncommitted").expect("write");
@@ -754,22 +725,6 @@ mod tests {
             )
             .await
             .expect("message");
-        store
-            .insert_sandbox(&Sandbox {
-                id: "sb-1".to_string(),
-                workspace_id: ws.clone(),
-                agent_id: agent.clone(),
-                path: "/tmp/sb".to_string(),
-                branch: "sandbox/agent-1".to_string(),
-                base_commit_sha: "abc".to_string(),
-                snapshot_commit_sha: None,
-                status: SandboxStatus::Created,
-                retry_count: 0,
-                created_at: intent_core::clock::now_iso(),
-                updated_at: intent_core::clock::now_iso(),
-            })
-            .await
-            .expect("sandbox");
 
         let assets_root = TempDir::new("intentd-transfer-assets");
         std::fs::create_dir_all(assets_root.0.join(&ws.0)).expect("mkdir assets");
@@ -862,17 +817,7 @@ mod tests {
         let codes: Vec<&str> = plan.warnings.iter().map(|w| w.code.as_str()).collect();
         assert!(codes.contains(&"agents-running"));
         assert!(codes.contains(&"uncommitted-changes"));
-        assert!(codes.contains(&"unmerged-sandboxes"));
-        let retained = plan
-            .warnings
-            .iter()
-            .find(|w| w.code == "unmerged-sandboxes")
-            .unwrap();
-        assert!(
-            retained.message.contains("not transferred"),
-            "{}",
-            retained.message
-        );
+        assert!(!codes.contains(&"unmerged-sandboxes"));
     }
 
     /// A repo whose only anomaly is an untracked nested git repo plans

@@ -1322,10 +1322,10 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 ///   provider) keeps its model / effort on legacy model-prefix or last-turn
 ///   evidence for the provider, else the selection is cleared so the target's defaults apply
 ///   as a unit (intent-hq/intent#5815); `last_turn_*` history is untouched.
-/// - **sandbox** (older archives only): never read — the table is not in
-///   the transfer set, so its rows file is skipped. Each `agent_session`
-///   row's retired sandbox link (`sandbox_id` / `sandbox_path` /
-///   `sandbox_branch`) is cleared: the sandbox stays on the source machine.
+/// - **sandbox** (older archives only): never read — the table no longer
+///   exists, so its rows file is skipped. The retired `agent_session`
+///   sandbox link columns (`sandbox_id` / `sandbox_path` / `sandbox_branch`)
+///   are removed from each session row: the columns no longer exist.
 /// - **script**: absolute `cwd` rewritten under the target root.
 /// - **draft**: dropped — drafts FK onto `client`, which never transfers.
 /// - **`workspace_discussion_message`**: keep the immutable author snapshot;
@@ -1427,9 +1427,7 @@ fn transform_rows(
                     map.insert("backend_session_id".into(), serde_json::Value::Null);
                     map.insert("is_active".into(), serde_json::json!(0));
                     for retired in ["sandbox_id", "sandbox_path", "sandbox_branch"] {
-                        if map.contains_key(retired) {
-                            map.insert(retired.into(), serde_json::Value::Null);
-                        }
+                        map.remove(retired);
                     }
                     for counter in [
                         "message_count",
@@ -2301,9 +2299,8 @@ mod tests {
         assert!(!outcome.rows.iter().any(|(t, _)| t == "draft"));
     }
 
-    /// An imported session's retired sandbox link is cleared (the sandbox
-    /// stays on the source machine); script cwds re-root like workspace
-    /// paths.
+    /// An older archive's session sandbox link columns are removed (the
+    /// columns no longer exist); script cwds re-root like workspace paths.
     #[test]
     fn transform_clears_sandbox_links_and_rewrites_script_paths() {
         let outcome = transform_one(
@@ -2317,7 +2314,7 @@ mod tests {
         );
         let session = &find(&outcome, "agent_session")[0];
         for key in ["sandbox_id", "sandbox_path", "sandbox_branch"] {
-            assert!(session[key].is_null(), "{key} cleared: {session}");
+            assert!(session.get(key).is_none(), "{key} removed: {session}");
         }
 
         let outcome = transform_one(
@@ -4040,12 +4037,9 @@ mod tests {
             "staged\n"
         );
 
-        // Old sandbox refs and rows are ignored: no sandbox row, no folder.
-        let sandboxes = svc.store().list_sandboxes(&ws).await.expect("sandboxes");
-        assert!(
-            sandboxes.is_empty(),
-            "no sandbox row imported: {sandboxes:?}"
-        );
+        // Old sandbox refs, rows and session links are ignored: the import
+        // commits (the dropped columns never reach the store) and makes no
+        // sandbox folder.
         assert!(
             !ws_root.0.join(&ws.0).join("sandboxes").exists(),
             "no sandbox folder materialised"
@@ -4056,7 +4050,7 @@ mod tests {
                 .get_agent_session_without_messages(&AgentId(id.to_string()))
                 .await
                 .expect("agent imported");
-            assert_eq!(session.sandbox_path, None, "no sandbox link on {id}");
+            assert_eq!(session.workspace_id, ws, "{id} imported");
         }
 
         // The workspace-owned checkout stays out of known_repo.

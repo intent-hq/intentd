@@ -2924,10 +2924,6 @@ async fn cmd_serve_owned(
             intent_core::agent_logs_root(&config.data_dir),
         )
     });
-    // Per-agent CoW sandboxes are retired: log one recovery notice per
-    // legacy sandbox that was never merged back, naming its kept folder and
-    // branch. Nothing is resumed, merged or deleted.
-    services.report_retained_sandboxes().await;
     // External MCP servers (§18.3): the health monitor (periodic ping +
     // auto-restart pushing `mcp.servers:status-changed`) starts immediately;
     // starting the enabled servers themselves is deferred to the background
