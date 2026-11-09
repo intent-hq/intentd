@@ -1051,7 +1051,8 @@ focused chat appear at top, top-right, and right, numbered and tinted purple. Yo
 most-used prompts fill the other directions, and **Cancel** is at the bottom.
 Release on a suggestion to send it, or on a used prompt to insert it into the
 focused text box. **Settings → Hardware / Creator Micro → Prompt picker limit**
-sets how many used prompts appear (up to 7).
+sets how many used prompts appear: up to 7, fewer when chat suggestions take the
+top directions.
 
 ## Inspect a failed response and recover
 
