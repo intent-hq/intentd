@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.160] - 2026-11-09
+
+### 🚀 Features
+
+- *(remote)* Remote agents commit with the backend's git identity ([#3165](https://github.com/intent-hq/intentd/pull/3165))
+
+### 🐛 Bug Fixes
+
+- Report runsOn from the placement before the machine is bound ([#3166](https://github.com/intent-hq/intentd/pull/3166))
+- *(e2b)* Send Content-Length: 0 on sandbox pause ([#3167](https://github.com/intent-hq/intentd/pull/3167))
+
+
 ## [0.11.159] - 2026-11-08
 
 ### 🚀 Features
