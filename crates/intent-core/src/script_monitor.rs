@@ -51,6 +51,18 @@ pub fn script_monitor_wake_metadata(row: &ScriptMonitor) -> Value {
     md
 }
 
+/// Remove the daemon-only machine-run wake markers (`remoteAgentId`,
+/// `nodeId`) from caller-supplied `script_monitor_wake` metadata: they let a
+/// wake past the script monitor fences, so only the daemon may set them.
+pub fn strip_machine_wake_markers(metadata: &mut Value) {
+    if let Some(obj) = metadata.as_object_mut() {
+        if obj.get("type").and_then(Value::as_str) == Some("script_monitor_wake") {
+            obj.remove("remoteAgentId");
+            obj.remove("nodeId");
+        }
+    }
+}
+
 /// Notification text with explicit output access and untrusted trigger excerpts.
 #[must_use]
 pub fn script_monitor_wake_text(row: &ScriptMonitor) -> String {

@@ -6192,13 +6192,9 @@ fn strip_sender_attribution(message_metadata: Option<Value>) -> Option<Value> {
         Some(Value::Object(mut obj)) => {
             obj.remove("fromAgentId");
             obj.remove("fromAgentName");
-            // Daemon-only: marks a machine-run wake, which skips the script
-            // monitor fences.
-            if obj.get("type").and_then(Value::as_str) == Some("script_monitor_wake") {
-                obj.remove("remoteAgentId");
-                obj.remove("nodeId");
-            }
-            Some(Value::Object(obj))
+            let mut md = Value::Object(obj);
+            intent_core::script_monitor::strip_machine_wake_markers(&mut md);
+            Some(md)
         }
         other => other,
     }
