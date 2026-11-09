@@ -2143,6 +2143,7 @@ async fn host_provider_discovery_honors_path_overrides_over_wss() {
 #[cfg(unix)]
 #[tokio::test]
 async fn host_provider_discovery_reports_cli_versions_over_wss() {
+    use std::fmt::Write as _;
     use std::os::unix::fs::PermissionsExt;
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
@@ -2161,7 +2162,7 @@ async fn host_provider_discovery_reports_cli_versions_over_wss() {
         std::fs::write(&bin, script).expect("write fake bin");
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake bin");
-        config.push_str(&format!("{name} = \"{}\"\n", bin.display()));
+        writeln!(config, "{name} = \"{}\"", bin.display()).expect("write config line");
     }
     std::fs::write(data_dir.join("config.toml"), config).expect("seed config.toml");
 

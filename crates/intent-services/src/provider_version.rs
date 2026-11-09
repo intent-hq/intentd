@@ -5,23 +5,34 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use intent_providers::ProviderAvailability;
+use intent_providers::{auggie_cli_gate, PiCliGate, PiCliProbe, ProviderAvailability};
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a failed probe is remembered, so a hanging CLI does not add
+/// [`PROBE_TIMEOUT`] to every discovery call.
+const FAILURE_TTL: Duration = Duration::from_secs(600);
 const MAX_VERSION_CHARS: usize = 80;
 
 type Fingerprint = (u64, Option<SystemTime>);
+
+/// Where a row's version comes from.
+enum Target {
+    Binary(PathBuf),
+    /// Auggie launches the first candidate that is not too old
+    /// (`select_auggie_for_spawn`), so the row reports that one.
+    AuggieCandidates(Vec<PathBuf>),
+}
 
 /// The binary whose `--version` describes the row: the `providers.paths`
 /// override when valid, else auto-detection. Unsloth reports its own CLI
 /// (the secondary), not the shared opencode primary. Rows that are gated,
 /// not installed, npx-launched, or probed elsewhere (Cursor) are skipped.
-fn probe_path<S: std::hash::BuildHasher>(
+fn probe_target<S: std::hash::BuildHasher>(
     p: &ProviderAvailability,
     provider_paths: &HashMap<String, String, S>,
-) -> Option<PathBuf> {
+) -> Option<Target> {
     if p.gated_off.is_some()
         || !p.installed
         || p.npx_only_package.is_some()
@@ -30,11 +41,33 @@ fn probe_path<S: std::hash::BuildHasher>(
         return None;
     }
     let explicit = provider_paths.get(p.id).map(String::as_str);
+    if p.id == "auggie" {
+        return Some(Target::AuggieCandidates(
+            intent_providers::find_auggie_candidates(explicit),
+        ));
+    }
     match &p.secondary_binary {
         Some(secondary) => {
             intent_providers::find_provider_binary(secondary.command, secondary.command, explicit)
         }
         None => intent_providers::find_provider_binary(p.id, p.command, explicit),
+    }
+    .map(Target::Binary)
+}
+
+fn target_version(target: &Target) -> Option<String> {
+    match target {
+        Target::Binary(path) => cached_version(path),
+        Target::AuggieCandidates(paths) => paths.iter().find_map(|path| {
+            let version = cached_version(path);
+            let probe = version
+                .clone()
+                .map_or(PiCliProbe::Failed, PiCliProbe::Output);
+            match auggie_cli_gate(&probe) {
+                PiCliGate::TooOld(_) => None,
+                _ => Some(version),
+            }
+        })?,
     }
 }
 
@@ -43,25 +76,42 @@ fn fingerprint(path: &Path) -> Option<Fingerprint> {
     Some((meta.len(), meta.modified().ok()))
 }
 
-fn cache() -> &'static Mutex<HashMap<PathBuf, (Fingerprint, String)>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (Fingerprint, String)>>> = OnceLock::new();
+struct Cached {
+    print: Fingerprint,
+    version: Option<String>,
+    probed_at: Instant,
+}
+
+fn cache() -> &'static Mutex<HashMap<PathBuf, Cached>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Cached>>> = OnceLock::new();
     CACHE.get_or_init(Mutex::default)
 }
 
-/// `--version` of `path`, cached until the binary changes. Failures are
-/// not cached, so a transient timeout is retried on the next discovery.
+/// `--version` of `path`, cached until the binary changes. A failure is
+/// cached for [`FAILURE_TTL`] only, so a transient timeout recovers.
 fn cached_version(path: &Path) -> Option<String> {
+    cached_version_with(path, FAILURE_TTL)
+}
+
+fn cached_version_with(path: &Path, failure_ttl: Duration) -> Option<String> {
     let print = fingerprint(path)?;
-    if let Some((cached, version)) = cache().lock().ok()?.get(path) {
-        if *cached == print {
-            return Some(version.clone());
+    if let Some(hit) = cache().lock().ok()?.get(path) {
+        if hit.print == print && (hit.version.is_some() || hit.probed_at.elapsed() < failure_ttl) {
+            return hit.version.clone();
         }
     }
-    let version = run_version_probe(path)?;
+    let version = run_version_probe(path);
     if let Ok(mut cache) = cache().lock() {
-        cache.insert(path.to_owned(), (print, version.clone()));
+        cache.insert(
+            path.to_owned(),
+            Cached {
+                print,
+                version: version.clone(),
+                probed_at: Instant::now(),
+            },
+        );
     }
-    Some(version)
+    version
 }
 
 /// Probe every eligible row in parallel; keyed by provider id.
@@ -69,14 +119,14 @@ pub(crate) fn probe_display_versions<S: std::hash::BuildHasher>(
     providers: &[ProviderAvailability],
     provider_paths: &HashMap<String, String, S>,
 ) -> HashMap<&'static str, String> {
-    let targets: Vec<(&'static str, PathBuf)> = providers
+    let targets: Vec<(&'static str, Target)> = providers
         .iter()
-        .filter_map(|p| probe_path(p, provider_paths).map(|path| (p.id, path)))
+        .filter_map(|p| probe_target(p, provider_paths).map(|target| (p.id, target)))
         .collect();
     std::thread::scope(|scope| {
         let handles: Vec<_> = targets
             .iter()
-            .map(|(id, path)| scope.spawn(move || cached_version(path).map(|v| (*id, v))))
+            .map(|(id, target)| scope.spawn(move || target_version(target).map(|v| (*id, v))))
             .collect();
         handles
             .into_iter()
@@ -108,7 +158,10 @@ fn kill_group(pid: u32) {
 }
 
 /// `<path> --version` in its own process group with the provider spawn
-/// PATH (npm shims need `node`), bounded by [`PROBE_TIMEOUT`].
+/// PATH (npm shims need `node`), bounded by [`PROBE_TIMEOUT`] including
+/// the stdout read (a grandchild may hold the pipe open). The group is
+/// killed only on timeout, before the child is reaped, so a recycled
+/// process-group id is never signalled.
 fn run_version_probe(path: &Path) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
@@ -127,27 +180,32 @@ fn run_version_probe(path: &Path) -> Option<String> {
     }
     let mut child = cmd.spawn().ok()?;
     let pid = child.id();
-    let start = std::time::Instant::now();
-    let result = loop {
+    let start = Instant::now();
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = (&mut stdout).take(64 * 1024).read_to_end(&mut out);
+            let _ = tx.send(out);
+        });
+    }
+    loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                kill_group(pid);
-                let mut out = Vec::new();
-                child.stdout.take()?.read_to_end(&mut out).ok()?;
-                break version_line(&out);
-            }
-            Ok(Some(_)) | Err(_) => break None,
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) | Err(_) => return None,
             Ok(None) if start.elapsed() >= PROBE_TIMEOUT => {
                 kill_group(pid);
                 let _ = child.kill();
                 let _ = child.wait();
-                break None;
+                return None;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
         }
-    };
-    kill_group(pid);
-    result
+    }
+    let out = rx
+        .recv_timeout(PROBE_TIMEOUT.saturating_sub(start.elapsed()))
+        .ok()?;
+    version_line(&out)
 }
 
 #[cfg(all(test, unix))]
@@ -177,5 +235,30 @@ mod tests {
         assert_eq!(cached_version(&bin), Some("10.20.30".into()));
         write("#!/bin/sh\nexit 1\n");
         assert_eq!(cached_version(&bin), None);
+    }
+
+    #[test]
+    fn failed_probe_is_remembered_until_its_ttl_expires() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("tool");
+        let marker = dir.path().join("runs");
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\necho x >> '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runs = || {
+            std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        assert_eq!(cached_version_with(&bin, Duration::from_secs(600)), None);
+        assert_eq!(cached_version_with(&bin, Duration::from_secs(600)), None);
+        assert_eq!(runs(), 1);
+        assert_eq!(cached_version_with(&bin, Duration::ZERO), None);
+        assert_eq!(runs(), 2);
     }
 }
