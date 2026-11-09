@@ -386,6 +386,13 @@ impl WorkspaceMcpServer {
         self
     }
 
+    /// Whether the prelude installs `ws.agent.machineModels`: set on a
+    /// remote machine whose head serves it, or the backend serves
+    /// `remoteMachines.models` itself.
+    pub(crate) fn installs_machine_models(&self) -> bool {
+        self.machine_models || self.api.remote_machines_capability()
+    }
+
     /// This bridge's captured spawn state, rendered by a docs version.
     fn render_docs<T>(&self, render: impl FnOnce(&WorkspaceApiDocsInputs<'_>) -> T) -> T {
         let features = self.effective_agent_features();
@@ -397,7 +404,11 @@ impl WorkspaceMcpServer {
             plain_folder: self.plain_folder,
             remote_placement_help: self.remote_placement_help.as_deref(),
             truncating_provider: self.compact_tool_descriptions,
-            capability_methods: &[],
+            capability_methods: if self.installs_machine_models() {
+                &["agent.machineModels"]
+            } else {
+                &[]
+            },
         })
     }
 

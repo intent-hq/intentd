@@ -196,7 +196,7 @@ impl WorkspaceMcpServer {
             &effective_features,
             self.is_sub_agent,
             &self.workspace_id,
-            self.machine_models || self.api.remote_machines_capability(),
+            self.installs_machine_models(),
         );
         let full_code = format!(
             "{bindings_prelude}\n\
