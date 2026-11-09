@@ -558,15 +558,17 @@ pub(crate) fn restore_remotes(
     } else {
         std::collections::HashMap::new()
     };
+    // An older archive's sandbox entries are otherwise ignored, but their
+    // WIP sentinels still must never read as published.
     let wip_shas: Vec<&str> = refs
         .workspace_wip_commit_sha
         .iter()
+        .map(String::as_str)
         .chain(
             refs.sandboxes
                 .iter()
-                .filter_map(|s| s.wip_commit_sha.as_ref()),
+                .filter_map(|s| s.get("wipCommitSha").and_then(serde_json::Value::as_str)),
         )
-        .map(String::as_str)
         .collect();
     let mut seen = std::collections::HashSet::new();
     validate_ref_under(

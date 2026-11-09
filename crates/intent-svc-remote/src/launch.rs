@@ -794,7 +794,6 @@ impl RemoteLaunchPort for RemoteLaunch {
                 } else {
                     ParentWorkCopy::LastPush
                 },
-                seeded: false,
             }))
         })
     }

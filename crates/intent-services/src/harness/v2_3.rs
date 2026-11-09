@@ -40,14 +40,6 @@ impl Harness for V2_3 {
         V1.rtk_instruction_line(subcommands)
     }
 
-    fn sandboxed_implementor_hint(&self, sandbox_path: &str, sandbox_branch: &str) -> String {
-        V1.sandboxed_implementor_hint(sandbox_path, sandbox_branch)
-    }
-
-    fn coordinator_cow_hint(&self) -> String {
-        V1.coordinator_cow_hint()
-    }
-
     fn specialist_role_section(&self, behavior_prompt: &str) -> String {
         V1.specialist_role_section(behavior_prompt)
     }

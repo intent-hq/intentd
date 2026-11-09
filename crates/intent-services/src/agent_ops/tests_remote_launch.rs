@@ -458,22 +458,26 @@ async fn delegate_refuses_a_remote_placement_with_isolation() {
     let (_t, svc, ws) = setup().await;
     let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
     let remote = || Some(placement(json!({"target": "remote"})));
-    let cow = svc
-        .agent_delegate_op(
+    let delegate = |isolation: &str| {
+        svc.agent_delegate_op(
             ws.clone(),
             AgentDelegateInput {
                 placement: remote(),
-                isolation: Some("cow".into()),
+                isolation: Some(isolation.into()),
                 task_text: Some("Do it".into()),
                 ..Default::default()
             },
             None,
         )
-        .await;
+    };
+    let shared = delegate("shared").await;
     assert!(
-        matches!(&cow, Err(Error::InvalidParams(m)) if m.contains("cannot be combined")),
-        "{cow:?}"
+        matches!(&shared, Err(Error::InvalidParams(m)) if m.contains("cannot be combined")),
+        "{shared:?}"
     );
+    // The retired value is refused first, whatever the placement.
+    let cow = delegate("cow").await;
+    assert!(matches!(&cow, Err(Error::IsolationRemoved)), "{cow:?}");
 }
 
 #[tokio::test]

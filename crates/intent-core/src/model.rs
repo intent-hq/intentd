@@ -3769,23 +3769,13 @@ pub const AGENT_LIST_PREVIEW_BUDGET_BYTES: usize = 400;
 /// ([`AgentLite::cap_list_previews`]); `agent.get` serves full values.
 pub const AGENT_LIST_NAME_CAP_BYTES: usize = 128;
 
-/// List-row byte cap for `metadata.sandboxPath` and `metadata.sandboxBranch`
-/// (intent-hq/intent#5383): filesystem paths and branch names run longer
-/// than labels but well under a preview — a sandbox checkout under a
-/// deep home directory is ≈ 70 B, a `sandbox/<workspace>/<sbx-id>` branch
-/// ≈ 50 B — so 256 B keeps every realistic value intact while bounding the
-/// row. Same truncation as [`AGENT_LIST_NAME_CAP_BYTES`]; `agent.get`
-/// serves full values.
-pub const AGENT_LIST_PATH_CAP_BYTES: usize = 256;
-
 /// Whole-row byte budget for one serialized `agent.list` row
 /// (intent-hq/intent#5383): the per-field caps above bound each string,
 /// but the row is the unit the transport frames, so a
 /// worst-case-realistic row — every optional field present, every capped
 /// string at its cap ([`AGENT_LIST_PREVIEW_BUDGET_BYTES`] for the previews
 /// and `metadata.attentionRequestReason`, [`AGENT_LIST_NAME_CAP_BYTES`]
-/// for `name` / `model`, [`AGENT_LIST_PATH_CAP_BYTES`] for
-/// `metadata.sandboxPath` / `metadata.sandboxBranch`), two active hooks
+/// for `name` / `model`), two active hooks
 /// and two PR monitors, the detail-only fields stripped
 /// ([`AgentLite::strip_detail_only_fields`]) — must serialize at or under
 /// this many bytes, enforced by the row-budget golden test in
@@ -4022,9 +4012,6 @@ pub const AGENT_LIST_ROW_METADATA_KEYS: &[&str] = &[
     "attentionRequestReasonTruncated",
     "attentionRequestTimestamp",
     "delegationDepth",
-    "sandboxId",
-    "sandboxPath",
-    "sandboxBranch",
     "dismissedQuestionsMessageId",
     "pendingQuestionsMessageId",
     "lastSeenMessageId",
@@ -4582,17 +4569,18 @@ pub struct AgentSession {
     /// legacy inline entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_blocks: Option<serde_json::Value>,
-    /// Sandbox ID when this agent runs in a CoW-isolated sandbox (direct-mode
-    /// workspaces with `CoW` support). `None` for shared-mode agents.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Stored id of the retired per-agent `CoW` sandbox this agent ran in
+    /// before protocol 16. Never written now and never emitted on the wire;
+    /// read only for the retained-sandbox recovery notice.
+    #[serde(default, skip_serializing)]
     pub sandbox_id: Option<String>,
-    /// Sandbox path when this agent runs in a CoW-isolated sandbox. The full path
-    /// to the `CoW` clone of the workspace directory that serves as this agent's
-    /// working root.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Retained folder of that retired sandbox (kept, never reused), named
+    /// by the agent's next-turn recovery notice. Never emitted on the wire.
+    #[serde(default, skip_serializing)]
     pub sandbox_path: Option<String>,
-    /// Sandbox branch name (e.g., "sb/<agentId>") when this agent runs in a sandbox.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Retained branch of that retired sandbox (`sb/<agentId>`), named by the
+    /// recovery notice. Never emitted on the wire.
+    #[serde(default, skip_serializing)]
     pub sandbox_branch: Option<String>,
     /// Whether the agent runs in the background (FE `metadata.isBackground`;
     /// G-A1/P3-1.2c). Persisted at `agent.create`/`agent.delegate` and served
@@ -4909,15 +4897,6 @@ pub struct AgentMetadata {
     pub attention_request_timestamp: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_depth: Option<i64>,
-    /// Sandbox ID when this agent runs in a CoW-isolated sandbox.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox_id: Option<String>,
-    /// Sandbox path when this agent runs in a CoW-isolated sandbox.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox_path: Option<String>,
-    /// Sandbox branch name when this agent runs in a sandbox.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox_branch: Option<String>,
     /// Question-dismissal marker (PROTOCOL §5.5, pending questions): the id of the
     /// assistant message whose trailing question resource blocks the user
     /// dismissed via `agent.dismissQuestions`. Clients gate the Q&A wizard on
@@ -5301,9 +5280,6 @@ impl AgentLite {
             attention_request_reason: session.attention_request_reason,
             attention_request_timestamp: session.attention_request_timestamp,
             delegation_depth: session.delegation_depth,
-            sandbox_id: session.sandbox_id.clone(),
-            sandbox_path: session.sandbox_path.clone(),
-            sandbox_branch: session.sandbox_branch.clone(),
             dismissed_questions_message_id,
             pending_questions_message_id,
             pending_proposals,
@@ -5449,9 +5425,8 @@ impl AgentLite {
     /// list row carries get the same truncation at a cap sized for
     /// the field — `metadata.attentionRequestReason` (a long reason blew
     /// the row budget in production, intent-hq/intent#5383) at the preview
-    /// budget, `name` / `model` / `nodeName` at [`AGENT_LIST_NAME_CAP_BYTES`],
-    /// and `metadata.sandboxPath` / `metadata.sandboxBranch` at
-    /// [`AGENT_LIST_PATH_CAP_BYTES`] — so every free-text string a list row
+    /// budget, and `name` / `model` / `nodeName` at [`AGENT_LIST_NAME_CAP_BYTES`]
+    /// — so every free-text string a list row
     /// carries is bounded (`placementError` is capped at write time,
     /// [`crate::remote_launch::PLACEMENT_ERROR_DETAIL_MAX_BYTES`];
     /// `lastToolUse.name` is the one string left
@@ -5469,7 +5444,7 @@ impl AgentLite {
     /// `metadata.completionReportTruncated`,
     /// `metadata.attentionRequestReasonTruncated`; intent-hq/intent#7250
     /// follow-up) so clients never mistake a prefix for the full value; the
-    /// identifier-sized `name` / `model` / `nodeName` / sandbox caps stay
+    /// identifier-sized `name` / `model` / `nodeName` caps stay
     /// unflagged.
     /// `name` is never touched, so the FE's tool
     /// classification keeps working. These fields exist to render a one-line
@@ -5488,8 +5463,8 @@ impl AgentLite {
     /// `agent.list` response harder. Only the six preview slots
     /// (`lastAgentResponse`, `lastUserMessage`, `digest`,
     /// `metadata.completionReport`, `metadata.attentionRequestReason`,
-    /// `lastToolUse.input`) follow `preview_budget`; `name` / `model` and the
-    /// sandbox strings keep their own fixed caps. Monotone: re-capping an
+    /// `lastToolUse.input`) follow `preview_budget`; `name` / `model` keep their
+    /// own fixed cap. Monotone: re-capping an
     /// already-capped row at a smaller budget only shortens it.
     pub fn cap_list_previews_to(&mut self, preview_budget: usize) {
         use serde_json::Value;
@@ -5570,8 +5545,6 @@ impl AgentLite {
         cap_str(&mut self.name, AGENT_LIST_NAME_CAP_BYTES);
         cap_string(&mut self.model, AGENT_LIST_NAME_CAP_BYTES);
         cap_string(&mut self.node_name, AGENT_LIST_NAME_CAP_BYTES);
-        cap_string(&mut self.metadata.sandbox_path, AGENT_LIST_PATH_CAP_BYTES);
-        cap_string(&mut self.metadata.sandbox_branch, AGENT_LIST_PATH_CAP_BYTES);
         match self.last_tool_use.as_mut() {
             Some(Value::Object(preview)) => {
                 if let Some(input) = preview.get("input") {
@@ -5677,9 +5650,11 @@ pub struct AgentDelegateInput {
     pub behavior_prompt: Option<String>,
     pub wait_mode: Option<String>,
     pub skip_auto_commit: Option<bool>,
-    /// Sandbox isolation mode: "cow" (copy-on-write sandbox) or "shared" (default).
-    /// When "cow" and `CoW` is supported, the agent runs in an isolated `CoW` clone of
-    /// the workspace directory. Falls back to shared mode if `CoW` is unsupported.
+    /// Retired per-agent isolation selector. `"cow"` is rejected with
+    /// `-32602` / `data.code: "isolation-removed"` before any side effect
+    /// (per-agent `CoW` sandboxes were removed in protocol 16); `"direct"` and
+    /// `"shared"` are accepted as no-ops. An agent that is not placed on a
+    /// remote machine works in the workspace checkout.
     pub isolation: Option<String>,
     /// Occupancy override: a task that already has a live assigned agent
     /// rejects a second delegation unless `force: true` is passed to
@@ -8917,8 +8892,7 @@ mod tests {
     /// bounded [`cap_json_value`] preview with the small `name` key
     /// surviving, and under-budget values pass through untouched. The
     /// non-preview strings get their own smaller caps: `name` / `model` at
-    /// [`AGENT_LIST_NAME_CAP_BYTES`], `sandboxPath` / `sandboxBranch` at
-    /// [`AGENT_LIST_PATH_CAP_BYTES`].
+    /// [`AGENT_LIST_NAME_CAP_BYTES`].
     #[test]
     fn agent_lite_cap_list_previews_bounds_preview_fields() {
         let session = AgentSession {
@@ -8970,8 +8944,8 @@ mod tests {
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
-            sandbox_path: Some("/p/".repeat(AGENT_LIST_PATH_CAP_BYTES)),
-            sandbox_branch: Some("sandbox/short".to_string()),
+            sandbox_path: None,
+            sandbox_branch: None,
         };
         let mut lite = AgentLite::from_session(
             session,
@@ -9037,14 +9011,6 @@ mod tests {
             Some(AGENT_LIST_NAME_CAP_BYTES)
         );
         assert_eq!(lite.model.as_deref(), Some("claude-sonnet-4-5-20250929"));
-        assert_eq!(
-            lite.metadata.sandbox_path.as_deref().map(str::len),
-            Some(AGENT_LIST_PATH_CAP_BYTES)
-        );
-        assert_eq!(
-            lite.metadata.sandbox_branch.as_deref(),
-            Some("sandbox/short")
-        );
         // The multi-byte report truncates on a char boundary at or under the
         // budget (never mid-`é`).
         let report = lite.metadata.completion_report.as_deref().unwrap();

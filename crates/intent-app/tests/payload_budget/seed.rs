@@ -517,8 +517,8 @@ pub async fn store(state: &LargeState) -> Seeded {
             .expect("interrupted agent");
     }
 
-    // Agents actively working in sandboxes on tracked files, with
-    // auto-commit on: the lock snapshot names them and their paths.
+    // Agents actively working on tracked files, with auto-commit on: the
+    // lock snapshot names them and their paths.
     store
         .set_workspace_auto_commit(big_ws, true)
         .await
@@ -536,7 +536,6 @@ pub async fn store(state: &LargeState) -> Seeded {
             continue;
         }
         s.status = AgentStatus::Active;
-        s.sandbox_path = Some(format!("/tmp/large-state-sandbox/{}", agent.0));
         store
             .update_agent_session(big_ws, &s)
             .await

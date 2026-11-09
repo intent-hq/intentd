@@ -331,23 +331,11 @@ async fn a_remote_agents_sub_agent_on_another_machine_starts_from_its_work() {
     );
 }
 
-/// Whether the filesystem under `/tmp` can copy-on-write clone, as the
-/// backend's sandbox provisioning needs.
-fn cow_supported(root: &Path) -> bool {
-    let (src, dst) = (root.join("cow-src"), root.join("cow-dst"));
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::create_dir_all(&dst).unwrap();
-    matches!(
-        intent_git::cow_probe(&src, &dst),
-        Ok(intent_git::CowSupport::Supported)
-    )
-}
-
-/// A remote parent's `target: "local"` sub-agent runs on the backend. In
-/// the workspace's shared checkout its instructions only say where the
-/// parent's work is (the checkout is not touched); with its own
-/// copy-on-write checkout (`isolation: "cow"`, where the filesystem supports
-/// it) that checkout starts from the parent's work, pushed at creation.
+/// A remote parent's `target: "local"` sub-agent runs on the backend in the
+/// workspace's shared checkout (per-agent copy-on-write checkouts are
+/// retired): its instructions only say where the parent's work is, and the
+/// checkout is not touched. Created or delegated, with the setting on or
+/// not, the child never gets its own checkout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_remote_agents_backend_sub_agent_gets_its_work() {
     if intent_providers::resolve_on_path("node").is_none()
@@ -391,13 +379,15 @@ async fn a_remote_agents_backend_sub_agent_gets_its_work() {
     .await;
     let parent = create_remote(&mut rpc_ws, &ws_id, "Parent", 10).await;
     let parent_id = parent["agent"]["id"].as_str().unwrap().to_owned();
-    let cow = cow_supported(scratch.path());
+    ok(
+        &mut rpc_ws,
+        4,
+        "settings.update",
+        json!({ "changes": [{ "path": "workspace.cowIsolation", "value": true }] }),
+    )
+    .await;
 
-    let delegate = if cow {
-        r#"const d = await ws.agent.delegate({ taskText: "Cow", agentInstructions: "echo-raw", provider: "mock", model: "default", placement: { target: "local" }, isolation: "cow" });"#
-    } else {
-        "const d = null;"
-    };
+    let delegate = r#"const d = await ws.agent.delegate({ taskText: "Delegated", agentInstructions: "echo-raw", provider: "mock", model: "default", placement: { target: "local" } });"#;
     let code = format!(
         r#"wsapi await ws.file.write("parent.txt", "from parent"); const c = await ws.agent.create("Back", "echo-raw", {{ provider: "mock", model: "default", placement: {{ target: "local" }} }}); {delegate} return JSON.stringify({{ marker: "parent-1", c, d }});"#
     );
@@ -454,39 +444,28 @@ async fn a_remote_agents_backend_sub_agent_gets_its_work() {
         "the work the instructions name holds the parent's edit"
     );
 
-    if !cow {
-        eprintln!("skipping the copy-on-write case: the filesystem cannot clone");
-        return;
-    }
-    // Own copy-on-write checkout: it starts from the parent's work.
+    // Delegated: the same shared checkout and notice, never its own copy.
     let notice = made["d"]["notice"].as_str().unwrap_or_default();
-    assert!(notice.contains("its own checkout"), "{made}");
-    let cow_id = made["d"]["agentId"]
-        .as_str()
-        .or_else(|| made["d"]["id"].as_str())
-        .map_or_else(
-            || panic!("the delegate result names the child: {made}"),
-            str::to_owned,
-        );
-    let seen = reply_containing(&mut rpc_ws, (&ws_id, &cow_id), "raw: ", 300).await;
     assert!(
-        seen.contains("starts from its parent's work"),
-        "the instructions say so: {seen}"
+        notice.contains("does not have its parent's work") && notice.contains(&parent_refs),
+        "the delegate notice names the parent's refs: {made}"
+    );
+    assert!(!notice.contains("its own checkout"), "{made}");
+    assert!(made["d"].get("effectiveIsolation").is_none(), "{made}");
+    let delegated_id = made["d"]["agentId"].as_str().map_or_else(
+        || panic!("the delegate result names the child: {made}"),
+        str::to_owned,
     );
     let session = ok(
         &mut rpc_ws,
         400,
         "agent.getSession",
-        json!({ "workspaceId": ws_id, "agentId": cow_id }),
+        json!({ "workspaceId": ws_id, "agentId": delegated_id }),
     )
     .await;
-    let sandbox = session["session"]["sandboxPath"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the child has its own checkout: {session}"));
-    assert_eq!(
-        std::fs::read_to_string(Path::new(sandbox).join("parent.txt")).unwrap(),
-        "from parent",
-        "its checkout has the parent's uncommitted edit"
+    assert!(
+        session["session"].get("sandboxPath").is_none(),
+        "no own checkout: {session}"
     );
     assert!(
         !repo.join("parent.txt").exists(),

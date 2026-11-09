@@ -322,64 +322,45 @@ pub(crate) struct SpecialistPromptInjection {
     pub role_reminder: Option<String>,
 }
 
-/// Build the mode-dependent isolation hint for Task 6 (`CoW` agent sandboxes).
-/// Returns `Some(hint)` when the agent's isolation mode and specialist warrant
-/// a context block, `None` otherwise. The hint selection keys off the agent's
-/// actual effective isolation (`session.sandbox_path` presence) and workspace mode,
-/// not just the workspace cowIsolation setting, so it reflects what the agent is
-/// actually running under.
-///
-/// Hint matrix (per spec line 104-110):
-/// - Sandboxed agent (`session.sandbox_path` present):
-///   isolation context block with sandbox path, branch, base commit, caches-warm
-///   notice, branch-switching warning, and conflict-bounce resolution instructions.
-/// - Coordinator in CoW-enabled workspace (specialist="spec-writer" + workspace
-///   direct-mode + `cow_supported=true`): parallel delegation safety guidance.
-/// - All other modes: no hint (worktree-mode unchanged, shared-mode direct unchanged).
-pub(crate) fn build_isolation_hint(
-    workspace: Option<&intent_core::Workspace>,
+/// Recovery notice for a legacy session that ran in a per-agent `CoW`
+/// sandbox before they were retired (protocol 16, `methods/nodes.md`
+/// "Landing sequence" step 2). Returns `Some(notice)` only when the session
+/// still owns a sandbox row in a live status (`created`, `merging`,
+/// `merge_pending`, `conflict_bounced`; a merged or discarded sandbox's row
+/// is gone): it names the retained folder and branch (kept as is, never
+/// reused or deleted) and says the agent now works in the workspace
+/// checkout. Every other session gets nothing.
+pub(crate) async fn build_retired_sandbox_notice(
+    store: &Store,
     agent_session: Option<&intent_core::AgentSession>,
-    specialist: Option<&SpecialistPromptInjection>,
 ) -> Option<String> {
-    // Isolation follows the checkout, independently of the selected specialist.
-    let is_sandboxed = agent_session
-        .and_then(|s| s.sandbox_path.as_ref())
-        .is_some();
+    use intent_store::SandboxStatus;
 
-    let specialist_name = specialist
-        .and_then(|s| s.specialist_name.as_deref())
-        .unwrap_or("");
-
-    // The session's pinned harness owns the hint wording (H2); session-less
-    // calls resolve to the latest.
-    let harness = session_harness_entry(agent_session).harness;
-
-    // Case 1: Sandboxed agent — inject isolation context
-    if is_sandboxed {
-        let session = agent_session?;
-        let sandbox_path = session.sandbox_path.as_deref().unwrap_or("<sandbox-path>");
-        let sandbox_branch = session.sandbox_branch.as_deref().unwrap_or("sb/<id>");
-        return Some(harness.sandboxed_implementor_hint(sandbox_path, sandbox_branch));
+    let session = agent_session?;
+    session.sandbox_path.as_ref()?;
+    let sandbox = store
+        .get_sandbox(&session.workspace_id, &session.id)
+        .await
+        .ok()
+        .flatten()?;
+    if !matches!(
+        sandbox.status,
+        SandboxStatus::Created
+            | SandboxStatus::Merging
+            | SandboxStatus::MergePending
+            | SandboxStatus::ConflictBounced
+    ) {
+        return None;
     }
-
-    // Case 2: Coordinator in CoW-enabled direct-mode workspace
-    // "spec-writer" is the coordinator specialist (per SPECIALISTS constant in FE)
-    if specialist_name.eq_ignore_ascii_case("coordinator")
-        || specialist_name.eq_ignore_ascii_case("spec-writer")
-    {
-        if let Some(ws) = workspace {
-            // Direct mode: skip_worktree=true OR worktree_path=None
-            let is_direct_mode = ws.skip_worktree || ws.worktree_path.is_none();
-            let cow_supported = ws.cow_supported.unwrap_or(false);
-
-            if is_direct_mode && cow_supported {
-                return Some(harness.coordinator_cow_hint());
-            }
-        }
-    }
-
-    // Case 3: Worktree mode or shared-mode direct — no hint (behavior unchanged)
-    None
+    let (path, branch) = (sandbox.path, sandbox.branch);
+    Some(format!(
+        "## Retired Agent Sandbox\n\n\
+         You previously worked in a per-agent copy-on-write sandbox at `{path}` on branch \
+         `{branch}`. Per-agent sandboxes are retired: you now work in the workspace checkout, \
+         and the sandbox's work was not merged back. Its folder and branch are kept as they \
+         were; nothing is deleted or reused. If you need work from it, read it from that folder \
+         or branch (for example `git -C {path} log {branch}`) and carry it over by hand."
+    ))
 }
 
 /// Format the RTK instruction line for the given usable subcommands. Wording
@@ -648,13 +629,11 @@ async fn assemble_system_prompt_layers(
             intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING
         ));
     }
-    // Mode-dependent isolation hints (Task 6): inject context about CoW
-    // sandboxing for implementors and parallel delegation safety for coordinators
-    // when appropriate, before the specialist role section so the specialist
-    // behavior prompt can reference them.
+    // A legacy session that ran in a retired per-agent CoW sandbox: name
+    // the retained folder and branch, and where the agent works now.
     if assistant.is_none() {
-        if let Some(hint) = build_isolation_hint(workspace, agent_session, specialist) {
-            parts.push(hint);
+        if let Some(notice) = build_retired_sandbox_notice(store, agent_session).await {
+            parts.push(notice);
         }
     }
     // A backend sub-agent of a remote agent: where its parent's work is.

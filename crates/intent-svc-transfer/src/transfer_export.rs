@@ -167,7 +167,7 @@ pub(crate) struct ExportSession {
     pub staging_dir: PathBuf,
     pub state: ExportState,
     /// Repos left holding a transfer WIP snapshot commit by the bundle
-    /// builder (worktree and/or sandboxes); unwound when the export settles
+    /// builder (the worktree); unwound when the export settles
     /// (finalize, abort, or a failed build after bundling succeeded).
     pub wip_paths: Vec<PathBuf>,
     /// Per-chunk byte budget served by `read`. Always
@@ -511,7 +511,7 @@ impl TransferExportExt for Services {
         }
         // Hold the teardown fence across the row export below: it blocks the
         // lazy-spawn paths for the swept agents, so a queued message cannot
-        // respawn one mid-export and mutate rows or the worktree/sandboxes
+        // respawn one mid-export and mutate rows or the worktree
         // while they are being captured. Held through the git bundle (stage
         // 3) so the bundle is built against the same quiesced state as the
         // rows.
@@ -596,23 +596,10 @@ impl TransferExportExt for Services {
         let git_payload = if manifest.git.has_repository {
             self.emit_export_progress(&id, export_id, "bundling-git", None)
                 .await;
-            let sandboxes = self.store().list_sandboxes(&id).await?;
-            let live: Vec<intent_store::Sandbox> = sandboxes
-                .into_iter()
-                .filter(|s| {
-                    matches!(
-                        s.status,
-                        intent_store::SandboxStatus::Created
-                            | intent_store::SandboxStatus::Merging
-                            | intent_store::SandboxStatus::MergePending
-                            | intent_store::SandboxStatus::ConflictBounced
-                    )
-                })
-                .collect();
             let ws_for_bundle = ws.clone();
             let bundle_staging = staging_dir.clone();
             let bundle = tokio::task::spawn_blocking(move || {
-                create_transfer_bundle(&ws_for_bundle, &live, &bundle_staging)
+                create_transfer_bundle(&ws_for_bundle, &bundle_staging)
             })
             .await
             .map_err(|e| Error::Internal(format!("export bundle task failed: {e}")))??;
@@ -621,14 +608,6 @@ impl TransferExportExt for Services {
             if bundle.refs.workspace_wip_commit_sha.is_some() {
                 if let Some(worktree) = git_ops::worktree_path(&ws) {
                     wip_paths.push(worktree);
-                }
-            }
-            for sb in &bundle.refs.sandboxes {
-                if sb.wip_commit_sha.is_some() {
-                    // Sandbox paths were validated to exist by the bundler.
-                    if let Some(path) = sandbox_path_for(self.store(), &id, &sb.agent_id).await {
-                        wip_paths.push(path);
-                    }
                 }
             }
             {
@@ -946,21 +925,6 @@ impl TransferExportExt for Services {
         )
         .await;
     }
-}
-
-/// Resolve a sandbox's on-disk path from its row (WIP unwind bookkeeping).
-async fn sandbox_path_for(
-    store: &intent_store::Store,
-    workspace_id: &WorkspaceId,
-    agent_id: &str,
-) -> Option<PathBuf> {
-    store
-        .list_sandboxes(workspace_id)
-        .await
-        .ok()?
-        .into_iter()
-        .find(|s| s.agent_id.0 == agent_id)
-        .map(|s| PathBuf::from(s.path))
 }
 
 /// Build a `workspace:transfer:*` event (PROTOCOL §6.5): self-sufficient

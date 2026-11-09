@@ -22096,7 +22096,7 @@ async fn wss_workspace_import_commit_materializes_git() {
     let staging = src.path().join("staging");
     let intent_app::transfer::transfer_git::TransferBundle {
         bundle_path, refs, ..
-    } = intent_app::transfer::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
+    } = intent_app::transfer::transfer_git::create_transfer_bundle(&src_ws, &staging)
         .expect("bundle");
     assert!(
         refs.workspace_wip_commit_sha.is_some(),

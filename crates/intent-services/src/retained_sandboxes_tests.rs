@@ -177,7 +177,11 @@ mod tests {
                 .map(|r| (r.agent_id.0.clone(), r.path.clone(), r.branch.clone()))
                 .collect::<Vec<_>>(),
             live.iter()
-                .map(|(agent, _, path, _)| (agent.0.clone(), path.clone(), format!("sb/{}", agent.0)))
+                .map(|(agent, _, path, _)| (
+                    agent.0.clone(),
+                    path.clone(),
+                    format!("sb/{}", agent.0)
+                ))
                 .collect::<Vec<_>>(),
             "one notice per live sandbox, naming its path and branch"
         );
@@ -191,7 +195,10 @@ mod tests {
             let row = store.get_sandbox(&ws.id, agent).await.unwrap().unwrap();
             assert_eq!(row.status, *status, "the row is not transitioned");
             assert_eq!(row.retry_count, 1, "the row is not reset");
-            let session = store.get_agent_session_without_messages(agent).await.unwrap();
+            let session = store
+                .get_agent_session_without_messages(agent)
+                .await
+                .unwrap();
             assert_eq!(
                 session.sandbox_path.as_deref(),
                 Some(path_s.as_str()),

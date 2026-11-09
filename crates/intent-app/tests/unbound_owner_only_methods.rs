@@ -384,14 +384,6 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
             json!({ "workspaceId": ws, "ruleType": "agents", "content": "" }),
         ),
         (
-            "sandbox.cow.discard",
-            json!({ "workspaceId": ws, "agentId": "a1" }),
-        ),
-        (
-            "sandbox.cow.merge",
-            json!({ "workspaceId": ws, "agentId": "a1" }),
-        ),
-        (
             "script.archive",
             json!({"workspaceId": ws, "scriptIds": ["s1"]}),
         ),

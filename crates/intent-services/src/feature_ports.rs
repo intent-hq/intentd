@@ -291,12 +291,10 @@ impl TransferPort for UnavailableTransfer {
 
 /// The workspace runtime feature: saved scripts (`script.*`, including
 /// script monitors), background hooks (`hook.*`), terminals (`terminal.*`),
-/// the browser tab registry (`browser.*`), agent sandboxes (`sandbox.*`)
-/// and workspace setup scripts. Each RPC method performs the full RPC,
+/// the browser tab registry (`browser.*`) and workspace setup scripts. Each RPC method performs the full RPC,
 /// authorization included, exactly as the `WorkspaceApi` method of the same
 /// name it backs; the remaining methods are the entry points core code
-/// (sandbox merge-back, provisioning, the browser-client pin, workspace
-/// creation) reaches the runtime through.
+/// (the browser-client pin, workspace creation) reaches the runtime through.
 pub trait RuntimePort: Send + Sync + 'static {
     fn script_list<'a>(
         &'a self,
@@ -638,22 +636,6 @@ pub trait RuntimePort: Send + Sync + 'static {
         force: bool,
     ) -> BoxFuture<'a, Result<serde_json::Value>>;
 
-    /// `sandbox.cow.merge`.
-    fn sandbox_merge<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: WorkspaceId,
-        sandbox_id: AgentId,
-    ) -> BoxFuture<'a, Result<serde_json::Value>>;
-
-    /// `sandbox.cow.discard`.
-    fn sandbox_discard<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: WorkspaceId,
-        sandbox_id: AgentId,
-    ) -> BoxFuture<'a, Result<serde_json::Value>>;
-
     /// Re-home every claimed browser tab of `workspace_id` to `new_host`,
     /// the workspace's new driving-client pin (REV-2 Model 10).
     fn migrate_claimed_browser_tabs<'a>(
@@ -673,32 +655,6 @@ pub trait RuntimePort: Send + Sync + 'static {
         client_id: ClientId,
         superseded: Vec<ClientId>,
     ) -> BoxFuture<'a, Result<usize>>;
-
-    /// Provision a `CoW` sandbox for `agent_id` under `workspaces_root`.
-    fn provision_sandbox<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: &'a WorkspaceId,
-        agent_id: &'a AgentId,
-        workspaces_root: PathBuf,
-    ) -> BoxFuture<'a, Result<ProvisionOutcome>>;
-
-    /// Attempt the merge-back of `agent_id`'s sandbox into canonical. The
-    /// caller owns the sandbox status claim and the bookkeeping.
-    fn merge_sandbox<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: &'a WorkspaceId,
-        agent_id: &'a AgentId,
-    ) -> BoxFuture<'a, Result<MergeOutcome>>;
-
-    /// Remove `agent_id`'s sandbox directory and record.
-    fn discard_sandbox<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: &'a WorkspaceId,
-        agent_id: &'a AgentId,
-    ) -> BoxFuture<'a, Result<()>>;
 
     /// Run a new workspace's effective setup script in its "Setup"
     /// terminal and wait for it to exit. Resolves to `(ran_script,
@@ -1059,43 +1015,6 @@ pub trait ScriptsClosing: Send {
 /// with this error (they have no `WorkspaceApi` default to mirror).
 fn runtime_unavailable() -> Error {
     Error::Internal("runtime feature not registered".to_string())
-}
-
-/// Outcome of sandbox provisioning.
-#[derive(Debug, Clone)]
-pub enum ProvisionOutcome {
-    /// `CoW` is supported; sandbox was created.
-    Supported {
-        path: PathBuf,
-        branch: String,
-        base_commit_sha: String,
-        snapshot_commit_sha: Option<String>,
-    },
-    /// `CoW` is not supported; fallback to shared mode (no bytes copied).
-    Unsupported,
-}
-
-/// Outcome of a merge-back attempt.
-#[derive(Debug, Clone)]
-pub enum MergeOutcome {
-    /// Clean merge; sandbox commits applied to canonical.
-    Merged {
-        commit_range: String,
-        canonical_head: String,
-    },
-    /// Conflicts detected; user's repo left pristine.
-    Conflict {
-        conflicting_paths: Vec<String>,
-        canonical_head: String,
-    },
-    /// Blocked: the merge could not proceed but stays retryable — canonical
-    /// has uncommitted user edits overlapping merge paths (`overlapping_paths`
-    /// populated), or the sandbox branch is missing/unborn (`overlapping_paths`
-    /// empty; see `reason`).
-    Blocked {
-        reason: String,
-        overlapping_paths: Vec<String>,
-    },
 }
 
 /// One workspace-creation setup-script run ([`RuntimePort::run_setup_script`]).
@@ -2164,24 +2083,6 @@ impl RuntimePort for UnavailableRuntime {
         DEFAULT_WORKSPACE_API.browser_close_tab(tab_id, force)
     }
 
-    fn sandbox_merge<'a>(
-        &'a self,
-        _svc: &'a Services,
-        workspace_id: WorkspaceId,
-        sandbox_id: AgentId,
-    ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        DEFAULT_WORKSPACE_API.sandbox_merge(workspace_id, sandbox_id)
-    }
-
-    fn sandbox_discard<'a>(
-        &'a self,
-        _svc: &'a Services,
-        workspace_id: WorkspaceId,
-        sandbox_id: AgentId,
-    ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        DEFAULT_WORKSPACE_API.sandbox_discard(workspace_id, sandbox_id)
-    }
-
     fn migrate_claimed_browser_tabs<'a>(
         &'a self,
         _svc: &'a Services,
@@ -2200,34 +2101,6 @@ impl RuntimePort for UnavailableRuntime {
         _superseded: Vec<ClientId>,
     ) -> BoxFuture<'a, Result<usize>> {
         Box::pin(async { Ok(0) })
-    }
-
-    fn provision_sandbox<'a>(
-        &'a self,
-        _svc: &'a Services,
-        _workspace_id: &'a WorkspaceId,
-        _agent_id: &'a AgentId,
-        _workspaces_root: PathBuf,
-    ) -> BoxFuture<'a, Result<ProvisionOutcome>> {
-        Box::pin(async { Err(runtime_unavailable()) })
-    }
-
-    fn merge_sandbox<'a>(
-        &'a self,
-        _svc: &'a Services,
-        _workspace_id: &'a WorkspaceId,
-        _agent_id: &'a AgentId,
-    ) -> BoxFuture<'a, Result<MergeOutcome>> {
-        Box::pin(async { Err(runtime_unavailable()) })
-    }
-
-    fn discard_sandbox<'a>(
-        &'a self,
-        _svc: &'a Services,
-        _workspace_id: &'a WorkspaceId,
-        _agent_id: &'a AgentId,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async { Err(runtime_unavailable()) })
     }
 
     fn run_setup_script(
@@ -3235,16 +3108,6 @@ mod tests {
             svc.browser_close_tab("t".into(), true).await,
             api.browser_close_tab("t".into(), true).await,
         );
-        same(
-            "sandbox_merge",
-            svc.sandbox_merge(ws.clone(), agent.clone()).await,
-            api.sandbox_merge(ws.clone(), agent.clone()).await,
-        );
-        same(
-            "sandbox_discard",
-            svc.sandbox_discard(ws.clone(), agent.clone()).await,
-            api.sandbox_discard(ws.clone(), agent.clone()).await,
-        );
         assert!(
             matches!(
                 svc.script_list(ws.clone()).await,
@@ -3262,7 +3125,6 @@ mod tests {
             .with_runtime_port(Arc::new(UnavailableRuntime) as Arc<dyn RuntimePort>);
         let port = svc.ports.runtime();
         let ws = WorkspaceId::new();
-        let agent = intent_core::AgentId::new();
         let refused = |method: &str, got: String| {
             assert_eq!(
                 got, r#"Err(Internal("runtime feature not registered"))"#,
@@ -3280,22 +3142,6 @@ mod tests {
                 )
                 .await
             ),
-        );
-        refused(
-            "provision_sandbox",
-            format!(
-                "{:?}",
-                port.provision_sandbox(&svc, &ws, &agent, tmp.path.clone())
-                    .await
-            ),
-        );
-        refused(
-            "merge_sandbox",
-            format!("{:?}", port.merge_sandbox(&svc, &ws, &agent).await),
-        );
-        refused(
-            "discard_sandbox",
-            format!("{:?}", port.discard_sandbox(&svc, &ws, &agent).await),
         );
         let run = super::SetupScriptRun {
             workspace_id: ws.clone(),

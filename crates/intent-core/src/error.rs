@@ -64,6 +64,13 @@ pub enum Error {
     #[error("{operation} is not available in plain-folder workspaces")]
     PlainFolderUnsupported { operation: &'static str },
 
+    /// `agent.delegate` asked for `isolation: "cow"`: per-agent `CoW`
+    /// sandboxes are retired (protocol 16, `methods/nodes.md` "Errors and
+    /// retirement gates"). Raised before any side effect. Surfaces as
+    /// `-32602` with `error.data = { code: "isolation-removed" }`.
+    #[error("invalid params: isolation \"cow\" was removed; per-agent copy-on-write sandboxes are retired and agents that are not placed on a remote machine work in the workspace checkout")]
+    IsolationRemoved,
+
     /// A `workspace.create { plainFolder: true }` request-shape rejection
     /// (§5.1 "Plain-folder workspaces"): a git-only option, a pr-kind
     /// context link, or a missing `repositoryPath`. Same `-32602` and message
@@ -759,6 +766,7 @@ impl Error {
             | Error::WorkspaceRetired { .. }
             | Error::RetireUnsupported { .. }
             | Error::PlainFolderUnsupported { .. }
+            | Error::IsolationRemoved
             | Error::PlainFolderInvalidParams(_)
             | Error::PlainFolderPathRejected(_)
             | Error::SecretRequest { .. }

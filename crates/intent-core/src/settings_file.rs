@@ -191,8 +191,9 @@ pub struct WorkspaceSettings {
     pub ssh_key_path: Option<String>,
     /// `workspace.defaultShell` — shell used for terminals/scripts.
     pub default_shell: Option<String>,
-    /// `workspace.cowIsolation` — `CoW` workspace provisioning and per-agent
-    /// sandboxing (requires `CoW` filesystem support on the workspaces root).
+    /// `workspace.cowIsolation` — `CoW` workspace checkouts (requires `CoW`
+    /// filesystem support on the workspaces root). It no longer puts
+    /// delegated agents in per-agent sandboxes (retired in protocol 16).
     /// A preference, not a guarantee: when the filesystem cannot `CoW`-clone,
     /// `workspace.create` falls back to a linked worktree (local repository)
     /// or a plain local clone (repo-cache hydration) instead of failing.
@@ -1892,8 +1893,8 @@ providerSettings = {}
 # sshKeyPath = "~/.ssh/id_ed25519"
 # Default shell -- shell used for terminals/scripts.
 # defaultShell = "/bin/zsh"
-# Copy-on-Write Isolation -- CoW workspaces + per-agent sandboxes (requires
-# CoW filesystem support on the workspaces root).
+# Copy-on-Write Isolation -- CoW workspace checkouts (requires CoW filesystem
+# support on the workspaces root).
 cowIsolation = false
 # Auto-archive -- archive workspaces idle for this many days (0 = off);
 # workspaces with uncommitted changes or unpushed commits are skipped.

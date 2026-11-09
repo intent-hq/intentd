@@ -253,34 +253,21 @@ fn node_resolve(base: &str, rel: &str) -> Result<PathBuf, HostExecError> {
 /// Resolve the workspace filesystem root, then apply the same lexical
 /// prefix-check `file_ops` uses. An empty root (unset `worktreePath`/`path`)
 /// rejects any `cwd` — the containment guard cannot be enforced without one.
-/// When `caller_agent_id` is provided and the agent has a sandbox, the sandbox
-/// path is used as the containment root (sandboxed agent containment).
+/// Every agent is contained to the workspace root.
 /// Public so the streaming surface (`host_exec_stream`) can reuse the guard
 /// bit-identically instead of re-deriving it.
 pub(crate) async fn resolve_cwd_within_workspace(
     api: &dyn WorkspaceApi,
     workspace_id: &str,
     cwd: &str,
-    caller_agent_id: Option<&intent_core::AgentId>,
+    _caller_agent_id: Option<&intent_core::AgentId>,
 ) -> Result<PathBuf, HostExecError> {
     let ws = api
         .get_workspace(WorkspaceId::from(workspace_id))
         .await
         .map_err(|e| HostExecError::internal(format!("workspace lookup failed: {e}")))?;
 
-    let root = if let Some(agent_id) = caller_agent_id {
-        if let Ok(session) = api.agent_get_session(agent_id.clone(), None).await {
-            if let Some(sandbox_path) = session.sandbox_path {
-                sandbox_path
-            } else {
-                file_ops::workspace_root(&ws)
-            }
-        } else {
-            file_ops::workspace_root(&ws)
-        }
-    } else {
-        file_ops::workspace_root(&ws)
-    };
+    let root = file_ops::workspace_root(&ws);
 
     if root.is_empty() {
         return Err(HostExecError::internal(

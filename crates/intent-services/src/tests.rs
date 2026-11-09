@@ -30611,11 +30611,11 @@ mod rules {
     #[tokio::test]
     async fn assembly_names_retained_sandbox_for_legacy_sandboxed_session() {
         let tree = worktree();
-        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
+        let (_tmp, store, _svc, ws_id) = setup(&tree.0).await;
 
         // Create a mock workspace (direct mode + CoW supported)
         let workspace = intent_core::Workspace {
-            id: intent_core::WorkspaceId::from("ws-1"),
+            id: ws_id.clone(),
             title: "Test".into(),
             branch: "main".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -30633,7 +30633,7 @@ mod rules {
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             id: intent_core::AgentId::from("agent-1"),
-            workspace_id: intent_core::WorkspaceId::from("ws-1"),
+            workspace_id: ws_id.clone(),
             parent_agent_id: None,
             backend_session_id: None,
             acp_session_id: None,
@@ -30677,22 +30677,41 @@ mod rules {
             updated_at: "2026-01-01T00:00:00Z".into(),
         };
 
-        let prompt = crate::rules::assemble_system_prompt(
-            &store,
-            Some(&tree.0),
-            "task-loop",
-            None,
-            true,
-            false,
-            false,
-            &intent_core::settings_file::AgentFeaturesSettings::default(),
-            Some(&workspace),
-            Some(&agent_session),
-            None,
-        )
-        .await
-        .expect("assembled prompt");
-
+        store
+            .insert_agent_session(&agent_session)
+            .await
+            .expect("session");
+        let sandbox = intent_store::Sandbox {
+            id: "sandbox-123".into(),
+            workspace_id: ws_id.clone(),
+            agent_id: agent_session.id.clone(),
+            path: "/test/sandboxes/agent-1/test-repo".into(),
+            branch: "sb/agent-1".into(),
+            base_commit_sha: "0".repeat(40),
+            snapshot_commit_sha: None,
+            status: intent_store::SandboxStatus::ConflictBounced,
+            retry_count: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        store.insert_sandbox(&sandbox).await.expect("sandbox");
+        let features = intent_core::settings_file::AgentFeaturesSettings::default();
+        let assemble = || {
+            crate::rules::assemble_system_prompt(
+                &store,
+                Some(&tree.0),
+                "task-loop",
+                None,
+                true,
+                false,
+                false,
+                &features,
+                Some(&workspace),
+                Some(&agent_session),
+                None,
+            )
+        };
+        let prompt = assemble().await.expect("assembled prompt");
         assert!(
             prompt.contains("## Retired Agent Sandbox"),
             "retirement notice header: {prompt}"
@@ -30713,8 +30732,23 @@ mod rules {
             "woken with the conflicting paths",
             "merges your branch back",
         ] {
-            assert!(!prompt.contains(gone), "retired sandbox text {gone:?} remains");
+            assert!(
+                !prompt.contains(gone),
+                "retired sandbox text {gone:?} remains"
+            );
         }
+
+        // A sandbox that was merged back (its row is deleted on merge) gets
+        // no notice, even though the session still records the old path.
+        store
+            .delete_sandbox(&ws_id, &agent_session.id)
+            .await
+            .expect("delete sandbox");
+        let prompt = assemble().await.expect("assembled prompt");
+        assert!(
+            !prompt.contains("## Retired Agent Sandbox"),
+            "no notice without a live sandbox row"
+        );
     }
 
     /// A coordinator in a CoW-capable direct-mode workspace no longer gets
@@ -30817,7 +30851,10 @@ mod rules {
             "isolation: \"cow\"",
             "Merge-back is automatic",
         ] {
-            assert!(!prompt.contains(gone), "retired coordinator hint {gone:?} remains");
+            assert!(
+                !prompt.contains(gone),
+                "retired coordinator hint {gone:?} remains"
+            );
         }
     }
 
@@ -31023,10 +31060,8 @@ mod rules {
         assert!(!prompt.contains("CoW sandbox"), "no CoW mention");
     }
 
-    /// Task 6 (verifier requirement): explicit isolation:"shared" override must prevent
-    /// sandbox hint even when workspace has `cow_supported=true` and setting ON. This
-    /// mutation test ensures `build_isolation_hint` keys off `session.sandbox_path` (actual
-    /// effective isolation), not `workspace.cow_supported` (capability).
+    /// A session without a sandbox gets no sandbox text even when the
+    /// workspace is CoW-capable (`cow_supported=true`).
     #[tokio::test]
     async fn assembly_omits_sandbox_hint_when_explicit_shared_override() {
         let tree = worktree();
@@ -35814,121 +35849,73 @@ mod file_ops_service {
         }
     }
 
-    #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
-    /// Wire-contract test: agent.delegate returns effectiveIsolation "pending"
-    /// when an eligible `CoW` provisioning kicks off (monorepo#871 — the clone
-    /// runs in a background task, off the delegate critical path). The settled
-    /// outcome is observable on the child's session: sandbox fields present on
-    /// success, absent on the shared-mode fallback.
+    /// Per-agent `CoW` sandboxes are retired: `isolation: "cow"` is refused
+    /// with `Error::IsolationRemoved` before any side effect (no session),
+    /// even in a sandbox-eligible direct-mode workspace with
+    /// `workspace.cowIsolation` on; `"shared"` / `"direct"` stay no-ops.
     #[tokio::test]
-    async fn delegate_returns_effective_isolation_in_result() {
+    async fn delegate_refuses_cow_isolation_before_side_effects() {
         use intent_core::AgentDelegateInput;
-        use intent_git::{cow_probe, CowSupport};
-        use std::fs;
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws_id = WorkspaceId::new();
-
-        // Set up test directories under target/ (same volume for CoW support)
-        let workspace_root = std::env::current_dir()
-            .unwrap()
-            .ancestors()
-            .nth(2)
-            .unwrap()
-            .to_path_buf();
-        let test_root = workspace_root
-            .join("target")
-            .join(format!("test-delegate-iso-{}", uuid::Uuid::new_v4()));
-        let user_dir = test_root.join("user-workspace");
-        let workspaces_root = test_root.join("workspaces");
-
-        // Initialize a git repo
-        fs::create_dir_all(&user_dir).unwrap();
-        let repo = git2::Repository::init(&user_dir).unwrap();
-        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
-        let tree_id = {
-            let mut index = repo.index().unwrap();
-            index.write_tree().unwrap()
-        };
-        let tree = repo.find_tree(tree_id).unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
-            .unwrap();
-
-        // Create workspace
         let mut ws = workspace(&ws_id);
-        ws.repository_path = Some(user_dir.to_string_lossy().to_string());
+        ws.repository_path = Some("/tmp/does-not-matter".to_string());
         ws.skip_worktree = true;
         store.insert_workspace(&ws).await.expect("insert ws");
-
-        // Probe CoW support to determine the expected SETTLED outcome (the
-        // session's sandbox fields; the delegate result itself is "pending").
-        fs::create_dir_all(&workspaces_root).unwrap();
-        let probe = cow_probe(&user_dir, &workspaces_root).unwrap();
-        let expect_sandbox = matches!(probe, CowSupport::Supported);
-
-        // Create services with workspaces_root configured
-        let mut svc = Services::new_isolated(store.clone())
+        let svc = Services::new_isolated(store.clone())
             .with_settings_registry(test_registry_with_default_provider(&tmp));
-        svc.workspaces_root = Some(workspaces_root);
+        svc.settings_update(serde_json::json!([{
+            "path": "workspace.cowIsolation",
+            "value": true
+        }]))
+        .await
+        .expect("enable cowIsolation");
 
-        // Delegate with isolation=cow
-        let delegate_input = AgentDelegateInput {
-            task_text: Some("test task".to_string()),
-            agent_instructions: Some("test instructions".to_string()),
-            isolation: Some("cow".to_string()),
-            ..Default::default()
-        };
-        let result = svc
-            .agent_delegate_op(ws_id.clone(), delegate_input, None)
-            .await
-            .expect("delegate");
-
-        // Assert effectiveIsolation reports "pending" — provisioning runs in
-        // a background task, off the delegate critical path (monorepo#871).
-        let effective_iso = result
-            .get("effectiveIsolation")
-            .expect("effectiveIsolation field must be present when isolation is requested");
-        assert_eq!(
-            effective_iso.as_str().unwrap(),
-            "pending",
-            "delegate returns immediately with pending provisioning"
+        for tasks in [
+            None,
+            Some(vec![intent_core::BatchTaskEntry::Id(NoteId::from("n1"))]),
+        ] {
+            let err = svc
+                .agent_delegate_op(
+                    ws_id.clone(),
+                    AgentDelegateInput {
+                        agent_instructions: tasks.is_none().then(|| "work".to_string()),
+                        isolation: Some("cow".to_string()),
+                        tasks,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .expect_err("isolation cow is removed");
+            assert!(matches!(err, Error::IsolationRemoved), "{err:?}");
+        }
+        assert!(
+            store
+                .list_agent_session_summaries(&ws_id)
+                .await
+                .expect("sessions")
+                .is_empty(),
+            "no session was created"
         );
 
-        // Also verify agentId and name are present (baseline delegate result shape)
-        assert!(result.get("ok").unwrap().as_bool().unwrap());
-        assert!(result.get("agentId").is_some());
-        assert!(result.get("name").is_some());
-
-        // Await settlement (the same gate the child's turn worker blocks on)
-        // and assert the settled outcome on the session: sandbox fields when
-        // CoW is supported, none on the shared-mode fallback.
-        let agent_id = AgentId::from(result.get("agentId").unwrap().as_str().unwrap());
-        svc.await_sandbox_provisioning(&agent_id).await;
-        let session = store
-            .get_agent_session_with_transcript(&agent_id)
-            .await
-            .expect("child session");
-        if expect_sandbox {
-            let sandbox_path = session
-                .sandbox_path
-                .as_deref()
-                .expect("sandbox_path settled on the session");
-            assert!(
-                std::path::Path::new(sandbox_path).exists(),
-                "provisioned sandbox exists at {sandbox_path}"
-            );
-            assert!(session.sandbox_branch.is_some());
-            assert!(session.sandbox_id.is_some());
-        } else {
-            assert!(
-                session.sandbox_path.is_none(),
-                "shared-mode fallback keeps no sandbox fields"
-            );
+        for isolation in ["shared", "direct"] {
+            let out = svc
+                .agent_delegate_op(
+                    ws_id.clone(),
+                    AgentDelegateInput {
+                        agent_instructions: Some("work".to_string()),
+                        isolation: Some(isolation.to_string()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .expect("no-op isolation is accepted");
+            assert!(out.get("effectiveIsolation").is_none(), "{out}");
         }
-
-        // Clean up
-        let _ = fs::remove_dir_all(&test_root);
     }
 }
 

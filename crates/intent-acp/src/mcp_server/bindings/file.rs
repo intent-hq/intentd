@@ -84,8 +84,7 @@ pub(crate) async fn dispatch(
         }
         "getAttachment" => {
             // Copy a registered attachment from the canonical store into the
-            // CALLER's working directory (sandbox clone for CoW-sandboxed
-            // callers — resolved inside the service from the caller session).
+            // caller's working directory (the workspace checkout).
             let attachment_id = req_str(args, "attachmentId")
                 .map_err(|_| "attachmentId is required".to_string())?;
             let dest_dir = opt_str(args, "destDir");

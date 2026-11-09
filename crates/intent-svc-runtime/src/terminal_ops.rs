@@ -215,23 +215,15 @@ fn interactive_login_args(shell: &str, is_windows: bool) -> Vec<String> {
 
 /// Default working directory when `terminal.create` omits `cwd`: the
 /// workspace's worktree root, resolved the same way `script_ops` resolves a
-/// script cwd (`worktreePath`, else `repositoryPath`). When `caller_agent_id`
-/// is provided and the agent has a sandbox, the sandbox path overrides the
-/// workspace worktree (sandboxed agent containment). A missing workspace row
+/// script cwd (`worktreePath`, else `repositoryPath`), for every caller. A
+/// missing workspace row
 /// or one without a resolvable worktree yields `None`, so the PTY inherits the
 /// daemon's cwd (the prior behavior).
 async fn default_cwd(
     store: &Store,
     workspace_id: &WorkspaceId,
-    caller_agent_id: Option<&intent_core::AgentId>,
+    _caller_agent_id: Option<&intent_core::AgentId>,
 ) -> Option<PathBuf> {
-    if let Some(agent_id) = caller_agent_id {
-        if let Ok(session) = store.get_agent_session_summary(agent_id).await {
-            if let Some(sandbox_path) = session.sandbox_path.clone() {
-                return Some(sandbox_path.into());
-            }
-        }
-    }
     let workspace = store.get_workspace(workspace_id).await.ok()?;
     intent_services::feature_api::git_ops::worktree_path(&workspace)
 }

@@ -91,7 +91,6 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ("pr_monitor", "workspace_id = ?1"),
     ("script", "workspace_id = ?1"),
     ("task_agent_link", "workspace_id = ?1"),
-    ("sandbox", "workspace_id = ?1"),
     ("tracked_changes", "workspace_id = ?1"),
     ("diffs", "workspace_id = ?1"),
     ("workspace_metrics", "workspace_id = ?1"),
@@ -119,6 +118,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("sandbox", "retired per-agent CoW sandboxes; their folders and branches stay on the source machine, and imports of older archives drop these rows"),
     ("discussion_agent_grant", "local explicit addressing authority is never restored on import"),
     ("discussion_agent_activity", "local invocation receipts are not restored on import"),
     ("discussion_agent_delivery", "pending addressed messages must not replay on a destination"),
@@ -1528,7 +1528,6 @@ mod tests {
             format!("INSERT INTO script_notification_job (wake_id,workspace_id,agent_id,script_id,run_id,metadata,body,phase,created_at) VALUES ('script-monitor:job-{ws}','{ws}','{agent}','s-{ws}','run-{ws}','{{}}','wake','pending','{t}')"),
             format!("INSERT INTO agent_queue_admission (id,agent_id,workspace_id,turn_id,payload,created_at,phase) VALUES ('script-monitor:admitted-{ws}','{agent}','{ws}','turn-{ws}','{{}}','{t}','pending')"),
             format!("INSERT INTO task_agent_link (workspace_id, note_id, task_key, task_text, agent_id, created_at) VALUES ('{ws}', 'n1', 'k', 'do', '{agent}', 1)"),
-            format!("INSERT INTO sandbox (id, workspace_id, agent_id, path, branch, base_commit_sha, created_at, updated_at) VALUES ('sb-{ws}', '{ws}', '{agent}', '/tmp/sb', 'sb/a', 'abc', '{t}', '{t}')"),
             format!("INSERT INTO tracked_changes (id, workspace_id, path, stage, status, created_at, updated_at) VALUES ('tc-{ws}', '{ws}', 'a.txt', 'unstaged', 'modified', '{t}', '{t}')"),
             format!("INSERT INTO diffs (id, workspace_id, file_path, created_at, updated_at) VALUES ('df-{ws}', '{ws}', 'a.txt', '{t}', '{t}')"),
             format!("INSERT INTO workspace_metrics (workspace_id, updated_at) VALUES ('{ws}', '{t}')"),
@@ -2140,7 +2139,6 @@ hook: hook_id, workspace_id, agent_id, name, code, delay_ms, state, created_at, 
 pr_monitor: monitor_id, workspace_id, agent_id, repo_owner, repo_name, pr_number, state, last_snapshot, pending_changes, pending_since, last_change_at, last_polled_at, last_error, created_at, updated_at, baseline_snapshot, target_provider, target_instance_base_url, target_project_path, target_kind, target_provenance, target_unresolved_reason
 script: id, workspace_id, name, command, cwd, env, mode, category, source, auto_start, created_at, updated_at, was_running, purpose, archived_at, last_run, pending_run_id, pending_started_at, latest_run_id, latest_run_result, remote_author
 task_agent_link: workspace_id, note_id, task_key, task_text, agent_id, created_at
-sandbox: id, workspace_id, agent_id, path, branch, base_commit_sha, snapshot_commit_sha, status, created_at, updated_at, retry_count
 tracked_changes: id, workspace_id, path, stage, status, agent_id, session_id, turn, commit_hash, old_blob_sha, new_blob_sha, additions, deletions, created_at, updated_at
 diffs: id, workspace_id, file_path, staged, old_content, new_content, hunks_json, created_at, updated_at
 workspace_metrics: workspace_id, additions, deletions, files_changed, updated_at

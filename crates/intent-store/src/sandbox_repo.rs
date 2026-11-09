@@ -1,4 +1,5 @@
-//! Sandbox repository: CRUD for agent sandboxes (`CoW` isolation).
+//! Sandbox repository: rows of retired per-agent `CoW` sandboxes. Nothing
+//! writes them now; the daemon reads live rows only for the recovery notice.
 
 use intent_core::{AgentId, Result, WorkspaceId};
 use serde::{Deserialize, Serialize};
@@ -216,7 +217,7 @@ impl Store {
     /// updated (the caller acquired the transition), `false` when another
     /// path already moved it — the compare-and-swap that lets the merge
     /// retry sweep claim `merge_pending → merging` without double-merging
-    /// against a concurrent `sandbox.cow.merge` RPC or a second sweep.
+    /// against a concurrent merge path.
     ///
     /// # Errors
     ///

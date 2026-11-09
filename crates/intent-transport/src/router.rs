@@ -427,6 +427,13 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": "plain-folder-unsupported", "operation": operation })),
         },
+        // Retired per-agent CoW isolation (`methods/nodes.md` "Errors and
+        // retirement gates"): -32602 with `data = { code: "isolation-removed" }`.
+        ref e @ Error::IsolationRemoved => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "isolation-removed" })),
+        },
         // Plain-folder create shape rejection (§5.1 "Plain-folder
         // workspaces"): -32602 with `data = { code: "invalid-params" }`.
         ref e @ Error::PlainFolderInvalidParams(_) => RpcErr {
@@ -3722,24 +3729,6 @@ async fn dispatch(
             let subscription_id = require_str_param(params, "subscriptionId")?;
             let result = api
                 .agent_unsubscribe(ws, subscription_id)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(result)
-        }
-        "sandbox.cow.merge" => {
-            let ws = require_ws_note(params)?;
-            let sandbox_id = require_agent_id(params)?;
-            let result = api
-                .sandbox_merge(ws, sandbox_id)
-                .await
-                .map_err(domain_to_rpc)?;
-            Ok(result)
-        }
-        "sandbox.cow.discard" => {
-            let ws = require_ws_note(params)?;
-            let sandbox_id = require_agent_id(params)?;
-            let result = api
-                .sandbox_discard(ws, sandbox_id)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)

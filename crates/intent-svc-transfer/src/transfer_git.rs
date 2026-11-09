@@ -1,8 +1,7 @@
 //! Source-side git packaging for workspace transfer (spec §4, resolved
-//! decision 1): snapshot dirty state as sentinel-marked WIP commits (the
-//! workspace worktree AND every sandbox), then build one `git bundle`
-//! carrying the workspace branch, the base ref, and all `sb/<agentId>`
-//! sandbox branches — plus one self-contained bundle per tracked submodule
+//! decision 1): snapshot the worktree's dirty state as a sentinel-marked WIP
+//! commit, then build one `git bundle` carrying the workspace branch and the
+//! base ref — plus one self-contained bundle per tracked submodule
 //! whose checked-out commit is unpublished (monorepo#4219), so the target
 //! can hydrate it without a network. The inverse helper ([`unwind_wip`]) removes a WIP
 //! snapshot commit and restores the exact staged/unstaged/untracked split —
@@ -13,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use intent_core::{Error, Result, Workspace};
-use intent_store::Sandbox;
 use serde::{Deserialize, Serialize};
 
 use crate::transfer_submodules::{find_unpublished_submodules, UnpublishedSubmodule};
@@ -40,12 +38,6 @@ const TRANSFER_REF_NS: &str = "refs/intent/transfer";
 /// refs dir, so concurrent transfers must not collide on temp-ref names.
 pub(crate) fn base_bundle_ref(workspace_id: &str) -> String {
     format!("{TRANSFER_REF_NS}/{workspace_id}/base")
-}
-
-/// Bundle ref name recording one sandbox's `sb/<agentId>` branch tip
-/// (workspace-namespaced like [`base_bundle_ref`]).
-pub(crate) fn sandbox_bundle_ref(workspace_id: &str, agent_id: &str) -> String {
-    format!("{TRANSFER_REF_NS}/{workspace_id}/sandbox/{agent_id}")
 }
 
 /// Temp ref anchoring the `index`-th unpublished submodule commit inside ITS
@@ -77,7 +69,7 @@ pub struct TransferBundle {
 }
 
 /// Ref inventory of a transfer bundle: what each bundle ref is and how it
-/// maps back to workspace/sandbox branches on the target.
+/// maps back to the workspace branch on the target.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferRefsManifest {
@@ -103,8 +95,11 @@ pub struct TransferRefsManifest {
     /// The resolved base commit SHA.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_sha: Option<String>,
-    /// One entry per sandbox whose branch made it into the bundle.
-    pub sandboxes: Vec<SandboxBundleRef>,
+    /// Retired per-agent `CoW` sandbox branches. Always written empty (an
+    /// older daemon requires the key); entries in archives from older
+    /// daemons are ignored on import.
+    #[serde(default)]
+    pub sandboxes: Vec<serde_json::Value>,
     /// One entry per tracked worktree submodule whose checked-out commit is
     /// unpublished (unreachable from any of its remote-tracking refs) and
     /// therefore rides the archive as its own bundle — plus every published
@@ -213,29 +208,6 @@ pub struct SubmoduleBundleRef {
     /// checked out. Absent (false) in archives from older daemons.
     #[serde(default)]
     pub published: bool,
-}
-
-/// One sandbox branch as recorded in the bundle.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SandboxBundleRef {
-    pub agent_id: String,
-    /// The sandbox branch name (`sb/<agentId>`).
-    pub branch: String,
-    /// Bundle ref carrying the branch (`refs/intent/transfer/sandbox/<agentId>`).
-    pub bundle_ref: String,
-    /// Tip of the sandbox branch as bundled (the WIP snapshot commit when the
-    /// sandbox was dirty).
-    pub head_sha: String,
-    /// WIP snapshot commit created in the sandbox, if it was dirty. Left in
-    /// place on success, like the workspace one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wip_commit_sha: Option<String>,
-    /// The sandbox's recorded provisioning base (`Sandbox.base_commit_sha`).
-    pub base_commit_sha: String,
-    /// The provisioning-time dirty-state snapshot (`Sandbox.snapshot_commit_sha`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub snapshot_commit_sha: Option<String>,
 }
 
 /// Snapshot a repository's dirty state (staged + unstaged + untracked) as a
@@ -359,9 +331,9 @@ pub(crate) fn unwind_wip(repo_path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Build the transfer bundle for a workspace: WIP-snapshot the worktree and
-/// every sandbox, anchor the base commit and each sandbox branch under
-/// temporary `refs/intent/transfer/*` refs in the worktree repo, and run
+/// Build the transfer bundle for a workspace: WIP-snapshot the worktree,
+/// anchor the base commit under a temporary `refs/intent/transfer/*` ref in
+/// the worktree repo, and run
 /// `git bundle create` + `verify`. Every tracked worktree submodule whose
 /// checked-out commit is unpublished — and every published ancestor a
 /// nested one needs — additionally gets its own self-contained bundle
@@ -381,11 +353,7 @@ pub(crate) fn unwind_wip(repo_path: &Path) -> Result<bool> {
 /// # Errors
 ///
 /// Returns `Error::Internal` if the workspace has no worktree, the staging directory cannot be created, or building the bundle fails.
-pub fn create_transfer_bundle(
-    ws: &Workspace,
-    sandboxes: &[Sandbox],
-    staging_dir: &Path,
-) -> Result<TransferBundle> {
+pub fn create_transfer_bundle(ws: &Workspace, staging_dir: &Path) -> Result<TransferBundle> {
     let worktree = intent_services::feature_api::git_ops::worktree_path(ws).ok_or_else(|| {
         Error::Internal("workspace has no worktree or repository path".to_string())
     })?;
@@ -399,7 +367,6 @@ pub fn create_transfer_bundle(
     let mut submodule_bundles: Vec<(PathBuf, String)> = Vec::new();
     let result = build_bundle(
         ws,
-        sandboxes,
         &worktree,
         &bundle_path,
         &submodules_dir,
@@ -442,10 +409,8 @@ pub fn create_transfer_bundle(
     })
 }
 
-#[expect(clippy::too_many_arguments)]
 fn build_bundle(
     ws: &Workspace,
-    sandboxes: &[Sandbox],
     worktree: &Path,
     bundle_path: &Path,
     submodules_dir: &Path,
@@ -500,84 +465,6 @@ fn build_bundle(
         None => (None, None),
     };
 
-    // 4. Snapshot each sandbox and fetch its branch into a temp ref.
-    let mut sandbox_refs = Vec::new();
-    for sb in sandboxes {
-        let sb_path = PathBuf::from(&sb.path);
-        if !sb_path.exists() {
-            tracing::warn!(
-                agent = %sb.agent_id.0,
-                path = %sb.path,
-                "transfer bundle: sandbox directory missing; skipping"
-            );
-            continue;
-        }
-        // Validate the branch BEFORE snapshotting: a sandbox that can't be
-        // bundled (or whose dirty state can't ride the bundled branch) must
-        // never be mutated.
-        let branch_ref = format!("refs/heads/{}", sb.branch);
-        let head_on_branch = {
-            let sb_repo = git2::Repository::open(&sb_path)
-                .map_err(|e| Error::Internal(format!("open sandbox repo failed: {e}")))?;
-            let committish = sb_repo
-                .find_reference(&branch_ref)
-                .and_then(|r| r.peel_to_commit())
-                .is_ok();
-            if !committish {
-                tracing::warn!(
-                    agent = %sb.agent_id.0,
-                    branch = %sb.branch,
-                    "transfer bundle: sandbox branch missing or unborn; skipping"
-                );
-                continue;
-            }
-            sb_repo
-                .head()
-                .ok()
-                .is_some_and(|h| h.is_branch() && h.name().ok() == Some(branch_ref.as_str()))
-        };
-        // The WIP commit lands on HEAD's branch while the bundler fetches
-        // `sb.branch` — so only snapshot when HEAD is on `sb.branch`;
-        // otherwise the dirty state would be unreachable from any bundled
-        // ref. Diverged HEADs bundle the clean branch tip instead.
-        let wip = if head_on_branch {
-            let wip = snapshot_wip(&sb_path)?;
-            if wip.is_some() {
-                snapshotted.push(sb_path.clone());
-            }
-            wip
-        } else {
-            tracing::warn!(
-                agent = %sb.agent_id.0,
-                branch = %sb.branch,
-                "transfer bundle: sandbox HEAD is not on its recorded branch; bundling the branch tip without a WIP snapshot"
-            );
-            None
-        };
-        let bundle_ref = sandbox_bundle_ref(&ws.id.0, &sb.agent_id.0);
-        fetch_local_ref(worktree, &sb_path, &branch_ref, &bundle_ref)?;
-        temp_refs.push(bundle_ref.clone());
-        let head_sha = repo
-            .find_reference(&bundle_ref)
-            .ok()
-            .and_then(|r| r.target())
-            .map(|oid| oid.to_string())
-            .ok_or_else(|| {
-                Error::Internal(format!(
-                    "fetched sandbox transfer ref {bundle_ref} did not resolve"
-                ))
-            })?;
-        sandbox_refs.push(SandboxBundleRef {
-            agent_id: sb.agent_id.0.clone(),
-            branch: sb.branch.clone(),
-            bundle_ref,
-            head_sha,
-            wip_commit_sha: wip,
-            base_commit_sha: sb.base_commit_sha.clone(),
-            snapshot_commit_sha: sb.snapshot_commit_sha.clone(),
-        });
-    }
-
     // 4b. Record the portable remotes and their remote-tracking tips; the
     //     tips are bundled too so the target can restore them offline and
     //     the workspace branch's published prefix stays reachable from
@@ -617,7 +504,6 @@ fn build_bundle(
     if let Some(r) = &base_bundle_ref {
         ref_args.push(r.clone());
     }
-    ref_args.extend(sandbox_refs.iter().map(|s| s.bundle_ref.clone()));
     ref_args.extend(
         remotes
             .iter()
@@ -678,7 +564,7 @@ fn build_bundle(
         base_ref: ws.base_ref.clone(),
         base_bundle_ref,
         base_sha,
-        sandboxes: sandbox_refs,
+        sandboxes: Vec::new(),
         submodules: submodule_refs,
         remotes,
         workspace_upstream,
@@ -763,26 +649,6 @@ fn resolve_base_commit(repo: &git2::Repository, ws: &Workspace) -> Option<git2::
     None
 }
 
-/// Fetch `src_ref` from a local repository into `dst_ref` of the worktree
-/// repo. Shells out with an explicit full refspec and tag auto-follow
-/// disabled, for the same reason as the sandbox merge path: `CoW` clones carry
-/// non-commit refs (`refs/intent/blobs/*`, `refs/stash`) that libgit2's local
-/// transport trips over.
-fn fetch_local_ref(worktree: &Path, from_repo: &Path, src_ref: &str, dst_ref: &str) -> Result<()> {
-    let from = from_repo
-        .to_str()
-        .ok_or_else(|| Error::Internal("sandbox path not UTF-8".to_string()))?;
-    let refspec = format!("+{src_ref}:{dst_ref}");
-    run_git(worktree, |cmd| {
-        cmd.arg("fetch")
-            .arg("--no-tags")
-            .arg("--quiet")
-            .arg(from)
-            .arg(&refspec);
-    })
-    .map_err(|e| Error::Internal(format!("fetch sandbox branch failed: {e}")))
-}
-
 /// Run a git subcommand in `dir` with prompts disabled; returns the trimmed
 /// stderr as the error string on non-zero exit.
 pub(crate) fn run_git(
@@ -822,8 +688,7 @@ fn cleanup_temp_refs(worktree: &Path, refs: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intent_core::{AgentId, WorkspaceId};
-    use intent_store::SandboxStatus;
+    use intent_core::WorkspaceId;
     use std::fs;
 
     thread_local! {
@@ -881,7 +746,7 @@ mod tests {
             }));
         });
         let ws = workspace_for_repo(&path);
-        let bundle = create_transfer_bundle(&ws, &[], &dir.path().join("staging")).unwrap();
+        let bundle = create_transfer_bundle(&ws, &dir.path().join("staging")).unwrap();
         assert_eq!(head_sha(&path), head.id().to_string(), "HEAD unchanged");
         assert!(repo_ref_names(&path)
             .iter()
@@ -890,7 +755,6 @@ mod tests {
             &bundle.bundle_path,
             &bundle.refs,
             &ws,
-            &[],
             &dir.path().join("target"),
         )
         .unwrap();
@@ -948,7 +812,7 @@ mod tests {
                 fs::write(lock, "force bundle lock failure").unwrap();
             }));
         });
-        assert!(create_transfer_bundle(&ws, &[], &staging).is_err());
+        assert!(create_transfer_bundle(&ws, &staging).is_err());
         assert_eq!(head_sha(&path), head.to_string());
         assert_eq!(status_fingerprint(&path), before);
         assert!(repo_ref_names(&path)
@@ -1059,43 +923,6 @@ mod tests {
             skip_worktree: true,
             ..Default::default()
         }
-    }
-
-    fn sandbox_row(ws: &Workspace, agent_id: &AgentId, path: &Path, branch: &str) -> Sandbox {
-        let now = now_iso();
-        Sandbox {
-            id: format!("sb-{}", agent_id.0),
-            workspace_id: ws.id.clone(),
-            agent_id: agent_id.clone(),
-            path: path.to_string_lossy().to_string(),
-            branch: branch.to_string(),
-            base_commit_sha: head_sha(path),
-            snapshot_commit_sha: None,
-            status: SandboxStatus::Created,
-            retry_count: 0,
-            created_at: now.clone(),
-            updated_at: now,
-        }
-    }
-
-    /// Simulate a sandbox: clone the workspace repo and check out `sb/<agent>`.
-    fn make_sandbox_clone(src: &Path, dst: &Path, branch: &str) {
-        let out = Command::new("git")
-            .arg("clone")
-            .arg("--quiet")
-            .arg(src)
-            .arg(dst)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let repo = git2::Repository::open(dst).unwrap();
-        let head = repo.head().unwrap().peel_to_commit().unwrap();
-        repo.branch(branch, &head, false).unwrap();
-        repo.set_head(&format!("refs/heads/{branch}")).unwrap();
     }
 
     /// Refs listed in a bundle header, via `git bundle list-heads`.
@@ -1211,7 +1038,7 @@ mod tests {
             bundle_path,
             submodule_bundles,
             refs: manifest,
-        } = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        } = create_transfer_bundle(&ws, &staging).unwrap();
         assert!(bundle_path.exists());
         assert!(submodule_bundles.is_empty());
         assert!(manifest.submodules.is_empty());
@@ -1266,7 +1093,7 @@ mod tests {
             bundle_path,
             refs: manifest,
             ..
-        } = create_transfer_bundle(&ws, &[], &dir.path().join("staging")).unwrap();
+        } = create_transfer_bundle(&ws, &dir.path().join("staging")).unwrap();
         let wip = manifest
             .workspace_wip_commit_sha
             .clone()
@@ -1281,8 +1108,10 @@ mod tests {
         assert_eq!(status_fingerprint(&repo), before);
     }
 
+    /// The bundle anchors the base ref and carries no sandbox branch: per-agent
+    /// `CoW` sandboxes are retired, so `refs.sandboxes` is always empty.
     #[test]
-    fn bundle_includes_base_and_sandbox_branches() {
+    fn bundle_includes_base_ref_and_no_sandbox_refs() {
         let (dir, repo) = temp_repo("ws-sb");
         let ws = {
             let mut ws = workspace_for_repo(&repo);
@@ -1290,20 +1119,11 @@ mod tests {
             ws
         };
 
-        // Sandbox with a committed change plus a dirty file.
-        let agent = AgentId::new();
-        let branch = format!("sb/{}", agent.0);
-        let sb_path = dir.path().join("sandbox");
-        make_sandbox_clone(&repo, &sb_path, &branch);
-        commit_file(&sb_path, "sb.txt", "sandbox work\n", "feat: sandbox commit");
-        fs::write(sb_path.join("sb-wip.txt"), "sandbox wip\n").unwrap();
-        let sb = sandbox_row(&ws, &agent, &sb_path, &branch);
-
         let TransferBundle {
             bundle_path,
             refs: manifest,
             ..
-        } = create_transfer_bundle(&ws, &[sb], &dir.path().join("staging")).unwrap();
+        } = create_transfer_bundle(&ws, &dir.path().join("staging")).unwrap();
 
         assert_eq!(manifest.base_ref.as_deref(), Some("main"));
         assert_eq!(
@@ -1311,62 +1131,18 @@ mod tests {
             Some(base_bundle_ref(&ws.id.0).as_str())
         );
         assert_eq!(manifest.base_sha.as_deref(), Some(head_sha(&repo).as_str()));
-
-        assert_eq!(manifest.sandboxes.len(), 1);
-        let entry = &manifest.sandboxes[0];
-        assert_eq!(entry.agent_id, agent.0);
-        assert_eq!(entry.branch, branch);
-        assert_eq!(entry.bundle_ref, sandbox_bundle_ref(&ws.id.0, &agent.0));
-        let sb_wip = entry
-            .wip_commit_sha
-            .clone()
-            .expect("dirty sandbox snapshots");
-        assert_eq!(entry.head_sha, sb_wip);
-        assert_eq!(head_sha(&sb_path), sb_wip);
+        assert!(manifest.sandboxes.is_empty());
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(
+            json["sandboxes"],
+            serde_json::json!([]),
+            "the key stays for older importers"
+        );
 
         let refs = bundle_refs(&repo, &bundle_path);
         assert!(refs.contains(&"refs/heads/main".to_string()), "{refs:?}");
         assert!(refs.contains(&base_bundle_ref(&ws.id.0)), "{refs:?}");
-        assert!(refs.contains(&entry.bundle_ref), "{refs:?}");
-
-        // The sandbox WIP content is reachable from the bundle: fetch the
-        // sandbox ref into a fresh clone and check the dirty file arrived.
-        let clone_dst = dir.path().join("from-bundle");
-        let out = Command::new("git")
-            .arg("clone")
-            .arg("--quiet")
-            .arg("-b")
-            .arg("main")
-            .arg(&bundle_path)
-            .arg(&clone_dst)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let out = Command::new("git")
-            .arg("fetch")
-            .arg("--quiet")
-            .arg(bundle_path.to_str().unwrap())
-            .arg(format!("{}:refs/heads/{branch}", entry.bundle_ref))
-            .current_dir(&clone_dst)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let cloned = git2::Repository::open(&clone_dst).unwrap();
-        let tip = cloned
-            .find_reference(&format!("refs/heads/{branch}"))
-            .unwrap()
-            .peel_to_commit()
-            .unwrap();
-        assert_eq!(tip.id().to_string(), sb_wip);
-        assert!(tip.tree().unwrap().get_name("sb-wip.txt").is_some());
+        assert!(refs.iter().all(|r| !r.contains("/sandbox/")), "{refs:?}");
 
         // Temp refs cleaned from the source worktree.
         assert!(
@@ -1375,8 +1151,6 @@ mod tests {
                 .all(|r| !r.starts_with(TRANSFER_REF_NS)),
             "temp refs cleaned up"
         );
-        // Sandbox WIP left in place on success for the caller to unwind.
-        assert!(unwind_wip(&sb_path).unwrap());
     }
 
     #[test]
@@ -1420,78 +1194,6 @@ mod tests {
         );
         assert!(!repo.join("staged-del.txt").exists());
         assert!(!repo.join("wt-del.txt").exists());
-    }
-
-    #[test]
-    fn bundle_skips_missing_sandbox_directory() {
-        let (dir, repo) = temp_repo("ws-missing-sb");
-        let ws = workspace_for_repo(&repo);
-        let agent = AgentId::new();
-        let sb = sandbox_row(&ws, &agent, &repo, &format!("sb/{}", agent.0));
-        let mut missing = sb.clone();
-        missing.path = dir.path().join("gone").to_string_lossy().to_string();
-
-        let TransferBundle { refs: manifest, .. } =
-            create_transfer_bundle(&ws, &[missing], &dir.path().join("staging")).unwrap();
-        assert!(manifest.sandboxes.is_empty(), "missing sandbox skipped");
-    }
-
-    #[test]
-    fn bundle_never_mutates_dirty_sandbox_with_missing_branch() {
-        let (dir, repo) = temp_repo("ws-sb-nobranch");
-        let ws = workspace_for_repo(&repo);
-
-        // Dirty sandbox whose recorded branch does not exist.
-        let agent = AgentId::new();
-        let sb_path = dir.path().join("sandbox");
-        make_sandbox_clone(&repo, &sb_path, &format!("sb/{}", agent.0));
-        fs::write(sb_path.join("dirty.txt"), "dirty\n").unwrap();
-        let sb_head = head_sha(&sb_path);
-        let before = status_fingerprint(&sb_path);
-        let mut sb = sandbox_row(&ws, &agent, &sb_path, &format!("sb/{}", agent.0));
-        sb.branch = "sb/does-not-exist".to_string();
-
-        let TransferBundle { refs: manifest, .. } =
-            create_transfer_bundle(&ws, &[sb], &dir.path().join("staging")).unwrap();
-        assert!(manifest.sandboxes.is_empty(), "unbundlable sandbox skipped");
-        // The skipped sandbox was not touched: no WIP commit, dirty state intact.
-        assert_eq!(
-            head_sha(&sb_path),
-            sb_head,
-            "no WIP commit on skipped sandbox"
-        );
-        assert_eq!(status_fingerprint(&sb_path), before);
-    }
-
-    #[test]
-    fn bundle_diverged_sandbox_head_bundles_branch_tip_without_wip() {
-        let (dir, repo) = temp_repo("ws-sb-diverged");
-        let ws = workspace_for_repo(&repo);
-
-        // Sandbox whose branch exists but HEAD sits on another branch.
-        let agent = AgentId::new();
-        let branch = format!("sb/{}", agent.0);
-        let sb_path = dir.path().join("sandbox");
-        make_sandbox_clone(&repo, &sb_path, &branch);
-        let branch_tip = head_sha(&sb_path);
-        {
-            let r = git2::Repository::open(&sb_path).unwrap();
-            let head = r.head().unwrap().peel_to_commit().unwrap();
-            r.branch("other", &head, false).unwrap();
-            r.set_head("refs/heads/other").unwrap();
-        }
-        fs::write(sb_path.join("dirty.txt"), "dirty\n").unwrap();
-        let before = status_fingerprint(&sb_path);
-        let sb = sandbox_row(&ws, &agent, &sb_path, &branch);
-
-        let TransferBundle { refs: manifest, .. } =
-            create_transfer_bundle(&ws, &[sb], &dir.path().join("staging")).unwrap();
-        assert_eq!(manifest.sandboxes.len(), 1);
-        let entry = &manifest.sandboxes[0];
-        assert_eq!(entry.wip_commit_sha, None, "no WIP on diverged HEAD");
-        assert_eq!(entry.head_sha, branch_tip, "clean branch tip bundled");
-        // Sandbox untouched: dirty state stays on the other branch.
-        assert_eq!(status_fingerprint(&sb_path), before);
     }
 
     /// Untracked nested repo like agents leave behind: a directory with its
@@ -1872,7 +1574,7 @@ mod tests {
             bundle_path,
             refs: manifest,
             ..
-        } = create_transfer_bundle(&ws, &[], &dir.path().join("staging")).unwrap();
+        } = create_transfer_bundle(&ws, &dir.path().join("staging")).unwrap();
         assert!(bundle_path.exists());
         let wip = manifest
             .workspace_wip_commit_sha
@@ -1909,23 +1611,18 @@ mod tests {
         fs::write(repo.join("wip.txt"), "wip\n").unwrap();
         let before = status_fingerprint(&repo);
 
-        // A sandbox whose path exists but is not a git repo forces a failure
-        // AFTER the workspace WIP snapshot has been taken.
-        let bogus = dir.path().join("not-a-repo");
-        fs::create_dir_all(&bogus).unwrap();
+        // A directory where the bundle file goes makes `git bundle create`
+        // fail AFTER the workspace WIP snapshot has been taken.
         let ws = workspace_for_repo(&repo);
-        let agent = AgentId::new();
-        let mut sb = sandbox_row(&ws, &agent, &repo, &format!("sb/{}", agent.0));
-        sb.path = bogus.to_string_lossy().to_string();
-
         let staging = dir.path().join("staging");
-        let err = create_transfer_bundle(&ws, &[sb], &staging);
+        let blocker = staging.join(format!("{}.bundle", ws.id.0));
+        fs::create_dir_all(blocker.join("occupied")).unwrap();
+        let err = create_transfer_bundle(&ws, &staging);
         assert!(err.is_err());
 
-        // Worktree restored exactly as found; no bundle, no temp refs.
+        // Worktree restored exactly as found; no temp refs.
         assert_eq!(head_sha(&repo), base, "WIP snapshot unwound on failure");
         assert_eq!(status_fingerprint(&repo), before);
-        assert!(!staging.join(format!("{}.bundle", ws.id.0)).exists());
         assert!(
             repo_ref_names(&repo)
                 .iter()
@@ -1951,7 +1648,7 @@ mod tests {
         let ws = workspace_for_repo(&sup);
         let staging = dir.path().join("staging");
 
-        let bundle = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        let bundle = create_transfer_bundle(&ws, &staging).unwrap();
         assert_eq!(bundle.submodule_bundles.len(), 1, "{bundle:?}");
         let (sub_bundle, entry) = &bundle.submodule_bundles[0];
         assert_eq!(entry, "git/submodules/0.bundle");
@@ -1999,7 +1696,7 @@ mod tests {
         // Once pushed, the submodule is published: nothing to bundle.
         git(&sub, &["push", "-q", "origin", "main"]);
         let staging2 = dir.path().join("staging2");
-        let bundle = create_transfer_bundle(&ws, &[], &staging2).unwrap();
+        let bundle = create_transfer_bundle(&ws, &staging2).unwrap();
         assert!(bundle.submodule_bundles.is_empty());
         assert!(bundle.refs.submodules.is_empty());
         assert!(!staging2.join("submodules").exists());
@@ -2046,7 +1743,7 @@ mod tests {
         let ws = workspace_for_repo(&sup);
         let staging = dir.path().join("staging");
 
-        let bundle = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        let bundle = create_transfer_bundle(&ws, &staging).unwrap();
         assert_eq!(bundle.submodule_bundles.len(), 2, "{bundle:?}");
         assert_eq!(bundle.refs.submodules.len(), 2);
         let parent = &bundle.refs.submodules[0];
@@ -2104,7 +1801,7 @@ mod tests {
         let ws = workspace_for_repo(&sup);
         let staging = dir.path().join("staging");
 
-        let bundle = create_transfer_bundle(&ws, &[], &staging).unwrap();
+        let bundle = create_transfer_bundle(&ws, &staging).unwrap();
         assert_eq!(bundle.submodule_bundles.len(), 2, "{bundle:?}");
         assert_eq!(bundle.refs.submodules.len(), 2);
         let parent = &bundle.refs.submodules[0];
@@ -2175,7 +1872,7 @@ mod tests {
         // `git bundle create` cannot replace a directory with the bundle.
         fs::create_dir_all(staging.join("submodules/0.bundle")).unwrap();
 
-        let err = create_transfer_bundle(&ws, &[], &staging).unwrap_err();
+        let err = create_transfer_bundle(&ws, &staging).unwrap_err();
         assert!(
             err.to_string()
                 .contains("git bundle create for submodule sub failed"),

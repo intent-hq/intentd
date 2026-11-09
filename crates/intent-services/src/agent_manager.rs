@@ -11939,14 +11939,6 @@ impl AgentManager {
                 "agent session {agent_id} is being deleted"
             )));
         }
-        // A delegate with CoW isolation provisions the sandbox in a background
-        // task, off the delegate critical path (monorepo#871). Await
-        // settlement BEFORE reading the session so the child never spawns
-        // against a half-copied sandbox (the spawn cwd is
-        // `session.sandbox_path`) and the session read below observes the
-        // settled sandbox fields. No-op when no provisioning is in flight —
-        // the common case for every turn after the first.
-        boxed_await(|| self.services.await_sandbox_provisioning(agent_id)).await;
         let mut session = boxed_await(|| self.services.require_agent_session(agent_id)).await?;
         // A remote agent runs on its execution node, never here: an agent
         // created with a remote placement carries the daemon-owned
@@ -14646,7 +14638,8 @@ fn resolve_spawn(
     // data dir spawns fine; a creation failure falls through to the temp-dir
     // catch-all rather than blocking the spawn.
     //
-    // Task 3: If the session has a sandbox_path (CoW isolation), use it as the cwd.
+    // A legacy session's retained per-agent sandbox path is never the cwd:
+    // per-agent CoW sandboxes are retired.
     //
     // Workspace chain (TS agent-factory parity): `path` → `worktree_path` →
     // `repository_path`. Each candidate is `is_dir()`-checked individually so
@@ -14655,23 +14648,17 @@ fn resolve_spawn(
     // without a persisted checkout path (legacy `isNewRepo` rows,
     // skip-worktree workspaces) so their agents spawn in the repository
     // folder, never the temp dir (intent-hq/monorepo#2611).
-    let cwd = session
-        .sandbox_path
-        .clone()
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .or_else(|| {
-            workspace.and_then(|w| {
-                [
-                    w.path.as_deref(),
-                    w.worktree_path.as_deref(),
-                    w.repository_path.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                .map(PathBuf::from)
-                .find(|p| p.is_dir())
-            })
+    let cwd = workspace
+        .and_then(|w| {
+            [
+                w.path.as_deref(),
+                w.worktree_path.as_deref(),
+                w.repository_path.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(PathBuf::from)
+            .find(|p| p.is_dir())
         })
         .or_else(|| {
             workspace

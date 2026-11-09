@@ -15,8 +15,6 @@
 //! - Script-monitor admission, completion markers and notification dispatch
 //!   mirror the runtime's store-level contract (the same store calls and
 //!   agent-wake port calls); the runtime's in-memory locks are not modelled.
-//! - Sandbox merges succeed without touching the checkout; discards remove
-//!   the sandbox folder and row.
 //! - Cancel sweeps on retire/archive mark the hook rows cancelled and resettle
 //!   the owner through core's real completion redelivery.
 
@@ -33,8 +31,8 @@ use intent_core::{
 use serde_json::{json, Value};
 
 use crate::feature_ports::{
-    monitor_id, wake_id, CommandScriptActivity, MergeOutcome, ProvisionOutcome, RuntimePort,
-    ScriptsClosing, SetupScriptRun, UnavailableRuntime,
+    monitor_id, wake_id, CommandScriptActivity, RuntimePort, ScriptsClosing, SetupScriptRun,
+    UnavailableRuntime,
 };
 use crate::Services;
 
@@ -590,24 +588,6 @@ impl RuntimePort for FakeRuntime {
         })
     }
 
-    /// A clean merge: the git merge-back itself is runtime behaviour, so the
-    /// fake leaves the checkout untouched and reports success.
-    fn merge_sandbox<'a>(
-        &'a self,
-        _svc: &'a Services,
-        _workspace_id: &'a WorkspaceId,
-        _agent_id: &'a AgentId,
-    ) -> BoxFuture<'a, Result<MergeOutcome>> {
-        self.record("merge_sandbox");
-        Box::pin(async {
-            Ok(MergeOutcome::Merged {
-                commit_range: "fake..fake".into(),
-                canonical_head: "fake".into(),
-            })
-        })
-    }
-
-    /// Remove the sandbox folder and row, as the runtime's discard does.
     /// Mirrors the runtime's claimed-tab migration on a pin change: reassign
     /// the claimed rows in the store, flag each moved tab's desktop
     /// assignment, and wake desktop waiters. The runtime's per-tab
@@ -639,25 +619,6 @@ impl RuntimePort for FakeRuntime {
         _superseded: Vec<ClientId>,
     ) -> BoxFuture<'a, Result<usize>> {
         Box::pin(async { Ok(0) })
-    }
-
-    fn discard_sandbox<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: &'a WorkspaceId,
-        agent_id: &'a AgentId,
-    ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            self.record("discard_sandbox");
-            if let Some(sandbox) = svc.store().get_sandbox(workspace_id, agent_id).await? {
-                let path = PathBuf::from(&sandbox.path);
-                if path.exists() {
-                    std::fs::remove_dir_all(&path)
-                        .map_err(|e| intent_core::Error::Internal(e.to_string()))?;
-                }
-            }
-            svc.store().delete_sandbox(workspace_id, agent_id).await
-        })
     }
 
     fn script_monitor_export_blocked(&self, svc: &Services, metadata: Option<&Value>) -> bool {
@@ -763,9 +724,6 @@ impl RuntimePort for FakeRuntime {
         fn browser_dispatch_error_message<'a>(&'a self, svc: &'a Services, err: intent_core::ReverseDispatchError) -> BoxFuture<'a, String>;
         fn browser_navigate_tab<'a>(&'a self, svc: &'a Services, tab_id: String, url: String) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn browser_close_tab<'a>(&'a self, svc: &'a Services, tab_id: String, force: bool) -> BoxFuture<'a, Result<serde_json::Value>>;
-        fn sandbox_merge<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, sandbox_id: AgentId) -> BoxFuture<'a, Result<serde_json::Value>>;
-        fn sandbox_discard<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, sandbox_id: AgentId) -> BoxFuture<'a, Result<serde_json::Value>>;
-        fn provision_sandbox<'a>(&'a self, svc: &'a Services, workspace_id: &'a WorkspaceId, agent_id: &'a AgentId, workspaces_root: PathBuf) -> BoxFuture<'a, Result<ProvisionOutcome>>;
         fn run_setup_script(&self, svc: &Services, run: SetupScriptRun) -> BoxFuture<'static, (bool, Option<u32>)>;
         fn script_monitor_lane<'a>(&'a self, svc: &'a Services) -> &'a tokio::sync::Mutex<()>;
         fn close_workspace_scripts<'a>(&'a self, svc: &'a Services, workspace_id: &'a WorkspaceId) -> BoxFuture<'a, Box<dyn ScriptsClosing>>;

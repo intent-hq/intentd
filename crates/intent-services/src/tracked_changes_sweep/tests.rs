@@ -362,11 +362,12 @@ async fn prune_keeps_a_row_committed_between_passes() {
     assert_eq!(paths(&svc, &ws).await, owned(&[("done.rs", "committed")]));
 }
 
-/// A sandboxed (copy-on-write) agent's rows describe files in its sandbox, which the
-/// workspace worktree cannot judge: the sweep leaves them alone and the lock
-/// filter keeps them.
+/// Per-agent `CoW` sandboxes are retired: an agent whose session still
+/// records a retained sandbox works in the workspace worktree, so its rows
+/// are judged like any other — a path the worktree no longer reports is
+/// pruned and does not lock.
 #[tokio::test]
-async fn sandboxed_agent_rows_are_left_alone() {
+async fn legacy_sandboxed_agent_rows_are_judged_against_the_worktree() {
     let repo = init_repo();
     let (_t, svc, ws) = svc_for(Some(&repo.dir)).await;
     let mut agent = crate::agent_locks::tests::session("agent-1", &ws, AgentStatus::Active, None);
@@ -374,15 +375,15 @@ async fn sandboxed_agent_rows_are_left_alone() {
     svc.store().insert_agent_session(&agent).await.unwrap();
     track(&svc, &ws, "src/in-sandbox.rs", "unstaged").await;
 
-    assert_eq!(prune_confirmed(&svc, &ws).await, 0);
-    assert_eq!(
-        paths(&svc, &ws).await,
-        owned(&[("src/in-sandbox.rs", "unstaged")])
+    assert!(
+        svc.compute_agent_locks(&ws)
+            .await
+            .locked_file_paths
+            .is_empty(),
+        "a path the worktree does not report does not lock"
     );
-    assert_eq!(
-        svc.compute_agent_locks(&ws).await.locked_file_paths,
-        vec!["src/in-sandbox.rs".to_string()]
-    );
+    assert_eq!(prune_confirmed(&svc, &ws).await, 1);
+    assert_eq!(paths(&svc, &ws).await, owned(&[]));
 }
 
 /// A workspace whose worktree cannot be scanned, or that has no local
