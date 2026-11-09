@@ -22,9 +22,10 @@ pub struct WorkspaceApiDocsInputs<'a> {
     pub remote_placement_help: Option<&'a str>,
     /// The provider truncates long tool descriptions.
     pub truncating_provider: bool,
-    /// Capability-gated bindings this bridge installs (paths like
-    /// `agent.machineModels`) that the static docs leave out. Harness 3.10
-    /// lists them in its capability map; earlier versions ignore them.
+    /// Capability-gated bindings this bridge installs (`namespace.method`
+    /// paths, installed only when a capability is present) that the static
+    /// docs leave out. Harness 3.10 lists them in its capability map; earlier
+    /// versions ignore them. No binding uses this yet.
     pub capability_methods: &'a [&'a str],
 }
 

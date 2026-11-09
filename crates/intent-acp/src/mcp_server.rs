@@ -461,17 +461,7 @@ impl WorkspaceMcpServer {
     /// so a raw `host({...})` frame gets the explicit top-level-only
     /// redirect error rather than a misleading "disabled in settings".
     fn effective_agent_features(&self) -> AgentFeaturesSettings {
-        let mut features = self.agent_features.clone();
-        if self.is_sub_agent {
-            features.structured_questions = false;
-            features.secret_requests = false;
-        }
-        // Secret requests (PROTOCOL §5.56) are usable only through
-        // `ws.host.exec`, which the chief description never advertises.
-        if !features.host_exec || self.is_chief {
-            features.secret_requests = false;
-        }
-        features
+        effective_agent_features(&self.agent_features, self.is_sub_agent, self.is_chief)
     }
 
     /// Names exposed to this caller, for provider-native policy configuration.
@@ -648,4 +638,24 @@ fn ok(id: &Value, result: Value) -> Value {
 
 fn err(id: &Value, code: i32, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+/// A bridge's `[agentFeatures]` with its sub-agent and Assistant gates
+/// folded in.
+pub(crate) fn effective_agent_features(
+    configured: &AgentFeaturesSettings,
+    is_sub_agent: bool,
+    is_chief: bool,
+) -> AgentFeaturesSettings {
+    let mut features = configured.clone();
+    if is_sub_agent {
+        features.structured_questions = false;
+        features.secret_requests = false;
+    }
+    // Secret requests (PROTOCOL §5.56) are usable only through
+    // `ws.host.exec`, which the chief description never advertises.
+    if !features.host_exec || is_chief {
+        features.secret_requests = false;
+    }
+    features
 }

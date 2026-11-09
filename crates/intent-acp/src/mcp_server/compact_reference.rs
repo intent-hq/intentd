@@ -222,6 +222,10 @@ pub(crate) struct CompactReference {
     pub(crate) extras: String,
 }
 
+/// Namespaces the Assistant workspace's docs leave out on purpose, though
+/// their bindings are installed: host exec, and the Labs-only discussions.
+pub(crate) const CHIEF_OMITTED_NAMESPACES: &[&str] = &["host", "discussion"];
+
 impl CompactReference {
     pub(crate) fn build(inputs: &WorkspaceApiDocsInputs<'_>) -> Self {
         let bridge_desc = |is_chief: bool, features: &AgentFeaturesSettings| {
@@ -240,7 +244,8 @@ impl CompactReference {
         if inputs.is_chief {
             // The Assistant workspace installs every binding a project
             // workspace has except `ws.secret`, but its static docs leave
-            // some out; take those lines from the project docs.
+            // some out; take those lines from the project docs, except the
+            // ones the Assistant omits on purpose.
             let project = AgentFeaturesSettings {
                 secret_requests: false,
                 ..inputs.features.clone()
@@ -248,7 +253,11 @@ impl CompactReference {
             descs.push(bridge_desc(false, &project));
         }
         let mut namespaces = namespaces_of(&descs[0]);
-        for extra in descs[1..].iter().flat_map(|desc| namespaces_of(desc)) {
+        for extra in descs[1..]
+            .iter()
+            .flat_map(|desc| namespaces_of(desc))
+            .filter(|ns| !CHIEF_OMITTED_NAMESPACES.contains(&ns.key))
+        {
             match namespaces.iter_mut().find(|ns| ns.key == extra.key) {
                 Some(ns) => {
                     for name in extra.methods {
@@ -261,13 +270,17 @@ impl CompactReference {
             }
         }
         for path in inputs.capability_methods {
-            let Some((key, name)) = path.rsplit_once('.') else {
-                continue;
-            };
-            if let Some(ns) = namespaces
-                .iter_mut()
-                .find(|ns| !ns.callable && ns.key == key)
-            {
+            let ns = path.rsplit_once('.').and_then(|(key, name)| {
+                namespaces
+                    .iter_mut()
+                    .find(|ns| !ns.callable && ns.key == key)
+                    .map(|ns| (ns, name))
+            });
+            debug_assert!(
+                ns.is_some(),
+                "capability method {path} has no map namespace"
+            );
+            if let Some((ns, name)) = ns {
                 if !ns.methods.contains(&name) {
                     ns.methods.push(name);
                 }

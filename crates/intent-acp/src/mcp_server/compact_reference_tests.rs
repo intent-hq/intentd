@@ -1,10 +1,15 @@
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::WorkspaceId;
 
-use super::{map_paths, tool_description, CompactReference, HOT_SET, ROUTES};
+use super::{
+    map_paths, tool_description, CompactReference, CHIEF_OMITTED_NAMESPACES, HOT_SET, ROUTES,
+};
 use crate::mcp_server::bindings::prelude_for_workspace;
+use crate::mcp_server::effective_agent_features;
 use crate::mcp_server::tools::{workspace_api_description, SpecialistModelOptions};
-use crate::mcp_server::workspace_api_docs::WorkspaceApiDocsInputs;
+use crate::mcp_server::workspace_api_docs::{
+    WorkspaceApiDocs, WorkspaceApiDocsInputs, WorkspaceApiDocsV3_10,
+};
 
 fn all_on() -> AgentFeaturesSettings {
     AgentFeaturesSettings {
@@ -109,13 +114,15 @@ fn unavailable_stubs_still_refuse() {
     }
 }
 
-/// Installed for listing but out of the map: the stubs above, and on a
+/// Installed for listing but out of the map: the stubs above; on a
 /// non-Assistant bridge the `ws.app.*` management bindings, whose dispatch
 /// refuses outside the Assistant workspace (`ws.app.question` is the
-/// exception).
+/// exception); and on the Assistant the namespaces its docs omit.
 fn listed(path: &str, is_chief: bool) -> bool {
+    let namespace = path.split('.').next().unwrap_or_default();
     !UNAVAILABLE_STUBS.contains(&path)
         && (is_chief || !path.starts_with("app.") || path.starts_with("app.question."))
+        && !(is_chief && CHIEF_OMITTED_NAMESPACES.contains(&namespace))
 }
 
 /// The drift test (brief M1): the map names every installed binding and
@@ -126,14 +133,7 @@ async fn capability_map_names_exactly_the_installed_bindings() {
         for shape in [Shape::Top, Shape::Sub, Shape::Chief] {
             let (is_chief, is_sub_agent) =
                 (matches!(shape, Shape::Chief), matches!(shape, Shape::Sub));
-            let mut effective = features.clone();
-            if is_sub_agent {
-                effective.structured_questions = false;
-                effective.secret_requests = false;
-            }
-            if is_chief || !effective.host_exec {
-                effective.secret_requests = false;
-            }
+            let effective = effective_agent_features(&features, is_sub_agent, is_chief);
             let installed: Vec<String> = installed_paths(&features, is_sub_agent, is_chief)
                 .await
                 .into_iter()
@@ -225,7 +225,10 @@ fn placement_follows_truncation() {
     );
     let short = tool_description(&inputs(Shape::Truncating, &features));
     assert!(!short.contains("Capability map"));
-    assert!(short.contains("Workspace API Reference"));
+    let heading = crate::mcp_server::tools::WORKSPACE_API_SYSTEM_PROMPT_HEADING;
+    assert!(short.contains(heading.trim_start_matches("# ")));
+    let section = WorkspaceApiDocsV3_10.prompt_section("body");
+    assert!(section.starts_with(heading), "{section}");
     assert!(short.len() < 2_000, "{}", short.len());
     let v1 = workspace_api_description(false, &features);
     assert!(full.len() * 4 < v1.len(), "{} vs {}", full.len(), v1.len());
