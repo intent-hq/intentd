@@ -74,10 +74,6 @@ mod tests {
         let current = super::super::resolve_entry("3.10");
         let previous = super::super::resolve_entry("3.9");
         assert_eq!(current.version, "3.10");
-        assert_eq!(
-            current.doctrine.instructions.common,
-            previous.doctrine.instructions.common
-        );
         assert_eq!(current.doctrine.specialists, previous.doctrine.specialists);
         assert!(std::ptr::addr_eq(current.harness, previous.harness));
         assert_eq!((current.default_features)(), (previous.default_features)());
@@ -90,14 +86,19 @@ mod tests {
     }
 
     /// Until each builder is filled, a 3.10 session gets exactly a 3.9
-    /// session's context, for every provider.
+    /// session's tool description, for every provider. (The doctrine already
+    /// differs; `v3_10_goldens` pins it.)
     #[tokio::test]
     async fn v3_10_context_matches_v3_9_until_changed() {
         let (_db, dir, services, session) = fixture().await;
         for provider in intent_providers::config::ACP_PROVIDERS {
             assert_eq!(
-                surfaces_for(&services, dir.path(), &session, "3.10", provider).await,
-                surfaces_for(&services, dir.path(), &session, "3.9", provider).await,
+                surfaces_for(&services, dir.path(), &session, "3.10", provider)
+                    .await
+                    .0,
+                surfaces_for(&services, dir.path(), &session, "3.9", provider)
+                    .await
+                    .0,
                 "{}",
                 provider.id
             );
