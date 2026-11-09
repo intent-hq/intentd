@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.165] - 2026-11-09
+
+### 🚀 Features
+
+- *(acp)* Self-correcting ws.* errors for invented names and bad arguments ([#3197](https://github.com/intent-hq/intentd/pull/3197))
+
+### 🐛 Bug Fixes
+
+- *(tunnel)* Restart tailcat when the host resumes ([#3207](https://github.com/intent-hq/intentd/pull/3207))
+
+
 ## [0.11.164] - 2026-11-09
 
 ### 🚀 Features
