@@ -1,4 +1,4 @@
-//! Retirement of per-agent `CoW` sandboxes (protocol 16): migration 0186
+//! Retirement of per-agent `CoW` sandboxes (protocol 16): migration 0187
 //! drops the `sandbox` table (0038/0040) and the `agent_session` sandbox link
 //! columns (0039). No live per-agent sandbox exists to carry over; the
 //! migration never touches files on disk and keeps every other session field.
@@ -21,7 +21,7 @@ async fn migration_drops_sandbox_table_and_session_link_columns() {
         migrations: std::borrow::Cow::Owned(
             crate::MIGRATOR
                 .iter()
-                .filter(|m| m.version <= 185)
+                .filter(|m| m.version <= 186)
                 .cloned()
                 .collect(),
         ),
