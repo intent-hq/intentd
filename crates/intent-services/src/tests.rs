@@ -42006,135 +42006,224 @@ mod turn_token_usage {
     }
 }
 
-/// Wire-payload tests for `discover_providers_with_npx` (host.providerDiscovery):
-/// the secondary-binary attribution fields (monorepo#991) must be present
-/// together for dual-binary providers (unsloth: opencode + unsloth) and
-/// omitted for everyone else. Assertions run against a SINGLE payload
-/// snapshot plus the static registry config — never a second discovery run,
-/// which could diverge under load or environment churn.
+/// Wire-payload tests for the `host.providerDiscovery` payload
+/// ([`crate::discovery_payload`]). Each test builds the payload from a
+/// [`FakeClis`] host, so the result is the same on every machine: a
+/// developer's installed CLIs (auggie, pi, opencode, …) can neither add nor
+/// remove fields. Assertions run against a single payload snapshot per host.
 mod provider_discovery_payload {
-    #[test]
-    fn secondary_binary_fields_follow_registry_config() {
-        let payload = crate::discover_providers_with_npx();
-        let entries = payload["providers"].as_array().expect("providers array");
-        assert_eq!(
-            entries.len(),
-            intent_providers::ACP_PROVIDERS.len(),
-            "one entry per registered provider"
-        );
-        for (entry, config) in entries.iter().zip(intent_providers::ACP_PROVIDERS) {
-            assert_eq!(entry["id"], config.id, "registry order preserved");
-            // Gated providers are never probed, so they omit the fields even
-            // when the registry declares a secondary requirement.
-            let expect_fields =
-                config.requires_secondary_binary.is_some() && entry.get("gatedOff").is_none();
-            if expect_fields {
-                assert_eq!(
-                    entry["secondaryCommand"],
-                    config.requires_secondary_binary.unwrap(),
-                    "dual-binary providers must name the secondary: {entry}"
-                );
-                assert!(
-                    entry["secondaryResolved"].is_boolean(),
-                    "secondaryResolved must be boolean: {entry}"
-                );
-                if entry["installed"] == true {
-                    assert_eq!(
-                        entry["secondaryResolved"], true,
-                        "installed dual-binary providers must have the secondary resolved: {entry}"
-                    );
-                }
-                // secondaryResolvedPath rides along exactly when the
-                // secondary resolved: an absolute path string, omitted
-                // otherwise.
-                if entry["secondaryResolved"] == true {
-                    let path = entry["secondaryResolvedPath"]
-                        .as_str()
-                        .expect("resolved secondary must carry secondaryResolvedPath");
-                    assert!(
-                        std::path::Path::new(path).is_absolute(),
-                        "secondaryResolvedPath must be absolute: {entry}"
-                    );
-                } else {
-                    assert!(
-                        entry.get("secondaryResolvedPath").is_none(),
-                        "unresolved secondary must omit secondaryResolvedPath: {entry}"
-                    );
-                }
-            } else {
-                assert!(
-                    entry.get("secondaryCommand").is_none()
-                        && entry.get("secondaryResolved").is_none()
-                        && entry.get("secondaryResolvedPath").is_none(),
-                    "providers without a probed secondary requirement must omit \
-                     the attribution fields: {entry}"
-                );
+    #[cfg(unix)]
+    use std::collections::HashMap;
+    #[cfg(unix)]
+    use std::path::PathBuf;
+
+    /// A fake set of provider CLIs. Discovery sees only the executables in
+    /// one temp dir, no env-var gate is set, and nothing on the real machine
+    /// (`PATH`, home directory, login-shell capture) is consulted.
+    #[cfg(unix)]
+    struct FakeClis {
+        dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl FakeClis {
+        fn new() -> Self {
+            Self {
+                dir: crate::tests::test_tempdir("provider-discovery-fake-clis-"),
             }
         }
-        // unsloth is the dual-binary provider today (and is never gated) —
-        // keep the attribution pinned so the wire contract cannot silently
-        // regress.
-        let unsloth = entries
+
+        /// Add an executable `command` that prints `version` for `--version`.
+        fn with(self, command: &str, version: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.dir.path().join(command);
+            std::fs::write(&path, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            self
+        }
+
+        fn path(&self, command: &str) -> PathBuf {
+            self.dir.path().join(command)
+        }
+
+        fn find(&self, command: &str) -> Option<PathBuf> {
+            let path = self.path(command);
+            path.is_file().then_some(path)
+        }
+
+        fn payload(&self, paths: &HashMap<String, String>) -> serde_json::Value {
+            crate::discovery_payload(self, paths)
+        }
+    }
+
+    #[cfg(unix)]
+    impl crate::DiscoveryHost for FakeClis {
+        fn providers<S: std::hash::BuildHasher>(
+            &self,
+            provider_paths: &HashMap<String, String, S>,
+        ) -> Vec<intent_providers::ProviderAvailability> {
+            intent_providers::ACP_PROVIDERS
+                .iter()
+                .map(|cfg| {
+                    intent_providers::discover::provider_availability_with(
+                        cfg,
+                        &|_, command| self.find(command),
+                        &|_| false,
+                        &|key| provider_paths.get(key).cloned(),
+                    )
+                })
+                .collect()
+        }
+
+        fn npx(&self) -> Option<PathBuf> {
+            self.find("npx")
+        }
+
+        fn pi_cli(&self) -> crate::pi_cli::PiCliStatus {
+            crate::pi_cli::probe_pi_cli_at("pi".into(), self.find("pi"))
+        }
+
+        fn cursor_cli(&self, override_path: Option<&str>) -> crate::cursor_cli::CursorCliStatus {
+            let explicit = override_path.map(PathBuf::from).filter(|p| p.is_file());
+            crate::cursor_cli::probe_cursor_cli_at(
+                explicit.or_else(|| self.find(intent_providers::cursor::CURSOR_COMMAND)),
+            )
+        }
+
+        fn locate(
+            &self,
+            _provider_id: &str,
+            command: &str,
+            explicit: Option<&str>,
+        ) -> Vec<PathBuf> {
+            explicit
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute() && p.is_file())
+                .into_iter()
+                .chain(self.find(command))
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    fn row(payload: &serde_json::Value, id: &str) -> serde_json::Value {
+        payload["providers"]
+            .as_array()
+            .expect("providers array")
             .iter()
-            .find(|e| e["id"] == "unsloth")
-            .expect("unsloth must be in the payload");
-        assert_eq!(unsloth["secondaryCommand"], "unsloth", "{unsloth}");
-        assert!(unsloth["secondaryResolved"].is_boolean(), "{unsloth}");
+            .find(|e| e["id"] == id)
+            .unwrap_or_else(|| panic!("{id} must be in the payload"))
+            .clone()
+    }
+
+    /// Fields only the probed pi and cursor rows may carry. `cliVersion`
+    /// is not here: any installed local-binary row reports it for display.
+    #[cfg(unix)]
+    const CLI_VERDICT_FIELDS: &[&str] = &[
+        "cliCommand",
+        "cliResolved",
+        "cliResolvedPath",
+        "cliVersionOk",
+        "cliRequirement",
+        "unavailableReason",
+    ];
+
+    /// The secondary-binary attribution fields (monorepo#991) are present
+    /// together for dual-binary providers and omitted for everyone else,
+    /// with and without the secondary installed.
+    #[cfg(unix)]
+    #[test]
+    fn secondary_binary_fields_follow_registry_config() {
+        let none = FakeClis::new();
+        let both = FakeClis::new()
+            .with("opencode", "1.0.0")
+            .with("unsloth", "1.0.0");
+        for host in [&none, &both] {
+            let payload = host.payload(&HashMap::new());
+            let entries = payload["providers"].as_array().expect("providers array");
+            assert_eq!(
+                entries.len(),
+                intent_providers::ACP_PROVIDERS.len(),
+                "one entry per registered provider"
+            );
+            for (entry, config) in entries.iter().zip(intent_providers::ACP_PROVIDERS) {
+                assert_eq!(entry["id"], config.id, "registry order preserved");
+                // Gated providers are never probed, so they omit the fields
+                // even when the registry declares a secondary requirement.
+                if let (Some(secondary), None) =
+                    (config.requires_secondary_binary, entry.get("gatedOff"))
+                {
+                    assert_eq!(
+                        entry["secondaryCommand"], secondary,
+                        "dual-binary providers must name the secondary: {entry}"
+                    );
+                    assert!(entry["secondaryResolved"].is_boolean(), "{entry}");
+                } else {
+                    assert!(
+                        entry.get("secondaryCommand").is_none()
+                            && entry.get("secondaryResolved").is_none()
+                            && entry.get("secondaryResolvedPath").is_none(),
+                        "providers without a probed secondary requirement must omit \
+                         the attribution fields: {entry}"
+                    );
+                }
+            }
+        }
+
+        let missing = row(&none.payload(&HashMap::new()), "unsloth");
+        assert_eq!(missing["secondaryCommand"], "unsloth", "{missing}");
+        assert_eq!(missing["secondaryResolved"], false, "{missing}");
+        assert!(missing.get("secondaryResolvedPath").is_none(), "{missing}");
+        assert_eq!(missing["installed"], false, "{missing}");
+
+        let found = row(&both.payload(&HashMap::new()), "unsloth");
+        assert_eq!(found["secondaryResolved"], true, "{found}");
+        assert_eq!(
+            found["secondaryResolvedPath"],
+            both.path("unsloth").display().to_string(),
+            "{found}"
+        );
+        assert_eq!(
+            found["resolvedPath"],
+            both.path("opencode").display().to_string(),
+            "{found}"
+        );
+        assert_eq!(found["installed"], true, "{found}");
     }
 
     /// monorepo#1065: valid `providers.paths` overrides flip `installed` /
     /// `secondaryResolved` on the wire payload, while `resolvedPath` /
     /// `secondaryResolvedPath` stay auto-detected — they must never carry the
-    /// override path.
+    /// override path. With nothing auto-detected, both stay absent.
+    #[cfg(unix)]
     #[test]
     fn overrides_flip_installed_but_paths_stay_auto_detected() {
-        let dir = crate::tests::test_tempdir("provider-discovery-payload-");
-        let opencode = dir.path().join("opencode");
-        let unsloth_bin = dir.path().join("unsloth");
-        for bin in [&opencode, &unsloth_bin] {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::write(bin, "#!/bin/sh\nexit 0\n").unwrap();
-                std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-            #[cfg(not(unix))]
-            std::fs::write(bin, "exit 0").unwrap();
-        }
-        let overrides = std::collections::HashMap::from([
-            ("opencode".to_string(), opencode.display().to_string()),
-            ("unsloth".to_string(), unsloth_bin.display().to_string()),
+        let overrides_dir = FakeClis::new()
+            .with("opencode", "1.0.0")
+            .with("unsloth", "1.0.0");
+        let host = FakeClis::new();
+        let overrides = HashMap::from([
+            (
+                "opencode".to_string(),
+                overrides_dir.path("opencode").display().to_string(),
+            ),
+            (
+                "unsloth".to_string(),
+                overrides_dir.path("unsloth").display().to_string(),
+            ),
         ]);
-        let payload = crate::discover_providers_with_npx_overrides(&overrides);
-        let unsloth = payload["providers"]
-            .as_array()
-            .expect("providers array")
-            .iter()
-            .find(|e| e["id"] == "unsloth")
-            .expect("unsloth must be in the payload")
-            .clone();
+        let unsloth = row(&host.payload(&overrides), "unsloth");
         assert_eq!(
             unsloth["installed"], true,
             "valid overrides must report installed: {unsloth}"
         );
         assert_eq!(unsloth["secondaryResolved"], true, "{unsloth}");
-        // The path fields stay auto-detected — never the override paths.
-        assert_ne!(
-            unsloth.get("resolvedPath").and_then(|v| v.as_str()),
-            Some(opencode.display().to_string().as_str()),
-            "{unsloth}"
-        );
-        assert_ne!(
-            unsloth
-                .get("secondaryResolvedPath")
-                .and_then(|v| v.as_str()),
-            Some(unsloth_bin.display().to_string().as_str()),
-            "{unsloth}"
-        );
+        assert!(unsloth.get("resolvedPath").is_none(), "{unsloth}");
+        assert!(unsloth.get("secondaryResolvedPath").is_none(), "{unsloth}");
 
         // Invalid overrides (missing files) contribute nothing: the payload
         // matches the override-free run for the unsloth entry.
-        let bad = std::collections::HashMap::from([
+        let bad = HashMap::from([
             (
                 "opencode".to_string(),
                 "/nonexistent/override/opencode".to_string(),
@@ -42144,77 +42233,103 @@ mod provider_discovery_payload {
                 "/nonexistent/override/unsloth".to_string(),
             ),
         ]);
-        let bad_payload = crate::discover_providers_with_npx_overrides(&bad);
-        let baseline = crate::discover_providers_with_npx();
-        let pick = |p: &serde_json::Value| {
-            p["providers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|e| e["id"] == "unsloth")
-                .unwrap()
-                .clone()
-        };
+        let baseline = row(&host.payload(&HashMap::new()), "unsloth");
+        assert_eq!(baseline["installed"], false, "{baseline}");
         assert_eq!(
-            pick(&bad_payload),
-            pick(&baseline),
+            row(&host.payload(&bad), "unsloth"),
+            baseline,
             "invalid overrides must behave exactly like no overrides"
         );
     }
 
     /// monorepo#1662: the pi row carries the `pi` CLI verdict fields, and
-    /// only the pi row does. Field-consistency assertions run against a
-    /// single payload snapshot (the live host's CLI state varies).
+    /// only the pi and cursor rows do. Other installed rows (auggie here)
+    /// may report a display-only `cliVersion`, which made this test fail on
+    /// machines with auggie installed before it used a fake host.
+    #[cfg(unix)]
     #[test]
     fn pi_row_carries_cli_verdict_fields() {
-        let payload = crate::discover_providers_with_npx();
-        let entries = payload["providers"].as_array().expect("providers array");
-        for entry in entries {
-            // Cursor reports its CLI identity too (`cursor_cli`): never the
-            // pi version-gate fields, and a reason only with installed=false.
-            if entry["id"] == "cursor" {
-                assert!(
-                    entry.get("cliVersionOk").is_none() && entry.get("cliRequirement").is_none(),
-                    "{entry}"
-                );
-                if entry.get("unavailableReason").is_some() {
-                    assert_eq!(entry["installed"], false, "{entry}");
-                }
+        let auggie_version = intent_providers::AUGGIE_CLI_MIN_VERSION;
+        let cursor_version = "2026.11.05-86047df";
+        let host = FakeClis::new()
+            .with("npx", "10.9.0")
+            .with("pi", intent_providers::PI_CLI_MIN_VERSION)
+            .with("auggie", auggie_version)
+            .with(intent_providers::cursor::CURSOR_COMMAND, cursor_version);
+        let payload = host.payload(&HashMap::new());
+
+        let pi = row(&payload, "pi");
+        assert_eq!(pi["cliCommand"], "pi", "{pi}");
+        assert_eq!(pi["cliResolved"], true, "{pi}");
+        assert_eq!(
+            pi["cliResolvedPath"],
+            host.path("pi").display().to_string(),
+            "{pi}"
+        );
+        assert_eq!(
+            pi["cliVersion"],
+            intent_providers::PI_CLI_MIN_VERSION,
+            "{pi}"
+        );
+        assert_eq!(pi["cliVersionOk"], true, "{pi}");
+        assert_eq!(
+            pi["cliRequirement"],
+            intent_providers::PI_CLI_REQUIREMENT,
+            "{pi}"
+        );
+        assert!(pi.get("unavailableReason").is_none(), "{pi}");
+        assert_eq!(pi["installed"], true, "{pi}");
+
+        let cursor = row(&payload, "cursor");
+        assert_eq!(
+            cursor["cliCommand"],
+            intent_providers::cursor::CURSOR_COMMAND,
+            "{cursor}"
+        );
+        assert_eq!(cursor["cliVersion"], cursor_version, "{cursor}");
+        assert!(
+            cursor.get("cliVersionOk").is_none() && cursor.get("cliRequirement").is_none(),
+            "cursor never carries the pi version-gate fields: {cursor}"
+        );
+        assert!(cursor.get("unavailableReason").is_none(), "{cursor}");
+        assert_eq!(cursor["installed"], true, "{cursor}");
+
+        let auggie = row(&payload, "auggie");
+        assert_eq!(auggie["installed"], true, "{auggie}");
+        assert_eq!(auggie["cliVersion"], auggie_version, "{auggie}");
+
+        for entry in payload["providers"].as_array().expect("providers array") {
+            if entry["id"] == "pi" || entry["id"] == "cursor" {
                 continue;
             }
-            if entry["id"] != "pi" || entry.get("gatedOff").is_some() {
+            for field in CLI_VERDICT_FIELDS {
                 assert!(
-                    entry.get("cliCommand").is_none()
-                        && entry.get("cliResolved").is_none()
-                        && entry.get("cliResolvedPath").is_none()
-                        && entry.get("cliVersion").is_none()
-                        && entry.get("cliVersionOk").is_none()
-                        && entry.get("cliRequirement").is_none()
-                        && entry.get("unavailableReason").is_none(),
-                    "only the probed pi and cursor rows carry CLI fields: {entry}"
+                    entry.get(field).is_none(),
+                    "only the probed pi and cursor rows carry {field}: {entry}"
                 );
-                continue;
-            }
-            assert!(entry["cliCommand"].is_string(), "{entry}");
-            assert!(entry["cliResolved"].is_boolean(), "{entry}");
-            assert!(entry["cliVersionOk"].is_boolean(), "{entry}");
-            assert_eq!(
-                entry["cliRequirement"],
-                intent_providers::PI_CLI_REQUIREMENT,
-                "{entry}"
-            );
-            if entry["cliResolved"] == false {
-                assert!(
-                    entry.get("cliResolvedPath").is_none() && entry.get("cliVersion").is_none(),
-                    "unresolved CLI must omit path/version: {entry}"
-                );
-            }
-            // A gating verdict forces installed=false and names the reason.
-            if entry.get("unavailableReason").is_some() {
-                assert_eq!(entry["installed"], false, "{entry}");
-                assert_eq!(entry["cliVersionOk"], false, "{entry}");
             }
         }
+
+        // A missing `pi` gates the row off with an actionable reason.
+        let without_pi = row(
+            &FakeClis::new()
+                .with("npx", "10.9.0")
+                .payload(&HashMap::new()),
+            "pi",
+        );
+        assert_eq!(without_pi["cliResolved"], false, "{without_pi}");
+        assert!(
+            without_pi.get("cliResolvedPath").is_none() && without_pi.get("cliVersion").is_none(),
+            "unresolved CLI must omit path/version: {without_pi}"
+        );
+        assert_eq!(without_pi["cliVersionOk"], false, "{without_pi}");
+        assert!(
+            without_pi["unavailableReason"]
+                .as_str()
+                .is_some_and(|r| r.contains(intent_providers::PI_CLI_REQUIREMENT)),
+            "{without_pi}"
+        );
+        assert_eq!(without_pi["installed"], false, "{without_pi}");
     }
 
     /// The pure gate-to-fields mapping (`apply_pi_cli_fields`): Missing and
