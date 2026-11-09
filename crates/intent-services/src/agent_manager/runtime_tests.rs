@@ -800,6 +800,87 @@ async fn a_remote_agent_receives_a_message_with_attachments() {
 #[path = "remote_quota_failover_tests.rs"]
 mod remote_quota_failover_tests;
 
+/// Re-stamp a session's harness version (the full-row write never touches
+/// the stamp, which is set once) on the codex provider.
+async fn stamp_harness(store: &Store, id: &AgentId, version: &str) {
+    sqlx::query("UPDATE agent_session SET harness_version=?, provider='codex' WHERE id=?")
+        .bind(version)
+        .bind(id.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+}
+
+/// The `promptBreakdown` field `agent.getSession` serves for `id`.
+async fn served_breakdown(mgr: &AgentManager, id: &AgentId) -> Value {
+    mgr.services
+        .agent_get_session_bounded_op(id.clone())
+        .await
+        .unwrap()["promptBreakdown"]
+        .clone()
+}
+
+/// A remote agent's spawn records no prompt breakdown (its machine serves
+/// the `workspace_api` description, which the backend cannot size), and
+/// clears an earlier one: `agent.getSession` reports `not-recorded`. A
+/// pre-3.10 session reports `harness-predates-breakdown` even with a
+/// breakdown stored against its exact prompt.
+#[tokio::test]
+async fn a_remote_spawn_records_no_prompt_breakdown() {
+    use intent_core::prompt_breakdown::PromptBreakdown;
+
+    let ws = WorkspaceId::from("ws-breakdown");
+    let id = AgentId::from("agent-breakdown");
+    let port = Arc::new(RemoteRuntimes {
+        runtime: None,
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port, &id, &ws).await;
+    let store = &mgr.services.store;
+    let newest = intent_core::NEWEST_HARNESS_VERSION;
+    let seeded = PromptBreakdown::new(newest, now_iso(), Vec::new(), Vec::new());
+    stamp_harness(store, &id, newest).await;
+    store
+        .set_agent_session_system_prompt_with_breakdown(&ws, &id, "", Some(&seeded))
+        .await
+        .unwrap();
+    assert_eq!(
+        served_breakdown(&mgr, &id).await["available"],
+        json!(true),
+        "seeded breakdown is served"
+    );
+    let session = store.get_agent_session_with_transcript(&id).await.unwrap();
+    mgr.prepare_remote_system_prompt(&id, &ws, &session)
+        .await
+        .unwrap();
+    assert!(store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap()
+        .system_prompt
+        .is_some_and(|p| !p.is_empty()));
+    assert_eq!(
+        served_breakdown(&mgr, &id).await,
+        json!({"available": false, "reason": "not-recorded"})
+    );
+
+    stamp_harness(store, &id, "3.8").await;
+    let prompt = store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap()
+        .system_prompt
+        .unwrap();
+    store
+        .set_agent_session_system_prompt_with_breakdown(&ws, &id, &prompt, Some(&seeded))
+        .await
+        .unwrap();
+    assert_eq!(
+        served_breakdown(&mgr, &id).await,
+        json!({"available": false, "reason": "harness-predates-breakdown"})
+    );
+}
+
 /// Remote parity S1: a remote agent's instructions match what its machine
 /// can serve. A truncating provider gets the condensed `ws.*` reference
 /// (its machine serves the compact tool description that points at it);

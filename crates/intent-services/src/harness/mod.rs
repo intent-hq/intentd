@@ -539,6 +539,10 @@ pub(crate) struct ContextSurfaces {
     pub repo_rules_reads_executor: bool,
     /// The `<available_skills>` block; empty adds no layer.
     pub skills_block: fn(&SkillsBlockInputs<'_>) -> String,
+    /// The skills [`Self::skills_block`] leaves out, with why: reported in
+    /// the session's prompt breakdown (3.10+).
+    pub hidden_skills:
+        fn(&SkillsBlockInputs<'_>) -> Vec<intent_core::prompt_breakdown::HiddenSkill>,
     /// The remote-placement text in the `ws.agent` docs.
     pub placement_help: intent_core::machine_selection::PlacementHelpRenderer,
 }
@@ -549,8 +553,16 @@ pub(crate) static CONTEXT_V1: ContextSurfaces = ContextSurfaces {
     repo_rules: crate::rules::workspace_rules_v1,
     repo_rules_reads_executor: false,
     skills_block: skills_block_v1,
+    hidden_skills: no_hidden_skills,
     placement_help: intent_core::machine_selection::exposed_machines_help,
 };
+
+/// No skill is ever hidden (harness 1.0 through 3.9).
+pub(crate) fn no_hidden_skills(
+    _: &SkillsBlockInputs<'_>,
+) -> Vec<intent_core::prompt_breakdown::HiddenSkill> {
+    Vec::new()
+}
 
 fn skills_block_v1(inputs: &SkillsBlockInputs<'_>) -> String {
     crate::skills::build_skills_catalog(inputs.skills)

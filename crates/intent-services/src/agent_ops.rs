@@ -8174,6 +8174,28 @@ impl Services {
             .await?;
         let mut out = serde_json::to_value(&session)
             .map_err(|e| Error::Internal(format!("serialize agent session: {e}")))?;
+        // `promptBreakdown` (always present): a pre-3.10 session is
+        // unavailable without a read; it counts toward the session budget.
+        // The read is tied to the served `systemPrompt`, so the two always
+        // describe the same spawn.
+        let stored_breakdown = if intent_core::prompt_breakdown::harness_records_prompt_breakdown(
+            &session.harness_version,
+        ) {
+            self.store
+                .get_agent_session_prompt_breakdown(&session.id, session.system_prompt.as_deref())
+                .await?
+        } else {
+            None
+        };
+        if let Value::Object(map) = &mut out {
+            map.insert(
+                "promptBreakdown".to_string(),
+                intent_core::prompt_breakdown::prompt_breakdown_wire(
+                    &session.harness_version,
+                    stored_breakdown.as_ref(),
+                ),
+            );
+        }
         let mut messages = match page.get("messages") {
             Some(Value::Array(rows)) => rows.clone(),
             _ => Vec::new(),
