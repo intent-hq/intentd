@@ -1002,6 +1002,10 @@ fn check_existing(to: &Destination, kind: CheckoutEntryKind) -> Result<()> {
 }
 
 /// Set `file`'s mode (0644 or 0755) through its handle.
+#[cfg_attr(
+    not(unix),
+    expect(clippy::unnecessary_wraps, reason = "fails only on unix")
+)]
 fn set_mode(file: &std::fs::File, mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
