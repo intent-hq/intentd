@@ -636,6 +636,15 @@ mod tests {
         assert_eq!(storage.agent_ids(), vec![agent]);
     }
 
+    fn private_dirs(path: &Path) {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .unwrap();
+    }
+
     #[test]
     fn a_taken_short_name_falls_back_to_the_full_agent_id() {
         let parent = tempfile::tempdir().unwrap();
@@ -644,7 +653,7 @@ mod tests {
             .unwrap()
             .with_work_dir(Some(work.clone()));
         let agent = AgentId::from("agent-1");
-        std::fs::create_dir_all(work.join(hex_digest(b"agent-1", 6))).unwrap();
+        private_dirs(&work.join(hex_digest(b"agent-1", 6)));
         let worktree = storage.agent_worktree(&agent).unwrap();
         assert_eq!(worktree, work.join("agent-1").join(WORK));
     }
@@ -654,7 +663,7 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let root = parent.path().join("node");
         let legacy = root.join(AGENTS).join("a1").join(WORK);
-        std::fs::create_dir_all(legacy.join(".git")).unwrap();
+        private_dirs(&legacy.join(".git"));
         let storage = Storage::open(&root, None)
             .unwrap()
             .with_work_dir(Some(parent.path().join("w")));
