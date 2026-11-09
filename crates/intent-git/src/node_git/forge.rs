@@ -1,4 +1,4 @@
-//! Head side of a sub-agent's forge remote (nodeProtocol 16, monorepo
+//! Head side of a sub-agent's forge remote (nodeProtocol 17, monorepo
 //! `docs/protocol/node-link.md` § Sub-agent fetch through the backend).
 //!
 //! Head fetches the workspace's GitHub repository into the private git
@@ -70,13 +70,13 @@ pub async fn refresh(repository: &Path, url: &str, token: Option<&str>) -> Resul
         .map_err(|_| Error::Internal("node-git-failed: the GitHub refresh timed out".into()))??;
     let mut symref = git_in(repository, token);
     symref.args(["ls-remote", "--symref", url, "HEAD"]);
-    let branch = match tokio::time::timeout_at(deadline, run(symref)).await {
-        Ok(Ok(out)) => default_branch(&out).map(str::to_owned),
-        _ => None,
+    // A failed `ls-remote` keeps the default branch recorded before.
+    let Ok(Ok(listed)) = tokio::time::timeout_at(deadline, run(symref)).await else {
+        return Ok(());
     };
     let mut head = sanitized_git();
     head.arg("-C").arg(repository);
-    match branch {
+    match default_branch(&listed) {
         Some(branch) => head.args([
             "symbolic-ref".to_owned(),
             format!("{PREFIX}HEAD"),
@@ -100,6 +100,17 @@ fn default_branch(ls_remote: &str) -> Option<&str> {
         let (target, name) = line.strip_prefix("ref: ")?.split_once('\t')?;
         (name == "HEAD" && target.starts_with("refs/heads/")).then_some(target)
     })
+}
+
+/// `repository`'s git common directory, shared by all its worktrees.
+pub async fn common_dir(repository: &Path) -> Option<std::path::PathBuf> {
+    let mut command = sanitized_git();
+    command.arg("-C").arg(repository).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ]);
+    run(command).await.ok().map(std::path::PathBuf::from)
 }
 
 /// Whether the namespace holds any ref.

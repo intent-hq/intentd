@@ -1205,7 +1205,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                 .is_some_and(|last| last != record.node_id)
                 .then(|| Box::new(MachineName(status.node_name.clone())));
             // A sub-agent reaches GitHub through this backend (nodeProtocol
-            // 16); the connector drops it on an older link.
+            // 17); the connector drops it on an older link.
             let forge_fetch = if is_sub_agent || checkout_of.is_some() {
                 forge_fetch_launch(svc, &record.workspace_id).await
             } else {

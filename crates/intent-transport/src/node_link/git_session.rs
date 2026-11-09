@@ -187,7 +187,7 @@ pub trait NodeGitAccess: Send + Sync {
     ) -> BoxFuture<'a, Result<PathBuf>>;
 
     /// The repository serving `remote`'s forge upload-pack (nodeProtocol
-    /// 16), refreshed from GitHub, under the same authority as
+    /// 17), refreshed from GitHub, under the same authority as
     /// [`Self::repository`]. Errors map to codes as there.
     fn forge<'a>(
         &'a self,
@@ -196,6 +196,12 @@ pub trait NodeGitAccess: Send + Sync {
     ) -> BoxFuture<'a, Result<ForgeServe>> {
         let _ = (binding, remote);
         Box::pin(async { Err(Error::InvalidParams(codes::INVALID.into())) })
+    }
+
+    /// Whether the link negotiated forge remotes (nodeProtocol 17); a
+    /// forge session on an older link is [`codes::INVALID`].
+    fn forge_supported(&self) -> bool {
+        false
     }
 }
 
@@ -310,6 +316,9 @@ async fn run_service(
     let service = GitService::parse(&open.service).map_err(|_| codes::INVALID)?;
     let remote = AgentRemote::parse(&open.url).map_err(|_| codes::INVALID)?;
     let (command, accept) = if remote.is_forge() {
+        if !access.forge_supported() {
+            return Err(codes::INVALID);
+        }
         if service == GitService::ReceivePack {
             return Err(codes::PUSH_REFUSED);
         }
@@ -387,9 +396,9 @@ async fn run_service(
 /// An event for one node-side session.
 #[derive(Debug)]
 enum SessionEvent {
-    /// With a forge ACCEPT's warning; `Err` for a payload that is not an
-    /// [`AcceptStatus`].
-    Accepted(std::result::Result<Option<String>, ()>),
+    /// `None` for an empty payload; else the decoded [`AcceptStatus`]
+    /// warning, `Err` when the payload is not one.
+    Accepted(Option<std::result::Result<Option<String>, ()>>),
     Data(Vec<u8>),
     Closed(Option<String>),
 }
@@ -463,12 +472,12 @@ impl NodeGitSessions {
         tokio::spawn(async move {
             while let Some((kind, id, payload)) = connection.recv().await.and_then(decode) {
                 let event = match kind {
-                    ACCEPT if payload.is_empty() => SessionEvent::Accepted(Ok(None)),
-                    ACCEPT => SessionEvent::Accepted(
+                    ACCEPT if payload.is_empty() => SessionEvent::Accepted(None),
+                    ACCEPT => SessionEvent::Accepted(Some(
                         serde_json::from_slice::<AcceptStatus>(&payload)
                             .map(|status| status.warning)
                             .map_err(|_| ()),
-                    ),
+                    )),
                     DATA => SessionEvent::Data(payload),
                     CLOSE => SessionEvent::Closed(
                         serde_json::from_slice::<CloseStatus>(&payload)
@@ -564,7 +573,11 @@ impl NodeGitSessions {
             .await
             .map_err(|_| session_error(codes::UNAVAILABLE))?;
         match events.recv().await {
-            Some(SessionEvent::Accepted(Ok(warning))) if warning.is_none() || remote.is_forge() => {
+            Some(SessionEvent::Accepted(None)) => {
+                session.events = Some(events);
+                Ok(session)
+            }
+            Some(SessionEvent::Accepted(Some(Ok(warning)))) if remote.is_forge() => {
                 session.events = Some(events);
                 session.warning = warning;
                 Ok(session)

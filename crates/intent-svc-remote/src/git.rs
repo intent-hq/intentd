@@ -43,42 +43,76 @@ fn unavailable(what: &str) -> Error {
 /// How long a successful refresh serves later forge sessions.
 const REFRESH_REUSE: Duration = Duration::from_secs(5);
 
-/// Points the forge refresh at another host than `https://github.com/`
-/// (tests: a local stand-in).
+/// Points the forge refresh at another host than `https://github.com/`, as
+/// `INTENTD_GITHUB_API_BASE_URI` does for the API: the e2e tests use a local
+/// stand-in. The backend's token is offered only to `https://github.com`.
 const GIT_BASE_ENV: &str = "INTENTD_GITHUB_GIT_BASE_URL";
 
-/// Per workspace repository: held while a refresh runs; the end of the last
-/// successful one.
-type RefreshSlot = Arc<tokio::sync::Mutex<Option<Instant>>>;
+/// One repository's refreshes: when the last successful one ended, and
+/// when the last one of any outcome ended, with its outcome.
+#[derive(Default)]
+struct RefreshState {
+    succeeded: Option<Instant>,
+    ended: Option<(Instant, bool)>,
+}
+
+/// Per repository (its git common directory): held while a refresh runs.
+type RefreshSlot = Arc<tokio::sync::Mutex<RefreshState>>;
 
 static REFRESHES: LazyLock<Mutex<HashMap<PathBuf, RefreshSlot>>> = LazyLock::new(Mutex::default);
 
-/// Refresh `repository`'s forge namespace from `url`, sharing one fetch
-/// among sessions close together: one that arrives while a fetch runs
-/// waits for it, and one within [`REFRESH_REUSE`] after a successful fetch
-/// uses it. A failed fetch is not reused.
+/// Run `fetch` for `slot`'s repository, shared among sessions close
+/// together: one that arrived while a fetch ran gets that fetch's outcome,
+/// failed or not, and one within [`REFRESH_REUSE`] after a successful fetch
+/// uses it. Any later session fetches again.
+async fn coalesced<F>(slot: &RefreshSlot, fetch: impl FnOnce() -> F) -> bool
+where
+    F: std::future::Future<Output = bool>,
+{
+    let arrived = Instant::now();
+    let mut state = slot.lock().await;
+    if let Some((ended, ok)) = state.ended {
+        if ended > arrived {
+            return ok;
+        }
+    }
+    if state
+        .succeeded
+        .is_some_and(|done| arrived.duration_since(done) <= REFRESH_REUSE)
+    {
+        return true;
+    }
+    let ok = fetch().await;
+    let now = Instant::now();
+    state.ended = Some((now, ok));
+    if ok {
+        state.succeeded = Some(now);
+    }
+    ok
+}
+
+/// Refresh `repository`'s forge namespace from `url` (see [`coalesced`]).
+/// Worktrees of one repository share the namespace, so they share a slot.
 async fn forge_refresh(repository: &Path, url: &str, token: Option<&str>) -> bool {
+    let key = forge::common_dir(repository)
+        .await
+        .unwrap_or_else(|| repository.to_path_buf());
     let slot = REFRESHES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(repository.to_path_buf())
+        .entry(key)
         .or_default()
         .clone();
-    let arrived = Instant::now();
-    let mut last = slot.lock().await;
-    if last.is_some_and(|done| done >= arrived || arrived.duration_since(done) <= REFRESH_REUSE) {
-        return true;
-    }
-    match forge::refresh(repository, url, token).await {
-        Ok(()) => {
-            *last = Some(Instant::now());
-            true
+    coalesced(&slot, || async {
+        match forge::refresh(repository, url, token).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "forge refresh from GitHub failed; serving the last fetched refs");
+                false
+            }
         }
-        Err(error) => {
-            tracing::warn!(%error, "forge refresh from GitHub failed; serving the last fetched refs");
-            false
-        }
-    }
+    })
+    .await
 }
 
 /// The URL head fetches for `launch`.
@@ -149,6 +183,10 @@ impl HeadGitAccess {
 }
 
 impl NodeGitAccess for HeadGitAccess {
+    fn forge_supported(&self) -> bool {
+        self.shared.protocol() >= FORGE_FETCH_PROTOCOL
+    }
+
     fn forge<'a>(
         &'a self,
         binding: &'a LeaseBinding,
@@ -273,5 +311,48 @@ impl NodeGitAccess for HeadGitAccess {
                 Err(ModuleRefusal::Unavailable(what)) => Err(unavailable(&what)),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    async fn counted(fetches: &AtomicUsize, ok: bool) -> bool {
+        fetches.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        ok
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sessions_that_wait_on_a_failed_fetch_share_its_failure() {
+        let slot = RefreshSlot::default();
+        let fetches = AtomicUsize::new(0);
+        let results = tokio::join!(
+            coalesced(&slot, || counted(&fetches, false)),
+            coalesced(&slot, || counted(&fetches, false)),
+            coalesced(&slot, || counted(&fetches, false)),
+            coalesced(&slot, || counted(&fetches, false)),
+        );
+        assert_eq!(results, (false, false, false, false));
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        // A session after that fetch ended fetches again.
+        assert!(!coalesced(&slot, || counted(&fetches, false)).await);
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_fetch_serves_sessions_for_five_seconds() {
+        let slot = RefreshSlot::default();
+        let fetches = AtomicUsize::new(0);
+        assert!(coalesced(&slot, || counted(&fetches, true)).await);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(coalesced(&slot, || counted(&fetches, false)).await);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!coalesced(&slot, || counted(&fetches, false)).await);
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
     }
 }

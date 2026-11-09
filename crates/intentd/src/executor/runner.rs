@@ -473,7 +473,7 @@ struct Agent {
     /// agents only.
     forge: Option<ForgeLaunch>,
     /// Its GitHub repository, fetched through the backend (nodeProtocol
-    /// 16): sub-agents only.
+    /// 17): sub-agents only.
     forge_fetch: Option<ForgeFetchLaunch>,
     /// The backend's commit identity for the workspace, set as the
     /// provider's `GIT_AUTHOR_*` / `GIT_COMMITTER_*`.
@@ -1776,8 +1776,13 @@ impl Runner {
         ) else {
             return Ok(None);
         };
-        let path =
-            super::storage::forge_socket_path(main, &agent.id.0, &super::storage::runtime_base())?;
+        // Named by this run too: a quick relaunch binds its own socket while
+        // the previous run's is still being removed.
+        let path = super::storage::forge_socket_path(
+            main,
+            &format!("{}/{}", agent.id.0, agent.run_marker),
+            &super::storage::runtime_base(),
+        )?;
         match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
