@@ -987,6 +987,27 @@ impl Store {
         Ok(recorded)
     }
 
+    /// Whether `workspace_id` has a remote agent or a final stop still
+    /// pending (kept after the agent and its `remote_agent` row are gone,
+    /// until the machine's last push lands in the workspace's repository).
+    /// # Errors
+    /// Returns database errors.
+    pub async fn workspace_has_remote_agent_work(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT EXISTS (SELECT 1 FROM remote_agent WHERE workspace_id = ?) \
+             OR EXISTS (SELECT 1 FROM remote_final_stop WHERE workspace_id = ?) AS pending",
+        )
+        .bind(workspace_id.as_str())
+        .bind(workspace_id.as_str())
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(db)?;
+        Ok(row.get::<i64, _>("pending") != 0)
+    }
+
     /// The final stops recorded on `lease_id`, oldest first.
     /// # Errors
     /// Returns database errors.

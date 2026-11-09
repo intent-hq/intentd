@@ -184,16 +184,21 @@ fn evaluate_repo(
         && modules.is_dir()
         && std::fs::canonicalize(&modules).is_ok_and(|m| m.starts_with(root))
     {
-        return evaluate_module_gitdirs(&modules, merged_heads);
+        return evaluate_module_gitdirs(&modules, root, merged_heads);
     }
     Ok(None)
 }
 
 /// Submodule repositories under a `.git/modules` directory (a name such as
 /// `packages/sub` is a directory of directories; a submodule's own
-/// submodules sit in its `modules/`): stashes and unpushed commits block,
-/// whether or not the submodule is checked out.
-fn evaluate_module_gitdirs(dir: &Path, merged_heads: &[String]) -> Result<Option<StandaloneWork>> {
+/// submodules sit in its `modules/`): stashes, unpushed commits and linked
+/// worktrees outside `root` block, whether or not the submodule is checked
+/// out.
+fn evaluate_module_gitdirs(
+    dir: &Path,
+    root: &Path,
+    merged_heads: &[String],
+) -> Result<Option<StandaloneWork>> {
     for entry in std::fs::read_dir(dir).map_err(|e| io_err(dir, &e))? {
         let entry = entry.map_err(|e| io_err(dir, &e))?;
         if !entry
@@ -208,7 +213,7 @@ fn evaluate_module_gitdirs(dir: &Path, merged_heads: &[String]) -> Result<Option
             && path.join("objects").is_dir()
             && path.join("refs").is_dir();
         if !gitdir {
-            if let Some(work) = evaluate_module_gitdirs(&path, merged_heads)? {
+            if let Some(work) = evaluate_module_gitdirs(&path, root, merged_heads)? {
                 return Ok(Some(work));
             }
             continue;
@@ -219,6 +224,8 @@ fn evaluate_module_gitdirs(dir: &Path, merged_heads: &[String]) -> Result<Option
             Some(StandaloneWorkKind::Stash)
         } else if has_unpushed(&repo, &path, merged_heads)? {
             Some(StandaloneWorkKind::Unpushed)
+        } else if has_external_worktree(&repo, root)? {
+            Some(StandaloneWorkKind::ExternalWorktree)
         } else {
             None
         };
@@ -227,7 +234,7 @@ fn evaluate_module_gitdirs(dir: &Path, merged_heads: &[String]) -> Result<Option
         }
         let nested = path.join("modules");
         if nested.is_dir() {
-            if let Some(work) = evaluate_module_gitdirs(&nested, merged_heads)? {
+            if let Some(work) = evaluate_module_gitdirs(&nested, root, merged_heads)? {
                 return Ok(Some(work));
             }
         }
@@ -657,6 +664,42 @@ mod tests {
         git(&l.repo, &["submodule", "deinit", "-q", "-f", "libs/sub"]);
         assert!(!sub.join(".git").exists(), "the checkout is gone");
         assert_eq!(kind(&l), Some(StandaloneWorkKind::Unpushed));
+    }
+
+    /// A submodule repository under `.git/modules` that backs a linked
+    /// worktree outside the folder blocks, checked out or not.
+    #[test]
+    fn a_module_repository_with_an_external_worktree_blocks() {
+        allow_file_submodules();
+        let l = layout("standalone-module-worktree");
+        let sub_src = l.tmp.path().join("sub-src");
+        std::fs::create_dir_all(&sub_src).unwrap();
+        git(&sub_src, &["init", "-q", "-b", "main"]);
+        commit(&sub_src, "a.txt");
+        git(
+            l.tmp.path(),
+            &["clone", "-q", "--bare", "sub-src", "sub.git"],
+        );
+        let sub_url = l.tmp.path().join("sub.git");
+        git(
+            &l.repo,
+            &["submodule", "add", "-q", sub_url.to_str().unwrap(), "sub"],
+        );
+        git(&l.repo, &["commit", "-q", "-m", "add sub"]);
+        git(&l.repo, &["push", "-q", "origin", "HEAD"]);
+        let outside = l.tmp.path().join("sub-outside");
+        git(
+            &l.repo.join("sub"),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                outside.to_str().unwrap(),
+            ],
+        );
+        git(&l.repo, &["submodule", "deinit", "-q", "-f", "sub"]);
+        assert_eq!(kind(&l), Some(StandaloneWorkKind::ExternalWorktree));
     }
 
     #[test]

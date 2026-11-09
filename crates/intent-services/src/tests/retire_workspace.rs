@@ -2126,3 +2126,48 @@ async fn a_standalone_checkout_with_a_remote_agent_is_kept() {
     assert!(s.folder.join("README.md").is_file(), "folder kept");
     assert!(!f.store.get_workspace(&s.ws.id).await.unwrap().is_retired());
 }
+
+/// Deleting a remote agent drops its `remote_agent` row, but its final stop
+/// stays recorded until the machine's last push lands — in this folder.
+/// While it is pending the purge keeps the folder.
+#[intent_test_macros::daemon_test]
+async fn a_standalone_checkout_with_a_pending_final_stop_is_kept() {
+    let f = fixture().await;
+    let s = insert_standalone(
+        &f,
+        "ws-direct-final-stop",
+        intent_core::CheckoutMode::Direct,
+        false,
+    )
+    .await;
+    f.store
+        .record_final_stop(&intent_core::remote_launch::RemoteFinalStopRecord {
+            agent_id: intent_core::AgentId::from("agent-deleted"),
+            workspace_id: s.ws.id.clone(),
+            machine_id: "node-test".into(),
+            lease_id: "lease-test".into(),
+            stop_id: "stop-1".into(),
+            reason: intent_core::remote_launch::FinalStopReason::AgentDeleted,
+            repo_path: s.folder.to_string_lossy().to_string(),
+            requested_at: crate::now_iso(),
+            submodules: Vec::new(),
+        })
+        .await
+        .expect("record final stop");
+
+    let report = purge_sweep(&f).await;
+    assert_eq!(
+        (report.retired, report.skipped_local_work),
+        (0, 1),
+        "{report:?}"
+    );
+    assert!(s.folder.join("README.md").is_file(), "folder kept");
+
+    assert!(f
+        .store
+        .finish_final_stop(&intent_core::AgentId::from("agent-deleted"), "stop-1")
+        .await
+        .expect("finish"));
+    let report = purge_sweep(&f).await;
+    assert_eq!(report.retired, 1, "{report:?}");
+}

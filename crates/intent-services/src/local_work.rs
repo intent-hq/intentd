@@ -215,21 +215,12 @@ impl Services {
         };
         // A remote agent pushes its work refs into the workspace's own
         // repository — for a standalone checkout, this folder — and its
-        // machine may still push a last time.
-        let agents = match self.store.list_agent_session_summaries(&ws.id).await {
-            Ok(sessions) => sessions
-                .into_iter()
-                .map(|s| s.id.clone())
-                .collect::<Vec<_>>(),
-            Err(e) => {
-                tracing::warn!(workspace = %ws.id, error = %e, "purge: agent lookup failed; kept");
-                return Some("local changes could not be evaluated");
-            }
-        };
-        match self.store.get_remote_agents(&agents).await {
-            Ok(remote) if remote.is_empty() => {}
-            Ok(_) => {
-                tracing::info!(workspace = %ws.id, "purge: remote agents push into the workspace folder; kept");
+        // machine may still push a last time, even after the agent was
+        // deleted (its final stop stays recorded until that push lands).
+        match self.store.workspace_has_remote_agent_work(&ws.id).await {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::info!(workspace = %ws.id, "purge: remote agents (or a pending final stop) push into the workspace folder; kept");
                 return Some(REMOTE_AGENTS);
             }
             Err(e) => {
