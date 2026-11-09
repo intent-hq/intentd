@@ -27,9 +27,9 @@ use intent_acp::{
     SinkEvent, SpawnOptions,
 };
 use intent_core::node_link::{
-    CheckoutRead, CheckoutReadOutcome, CheckoutReadReply, ExitFailure, FinalPush,
-    ForgeFetchLaunch, ForgeLaunch, GitIdentity, JournalBody, JournalRecord, LaunchCommand,
-    LeaseBinding, MachineCapacity, StopOutcome, SKILLS_PROTOCOL,
+    CheckoutRead, CheckoutReadOutcome, CheckoutReadReply, ExitFailure, FinalPush, ForgeFetchLaunch,
+    ForgeLaunch, GitIdentity, JournalBody, JournalRecord, LaunchCommand, LeaseBinding,
+    MachineCapacity, StopOutcome, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::CapacityRefusal;
