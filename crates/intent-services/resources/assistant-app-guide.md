@@ -32,7 +32,7 @@ GitLab is supported alongside GitHub; there is no Labs switch. Connect a GitLab.
 self-managed GitLab account in **Settings → Connections** or during onboarding, by
 device sign-in or a personal access token. With it connected, sharing can pin
 invitations to GitLab accounts and a guest can join with a GitLab identity; on hosts
-that support GitLab checkout, **Add codebase → Clone** also lists GitLab projects. An
+that support GitLab checkout, **Add codebase or folder → Clone** also lists GitLab projects. An
 older connected daemon shows an update note instead of the GitLab setup.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{capability,invite_ops}.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts; packages/cloudlands-fe/src/lib/components/settings/GitLabAuthConnection.svelte; packages/cloudlands-fe/src/features/onboarding/steps/OnboardingForgeStep.svelte; packages/cloudlands-fe/src/features/collaboration-auth/renderer/CollaborationSignInModal.svelte. -->
@@ -675,8 +675,8 @@ the selected codebase is included even if it has not reached your history yet.
 Codebase icons use owner avatars where available, or folder icons for local paths.
 The selected codebase field shows the same icon as its dropdown row.
 Use the external-link action beside a codebase to open it in your browser.
-**Add codebase** opens the **Clone**, **Existing folder**, and **New** tabs.
-If you paste a GitHub URL in codebase search, **Add codebase** carries it into
+**Add codebase or folder** opens the **Clone**, **Existing folder**, and **New** tabs.
+If you paste a GitHub URL in **Search codebases or folders**, **Add codebase or folder** carries it into
 **Clone**; press Enter to select it. Selecting the current codebase again keeps
 your branch selection. If the branch list fails to load, open **Branch** and use
 **Refresh branches**.
