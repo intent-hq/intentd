@@ -355,6 +355,7 @@ impl Running {
         let service = ExecutorService::start_with_checkouts(
             ExecutorDeps {
                 data_dir: data_dir.to_owned(),
+                work_base: None,
                 node_id: NODE_ID.into(),
                 admission,
                 launch: Arc::new(FixedLaunch(providers)),
@@ -1682,6 +1683,14 @@ async fn a_revoked_credentials_storage_is_removed_and_active_ones_are_kept() {
     // removal) goes at the next bind.
     let stale = dir.path().join("executor").join("stalecredential");
     std::fs::create_dir_all(stale.join("agents").join("a1")).unwrap();
+    let stale_home = storage::work_dir(&dir.path().join("w"), "stalecredential").join("a1home");
+    std::fs::create_dir_all(stale_home.join("work")).unwrap();
+    std::fs::write(stale_home.join(".agent"), "a1").unwrap();
+    std::fs::write(
+        stale.join("agents").join("a1").join("home"),
+        stale_home.to_str().unwrap(),
+    )
+    .unwrap();
     drop(other);
     let mut again = dial_link(
         &node.endpoint_for(&other_token()),
@@ -1691,6 +1700,7 @@ async fn a_revoked_credentials_storage_is_removed_and_active_ones_are_kept() {
     .unwrap();
     replay_complete(&mut again).await;
     gone(stale.clone()).await;
+    assert!(!stale_home.exists(), "its short home goes with it");
     assert!(root(&other_token()).join("journal").is_dir());
     let api = node.stop().await;
 

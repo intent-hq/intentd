@@ -288,13 +288,9 @@ async fn a_remote_agents_sub_agent_on_another_machine_starts_from_its_work() {
 
     // Retiring the parent retires the child too: its final stop on the
     // other machine removes its checkout there.
-    let checkout = scratch
-        .path()
-        .join("Far")
-        .join("executor")
-        .join(&far.credential_id)
-        .join("agents")
-        .join(&child_id);
+    let far_dir = scratch.path().join("Far");
+    let record = agent_record(&far_dir, &far.credential_id, &child_id);
+    let checkout = agent_home(&far_dir, &far.credential_id, &child_id);
     assert!(checkout.exists(), "{}", checkout.display());
     ok(
         &mut rpc_ws,
@@ -319,7 +315,7 @@ async fn a_remote_agents_sub_agent_on_another_machine_starts_from_its_work() {
     .await;
     assert!(child["agent"]["retiredAt"].is_string(), "{child}");
     let removed = timeout(wait(), async {
-        while checkout.exists() {
+        while checkout.exists() || record.exists() {
             // timing-guard: poll interval for the machine's checkout removal (no event exposes it)
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

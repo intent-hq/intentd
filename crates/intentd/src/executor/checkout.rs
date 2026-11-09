@@ -131,7 +131,7 @@ impl Checkouts for GitCheckouts {
     }
 
     fn existing(&self, agent_id: &AgentId) -> Option<PathBuf> {
-        let worktree = self.storage.agent_worktree(agent_id).ok()?;
+        let worktree = self.storage.existing_worktree(agent_id)?;
         worktree.join(".git").exists().then_some(worktree)
     }
 

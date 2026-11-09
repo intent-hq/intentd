@@ -16,7 +16,7 @@
 
 #![cfg(unix)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +43,32 @@ mod secrets;
 mod sub_agents;
 
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
+
+/// `agent_id`'s record on the machine whose data dir is `node_dir`.
+fn agent_record(node_dir: &Path, credential_id: &str, agent_id: &str) -> PathBuf {
+    node_dir
+        .join("executor")
+        .join(credential_id)
+        .join("agents")
+        .join(agent_id)
+}
+
+/// `agent_id`'s home on that machine: the short work dir its record names,
+/// never under the data dir.
+#[track_caller]
+fn agent_home(node_dir: &Path, credential_id: &str, agent_id: &str) -> PathBuf {
+    let record = agent_record(node_dir, credential_id, agent_id);
+    let home = PathBuf::from(
+        std::fs::read_to_string(record.join("home"))
+            .unwrap_or_else(|e| panic!("{}: {e}", record.display())),
+    );
+    assert!(
+        home.starts_with(node_dir.join("w")) && !home.to_string_lossy().contains(' '),
+        "{}",
+        home.display()
+    );
+    home
+}
 
 fn wait() -> Duration {
     common::test_timeout(Duration::from_secs(60))
@@ -1854,28 +1880,23 @@ async fn placement_chooses_among_exposed_machines() {
 }
 
 /// The `agent.pid` file the fixture provider wrote in `agent_id`'s worktree
-/// under the machine's data dir `root`.
+/// on the machine whose data dir is `root`.
 fn find_agent_pid_file(root: &Path, agent_id: &str) -> Option<std::path::PathBuf> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_dir() && !kind.is_symlink() {
-                stack.push(path);
-            } else if path.file_name().is_some_and(|n| n == "agent.pid")
-                && path.to_string_lossy().contains(agent_id)
-            {
-                return Some(path);
-            }
-        }
-    }
-    None
+    std::fs::read_dir(root.join("executor"))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|credential| {
+            agent_record(root, credential, agent_id)
+                .join("home")
+                .is_file()
+        })
+        .map(|credential| {
+            agent_home(root, &credential, agent_id)
+                .join("work")
+                .join("agent.pid")
+        })
+        .find(|path| path.is_file())
 }
 
 fn pid_alive(pid: i64) -> bool {
@@ -2256,11 +2277,8 @@ async fn deleting_a_remote_agent_pushes_its_work_then_removes_its_checkout() {
     })
     .await
     .expect("the turn-end wip lands on head");
-    let checkout = node_dir
-        .join("executor")
-        .join(&machine.credential_id)
-        .join("agents")
-        .join(&agent_id);
+    let record = agent_record(&node_dir, &machine.credential_id, &agent_id);
+    let checkout = agent_home(&node_dir, &machine.credential_id, &agent_id);
     // Unsaved work after the last turn, written straight into the checkout.
     std::fs::write(checkout.join("work").join("final.txt"), "unsaved work").unwrap();
 
@@ -2293,13 +2311,13 @@ async fn deleting_a_remote_agent_pushes_its_work_then_removes_its_checkout() {
         "turn work"
     );
     timeout(wait(), async {
-        while checkout.exists() {
+        while checkout.exists() || record.exists() {
             // timing-guard: poll interval for the machine's checkout removal (no event exposes it)
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("the machine removes the checkout after the push");
+    .expect("the machine removes the checkout and its record after the push");
 }
 
 /// The machine's own graceful shutdown (a restart or an update) stops its
@@ -2390,12 +2408,7 @@ async fn machine_shutdown_pushes_live_agents_work() {
     .expect("the turn-end push lands on head");
 
     // Work since that push, still only in the machine's checkout.
-    let checkout = node_dir
-        .join("executor")
-        .join(&machine.credential_id)
-        .join("agents")
-        .join(&agent_id)
-        .join("work");
+    let checkout = agent_home(&node_dir, &machine.credential_id, &agent_id).join("work");
     assert!(
         checkout.join("turn.txt").is_file(),
         "{}",
@@ -2555,12 +2568,7 @@ async fn a_remote_agents_submodules_are_prepared_and_their_work_comes_back() {
     let reply = turn(&mut rpc_ws, &mut events, (&ws_id, &agent_id), "hello", 50).await;
     assert!(reply.contains("echo:"), "{reply}");
 
-    let work = node_dir
-        .join("executor")
-        .join(&machine.credential_id)
-        .join("agents")
-        .join(&agent_id)
-        .join("work");
+    let work = agent_home(&node_dir, &machine.credential_id, &agent_id).join("work");
     assert_eq!(heads(&work), backend_heads);
     assert_eq!(status(&work), status(&repo));
     assert_eq!(
@@ -2882,12 +2890,7 @@ async fn a_remote_agents_setup_script_runs_on_the_machine_after_its_submodules()
     assert_eq!(value["setup"]["exitCode"], 0, "{value}");
     assert!(value["setup"].get("unsentSubmodules").is_none(), "{value}");
 
-    let work = node_dir
-        .join("executor")
-        .join(&machine.credential_id)
-        .join("agents")
-        .join(&agent_id)
-        .join("work");
+    let work = agent_home(&node_dir, &machine.credential_id, &agent_id).join("work");
     let env = std::fs::read_to_string(work.join("setup-env.txt")).unwrap();
     let fields: Vec<&str> = env.trim_end().split('|').collect();
     assert_eq!(fields[..3], ["main", "main", "1"], "{env}");
@@ -3120,12 +3123,7 @@ async fn a_remote_agent_is_told_about_a_submodule_its_setup_script_added() {
     .expect("the first turn is recorded");
     assert!(reply.contains("x was populated on this machine"), "{reply}");
     assert!(!reply.contains("a was populated"), "{reply}");
-    let work = node_dir
-        .join("executor")
-        .join(&machine.credential_id)
-        .join("agents")
-        .join(&agent_id)
-        .join("work");
+    let work = agent_home(&node_dir, &machine.credential_id, &agent_id).join("work");
     assert!(work.join("a/README.md").exists(), "the pin a is carried");
     assert!(work.join("x/README.md").exists(), "the script populated x");
 
