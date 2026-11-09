@@ -73,16 +73,23 @@ fn is_false(value: &bool) -> bool {
 /// skills ([`SKILLS_PROTOCOL`]); 13 adds sub-agent checkouts
 /// ([`SHARED_CHECKOUT_PROTOCOL`]); 14 adds agent secrets held on the
 /// machine ([`SECRETS_PROTOCOL`]); 15 adds the backend's forge token
-/// ([`FORGE_TOKEN_PROTOCOL`]); each keeps everything the one before
+/// ([`FORGE_TOKEN_PROTOCOL`]); 16 adds reads of an agent's checkout files
+/// ([`CHECKOUT_FILES_PROTOCOL`]); each keeps everything the one before
 /// has. Neither 6 nor the single-node 5 ever
 /// shipped, and a protocol-6 peer cannot confirm a stop, so this build
-/// speaks 7 to 15: a backend never takes a stop as confirmed by a machine
+/// speaks 7 to 16: a backend never takes a stop as confirmed by a machine
 /// that cannot acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 15 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 16 };
+
+/// The first protocol with reads of an agent's checkout files for
+/// `ws.file.pull`: the [`LinkFrame::CheckoutRead`] /
+/// [`LinkFrame::CheckoutReadReply`] frames. The backend sends neither on a
+/// link that negotiated less, and a pull from an agent there fails at once.
+pub const CHECKOUT_FILES_PROTOCOL: u32 = 16;
 
 /// The first protocol with the backend's forge token on the machine: the
 /// [`LinkFrame::ForgeToken`] / [`LinkFrame::ForgeTokenReply`] frames and
@@ -175,12 +182,13 @@ impl std::fmt::Display for ProtocolRange {
 /// responses to the machine's forwarded `workspace.call` requests, and
 /// starting and stopping script runs (protocol 8), the skills query
 /// (protocol 12), the push request (protocol 13), the agent secret
-/// frames (protocol 14) and the forge token (protocol 15). Nothing else is
+/// frames (protocol 14), the forge token (protocol 15) and checkout reads
+/// (protocol 16). Nothing else is
 /// admitted
 /// from an executor credential; the machine-to-backend frames (`welcome`,
 /// `journal`, `replayComplete`, `request`, `capabilitiesReply`, `stopAck`,
 /// `scriptStarted`, `scriptOutput`, `scriptExited`, `skillsReply`, `secretReply`,
-/// `forgeTokenReply`) and
+/// `forgeTokenReply`, `checkoutReadReply`) and
 /// `cancelRequest` are
 /// refused. Git sessions use the
 /// separate `/node/git` connection, admitted per binding. Sorted;
@@ -189,6 +197,7 @@ pub const EXECUTOR_LINK_REQUESTS: &[&str] = &[
     "ack",
     "cancel",
     "capabilities",
+    "checkoutRead",
     "forgeToken",
     "heartbeat",
     "heartbeatReply",
@@ -751,6 +760,77 @@ pub struct ForgeTokenReply {
     pub error: Option<String>,
 }
 
+/// What a [`CheckoutPiece`] carries: one file's bytes, or a folder packed
+/// as one uncompressed tar archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckoutEntryKind {
+    File,
+    Directory,
+}
+
+/// One ranged piece of an agent-file-pull snapshot (`FilePullPiece`): the
+/// backend's `file.pullData` answer and [`CheckoutReadReply::piece`].
+/// `data` is base64, at most `MAX_LINK_ATTACHMENT_CHUNK_BYTES` bytes from
+/// `offset`; `size` is the whole snapshot's, and `transfer_id` names it. At
+/// offset 0 the piece also carries the whole snapshot's `sha256`
+/// (lowercase hex) and, for a folder, `skipped`: the entries packing left
+/// out. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckoutPiece {
+    pub kind: CheckoutEntryKind,
+    pub size: u64,
+    pub offset: u64,
+    pub data: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    pub transfer_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<u64>,
+}
+
+/// How a [`CheckoutRead`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckoutReadOutcome {
+    Ok,
+    Failed,
+}
+
+/// Backend to machine (nodeProtocol 16): read one piece of `path`, relative
+/// to `agent_id`'s checkout on the machine, from `offset`, at most `length`
+/// bytes (1 to 4 MiB). The first piece (offset 0, no `transfer_id`) makes a
+/// snapshot; every later piece names its `transfer_id` and the same `path`.
+/// The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckoutRead {
+    pub request_id: LinkId,
+    pub agent_id: AgentId,
+    pub path: String,
+    pub offset: u64,
+    pub length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_id: Option<String>,
+}
+
+/// Machine to backend (nodeProtocol 16): the one answer to a
+/// [`CheckoutRead`]: `ok` with the `piece`, or `failed` with an `error`
+/// that starts with a `file-pull-*` code (fixed text, never file content).
+/// The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CheckoutReadReply {
+    pub request_id: LinkId,
+    pub agent_id: AgentId,
+    pub outcome: CheckoutReadOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub piece: Option<CheckoutPiece>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// One user MCP server a remote agent's provider sees: only its name and
 /// head's server id, never its command, environment, URL or headers. The
 /// body is closed.
@@ -1107,6 +1187,10 @@ pub enum LinkFrame {
     ForgeToken(ForgeToken),
     /// Machine to backend (nodeProtocol 15): the answer to a `forgeToken`.
     ForgeTokenReply(ForgeTokenReply),
+    /// Backend to machine (nodeProtocol 16): read a piece of a checkout file.
+    CheckoutRead(CheckoutRead),
+    /// Machine to backend (nodeProtocol 16): the answer to a `checkoutRead`.
+    CheckoutReadReply(CheckoutReadReply),
 }
 
 /// A chunk of an agent's checkout progress and setup output, `seq`
@@ -1170,7 +1254,10 @@ impl LinkFrame {
             | Self::ScriptStarted(_)
             | Self::ScriptOutput(_)
             | Self::ScriptExited(_)
-            | Self::SetupOutput(_) => LinkChannel::Script,
+            | Self::SetupOutput(_)
+            // Up to 4 MB of file bytes: behind every control frame.
+            | Self::CheckoutRead(_)
+            | Self::CheckoutReadReply(_) => LinkChannel::Script,
         }
     }
 
@@ -1185,6 +1272,7 @@ impl LinkFrame {
             | Self::SecretList(_)
             | Self::SecretReply(_) => SECRETS_PROTOCOL,
             Self::ForgeToken(_) | Self::ForgeTokenReply(_) => FORGE_TOKEN_PROTOCOL,
+            Self::CheckoutRead(_) | Self::CheckoutReadReply(_) => CHECKOUT_FILES_PROTOCOL,
             Self::Launch(command) if command.forge.is_some() => FORGE_TOKEN_PROTOCOL,
             Self::Launch(command) if !command.mcp_proxies.is_empty() => MCP_PROXY_PROTOCOL,
             Self::Launch(command) if command.checkout.is_some() => PREPARED_CHECKOUT_PROTOCOL,
@@ -1228,7 +1316,8 @@ impl LinkFrame {
             | Self::SecretPut(_)
             | Self::SecretForget(_)
             | Self::SecretList(_)
-            | Self::ForgeToken(_) => true,
+            | Self::ForgeToken(_)
+            | Self::CheckoutRead(_) => true,
             Self::Welcome(_)
             | Self::Journal(_)
             | Self::ReplayComplete { .. }
@@ -1243,7 +1332,8 @@ impl LinkFrame {
             | Self::SkillsReply(_)
             | Self::PushWipReply(_)
             | Self::SecretReply(_)
-            | Self::ForgeTokenReply(_) => false,
+            | Self::ForgeTokenReply(_)
+            | Self::CheckoutReadReply(_) => false,
         }
     }
 

@@ -12,8 +12,8 @@
 
 use intent_core::node_link::{
     FinalPush, LeaseBinding, LinkChannel, LinkFrame, LinkHello, LinkOutcome, LinkRpcError,
-    MachineCapabilities, PushWipResult, SkillsReply, StopId, StopOutcome, FINAL_STOP_PROTOCOL,
-    FORGE_TOKEN_PROTOCOL, NODE_LINK_PROTOCOLS, SKILLS_PROTOCOL,
+    MachineCapabilities, PushWipResult, SkillsReply, StopId, StopOutcome, CHECKOUT_FILES_PROTOCOL,
+    FINAL_STOP_PROTOCOL, FORGE_TOKEN_PROTOCOL, NODE_LINK_PROTOCOLS, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::AgentId;
@@ -369,6 +369,19 @@ pub(super) async fn serve_link(
                             error,
                         }))
                         .await;
+                });
+            }
+            // Reads a piece of an agent's checkout for another agent's pull
+            // (nodeProtocol 16); the reply rides the script lane.
+            LinkEvent::Frame(LinkFrame::CheckoutRead(read))
+                if protocol >= CHECKOUT_FILES_PROTOCOL =>
+            {
+                let link = link.clone();
+                let runner = runner.clone();
+                // caller-binding: allow — answers one checkout read on its link
+                tokio::spawn(async move {
+                    let reply = runner.checkout_read(read).await;
+                    let _ = link.send(&LinkFrame::CheckoutReadReply(reply)).await;
                 });
             }
             LinkEvent::Frame(LinkFrame::ForgeToken(frame)) => {

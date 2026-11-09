@@ -25,7 +25,7 @@ use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
     GIT_ROOTS_METHOD, INTERNAL_METHODS, MAX_FORWARDED_ATTACHMENTS, MAX_LINK_ATTACHMENT_BYTES,
     MAX_LINK_ATTACHMENT_CHUNK_BYTES, MCP_PROXY_CALL_TOOL_METHOD, MCP_PROXY_LINK_TIMEOUT,
-    MCP_PROXY_LIST_TOOLS_METHOD, PLACEMENT_HELP_METHOD,
+    MCP_PROXY_LIST_TOOLS_METHOD, PLACEMENT_HELP_METHOD, PULL_DATA_METHOD,
 };
 use intent_core::remote_launch::{RemoteAgentRecord, RemotePlacementView};
 use intent_core::{with_caller, AgentSession, Caller, Error, WorkspaceApi};
@@ -206,6 +206,22 @@ impl HeadCalls {
                 Ok(value) => LinkOutcome::Ok(value),
                 Err(Error::InvalidParams(message)) => refusal(INVALID_PARAMS, message),
                 Err(error) => refusal(CALL_FAILED, error.to_string()),
+            };
+        }
+        if method == PULL_DATA_METHOD {
+            return match pull_request(request.params.get("args")) {
+                Ok((from, read)) => match self
+                    .services
+                    .pull_piece(&record.workspace_id, Some(&record.agent_id), &from, read)
+                    .await
+                    .and_then(|piece| {
+                        serde_json::to_value(piece).map_err(|e| Error::Internal(e.to_string()))
+                    }) {
+                    Ok(value) => LinkOutcome::Ok(value),
+                    Err(Error::InvalidParams(message)) => refusal(INVALID_PARAMS, message),
+                    Err(error) => refusal(CALL_FAILED, error.to_string()),
+                },
+                Err(message) => refusal(INVALID_PARAMS, message),
             };
         }
         if method == MCP_PROXY_LIST_TOOLS_METHOD || method == MCP_PROXY_CALL_TOOL_METHOD {
@@ -444,6 +460,63 @@ fn forwarded_attachments(
             })
         })
         .collect()
+}
+
+/// A `file.pullData` frame's `{ fromAgentId, path, offset, length,
+/// transferId? }`: `length` 1 to 4 MiB, and every piece after offset 0
+/// names its `transferId`.
+fn pull_request(
+    args: Option<&Value>,
+) -> std::result::Result<
+    (
+        intent_core::AgentId,
+        intent_services::checkout_transfer::PieceRequest,
+    ),
+    String,
+> {
+    let args = args.ok_or_else(|| format!("{PULL_DATA_METHOD} needs its arguments"))?;
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{PULL_DATA_METHOD} needs a string `{key}`"))
+    };
+    let number = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("{PULL_DATA_METHOD} needs a non-negative integer `{key}`"))
+    };
+    let from = text("fromAgentId")?;
+    if from.trim().is_empty() {
+        return Err(format!("{PULL_DATA_METHOD} needs a string `fromAgentId`"));
+    }
+    let offset = number("offset")?;
+    let length = number("length")?;
+    if !(1..=MAX_LINK_ATTACHMENT_CHUNK_BYTES).contains(&length) {
+        return Err(format!(
+            "{PULL_DATA_METHOD} needs a `length` of 1 to {MAX_LINK_ATTACHMENT_CHUNK_BYTES}"
+        ));
+    }
+    let transfer_id = match args.get("transferId") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) => Some(id.clone()),
+        Some(_) => return Err(format!("{PULL_DATA_METHOD} `transferId` must be a string")),
+    };
+    if (offset > 0) != transfer_id.is_some() {
+        return Err(
+            "file-pull-mismatch: a piece names the first answer's transferId exactly when its offset is past 0"
+                .to_owned(),
+        );
+    }
+    Ok((
+        intent_core::AgentId::from(from),
+        intent_services::checkout_transfer::PieceRequest {
+            path: text("path")?,
+            offset,
+            length,
+            transfer_id,
+        },
+    ))
 }
 
 #[cfg(test)]

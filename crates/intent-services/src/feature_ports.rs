@@ -1353,6 +1353,29 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
         Box::pin(async { None })
     }
 
+    /// One piece of `read.path` in remote agent `agent_id`'s checkout, read
+    /// on its machine (`checkoutRead`, nodeProtocol 16) for `ws.file.pull`.
+    /// A paused cloud machine is resumed for it. Refuses with
+    /// `file-pull-unsupported` by default (no machines here).
+    ///
+    /// # Errors
+    ///
+    /// `InvalidParams` with a `file-pull-*` code: `unsupported` for a
+    /// machine on an older link, or the machine's own refusal; `Internal`
+    /// when the machine cannot be reached.
+    fn checkout_piece<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+        _read: crate::checkout_transfer::PieceRequest,
+    ) -> BoxFuture<'a, Result<intent_core::node_link::CheckoutPiece>> {
+        Box::pin(async {
+            Err(Error::InvalidParams(
+                "file-pull-unsupported: this backend does not run agents on machines".into(),
+            ))
+        })
+    }
+
     /// Check that an agent with `placement` and `needs` (its provider,
     /// model and whether a profile is sent) can start in `workspace_id`
     /// now, before anything is created, and resolve where it would run.

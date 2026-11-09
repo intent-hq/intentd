@@ -9155,6 +9155,29 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// MCP `ws.file.pull` backing op: copy `path` (a file or folder) from
+    /// the checkout of `from_agent_id`, another agent of the same workspace,
+    /// into the caller's checkout at `to` (default: the same relative path),
+    /// and return `{ path, kind, size, sha256, files, skipped }`. Both paths
+    /// are confined to their checkout after links are followed; at most
+    /// `remote_launch::workspace_api::MAX_PULL_BYTES` are copied. Failures
+    /// are `InvalidParams` whose message starts with a `file-pull-*` code.
+    fn file_pull(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+        from_agent_id: AgentId,
+        path: String,
+        to: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, caller_agent_id, from_agent_id, path, to);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_pull not implemented".to_string(),
+            ))
+        })
+    }
+
     // ------------------------------------------------------------------------
     // primitive.* — append a fenced ```ws-block:<type>``` JSON primitive to a
     // note. Each returns `{ ok: true, primitiveId, noteId, content }` where

@@ -34,6 +34,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::common;
 
 mod cloud;
+mod file_pull;
 mod forge_push;
 mod forge_token;
 mod git_identity;

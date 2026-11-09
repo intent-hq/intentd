@@ -24,6 +24,7 @@ pub(crate) const PRELUDE: &str = r"
             host({ method: 'file.rename', args: { oldPath, newPath } }),
         getAttachment: (attachmentId, destDir) =>
             host({ method: 'file.getAttachment', args: { attachmentId, destDir } }),
+        pull: (opts) => host({ method: 'file.pull', args: opts || {} }),
     };
 ";
 
@@ -92,6 +93,25 @@ pub(crate) async fn dispatch(
             api.file_get_attachment(ws.clone(), attachment_id, caller, dest_dir)
                 .await
                 .map_err(map_err)
+        }
+        "pull" => {
+            // Copy a file or folder from another agent's checkout into the
+            // caller's; the service resolves both agents and confines both
+            // paths.
+            let from = req_str(args, "fromAgentId")
+                .map_err(|_| "fromAgentId and path are required".to_string())?;
+            let path = req_str(args, "path")
+                .map_err(|_| "fromAgentId and path are required".to_string())?;
+            let to = opt_str(args, "to");
+            api.file_pull(
+                ws.clone(),
+                caller,
+                intent_core::AgentId::from(from),
+                path,
+                to,
+            )
+            .await
+            .map_err(map_err)
         }
         other => Err(format!("host: unknown method `file.{other}`")),
     }

@@ -85,25 +85,28 @@ fn the_binding_wire_shape_uses_decimal_string_generations() {
 }
 
 #[test]
-fn the_daemon_to_daemon_link_speaks_protocols_7_to_15() {
+fn the_daemon_to_daemon_link_speaks_protocols_7_to_16() {
     // 7 adds the correlated stop acknowledgement. A protocol-6 peer cannot
     // send `stopAck`, so it never links: a backend must not take a stop as
     // confirmed by a machine that cannot confirm it. 8 adds the script
     // frames, 9 final stops, 10 the prepared checkout, 11 the user MCP
     // server proxies, 12 the machine's skills, 13 sub-agent checkouts, 14
-    // agent secrets on the machine, 15 the backend's forge token; a
-    // protocol-7 peer still binds and runs agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 15 });
+    // agent secrets on the machine, 15 the backend's forge token, 16 reads
+    // of an agent's checkout files; a protocol-7 peer still binds and runs
+    // agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 16 });
     assert_eq!(SCRIPT_PROTOCOL, 8);
     assert_eq!(FINAL_STOP_PROTOCOL, 9);
     assert_eq!(PREPARED_CHECKOUT_PROTOCOL, 10);
     assert_eq!(MCP_PROXY_PROTOCOL, 11);
+    assert_eq!(CHECKOUT_FILES_PROTOCOL, 16);
     assert_eq!(SKILLS_PROTOCOL, 12);
     assert_eq!(SHARED_CHECKOUT_PROTOCOL, 13);
     assert_eq!(SECRETS_PROTOCOL, 14);
-    assert_eq!(FORGE_TOKEN_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    assert_eq!(FORGE_TOKEN_PROTOCOL, 15);
+    assert_eq!(CHECKOUT_FILES_PROTOCOL, NODE_LINK_PROTOCOLS.max);
     assert!(offers_prepared_checkout());
-    for version in 7..=15 {
+    for version in 7..=16 {
         ensure_protocol(version).unwrap();
     }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
@@ -340,6 +343,7 @@ fn executor_link_requests_golden() {
             "ack",
             "cancel",
             "capabilities",
+            "checkoutRead",
             "forgeToken",
             "heartbeat",
             "heartbeatReply",
@@ -393,6 +397,7 @@ fn every_frame_is_classified_for_executors_consistently_with_the_list() {
         [
             "cancelRequest",
             "capabilitiesReply",
+            "checkoutReadReply",
             "forgeTokenReply",
             "journal",
             "pushWipReply",
@@ -626,6 +631,36 @@ fn every_frame() -> Vec<LinkFrame> {
             outcome: SecretOutcome::Failed,
             error: Some(FORGE_TOKEN_INVALID.into()),
         }),
+        LinkFrame::CheckoutRead(CheckoutRead {
+            request_id,
+            agent_id: AgentId::from("a1"),
+            path: "out/report.txt".into(),
+            offset: 0,
+            length: 4 * 1024 * 1024,
+            transfer_id: None,
+        }),
+        LinkFrame::CheckoutReadReply(CheckoutReadReply {
+            request_id,
+            agent_id: AgentId::from("a1"),
+            outcome: CheckoutReadOutcome::Ok,
+            piece: Some(CheckoutPiece {
+                kind: CheckoutEntryKind::Directory,
+                size: 3,
+                offset: 0,
+                data: "YWJj".into(),
+                sha256: Some("ba7816bf".into()),
+                transfer_id: "t1".into(),
+                skipped: Some(2),
+            }),
+            error: None,
+        }),
+        LinkFrame::CheckoutReadReply(CheckoutReadReply {
+            request_id,
+            agent_id: AgentId::from("a1"),
+            outcome: CheckoutReadOutcome::Failed,
+            piece: None,
+            error: Some("file-pull-not-found: out/missing".into()),
+        }),
     ]
 }
 
@@ -662,7 +697,8 @@ fn frames_are_routed_to_their_lane() {
             Control, Control, Control, Control, Control, Control, Control, Control, Control,
             Control, Journal, Journal, Journal, Journal, Journal, Rpc, Rpc, Rpc, Rpc, Control,
             Control, Script, Script, Script, Script, Script, Control, Control, Journal, Control,
-            Control, Control, Control, Control, Control, Control, Control, Control
+            Control, Control, Control, Control, Control, Control, Control, Control, Script, Script,
+            Script
         ]
     );
 }
@@ -1146,7 +1182,13 @@ fn script_frames_need_protocol_8_skills_frames_12_and_push_frames_13() {
             frame,
             LinkFrame::ForgeToken(_) | LinkFrame::ForgeTokenReply(_)
         );
-        let expected = if forge {
+        let checkout = matches!(
+            frame,
+            LinkFrame::CheckoutRead(_) | LinkFrame::CheckoutReadReply(_)
+        );
+        let expected = if checkout {
+            CHECKOUT_FILES_PROTOCOL
+        } else if forge {
             FORGE_TOKEN_PROTOCOL
         } else if secret {
             SECRETS_PROTOCOL

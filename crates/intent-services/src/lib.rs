@@ -83,6 +83,8 @@ mod auto_commit;
 pub mod browser_ops;
 mod bundled_cli;
 mod capability;
+#[doc(hidden)]
+pub mod checkout_transfer;
 #[cfg(all(test, unix))]
 mod claude_adapter_contract;
 mod clone_ops;
@@ -112,7 +114,6 @@ mod event_subscriptions;
 pub mod events;
 mod execution_call;
 mod executor_link;
-#[doc(hidden)]
 pub mod feature_api;
 mod feature_ports;
 mod file_ops;
@@ -956,6 +957,11 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
+    /// Serves pieces of local agents' checkout files to `ws.file.pull`,
+    /// packing folders under `<data_dir>/pulls`; made on first use.
+    pulls: Arc<std::sync::OnceLock<Arc<checkout_transfer::PieceSource>>>,
+    /// Which caller opened each `ws.file.pull` transfer.
+    pull_transfers: Arc<checkout_transfer::PullTransfers>,
     /// Test park seam (monorepo#1180) for the `script.*` supervisor
     /// pre-registration race window. `None` in production wiring; tests
     /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
@@ -1825,6 +1831,8 @@ impl Services {
                 max_bytes_per_run: intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
             },
             script_too_fast_ms: runtime_config::TOO_FAST_MS,
+            pulls: Arc::new(std::sync::OnceLock::new()),
+            pull_transfers: Arc::default(),
             script_parks: runtime_config::ScriptParks::default(),
             completion_classify_park: None,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -21809,6 +21817,17 @@ impl WorkspaceApi for Services {
             .await;
             file_ops::get_attachment(&canonical_root, &dest_root, &record, dest_dir.as_deref())
         })
+    }
+
+    fn file_pull(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+        from_agent_id: AgentId,
+        path: String,
+        to: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.file_pull_here(workspace_id, caller_agent_id, from_agent_id, path, to))
     }
 
     fn primitive_add_reference(

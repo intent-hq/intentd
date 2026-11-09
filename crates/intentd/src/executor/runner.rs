@@ -27,11 +27,13 @@ use intent_acp::{
     SinkEvent, SpawnOptions,
 };
 use intent_core::node_link::{
-    ExitFailure, FinalPush, ForgeLaunch, GitIdentity, JournalBody, JournalRecord, LaunchCommand,
-    LeaseBinding, MachineCapacity, StopOutcome, SKILLS_PROTOCOL,
+    CheckoutRead, CheckoutReadOutcome, CheckoutReadReply, ExitFailure, FinalPush, ForgeLaunch,
+    GitIdentity, JournalBody, JournalRecord, LaunchCommand, LeaseBinding, MachineCapacity,
+    StopOutcome, SKILLS_PROTOCOL,
 };
 use intent_core::nodes::NodeCounter;
 use intent_core::placement::CapacityRefusal;
+use intent_core::remote_launch::workspace_api::MAX_LINK_ATTACHMENT_CHUNK_BYTES;
 use intent_core::{AgentId, BoxFuture, WorkspaceId};
 use intent_nodes::journal::{Journal, JournalEntry};
 use intent_providers::ProviderConfig;
@@ -152,6 +154,8 @@ pub(super) struct RunnerConfig {
     /// Told the provider when a launch without a profile fails to
     /// authenticate.
     pub auth_failed: AuthFailed,
+    /// Where folders other agents pull are packed (nodeProtocol 16).
+    pub pull_staging: PathBuf,
 }
 
 /// Told a provider id when that provider's default account (a launch
@@ -200,6 +204,9 @@ struct Inner {
     /// hello (nodeProtocol 14): a secret is held only for an agent on the
     /// lease, and a new session drops every secret.
     head_session: Mutex<HeadSession>,
+    /// Serves pieces of the agents' checkout files to other agents'
+    /// `ws.file.pull` (nodeProtocol 16).
+    pulls: Arc<intent_services::checkout_transfer::PieceSource>,
 }
 
 /// See [`Inner::head_session`].
@@ -893,6 +900,9 @@ impl Runner {
                 push_locks: Mutex::new(HashMap::new()),
                 closing_signal: watch::channel(false).0,
                 head_session: Mutex::new(HeadSession::default()),
+                pulls: Arc::new(intent_services::checkout_transfer::PieceSource::new(
+                    config.pull_staging,
+                )),
             }),
         }
     }
@@ -918,6 +928,7 @@ impl Runner {
         head.lease_agents.remove(agent_id);
         drop(head);
         self.inner.head.secrets().forget(agent_id, None);
+        self.inner.pulls.forget(agent_id.as_str());
     }
 
     /// Apply a `forgeToken` frame (nodeProtocol 15): hold its token, or drop
@@ -2343,6 +2354,64 @@ impl Runner {
                 tracing::warn!(agent = %owner, %error, "node: requested WIP push failed");
                 (FinalPush::Failed, Some(error))
             }
+        }
+    }
+
+    /// Answer a `checkoutRead` (nodeProtocol 16): one piece of a snapshot
+    /// of a file or folder in `read.agent_id`'s checkout, confined to it.
+    /// Only an agent on the binding's lease whose checkout exists serves.
+    pub(super) async fn checkout_read(&self, read: CheckoutRead) -> CheckoutReadReply {
+        let worktree = {
+            let head = lock(&self.inner.head_session);
+            let state = lock(&self.inner.state);
+            let on_lease = !head.ended.contains(&read.agent_id)
+                && (head.lease_agents.contains(&read.agent_id)
+                    || state.workspaces.contains_key(&read.agent_id));
+            let owner = state.checkout_owner(&read.agent_id);
+            drop((head, state));
+            on_lease
+                .then(|| self.inner.checkouts.existing(&owner))
+                .flatten()
+        };
+        let answer = match worktree {
+            None => Err(format!(
+                "file-pull-source-unavailable: agent {} has no checkout on this machine",
+                read.agent_id
+            )),
+            Some(_) if !(1..=MAX_LINK_ATTACHMENT_CHUNK_BYTES).contains(&read.length) => {
+                Err("file-pull-mismatch: length must be 1 to 4194304".to_owned())
+            }
+            Some(worktree) => {
+                let pulls = self.inner.pulls.clone();
+                let source = read.agent_id.to_string();
+                let request = intent_services::checkout_transfer::PieceRequest {
+                    path: read.path.clone(),
+                    offset: read.offset,
+                    length: read.length,
+                    transfer_id: read.transfer_id.clone(),
+                };
+                tokio::task::spawn_blocking(move || pulls.read(&source, &worktree, &request))
+                    .await
+                    .map_err(|error| format!("file-pull-source-unavailable: {error}"))
+                    .and_then(|read| {
+                        read.map_err(|error| match error {
+                            intent_core::Error::InvalidParams(message) => message,
+                            // Fixed text: an I/O error may name a path.
+                            _ => "file-pull-source-unavailable: the machine could not read the checkout".to_owned(),
+                        })
+                    })
+            }
+        };
+        let (outcome, piece, error) = match answer {
+            Ok(piece) => (CheckoutReadOutcome::Ok, Some(piece), None),
+            Err(error) => (CheckoutReadOutcome::Failed, None, Some(error)),
+        };
+        CheckoutReadReply {
+            request_id: read.request_id,
+            agent_id: read.agent_id,
+            outcome,
+            piece,
+            error,
         }
     }
 
