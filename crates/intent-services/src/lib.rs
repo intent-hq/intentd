@@ -11088,11 +11088,30 @@ enum ContentWritePolicy {
     /// writer's text before any merge, then each attempt applies the
     /// reduction guard (measured against the writer's base when known, else
     /// the stored current) and validates the merged text before persisting.
-    SetContent { confirm_replacement: bool },
+    /// `trim_edges` trims the merged text (agent and tool writes, not editor
+    /// saves).
+    SetContent {
+        confirm_replacement: bool,
+        trim_edges: bool,
+    },
     /// `note.add` / `note.edit` / `note.editLines`: the surgical transform
     /// already ran against the content the caller read; the merged text
-    /// persists verbatim.
+    /// persists with its edge whitespace trimmed.
     Surgical,
+    /// `task.update` / `task.updateStatus`: like `Surgical`, but the edge
+    /// whitespace is kept. Callers address checkboxes by line number from an
+    /// earlier read, so a trim would shift their next write onto another line.
+    LineStable,
+}
+
+impl ContentWritePolicy {
+    fn trims_edges(self) -> bool {
+        match self {
+            Self::SetContent { trim_edges, .. } => trim_edges,
+            Self::Surgical => true,
+            Self::LineStable => false,
+        }
+    }
 }
 
 /// One persisted content write from [`persist_merged_content`].
@@ -11180,7 +11199,7 @@ async fn persist_merged_content(
             normalized = note_ops::normalize_set_content(incoming);
             normalized.as_str()
         }
-        ContentWritePolicy::Surgical => incoming,
+        ContentWritePolicy::Surgical | ContentWritePolicy::LineStable => incoming,
     };
     let mut attempt = 0;
     loop {
@@ -11213,8 +11232,14 @@ async fn persist_merged_content(
         if let Some(expected) = base_content_bytes {
             check_content_base(expected, &merge, &old_content)?;
         }
+        let text = if policy.trims_edges() {
+            note_ops::trim_note_edges(merge.text)
+        } else {
+            merge.text
+        };
         if let ContentWritePolicy::SetContent {
             confirm_replacement,
+            ..
         } = policy
         {
             check_set_content_reduction(
@@ -11222,9 +11247,8 @@ async fn persist_merged_content(
                 incoming,
                 confirm_replacement,
             )?;
-            note_ops::validate_set_content(&merge.text)?;
+            note_ops::validate_set_content(&text)?;
         }
-        let text = merge.text;
         tracing::debug!(
             note = %note_id.0,
             op,
@@ -18857,6 +18881,105 @@ impl Services {
         })
     }
 }
+impl Services {
+    /// `note.setContent` body. `trim_edges` is set for agent and tool writes
+    /// (`set_note_content`) and clear for client saves (`set_note_content_guarded`),
+    /// so the editor keeps blank paragraphs typed at the note's edges.
+    #[expect(clippy::too_many_arguments)]
+    fn write_set_content(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        content: String,
+        confirm_replacement: bool,
+        expected_version: Option<i64>,
+        base_content_bytes: Option<u64>,
+        caller_agent_id: Option<AgentId>,
+        trim_edges: bool,
+    ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        let services = self.clone();
+        Box::pin(async move {
+            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
+            self.require_member(&workspace_id).await?;
+            // Guard before the merge so a rejected write touches neither the
+            // store nor the merge state.
+            note_ops::reject_numbered_read_presentation(&content)?;
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
+            let MergedContentWrite {
+                note,
+                old_content,
+                content: clean,
+                now,
+                rev,
+            } = persist_merged_content(
+                &store,
+                &write_lane,
+                ContentWrite {
+                    seed: None,
+                    incoming: &content,
+                    expected_version,
+                    policy: ContentWritePolicy::SetContent {
+                        confirm_replacement,
+                        trim_edges,
+                    },
+                    author: &author,
+                    op: "note.setContent",
+                    base_content_bytes,
+                },
+            )
+            .await?;
+            drop(write_lane);
+            let previous_title = note.title.clone();
+            services
+                .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
+            let outcome = services
+                .auto_convert_task_blocks_after_write(
+                    &note.workspace_id,
+                    &note.id,
+                    &clean,
+                    caller_agent_id.as_ref(),
+                )
+                .await;
+            let (final_content, final_updated_at, final_rev) = match outcome.refetched_note {
+                Some(n) => (n.content, n.updated_at, n.rev),
+                None => (clean, now, rev),
+            };
+            publish_event(
+                bus.as_ref(),
+                note_change_event(
+                    &note.workspace_id,
+                    &note.id,
+                    &note.title,
+                    NOTE_UPDATED,
+                    "update",
+                ),
+            )
+            .await;
+            // A spec-body write can move taskStats (link-gated rollup);
+            // non-spec notes skip the probe (§6.5).
+            services
+                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
+                .await;
+            Ok(NoteSetContentResult {
+                ok: true,
+                title: note.title,
+                note_id: note.id,
+                previous_title: Some(previous_title),
+                updated_at: final_updated_at,
+                old_content: Some(old_content),
+                new_content: final_content,
+                converted_count: outcome.converted_count,
+                created_task_note_ids: outcome.created_note_ids,
+                created_tasks: outcome.created_tasks,
+                warnings: outcome.warnings,
+                rev: final_rev,
+            })
+        })
+    }
+}
 
 impl WorkspaceApi for Services {
     fn node_mode(&self) -> bool {
@@ -26144,7 +26267,7 @@ impl WorkspaceApi for Services {
                         id: NoteId::new(),
                         workspace_id,
                         title: input.title,
-                        content: input.content.unwrap_or_default(),
+                        content: note_ops::trim_note_edges(input.content.unwrap_or_default()),
                         content_type: ContentType::Markdown,
                         tags: input.tags.unwrap_or_default(),
                         is_pinned: false,
@@ -26641,7 +26764,7 @@ impl WorkspaceApi for Services {
         expected_version: Option<i64>,
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
-        self.set_note_content_guarded(
+        self.write_set_content(
             workspace_id,
             note_id,
             content,
@@ -26649,6 +26772,7 @@ impl WorkspaceApi for Services {
             expected_version,
             None,
             caller_agent_id,
+            true,
         )
     }
 
@@ -26662,86 +26786,16 @@ impl WorkspaceApi for Services {
         base_content_bytes: Option<u64>,
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
-        let services = self.clone();
-        Box::pin(async move {
-            let _mutation = self.workspace_mutations.enter(&workspace_id)?;
-            self.require_member(&workspace_id).await?;
-            // Guard before the merge so a rejected write touches neither the
-            // store nor the merge state.
-            note_ops::reject_numbered_read_presentation(&content)?;
-            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
-            let MergedContentWrite {
-                note,
-                old_content,
-                content: clean,
-                now,
-                rev,
-            } = persist_merged_content(
-                &store,
-                &write_lane,
-                ContentWrite {
-                    seed: None,
-                    incoming: &content,
-                    expected_version,
-                    policy: ContentWritePolicy::SetContent {
-                        confirm_replacement,
-                    },
-                    author: &author,
-                    op: "note.setContent",
-                    base_content_bytes,
-                },
-            )
-            .await?;
-            drop(write_lane);
-            let previous_title = note.title.clone();
-            services
-                .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            let outcome = services
-                .auto_convert_task_blocks_after_write(
-                    &note.workspace_id,
-                    &note.id,
-                    &clean,
-                    caller_agent_id.as_ref(),
-                )
-                .await;
-            let (final_content, final_updated_at, final_rev) = match outcome.refetched_note {
-                Some(n) => (n.content, n.updated_at, n.rev),
-                None => (clean, now, rev),
-            };
-            publish_event(
-                bus.as_ref(),
-                note_change_event(
-                    &note.workspace_id,
-                    &note.id,
-                    &note.title,
-                    NOTE_UPDATED,
-                    "update",
-                ),
-            )
-            .await;
-            // A spec-body write can move taskStats (link-gated rollup);
-            // non-spec notes skip the probe (§6.5).
-            services
-                .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
-                .await;
-            Ok(NoteSetContentResult {
-                ok: true,
-                title: note.title,
-                note_id: note.id,
-                previous_title: Some(previous_title),
-                updated_at: final_updated_at,
-                old_content: Some(old_content),
-                new_content: final_content,
-                converted_count: outcome.converted_count,
-                created_task_note_ids: outcome.created_note_ids,
-                created_tasks: outcome.created_tasks,
-                warnings: outcome.warnings,
-                rev: final_rev,
-            })
-        })
+        self.write_set_content(
+            workspace_id,
+            note_id,
+            content,
+            confirm_replacement,
+            expected_version,
+            base_content_bytes,
+            caller_agent_id,
+            false,
+        )
     }
 
     fn update_note_metadata(
@@ -27270,7 +27324,7 @@ impl WorkspaceApi for Services {
                     seed: Some(note),
                     incoming: &updated,
                     expected_version: Some(read_rev),
-                    policy: ContentWritePolicy::Surgical,
+                    policy: ContentWritePolicy::LineStable,
                     author: &author,
                     op: "task.updateStatus",
                     base_content_bytes: None,
@@ -27464,7 +27518,7 @@ impl WorkspaceApi for Services {
                             seed: Some(note),
                             incoming: &update.content,
                             expected_version: Some(read_rev),
-                            policy: ContentWritePolicy::Surgical,
+                            policy: ContentWritePolicy::LineStable,
                             author: &author,
                             op: "task.update",
                             base_content_bytes: None,

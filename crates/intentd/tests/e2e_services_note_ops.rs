@@ -219,6 +219,245 @@ async fn note_update_metadata() {
     drop(services); // Drop store handles before DB cleanup
 }
 
+/// Agent and tool writes persist the note without leading blank lines or
+/// trailing whitespace, including the `\n\n` separator `note.add` puts before content
+/// added to an empty note. Editor saves (`note.update`, the guarded
+/// `note.setContent`) keep it.
+#[intent_test_macros::daemon_test]
+async fn content_writes_trim_edge_whitespace() {
+    let (services, ws, _tmp) = setup().await;
+    let stored = |id: NoteId| {
+        let services = services.clone();
+        let ws = ws.clone();
+        async move { services.get_note(ws, id).await.expect("get note").content }
+    };
+
+    let created = services
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Trim".to_string(),
+                content: Some("\n \t\n# Title\n\n  indented body\n\n \n".to_string()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create note")
+        .note;
+    let id = created.id.clone();
+    assert_eq!(created.content, "# Title\n\n  indented body");
+    assert_eq!(stored(id.clone()).await, "# Title\n\n  indented body");
+
+    let set = services
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "\n\nReplaced body\n\n\n".to_string(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect("set content");
+    assert_eq!(set.new_content, "Replaced body");
+    assert_eq!(stored(id.clone()).await, "Replaced body");
+
+    // The first line keeps its indentation: an indented code block stays one.
+    let code = services
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "\n  \n    code block\n".to_string(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect("set indented content");
+    assert_eq!(code.new_content, "    code block");
+
+    // Editor saves keep the blank paragraphs typed at the note's edges.
+    let guarded = services
+        .set_note_content_guarded(
+            ws.clone(),
+            id.clone(),
+            "Editor body\n\n".to_string(),
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("editor set content");
+    assert_eq!(guarded.new_content, "Editor body\n\n");
+    let updated = services
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                content: Some("\nEditor save\n\n".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update note");
+    assert_eq!(updated.content, "\nEditor save\n\n");
+
+    let reset = services
+        .set_note_content(ws.clone(), id.clone(), updated.content, true, None, None)
+        .await
+        .expect("tool set content");
+    assert_eq!(reset.new_content, "Editor save");
+
+    let added = services
+        .add_to_note(
+            ws.clone(),
+            id.clone(),
+            NoteAddInput {
+                content: "Tail\n\n".to_string(),
+                heading: None,
+                position: Some("end".to_string()),
+            },
+            None,
+        )
+        .await
+        .expect("add to note");
+    assert_eq!(added.new_content, "Editor save\n\nTail");
+
+    let edited = services
+        .edit_note(
+            ws.clone(),
+            id.clone(),
+            NoteEditInput {
+                old: "Editor save".to_string(),
+                new: "\n\nLead".to_string(),
+            },
+            None,
+        )
+        .await
+        .expect("edit note");
+    assert_eq!(edited.new_content, "Lead\n\nTail");
+
+    let lines = services
+        .edit_note_lines(
+            ws.clone(),
+            id.clone(),
+            NoteEditLinesInput {
+                start: 3,
+                end: 3,
+                content: "Last\n\n\n".to_string(),
+            },
+            None,
+        )
+        .await
+        .expect("edit lines");
+    assert_eq!(lines.new_content, "Lead\n\nLast");
+    assert_eq!(stored(id.clone()).await, "Lead\n\nLast");
+
+    let empty = services
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Empty".to_string(),
+                content: None,
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create empty note")
+        .note;
+    let added_to_empty = services
+        .add_to_note(
+            ws.clone(),
+            empty.id.clone(),
+            NoteAddInput {
+                content: "First line".to_string(),
+                heading: None,
+                position: None,
+            },
+            None,
+        )
+        .await
+        .expect("add to empty note");
+    assert_eq!(added_to_empty.new_content, "First line");
+    assert_eq!(stored(empty.id.clone()).await, "First line");
+
+    drop(services);
+}
+
+/// Checkbox writes keep the note's edge whitespace: callers address lines by
+/// number from an earlier read, so a trim would shift the next write onto
+/// the wrong checkbox.
+#[intent_test_macros::daemon_test]
+async fn checkbox_writes_keep_line_numbers() {
+    let (services, ws, _tmp) = setup().await;
+    let id = services
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Checklist".to_string(),
+                content: Some("- [ ] seed".to_string()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create note")
+        .note
+        .id;
+    let editor_text = "\n\n- [ ] one\n- [ ] two\n- [ ] three\n";
+    services
+        .set_note_content_guarded(
+            ws.clone(),
+            id.clone(),
+            editor_text.to_string(),
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("editor save");
+
+    for line in [3, 4] {
+        let r = services
+            .task_update(
+                ws.clone(),
+                id.clone(),
+                line,
+                None,
+                Some("done".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("task update");
+        assert_eq!(r.line_number, line);
+    }
+    services
+        .task_update_status(
+            ws.clone(),
+            id.clone(),
+            "three".to_string(),
+            "in-progress".to_string(),
+            None,
+        )
+        .await
+        .expect("task update status");
+
+    let note = services.get_note(ws, id).await.expect("get note");
+    assert_eq!(note.content, "\n\n- [x] one\n- [x] two\n- [/] three\n");
+    drop(services);
+}
+
 /// Parallel writers per concurrency test. The issue (intent-hq/intent#7184)
 /// saw 2–3 of 8 parallel `ws.note.edit` calls fail; more writers than the
 /// 5-attempt retry bound makes the pre-fix failure deterministic.

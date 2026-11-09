@@ -424,7 +424,7 @@ async fn note_edit_matches_visible_text_around_comment_anchor() {
 
     let id = &added.comment_id;
     let expected = format!(
-        "Alpha line here.\n<!--anchor:{id}:start-->Beta<!--anchor:{id}:end--> line edited.\n"
+        "Alpha line here.\n<!--anchor:{id}:start-->Beta<!--anchor:{id}:end--> line edited."
     );
     assert_eq!(result.new_content, expected);
     let stored = services

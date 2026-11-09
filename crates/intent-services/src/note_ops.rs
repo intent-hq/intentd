@@ -373,6 +373,22 @@ pub(crate) fn normalize_set_content(content: &str) -> String {
     clean
 }
 
+/// Note content without leading blank lines or trailing whitespace, for agent
+/// and tool writes. The first line keeps its indentation (an indented code
+/// block stays one). Editor saves skip this: the editor stores blank
+/// paragraphs typed at the note's edges as newlines.
+pub(crate) fn trim_note_edges(content: String) -> String {
+    let body = content.trim_end();
+    let lead = body.len() - body.trim_start().len();
+    let first_line = body[..lead].rfind('\n').map_or(0, |nl| nl + 1);
+    let trimmed = &body[first_line..];
+    if trimmed.len() == content.len() {
+        content
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Validating half of the `note.setContent` cleaner: truncation and empty
 /// guards. Runs on the text that is about to persist, which after a merge is
 /// not necessarily the writer's own.
