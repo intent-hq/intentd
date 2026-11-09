@@ -406,22 +406,39 @@ impl ScriptMonitorExt for Services {
         agent: Option<&AgentId>,
         reason: &str,
     ) -> Result<()> {
-        let owners = self
+        let mut owners = self
             .script_manager()
             .cleanup_monitors(ws, agent, reason)
             .await?;
+        // A machine-run wake has no notification row, so `cleanup_monitors`
+        // does not see its owner: drop its persisted copy here too.
+        let mut machine_owners = Vec::new();
         {
             let mut queues = self.feature_agent_queues().lock().expect("queue registry");
             for (id, queue) in queues.iter_mut() {
                 if agent.is_some_and(|a| a != id) {
                     continue;
                 }
+                let mut machine = false;
                 queue.retain(|entry| {
                     entry.message_metadata.as_ref().is_none_or(|md| {
-                        md["type"] != "script_monitor_wake"
-                            || md["workspaceId"].as_str() != Some(ws.as_str())
+                        let keep = md["type"] != "script_monitor_wake"
+                            || md["workspaceId"].as_str() != Some(ws.as_str());
+                        machine |= !keep && md.get("remoteAgentId").is_some();
+                        keep
                     })
                 });
+                if machine {
+                    machine_owners.push(id.clone());
+                }
+            }
+        }
+        for id in machine_owners {
+            self.store()
+                .suppress_script_notifications(ws, Some(&id))
+                .await?;
+            if !owners.contains(&id) {
+                owners.push(id);
             }
         }
         for agent in owners {

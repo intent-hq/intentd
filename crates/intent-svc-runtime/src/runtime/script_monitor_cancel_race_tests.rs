@@ -333,3 +333,61 @@ async fn script_monitor_cancel_redelivers_a_watched_childs_completion_once() {
         delivery.abort();
     }
 }
+
+/// A remote agent's machine-run wake has no stored notification, so the
+/// owner's cleanup is the only thing that removes it: it must leave neither
+/// the live queue nor the persisted one, or a restart would rehydrate a wake
+/// for a cancelled watch.
+#[tokio::test]
+async fn owner_cleanup_drops_a_persisted_machine_run_wake() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let svc = crate::test_runtime::with_runtime(Services::new_repository_fixture(
+        store,
+        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets")),
+        None,
+    ))
+    .with_settings_registry(test_registry_with_default_provider(&tmp));
+    let owner = Harness::agent(&svc, &ws, "Remote").await;
+    let other = Harness::agent(&svc, &ws, "Other").await;
+    let wake = |agent: &AgentId| {
+        json!({
+            "type": "script_monitor_wake",
+            "source": "system",
+            "monitorId": format!("machine-{agent}"),
+            "workspaceId": ws.as_str(),
+            "agentId": agent.as_str(),
+            "remoteAgentId": agent.as_str(),
+            "nodeId": "mac",
+        })
+    };
+    for agent in [&owner, &other] {
+        svc.enqueue_message_with_id_for_test(
+            agent,
+            Some(format!("wake-{agent}")),
+            "Script \"build\" (machine run on Mac) exited with code 0".into(),
+            None,
+            None,
+            Some(wake(agent)),
+            false,
+            intent_core::MessageOrigin::Automatic,
+        );
+        svc.persist_queue_snapshot_for_test(agent).await;
+    }
+
+    svc.cancel_script_monitors(&ws, Some(&owner), "owner-retired")
+        .await
+        .expect("cleanup");
+
+    assert!(svc.queue_snapshot_for_test(&owner).is_empty());
+    assert_eq!(svc.queue_snapshot_for_test(&other).len(), 1);
+    let restarted = crate::test_runtime::with_runtime(Services::new_isolated(svc.store().clone()));
+    restarted.rehydrate_agent_queues().await.expect("rehydrate");
+    assert!(
+        restarted.queue_snapshot_for_test(&owner).is_empty(),
+        "the persisted machine-run wake was rehydrated"
+    );
+    assert_eq!(restarted.queue_snapshot_for_test(&other).len(), 1);
+}

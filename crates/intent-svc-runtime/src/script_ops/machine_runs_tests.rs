@@ -1571,3 +1571,30 @@ async fn match_and_stop_wakes_carry_their_card_reason() {
     assert_eq!(md["result"]["outcome"], "cancelled", "{md}");
     assert_eq!(md["nodeId"], "mac");
 }
+
+/// An expiry wake is a `ttl-expired` card: no result, the run goes on.
+#[tokio::test(start_paused = true)]
+async fn an_expiry_wake_carries_the_ttl_expired_card() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let (_, id) = watched(
+        &runs,
+        &rec,
+        &place(&agent),
+        ScriptMode::Service,
+        serde_json::json!({ "ttlMs": 1000 }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let wakes = card_wakes(&rec);
+    assert_eq!(wakes.len(), 1, "{wakes:?}");
+    let (_, md) = &wakes[0];
+    assert_eq!(md["type"], "script_monitor_wake");
+    assert_eq!(md["monitorId"], id.as_str());
+    assert_eq!(md["reason"], "ttl-expired", "{md}");
+    assert!(md.get("result").is_none(), "{md}");
+    assert!(md["runId"].is_string(), "{md}");
+    assert_eq!(md["remoteAgentId"], agent.as_str());
+    assert_eq!(md["nodeId"], "mac");
+}
