@@ -30605,10 +30605,11 @@ mod rules {
         sub.recv().await.expect("subscription open")
     }
 
-    /// Task 6: sandboxed general agent sessions get an isolation context block
-    /// with sandbox path, branch, and conflict-resolution instructions.
+    /// Per-agent `CoW` sandboxes are retired: a legacy session that still
+    /// carries `sandbox_path` gets a retirement notice naming the kept
+    /// sandbox path and branch, and none of the old sandbox instructions.
     #[tokio::test]
-    async fn assembly_injects_sandbox_context_for_sandboxed_general_agent() {
+    async fn assembly_names_retained_sandbox_for_legacy_sandboxed_session() {
         let tree = worktree();
         let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
 
@@ -30693,33 +30694,34 @@ mod rules {
         .expect("assembled prompt");
 
         assert!(
-            prompt.contains("## Workspace Isolation"),
-            "isolation header"
+            prompt.contains("## Retired Agent Sandbox"),
+            "retirement notice header: {prompt}"
         );
         assert!(
-            prompt.contains("isolated CoW (copy-on-write) sandbox"),
-            "CoW mention"
+            prompt.contains("`/test/sandboxes/agent-1/test-repo`"),
+            "notice names the retained sandbox path"
         );
+        assert!(prompt.contains("`sb/agent-1`"), "notice names the branch");
         assert!(
-            prompt.contains("/test/sandboxes/agent-1/test-repo"),
-            "sandbox path"
+            prompt.contains("workspace checkout"),
+            "notice says where the agent works now"
         );
-        assert!(prompt.contains("sb/agent-1"), "sandbox branch");
-        assert!(prompt.contains("Do NOT switch branches"), "branch warning");
-        assert!(
-            prompt.contains("woken with the conflicting paths"),
-            "conflict bounce"
-        );
-        assert!(
-            prompt.contains("resolve the conflicts **in your sandbox only**"),
-            "sandbox-only fix"
-        );
+        for gone in [
+            "## Workspace Isolation",
+            "isolated CoW",
+            "Do NOT switch branches",
+            "woken with the conflicting paths",
+            "merges your branch back",
+        ] {
+            assert!(!prompt.contains(gone), "retired sandbox text {gone:?} remains");
+        }
     }
 
-    /// Task 6: coordinator (spec-writer specialist) in CoW-enabled direct-mode
-    /// workspace gets parallel delegation safety guidance.
+    /// A coordinator in a CoW-capable direct-mode workspace no longer gets
+    /// the per-agent sandbox delegation hint: sandboxes are retired, and the
+    /// hint fired even with `workspace.cowIsolation` off.
     #[tokio::test]
-    async fn assembly_injects_parallel_delegation_hint_for_coordinator() {
+    async fn assembly_omits_cow_delegation_hint_for_coordinator() {
         let tree = worktree();
         let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
 
@@ -30809,20 +30811,14 @@ mod rules {
         .await
         .expect("assembled prompt");
 
-        assert!(
-            prompt.contains("## Agent Delegation & Isolation"),
-            "delegation header"
-        );
-        assert!(prompt.contains("isolated CoW sandboxes"), "sandbox mention");
-        assert!(
-            prompt.contains("parallel delegation is safe"),
-            "parallel safety"
-        );
-        assert!(prompt.contains("Merge-back is automatic"), "auto merge");
-        assert!(
-            prompt.contains("only handle `blocked` outcomes"),
-            "coordinator scope"
-        );
+        for gone in [
+            "## Agent Delegation & Isolation",
+            "isolated CoW sandboxes",
+            "isolation: \"cow\"",
+            "Merge-back is automatic",
+        ] {
+            assert!(!prompt.contains(gone), "retired coordinator hint {gone:?} remains");
+        }
     }
 
     /// Task 6: worktree-mode workspaces get no isolation hints (behavior unchanged).
@@ -31130,117 +31126,6 @@ mod rules {
         assert!(
             !prompt.contains("isolated CoW"),
             "no CoW mention for shared mode"
-        );
-    }
-
-    /// Task 6 (verifier requirement): explicit isolation:"cow" override in a setting-OFF
-    /// workspace must still inject sandbox hint when session has `sandbox_path`. This
-    /// mutation test proves `build_isolation_hint` respects actual `session.sandbox_path`
-    /// (effective isolation), not just `workspace.cow_supported` + setting.
-    #[tokio::test]
-    async fn assembly_injects_sandbox_hint_when_explicit_cow_override() {
-        let tree = worktree();
-        let (_tmp, store, _svc, _ws) = setup(&tree.0).await;
-
-        let injection = crate::rules::SpecialistPromptInjection {
-            behavior_prompt: Some("Implement your task.".into()),
-            specialist_name: Some("Implementor".into()),
-            role_reminder: Some("Stay in scope.".into()),
-        };
-
-        // Workspace with cow_supported=true but hypothetically setting OFF
-        // (doesn't matter — the agent session has sandbox_path, so it's sandboxed)
-        let workspace = intent_core::Workspace {
-            id: intent_core::WorkspaceId::from("ws-1"),
-            title: "Test".into(),
-            branch: "main".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            path: Some("/test/path".into()),
-            repository_path: Some("/test/repo".into()),
-            repository_name: Some("test-repo".into()),
-            skip_worktree: true,
-            cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
-            ..Default::default()
-        };
-
-        // Agent session WITH sandbox fields (explicit isolation:"cow" override)
-        let agent_session = intent_core::AgentSession {
-            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
-            harness_features: None,
-            id: intent_core::AgentId::from("agent-1"),
-            workspace_id: intent_core::WorkspaceId::from("ws-1"),
-            parent_agent_id: None,
-            backend_session_id: None,
-            acp_session_id: None,
-            name: "Test Agent".into(),
-            name_explicitly_set: false,
-            model: None,
-            reasoning_effort: None,
-            effort_levels: None,
-            provider: None,
-            system_prompt: None,
-            specialist: Some("implementor".into()),
-            status: intent_core::AgentStatus::Active,
-            is_active: false,
-            messages: vec![],
-            stats: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            attention_request_kind: None,
-            attention_request_reason: None,
-            attention_request_timestamp: None,
-            delegation_depth: None,
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            file_blocks: None,
-            sandbox_id: Some("sandbox-explicit".into()),
-            sandbox_path: Some("/test/sandboxes/agent-1/test-repo".into()), // Sandboxed!
-            sandbox_branch: Some("sb/agent-1".into()),
-            stop_reason: None,
-            stop_reason_timestamp: None,
-            session_corrupted: false,
-            pending_delete_at: None,
-            retired_at: None,
-            notifications_muted: false,
-            pinned: false,
-            is_background: false,
-            metadata: None,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-        };
-
-        let prompt = crate::rules::assemble_system_prompt(
-            &store,
-            Some(&tree.0),
-            "task-loop",
-            Some(&injection),
-            true,
-            false,
-            false,
-            &intent_core::settings_file::AgentFeaturesSettings::default(),
-            Some(&workspace),
-            Some(&agent_session),
-            None,
-        )
-        .await
-        .expect("assembled prompt");
-
-        // Sandbox hint IS present when session has sandbox_path, regardless of setting
-        assert!(
-            prompt.contains("## Workspace Isolation"),
-            "sandbox hint when explicit cow override"
-        );
-        assert!(
-            prompt.contains("isolated CoW"),
-            "CoW mention for sandboxed session"
-        );
-        assert!(
-            prompt.contains("/test/sandboxes/agent-1/test-repo"),
-            "sandbox path included"
         );
     }
 }

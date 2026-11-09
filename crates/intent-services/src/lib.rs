@@ -90,7 +90,7 @@ pub mod codex_diagnostics;
 mod codex_session_title;
 mod complete_ops;
 #[cfg(test)]
-mod completion_interception_tests;
+mod retained_sandboxes_tests;
 #[cfg(test)]
 mod conditional_write_precedence_tests;
 mod config_watcher;

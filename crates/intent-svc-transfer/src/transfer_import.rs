@@ -3943,16 +3943,17 @@ mod tests {
     }
 
     /// Full `begin → chunk → commit` over an archive that carries a real git
-    /// payload: a dirty workspace repo (staged + untracked) and one sandbox,
-    /// plus a sandbox row whose branch never made it into the bundle. The
+    /// payload: a dirty workspace repo (staged + untracked). It is an archive
+    /// from a daemon before per-agent `CoW` sandboxes were retired: it carries
+    /// sandbox rows and a `refs.sandboxes` entry, which the import ignores. The
     /// workspace ROW records a stale branch name (`feature-stale`) that
     /// diverges from the branch HEAD actually pointed at when the bundle was
     /// built (`feature`) — the bundle wins. Commit must materialize the
-    /// checkout and sandbox on disk, rewrite the stored workspace row
+    /// checkout on disk, rewrite the stored workspace row
     /// (`repository_path` → checkout, `worktree_path` cleared, `checkout_mode`
     /// direct, branch → the bundled branch, `base_commit_sha` backfilled),
-    /// rewrite the stored sandbox path, and drop the bundle-less sandbox
-    /// row — WITHOUT registering the workspace-owned checkout in `known_repo`
+    /// drop every sandbox row without making a sandbox folder — WITHOUT
+    /// registering the workspace-owned checkout in `known_repo`
     /// (intent-hq/monorepo#2227).
     #[tokio::test]
     async fn import_commit_materializes_git() {
@@ -3983,25 +3984,11 @@ mod tests {
         }
         std::fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
 
-        // Source sandbox: clone on `sb/<agent>` with one commit.
+        // The legacy sandbox the old archive names. Its folder and branch
+        // never reach the bundle: only the row and the refs entry do.
         let agent = "agent-sb";
         let sb_branch = format!("sb/{agent}");
         let sb_src = src.0.join("sandbox");
-        let out = std::process::Command::new("git")
-            .arg("clone")
-            .arg("--quiet")
-            .arg(&repo)
-            .arg(&sb_src)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        {
-            let r = git2::Repository::open(&sb_src).unwrap();
-            let head = r.head().unwrap().peel_to_commit().unwrap();
-            r.branch(&sb_branch, &head, false).unwrap();
-            r.set_head(&format!("refs/heads/{sb_branch}")).unwrap();
-        }
-        commit_file(&sb_src, "sb.txt", "sandbox work\n", "feat: sandbox commit");
 
         // Source-side rows (DB-shaped, source-absolute paths). The row's
         // `branch` is stale — HEAD is on `feature`, so the bundle records
@@ -4029,7 +4016,9 @@ mod tests {
         });
         let sessions = serde_json::json!([
             { "id": agent, "workspace_id": ws.0, "name": "SB",
-              "status": "idle", "created_at": t, "updated_at": t },
+              "status": "idle", "created_at": t, "updated_at": t,
+              "sandbox_id": "sb-1", "sandbox_path": sb_src.to_string_lossy(),
+              "sandbox_branch": sb_branch },
             { "id": "agent-ghost", "workspace_id": ws.0, "name": "G",
               "status": "idle", "created_at": t, "updated_at": t }
         ]);
@@ -4047,29 +4036,22 @@ mod tests {
             w.repository_name = Some("test-repo".to_string());
             w
         };
-        let src_sb = Sandbox {
-            id: "sb-1".to_string(),
-            workspace_id: ws.clone(),
-            agent_id: AgentId(agent.to_string()),
-            path: sb_src.to_string_lossy().into_owned(),
-            branch: sb_branch.clone(),
-            base_commit_sha: base.clone(),
-            snapshot_commit_sha: None,
-            status: SandboxStatus::Created,
-            retry_count: 0,
-            created_at: t.to_string(),
-            updated_at: t.to_string(),
-        };
         let staging = src.0.join("staging");
         let crate::transfer_git::TransferBundle {
-            bundle_path, refs, ..
-        } = crate::transfer_git::create_transfer_bundle(
-            &src_ws,
-            std::slice::from_ref(&src_sb),
-            &staging,
-        )
-        .expect("bundle");
+            bundle_path,
+            mut refs,
+            ..
+        } = crate::transfer_git::create_transfer_bundle(&src_ws, &staging).expect("bundle");
         assert!(refs.workspace_wip_commit_sha.is_some(), "source was dirty");
+        assert!(refs.sandboxes.is_empty(), "export carries no sandbox refs");
+        // What an older daemon wrote for a live sandbox.
+        refs.sandboxes.push(serde_json::json!({
+            "agentId": agent,
+            "branch": sb_branch,
+            "bundleRef": format!("refs/intent/transfer/{}/sandbox/{agent}", ws.0),
+            "headSha": base,
+            "baseCommitSha": base,
+        }));
 
         let m = manifest(&ws);
         let rows: Vec<(&str, Vec<serde_json::Value>)> = vec![
@@ -4128,21 +4110,21 @@ mod tests {
             "staged\n"
         );
 
-        // Sandbox rows: the bundled one rewritten on disk + in the store,
-        // the ghost dropped.
+        // Old sandbox refs and rows are ignored: no sandbox row, no folder.
         let sandboxes = svc.store().list_sandboxes(&ws).await.expect("sandboxes");
-        assert_eq!(sandboxes.len(), 1);
-        let expected_sb = ws_root
-            .0
-            .join(&ws.0)
-            .join("sandboxes")
-            .join(agent)
-            .join("test-repo");
-        assert_eq!(sandboxes[0].path, expected_sb.to_string_lossy());
-        assert_eq!(
-            std::fs::read_to_string(expected_sb.join("sb.txt")).unwrap(),
-            "sandbox work\n"
+        assert!(sandboxes.is_empty(), "no sandbox row imported: {sandboxes:?}");
+        assert!(
+            !ws_root.0.join(&ws.0).join("sandboxes").exists(),
+            "no sandbox folder materialised"
         );
+        for id in [agent, "agent-ghost"] {
+            let session = svc
+                .store()
+                .get_agent_session_without_messages(&AgentId(id.to_string()))
+                .await
+                .expect("agent imported");
+            assert_eq!(session.sandbox_path, None, "no sandbox link on {id}");
+        }
 
         // The workspace-owned checkout stays out of known_repo.
         assert_eq!(

@@ -13,17 +13,11 @@
 //!   preference, not a guarantee.
 //! - `skipIsolation: true` wins over `workspace.cowIsolation` ON: direct
 //!   mode, no checkout provisioned at all (no probe, no fallback).
-//! - `agent.delegate` in a `CoW` workspace provisions a per-agent `CoW` sandbox
-//!   (`effectiveIsolation: "pending"` in the delegate result; the
-//!   `sandbox:cow:created` event and session sandbox fields report the settled
-//!   outcome), and completion merges the sandbox back into the workspace
-//!   checkout (`sandbox:cow:merged` event, filesystem changes land, sandbox dir
-//!   discarded).
-//! - SLOW sandbox provisioning (test seam) never blocks `agent.delegate` —
-//!   the RPC returns promptly with `effectiveIsolation: "pending"` and the
-//!   gated child still spawns in the settled sandbox (monorepo#871).
-//! - A provisioning FAILURE (test seam) falls back to shared mode: the child
-//!   spawns in the workspace checkout and no sandbox is materialised.
+//! - Per-agent `CoW` sandboxes are retired: an explicit `isolation: "cow"`
+//!   is rejected with `-32602` / `isolation-removed` before side effects,
+//!   `sandbox.cow.merge` / `sandbox.cow.discard` answer `-32601`, and the
+//!   `workspace.cowIsolation` preference no longer puts a delegated child in
+//!   a sandbox: it works in the workspace checkout.
 //! - `workspace.delete` of a `CoW` workspace removes the clone from disk and
 //!   leaves the source repository untouched.
 //! - `workspace.duplicate` of a `CoW` workspace provisions a fresh standalone
@@ -32,8 +26,9 @@
 //! Gated on `git` on PATH plus a CoW-capable filesystem via
 //! `intent_git::cow_probe` (APFS/Btrfs/XFS-reflink); skips cleanly
 //! elsewhere. The worktree-fallback scenario is inverse-gated (runs only
-//! where `CoW` is NOT supported, e.g. ext4 CI runners). The delegation
-//! scenario is additionally gated on `node` + the mock ACP agent fixture.
+//! where `CoW` is NOT supported, e.g. ext4 CI runners). The sandbox
+//! retirement scenarios run on every filesystem; the delegation one is
+//! additionally gated on `node` + the mock ACP agent fixture.
 
 #![cfg(unix)]
 
@@ -208,34 +203,6 @@ where
                 if v["id"] == json!(id) {
                     assert!(v.get("error").is_none(), "rpc {method} errored: {v}");
                     return v["result"].clone();
-                }
-            }
-            Some(Ok(Message::Ping(p))) => {
-                let _ = ws.send(Message::Pong(p)).await;
-            }
-            Some(Ok(_)) => {}
-            other => panic!("expected text frame, got {other:?}"),
-        }
-    }
-}
-
-/// Read one `events.event` notification from a subscriber connection (bounded).
-async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    loop {
-        let next = timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(secs)),
-            ws.next(),
-        )
-        .await
-        .expect("wss event timed out");
-        match next {
-            Some(Ok(Message::Text(text))) => {
-                let v: Value = serde_json::from_str(&text).expect("json frame");
-                if v["method"] == "events.event" {
-                    return v;
                 }
             }
             Some(Ok(Message::Ping(p))) => {
@@ -663,184 +630,229 @@ async fn workspace_create_routes_linked_worktree_source_to_worktree_mode() {
     drop(daemon);
 }
 
-/// Scenario C — `agent.delegate` in a `CoW` workspace: the delegated agent gets
-/// its own per-agent `CoW` sandbox (`effectiveIsolation: "pending"` in the
-/// delegate result; the `sandbox:cow:created` event with the §5.5 payload
-/// reports the settled outcome), and when the
-/// child completes its turn the daemon auto-merges the sandbox back into the
-/// workspace checkout (`sandbox:cow:merged` event, the file written inside the
-/// sandbox lands in the checkout as a commit, and the sandbox directory is
-/// discarded).
-#[tokio::test]
-async fn delegate_in_cow_workspace_provisions_and_merges_sandbox_over_wss() {
-    const TEST: &str = "agent.delegate CoW sandbox WSS e2e";
-    if !git_gate(TEST) || !cow_gate(TEST) {
-        return;
+/// Send one JSON-RPC frame and return its `error` member; panics on a result.
+async fn wss_rpc_err<S>(ws: &mut WebSocketStream<S>, id: i64, method: &str, params: Value) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    ws.send(Message::Text(frame.to_string().into()))
+        .await
+        .expect("send rpc frame");
+    loop {
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(20)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text).expect("json frame");
+                if v["id"] == json!(id) {
+                    assert!(v.get("result").is_none(), "rpc {method} must fail: {v}");
+                    return v["error"].clone();
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = ws.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {}
+            other => panic!("expected text frame, got {other:?}"),
+        }
     }
-    let Some(script) = mock_gate(TEST) else {
-        return;
-    };
-    let root_dir = scratch_dir("sbroot");
-    let root = root_dir.path().to_path_buf();
-    // The delegated child's turn is delayed so the test can write a file into
-    // the sandbox while the turn is still in flight (before agent:idle
-    // triggers the auto-merge).
-    let behavior = json!({ "delayMs": 8000, "response": "sandbox work done" }).to_string();
-    let extra: [(&str, &str); 2] = [
-        ("MOCK_AGENT_SCRIPT_PATH", &script),
-        ("MOCK_AGENT_BEHAVIOR", &behavior),
-    ];
-    let (daemon, port, cfg) = boot(&root, &extra).await;
-    let (repo, head_sha) = make_source_repo(daemon.scratch.path());
+}
 
-    let mut rpc = connect_ws(port, cfg.clone()).await;
-    set_cow_isolation(&mut rpc, 1, true).await;
-
+/// A direct-mode workspace (`skipIsolation: true`) over the user's own
+/// repository: the shape that was eligible for a per-agent `CoW` sandbox on
+/// every filesystem, so the retirement scenarios run on ext4 CI too.
+async fn create_direct_workspace<S>(ws: &mut WebSocketStream<S>, id: i64, repo: &Path) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let created = wss_rpc(
-        &mut rpc,
-        2,
+        ws,
+        id,
         "workspace.create",
         json!({
-            "title": "Sandbox E2E",
+            "title": "Retired Sandbox E2E",
             "repositoryPath": repo.to_string_lossy(),
             "repositoryName": "source-repo",
             "baseRef": "main",
+            "skipIsolation": true,
             "idempotencyKey": Uuid::new_v4().to_string(),
         }),
     )
     .await;
-    let workspace = &created["workspace"];
-    let ws_id = workspace["id"].as_str().expect("workspace id").to_string();
-    assert_eq!(workspace["checkoutMode"], json!("cow"));
-    let checkout = PathBuf::from(workspace["worktreePath"].as_str().expect("worktreePath"));
+    created["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string()
+}
 
-    // SUBSCRIBER conn — sandbox:* + agent:* BEFORE delegating.
-    let mut sub = connect_ws(port, cfg.clone()).await;
-    let sub_resp = wss_rpc(
-        &mut sub,
-        1,
-        "events.subscribe",
-        json!({ "eventTypes": ["sandbox:*", "agent:*"], "workspaceId": ws_id }),
-    )
-    .await;
-    assert!(
-        sub_resp["subscriptionId"].is_string(),
-        "subscribed: {sub_resp}"
-    );
+/// Scenario C — per-agent `CoW` sandboxes are retired (`methods/nodes.md`
+/// "Landing sequence" step 2): an explicit `isolation: "cow"` is rejected
+/// with `-32602` / `data.code: "isolation-removed"` BEFORE any side effect,
+/// on both the single and the batch form — no session row, no sandbox folder.
+#[tokio::test]
+async fn delegate_with_cow_isolation_is_rejected_before_side_effects() {
+    const TEST: &str = "agent.delegate isolation-removed WSS e2e";
+    if !git_gate(TEST) {
+        return;
+    }
+    let root_dir = scratch_dir("sbgone");
+    let root = root_dir.path().to_path_buf();
+    let (daemon, port, cfg) = boot(&root, &[]).await;
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
 
-    // Delegate: workspace.cowIsolation on ⇒ isolation defaults to "cow" and
-    // the CoW-checkout workspace is sandbox-eligible.
-    let delegated = wss_rpc(
+    let mut rpc = connect_ws(port, cfg).await;
+    set_cow_isolation(&mut rpc, 1, true).await;
+    let ws_id = create_direct_workspace(&mut rpc, 2, &repo).await;
+
+    let single = wss_rpc_err(
         &mut rpc,
         3,
         "agent.delegate",
         json!({
             "workspaceId": ws_id,
-            "agentInstructions": "do sandboxed work",
+            "agentInstructions": "work in a sandbox",
+            "isolation": "cow",
             "model": "default", "provider": "mock",
         }),
     )
     .await;
-    assert_eq!(delegated["ok"], json!(true), "delegate ok: {delegated}");
-    let agent_id = delegated["agentId"].as_str().expect("agentId").to_string();
-    // Provisioning runs off the delegate critical path (monorepo#871): the
-    // delegate result reports "pending" immediately; the settled outcome is
-    // observed via the `sandbox:cow:created` event asserted below.
+    assert_eq!(single["code"], json!(-32602), "invalid params: {single}");
     assert_eq!(
-        delegated["effectiveIsolation"],
-        json!("pending"),
-        "CoW sandbox provisioning kicked off in the background: {delegated}"
+        single["data"]["code"],
+        json!("isolation-removed"),
+        "machine-readable retirement code: {single}"
     );
 
-    // sandbox:cow:created — §5.5 payload: workspaceId, agentId, sandboxPath,
-    // branch (sb/<agentId>), baseCommitSha, snapshotCommitSha.
-    let mut sandbox_path = None;
-    for _ in 0..120 {
-        let frame = wss_event(&mut sub, 30).await;
-        let ev = &frame["params"]["event"];
-        if ev["type"] == "sandbox:cow:created" {
-            assert_eq!(ev["data"]["workspaceId"], json!(ws_id));
-            assert_eq!(ev["data"]["agentId"], json!(agent_id));
-            assert_eq!(
-                ev["data"]["branch"],
-                json!(format!("sb/{agent_id}")),
-                "sandbox snapshot branch: {ev}"
-            );
-            assert_eq!(ev["data"]["baseCommitSha"], json!(head_sha));
-            sandbox_path = Some(PathBuf::from(
-                ev["data"]["sandboxPath"].as_str().expect("sandboxPath"),
-            ));
-            break;
-        }
-    }
-    let sandbox_path = sandbox_path.expect("sandbox:cow:created event delivered");
+    let batch = wss_rpc_err(
+        &mut rpc,
+        4,
+        "agent.delegate",
+        json!({
+            "workspaceId": ws_id,
+            "tasks": ["no-such-task"],
+            "isolation": "cow",
+        }),
+    )
+    .await;
+    assert_eq!(batch["code"], json!(-32602), "invalid params: {batch}");
     assert_eq!(
-        sandbox_path,
-        root.join(&ws_id)
-            .join("sandboxes")
-            .join(&agent_id)
-            .join("source-repo"),
-        "sandbox lives at <root>/<wsId>/sandboxes/<agentId>/<repo-slug>"
-    );
-    assert!(
-        sandbox_path.join("README.md").exists(),
-        "sandbox clone populated"
-    );
-    assert!(
-        sandbox_path.join(".git").is_dir(),
-        "sandbox is a standalone CoW clone"
+        batch["data"]["code"],
+        json!("isolation-removed"),
+        "the batch form is rejected before task validation: {batch}"
     );
 
-    // Write a change INTO the sandbox while the child's (delayed) turn is
-    // still in flight — the auto-merge on completion must carry it back.
-    std::fs::write(sandbox_path.join("sandbox-work.txt"), "from the sandbox\n")
-        .expect("write into sandbox");
-
-    // sandbox:cow:merged — auto-merge on agent:idle; payload carries the
-    // post-merge canonical HEAD.
-    let mut canonical_head = None;
-    for _ in 0..120 {
-        let frame = wss_event(&mut sub, 60).await;
-        let ev = &frame["params"]["event"];
-        if ev["type"] == "sandbox:cow:merged" {
-            assert_eq!(ev["data"]["workspaceId"], json!(ws_id));
-            assert_eq!(ev["data"]["agentId"], json!(agent_id));
-            canonical_head = Some(
-                ev["data"]["canonicalHead"]
-                    .as_str()
-                    .expect("canonicalHead")
-                    .to_string(),
-            );
-            break;
-        }
-    }
-    let canonical_head = canonical_head.expect("sandbox:cow:merged event delivered");
-
-    // The sandbox change landed in the workspace checkout as a commit.
-    assert!(
-        checkout.join("sandbox-work.txt").exists(),
-        "sandbox file merged into the workspace checkout"
-    );
+    let list = wss_rpc(&mut rpc, 5, "agent.list", json!({ "workspaceId": ws_id })).await;
     assert_eq!(
-        run_git(&["rev-parse", "HEAD"], &checkout),
-        canonical_head,
-        "checkout HEAD is the post-merge canonicalHead"
+        list["agents"].as_array().map(Vec::len),
+        Some(0),
+        "no session row persisted by the rejected calls: {list}"
     );
-    assert_ne!(
-        canonical_head, head_sha,
-        "merge advanced the canonical HEAD past the base"
+    assert!(
+        !root.join(&ws_id).join("sandboxes").exists(),
+        "no sandbox folder materialised"
     );
 
-    // Clean merge discards the sandbox directory.
-    for _ in 0..50 {
-        if !sandbox_path.exists() {
-            break;
+    drop(daemon);
+}
+
+/// Scenario C2 — the removed `sandbox.cow.merge` / `sandbox.cow.discard`
+/// routes answer the normal `-32601` method-not-found, with no alias.
+#[tokio::test]
+async fn sandbox_cow_routes_are_removed_over_wss() {
+    const TEST: &str = "sandbox.cow.* removed WSS e2e";
+    if !git_gate(TEST) {
+        return;
+    }
+    let root_dir = scratch_dir("sbroutes");
+    let (daemon, port, cfg) = boot(root_dir.path(), &[]).await;
+    let mut rpc = connect_ws(port, cfg).await;
+    for (id, method) in [(1, "sandbox.cow.merge"), (2, "sandbox.cow.discard")] {
+        let error = wss_rpc_err(
+            &mut rpc,
+            id,
+            method,
+            json!({ "workspaceId": "ws-x", "agentId": "agent-x" }),
+        )
+        .await;
+        assert_eq!(error["code"], json!(-32601), "{method} is removed: {error}");
+    }
+    drop(daemon);
+}
+
+/// Scenario C3 — the persisted `workspace.cowIsolation` preference no longer
+/// selects a per-agent sandbox: a delegate with no `isolation` (and one with
+/// the accepted no-op `"shared"`) runs the child in the workspace checkout,
+/// the result carries no `effectiveIsolation`, and no sandbox folder or
+/// session sandbox field appears.
+#[tokio::test]
+async fn delegate_with_cow_isolation_setting_works_in_workspace_checkout() {
+    const TEST: &str = "agent.delegate cowIsolation ignored WSS e2e";
+    if !git_gate(TEST) {
+        return;
+    }
+    let Some(script) = mock_gate(TEST) else {
+        return;
+    };
+    let root_dir = scratch_dir("sbshared");
+    let root = root_dir.path().to_path_buf();
+    let behavior = json!({ "response": "done", "echoCwd": true }).to_string();
+    let extra: [(&str, &str); 2] = [
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let (daemon, port, cfg) = boot(&root, &extra).await;
+    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
+
+    let mut rpc = connect_ws(port, cfg).await;
+    set_cow_isolation(&mut rpc, 1, true).await;
+    let ws_id = create_direct_workspace(&mut rpc, 2, &repo).await;
+    let expected = std::fs::canonicalize(&repo).expect("repo exists");
+
+    for (id, isolation) in [(3, None), (4, Some("shared"))] {
+        let mut params = json!({
+            "workspaceId": ws_id,
+            "agentInstructions": "do shared work",
+            "model": "default", "provider": "mock",
+        });
+        if let Some(isolation) = isolation {
+            params["isolation"] = json!(isolation);
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let delegated = wss_rpc(&mut rpc, id, "agent.delegate", params).await;
+        assert_eq!(delegated["ok"], json!(true), "delegate ok: {delegated}");
+        assert!(
+            delegated.get("effectiveIsolation").is_none(),
+            "no sandbox provisioning is reported: {delegated}"
+        );
+        let agent_id = delegated["agentId"].as_str().expect("agentId").to_string();
+
+        let echoed = poll_echoed_cwd(&mut rpc, id * 1000, &agent_id).await;
+        let actual = std::fs::canonicalize(&echoed).unwrap_or_else(|_| PathBuf::from(&echoed));
+        assert_eq!(
+            actual, expected,
+            "the child works in the workspace checkout, got {echoed}"
+        );
+
+        let session = wss_rpc(
+            &mut rpc,
+            id * 1000 + 500,
+            "agent.getSession",
+            json!({ "agentId": agent_id }),
+        )
+        .await;
+        let text = session.to_string();
+        assert!(
+            !text.contains("sandboxPath") && !text.contains("sandboxId"),
+            "no sandbox fields on the session: {session}"
+        );
     }
     assert!(
-        !sandbox_path.exists(),
-        "sandbox directory discarded after a clean merge"
+        !root.join(&ws_id).join("sandboxes").exists(),
+        "no sandbox folder materialised"
     );
 
     drop(daemon);
@@ -872,224 +884,6 @@ where
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     panic!("timed out waiting for the mock child's echoed cwd");
-}
-
-/// Scenario C2 — regression for monorepo#871: SLOW sandbox provisioning must
-/// not block or time out `agent.delegate`. The
-/// `INTENTD_TEST_SANDBOX_PROVISION_GATE` seam holds `provision_sandbox` until
-/// the test creates the gate file (standing in for a `CoW` clone of a large
-/// checkout); the delegate must return while provisioning is still held, with
-/// `effectiveIsolation: "pending"`, the `sandbox:cow:created` event arrives
-/// only after the gate opens, and the child's first ACP spawn waits for
-/// settlement — its actual cwd (mock `echoCwd`) is the sandbox, never the
-/// shared checkout or a half-copied directory. No clock is read: a timed
-/// bound on the delegate failed on loaded CI runners (intentd#2917), and a
-/// delegate that waited for provisioning now hangs into the RPC hang guard.
-#[tokio::test]
-async fn delegate_returns_promptly_while_sandbox_provisioning_is_slow() {
-    const TEST: &str = "agent.delegate slow-provisioning WSS e2e";
-    if !git_gate(TEST) || !cow_gate(TEST) {
-        return;
-    }
-    let Some(script) = mock_gate(TEST) else {
-        return;
-    };
-    let root_dir = scratch_dir("sbslow");
-    let root = root_dir.path().to_path_buf();
-    let gate_dir = scratch_dir("sbgate");
-    let gate = gate_dir.path().join("provisioning-may-finish");
-    let gate_env = gate.to_string_lossy().into_owned();
-    let behavior = json!({ "response": "done", "echoCwd": true }).to_string();
-    let extra: [(&str, &str); 3] = [
-        ("MOCK_AGENT_SCRIPT_PATH", &script),
-        ("MOCK_AGENT_BEHAVIOR", &behavior),
-        ("INTENTD_TEST_SANDBOX_PROVISION_GATE", &gate_env),
-    ];
-    let (daemon, port, cfg) = boot(&root, &extra).await;
-    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
-
-    let mut rpc = connect_ws(port, cfg.clone()).await;
-    set_cow_isolation(&mut rpc, 1, true).await;
-
-    let created = wss_rpc(
-        &mut rpc,
-        2,
-        "workspace.create",
-        json!({
-            "title": "Slow Sandbox E2E",
-            "repositoryPath": repo.to_string_lossy(),
-            "repositoryName": "source-repo",
-            "baseRef": "main",
-            "idempotencyKey": Uuid::new_v4().to_string(),
-        }),
-    )
-    .await;
-    let workspace = &created["workspace"];
-    let ws_id = workspace["id"].as_str().expect("workspace id").to_string();
-    assert_eq!(workspace["checkoutMode"], json!("cow"));
-
-    // SUBSCRIBER conn — sandbox:* BEFORE delegating.
-    let mut sub = connect_ws(port, cfg.clone()).await;
-    let sub_resp = wss_rpc(
-        &mut sub,
-        1,
-        "events.subscribe",
-        json!({ "eventTypes": ["sandbox:*"], "workspaceId": ws_id }),
-    )
-    .await;
-    assert!(
-        sub_resp["subscriptionId"].is_string(),
-        "subscribed: {sub_resp}"
-    );
-
-    // The delegate must return while provisioning is still held at the gate:
-    // the gate file is created only after this reply, so a delegate that
-    // waited for provisioning never answers and `wss_rpc`'s hang guard fails.
-    let delegated = wss_rpc(
-        &mut rpc,
-        3,
-        "agent.delegate",
-        json!({
-            "workspaceId": ws_id,
-            "agentInstructions": "do slow-sandboxed work",
-            "model": "default", "provider": "mock",
-        }),
-    )
-    .await;
-    assert_eq!(delegated["ok"], json!(true), "delegate ok: {delegated}");
-    let agent_id = delegated["agentId"].as_str().expect("agentId").to_string();
-    assert_eq!(
-        delegated["effectiveIsolation"],
-        json!("pending"),
-        "provisioning kicked off in the background: {delegated}"
-    );
-
-    // sandbox:cow:created lands only after the gate opens.
-    std::fs::write(&gate, b"").expect("open the provisioning gate");
-    let expected_sandbox = root
-        .join(&ws_id)
-        .join("sandboxes")
-        .join(&agent_id)
-        .join("source-repo");
-    loop {
-        let frame = wss_event(&mut sub, 30).await;
-        let ev = &frame["params"]["event"];
-        if ev["type"] == "sandbox:cow:created" {
-            assert_eq!(ev["data"]["agentId"], json!(agent_id));
-            assert_eq!(
-                ev["data"]["sandboxPath"],
-                json!(expected_sandbox.to_string_lossy()),
-                "sandbox path: {ev}"
-            );
-            break;
-        }
-    }
-
-    // The child's first spawn was gated on settlement: its actual working
-    // directory is the fully-provisioned sandbox (mock `echoCwd` stamp). The
-    // sandbox dir may already be merged + discarded by the time the stamp is
-    // read (the mock turn completes fast), so compare against the
-    // symlink-resolved root (`/tmp` → `/private/tmp` on macOS) rather than
-    // canonicalizing the sandbox path itself.
-    let echoed = poll_echoed_cwd(&mut rpc, 100, &agent_id).await;
-    let expected = std::fs::canonicalize(&root)
-        .expect("scratch root exists")
-        .join(&ws_id)
-        .join("sandboxes")
-        .join(&agent_id)
-        .join("source-repo");
-    let actual = std::fs::canonicalize(&echoed).unwrap_or_else(|_| PathBuf::from(&echoed));
-    assert_eq!(
-        actual, expected,
-        "child must spawn in the settled sandbox, got {echoed}"
-    );
-
-    drop(daemon);
-}
-
-/// Scenario C3 — provisioning FAILURE falls back to shared mode: with the
-/// `INTENTD_TEST_SANDBOX_PROVISION_ERROR` seam armed, the delegate still
-/// returns `effectiveIsolation: "pending"` (the failure happens later, in the
-/// background), no sandbox is materialised, and the gated child spawns in the
-/// shared workspace checkout — the exact pre-sandbox behavior.
-#[tokio::test]
-async fn delegate_falls_back_to_shared_mode_when_provisioning_fails() {
-    const TEST: &str = "agent.delegate provisioning-error fallback WSS e2e";
-    if !git_gate(TEST) || !cow_gate(TEST) {
-        return;
-    }
-    let Some(script) = mock_gate(TEST) else {
-        return;
-    };
-    let root_dir = scratch_dir("sberr");
-    let root = root_dir.path().to_path_buf();
-    let behavior = json!({ "response": "done", "echoCwd": true }).to_string();
-    let extra: [(&str, &str); 3] = [
-        ("MOCK_AGENT_SCRIPT_PATH", &script),
-        ("MOCK_AGENT_BEHAVIOR", &behavior),
-        ("INTENTD_TEST_SANDBOX_PROVISION_ERROR", "1"),
-    ];
-    let (daemon, port, cfg) = boot(&root, &extra).await;
-    let (repo, _head_sha) = make_source_repo(daemon.scratch.path());
-
-    let mut rpc = connect_ws(port, cfg.clone()).await;
-    set_cow_isolation(&mut rpc, 1, true).await;
-
-    let created = wss_rpc(
-        &mut rpc,
-        2,
-        "workspace.create",
-        json!({
-            "title": "Sandbox Error E2E",
-            "repositoryPath": repo.to_string_lossy(),
-            "repositoryName": "source-repo",
-            "baseRef": "main",
-            "idempotencyKey": Uuid::new_v4().to_string(),
-        }),
-    )
-    .await;
-    let workspace = &created["workspace"];
-    let ws_id = workspace["id"].as_str().expect("workspace id").to_string();
-    assert_eq!(workspace["checkoutMode"], json!("cow"));
-    let checkout = PathBuf::from(workspace["worktreePath"].as_str().expect("worktreePath"));
-
-    let delegated = wss_rpc(
-        &mut rpc,
-        3,
-        "agent.delegate",
-        json!({
-            "workspaceId": ws_id,
-            "agentInstructions": "do work that cannot be sandboxed",
-            "model": "default", "provider": "mock",
-        }),
-    )
-    .await;
-    assert_eq!(delegated["ok"], json!(true), "delegate ok: {delegated}");
-    let agent_id = delegated["agentId"].as_str().expect("agentId").to_string();
-    // The failure happens in the background task; the delegate result still
-    // reports the provisioning attempt as pending.
-    assert_eq!(
-        delegated["effectiveIsolation"],
-        json!("pending"),
-        "provisioning kicked off in the background: {delegated}"
-    );
-
-    // The gated child spawned in the SHARED workspace checkout (fallback).
-    let echoed = poll_echoed_cwd(&mut rpc, 100, &agent_id).await;
-    let expected = std::fs::canonicalize(&checkout).expect("checkout exists");
-    let actual = std::fs::canonicalize(&echoed).unwrap_or_else(|_| PathBuf::from(&echoed));
-    assert_eq!(
-        actual, expected,
-        "failed provisioning falls back to the shared checkout, got {echoed}"
-    );
-
-    // No sandbox materialised for the agent.
-    assert!(
-        !root.join(&ws_id).join("sandboxes").join(&agent_id).exists(),
-        "no sandbox directory after a provisioning failure"
-    );
-
-    drop(daemon);
 }
 
 /// Scenario D — `workspace.delete` of a `CoW` workspace removes the clone from

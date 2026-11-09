@@ -622,6 +622,46 @@ pub fn sub_agent_notice(view: &RemotePlacementView) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Per-agent `CoW` sandboxes are retired: a backend sub-agent of a remote
+    /// agent always works in the shared workspace checkout, so its notice
+    /// names the parent's refs, even for metadata an older daemon marked
+    /// `seeded` (its own checkout started from the parent's work).
+    #[test]
+    fn backend_parent_work_notice_always_names_the_shared_checkout() {
+        for seeded in [false, true] {
+            let work: BackendParentWork = serde_json::from_value(serde_json::json!({
+                "agentId": "agent-parent",
+                "head": "0123456789abcdef0123",
+                "wip": "fedcba9876543210fedc",
+                "copied": "pushed",
+                "seeded": seeded,
+            }))
+            .expect("legacy metadata still parses");
+            let notice = work.notice("ws-1");
+            assert!(
+                notice.contains("in the workspace's checkout"),
+                "seeded={seeded}: {notice}"
+            );
+            assert!(
+                notice.contains("`refs/intent/ws/ws-1/agents/agent-parent/head`")
+                    && notice.contains("`refs/intent/ws/ws-1/agents/agent-parent/wip`"),
+                "seeded={seeded}: names the parent's refs: {notice}"
+            );
+            assert!(
+                !notice.contains("its own checkout"),
+                "seeded={seeded}: no own checkout: {notice}"
+            );
+        }
+        let fresh: BackendParentWork = serde_json::from_value(serde_json::json!({
+            "agentId": "agent-parent",
+            "head": "0123456789abcdef0123",
+            "copied": "pushed",
+        }))
+        .expect("metadata without seeded parses");
+        let value = serde_json::to_value(&fresh).unwrap();
+        assert!(value.get("seeded").is_none(), "new metadata drops seeded: {value}");
+    }
+
     #[test]
     fn placement_errors_split_the_node_code_and_cap_the_detail() {
         let error =

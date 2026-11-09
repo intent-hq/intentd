@@ -9247,6 +9247,70 @@ mod tests {
         );
     }
 
+    /// Per-agent `CoW` sandboxes are retired (protocol 16): a session that
+    /// still carries the stored sandbox link emits no sandbox field on the
+    /// wire, neither on the session nor in the `AgentLite` metadata.
+    #[test]
+    fn retired_sandbox_fields_are_not_emitted() {
+        let session = AgentSession {
+            harness_version: CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from("agent-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: "Builder".to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id: None,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            retired_at: None,
+            notifications_muted: false,
+            pinned: false,
+            created_at: "t0".to_string(),
+            updated_at: "t1".to_string(),
+            sandbox_id: Some("sandbox-1".to_string()),
+            sandbox_path: Some("/ws/sandboxes/agent-1/repo".to_string()),
+            sandbox_branch: Some("sb/agent-1".to_string()),
+        };
+        let wire = serde_json::to_string(&session).unwrap();
+        let lite = serde_json::to_string(&AgentLite::from_session(
+            session, 0, None, None, None, None, None,
+        ))
+        .unwrap();
+        for text in [&wire, &lite] {
+            for key in ["sandboxId", "sandboxPath", "sandboxBranch", "sandbox_path"] {
+                assert!(!text.contains(key), "{key} emitted: {text}");
+            }
+        }
+    }
+
     /// [`fit_agent_list_frame`] (intent-hq/intent#5531): a rows array that
     /// fits [`AGENT_LIST_FRAME_BUDGET_BYTES`] at the default preview cap is
     /// left untouched (`None`); one that overflows — the motivating shape,
