@@ -140,7 +140,7 @@ pub struct ModelSettings {
 }
 
 /// `[quickActions]` — model config for single-shot quick actions
-/// (`quickActions.*`): commit messages, PR descriptions, quick tasks. These
+/// (`quickActions.*`): commit messages and PR descriptions. These
 /// keys never apply to interactive or delegated agent sessions
 /// (monorepo#1729); the group was named `backgroundAgents` before that
 /// rename (see [`LEGACY_SETTINGS_PATHS`]).
@@ -1868,7 +1868,7 @@ providerDefaults = {}
 
 [quickActions]
 # Quick action default model -- model for single-shot quick actions (commit
-# messages, PR descriptions, quick tasks); never applied to agent sessions.
+# messages and PR descriptions); never applied to agent sessions.
 # defaultModel = "claude-sonnet-4-5"
 # Quick action type overrides -- per-quick-action model overrides.
 typeOverrides = {}
