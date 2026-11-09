@@ -2796,7 +2796,7 @@ pub(super) fn first_turn_preamble(notices: Option<&str>) -> String {
     format!(
         "<system>{}</system>{}",
         intent_core::machine_selection::REMOTE_LONG_COMMANDS_HINT,
-        notices.unwrap_or_default()
+        notices.map(|n| format!("\n\n{n}")).unwrap_or_default()
     )
 }
 

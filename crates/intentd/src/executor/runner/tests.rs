@@ -2106,11 +2106,13 @@ async fn node_runner_opens_the_first_turn_with_the_long_commands_hint() {
         .await;
     let all = wait_for(&h.runner, "first turn end", turn_ended("a1", "t1")).await;
     let first = raw(&all, "t1");
+    let sent: Value = serde_json::from_str(first.strip_prefix("raw: ").unwrap()).unwrap();
+    let first = sent["raw"].as_str().unwrap();
     let hint = format!(
-        "<system>{}</system>Note from Intent: wip-not-restored.",
+        "<system>{}</system>\n\nNote from Intent: wip-not-restored.",
         intent_core::machine_selection::REMOTE_LONG_COMMANDS_HINT
     );
-    assert!(first.contains(&hint), "{first}");
+    assert!(first.starts_with(&hint), "{first}");
     h.runner
         .prompt(&AgentId::from("a1"), "t2".into(), text("echo-raw"))
         .await;
