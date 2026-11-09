@@ -251,6 +251,7 @@ mod profile_activation;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
 pub mod provider_cli;
+mod provider_version;
 mod provider_images;
 pub mod provider_models;
 mod provider_preparation;
@@ -39977,11 +39978,16 @@ pub fn discover_providers_with_npx_overrides<S: std::hash::BuildHasher>(
             crate::cursor_cli::probe_cursor_cli(provider_paths.get("cursor").map(String::as_str))
         });
 
+    let display_versions = provider_version::probe_display_versions(&providers, provider_paths);
+
     let provider_array: Vec<serde_json::Value> = providers
         .iter()
         .map(|p| {
             let mut obj = serde_json::Map::new();
             obj.insert("id".to_string(), serde_json::json!(p.id));
+            if let Some(version) = display_versions.get(p.id) {
+                obj.insert("cliVersion".to_string(), serde_json::json!(version));
+            }
             obj.insert("displayName".to_string(), serde_json::json!(p.display_name));
             obj.insert("command".to_string(), serde_json::json!(p.command));
             let mut installed = p.installed;
