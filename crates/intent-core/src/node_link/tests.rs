@@ -470,6 +470,7 @@ fn every_frame() -> Vec<LinkFrame> {
             forge_fetch: None,
             git_identity: None,
             new_machine: None,
+            harness_version: None,
         }),
         LinkFrame::Prompt {
             agent_id: agent_id.clone(),
@@ -913,6 +914,7 @@ fn launch_profile_env_never_debug_renders_its_values() {
         forge_fetch: None,
         git_identity: None,
         new_machine: None,
+        harness_version: None,
     };
     let rendered = format!("{command:?} {:?}", LinkFrame::Launch(command.clone()));
     assert!(!rendered.contains("canary-secret-7f3a"), "{rendered}");
@@ -944,6 +946,7 @@ fn launch_without_a_profile_omits_profile_env() {
         forge_fetch: None,
         git_identity: None,
         new_machine: None,
+        harness_version: None,
     };
     let wire = serde_json::to_value(&command).unwrap();
     assert!(wire.get("profileEnv").is_none(), "{wire}");
@@ -1288,6 +1291,7 @@ fn a_launch_with_a_checkout_needs_protocol_10() {
             forge_fetch: None,
             git_identity: None,
             new_machine: None,
+            harness_version: None,
         })
     };
     assert_eq!(launch(None).min_protocol(), NODE_LINK_PROTOCOLS.min);
@@ -1321,6 +1325,7 @@ fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
             forge_fetch: None,
             git_identity: None,
             new_machine: None,
+            harness_version: None,
         };
     let proxy = McpProxy {
         name: "Linear".into(),
@@ -1352,6 +1357,46 @@ fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
     assert!(!decoded.compact_tool_descriptions);
 }
 
+/// `harnessVersion` rides every launch on any protocol: present as the
+/// session's stamp, absent from an older backend's launch (which decodes
+/// to none), and no protocol gate.
+#[test]
+fn a_launch_carries_the_harness_version_on_any_protocol() {
+    let launch = |harness_version: Option<Box<str>>| LaunchCommand {
+        agent_id: AgentId::from("a1"),
+        workspace_id: WorkspaceId::from("ws-1"),
+        provider: "codex".into(),
+        model: None,
+        base_commit: "base".into(),
+        repo_key: "repo".into(),
+        agent_features: json!({}),
+        is_sub_agent: false,
+        profile_env: None,
+        checkout: None,
+        mcp_proxies: Vec::new(),
+        compact_tool_descriptions: false,
+        checkout_of: None,
+        forge: None,
+        forge_fetch: None,
+        git_identity: None,
+        new_machine: None,
+        harness_version,
+    };
+    let with = launch(Some("7.42".into()));
+    assert_eq!(
+        LinkFrame::Launch(with.clone()).min_protocol(),
+        NODE_LINK_PROTOCOLS.min
+    );
+    let wire = serde_json::to_value(&with).unwrap();
+    assert_eq!(wire["harnessVersion"], json!("7.42"));
+    let decoded: LaunchCommand = serde_json::from_value(wire).unwrap();
+    assert_eq!(decoded.harness_version.as_deref(), Some("7.42"));
+    let bare = serde_json::to_value(launch(None)).unwrap();
+    assert!(bare.get("harnessVersion").is_none(), "{bare}");
+    let decoded: LaunchCommand = serde_json::from_value(bare).unwrap();
+    assert!(decoded.harness_version.is_none());
+}
+
 /// A machine below nodeProtocol 13 rejects a launch into another agent's
 /// checkout: it would ignore `checkoutOf` and make a checkout of its own.
 #[test]
@@ -1372,6 +1417,7 @@ fn a_launch_into_another_agents_checkout_needs_protocol_13() {
         forge_fetch: None,
         git_identity: None,
         new_machine: None,
+        harness_version: None,
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
     };
@@ -1736,6 +1782,7 @@ fn a_launchs_git_identity_is_optional_and_closed() {
         forge_fetch: None,
         git_identity: None,
         new_machine: None,
+        harness_version: None,
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
     };
@@ -1756,6 +1803,7 @@ fn a_launchs_git_identity_is_optional_and_closed() {
         LinkFrame::Launch(LaunchCommand {
             git_identity: None,
             new_machine: None,
+            harness_version: None,
             ..command.clone()
         })
         .min_protocol()

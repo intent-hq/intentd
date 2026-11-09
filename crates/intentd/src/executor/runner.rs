@@ -1238,6 +1238,7 @@ impl Runner {
             forge_fetch,
             git_identity,
             new_machine,
+            harness_version,
         } = command;
         let git_identity = git_identity.map(|identity| *identity);
         let forge = forge.map(|forge| *forge);
@@ -1357,6 +1358,7 @@ impl Runner {
                 // the condensed reference the compact description points at.
                 compact_tool_descriptions,
                 mcp_proxies,
+                harness_version: harness_version.map(String::from),
             },
             worktree: Mutex::new(None),
             notice: Mutex::new(None),

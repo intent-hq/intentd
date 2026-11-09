@@ -1233,6 +1233,9 @@ impl RemoteLaunchPort for RemoteLaunch {
                     forge_fetch,
                     git_identity,
                     new_machine,
+                    // Every launch, relaunches included: the machine builds
+                    // the agent's `workspace_api` description for this stamp.
+                    harness_version: Some(session.harness_version.as_str().into()),
                 })
                 .await?;
             Ok(runtime as Arc<RemoteRuntime>)

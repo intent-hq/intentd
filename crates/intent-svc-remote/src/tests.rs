@@ -1370,6 +1370,7 @@ mod stop_acks {
             forge_fetch: None,
             git_identity: None,
             new_machine: None,
+            harness_version: None,
             profile_env: None,
         }
     }

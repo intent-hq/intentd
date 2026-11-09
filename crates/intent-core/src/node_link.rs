@@ -506,6 +506,12 @@ pub struct LaunchCommand {
     /// from before ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_machine: Option<Box<MachineName>>,
+    /// The session's stamped harness version (`MAJOR.MINOR`): the machine
+    /// builds the agent's `workspace_api` description for it. Absent (an
+    /// older backend): the legacy description. Needs no protocol: a
+    /// machine from before ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness_version: Option<Box<str>>,
 }
 
 /// [`LaunchCommand::new_machine`]: a machine's name, a plain string on the

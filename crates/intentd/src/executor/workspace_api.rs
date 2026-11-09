@@ -95,6 +95,10 @@ pub(super) struct Gates {
     pub compact_tool_descriptions: bool,
     /// The user MCP servers head proxies to its hub (nodeProtocol 11).
     pub mcp_proxies: Vec<McpProxy>,
+    /// The session's stamped harness version, which picks the
+    /// `workspace_api` description; absent (an older head) is the legacy
+    /// text.
+    pub harness_version: Option<String>,
 }
 
 /// The agent's MCP listeners: its workspace server's and one per proxied
@@ -251,7 +255,12 @@ fn server_with_setup(
         .with_caller_agent_id(Some(agent_id.clone()))
         .with_agent_features(features)
         .with_sub_agent(gates.is_sub_agent)
-        .with_compact_tool_descriptions(gates.compact_tool_descriptions);
+        .with_compact_tool_descriptions(gates.compact_tool_descriptions)
+        .with_workspace_api_docs(
+            intent_services::feature_api::harness::launch_workspace_api_docs(
+                gates.harness_version.as_deref(),
+            ),
+        );
     let router = Router {
         timeout: server.workspace_api_timeout(),
         ..router
