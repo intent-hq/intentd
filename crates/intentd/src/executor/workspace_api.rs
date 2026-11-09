@@ -396,11 +396,17 @@ impl HostFrameRouter for Router {
             Route::Forward if method == REPORT_METHOD => {
                 let push = self.push.clone();
                 let forward = self.forward(method, args);
+                // Its own task: when the script's budget ends first, the
+                // push and the report still finish.
                 Some(Box::pin(async move {
-                    if let Some((push, budget)) = push {
-                        push(budget).await;
-                    }
-                    forward.await
+                    tokio::spawn(async move {
+                        if let Some((push, budget)) = push {
+                            push(budget).await;
+                        }
+                        forward.await
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("the report task failed: {e}")))
                 }))
             }
             Route::Forward => Some(Box::pin(self.forward(method, args))),
@@ -960,7 +966,9 @@ impl WorkspaceApi for NodeApi {
                     .await
                     .map_err(|e| Error::Internal(format!("node commit task failed: {e}")))??;
             if let Some((push, budget)) = &self.push {
-                result.pushed = Some(push(*budget).await);
+                // Its own task, so the push still finishes when the
+                // script's budget ends first.
+                result.pushed = Some(tokio::spawn(push(*budget)).await.unwrap_or(false));
             }
             Ok(result)
         })
