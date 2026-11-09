@@ -83,10 +83,7 @@ fn ancestry_message_transitions_never_invent_an_update_or_clear() {
     let mut current = moved.clone();
     current.requirements.ancestry = known(0);
     assert_eq!(diff_snapshots(&moved, &current), Vec::<String>::new());
-    assert_eq!(
-        diff_snapshots(&first, &old),
-        vec!["forge branch-update requirement unknown",]
-    );
+    assert_eq!(diff_snapshots(&first, &old), Vec::<String>::new());
     let mut required = first.clone();
     required.requirements.branch_update_required = Some(true);
     required.requirements.is_behind = true;
@@ -98,10 +95,7 @@ fn ancestry_message_transitions_never_invent_an_update_or_clear() {
         diff_snapshots(&required, &first),
         vec!["forge no longer requires a branch update before merging"]
     );
-    assert_eq!(
-        diff_snapshots(&required, &old),
-        vec!["forge branch-update requirement unknown",]
-    );
+    assert_eq!(diff_snapshots(&required, &old), Vec::<String>::new());
     let mut other_pair = first.clone();
     other_pair.requirements.ancestry = PrAncestry::Known {
         base_sha: "c".repeat(40),

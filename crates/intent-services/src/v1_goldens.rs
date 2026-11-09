@@ -642,6 +642,8 @@ pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
         pr_updated_at: None,
         checks_not_started_delivered: None,
         latest_reviews_carried: false,
+        branch_update_required_last_known: None,
+        unresolved_threads_last_known: None,
     }
 }
 

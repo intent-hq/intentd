@@ -1142,10 +1142,14 @@ impl Harness for V1 {
                 new.review_comment_count
             ));
         }
-        // A count delta is only meaningful when both sides are known; a
-        // readability transition is reported as such, never as a `n → 0` /
-        // `0 → n` delta.
-        match (o.threads.unresolved, n.threads.unresolved) {
+        // Counts compare last known values: an unreadable thread read is
+        // silent, and a recovery reports only a count that differs from the
+        // last one seen (never a fabricated `n → 0` / `0 → n` delta). Only a
+        // count never known before reports as "readable again".
+        match (
+            old.unresolved_threads_known(),
+            new.unresolved_threads_known(),
+        ) {
             (Some(before), Some(after)) if before != after => {
                 let verb = if after < before {
                     "thread(s) resolved"
@@ -1153,10 +1157,6 @@ impl Harness for V1 {
                     "thread(s) unresolved/opened"
                 };
                 changes.push(format!("{verb}: {before} → {after} unresolved"));
-            }
-            (Some(_), None) => {
-                changes
-                    .push("review threads unreadable (resolution state unavailable)".to_string());
             }
             (None, Some(after)) => {
                 changes.push(format!("review threads readable again: {after} unresolved"));
@@ -1231,7 +1231,13 @@ impl Harness for V1 {
         // availability changes warrant a wake or reset the debounce window.
         // Only a known true→false forge verdict clears this requirement.
         // In particular, an old persisted baseline has None, not false.
-        let update_change = match (o.branch_update_required, n.branch_update_required) {
+        // Verdicts compare last known values: GitHub reports the verdict
+        // unknown while it recomputes after the base moves, and that blip
+        // (or its settling back) is not news (intent-hq/intent#8843).
+        let update_change = match (
+            old.branch_update_required_known(),
+            new.branch_update_required_known(),
+        ) {
             (Some(false), Some(true)) => Some("forge now requires a branch update before merging"),
             (Some(true), Some(false)) => {
                 Some("forge no longer requires a branch update before merging")
@@ -1240,7 +1246,6 @@ impl Harness for V1 {
                 Some("forge branch-update requirement available: required before merging")
             }
             (None, Some(false)) => Some("forge branch-update requirement available: not required"),
-            (Some(_), None) => Some("forge branch-update requirement unknown"),
             _ => None,
         };
         if let Some(line) = update_change {
