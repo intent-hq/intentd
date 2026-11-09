@@ -21,9 +21,8 @@ use intent_core::machines::ExposedMachine;
 use intent_core::node_link::MachineCapabilities;
 use intent_core::node_link::{
     FinalPush, ForgeFetchLaunch, ForgeLaunch, GitIdentity, LaunchCommand, LaunchProfileEnv,
-    MachineName,
-    PreparedCheckout, SetupCommand, SubmodulePin, MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL,
-    SHARED_CHECKOUT_PROTOCOL,
+    MachineName, PreparedCheckout, SetupCommand, SubmodulePin, MCP_PROXY_PROTOCOL,
+    PREPARED_CHECKOUT_PROTOCOL, SHARED_CHECKOUT_PROTOCOL,
 };
 use intent_core::placement::{
     AgentPlacement, MachineRef, PlacementCheckout, PlacementTarget, PlacementUnavailable,
