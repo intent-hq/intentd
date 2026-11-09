@@ -1873,7 +1873,10 @@ async fn search_binding_finds_notes_and_messages_in_this_workspace_only() {
     let mut sibling = workspace(&sibling_id, None);
     sibling.repository_owner = caller.repository_owner.clone();
     sibling.repository_name = caller.repository_name.clone();
-    store.insert_workspace(&sibling).await.expect("insert sibling");
+    store
+        .insert_workspace(&sibling)
+        .await
+        .expect("insert sibling");
 
     let new_note = |target: WorkspaceId, title: &str, content: &str| {
         let services = services.clone();

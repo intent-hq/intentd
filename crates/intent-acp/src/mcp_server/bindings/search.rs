@@ -163,7 +163,9 @@ fn parse_args(args: &Value) -> Result<SearchArgs, String> {
         }
     }
     if !messages && (agent_id.is_some() || role.is_some()) {
-        return Err("agentId and role filter messages; they cannot be used with in: \"notes\"".to_string());
+        return Err(
+            "agentId and role filter messages; they cannot be used with in: \"notes\"".to_string(),
+        );
     }
     let limit = match args.get("limit") {
         None | Some(Value::Null) => DEFAULT_LIMIT,
@@ -206,8 +208,10 @@ mod tests {
         assert!(a.notes && !a.messages);
         assert_eq!(a.limit, MAX_LIMIT);
 
-        let a = parse_args(&json!({ "query": "x", "in": "messages", "agentId": "a-1", "role": "user" }))
-            .unwrap();
+        let a = parse_args(
+            &json!({ "query": "x", "in": "messages", "agentId": "a-1", "role": "user" }),
+        )
+        .unwrap();
         assert!(!a.notes && a.messages);
         assert_eq!(a.agent_id.as_deref(), Some("a-1"));
         assert_eq!(a.role.as_deref(), Some("user"));
@@ -222,7 +226,10 @@ mod tests {
             (json!({ "query": "x", "in": "files" }), "in must be"),
             (json!({ "query": "x", "role": "system" }), "role must be"),
             (json!({ "query": "x", "agentId": 7 }), "agentId must be"),
-            (json!({ "query": "x", "in": "notes", "role": "user" }), "filter messages"),
+            (
+                json!({ "query": "x", "in": "notes", "role": "user" }),
+                "filter messages",
+            ),
             (json!({ "query": "x", "limit": 0 }), "limit must be"),
             (json!({ "query": "x", "limit": 21 }), "limit must be"),
             (json!({ "query": "x", "limit": "5" }), "limit must be"),
