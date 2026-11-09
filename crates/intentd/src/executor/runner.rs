@@ -1521,7 +1521,7 @@ impl Runner {
             Some(Ok(Prepared {
                 worktree: cwd,
                 tmp,
-                notice,
+                unrestored,
                 fresh,
             })) => {
                 *lock(&agent.worktree) = Some(cwd.clone());
@@ -1547,14 +1547,12 @@ impl Runner {
                     Err(None)
                 } else {
                     let forge_notice = self.forge_notice(&agent);
-                    let notice = match &agent.new_machine {
-                        Some(machine) => Some(super::checkout::new_machine_notice(
-                            machine,
-                            notice.as_deref(),
-                        )),
-                        None => notice,
-                    };
-                    *lock(&agent.notice) = [settled.notice, notice, forge_notice]
+                    let notice = super::checkout::first_turn_notice(
+                        agent.new_machine.as_deref(),
+                        &unrestored,
+                        agent.setup.is_some(),
+                    );
+                    *lock(&agent.notice) = [notice, settled.notice, forge_notice]
                         .into_iter()
                         .flatten()
                         .reduce(|all, next| format!("{all}\n\n{next}"));
@@ -2293,7 +2291,7 @@ impl Runner {
             Some(worktree) if !removing => Ok(Prepared {
                 worktree,
                 tmp: self.inner.checkouts.agent_tmp(agent_id)?,
-                notice: None,
+                unrestored: Vec::new(),
                 fresh: false,
             }),
             _ => Err(anyhow::anyhow!(

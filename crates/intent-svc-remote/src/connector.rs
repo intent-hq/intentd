@@ -2875,7 +2875,9 @@ async fn record_placement(shared: &Shared, record: &intent_core::node_link::Jour
                 Box::new(move |view| {
                     view.effective_isolation = EffectiveIsolation::Isolated;
                     view.placement_error = None;
-                    if !machine.is_empty() {
+                    // Only for the machine the agent is placed on now: a
+                    // record replayed by one it left never points back.
+                    if !machine.is_empty() && view.node_id == machine {
                         view.launched_on = Some(machine);
                     }
                 })

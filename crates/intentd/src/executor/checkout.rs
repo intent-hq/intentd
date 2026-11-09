@@ -27,9 +27,9 @@ pub(super) struct Prepared {
     pub(super) worktree: PathBuf,
     /// The agent's private temp folder beside the worktree, removed with it.
     pub(super) tmp: PathBuf,
-    /// Prepended to the agent's first turn: its saved `wip` work could not
-    /// be restored on top of its saved head.
-    pub(super) notice: Option<String>,
+    /// For the agent's first turn: each saved `wip` that could not be
+    /// restored on top of its saved head ([`first_turn_notice`]).
+    pub(super) unrestored: Vec<String>,
     /// This launch created the checkout (it did not keep one).
     pub(super) fresh: bool,
 }
@@ -155,7 +155,7 @@ impl Checkouts for GitCheckouts {
                 notices.extend(
                     checkout
                         .unrestored_wip
-                        .map(|wip| unrestored_wip_notice(&remote, &checkout.at, &wip)),
+                        .map(|wip| unrestored_wip(&remote, &checkout.at, &wip)),
                 );
             }
             // Recorded before the modules, so a push or removal of a
@@ -190,13 +190,12 @@ impl Checkouts for GitCheckouts {
                     ..
                 } = module;
                 let wip = unrestored_wip.as_ref()?;
-                Some(unrestored_module_notice(&remote, path, at, wip))
+                Some(unrestored_module(&remote, path, at, wip))
             }));
-            let notice = (!notices.is_empty()).then(|| notices.join("\n\n"));
             Ok(Prepared {
                 tmp: self.storage.agent_tmp(agent_id)?,
                 worktree,
-                notice,
+                unrestored: notices,
                 fresh,
             })
         })
@@ -315,56 +314,60 @@ fn read_pins(file: &Path) -> Vec<SubmodulePin> {
 
 const NOTE: &str = "Note from Intent: ";
 
-/// What an agent's first turn on another machine than its last run is told:
-/// one notice, carrying the checkout's own notice (`restore`) of saved work
-/// that did not apply.
-pub(super) fn new_machine_notice(machine: &str, restore: Option<&str>) -> String {
-    let restored = if restore.is_some() {
-        "Your conversation and your saved commits were restored, but not all of your \
-         uncommitted changes (see below)."
-    } else {
-        "Your conversation and your saved work (commits and uncommitted changes from your last \
-         push) were restored."
-    };
-    let mut notice = format!(
-        "{NOTE}You're on a new machine ({machine}). {restored} Anything else from your previous \
-         machine is gone: installed tools, caches, running processes, and files outside your \
-         checkout. Re-run any setup you need."
-    );
-    for part in restore
-        .into_iter()
-        .flat_map(|restore| restore.split("\n\n"))
-    {
-        let part = part.strip_prefix(NOTE).unwrap_or(part);
-        let mut chars = part.chars();
-        notice.push_str("\n\n");
-        notice.extend(chars.next().map(|first| first.to_ascii_uppercase()));
-        notice.push_str(chars.as_str());
+/// What the agent's first turn is told about its checkout, as one notice:
+/// that it runs on `new_machine` (head says its last run was on another
+/// machine), and each saved `wip` that could not be restored (`unrestored`,
+/// from [`Prepared::unrestored`]). `setup` is whether a setup script ran for
+/// the checkout. `None` when there is nothing to tell.
+pub(super) fn first_turn_notice(
+    new_machine: Option<&str>,
+    unrestored: &[String],
+    setup: bool,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(machine) = new_machine {
+        let restored = if unrestored.is_empty() {
+            "Your conversation and your saved work (commits and uncommitted changes from your \
+             last push) were restored."
+        } else {
+            "Your conversation and your saved commits were restored, but not all of your \
+             uncommitted changes (see below)."
+        };
+        let redo = if setup {
+            "The workspace setup script ran again here; redo only the setup you did yourself."
+        } else {
+            "Re-run any setup you need."
+        };
+        parts.push(format!(
+            "You're on a new machine ({machine}). {restored} Anything else from your previous \
+             machine is gone: installed tools, caches, running processes, and files outside \
+             your checkout. {redo}"
+        ));
     }
-    notice
+    parts.extend(unrestored.iter().cloned());
+    (!parts.is_empty()).then(|| format!("{NOTE}{}", parts.join("\n\n")))
 }
 
-/// [`unrestored_wip_notice`] for the submodule at `path`, whose wip is
-/// pinned in that submodule's repository.
-fn unrestored_module_notice(remote: &AgentRemote, path: &str, at: &str, wip: &str) -> String {
+/// [`unrestored_wip`] for the submodule at `path`, whose wip is pinned in
+/// that submodule's repository.
+fn unrestored_module(remote: &AgentRemote, path: &str, at: &str, wip: &str) -> String {
     let pinned = remote.unapplied_ref(wip);
     format!(
-        "{NOTE}the submodule {path} of this agent's checkout was recreated at its \
-         saved head commit {at}. Its uncommitted work (commit {wip}) could not be applied on top \
-         of it and is kept in {pinned} in that submodule's repository. Inspect it with \
+        "The submodule {path} of your checkout was recreated at its saved head commit {at}. \
+         Its uncommitted work (commit {wip}) could not be applied on top of it and is kept in \
+         {pinned} in that submodule's repository. Inspect it with \
          `git -C {path} diff {wip}^ {wip}` and reapply what you need."
     )
 }
 
 /// What the agent's first turn is told when its saved `wip` work could not
 /// be restored on top of its saved head (the work is pinned on head).
-fn unrestored_wip_notice(remote: &AgentRemote, at: &str, wip: &str) -> String {
+fn unrestored_wip(remote: &AgentRemote, at: &str, wip: &str) -> String {
     let pinned = remote.unapplied_ref(wip);
     format!(
-        "{NOTE}this agent's checkout on this machine was removed and has been \
-         recreated at its saved head commit {at}. Its uncommitted work (commit {wip}) could \
-         not be applied on top of it and is kept in {pinned}. Inspect it with \
-         `git diff {wip}^ {wip}` in this checkout and reapply what you need."
+        "Your checkout was recreated at its saved head commit {at}. Its uncommitted work \
+         (commit {wip}) could not be applied on top of it and is kept in {pinned}. Inspect it \
+         with `git diff {wip}^ {wip}` in your checkout and reapply what you need."
     )
 }
 
@@ -477,7 +480,7 @@ impl Checkouts for PlainCheckouts {
             Ok(Prepared {
                 worktree: self.storage.agent_dir(agent_id)?,
                 tmp: self.storage.agent_tmp(agent_id)?,
-                notice: self.notice.lock().unwrap().take(),
+                unrestored: self.notice.lock().unwrap().take().into_iter().collect(),
                 fresh,
             })
         })
