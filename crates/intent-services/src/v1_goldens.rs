@@ -646,6 +646,8 @@ pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
         unresolved_threads_last_known: None,
         mergeable_last_known: None,
         merge_state_status_last_known: None,
+        has_conflicts_last_known: false,
+        merge_blocked_reason_last_known: None,
     }
 }
 

@@ -652,6 +652,16 @@ pub(crate) struct PrMonitorSnapshot {
     /// `branch_update_required_last_known`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_state_status_last_known: Option<String>,
+    /// Conflicts were last known while GitHub recomputes mergeability (the
+    /// recomputation resets `requirements.hasConflicts`); the same role as
+    /// `branch_update_required_last_known`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_conflicts_last_known: bool,
+    /// The last known `requirements.mergeBlockedReason` while GitHub
+    /// recomputes mergeability (the recomputation resets it); the same role
+    /// as `has_conflicts_last_known`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_blocked_reason_last_known: Option<String>,
 }
 
 /// `baseline` (a serialized snapshot) with the last known values of
@@ -684,6 +694,7 @@ impl PrMonitorSnapshot {
         let unknown_threads = r.threads.unresolved.is_none();
         let unknown_mergeable = r.mergeable.is_none();
         let unknown_merge_state = known_merge_state(r.merge_state_status.as_deref()).is_none();
+        let recomputing = self.merge_recomputing();
         self.branch_update_required_last_known = previous
             .filter(|_| unknown_update)
             .and_then(Self::branch_update_required_known);
@@ -697,6 +708,36 @@ impl PrMonitorSnapshot {
             .filter(|_| unknown_merge_state)
             .and_then(Self::merge_state_status_known)
             .map(str::to_string);
+        self.has_conflicts_last_known =
+            recomputing && previous.is_some_and(Self::has_conflicts_known);
+        self.merge_blocked_reason_last_known = previous
+            .filter(|_| recomputing)
+            .and_then(Self::merge_blocked_reason_known)
+            .map(str::to_string);
+    }
+
+    /// GitHub is still recomputing mergeability: `mergeable` or the merge
+    /// state reads unknown, and the derived conflict / blocked signals are
+    /// reset rather than observed.
+    pub(crate) fn merge_recomputing(&self) -> bool {
+        self.requirements.mergeable.is_none()
+            || known_merge_state(self.requirements.merge_state_status.as_deref()).is_none()
+    }
+
+    /// Whether the PR has conflicts, keeping the last known verdict while
+    /// GitHub recomputes (the read reports none then).
+    pub(crate) fn has_conflicts_known(&self) -> bool {
+        self.requirements.has_conflicts
+            || (self.has_conflicts_last_known && self.merge_recomputing())
+    }
+
+    /// The merge-blocked reason, keeping the last known one while GitHub
+    /// recomputes (the read reports none then).
+    pub(crate) fn merge_blocked_reason_known(&self) -> Option<&str> {
+        self.requirements.merge_blocked_reason.as_deref().or(self
+            .merge_blocked_reason_last_known
+            .as_deref()
+            .filter(|_| self.merge_recomputing()))
     }
 
     /// The forge's tri-state mergeability, or the last known one while
@@ -941,6 +982,8 @@ impl SharedPrSnapshot {
             unresolved_threads_last_known: None,
             mergeable_last_known: None,
             merge_state_status_last_known: None,
+            has_conflicts_last_known: false,
+            merge_blocked_reason_last_known: None,
         };
         // An unknown read keeps the last known value for the diff.
         snapshot.carry_last_known(previous);
@@ -6696,6 +6739,8 @@ mod tests {
             unresolved_threads_last_known: None,
             mergeable_last_known: None,
             merge_state_status_last_known: None,
+            has_conflicts_last_known: false,
+            merge_blocked_reason_last_known: None,
         };
         f(&mut s);
         s
@@ -7144,6 +7189,32 @@ mod tests {
             .iter()
             .any(|c| c == "forge branch-update requirement available: required before merging"));
         assert!(changes.iter().any(|c| c == "merge blocked: blocked"));
+
+        // A blip carrying the last known verdict (an unrelated wake moved
+        // the emit baseline onto it) is silent when it settles there, and a
+        // later real clear reports against the last known verdict.
+        let carried = snapshot(|s| {
+            s.requirements.mergeable = None;
+            s.requirements.merge_state_status = Some("UNKNOWN".into());
+            s.branch_update_required_last_known = Some(true);
+            s.mergeable_last_known = Some(false);
+            s.merge_state_status_last_known = Some("DIRTY".into());
+            s.has_conflicts_last_known = true;
+            s.merge_blocked_reason_last_known = Some("merge conflicts".into());
+        });
+        assert!(carried.has_conflicts_known());
+        assert!(!carried.requirements.has_conflicts);
+        assert_eq!(diff_snapshots(&dirty, &carried), Vec::<String>::new());
+        assert_eq!(diff_snapshots(&carried, &dirty), Vec::<String>::new());
+        let changes = diff_snapshots(&carried, &cleared);
+        assert!(changes.iter().any(|c| c == "merge conflicts resolved"));
+        assert!(changes.iter().any(|c| c == "merge is no longer blocked"));
+        // A carry left on a known read is never consulted.
+        let stale = snapshot(|s| {
+            s.has_conflicts_last_known = true;
+            s.merge_blocked_reason_last_known = Some("merge conflicts".into());
+        });
+        assert_eq!(diff_snapshots(&base, &stale), Vec::<String>::new());
     }
 
     /// The ejection diff is keyed on the event identity (`at`): a new event
@@ -9536,6 +9607,8 @@ mod tests {
             unresolved_threads_last_known: Some(pick(b, 4, 6)),
             mergeable_last_known: Some(b),
             merge_state_status_last_known: Some(pick(b, "BEHIND", "DIRTY").into()),
+            has_conflicts_last_known: !b,
+            merge_blocked_reason_last_known: Some(pick(b, "branch behind base", "draft").into()),
         }
     }
 
@@ -9936,6 +10009,14 @@ mod tests {
         (
             "/mergeStateStatusLastKnown",
             "read only while the merge state is unknown",
+        ),
+        (
+            "/hasConflictsLastKnown",
+            "read only while mergeability is recomputing",
+        ),
+        (
+            "/mergeBlockedReasonLastKnown",
+            "read only while mergeability is recomputing",
         ),
         (
             "/requirements/mergeQueueEjection/reason",
