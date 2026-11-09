@@ -8,6 +8,7 @@ use super::*;
 
 /// Writes `$1` to the file `$2`, then waits for the file `$3`.
 const GATE: &str =
+    // timing-guard: shell poll interval while the agent waits for the test's go file
     r#"printf %s "$1" > "$2.tmp" && mv "$2.tmp" "$2"; while [ ! -f "$3" ]; do sleep 0.1; done"#;
 
 /// The text of `path` once it exists.
@@ -101,6 +102,7 @@ async fn a_remote_agents_commits_reach_head_before_its_turn_ends() {
     // commits with git, reports, and blocks.
     let start = gates.join("start");
     let (hash_2, go_2) = (gates.join("hash-2"), gates.join("go-2"));
+    // timing-guard: shell poll interval until the parent's turn has ended
     let commit_script = r#"while [ ! -f "$1" ]; do sleep 0.1; done; echo b > b.txt && git add -A && git -c user.name=t -c user.email=t@t.invalid commit -qm child && git rev-parse HEAD"#;
     let child_prompt = format!(
         r#"wsapi const x = await ws.host.exec({{ command: "sh", args: ["-c", {commit_script:?}, "sh", {start:?}] }}); const h = x.stdout.trim(); let r; try {{ r = await ws.agent.reportToParent("committed " + h); }} catch (e) {{ r = "ERR:" + String(e); }} await ws.host.exec({{ command: "sh", args: ["-c", {GATE:?}, "sh", typeof r === "string" ? r : h, {hash:?}, {go:?}] }}); return JSON.stringify({{ marker: "child-1", r }});"#,
