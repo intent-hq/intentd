@@ -747,11 +747,9 @@ fn unpacking_refuses_what_a_snapshot_never_holds() {
         std::fs::write(&archive, builder.into_inner().unwrap()).unwrap();
         let into = dir.path().join("into");
         std::fs::create_dir(&into).unwrap();
-        assert_eq!(
-            code(unpack(&archive, &into)),
-            "file-pull-mismatch",
-            "{what}"
-        );
+        let into = place::Folder::root(&into).unwrap();
+        let archive = std::fs::File::open(&archive).unwrap();
+        assert_eq!(code(unpack(archive, &into)), "file-pull-mismatch", "{what}");
         assert!(!dir.path().join("x").exists(), "{what}");
     }
 }
@@ -842,5 +840,65 @@ fn concurrent_first_pieces_never_pass_the_busy_cap() {
     assert_eq!(served, MAX_SNAPSHOTS_PER_SOURCE);
     for result in results.into_iter().filter(Result::is_err) {
         assert_eq!(code(result), "file-pull-busy");
+    }
+}
+
+/// The caller cannot steer the unpack with its own `.intent`: after the
+/// first piece it plants `evil/pulls/<part>.d` as a link to a folder outside
+/// and swaps `.intent` for a link to `evil`. The unpack and the moves go
+/// through the handles opened at the start, so nothing lands outside.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_swapped_intent_folder_cannot_steer_the_unpack() {
+    let staging = tempfile::tempdir().unwrap();
+    let from = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(from.path().join("dir")).unwrap();
+    std::fs::write(from.path().join("dir/authorized_keys"), vec![6u8; 9000]).unwrap();
+    let src = Arc::new(source(staging.path()));
+    let (dest_root, outside_dir) = (dest.path().to_path_buf(), outside.path().to_path_buf());
+    let pulled = pull_into(
+        dest.path(),
+        "got",
+        None,
+        MAX_PULL_BYTES,
+        fetcher(&src, from.path(), "dir", move |n, _| {
+            if n == 1 {
+                let pulls = dest_root.join(".intent/pulls");
+                let part = std::fs::read_dir(&pulls)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .find(|name| {
+                        std::path::Path::new(name)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("part"))
+                    })
+                    .unwrap();
+                let evil = dest_root.join("evil/pulls");
+                std::fs::create_dir_all(&evil).unwrap();
+                std::os::unix::fs::symlink(&outside_dir, evil.join(part.replace(".part", ".d")))
+                    .unwrap();
+                std::fs::rename(dest_root.join(".intent"), dest_root.join(".intent-real")).unwrap();
+                std::os::unix::fs::symlink(dest_root.join("evil"), dest_root.join(".intent"))
+                    .unwrap();
+            }
+            Ok(())
+        }),
+    )
+    .await;
+    assert!(
+        entries(outside.path()).is_empty(),
+        "nothing lands outside: {pulled:?}"
+    );
+    if pulled.is_ok() {
+        assert_eq!(
+            std::fs::read(dest.path().join("got/authorized_keys"))
+                .unwrap()
+                .len(),
+            9000
+        );
+    } else {
+        assert_eq!(code(pulled), "file-pull-outside-checkout");
     }
 }

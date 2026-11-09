@@ -30,14 +30,20 @@ fn io(context: &str, error: &std::io::Error) -> Error {
 }
 
 impl Folder {
-    /// The checkout's root (its canonical path).
+    /// The checkout's root (its canonical path), opened without following
+    /// a link there; kept for the whole pull, so the checkout swapped for a
+    /// link later is never followed.
+    #[cfg_attr(
+        not(unix),
+        expect(clippy::unnecessary_wraps, reason = "fails only on unix")
+    )]
     pub(super) fn root(root: &Path) -> Result<Self> {
         #[cfg(unix)]
         {
             use nix::fcntl::OFlag;
             let fd = nix::fcntl::open(
                 root,
-                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
                 nix::sys::stat::Mode::empty(),
             )
             .map_err(|e| io("open the checkout", &e.into()))?;
@@ -54,12 +60,11 @@ impl Folder {
         }
     }
 
-    /// Where this folder was when it was opened (for messages and cleanup).
-    pub(super) fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// What is at `name` here.
+    #[cfg_attr(
+        not(unix),
+        expect(clippy::unnecessary_wraps, reason = "fails only on unix")
+    )]
     pub(super) fn entry(&self, name: &str) -> Result<Entry> {
         #[cfg(unix)]
         {
@@ -155,6 +160,10 @@ impl Folder {
         Ok(folder)
     }
 
+    #[cfg_attr(
+        not(unix),
+        expect(clippy::unnecessary_wraps, reason = "fails only on unix")
+    )]
     fn reopen(&self) -> Result<Self> {
         Ok(Self {
             #[cfg(unix)]
@@ -166,7 +175,8 @@ impl Folder {
         })
     }
 
-    /// A new file `name` here, never through a link.
+    /// A new file `name` here, open to write and read back, never through
+    /// a link.
     pub(super) fn create_file(&self, name: &str) -> Result<std::fs::File> {
         #[cfg(unix)]
         {
@@ -174,7 +184,7 @@ impl Folder {
             let fd = nix::fcntl::openat(
                 &self.fd,
                 name,
-                OFlag::O_WRONLY
+                OFlag::O_RDWR
                     | OFlag::O_CREAT
                     | OFlag::O_EXCL
                     | OFlag::O_NOFOLLOW
@@ -187,6 +197,7 @@ impl Folder {
         #[cfg(not(unix))]
         {
             std::fs::OpenOptions::new()
+                .read(true)
                 .write(true)
                 .create_new(true)
                 .open(self.path.join(name))
@@ -205,6 +216,89 @@ impl Folder {
         {
             std::fs::rename(self.path.join(name), to.path.join(to_name))
                 .map_err(|e| io("place the copy", &e))
+        }
+    }
+
+    /// The names here, each with whether it is a folder (a link is not).
+    pub(super) fn list(&self) -> Result<Vec<(String, bool)>> {
+        #[cfg(unix)]
+        {
+            use nix::dir::{Dir, Type};
+            let fd = self.fd.try_clone().map_err(|e| io("list the folder", &e))?;
+            let dir = Dir::from_fd(fd).map_err(|e| io("list the folder", &e.into()))?;
+            let mut names = Vec::new();
+            for entry in dir {
+                let entry = entry.map_err(|e| io("list the folder", &e.into()))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name == "." || name == ".." {
+                    continue;
+                }
+                let is_dir = match entry.file_type() {
+                    Some(Type::Directory) => true,
+                    Some(_) => false,
+                    None => self.entry(&name)? == Entry::Folder,
+                };
+                names.push((name, is_dir));
+            }
+            names.sort();
+            Ok(names)
+        }
+        #[cfg(not(unix))]
+        {
+            let mut names = Vec::new();
+            for entry in std::fs::read_dir(&self.path).map_err(|e| io("list the folder", &e))? {
+                let entry = entry.map_err(|e| io("list the folder", &e))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let is_dir = self.entry(&name)? == Entry::Folder;
+                names.push((name, is_dir));
+            }
+            names.sort();
+            Ok(names)
+        }
+    }
+
+    /// Remove the file `name` here (never what a link points to).
+    pub(super) fn remove_file(&self, name: &str) -> Result<()> {
+        #[cfg(unix)]
+        {
+            nix::unistd::unlinkat(&self.fd, name, nix::unistd::UnlinkatFlags::NoRemoveDir)
+                .map_err(|e| io("remove the copy", &e.into()))
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::remove_file(self.path.join(name)).map_err(|e| io("remove the copy", &e))
+        }
+    }
+
+    /// Remove the folder `name` here and everything in it, through handles,
+    /// removing links as links.
+    pub(super) fn remove_tree(&self, name: &str) -> Result<()> {
+        if self.entry(name)? == Entry::Folder {
+            let inner = self.child(name, false, &mut Vec::new(), &|_| {
+                io(
+                    "remove the copy",
+                    &std::io::Error::other("changed while removed"),
+                )
+            })?;
+            for (entry, is_dir) in inner.list()? {
+                if is_dir {
+                    inner.remove_tree(&entry)?;
+                } else {
+                    inner.remove_file(&entry)?;
+                }
+            }
+            #[cfg(unix)]
+            {
+                nix::unistd::unlinkat(&self.fd, name, nix::unistd::UnlinkatFlags::RemoveDir)
+                    .map_err(|e| io("remove the copy", &e.into()))?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::remove_dir(self.path.join(name)).map_err(|e| io("remove the copy", &e))?;
+            }
+            Ok(())
+        } else {
+            self.remove_file(name)
         }
     }
 }

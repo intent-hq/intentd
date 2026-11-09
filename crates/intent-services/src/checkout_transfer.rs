@@ -736,6 +736,9 @@ struct Destination {
     /// The final path's components below `root`, resolved when the pull
     /// began; every write walks them again without following links.
     parts: Vec<String>,
+    /// The checkout's root, opened before the first piece is fetched: every
+    /// write walks from this handle, never from the path again.
+    handle: place::Folder,
 }
 
 impl Destination {
@@ -801,10 +804,12 @@ fn resolve_destination(dest_root: &Path, to: &str) -> Result<Destination> {
     {
         return Err(outside(to));
     }
+    let handle = place::Folder::root(&root).map_err(|_| outside(to))?;
     Ok(Destination {
         rel: to.to_owned(),
         root,
         parts,
+        handle,
     })
 }
 
@@ -820,9 +825,8 @@ struct PieceSink {
     kind: CheckoutEntryKind,
     size: u64,
     sha256: String,
-    /// The checkout's root and its `.intent/pulls/`, opened without
-    /// following links.
-    root: place::Folder,
+    /// The checkout's `.intent/pulls/`, opened from the root handle
+    /// without following links.
     pulls: place::Folder,
     /// The part file's name in `pulls`.
     part: String,
@@ -838,10 +842,10 @@ impl PieceSink {
     fn begin(to: Destination, kind: CheckoutEntryKind, size: u64, sha256: String) -> Result<Self> {
         use sha2::Digest as _;
         check_existing(&to, kind)?;
-        let root = place::Folder::root(&to.root)?;
         let refuse = |_| outside(PULLS_DIR);
         let mut kept = Vec::new();
-        let pulls = root
+        let pulls = to
+            .handle
             .child(".intent", true, &mut kept, &refuse)?
             .child("pulls", true, &mut kept, &refuse)?;
         if pulls.entry(".gitignore")? == place::Entry::Missing {
@@ -857,7 +861,6 @@ impl PieceSink {
             kind,
             size,
             sha256,
-            root,
             pulls,
             part,
             file: Some(file),
@@ -883,9 +886,11 @@ impl PieceSink {
 
     fn finish(mut self) -> Result<Value> {
         use sha2::Digest as _;
-        if let Some(file) = self.file.take() {
-            file.sync_all().map_err(|e| io("write the copy", &e))?;
-        }
+        let mut written = self
+            .file
+            .take()
+            .ok_or_else(|| Error::Internal("file pull already finished".into()))?;
+        written.sync_all().map_err(|e| io("write the copy", &e))?;
         let digest = lower_hex(&self.hasher.clone().finalize());
         if self.written != self.size || !digest.eq_ignore_ascii_case(&self.sha256) {
             return Err(mismatch(format!(
@@ -902,7 +907,14 @@ impl PieceSink {
                 self.pulls.rename(&self.part, &parent, &name)?;
                 1
             }
-            CheckoutEntryKind::Directory => self.place_folder()?,
+            CheckoutEntryKind::Directory => {
+                // The archive is read back through the descriptor it was
+                // written with, never reopened by path.
+                written
+                    .seek(std::io::SeekFrom::Start(0))
+                    .map_err(|e| io("unpack the folder", &e))?;
+                self.place_folder(written)?
+            }
         };
         self.made.clear();
         Ok(json!({
@@ -923,21 +935,24 @@ impl PieceSink {
             .split_last()
             .ok_or_else(|| outside(&self.to.rel))?;
         let refuse = self.to.refuse();
-        let parent = self.root.walk(parents, true, &mut self.made, &refuse)?;
+        let parent = self
+            .to
+            .handle
+            .walk(parents, true, &mut self.made, &refuse)?;
         Ok((parent, name.clone()))
     }
 
     /// Unpack the verified archive into a folder under `.intent/pulls/`,
     /// then move it into place, merging into a folder already there.
     /// Returns the number of regular files written.
-    fn place_folder(&mut self) -> Result<u64> {
+    fn place_folder(&mut self, archive: std::fs::File) -> Result<u64> {
         let name = self.part.replace(".part", ".d");
         let mut kept = Vec::new();
         let unpacked = self
             .pulls
             .child(&name, true, &mut kept, &|_| outside(PULLS_DIR))?;
         self.unpacked = Some(name.clone());
-        let files = unpack(&self.pulls.path().join(&self.part), unpacked.path())?;
+        let files = unpack(archive, &unpacked)?;
         let (parent, last) = self.parent()?;
         match parent.entry(&last)? {
             place::Entry::Missing => {
@@ -952,18 +967,8 @@ impl PieceSink {
         let refuse = self.to.refuse();
         let into = parent.child(&last, false, &mut Vec::new(), &refuse)?;
         let mut moves = Vec::new();
-        plan_merge(
-            unpacked.path(),
-            &into,
-            Path::new(""),
-            &self.to.rel,
-            &mut moves,
-        )?;
-        for rel in moves {
-            let parts: Vec<String> = rel
-                .components()
-                .map(|part| part.as_os_str().to_string_lossy().into_owned())
-                .collect();
+        plan_merge(&unpacked, &into, &[], &self.to.rel, &mut moves)?;
+        for parts in moves {
             let Some((entry, parents)) = parts.split_last() else {
                 continue;
             };
@@ -996,16 +1001,27 @@ fn check_existing(to: &Destination, kind: CheckoutEntryKind) -> Result<()> {
     }
 }
 
+/// Set `file`'s mode (0644 or 0755) through its handle.
+fn set_mode(file: &std::fs::File, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|e| io("unpack the folder", &e))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, mode);
+        Ok(())
+    }
+}
+
 /// Unpack `archive` into the empty folder `into`, allowing only what a
 /// snapshot holds: regular files and folders with plain relative paths
 /// (no `.git`), modes 0644 or 0755, and pax records setting only `path`
 /// and `size`, each path once. Returns the number of regular files.
-fn unpack(archive: &Path, into: &Path) -> Result<u64> {
-    let file = std::fs::File::open(archive).map_err(|e| io("unpack the folder", &e))?;
-    let mut archive = tar::Archive::new(file);
-    archive.set_preserve_permissions(false);
-    archive.set_preserve_mtime(false);
-    archive.set_overwrite(false);
+fn unpack(archive: std::fs::File, into: &place::Folder) -> Result<u64> {
+    let mut archive = tar::Archive::new(archive);
     let (mut files, mut entries) = (0, 0);
     let mut seen = std::collections::HashSet::new();
     for entry in archive.entries().map_err(|e| io("unpack the folder", &e))? {
@@ -1024,9 +1040,10 @@ fn unpack(archive: &Path, into: &Path) -> Result<u64> {
         if !(file || kind == tar::EntryType::Directory) {
             return Err(not_allowed("a link or special entry"));
         }
-        if plain_parts(&name).is_none_or(|parts| parts.is_empty()) {
+        let Some(parts) = plain_parts(&name).filter(|parts| !parts.is_empty()) else {
             return Err(not_allowed("the path"));
-        }
+        };
+        let parts: Vec<String> = parts.into_iter().map(str::to_owned).collect();
         if !seen.insert(name.trim_end_matches('/').to_owned()) {
             return Err(not_allowed("twice the path"));
         }
@@ -1046,48 +1063,51 @@ fn unpack(archive: &Path, into: &Path) -> Result<u64> {
                 }
             }
         }
-        if !entry
-            .unpack_in(into)
-            .map_err(|e| io("unpack the folder", &e))?
-        {
-            return Err(not_allowed("the path"));
-        }
+        // Written through handles from `into`: no entry follows a link.
+        let refuse = |_| outside(&name);
+        let mut created_dirs = Vec::new();
         if file {
+            let (last, parents) = parts.split_last().ok_or_else(|| not_allowed("the path"))?;
+            let parent = into.walk(parents, true, &mut created_dirs, &refuse)?;
+            let mut out = parent.create_file(last)?;
+            std::io::copy(&mut entry, &mut out)
+                .map_err(|_| mismatch("the archive is malformed"))?;
+            set_mode(&out, mode)?;
             files += 1;
+        } else {
+            into.walk(&parts, true, &mut created_dirs, &refuse)?;
         }
     }
     Ok(files)
 }
 
-/// The entries (relative to `from`) that merge the unpacked folder `from`
-/// into the existing folder `into`: a new entry moves whole, a file
-/// replaces a file or a link (as a link, never through it), and a folder
-/// merges into a folder. A folder onto a link is outside the checkout; a
-/// file against a folder conflicts. Found before anything moves.
+/// The entries (relative to `from`, as components) that merge the
+/// unpacked folder `from` into the existing folder `into`: a new entry
+/// moves whole, a file replaces a file or a link (as a link, never through
+/// it), and a folder merges into a folder. A folder onto a link is outside
+/// the checkout; a file against a folder conflicts. Both sides are read
+/// through handles; found before anything moves.
 fn plan_merge(
-    from: &Path,
+    from: &place::Folder,
     into: &place::Folder,
-    rel: &Path,
+    rel: &[String],
     shown: &str,
-    moves: &mut Vec<PathBuf>,
+    moves: &mut Vec<Vec<String>>,
 ) -> Result<()> {
-    for entry in std::fs::read_dir(from.join(rel)).map_err(|e| io("place the folder", &e))? {
-        let entry = entry.map_err(|e| io("place the folder", &e))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let entry_rel = rel.join(&name);
-        let label = format!("{shown}/{}", entry_rel.display());
-        let incoming_dir = entry
-            .file_type()
-            .map_err(|e| io("place the folder", &e))?
-            .is_dir();
+    for (name, incoming_dir) in from.list()? {
+        let mut entry_rel = rel.to_vec();
+        entry_rel.push(name.clone());
+        let label = format!("{shown}/{}", entry_rel.join("/"));
         match (incoming_dir, into.entry(&name)?) {
             (_, place::Entry::Missing) | (false, place::Entry::Other | place::Entry::Link) => {
                 moves.push(entry_rel);
             }
             (true, place::Entry::Link) => return Err(outside(&label)),
             (true, place::Entry::Folder) => {
-                let inner = into.child(&name, false, &mut Vec::new(), &|_| outside(&label))?;
-                plan_merge(from, &inner, &entry_rel, shown, moves)?;
+                let refuse = |_| outside(&label);
+                let inner_from = from.child(&name, false, &mut Vec::new(), &refuse)?;
+                let inner_into = into.child(&name, false, &mut Vec::new(), &refuse)?;
+                plan_merge(&inner_from, &inner_into, &entry_rel, shown, moves)?;
             }
             _ => return Err(conflict(&label, "a file and a folder have the same name")),
         }
@@ -1098,9 +1118,9 @@ fn plan_merge(
 impl Drop for PieceSink {
     fn drop(&mut self) {
         self.file.take();
-        let _ = std::fs::remove_file(self.pulls.path().join(&self.part));
+        let _ = self.pulls.remove_file(&self.part);
         if let Some(unpacked) = self.unpacked.take() {
-            let _ = std::fs::remove_dir_all(self.pulls.path().join(unpacked));
+            let _ = self.pulls.remove_tree(&unpacked);
         }
         for dir in self.made.drain(..).rev() {
             let _ = std::fs::remove_dir(dir);
