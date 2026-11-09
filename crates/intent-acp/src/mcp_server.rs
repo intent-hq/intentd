@@ -18,6 +18,7 @@ use crate::tool_restrictions::get_tool_denylist_for_agent_type;
 
 pub(crate) mod bindings;
 mod call_ledger;
+mod compact_reference;
 mod dispatch;
 pub mod private_results;
 pub mod repository_guidance;
@@ -382,6 +383,7 @@ impl WorkspaceMcpServer {
             plain_folder: self.plain_folder,
             remote_placement_help: self.remote_placement_help.as_deref(),
             truncating_provider: self.compact_tool_descriptions,
+            capability_methods: &[],
         })
     }
 

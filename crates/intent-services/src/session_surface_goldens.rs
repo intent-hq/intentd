@@ -179,6 +179,181 @@ async fn variant(
     )
 }
 
+/// The `workspace_api` tool description and system-prompt reference of
+/// every variant for `provider` with the session stamped `version`, joined:
+/// `(tool descriptions, references)`. Unlike [`surfaces_for`], it leaves
+/// out the rest of the prompt, which other surfaces own.
+pub(crate) fn workspace_api_surfaces_for(
+    services: &Services,
+    base: &AgentSession,
+    version: &str,
+    provider: &ProviderConfig,
+) -> (String, String) {
+    let mut top = base.clone();
+    top.harness_version = version.to_owned();
+    let mut sub = top.clone();
+    sub.parent_agent_id = Some(AgentId::from("agent-parent"));
+    let mut chief = top.clone();
+    chief.workspace_id = WorkspaceId::chief();
+    let mut tools = Vec::new();
+    let mut references = Vec::new();
+    for (session, placement, plain_folder) in [
+        (&top, None, false),
+        (&sub, None, false),
+        (&chief, None, false),
+        (&top, Some(PLACEMENT), false),
+        (&top, Some(PLACEMENT), true),
+    ] {
+        let surfaces = SessionSurfaces::new(session, provider);
+        let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
+        let server = surfaces.configure(
+            WorkspaceMcpServer::for_agent_type(api, session.workspace_id.clone(), "interactive")
+                .with_agent_features(AgentFeaturesSettings::default())
+                .with_sub_agent(session.parent_agent_id.is_some())
+                .with_remote_placement_help(placement.map(str::to_owned))
+                .with_plain_folder(plain_folder),
+        );
+        tools.push(server.workspace_api_tool_description());
+        references.push(server.workspace_api_prompt_reference().unwrap_or_default());
+    }
+    (tools.join(SEPARATOR), references.join(SEPARATOR))
+}
+
+/// `(provider, tool description bytes, SHA-256, reference bytes, SHA-256)`
+/// of harness 3.10's `workspace_api` surfaces.
+const V3_10_WORKSPACE_API: &[(&str, usize, &str, usize, &str)] = &[
+    (
+        "antigravity",
+        49_079,
+        "9ad8073d647779283d4f8a950113581319f752de8f8219b27507d96945e798cf",
+        12,
+        "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
+    ),
+    (
+        "auggie",
+        49_079,
+        "9ad8073d647779283d4f8a950113581319f752de8f8219b27507d96945e798cf",
+        12,
+        "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
+    ),
+    (
+        "claude-code",
+        4_682,
+        "7e0084a973e2675cb00e155af601296de3a1ac373611d5a9b8a7b77146f9a643",
+        45_309,
+        "6fbc7d361998d46e35c671f7f17667cad17c89a4fe10940b9003afb776a19f9b",
+    ),
+    (
+        "codex",
+        49_079,
+        "9ad8073d647779283d4f8a950113581319f752de8f8219b27507d96945e798cf",
+        12,
+        "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
+    ),
+    (
+        "cortex",
+        49_079,
+        "9ad8073d647779283d4f8a950113581319f752de8f8219b27507d96945e798cf",
+        12,
+        "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
+    ),
+    (
+        "cursor",
+        49_079,
+        "9ad8073d647779283d4f8a950113581319f752de8f8219b27507d96945e798cf",
+        12,
+        "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
+    ),
+    (
+        "droid",
+        4_682,
+        "7e0084a973e2675cb00e155af601296de3a1ac373611d5a9b8a7b77146f9a643",
+        45_309,
+        "6fbc7d361998d46e35c671f7f17667cad17c89a4fe10940b9003afb776a19f9b",
+    ),
+    (
+        "grok",
+        4_682,
+        "7e0084a973e2675cb00e155af601296de3a1ac373611d5a9b8a7b77146f9a643",
+        45_309,
+        "6fbc7d361998d46e35c671f7f17667cad17c89a4fe10940b9003afb776a19f9b",
+    ),
+    (
+        "mock",
+        49_079,
+        "9ad8073d647779283d4f8a950113581319f752de8f8219b27507d96945e798cf",
+        12,
+        "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
+    ),
+    (
+        "opencode",
+        49_079,
+        "9ad8073d647779283d4f8a950113581319f752de8f8219b27507d96945e798cf",
+        12,
+        "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
+    ),
+    (
+        "pi",
+        49_079,
+        "9ad8073d647779283d4f8a950113581319f752de8f8219b27507d96945e798cf",
+        12,
+        "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
+    ),
+    (
+        "unsloth",
+        49_079,
+        "9ad8073d647779283d4f8a950113581319f752de8f8219b27507d96945e798cf",
+        12,
+        "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
+    ),
+];
+
+/// Harness 3.10's compact `workspace_api` surfaces, per provider: the whole
+/// reference in the tool description, or in the system prompt for a
+/// provider that truncates tool descriptions.
+#[tokio::test]
+async fn v3_10_workspace_api_surfaces() {
+    let (_db, _dir, services, session) = fixture().await;
+    let mut actual = Vec::new();
+    let mut mismatches = Vec::new();
+    for provider in intent_providers::config::ACP_PROVIDERS {
+        let (tool, reference) = workspace_api_surfaces_for(&services, &session, "3.10", provider);
+        assert_eq!(
+            reference.replace(SEPARATOR, "").is_empty(),
+            !provider.truncates_tool_descriptions,
+            "{}: the reference lives in exactly one place",
+            provider.id
+        );
+        let row = (
+            provider.id,
+            tool.len(),
+            sha256_hex(&tool),
+            reference.len(),
+            sha256_hex(&reference),
+        );
+        if V3_10_WORKSPACE_API.iter().find(|r| r.0 == provider.id)
+            != Some(&(row.0, row.1, row.2.as_str(), row.3, row.4.as_str()))
+        {
+            mismatches.push(provider.id);
+        }
+        actual.push(format!(
+            "    (\"{}\", {}, \"{}\", {}, \"{}\"),",
+            row.0,
+            grouped(row.1),
+            row.2,
+            grouped(row.3),
+            row.4
+        ));
+    }
+    assert!(
+        mismatches.is_empty() && V3_10_WORKSPACE_API.len() == actual.len(),
+        "harness 3.10 workspace_api surfaces changed for {mismatches:?}. Review the text \
+         (it is staged, so no session carries it yet), then paste the rows into \
+         `V3_10_WORKSPACE_API`:\n{}",
+        actual.join("\n")
+    );
+}
+
 /// Every variant's surfaces for `provider` with the session stamped
 /// `version`, joined: `(tool descriptions, system prompts)`.
 pub(crate) async fn surfaces_for(
