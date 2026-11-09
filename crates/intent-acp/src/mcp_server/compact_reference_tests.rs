@@ -75,6 +75,7 @@ async fn installed_paths(
     features: &AgentFeaturesSettings,
     is_sub_agent: bool,
     is_chief: bool,
+    machine_models: bool,
 ) -> Vec<String> {
     let workspace = if is_chief {
         WorkspaceId::chief()
@@ -86,7 +87,7 @@ async fn installed_paths(
          const walk = (o, p, depth) => {{ for (const k of Object.keys(o)) {{ const v = o[k]; const path = p ? p + '.' + k : k;\n\
          if (typeof v === 'function') out.push(path); else if (v && typeof v === 'object' && depth < 4) walk(v, path, depth + 1); }} }};\n\
          walk(ws, '', 0); return out.sort();",
-        prelude_for_workspace(features, is_sub_agent, &workspace)
+        prelude_for_workspace(features, is_sub_agent, &workspace, machine_models)
     );
     let value = intent_js::eval(&code, &intent_js::EvalOptions::default(), None)
         .await
@@ -134,21 +135,31 @@ async fn capability_map_names_exactly_the_installed_bindings() {
             let (is_chief, is_sub_agent) =
                 (matches!(shape, Shape::Chief), matches!(shape, Shape::Sub));
             let effective = effective_agent_features(&features, is_sub_agent, is_chief);
-            let installed: Vec<String> = installed_paths(&features, is_sub_agent, is_chief)
-                .await
-                .into_iter()
-                .filter(|path| listed(path, is_chief))
-                .collect();
-            let reference = CompactReference::build(&inputs(shape, &effective));
-            let mut mapped = map_paths(&reference.map);
-            mapped.sort();
-            let missing: Vec<&String> = installed.iter().filter(|p| !mapped.contains(p)).collect();
-            let extra: Vec<&String> = mapped.iter().filter(|p| !installed.contains(p)).collect();
-            assert!(
-                missing.is_empty() && extra.is_empty(),
-                "{toggle} chief={is_chief} sub={is_sub_agent}: map is missing {missing:?}, \
-                 names uninstalled {extra:?}. Document a new binding in tools.rs."
-            );
+            for machine_models in [false, true] {
+                let installed: Vec<String> =
+                    installed_paths(&features, is_sub_agent, is_chief, machine_models)
+                        .await
+                        .into_iter()
+                        .filter(|path| listed(path, is_chief))
+                        .collect();
+                let mut docs = inputs(shape, &effective);
+                if machine_models {
+                    docs.capability_methods = &["agent.machineModels"];
+                }
+                let reference = CompactReference::build(&docs);
+                let mut mapped = map_paths(&reference.map);
+                mapped.sort();
+                let missing: Vec<&String> =
+                    installed.iter().filter(|p| !mapped.contains(p)).collect();
+                let extra: Vec<&String> =
+                    mapped.iter().filter(|p| !installed.contains(p)).collect();
+                assert!(
+                    missing.is_empty() && extra.is_empty(),
+                    "{toggle} chief={is_chief} sub={is_sub_agent} machineModels={machine_models}: \
+                     map is missing {missing:?}, names uninstalled {extra:?}. Document a new \
+                     binding in tools.rs."
+                );
+            }
         }
     }
 }

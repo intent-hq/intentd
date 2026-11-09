@@ -138,7 +138,7 @@ fn sha256_hex(text: &str) -> String {
 
 /// One variant's `(tool description, system prompt)`, built the way a spawn
 /// builds them for `session` on `provider`.
-async fn variant(
+pub(crate) async fn variant(
     services: &Services,
     workspace_path: &Path,
     session: &AgentSession,
@@ -512,11 +512,13 @@ fn frozen_sessions_keep_the_original_builders() {
         }),
         crate::skills::build_skills_catalog(&skills)
     );
-    assert!(std::ptr::fn_addr_eq(
-        context.placement_help,
-        intent_core::machine_selection::exposed_machines_help
-            as intent_core::machine_selection::PlacementHelpRenderer
-    ));
+    for renderer in [context.placement_help, context.placement_reference] {
+        assert!(std::ptr::fn_addr_eq(
+            renderer,
+            intent_core::machine_selection::exposed_machines_help
+                as intent_core::machine_selection::PlacementHelpRenderer
+        ));
+    }
     assert!(std::ptr::addr_eq(
         context.workspace_api,
         &raw const intent_acp::WORKSPACE_API_DOCS_V1

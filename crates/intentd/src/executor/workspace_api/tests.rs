@@ -914,9 +914,18 @@ async fn backend_data_calls_are_forwarded_to_head() {
 /// frame (older) or no link leaves it out.
 #[tokio::test]
 async fn placement_help_comes_from_head() {
+    use intent_core::machine_selection::MACHINE_MODELS_SIGNATURE;
     use intent_core::remote_launch::workspace_api::PLACEMENT_HELP_METHOD;
     const HELP: &str = "Remote placement (test): machine `node-2`.";
-    for answers in [true, false] {
+    let lookup_help = format!("{HELP} Confirm with `{MACHINE_MODELS_SIGNATURE}`.");
+    // An older backend's text (no lookup), a backend that serves the lookup,
+    // and one that refuses the frame.
+    for (answer, lookup) in [
+        (Some(HELP.to_owned()), false),
+        (Some(lookup_help), true),
+        (None, false),
+    ] {
+        let answers = answer.is_some();
         let dir = tempfile::tempdir().unwrap();
         let (node_end, mut head_end, _served) = bound_link(dir.path()).await;
         let head = HeadLink::default();
@@ -928,8 +937,8 @@ async fn placement_help_comes_from_head() {
                     let frame = request.request().clone();
                     assert_eq!(frame.agent_id, agent());
                     asked_tx.send(frame.params["method"].clone()).unwrap();
-                    let outcome = if answers {
-                        LinkOutcome::Ok(json!({ "help": HELP }))
+                    let outcome = if let Some(help) = &answer {
+                        LinkOutcome::Ok(json!({ "help": help }))
                     } else {
                         LinkOutcome::Err(LinkRpcError {
                             code: -32003,
@@ -957,6 +966,12 @@ async fn placement_help_comes_from_head() {
         let help = help.as_str().unwrap_or_default();
         assert_eq!(help.contains(HELP), answers, "{help}");
         assert!(help.contains("ws.agent.create"), "{help}");
+        let bound = ok_json(call(&server, "return 'machineModels' in ws.agent;").await);
+        assert_eq!(
+            bound,
+            json!(lookup),
+            "machineModels bound only when head serves it"
+        );
         answering.abort();
     }
 

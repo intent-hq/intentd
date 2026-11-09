@@ -1890,10 +1890,16 @@ mod tests {
     #[test]
     fn every_bound_method_is_documented() {
         let deferred = deferred();
+        // Installed only when the daemon advertises the capability; its doc
+        // line is rendered by the per-session `ws.help("agent")` text instead.
+        let capability_gated: HashSet<(&str, &str)> =
+            [("agent", "machineModels")].into_iter().collect();
         let documented = extract_ws_methods(WORKSPACE_API_DESCRIPTION);
         for (ns, src) in all_namespaces() {
             for method in bound_methods(src) {
-                if deferred.contains(&(*ns, method.as_str())) {
+                if deferred.contains(&(*ns, method.as_str()))
+                    || capability_gated.contains(&(*ns, method.as_str()))
+                {
                     continue;
                 }
                 assert!(

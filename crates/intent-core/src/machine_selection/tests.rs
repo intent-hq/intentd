@@ -1023,6 +1023,112 @@ fn help_says_the_default_configuration_travels_before_the_machine_login() {
 }
 
 #[test]
+fn stable_help_lists_identity_only_in_name_order() {
+    let mut mac = machine(
+        "d-mac",
+        Some(report(
+            MAC,
+            FRESH,
+            vec![provider("claude-code", ProviderStatus::SignedIn, &["opus"])],
+        )),
+    );
+    mac.name = "Mac mini".into();
+    mac.last_connected_at = Some("2026-10-30T08:00:00Z".into());
+    let mut fresh = machine("d-new", None);
+    fresh.name = "Attic box".into();
+    let mut revoked = machine("d-gone", None);
+    revoked.state = RemoteMachineState::Revoked;
+    let rows = [mac, fresh, revoked];
+    let text = stable_machines_help(&PlacementHelpInputs::new(&rows, &|id| id == "d-mac")).unwrap();
+    assert_eq!(
+        text,
+        "Remote placement (experimental): machines exposed to this backend:\n\
+         - \"Attic box\" (nodeId `d-new`, platform unknown)\n\
+         - \"Mac mini\" (nodeId `d-mac`, macos/aarch64)\n\
+         Before you choose a machine, provider or model for a remote agent, confirm it with `ws.agent.machineModels(nodeId?, { provider?, model? }?)`: each machine's state, provider sign-in status and full model list. How to place one: `ws.help(\"agent\")`.\n\
+         On a remote machine, run anything over 30 s with `ws.script.start`; shell background jobs never wake you."
+    );
+    assert_eq!(
+        stable_machines_help(&PlacementHelpInputs::new(&rows, &|_| false)).as_deref(),
+        Some(text.as_str())
+    );
+
+    let profiles = [profile(
+        "claude-code",
+        "pw1",
+        "Work",
+        ProfileRemote::Compatible,
+    )];
+    let with_profiles = PlacementHelpInputs {
+        profiles: &profiles,
+        ..PlacementHelpInputs::new(&rows, &|id| id == "d-mac")
+    };
+    assert_eq!(
+        stable_machines_help(&with_profiles).as_deref(),
+        Some(text.as_str()),
+        "profiles stay out of the prompt text"
+    );
+    let reference = stable_machines_reference(&with_profiles).unwrap();
+    assert!(
+        reference.contains("- `claude-code@pw1` \"Work\"\n"),
+        "{reference}"
+    );
+    assert!(reference.starts_with(
+        "Remote placement (experimental): machines exposed to this backend:\n- \"Attic box\""
+    ));
+    assert!(reference.contains(
+        "\n  ws.agent.machineModels(nodeId?, { provider?, model? }?) → { machines }  // Experimental."
+    ));
+    assert!(reference.contains("To run an agent on one, pass `placement"));
+    assert!(reference.contains("`ws.agent.setModel` can switch it"));
+    assert_eq!(reference.lines().last(), Some(REMOTE_LONG_COMMANDS_HINT));
+    for text in [&text, &reference] {
+        for live in [
+            FRESH,
+            "2026-10-30",
+            "signed-in",
+            "opus",
+            "connected",
+            "last seen",
+            "d-gone",
+        ] {
+            assert!(!text.contains(live), "{live} in {text}");
+        }
+        for secret in ["10.0.0.1", "100.64.0.1", "7443", &"ab".repeat(32)] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+    }
+    assert_eq!(
+        stable_machines_help(&PlacementHelpInputs::new(&[], &|_| false)),
+        None
+    );
+    assert_eq!(
+        stable_machines_reference(&PlacementHelpInputs::new(&[], &|_| false)),
+        None
+    );
+}
+
+#[test]
+fn stable_help_caps_machines_and_points_at_the_lookup() {
+    let rows: Vec<ExposedMachine> = (0..12)
+        .map(|i| {
+            machine(
+                &format!("m{i:02}"),
+                Some(report(MAC, FRESH, claude(&["opus"]))),
+            )
+        })
+        .collect();
+    let text = stable_machines_help(&PlacementHelpInputs::new(&rows, &|_| false)).unwrap();
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("- \"")).count(),
+        HELP_MAX_MACHINES
+    );
+    assert!(text.contains("- \"m07-name\""), "{text}");
+    assert!(!text.contains("m08"), "{text}");
+    assert!(text.contains("- … 4 more; `ws.agent.machineModels()` lists them all.\n"));
+}
+
+#[test]
 fn a_requested_model_matches_its_listed_id_or_an_alias_of_it() {
     for (listed, requested, expected) in [
         ("claude-opus-4-1", "claude-opus-4-1", true),

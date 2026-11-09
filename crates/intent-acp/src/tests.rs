@@ -11355,6 +11355,10 @@ mod wsapi4_bindings_tests {
         placements: Mutex<Vec<(&'static str, Option<Value>)>>,
         /// What `agent_placement_help` answers.
         placement_help: Mutex<Option<String>>,
+        /// What `remote_machines_capability` answers.
+        machine_models: Mutex<bool>,
+        /// The params of every `agent_machine_models` call.
+        machine_models_calls: Mutex<Vec<Value>>,
         /// What `is_plain_folder_workspace` answers.
         plain_folder: Mutex<bool>,
         /// Count of `agent_watch_completion` (create-path auto-subscribe)
@@ -11857,6 +11861,19 @@ mod wsapi4_bindings_tests {
         fn agent_placement_help(&self, _ws: WorkspaceId) -> BoxFuture<'_, Option<String>> {
             let help = self.placement_help.lock().unwrap().clone();
             Box::pin(async move { help })
+        }
+
+        fn remote_machines_capability(&self) -> bool {
+            *self.machine_models.lock().unwrap()
+        }
+
+        fn agent_machine_models(
+            &self,
+            _ws: WorkspaceId,
+            params: Value,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.machine_models_calls.lock().unwrap().push(params);
+            Box::pin(async { Ok(json!({ "machines": [] })) })
         }
 
         fn is_plain_folder_workspace(&self, _id: WorkspaceId) -> BoxFuture<'_, bool> {
@@ -14058,6 +14075,52 @@ mod wsapi4_bindings_tests {
         let resp = call(&srv, "return await ws.help('agent');").await;
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(!text.contains("Remote placement"), "{text}");
+    }
+
+    /// `ws.agent.machineModels` exists only where the backend serves
+    /// `remoteMachines.models`, and maps `(nodeId?, { provider?, model? })`
+    /// (or the options object alone) onto its params. Through the `ws.*`
+    /// guard, an absent binding fails with an explanation instead of a
+    /// closest-match guess, and the installed one is the real binding.
+    #[tokio::test]
+    async fn machine_models_follows_the_capability_and_maps_its_arguments() {
+        let (srv, api) = server_with_caller("caller-1");
+        let resp = call(&srv, "return 'machineModels' in ws.agent;").await;
+        assert_eq!(text(&resp), "false", "{resp}");
+        let resp = call(&srv, "return await ws.agent.machineModels('m-1');").await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        assert!(
+            text(&resp).contains("this daemon does not serve remote machine model lookups"),
+            "{resp}"
+        );
+        assert!(api.machine_models_calls.lock().unwrap().is_empty());
+
+        *api.machine_models.lock().unwrap() = true;
+        let resp = call(&srv, "return 'machineModels' in ws.agent;").await;
+        assert_eq!(text(&resp), "true", "{resp}");
+        for code in [
+            "return await ws.agent.machineModels();",
+            "return await ws.agent.machineModels('m-1');",
+            "return await ws.agent.machineModels('m-1', { provider: 'codex', model: 'gpt-5' });",
+            "return await ws.agent.machineModels({ model: 'opus' });",
+            "return await ws.agent.machineModels(undefined, { provider: 'codex' });",
+        ] {
+            let resp = call(&srv, code).await;
+            assert_eq!(resp["result"]["isError"], json!(false), "{code}: {resp}");
+        }
+        assert_eq!(
+            *api.machine_models_calls.lock().unwrap(),
+            vec![
+                json!({}),
+                json!({ "nodeId": "m-1" }),
+                json!({ "nodeId": "m-1", "provider": "codex", "model": "gpt-5" }),
+                json!({ "model": "opus" }),
+                json!({ "provider": "codex" }),
+            ]
+        );
+        let resp = call(&srv, "return await ws.agent.machineModels(7);").await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        assert!(text(&resp).contains("nodeId must be a string"), "{resp}");
     }
 
     #[tokio::test]

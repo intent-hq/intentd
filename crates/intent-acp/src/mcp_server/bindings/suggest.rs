@@ -192,6 +192,15 @@ fn first_sentence(text: &str) -> &str {
     text
 }
 
+/// Real bindings installed only when the backend advertises a capability,
+/// so they are absent from the static docs. A call while absent explains
+/// why instead of guessing a closest match.
+const CAPABILITY_GATED: &[(&str, &str)] = &[(
+    "agent.machineModels",
+    "this daemon does not serve remote machine model lookups. \
+     Check with `'machineModels' in ws.agent` before calling it.",
+)];
+
 /// Near-synonyms agents invent, mapped to real method names in priority
 /// order. Only targets present in the namespace are used.
 const ALIASES: &[(&[&str], &[&str])] = &[
@@ -316,6 +325,9 @@ pub(crate) fn unknown_method_message(
                 .collect()
         })
         .unwrap_or_default();
+    if let Some((_, why)) = CAPABILITY_GATED.iter().find(|(p, _)| *p == path) {
+        return format!("ws.{path} is unavailable: {why}");
+    }
     let (parent, leaf) = path.rsplit_once('.').unwrap_or(("", path));
     let mut out = format!("ws.{path} is not a function");
     let help_all = "Call ws.help() for the namespace index.";

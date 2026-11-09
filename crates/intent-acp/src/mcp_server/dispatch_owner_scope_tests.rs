@@ -66,7 +66,7 @@ fn every_binding_method() -> Vec<(String, WorkspaceId)> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for ws in [WorkspaceId::from("ws-hook"), WorkspaceId::chief()] {
-        let prelude = super::super::bindings::prelude_for_workspace(&features, false, &ws);
+        let prelude = super::super::bindings::prelude_for_workspace(&features, false, &ws, true);
         for chunk in prelude.split("method: '").skip(1) {
             let method = chunk.split('\'').next().unwrap_or_default().to_string();
             if seen.insert(method.clone()) {

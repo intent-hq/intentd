@@ -596,6 +596,7 @@ async fn run_hook_script(
     // `ws.*` call acts as the hook's owner — the same identity and the same
     // agent-only service checks as the owner's own turn — even though the
     // run itself is daemon work (the `Caller::Daemon` scope below).
+    let machine_models = api.remote_machines_capability();
     let host = intent_acp::make_workspace_host_for_bridge(
         api,
         hook.workspace_id.clone(),
@@ -614,6 +615,7 @@ async fn run_hook_script(
         agent_features,
         is_sub_agent,
         &hook.workspace_id,
+        machine_models,
     );
     let code = &hook.code;
     let max_lines = HOOK_LOG_MAX_LINES;
@@ -2634,8 +2636,10 @@ mod tests {
             }
         );
         let workspace = WorkspaceId::from_string("ws-hook");
-        let live_prelude = intent_acp::bindings_prelude_for_workspace(&live, false, &workspace);
-        let hook_prelude = intent_acp::bindings_prelude_for_workspace(&hook, false, &workspace);
+        let live_prelude =
+            intent_acp::bindings_prelude_for_workspace(&live, false, &workspace, false);
+        let hook_prelude =
+            intent_acp::bindings_prelude_for_workspace(&hook, false, &workspace, false);
         for installer in ["ws.secret = {", "ws.desktop = Object"] {
             assert!(live_prelude.contains(installer), "{installer}");
             assert!(!hook_prelude.contains(installer), "{installer}");

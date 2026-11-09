@@ -172,6 +172,9 @@ pub(crate) fn with_runtime_capabilities(
                 capabilities["cloudMachines"] = json!(1);
                 // Several named E2B entries, each with its own key.
                 capabilities["cloudMachineEntries"] = json!(1);
+                // `remoteMachines.models`, the experimental machine model
+                // lookup (and the agents' `ws.agent.machineModels`).
+                capabilities["remoteMachineModels"] = json!(1);
             }
         }
         value.to_string()

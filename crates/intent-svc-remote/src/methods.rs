@@ -135,6 +135,7 @@ pub(crate) async fn call(
     match method {
         "backendInfo" => backend_info(svc).await,
         "list" => list(feature, svc).await,
+        "models" => models(feature, svc, &params).await,
         "add" => add(feature, svc, &params).await,
         "remove" => remove(feature, svc, &params).await,
         "refresh" => refresh(feature, svc, &params).await,
@@ -196,6 +197,103 @@ async fn list(feature: &RemoteFeature, svc: &Services) -> Result<Value> {
         })
         .collect();
     Ok(json!({ "machines": machines }))
+}
+
+/// `remoteMachines.models`: each exposed machine's state and, from its last
+/// report, its providers' sign-in status and full model lists, in name
+/// order. Reads the saved rows only: no connect, no refresh. `nodeId`,
+/// `provider` and `model` filter by exact match.
+async fn models(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<Value> {
+    let node_id = text(params, "nodeId", false)?;
+    let provider = text(params, "provider", false)?;
+    let model = text(params, "model", false)?;
+    let mut rows = svc.store().list_exposed_machines().await?;
+    if let Some(node_id) = node_id {
+        rows.retain(|row| row.id == node_id);
+        if rows.is_empty() {
+            return Err(coded(
+                false,
+                "machine-unknown",
+                format!("No exposed machine has id {node_id}."),
+                json!({}),
+            ));
+        }
+    }
+    rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    let machines: Vec<Value> = rows
+        .iter()
+        .filter_map(|row| {
+            let live = feature.running_node(&row.id);
+            machine_models_json(
+                row,
+                live.as_ref().map(RemoteNode::shared_ref),
+                provider,
+                model,
+            )
+        })
+        .collect();
+    Ok(json!({ "machines": machines }))
+}
+
+/// One `MachineModels` row, or `None` when a `provider` or `model` filter
+/// leaves it no provider. Never carries routes, the pin, the capacity or
+/// the link protocol.
+fn machine_models_json(
+    row: &ExposedMachine,
+    live: Option<&Shared>,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Option<Value> {
+    let state = if live.is_some_and(Shared::is_connected) {
+        RemoteMachineState::Connected
+    } else {
+        row.state
+    };
+    let providers: Vec<Value> = row
+        .capabilities
+        .iter()
+        .flat_map(|caps| caps.providers.iter())
+        .filter(|entry| provider.is_none_or(|id| entry.id == id))
+        .filter(|entry| model.is_none_or(|model| entry.models.iter().any(|m| m == model)))
+        .map(|entry| {
+            json!({
+                "id": entry.id,
+                "status": entry.status,
+                "models": entry.models,
+                "modelsStale": entry.models_stale,
+            })
+        })
+        .collect();
+    if providers.is_empty() && (provider.is_some() || model.is_some()) {
+        return None;
+    }
+    let mut machine = Map::new();
+    machine.insert("nodeId".into(), json!(row.id));
+    machine.insert("name".into(), json!(row.name));
+    if let Some(platform) = &row.platform {
+        machine.insert("platform".into(), json!(platform));
+    }
+    machine.insert("state".into(), json!(state));
+    if let Some(last) = &row.last_connected_at {
+        machine.insert("lastConnectedAt".into(), json!(last));
+    }
+    if let Some(observed_at) = &row.observed_at {
+        machine.insert("observedAt".into(), json!(observed_at));
+    }
+    machine.insert(
+        "runningAgents".into(),
+        json!(live.map_or(0, |shared| shared.agents.live_count())),
+    );
+    machine.insert("providers".into(), Value::Array(providers));
+    if let Some(disabled) = row
+        .capabilities
+        .as_ref()
+        .map(|caps| &caps.disabled_providers)
+        .filter(|disabled| !disabled.is_empty())
+    {
+        machine.insert("disabledProviders".into(), json!(disabled));
+    }
+    Some(Value::Object(machine))
 }
 
 /// The validated `add` params.

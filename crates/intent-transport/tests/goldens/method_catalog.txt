@@ -337,6 +337,7 @@ router remoteLinkTraffic.stop
 router remoteMachines.add
 router remoteMachines.backendInfo
 router remoteMachines.list
+router remoteMachines.models
 router remoteMachines.refresh
 router remoteMachines.remove
 router repo.list
