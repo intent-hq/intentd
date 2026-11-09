@@ -255,7 +255,7 @@ pub fn unsupported_message(method: &str) -> String {
         return GIT_ROOTS_MESSAGE.to_owned();
     }
     format!(
-        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet (ws.{namespace}.* is not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.app.question.ask, ws.secret (node-link protocol 14), ws.git.listRoots, ws.terminal.list and readOutput, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
+        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet (ws.{namespace}.* is not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.app.question.ask, ws.secret (node-link protocol 14), ws.git.listRoots, ws.terminal.list and readOutput, ws.search, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
         FORWARDED_NAMESPACES
             .iter()
             .filter(|namespace| **namespace != "mr")

@@ -99,13 +99,15 @@ async fn search(
 }
 
 /// Cut a daemon reply's `matches` to `limit` rows, reporting whether more
-/// hits exist (the probe hit, or the daemon's own `truncated` budget cut).
+/// hits exist: the probe hit, a message `truncated` budget cut, or a note
+/// `nextToken` (how `search.notes` reports its budget cut).
 fn shape(reply: &Value, limit: usize, row: impl Fn(&Value) -> Value) -> (Vec<Value>, bool) {
     let matches = reply
         .get("matches")
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
-    let cut = reply.get("truncated").and_then(Value::as_bool) == Some(true);
+    let cut = reply.get("truncated").and_then(Value::as_bool) == Some(true)
+        || reply.get("nextToken").is_some_and(Value::is_string);
     let rows = matches.iter().take(limit).map(row).collect();
     (rows, cut || matches.len() > limit)
 }
@@ -250,5 +252,9 @@ mod tests {
         assert!(!more);
         let (_, more) = shape(&json!({ "matches": [], "truncated": true }), 3, message_row);
         assert!(more);
+        let (_, more) = shape(&json!({ "matches": [], "nextToken": "t" }), 3, message_row);
+        assert!(more);
+        let (_, more) = shape(&json!({ "matches": [], "nextToken": null }), 3, message_row);
+        assert!(!more);
     }
 }
