@@ -16,6 +16,12 @@
 //!   and leave the process, plus anything it spawned, behind forever. Use it
 //!   for every long-lived process a test owns; call [`GuardedChild::disarm`]
 //!   only when something else takes over the teardown.
+//! - [`ProcessGroup`] (unix only): a watchdog-anchored process group for
+//!   processes a test starts but does not parent (a script's `nohup ... &`
+//!   daemon). Its teardown asks the members to stop, then SIGKILLs the rest,
+//!   and the anchor kills the group once the test process dies, so nothing
+//!   started into it outlives the test. [`is_running`] tells a live process
+//!   from a gone or zombie one.
 //! - [`Barrier`]: a release-file handshake between a test and a shell-script
 //!   fake, so a held state stays stable for as long as the assertions take
 //!   instead of racing a fixed `sleep`. A hold gives up on its own (exit
@@ -47,12 +53,16 @@
 mod barrier;
 #[cfg(unix)]
 mod guarded_child;
+#[cfg(unix)]
+mod process_group;
 pub mod source_lint;
 mod timeout;
 
 pub use barrier::{Barrier, DEFAULT_HOLD_DEADLINE};
 #[cfg(unix)]
 pub use guarded_child::GuardedChild;
+#[cfg(unix)]
+pub use process_group::{is_running, ProcessGroup};
 pub use timeout::{
     scale_test_timeout, test_timeout, test_timeout_multiplier, timeout_multiplier,
     MAX_TIMEOUT_MULTIPLIER, TIMEOUT_MULTIPLIER_ENV,
