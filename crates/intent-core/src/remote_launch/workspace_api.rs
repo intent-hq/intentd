@@ -132,7 +132,7 @@ pub const LOCAL_METHODS: &[&str] = &[
 
 /// Single methods forwarded to head outside [`FORWARDED_NAMESPACES`]: the
 /// `workspace.*` calls other than `info`, the secondary-root list, the
-/// read-only terminal calls and structured questions (registered for the
+/// read-only terminal calls, `ws.search` and structured questions (registered for the
 /// agent's turn on head, so they drain onto its message there). Head runs them as the agent with a local
 /// agent's checks, so `setAgentName` renames only the caller, a sub-agent
 /// cannot propose, and `archive` / `unarchive` act on the workspace on head
@@ -157,6 +157,7 @@ pub const FORWARDED_METHODS: &[&str] = &[
     "git.listRoots",
     "terminal.list",
     "terminal.readOutput",
+    "search.workspace",
     "app.question.ask",
     "secret.request",
     "secret.list",
@@ -254,7 +255,7 @@ pub fn unsupported_message(method: &str) -> String {
         return GIT_ROOTS_MESSAGE.to_owned();
     }
     format!(
-        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet (ws.{namespace}.* is not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.app.question.ask, ws.secret (node-link protocol 14), ws.git.listRoots, ws.terminal.list and readOutput, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
+        "{UNSUPPORTED_CODE}: `{method}` is not supported on remote agents yet (ws.{namespace}.* is not available on an execution node). Remote agents can use ws.file, ws.git.commit, ws.host.exec and ws.workspace.info on their own checkout, and ws.{}, ws.app.question.ask, ws.secret (node-link protocol 14), ws.git.listRoots, ws.terminal.list and readOutput, ws.search, and the other ws.workspace calls (details, the setters, proposeSibling, applyProposal, archive, unarchive) through head.",
         FORWARDED_NAMESPACES
             .iter()
             .filter(|namespace| **namespace != "mr")
@@ -329,6 +330,7 @@ mod tests {
             "crossWorkspace.listSiblings",
             "crossWorkspace.readNote",
             "crossWorkspace.search",
+            "search.workspace",
             "git.listRoots",
             "terminal.list",
             "terminal.readOutput",

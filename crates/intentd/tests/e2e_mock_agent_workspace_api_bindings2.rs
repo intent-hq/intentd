@@ -1845,3 +1845,190 @@ async fn note_bindings_edit_and_cross_workspace_reads() {
     );
     manager.shutdown().await;
 }
+
+//
+// ws.search — notes and agent messages in the caller's own workspace
+//
+
+#[intent_test_macros::daemon_test]
+async fn search_binding_finds_notes_and_messages_in_this_workspace_only() {
+    let Some(script) = gate() else { return };
+
+    let db_dir = common::test_tempdir("intentd-e2e-search-");
+    let db = db_dir.path().join("intentd.db");
+    let store = Store::open(&db).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let ws_root = common::hermetic_workspaces_root();
+    let services = Services::new_isolated(store.clone())
+        .with_workspaces_root(ws_root.path().to_path_buf())
+        .with_settings_registry(common::registry_with_default_provider(ws_root.path()))
+        .with_event_bus(bus.clone());
+
+    let ws = WorkspaceId::new();
+    let mut caller = workspace(&ws, None);
+    caller.repository_owner = Some("intent-hq".into());
+    caller.repository_name = Some("search-fixture".into());
+    store.insert_workspace(&caller).await.expect("insert ws");
+    let sibling_id = WorkspaceId::new();
+    let mut sibling = workspace(&sibling_id, None);
+    sibling.repository_owner = caller.repository_owner.clone();
+    sibling.repository_name = caller.repository_name.clone();
+    store
+        .insert_workspace(&sibling)
+        .await
+        .expect("insert sibling");
+
+    let new_note = |target: WorkspaceId, title: &str, content: &str| {
+        let services = services.clone();
+        let note = NoteCreate {
+            title: title.into(),
+            content: Some(content.into()),
+            tags: None,
+            parent_id: None,
+        };
+        async move {
+            services
+                .create_note(target, note, None, None)
+                .await
+                .expect("create note")
+                .note
+        }
+    };
+    let note = new_note(ws.clone(), "Quokka plan", "Where the quokka lives.").await;
+    let sibling_note = new_note(sibling_id.clone(), "Sibling quokka", "Another quokka.").await;
+
+    let new_agent = |target: WorkspaceId, name: &str| {
+        let services = services.clone();
+        let name = name.to_string();
+        async move {
+            let val = services
+                .agent_create(
+                    target,
+                    Some(name),
+                    None,
+                    None,
+                    None,
+                    None,
+                    intent_core::AgentCreateExtra::default(),
+                )
+                .await
+                .expect("create agent");
+            AgentId::from(val["agent"]["id"].as_str().unwrap())
+        }
+    };
+    let agent_id = new_agent(ws.clone(), "E2E Search").await;
+    let sibling_agent = new_agent(sibling_id.clone(), "Sibling agent").await;
+    let say = |agent: &AgentId, role: &'static str, text: &'static str| {
+        let store = store.clone();
+        let agent = agent.clone();
+        async move {
+            store
+                .append_agent_message(&agent, role, &serde_json::json!(text), &now_iso())
+                .await
+                .expect("append message")
+                .id
+        }
+    };
+    let asked = say(&agent_id, "user", "Did you find the quokka?").await;
+    let answered = say(&agent_id, "assistant", "The quokka is in the plan note.").await;
+    let foreign = say(&sibling_agent, "user", "Sibling quokka question").await;
+
+    let script_static: &'static str = Box::leak(script.into_boxed_str());
+    let base_args: &'static [&'static str] = Box::leak(vec![script_static].into_boxed_slice());
+    let provider = ProviderConfig {
+        command: "node",
+        base_args,
+        supports_authenticate: true,
+        supports_mcp_config: true,
+        mcp_config_flag: Some("--mcp-config"),
+        ..*intent_providers::find_provider("mock").unwrap()
+    };
+
+    let js = format!(
+        r"
+        const fail = (what, value) => {{ throw new Error(what + ': ' + JSON.stringify(value)); }};
+        const ids = (rows) => rows.map(r => r.messageId);
+        const all = await ws.search('quokka');
+        if (all.notes.length !== 1 || all.notes[0].noteId !== '{note_id}'
+            || all.notes[0].markdownLink !== '[Quokka plan](intent://local/{ws_id}/note/{note_id})') fail('notes', all);
+        if (all.notes.some(n => n.noteId === '{sibling_note_id}')) fail('sibling note leaked', all);
+        if (!ids(all.messages).includes('{asked}') || !ids(all.messages).includes('{answered}')) fail('messages', all);
+        if (ids(all.messages).includes('{foreign}')) fail('sibling message leaked', all);
+        if (all.truncated) fail('unexpected truncation', all);
+        const asks = await ws.search('quokka', {{ in: 'messages', role: 'user' }});
+        if ('notes' in asks || !ids(asks.messages).includes('{asked}')
+            || asks.messages.some(m => m.role !== 'user')) fail('role filter', asks);
+        const notesOnly = await ws.search({{ query: 'quok', in: 'notes' }});
+        if ('messages' in notesOnly || notesOnly.notes[0]?.noteId !== '{note_id}') fail('prefix notes', notesOnly);
+        const first = await ws.search('quokka', {{ in: 'messages', limit: 1 }});
+        if (first.messages.length !== 1 || first.truncated !== true) fail('limit', first);
+        let rejected = false;
+        try {{ await ws.search('  '); }} catch (e) {{ rejected = String(e).includes('non-empty'); }}
+        if (!rejected) fail('blank query accepted', null);
+        await ws.note.add('{note_id}', {{ content: 'search checks passed' }});
+        return 'ok';
+        ",
+        note_id = note.id.0,
+        sibling_note_id = sibling_note.id.0,
+        ws_id = ws.0,
+    );
+
+    let behavior = serde_json::json!({
+        "toolCall": {
+            "name": "workspace_api",
+            "arguments": { "code": js, "summary": "search binding e2e" }
+        },
+        "response": "searched",
+    })
+    .to_string();
+
+    let mut extra_env = BTreeMap::new();
+    extra_env.insert("MOCK_AGENT_BEHAVIOR".to_string(), behavior);
+    let cwd_dir = common::test_tempdir("itd-agent-cwd-");
+    let cwd = cwd_dir.path().to_path_buf();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(&cwd);
+    opts.extra_env = extra_env;
+
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let manager = AgentManager::new(services.clone(), sink, 8)
+        .with_mcp_bridge_exe(env!("CARGO_BIN_EXE_intentd"));
+    manager
+        .create_agent(
+            agent_id.clone(),
+            ws.clone(),
+            "E2E Search",
+            "interactive",
+            cwd.clone(),
+            &opts,
+        )
+        .await
+        .expect("create_agent");
+    let acp_session = manager
+        .start_session(&agent_id, cwd.clone(), &provider)
+        .await
+        .expect("start_session");
+    let block: intent_acp::session::ContentBlock =
+        serde_json::from_value(serde_json::json!({ "type": "text", "text": "run checks" }))
+            .unwrap();
+    let stop = manager
+        .run_turn(&agent_id, &ws, &acp_session, vec![block], None)
+        .await
+        .expect("run_turn");
+    assert_eq!(
+        serde_json::to_value(stop).unwrap(),
+        serde_json::json!("end_turn"),
+        "agent completed turn (not refusal)"
+    );
+
+    let updated = services
+        .get_note(ws.clone(), note.id.clone())
+        .await
+        .expect("get note");
+    assert!(
+        updated.content.contains("search checks passed"),
+        "MCP ws.search checks did not finish: {}",
+        updated.content
+    );
+    manager.shutdown().await;
+}
