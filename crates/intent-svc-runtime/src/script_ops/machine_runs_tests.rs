@@ -1414,7 +1414,8 @@ async fn a_lease_end_between_service_processes_settles_its_monitor() {
     assert_eq!(runs.state(&here).unwrap().status, ScriptStatus::Restarting);
     runs.end_agents(
         std::slice::from_ref(&agent),
-        tokio::time::Instant::now() + Duration::from_millis(100),
+        tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_millis(100)),
         "remote-script-lost: the lease ended",
     )
     .await;
@@ -1427,11 +1428,14 @@ async fn a_lease_end_between_service_processes_settles_its_monitor() {
 }
 
 async fn timeout_until(done: impl Fn() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !done() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !done() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("condition reached");
 }
