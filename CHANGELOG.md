@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.166] - 2026-11-09
+
+### 🚀 Features
+
+- *(harness)* Trim the 3.10 doctrine ([#3214](https://github.com/intent-hq/intentd/pull/3214))
+- *(harness)* Skip repo rule files the provider loads natively (3.10) ([#3211](https://github.com/intent-hq/intentd/pull/3211))
+- *(workspace)* Retire cowIsolation, cowSupported and workspace.duplicate ([#3205](https://github.com/intent-hq/intentd/pull/3205))
+- *(remote)* Build a remote agent's workspace_api description for its harness version ([#3220](https://github.com/intent-hq/intentd/pull/3220))
+
+### 🐛 Bug Fixes
+
+- *(notes)* Trim edge whitespace on agent and tool note writes ([#3204](https://github.com/intent-hq/intentd/pull/3204))
+- *(executor)* Keep remote agent checkouts in a short path without spaces ([#3206](https://github.com/intent-hq/intentd/pull/3206))
+- *(remote)* Turn off Claude Code background tasks for remote agents ([#3209](https://github.com/intent-hq/intentd/pull/3209))
+- *(remote)* Say why a remote agent did not start, and word the failover error by cause ([#3217](https://github.com/intent-hq/intentd/pull/3217))
+- *(nodes)* Push a remote agent's commits when it commits or reports ([#3215](https://github.com/intent-hq/intentd/pull/3215))
+
+### 🧪 Testing
+
+- *(harness)* Context budget test with realistic and clean fixtures ([#3213](https://github.com/intent-hq/intentd/pull/3213))
+
+
 ## [0.11.165] - 2026-11-09
 
 ### 🚀 Features
