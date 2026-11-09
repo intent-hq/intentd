@@ -24,6 +24,23 @@ pub(super) fn observed(previous: &Value, fresh: &Value) -> Value {
             }
         }
     }
+    // An unreadable thread read omits the count: keep the last known one so
+    // the diff stays quiet unless a recovered count differs from it.
+    if result
+        .pointer("/requirements/threads/unresolved")
+        .is_none_or(Value::is_null)
+    {
+        if let (Some(count), Some(threads)) = (
+            previous
+                .pointer("/requirements/threads/unresolved")
+                .filter(|v| v.is_i64()),
+            result
+                .pointer_mut("/requirements/threads")
+                .and_then(Value::as_object_mut),
+        ) {
+            threads.insert("unresolved".into(), count.clone());
+        }
+    }
     if fresh["requirements"]["checks"]["items"].is_null()
         && previous["headSha"] == result["headSha"]
         && !previous["headSha"].is_null()
@@ -110,6 +127,9 @@ pub(super) fn diff(old: &Value, new: &Value) -> Vec<String> {
             }
         }
     }
+    // Counts compare the carried last known count (see `observed`): an
+    // unreadable read is silent, and only a count never known before
+    // reports as "readable again".
     match (
         old["requirements"]["threads"]["unresolved"].as_i64(),
         new["requirements"]["threads"]["unresolved"].as_i64(),
@@ -122,9 +142,6 @@ pub(super) fn diff(old: &Value, new: &Value) -> Vec<String> {
                 "thread(s) unresolved/opened"
             }
         )),
-        (Some(_), None) => {
-            changes.push("review threads unreadable (resolution state unavailable)".into());
-        }
         (None, Some(b)) => changes.push(format!("review threads readable again: {b} unresolved")),
         _ => {}
     }
@@ -353,19 +370,33 @@ mod tests {
         );
     }
 
+    /// An unreadable thread read is silent and carries the last known count,
+    /// so a recovery reports only a count that differs from it. Only a count
+    /// never known before reports as "readable again", never as `n → 0`.
     #[test]
     fn qualified_diff_threads_report_availability_without_zero() {
         let mut before = snapshot("passed");
         before["requirements"]["threads"] = json!({"unresolved":2});
-        let mut after = before.clone();
-        after["requirements"]["threads"] = json!({});
+        let mut unreadable = before.clone();
+        unreadable["requirements"]["threads"] = json!({});
+        assert!(diff(&before, &unreadable).is_empty());
         assert_eq!(
-            diff(&before, &after),
-            vec!["review threads unreadable (resolution state unavailable)"]
-        );
-        assert_eq!(
-            diff(&after, &before),
+            diff(&unreadable, &before),
             vec!["review threads readable again: 2 unresolved"]
+        );
+
+        let carried = observed(&before, &unreadable);
+        assert_eq!(carried["requirements"]["threads"]["unresolved"], 2);
+        assert!(unreadable["requirements"]["threads"]["unresolved"].is_null());
+        assert!(diff(&before, &carried).is_empty());
+        let still = observed(&carried, &unreadable);
+        assert!(diff(&carried, &still).is_empty());
+        assert!(diff(&still, &observed(&still, &before)).is_empty());
+        let mut resolved = before.clone();
+        resolved["requirements"]["threads"] = json!({"unresolved":1});
+        assert_eq!(
+            diff(&still, &observed(&still, &resolved)),
+            vec!["thread(s) resolved: 2 → 1 unresolved"]
         );
     }
 
