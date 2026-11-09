@@ -564,6 +564,64 @@ esac
         sup.stop().await;
     }
 
+    /// A paused VM (E2B sandbox) or a sleeping host thaws the same tailcat
+    /// process, whose relay and peer state went stale while frozen: it stays
+    /// alive but no dial reaches it. A host resume must restart it.
+    #[tokio::test]
+    async fn host_resume_restarts_the_sidecar_with_the_same_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-tailcat.sh");
+        let script = r#"#!/bin/sh
+key=""
+for arg in "$@"; do
+  case "$arg" in
+    --key=*) key="${arg#--key=}" ;;
+  esac
+done
+dir=$(dirname "$key")
+case "$1" in
+  genkey)
+    printf 'k' > "$key"
+    ;;
+  serve)
+    echo run >> "$dir/runs"
+    printf '{"listenAddr":"tcTest"}\n'
+    exec sleep 600
+    ;;
+esac
+"#;
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sup = std::sync::Arc::new(TunnelSupervisor::new(path, dir.path()));
+        assert_eq!(sup.start(5181, None).await.unwrap(), "tcTest");
+
+        let tracker = crate::suspend::SuspendTracker::new();
+        let recycler = recycle_on_resume(std::sync::Arc::clone(&sup), tracker.subscribe());
+        let now = std::time::Instant::now();
+        tracker.record_suspend(now, now, Duration::from_secs(60));
+
+        let runs = || {
+            std::fs::read_to_string(dir.path().join("runs"))
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
+        while runs() < 2 || sup.address().await.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "tailcat not restarted after host resume (runs = {})",
+                runs()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(runs(), 2);
+        assert_eq!(sup.address().await.as_deref(), Some("tcTest"));
+
+        recycler.abort();
+        sup.stop().await;
+    }
+
     /// Serializes tests that touch the process-global `INTENTD_TAILCAT_BIN`
     /// env var with tests whose error path reads it (`tailcat_spawn_error`).
     static TAILCAT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
