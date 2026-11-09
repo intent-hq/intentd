@@ -1022,7 +1022,7 @@ or a blocker.
 
 ## Workspace numbers for Micro keys
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/lib/components/layout/WorkspaceTabStrip.svelte; src/features/hardware-console/device/{connection-status,supported-devices}.ts; src/features/hardware-console/assignment/{key-assignment,key-pin-persistence-service,workspace-key-menu}.ts; src/features/hardware-console/components/WorkspaceMicroKeySlot.svelte; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard}.svelte; src/lib/components/layout/WorkspaceTabStrip.svelte; src/features/hardware-console/device/{connection-status,supported-devices}.ts; src/features/hardware-console/assignment/{key-assignment,key-pin-persistence-service,key-switch-service,workspace-key-menu}.ts; src/features/hardware-console/components/WorkspaceMicroKeySlot.svelte; src/features/hardware-console/prompt-picker/{radial-layout,prompt-picker-service}.ts; src/features/hardware-console/prompt-picker/RadialPromptPickerOverlay.svelte; messages/en.json. -->
 
 With a supported **Creator Micro 2** or **Codex Micro** connected to Intent,
 **Home → Workspaces** shows colored numbered squares on assigned workspaces in
@@ -1042,6 +1042,16 @@ The numbers and assignment actions appear only while Intent's Micro integration
 is connected; a device merely being plugged in or detected is not enough.
 Disconnecting hides them without deleting saved assignments. If they are missing,
 check the device's connection to Intent before trying to change assignments.
+
+Pressing keys **1–6** switches to the assigned workspace. When the press lands on
+an agent tab, its chat box is focused so you can type right away.
+
+Push the joystick to open the prompt ring. Up to three suggested prompts from the
+focused chat appear at top, top-right, and right, numbered and tinted purple. Your
+most-used prompts fill the other directions, and **Cancel** is at the bottom.
+Release on a suggestion to send it, or on a used prompt to insert it into the
+focused text box. **Settings → Hardware / Creator Micro → Prompt picker limit**
+sets how many used prompts appear (up to 7).
 
 ## Inspect a failed response and recover
 
