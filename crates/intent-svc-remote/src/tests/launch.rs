@@ -1363,7 +1363,8 @@ async fn head_answers_placement_help_for_lease_agents() {
 /// Remote parity S6: the machine fetches an attachment's bytes for
 /// `ws.file.getAttachment` with the internal `file.attachmentData` frame.
 /// Head answers only for a lease agent, only for an attachment of that
-/// agent's workspace, and only when the bytes fit the link.
+/// agent's workspace, only when the bytes fit the link, and never for an
+/// attachment over the 200 MiB `ws.file.getAttachment` cap.
 #[tokio::test]
 async fn head_serves_attachment_bytes_to_lease_agents_of_the_workspace() {
     use base64::Engine as _;
@@ -1420,6 +1421,27 @@ async fn head_serves_attachment_bytes_to_lease_agents_of_the_workspace() {
         store.insert_attachment(&record).await.unwrap();
     }
     std::fs::remove_file(root.join(".intent/attachments/gone.txt")).unwrap();
+    let cap = intent_services::feature_api::file_ops::ATTACHMENT_COPY_MAX_BYTES;
+    let huge = record("att-huge", workspace(), "huge.bin", 0);
+    std::fs::File::options()
+        .write(true)
+        .open(root.join(".intent/attachments/huge.bin"))
+        .unwrap()
+        .set_len(cap + 1)
+        .unwrap();
+    store.insert_attachment(&huge).await.unwrap();
+    for args in [
+        json!({ "attachmentId": "att-huge" }),
+        json!({ "attachmentId": "att-huge", "offset": 0, "length": MAX_LINK_ATTACHMENT_CHUNK_BYTES }),
+    ] {
+        let over = refused(forward(&link, &agent, ATTACHMENT_DATA_METHOD, args.clone()).await);
+        assert_eq!(over.code, -32602, "{args}: {over:?}");
+        assert_eq!(
+            over.message,
+            format!("attachment-exceeds-cap: {} bytes; limit 209715200", cap + 1),
+            "{args}"
+        );
+    }
 
     let answer = answered(
         forward(
