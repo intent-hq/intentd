@@ -40,7 +40,8 @@ const DEFAULT_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for the `initialize` handshake request. Overridable via
 /// `INTENTD_ACP_INITIALIZE_TIMEOUT_MS` (positive integer milliseconds;
 /// unset/invalid → default), primarily for tests/CI.
-fn initialize_timeout() -> Duration {
+#[must_use]
+pub fn initialize_timeout() -> Duration {
     initialize_timeout_from(std::env::var("INTENTD_ACP_INITIALIZE_TIMEOUT_MS").ok())
 }
 
@@ -87,7 +88,27 @@ pub struct HandshakeResult {
 ///
 /// Propagates errors from [`initialize`] and [`authenticate`].
 pub async fn handshake(conn: &Connection, provider: &ProviderConfig) -> AcpResult<HandshakeResult> {
-    let initialize = initialize(conn).await?;
+    handshake_within(conn, provider, initialize_timeout()).await
+}
+
+/// [`handshake`] with `initialize` allowed `initialize_timeout`.
+///
+/// # Errors
+///
+/// Propagates errors from [`initialize`] and [`authenticate`].
+pub async fn handshake_within(
+    conn: &Connection,
+    provider: &ProviderConfig,
+    initialize_timeout: Duration,
+) -> AcpResult<HandshakeResult> {
+    let (initialize, _) = initialize_with_offers(
+        conn,
+        CallbackOffer::Disabled,
+        ReviewMonitoringOffer::Disabled,
+        false,
+        initialize_timeout,
+    )
+    .await?;
     let authenticated = authenticate(conn, provider).await?;
     Ok(HandshakeResult {
         initialize,
@@ -118,8 +139,14 @@ pub async fn handshake_with_review_monitoring(
     offer: CallbackOffer,
     monitoring: ReviewMonitoringOffer,
 ) -> AcpResult<CallbackHandshake> {
-    let (initialize, generation) =
-        initialize_with_offers(&conn, offer, monitoring, provider.requests_agent_workers).await?;
+    let (initialize, generation) = initialize_with_offers(
+        &conn,
+        offer,
+        monitoring,
+        provider.requests_agent_workers,
+        initialize_timeout(),
+    )
+    .await?;
     let authenticated = authenticate(&conn, provider).await?;
     let generation = (offer == CallbackOffer::V1
         && monitoring == ReviewMonitoringOffer::V1
@@ -149,9 +176,15 @@ async fn initialize_with_offer(
     conn: &Connection,
     offer: CallbackOffer,
 ) -> AcpResult<InitializeResponse> {
-    initialize_with_offers(conn, offer, ReviewMonitoringOffer::Disabled, false)
-        .await
-        .map(|(result, _)| result)
+    initialize_with_offers(
+        conn,
+        offer,
+        ReviewMonitoringOffer::Disabled,
+        false,
+        initialize_timeout(),
+    )
+    .await
+    .map(|(result, _)| result)
 }
 
 async fn initialize_with_offers(
@@ -159,6 +192,7 @@ async fn initialize_with_offers(
     offer: CallbackOffer,
     monitoring: ReviewMonitoringOffer,
     agent_workers: bool,
+    timeout: Duration,
 ) -> AcpResult<(InitializeResponse, Arc<Generation>)> {
     let request = InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(
@@ -188,9 +222,7 @@ async fn initialize_with_offers(
     if !meta.is_empty() {
         params["clientCapabilities"]["_meta"] = Value::Object(meta);
     }
-    let (result, generation) = conn
-        .initialize_recipient(params, initialize_timeout())
-        .await?;
+    let (result, generation) = conn.initialize_recipient(params, timeout).await?;
     let response = serde_json::from_value(result)
         .map_err(|e| AcpError::Protocol(format!("invalid initialize response: {e}")))?;
     Ok((response, generation))

@@ -3,6 +3,10 @@
 // node configuration's provider `args` can select the behavior.
 //
 //   --exit-on-start <code>  exit immediately with <code>
+//   --exit-on-first-start <file>  exit with 3 when <file> is missing, after
+//                           creating it (a start that fails only once)
+//   --slow-initialize <ms>  answer initialize after <ms>
+//   --log-start <file>      append a line to <file> each time it starts
 //   --hang-setup            never answer session/new
 //   --detached-helper       start the `sleep` child in its own process group
 //   --dump-env              write its environment to `agent.env.json` in its
@@ -45,8 +49,20 @@ import net from 'node:net';
 import { spawn, spawnSync } from 'node:child_process';
 
 const argv = process.argv.slice(2);
+const logStartAt = argv.indexOf('--log-start');
+if (logStartAt >= 0) fs.appendFileSync(argv[logStartAt + 1], 'start\n');
 const exitAt = argv.indexOf('--exit-on-start');
 if (exitAt >= 0) process.exit(Number(argv[exitAt + 1] ?? 1));
+const firstStartAt = argv.indexOf('--exit-on-first-start');
+if (firstStartAt >= 0) {
+  const marker = argv[firstStartAt + 1];
+  if (!fs.existsSync(marker)) {
+    fs.writeFileSync(marker, '');
+    process.exit(3);
+  }
+}
+const slowInitAt = argv.indexOf('--slow-initialize');
+const slowInitMs = slowInitAt >= 0 ? Number(argv[slowInitAt + 1]) : 0;
 const hangSetup = argv.includes('--hang-setup');
 const failSetupAt = argv.indexOf('--fail-setup-echo');
 const failSetupVar = failSetupAt >= 0 ? argv[failSetupAt + 1] : undefined;
@@ -183,6 +199,7 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
   }
   switch (msg.method) {
     case 'initialize':
+      if (slowInitMs) await new Promise((resolve) => setTimeout(resolve, slowInitMs));
       return send({ id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
     case 'authenticate':
       return send({ id: msg.id, result: {} });

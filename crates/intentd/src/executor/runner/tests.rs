@@ -645,6 +645,96 @@ async fn node_runner_turn_refusal_names_the_exit_status() {
     );
 }
 
+fn starts(log: &std::path::Path) -> usize {
+    std::fs::read_to_string(log).map_or(0, |log| log.lines().count())
+}
+
+/// A provider that exits before it is ready is started once more, and the
+/// agent then runs as if its first start had worked.
+#[tokio::test]
+async fn node_runner_starts_a_provider_once_more_when_its_first_start_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let (marker, log) = (dir.path().join("failed-once"), dir.path().join("starts"));
+    let Some(h) = harness(
+        1,
+        &[
+            "--exit-on-first-start",
+            marker.to_str().unwrap(),
+            "--log-start",
+            log.to_str().unwrap(),
+        ],
+    ) else {
+        return;
+    };
+    h.runner.launch(launch("a1")).await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hello"))
+        .await;
+    let all = wait_for(&h.runner, "turn end", turn_ended("a1", "t1")).await;
+    let (stop_reason, error) = turn_end(find(&all, turn_ended("a1", "t1")));
+    assert_eq!((stop_reason, error), ("end_turn", None));
+    assert_eq!(all.iter().filter(|r| started("a1")(r)).count(), 1);
+    assert!(!all.iter().any(exited("a1")), "{all:#?}");
+    assert_eq!(starts(&log), 2);
+}
+
+/// A provider that times out on both starts exits once, saying why, and a
+/// turn sent after it is told the same reason.
+#[tokio::test]
+async fn node_runner_gives_up_after_the_second_start_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("starts");
+    let Some(h) = harness(
+        1,
+        &[
+            "--slow-initialize",
+            "5000",
+            "--log-start",
+            log.to_str().unwrap(),
+        ],
+    ) else {
+        return;
+    };
+    h.runner
+        .set_initialize_timeouts(Duration::from_millis(200), Duration::from_secs(60));
+    h.runner.launch(launch("a1")).await;
+    let all = wait_for(&h.runner, "exit", exited("a1")).await;
+    let exit = exit_error(find(&all, exited("a1"))).unwrap().to_owned();
+    assert_eq!(
+        exit,
+        format!("{}: request `initialize` timed out", codes::START)
+    );
+    assert_eq!(all.iter().filter(|r| exited("a1")(r)).count(), 1);
+    assert_eq!(starts(&log), 2);
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("late"))
+        .await;
+    let all = wait_for(&h.runner, "late turn end", turn_ended("a1", "t1")).await;
+    let (_, error) = turn_end(find(&all, turn_ended("a1", "t1")));
+    let error = error.unwrap();
+    assert!(error.starts_with(codes::NOT_RUNNING), "{error}");
+    assert!(error.contains(&exit), "{error}");
+}
+
+/// Only the first agent started after a link binds gets the longer cold
+/// `initialize` timeout.
+#[tokio::test]
+async fn node_runner_allows_a_slow_start_only_for_the_first_launch_after_a_bind() {
+    let Some(h) = harness(2, &["--slow-initialize", "1000"]) else {
+        return;
+    };
+    h.runner
+        .set_initialize_timeouts(Duration::from_millis(300), Duration::from_secs(20));
+    h.runner.adopt_head(Some("hs-1"), &[]);
+    h.runner.launch(launch("a1")).await;
+    wait_for(&h.runner, "cold start", started("a1")).await;
+    h.runner.launch(launch("a2")).await;
+    let all = wait_for(&h.runner, "warm start timeout", exited("a2")).await;
+    let exit = exit_error(find(&all, exited("a2"))).unwrap();
+    assert!(exit.contains("request `initialize` timed out"), "{exit}");
+    assert!(!all.iter().any(exited("a1")), "{all:#?}");
+}
+
 #[tokio::test]
 async fn node_runner_stop_during_setup_ends_waiting_turns() {
     let Some(h) = harness(1, &["--hang-setup"]) else {
