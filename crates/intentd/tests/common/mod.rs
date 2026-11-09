@@ -738,7 +738,9 @@ pub fn hermetic_fixture_identity(cmd: &mut std::process::Command, data_dir: &Pat
         .env_remove("GITHUB_ENTERPRISE_TOKEN")
         .env_remove("GH_HOST")
         .env("GH_CONFIG_DIR", gh_config_dir)
-        .env("INTENTD_SECRETS_FILE", secrets);
+        .env("INTENTD_SECRETS_FILE", secrets)
+        // A machine's agent checkouts stay out of the runner's home.
+        .env("INTENTD_EXECUTOR_WORK_DIR", data_dir.join("w"));
 }
 
 /// Deliberate mock-token exception. Call only with a test-owned synthetic token

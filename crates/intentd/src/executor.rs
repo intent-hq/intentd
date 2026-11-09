@@ -3,8 +3,9 @@
 //! listener serves at `/node/link` and `/node/git`.
 //!
 //! Each executor credential (one per backend) gets its own storage under
-//! `<data_dir>/executor/<credentialId>/` (journal, checkout caches,
-//! worktrees), runner and git sessions, opened when its backend first
+//! `<data_dir>/executor/<credentialId>/` (journal, checkout caches, agent
+//! records; the worktrees go in a short work dir, see [`storage`]), runner
+//! and git sessions, opened when its backend first
 //! binds. Every remote agent counts against the machine's shared agent
 //! limits (the process registry's cap and memory budget, shared with local
 //! agents); a launch they deny is refused with `node-capacity`, never
@@ -126,6 +127,9 @@ pub(crate) fn reconcile_providers(
 /// What the executor service is built from.
 pub(crate) struct ExecutorDeps {
     pub data_dir: PathBuf,
+    /// The base of the agents' work dirs ([`storage::work_base`]); `None`
+    /// keeps their homes in the data dir.
+    pub work_base: Option<PathBuf>,
     /// This daemon's id: a bind must name it as `nodeId`.
     pub node_id: String,
     pub admission: Arc<dyn Admission>,
@@ -361,10 +365,15 @@ impl ExecutorService {
         let base = self.deps.data_dir.join(EXECUTOR_DIR);
         let root = base.join(&credential.0);
         let id = credential.0.clone();
+        let work = self
+            .deps
+            .work_base
+            .as_deref()
+            .map(|work_base| storage::work_dir(work_base, &id));
         let storage = Arc::new(
             tokio::task::spawn_blocking(move || {
                 let socket = storage::git_socket_path(&base, &id, &storage::runtime_base())?;
-                Storage::open(&root, Some(socket))
+                Ok::<_, anyhow::Error>(Storage::open(&root, Some(socket))?.with_work_dir(work))
             })
             .await??,
         );
@@ -602,10 +611,13 @@ impl ExecutorService {
 
 /// Remove a revoked credential's storage root.
 async fn remove_storage(root: PathBuf) {
-    let removed = tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&root) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+    let removed = tokio::task::spawn_blocking(move || {
+        storage::remove_agent_homes(&root);
+        match std::fs::remove_dir_all(&root) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     })
     .await;
     if !matches!(removed, Ok(Ok(()))) {
@@ -1092,6 +1104,10 @@ pub(crate) async fn start_in_daemon(parts: DaemonParts<'_>) -> Option<Arc<Execut
     let service = match ExecutorService::start(
         ExecutorDeps {
             data_dir: parts.data_dir.to_owned(),
+            work_base: storage::work_base(
+                std::env::var_os(storage::WORK_DIR_ENV).as_deref(),
+                machine_home().as_deref(),
+            ),
             node_id,
             admission: Arc::new(RegistryAdmission(parts.manager.clone())),
             launch: Arc::new(SettingsLaunch(parts.settings.clone())),
