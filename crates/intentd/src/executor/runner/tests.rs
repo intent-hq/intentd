@@ -2082,6 +2082,48 @@ async fn node_runner_prepends_the_checkout_notice_to_the_first_turn_only() {
     wait_for(&h.runner, "exit", exited("a1")).await;
 }
 
+/// Every remote agent's first turn on the machine opens with the
+/// long-commands hint, before any checkout notice; later turns do not.
+#[tokio::test]
+async fn node_runner_opens_the_first_turn_with_the_long_commands_hint() {
+    let Some(h) = harness(1, &[]) else { return };
+    *h.checkouts.notice.lock().unwrap() = Some("wip-not-restored.".into());
+    h.runner.launch(launch("a1")).await;
+    let raw = |all: &[JournalRecord], turn: &str| -> String {
+        all.iter()
+            .filter(|r| r.turn_id.as_deref() == Some(turn))
+            .filter_map(|r| match &r.body {
+                JournalBody::Notification { notification } => notification["update"]["content"]
+                    ["text"]
+                    .as_str()
+                    .map(str::to_owned),
+                _ => None,
+            })
+            .collect()
+    };
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("echo-raw"))
+        .await;
+    let all = wait_for(&h.runner, "first turn end", turn_ended("a1", "t1")).await;
+    let first = raw(&all, "t1");
+    let sent: Value = serde_json::from_str(first.strip_prefix("raw: ").unwrap()).unwrap();
+    let first = sent["raw"].as_str().unwrap();
+    let hint = format!(
+        "<system>{}</system>\n\nNote from Intent: wip-not-restored.",
+        intent_core::machine_selection::REMOTE_LONG_COMMANDS_HINT
+    );
+    assert!(first.starts_with(&hint), "{first}");
+    h.runner
+        .prompt(&AgentId::from("a1"), "t2".into(), text("echo-raw"))
+        .await;
+    let all = wait_for(&h.runner, "second turn end", turn_ended("a1", "t2")).await;
+    let second = raw(&all, "t2");
+    assert!(second.starts_with("raw: "), "{second}");
+    assert!(!second.contains("ws.script.start"), "{second}");
+    h.runner.stop(&AgentId::from("a1"));
+    wait_for(&h.runner, "exit", exited("a1")).await;
+}
+
 /// A push while the daemon is stopping is the agent's last one, bounded like
 /// a final stop's (intent-hq/intent#8437).
 #[tokio::test]

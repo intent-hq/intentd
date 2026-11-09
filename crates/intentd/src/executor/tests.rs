@@ -2283,3 +2283,60 @@ async fn a_forge_token_is_held_until_an_older_rebind_or_a_revocation() {
     }
     node.stop().await;
 }
+
+/// A provider's remote launch env reaches its process on the machine:
+/// launched with claude-code's, the agent runs with Claude Code's
+/// background tasks off, so it cannot end a turn on a background shell
+/// that never wakes it. Neither the machine's provider env nor the
+/// selected profile can turn them back on.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_remote_launch_carries_the_providers_remote_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(mut providers) = fixture_providers() else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let claude = intent_providers::find_provider("claude-code").unwrap();
+    let mock = providers.get_mut("mock").unwrap();
+    mock.config.remote_launch_env = claude.remote_launch_env;
+    mock.extra_env
+        .insert("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".into(), "0".into());
+    let node = Running::start_with(
+        dir.path(),
+        MachineApi::new(),
+        CountAdmission::new(4),
+        providers,
+    )
+    .await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    let LinkFrame::Launch(mut launch) = launch_of("a1", "mock") else {
+        unreachable!()
+    };
+    launch.profile_env = Some(intent_core::node_link::LaunchProfileEnv(
+        serde_json::json!({
+            "providerRef": "mock@work",
+            "fingerprint": "f1",
+            "env": [{ "key": "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "value": "0" }],
+        }),
+    ));
+    dialed.link.send(&LinkFrame::Launch(launch)).await.unwrap();
+    let started = next_record(&mut dialed).await.body;
+    assert!(
+        matches!(started, JournalBody::Started { .. }),
+        "{started:?}"
+    );
+    let roots = node.service.agent_roots();
+    assert_eq!(roots.len(), 1, "{roots:?}");
+    let environ = std::fs::read(format!("/proc/{}/environ", roots[0].root_pid)).unwrap();
+    assert!(
+        environ
+            .split(|b| *b == 0)
+            .any(|var| var == b"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1"),
+        "the agent runs with background tasks on"
+    );
+    node.stop().await;
+}

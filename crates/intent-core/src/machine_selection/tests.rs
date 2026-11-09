@@ -813,6 +813,7 @@ fn help_lists_machines_providers_and_sign_in_without_routes() {
     assert!(lines[3].starts_with("To run an agent on one, pass `placement"));
     assert!(text.contains("`profile-not-remote-compatible`"), "{text}");
     assert!(text.contains("`ws.agent.setModel` can switch it"), "{text}");
+    assert_eq!(text.lines().last(), Some(REMOTE_LONG_COMMANDS_HINT));
     for secret in ["10.0.0.1", "100.64.0.1", "7443", &"ab".repeat(32), "d-gone"] {
         assert!(!text.contains(secret), "{secret} leaked: {text}");
     }

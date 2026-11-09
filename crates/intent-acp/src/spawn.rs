@@ -1734,6 +1734,22 @@ mod build_command_tests {
             .map(|v| v.to_string_lossy().into_owned())
     }
 
+    /// Claude Code's remote launch env is the remote node's to apply: a
+    /// local spawn keeps its background tasks.
+    #[test]
+    fn build_command_leaves_remote_launch_env_to_the_remote_node() {
+        let provider = intent_providers::find_provider("claude-code").unwrap();
+        assert!(!provider.remote_launch_env.is_empty());
+        let npx = Path::new("/usr/local/bin/npx");
+        let mut opts = SpawnOptions::new(provider);
+        opts.npx_fallback_binary = Some(npx);
+        opts.npx_fallback_package = provider.npx_only_package;
+        let cmd = build_command(&opts);
+        for (key, _) in provider.remote_launch_env {
+            assert_eq!(env_value(&cmd, key), None, "{key} set on a local spawn");
+        }
+    }
+
     #[test]
     fn build_command_codex_initial_mode_default_and_extra_env_precedence() {
         let provider = intent_providers::find_provider("codex").unwrap();
