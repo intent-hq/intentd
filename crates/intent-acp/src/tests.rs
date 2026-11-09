@@ -11893,7 +11893,21 @@ mod wsapi4_bindings_tests {
                 input.wait_mode.clone(),
                 caller.as_ref().map(|c| c.as_str().to_string()),
             ));
-            Box::pin(async move { Ok(json!({ "agent": { "id": "child-1", "name": "child" } })) })
+            let batch = input.tasks.is_some();
+            let placed = input.placement.is_some();
+            Box::pin(async move {
+                if batch {
+                    return Ok(json!({
+                        "tasks": [{ "taskNoteId": "t-1", "agentId": "child-1", "disposition": "started" }]
+                    }));
+                }
+                if placed {
+                    return Ok(
+                        json!({ "agentId": "child-1", "agent": { "id": "child-1", "name": "child" } }),
+                    );
+                }
+                Ok(json!({ "agent": { "id": "child-1", "name": "child" } }))
+            })
         }
 
         fn agent_subscribe(
@@ -13945,6 +13959,8 @@ mod wsapi4_bindings_tests {
         for code in [
             "const r = await ws.agent.create('n', 'go', { placement: { target: 'e2b', cloudMachineId: 'box' } }); return r.runsOn;",
             "const r = await ws.agent.create('n', 'go', { topLevel: true, placement: { target: 'e2b', cloudMachineId: 'box' } }); return r.runsOn;",
+            "const r = await ws.agent.delegate({ taskNoteId: 't-1', placement: { target: 'e2b', cloudMachineId: 'box' } }); return r.runsOn;",
+            "const r = await ws.agent.delegate({ tasks: [{ taskNoteId: 't-1', placement: { target: 'e2b', cloudMachineId: 'box' } }] }); return r.tasks[0].runsOn;",
         ] {
             assert_eq!(
                 runs_on(call(&srv, code).await),

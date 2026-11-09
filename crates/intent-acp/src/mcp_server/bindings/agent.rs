@@ -416,8 +416,8 @@ fn check_options(args: &Value, what: &str, accepted: &[&str]) -> Result<(), Stri
 
 /// Where an agent runs, for a create result: `{ target: "local" }` on this
 /// backend, else the placement target with the machine's id and name. A
-/// placed agent whose machine is not bound yet (an E2B sandbox still
-/// starting) reports its target alone, never `local`.
+/// placed agent with no machine bound (an E2B sandbox starting or gone)
+/// reports its target alone, never `local`.
 async fn runs_on(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, agent_id: &str) -> Option<Value> {
     let agent = api
         .agent_get(AgentId::from(agent_id), Some(ws.clone()))
