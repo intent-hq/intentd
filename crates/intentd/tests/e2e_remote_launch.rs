@@ -1884,8 +1884,16 @@ fn find_agent_pid_file(root: &Path, agent_id: &str) -> Option<std::path::PathBuf
         .ok()?
         .flatten()
         .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|credential| agent_record(root, credential, agent_id).join("home").is_file())
-        .map(|credential| agent_home(root, &credential, agent_id).join("work").join("agent.pid"))
+        .filter(|credential| {
+            agent_record(root, credential, agent_id)
+                .join("home")
+                .is_file()
+        })
+        .map(|credential| {
+            agent_home(root, &credential, agent_id)
+                .join("work")
+                .join("agent.pid")
+        })
         .find(|path| path.is_file())
 }
 

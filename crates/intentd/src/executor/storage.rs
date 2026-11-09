@@ -364,9 +364,12 @@ impl Storage {
             .context("create agent directory")?;
         let pointer = record.join(HOME);
         let scratch = record.join("home.tmp");
-        std::fs::write(&scratch, std::os::unix::ffi::OsStrExt::as_bytes(home.as_os_str()))
-            .and_then(|()| std::fs::rename(&scratch, &pointer))
-            .context("record the agent's home")?;
+        std::fs::write(
+            &scratch,
+            std::os::unix::ffi::OsStrExt::as_bytes(home.as_os_str()),
+        )
+        .and_then(|()| std::fs::rename(&scratch, &pointer))
+        .context("record the agent's home")?;
         Ok(home)
     }
 
@@ -710,7 +713,10 @@ mod tests {
         drop(storage);
         remove_agent_homes(&root);
         assert!(!home.exists());
-        assert!(root.join(AGENTS).join("a1").exists(), "the root is the caller's");
+        assert!(
+            root.join(AGENTS).join("a1").exists(),
+            "the root is the caller's"
+        );
     }
 
     #[test]
