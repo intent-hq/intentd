@@ -312,7 +312,7 @@ fn frozen_sessions_keep_the_original_builders() {
     for version in FROZEN_VERSIONS {
         let context = crate::harness::resolve_entry(version).context;
         assert!(
-            std::ptr::eq(context, &crate::harness::CONTEXT_V1),
+            std::ptr::eq(context, &raw const crate::harness::CONTEXT_V1),
             "{version}"
         );
     }
@@ -337,6 +337,6 @@ fn frozen_sessions_keep_the_original_builders() {
     ));
     assert!(std::ptr::addr_eq(
         context.workspace_api,
-        &intent_acp::WORKSPACE_API_DOCS_V1
+        &raw const intent_acp::WORKSPACE_API_DOCS_V1
     ));
 }
