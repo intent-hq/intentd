@@ -483,8 +483,14 @@ pub struct LaunchCommand {
     /// first turn is told what came with it. Needs no protocol: a machine
     /// from before ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub new_machine: Option<String>,
+    pub new_machine: Option<Box<MachineName>>,
 }
+
+/// [`LaunchCommand::new_machine`]: a machine's name, a plain string on the
+/// wire (boxed in the launch, which is at its size limit).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MachineName(pub String);
 
 /// [`LaunchCommand::git_identity`]: the `user.name` and `user.email` the
 /// machine sets as the agent's `GIT_AUTHOR_*` / `GIT_COMMITTER_*`

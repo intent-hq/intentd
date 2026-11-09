@@ -20,8 +20,8 @@ use intent_core::machine_selection::{
 use intent_core::machines::ExposedMachine;
 use intent_core::node_link::MachineCapabilities;
 use intent_core::node_link::{
-    FinalPush, ForgeLaunch, GitIdentity, LaunchCommand, LaunchProfileEnv, PreparedCheckout,
-    SetupCommand, SubmodulePin, MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL,
+    FinalPush, ForgeLaunch, GitIdentity, LaunchCommand, LaunchProfileEnv, MachineName,
+    PreparedCheckout, SetupCommand, SubmodulePin, MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL,
     SHARED_CHECKOUT_PROTOCOL,
 };
 use intent_core::placement::{
@@ -1108,7 +1108,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                 .launched_on
                 .as_deref()
                 .is_some_and(|last| last != record.node_id)
-                .then(|| status.node_name.clone());
+                .then(|| Box::new(MachineName(status.node_name.clone())));
             let runtime = node
                 .launch(LaunchCommand {
                     agent_id: agent_id.clone(),

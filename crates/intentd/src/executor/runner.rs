@@ -1306,7 +1306,7 @@ impl Runner {
             },
             worktree: Mutex::new(None),
             notice: Mutex::new(None),
-            new_machine,
+            new_machine: new_machine.map(|machine| machine.0),
             skills_catalog: Mutex::new(None),
             wip: self.push_lock(checkout_of.as_ref().unwrap_or(&agent_id)),
             checkout_of: checkout_of.clone(),
