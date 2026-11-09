@@ -248,7 +248,7 @@ pub(crate) const EMBEDDED_BUNDLED_V3_8: &[(&str, &str)] = &[
     EMBEDDED_BUNDLED_V3_1[8],
 ];
 
-/// The v3.9 embedded specialist bundle: the v3.8 set plus the Planner, which
+/// The v3.9 embedded specialist bundle: the v3.8 set plus the Product Manager, which
 /// writes a critiqued spec and hands it to a Developer.
 pub(crate) const EMBEDDED_BUNDLED_V3_9: &[(&str, &str)] = &[
     EMBEDDED_BUNDLED_V3_8[0],
@@ -258,8 +258,8 @@ pub(crate) const EMBEDDED_BUNDLED_V3_9: &[(&str, &str)] = &[
     EMBEDDED_BUNDLED_V3_8[4],
     EMBEDDED_BUNDLED_V3_8[5],
     (
-        "planner",
-        include_str!("../resources/specialists/v3.9/planner.md"),
+        "product-manager",
+        include_str!("../resources/specialists/v3.9/product-manager.md"),
     ),
 ];
 
@@ -2975,7 +2975,7 @@ mod tests {
         "ui-designer",
         "pr-reviewer",
         "vulnerability-scanner",
-        "planner",
+        "product-manager",
     ];
 
     #[test]

@@ -681,8 +681,8 @@ async fn embedded_bundled_catalog_over_wss() {
         [
             "chief-of-staff",
             "developer",
-            "planner",
             "pr-reviewer",
+            "product-manager",
             "ui-designer",
             "vulnerability-scanner",
         ],
@@ -713,16 +713,22 @@ async fn embedded_bundled_catalog_over_wss() {
         .as_str()
         .is_some_and(|body| body.starts_with("## Vulnerability Scanner\n")));
 
-    let planner = wss_rpc(&mut ws, 4, "specialist.get", json!({ "id": "planner" })).await;
-    let planner = &planner["specialist"];
-    assert_eq!(planner["name"], "Planner");
-    assert_eq!(planner["source"], "bundled");
-    assert_eq!(planner["icon"], "coordinator");
-    assert!(planner.get("codingAgent").is_none());
-    assert!(planner.get("model").is_none());
-    assert!(planner["prompt"]
+    let product_manager = wss_rpc(
+        &mut ws,
+        4,
+        "specialist.get",
+        json!({ "id": "product-manager" }),
+    )
+    .await;
+    let product_manager = &product_manager["specialist"];
+    assert_eq!(product_manager["name"], "Product Manager");
+    assert_eq!(product_manager["source"], "bundled");
+    assert_eq!(product_manager["icon"], "coordinator");
+    assert!(product_manager.get("codingAgent").is_none());
+    assert!(product_manager.get("model").is_none());
+    assert!(product_manager["prompt"]
         .as_str()
-        .is_some_and(|body| body.starts_with("## Planner\n")));
+        .is_some_and(|body| body.starts_with("## Product Manager\n")));
 
     let ralph = wss_rpc(&mut ws, 5, "specialist.get", json!({ "id": "ralph" })).await;
     assert_eq!(ralph["specialist"]["source"], "bundled");

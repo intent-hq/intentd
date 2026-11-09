@@ -1,4 +1,4 @@
-//! Adds the bundled Planner specialist; every other surface is 3.8's.
+//! Adds the bundled Product Manager specialist; every other surface is 3.8's.
 
 use super::{Doctrine, HarnessEntry};
 
@@ -22,13 +22,13 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     #[test]
-    fn golden_v3_9_planner_bytes() {
+    fn golden_v3_9_product_manager_bytes() {
         let content = super::ENTRY
             .doctrine
             .specialists
             .iter()
-            .find_map(|(id, content)| (*id == "planner").then_some(*content))
-            .expect("planner specialist");
+            .find_map(|(id, content)| (*id == "product-manager").then_some(*content))
+            .expect("product manager specialist");
         let actual = Sha256::digest(content)
             .iter()
             .fold(String::new(), |mut hex, byte| {
@@ -37,12 +37,12 @@ mod tests {
             });
         assert_eq!(
             actual,
-            "7af68d36ab2f3e8c1ead2a84e793c70b23c72331f959219195d84cc15ebddb44"
+            "842ef09f07221da0997f0f2144f11fb46df795acfeb161c82966628295e140f3"
         );
     }
 
     #[test]
-    fn v3_9_only_adds_the_planner() {
+    fn v3_9_only_adds_the_product_manager() {
         let current = super::super::resolve_entry("3.9");
         let previous = super::super::resolve_entry("3.8");
         assert_eq!(current.version, "3.9");
@@ -54,14 +54,14 @@ mod tests {
         assert_eq!((current.default_features)(), (previous.default_features)());
         assert_eq!(current.feature_labels, previous.feature_labels);
         let specialists: &[(&str, &str)] = current.doctrine.specialists;
-        let (planner, kept) = specialists.split_last().expect("non-empty bundle");
-        assert_eq!(planner.0, "planner");
+        let (added, kept) = specialists.split_last().expect("non-empty bundle");
+        assert_eq!(added.0, "product-manager");
         assert_eq!(kept, previous.doctrine.specialists);
-        let (meta, body) = crate::specialists::parse_frontmatter(planner.1);
-        assert_eq!(meta["name"], "Planner");
+        let (meta, body) = crate::specialists::parse_frontmatter(added.1);
+        assert_eq!(meta["name"], "Product Manager");
         assert_eq!(meta["icon"], "coordinator");
         assert!(meta.get("model").is_none());
-        assert!(body.contains(r#"{ specialist: "planner" }"#));
+        assert!(body.contains(r#"{ specialist: "product-manager" }"#));
         assert!(body.contains(r#"{ topLevel: true, specialist: "developer" }"#));
     }
 }
