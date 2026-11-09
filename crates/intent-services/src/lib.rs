@@ -38076,6 +38076,7 @@ mod plugins;
 mod prompt_sections;
 mod rules;
 mod session_surfaces;
+mod skill_catalog;
 pub mod skills;
 mod specialists;
 

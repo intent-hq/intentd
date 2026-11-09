@@ -522,6 +522,8 @@ pub(crate) struct RepoRulesInputs<'a> {
 /// What the skills block is built from.
 pub(crate) struct SkillsBlockInputs<'a> {
     pub skills: &'a [crate::skills::SkillMetadata],
+    /// The agent's provider and the MCP servers it can reach.
+    pub environment: &'a crate::skill_catalog::SkillEnvironment,
 }
 
 /// A version's builders for the context an agent gets at spawn, beyond its

@@ -2087,6 +2087,45 @@ fn profile_overlay_beats_inherited_and_captured_before_home_lookup() {
 }
 
 #[test]
+fn mcp_config_file_follows_the_profile_overlay() {
+    let root = tempfile::tempdir().unwrap();
+    let personal = root.path().join("personal");
+    let work = root.path().join("work");
+    let codex = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n");
+    assert_eq!(codex.mcp_config_file(), Some(personal.join("config.toml")));
+    let codex = codex.with_profile(Some(profile(
+        "codex@work",
+        "f1",
+        &[("CODEX_HOME", Some(work.to_str().unwrap()))],
+    )));
+    assert_eq!(codex.mcp_config_file(), Some(work.join("config.toml")));
+
+    let claude = conflicting_context(InstalledCli::Claude, root.path(), "#!/bin/sh\n");
+    assert_eq!(
+        claude.mcp_config_file(),
+        Some(personal.join(".claude.json"))
+    );
+    let claude_work = claude.clone().with_profile(Some(profile(
+        "claude-code@work",
+        "f1",
+        &[("CLAUDE_CONFIG_DIR", Some(work.to_str().unwrap()))],
+    )));
+    assert_eq!(
+        claude_work.mcp_config_file(),
+        Some(work.join(".claude.json"))
+    );
+    let claude_unset = claude.with_profile(Some(profile(
+        "claude-code@default-home",
+        "f1",
+        &[("CLAUDE_CONFIG_DIR", None)],
+    )));
+    assert_eq!(
+        claude_unset.mcp_config_file(),
+        Some(root.path().join(".claude.json"))
+    );
+}
+
+#[test]
 fn profile_cannot_override_enforced_executable_or_policy() {
     let root = tempfile::tempdir().unwrap();
     let context = conflicting_context(InstalledCli::Codex, root.path(), "#!/bin/sh\n")

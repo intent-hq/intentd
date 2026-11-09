@@ -267,6 +267,18 @@ impl InstalledContext {
             .or_else(|| self.home().map(|p| p.join(".claude")))
     }
 
+    /// The provider's own MCP config file for this launch environment:
+    /// Codex's `config.toml` or Claude Code's `.claude.json`.
+    pub(crate) fn mcp_config_file(&self) -> Option<PathBuf> {
+        match self.runtime.cli() {
+            InstalledCli::Codex => self.codex_home().map(|home| home.join("config.toml")),
+            InstalledCli::Claude => nonempty(&self.env, "CLAUDE_CONFIG_DIR")
+                .map(PathBuf::from)
+                .or_else(|| self.home())
+                .map(|dir| dir.join(".claude.json")),
+        }
+    }
+
     fn home(&self) -> Option<PathBuf> {
         nonempty(&self.env, "HOME")
             .or_else(|| nonempty(&self.env, "USERPROFILE"))

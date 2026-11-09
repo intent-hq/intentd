@@ -43,21 +43,21 @@ const REALISTIC_MAX_RATIO: f64 = 0.5;
 
 /// Clean-fixture ceiling per provider: `(provider, top-level chars,
 /// sub-agent chars)`. Measured on harness 3.10 with the compact ws.*
-/// reference and the trimmed doctrine (2026-11-09); lower each row again as
-/// further cuts land.
+/// reference, the trimmed doctrine and the skills cut (2026-11-09); lower
+/// each row again as further cuts land.
 const CLEAN_CEILING: &[(&str, usize, usize)] = &[
-    ("auggie", 27_026, 25_386),
-    ("claude-code", 27_305, 25_665),
-    ("codex", 27_026, 25_386),
-    ("cortex", 27_026, 25_386),
-    ("opencode", 27_026, 25_386),
-    ("unsloth", 27_026, 25_386),
-    ("pi", 27_026, 25_386),
-    ("droid", 27_305, 25_665),
-    ("grok", 27_305, 25_665),
-    ("antigravity", 27_026, 25_386),
-    ("cursor", 27_254, 25_614),
-    ("mock", 27_026, 25_386),
+    ("auggie", 24_859, 23_219),
+    ("claude-code", 25_138, 23_498),
+    ("codex", 24_859, 23_219),
+    ("cortex", 24_859, 23_219),
+    ("opencode", 24_859, 23_219),
+    ("unsloth", 24_859, 23_219),
+    ("pi", 24_859, 23_219),
+    ("droid", 25_138, 23_498),
+    ("grok", 25_138, 23_498),
+    ("antigravity", 24_859, 23_219),
+    ("cursor", 25_087, 23_447),
+    ("mock", 24_859, 23_219),
 ];
 
 /// Where the fixtures' paths appear to live, so sizes do not depend on the
@@ -331,14 +331,22 @@ async fn measure(
         None,
         Some(&session),
         docs.as_deref(),
+        &crate::skill_catalog::SkillEnvironment::default(),
         executor.as_ref(),
     )
     .await
     .expect("assembled prompt");
     // The prompt assembler discovers skills from the workspace's checkout
     // and the daemon's home; the fixture's live in a temp home instead.
+    // No MCP servers configured in Intent or the provider, as on a fresh
+    // machine: skills that need one are hidden.
+    let environment = crate::skill_catalog::SkillEnvironment::new(
+        provider.id,
+        Some(std::collections::BTreeMap::new()),
+    );
     let skills = (entry.context.skills_block)(&crate::harness::SkillsBlockInputs {
         skills: &fixture.skills,
+        environment: &environment,
     });
     let prompt = if skills.trim().is_empty() {
         prompt

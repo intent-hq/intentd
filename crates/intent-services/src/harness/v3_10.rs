@@ -35,16 +35,17 @@ fn repo_rules(inputs: &RepoRulesInputs<'_>) -> crate::rules::RepoRules {
     crate::rules::workspace_rules_native_aware(inputs)
 }
 
-/// The skills block: budget and hidden skills.
+/// The skills block: hides the skills this agent cannot use and lists the
+/// rest within a budget.
 fn skills_block(inputs: &SkillsBlockInputs<'_>) -> String {
-    super::skills_block_v1(inputs)
+    crate::skill_catalog::build(inputs.skills, inputs.environment).text
 }
 
 /// The skills the skills block leaves out, with why.
 fn hidden_skills(
     inputs: &SkillsBlockInputs<'_>,
 ) -> Vec<intent_core::prompt_breakdown::HiddenSkill> {
-    super::no_hidden_skills(inputs)
+    crate::skill_catalog::build(inputs.skills, inputs.environment).hidden
 }
 
 /// The remote-placement text: stable machine identity only.
@@ -110,25 +111,54 @@ mod tests {
             executor: None,
         };
         assert_eq!((current.repo_rules)(&rules), (previous.repo_rules)(&rules));
-        let skills = [crate::skills::SkillMetadata {
-            name: "pdf".into(),
-            description: "Read and write PDF files.".into(),
-            location: "/skills/pdf/SKILL.md".into(),
-            resource_directory: None,
-            scope: "user".into(),
-            allowed_tools: None,
-            compatibility: None,
-        }];
-        let skills = super::SkillsBlockInputs { skills: &skills };
-        assert_eq!(
-            (current.skills_block)(&skills),
-            (previous.skills_block)(&skills)
-        );
         let machines = [machine("d-mac"), machine("d-box")];
         let connected = |id: &str| id == "d-mac";
         assert_eq!(
             (current.placement_help)(&machines, &connected),
             (previous.placement_help)(&machines, &connected)
         );
+    }
+
+    /// 3.10 hides the skills an agent cannot use and budgets the rest;
+    /// older harnesses keep the full catalog.
+    #[test]
+    fn v3_10_skills_block_hides_and_budgets() {
+        let skill = |name: &str, compatibility: Option<&str>| crate::skills::SkillMetadata {
+            name: name.into(),
+            description: "Read and write PDF files.".into(),
+            location: format!("/skills/{name}/SKILL.md"),
+            resource_directory: None,
+            scope: "user".into(),
+            allowed_tools: None,
+            compatibility: compatibility.map(str::to_string),
+            mcp_servers: Vec::new(),
+        };
+        let skills = [skill("pdf", None), skill("desktop", Some("Cowork only"))];
+        let environment = crate::skill_catalog::SkillEnvironment::new("codex", None);
+        let inputs = super::SkillsBlockInputs {
+            skills: &skills,
+            environment: &environment,
+        };
+        let block = crate::skill_catalog::build(&skills, &environment);
+        let current = super::super::resolve_entry("3.10").context;
+        assert_eq!((current.skills_block)(&inputs), block.text);
+        let hidden = (current.hidden_skills)(&inputs);
+        assert_eq!(hidden, block.hidden);
+        assert_eq!(
+            hidden
+                .iter()
+                .map(|h| (h.name.as_str(), h.reason))
+                .collect::<Vec<_>>(),
+            [(
+                "desktop",
+                intent_core::prompt_breakdown::HiddenSkillReason::Compatibility
+            )]
+        );
+        let previous = super::super::resolve_entry("3.8").context;
+        assert_eq!(
+            (previous.skills_block)(&inputs),
+            crate::skills::build_skills_catalog(&skills)
+        );
+        assert_eq!((previous.hidden_skills)(&inputs), []);
     }
 }

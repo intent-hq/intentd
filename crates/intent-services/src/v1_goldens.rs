@@ -1750,6 +1750,7 @@ fn golden_skills_catalog_wrapper() {
         scope: "project".to_string(),
         allowed_tools: None,
         compatibility: None,
+        mcp_servers: Vec::new(),
     };
     assert_eq!(crate::skills::build_skills_catalog(&[]), "");
     assert_eq!(

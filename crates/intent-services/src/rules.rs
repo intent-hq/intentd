@@ -608,7 +608,9 @@ pub(crate) async fn assemble_system_prompt(
         workspace,
         agent_session,
         workspace_api_docs,
-        true,
+        Some(&crate::skill_catalog::SkillEnvironment::new(
+            agent_type, None,
+        )),
         None,
     )
     .await
@@ -631,6 +633,7 @@ pub(crate) async fn assemble_agent_system_prompt(
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
     workspace_api_docs: Option<&str>,
+    skills_environment: &crate::skill_catalog::SkillEnvironment,
     rule_executor: Option<&crate::native_rules::RuleExecutor>,
 ) -> Option<String> {
     assemble_system_prompt_sections(
@@ -645,6 +648,7 @@ pub(crate) async fn assemble_agent_system_prompt(
         workspace,
         agent_session,
         workspace_api_docs,
+        skills_environment,
         rule_executor,
     )
     .await
@@ -654,7 +658,8 @@ pub(crate) async fn assemble_agent_system_prompt(
 /// [`assemble_system_prompt`] for a local agent spawn, with the prompt's
 /// measured sections for the `promptBreakdown` the spawn path records.
 /// `rule_executor` says what runs the agent, so the session's harness can
-/// skip rule files the provider loads by itself ([`crate::native_rules`]).
+/// skip rule files the provider loads by itself ([`crate::native_rules`]);
+/// the skills block is built for `skills_environment`.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn assemble_system_prompt_sections(
     store: &Store,
@@ -668,6 +673,7 @@ pub(crate) async fn assemble_system_prompt_sections(
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
     workspace_api_docs: Option<&str>,
+    skills_environment: &crate::skill_catalog::SkillEnvironment,
     rule_executor: Option<&crate::native_rules::RuleExecutor>,
 ) -> Option<AssembledPrompt> {
     assemble_system_prompt_layers(
@@ -682,7 +688,7 @@ pub(crate) async fn assemble_system_prompt_sections(
         workspace,
         agent_session,
         workspace_api_docs,
-        true,
+        Some(skills_environment),
         rule_executor,
     )
     .await
@@ -721,13 +727,15 @@ pub(crate) async fn assemble_remote_system_prompt(
         workspace,
         agent_session,
         workspace_api_docs,
-        false,
+        None,
         remote.as_ref(),
     )
     .await
 }
 
-#[expect(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+/// `skills` is the environment the skills block is built for; `None` adds
+/// no skills block.
+#[expect(clippy::too_many_arguments)]
 async fn assemble_system_prompt_layers(
     store: &Store,
     workspace_path: Option<&Path>,
@@ -740,7 +748,7 @@ async fn assemble_system_prompt_layers(
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
     workspace_api_docs: Option<&str>,
-    skills_catalog: bool,
+    skills: Option<&crate::skill_catalog::SkillEnvironment>,
     rule_executor: Option<&crate::native_rules::RuleExecutor>,
 ) -> Option<AssembledPrompt> {
     // The session's pinned harness + doctrine (H2): a stamped session keeps
@@ -835,12 +843,13 @@ async fn assemble_system_prompt_layers(
     // workspace path is available, discover and inject the skills catalog. Empty
     // catalog ⇒ no layer appended. Discovery failures degrade gracefully (log
     // warn, omit layer) — never fail prompt assembly.
-    if let Some(ws) = workspace.filter(|_| skills_catalog) {
+    if let (Some(ws), Some(environment)) = (workspace, skills) {
         if let Some(repo_path) = crate::git_ops::worktree_path(ws) {
             let skills =
                 crate::skills::discover_skills_for_prompt(&repo_path.to_string_lossy()).await;
             match (entry.context.skills_block)(&crate::harness::SkillsBlockInputs {
                 skills: &skills,
+                environment,
             }) {
                 catalog if !catalog.trim().is_empty() => {
                     parts.push((LayerTag::user("skills", "Skills"), catalog));
@@ -849,6 +858,7 @@ async fn assemble_system_prompt_layers(
             }
             hidden_skills = (entry.context.hidden_skills)(&crate::harness::SkillsBlockInputs {
                 skills: &skills,
+                environment,
             });
         }
     }
@@ -2168,6 +2178,7 @@ This is a test skill.
                     None,
                     Some(&session),
                     None,
+                    &crate::skill_catalog::SkillEnvironment::default(),
                     executor,
                 )
                 .await
@@ -2296,6 +2307,7 @@ This is a test skill.
                 None,
                 Some(&session),
                 None,
+                &crate::skill_catalog::SkillEnvironment::default(),
                 Some(executor),
             )
             .await

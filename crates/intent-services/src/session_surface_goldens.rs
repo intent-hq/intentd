@@ -503,9 +503,13 @@ fn frozen_sessions_keep_the_original_builders() {
         scope: "user".into(),
         allowed_tools: None,
         compatibility: None,
+        mcp_servers: Vec::new(),
     }];
     assert_eq!(
-        (context.skills_block)(&crate::harness::SkillsBlockInputs { skills: &skills }),
+        (context.skills_block)(&crate::harness::SkillsBlockInputs {
+            skills: &skills,
+            environment: &crate::skill_catalog::SkillEnvironment::new("codex", None),
+        }),
         crate::skills::build_skills_catalog(&skills)
     );
     assert!(std::ptr::fn_addr_eq(

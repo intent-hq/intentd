@@ -59,6 +59,9 @@ pub(crate) struct SkillMetadata {
     pub allowed_tools: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compatibility: Option<String>,
+    /// The MCP servers whose tools the skill names (`mcp__<server>__`).
+    #[serde(skip)]
+    pub mcp_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +245,7 @@ impl SkillMetadata {
             scope: skill.scope,
             allowed_tools: skill.allowed_tools,
             compatibility: skill.compatibility,
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -923,8 +927,34 @@ fn parse_skill_file(skill_path: &Path, state: &mut ScanState) -> Option<ParsedSk
             scope: "user".to_string(), // Will be overridden by scan_skills
             allowed_tools: parsed.allowed_tools,
             compatibility: parsed.compatibility,
+            mcp_servers: mcp_server_refs(&content),
         },
     })
+}
+
+/// The MCP servers whose tools `content` names as `mcp__<server>__`, sorted.
+fn mcp_server_refs(content: &str) -> Vec<String> {
+    let mut servers = std::collections::BTreeSet::new();
+    for (at, _) in content.match_indices("mcp__") {
+        if content[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let rest = &content[at + "mcp__".len()..];
+        let Some(end) = rest.find("__") else { continue };
+        let server = &rest[..end];
+        if !server.is_empty()
+            && server
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            servers.insert(server.to_string());
+        }
+    }
+    servers.into_iter().collect()
 }
 
 #[derive(Debug)]
@@ -1082,7 +1112,7 @@ pub(crate) fn build_skills_catalog(skills: &[SkillMetadata]) -> String {
 }
 
 /// Escape XML special characters
-fn escape_xml(text: &str) -> String {
+pub(crate) fn escape_xml(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
