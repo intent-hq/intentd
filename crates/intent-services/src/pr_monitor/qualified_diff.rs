@@ -24,6 +24,23 @@ pub(super) fn observed(previous: &Value, fresh: &Value) -> Value {
             }
         }
     }
+    // An unreadable thread read omits the count: keep the last known one so
+    // the diff stays quiet unless a recovered count differs from it.
+    if result
+        .pointer("/requirements/threads/unresolved")
+        .is_none_or(Value::is_null)
+    {
+        if let (Some(count), Some(threads)) = (
+            previous
+                .pointer("/requirements/threads/unresolved")
+                .filter(|v| v.is_i64()),
+            result
+                .pointer_mut("/requirements/threads")
+                .and_then(Value::as_object_mut),
+        ) {
+            threads.insert("unresolved".into(), count.clone());
+        }
+    }
     if fresh["requirements"]["checks"]["items"].is_null()
         && previous["headSha"] == result["headSha"]
         && !previous["headSha"].is_null()
@@ -110,6 +127,9 @@ pub(super) fn diff(old: &Value, new: &Value) -> Vec<String> {
             }
         }
     }
+    // Counts compare the carried last known count (see `observed`): an
+    // unreadable read is silent, and only a count never known before
+    // reports as "readable again".
     match (
         old["requirements"]["threads"]["unresolved"].as_i64(),
         new["requirements"]["threads"]["unresolved"].as_i64(),
@@ -122,9 +142,6 @@ pub(super) fn diff(old: &Value, new: &Value) -> Vec<String> {
                 "thread(s) unresolved/opened"
             }
         )),
-        (Some(_), None) => {
-            changes.push("review threads unreadable (resolution state unavailable)".into());
-        }
         (None, Some(b)) => changes.push(format!("review threads readable again: {b} unresolved")),
         _ => {}
     }
