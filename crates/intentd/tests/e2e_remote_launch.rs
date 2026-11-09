@@ -1417,14 +1417,19 @@ async fn machine_runs(
 
     // A service started by the agent, stopped from the app.
     // timing-guard: the saved script's own runtime on the machine, not a wait in the test
-    let wsapi = r#"wsapi const c = await ws.script.create("msrv", "echo up; sleep 300", "service"); const id = c.id ?? c.script.id; await ws.script.start(id); return JSON.stringify({ marker: "turn-206", id });"#;
+    let wsapi = r#"wsapi const c = await ws.script.create("msrv", "echo up; sleep 300", "service"); const id = c.id ?? c.script.id; await ws.script.start(id); const m = await ws.script.monitor(id, { ttlMs: 600000 }); return JSON.stringify({ marker: "turn-206", id, m });"#;
     let reply = wsapi_turn(rpc_ws, events, (ws_id, agent_id), wsapi, "turn-206", 206).await;
     let body = wsapi_value(&reply);
     let service_id = body["id"].as_str().unwrap().to_owned();
+    let monitor_id = body["m"]["monitor"]["monitorId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{body}"))
+        .to_owned();
     machine_run_until(rpc_ws, (ws_id, &service_id, agent_id), 210, |run| {
         run["runtime"]["status"] == "running"
     })
     .await;
+    machine_monitor_in_the_footer(rpc_ws, (ws_id, agent_id), (&service_id, &monitor_id)).await;
     let stopped = ok(
         rpc_ws,
         250,
@@ -1434,6 +1439,74 @@ async fn machine_runs(
     .await;
     assert_eq!(stopped["status"], "idle", "{stopped}");
     service_id
+}
+
+/// The app reads a remote agent's machine-run monitor as it reads a local
+/// one (the chat footer's `scriptMonitor.list` / `scriptMonitor.get`, the
+/// agent's `waitingOnScriptMonitors`), and cancels it with
+/// `scriptMonitor.cancel`.
+async fn machine_monitor_in_the_footer(
+    rpc_ws: &mut common::TlsWs,
+    (ws_id, agent_id): (&str, &str),
+    (script_id, monitor_id): (&str, &str),
+) {
+    let page = ok(
+        rpc_ws,
+        240,
+        "scriptMonitor.list",
+        json!({ "workspaceId": ws_id, "view": "summary", "state": "active", "limit": 100 }),
+    )
+    .await;
+    let rows = page["monitors"].as_array().cloned().unwrap_or_default();
+    let row = rows
+        .iter()
+        .find(|row| row["monitorId"] == monitor_id)
+        .unwrap_or_else(|| panic!("the machine monitor is not listed: {page}"));
+    assert_eq!(row["agentId"], agent_id, "{row}");
+    assert_eq!(row["scriptId"], script_id, "{row}");
+    assert_eq!(row["scriptName"], "msrv", "{row}");
+    assert_eq!(row["state"], "active", "{row}");
+    assert!(row["runId"].is_string(), "{row}");
+    let full = ok(
+        rpc_ws,
+        241,
+        "scriptMonitor.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(full.to_string().contains(monitor_id), "{full}");
+    let got = ok(
+        rpc_ws,
+        242,
+        "scriptMonitor.get",
+        json!({ "workspaceId": ws_id, "monitorId": monitor_id }),
+    )
+    .await;
+    assert_eq!(got["monitorId"], monitor_id, "{got}");
+    assert_eq!(got["state"], "active", "{got}");
+    let agents = ok(rpc_ws, 243, "agent.list", json!({ "workspaceId": ws_id })).await;
+    let waiting = agents["agents"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == agent_id))
+        .map_or(Value::Null, |row| row["waitingOnScriptMonitors"].clone());
+    assert!(waiting.to_string().contains(monitor_id), "{agents}");
+
+    let cancelled = ok(
+        rpc_ws,
+        244,
+        "scriptMonitor.cancel",
+        json!({ "workspaceId": ws_id, "monitorId": monitor_id }),
+    )
+    .await;
+    assert_eq!(cancelled["ok"], true, "{cancelled}");
+    let page = ok(
+        rpc_ws,
+        245,
+        "scriptMonitor.list",
+        json!({ "workspaceId": ws_id, "view": "summary", "state": "active", "limit": 100 }),
+    )
+    .await;
+    assert!(!page.to_string().contains(monitor_id), "{page}");
 }
 
 /// A backend `intentd serve` on `data_dir` with a seeded workspace on

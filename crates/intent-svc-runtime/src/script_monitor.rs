@@ -244,13 +244,24 @@ impl ScriptMonitorExt for Services {
     }
 
     async fn active_script_monitors_for_agent(&self, agent: &AgentId) -> Vec<Value> {
-        self.store()
+        let mut rows: Vec<Value> = self
+            .store()
             .script_monitor_waiting(None, Some(agent))
             .await
             .unwrap_or_default()
             .into_iter()
             .map(|(_, row)| row)
-            .collect()
+            .collect();
+        // A remote agent's watches are its machine runs' monitors.
+        if let Some(runs) = self.script_manager().machine_runs() {
+            rows.extend(
+                runs.waiting(None)
+                    .into_iter()
+                    .filter(|(_, owner, _)| owner == agent)
+                    .map(|(_, _, row)| row),
+            );
+        }
+        rows
     }
 
     async fn annotate_waiting_on_script_monitors(&self, agent: &AgentId, data: &mut Value) {

@@ -4307,11 +4307,7 @@ impl Services {
             )
         };
         let mut script_monitors_by_agent: HashMap<String, Vec<Value>> = HashMap::new();
-        for (agent, row) in self
-            .store
-            .script_monitor_waiting(Some(&workspace_id), None)
-            .await?
-        {
+        for (agent, row) in self.script_monitors_waiting(&workspace_id).await? {
             script_monitors_by_agent.entry(agent).or_default().push(row);
         }
         let mut rows: Vec<AgentLite> = sessions
@@ -16292,11 +16288,7 @@ impl Services {
         // one workspace-wide monitor query.
         let mut pr_monitors_by_agent = self.active_pr_monitors_by_agent(&workspace_id).await;
         let mut script_monitors_by_agent: HashMap<String, Vec<Value>> = HashMap::new();
-        for (owner, row) in self
-            .store
-            .script_monitor_waiting(Some(&workspace_id), None)
-            .await?
-        {
+        for (owner, row) in self.script_monitors_waiting(&workspace_id).await? {
             script_monitors_by_agent.entry(owner).or_default().push(row);
         }
 
@@ -17574,6 +17566,26 @@ impl Services {
     /// falls back to the pre-DELIV-1 store-only persist so hermetic tests
     /// keep working. Auto-queue-on-store-failure mirrors
     /// [`Services::agent_send_message_op`].
+    /// The active script monitors of `workspace_id` as `(owner, waiting
+    /// row)`: the stored ones, then remote agents' machine-run ones.
+    async fn script_monitors_waiting(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Vec<(String, Value)>> {
+        let mut rows = self
+            .store
+            .script_monitor_waiting(Some(workspace_id), None)
+            .await?;
+        rows.extend(
+            self.ports
+                .runtime()
+                .machine_script_monitors_waiting(self, Some(workspace_id))
+                .into_iter()
+                .map(|(_, owner, row)| (owner.0, row)),
+        );
+        Ok(rows)
+    }
+
     pub(crate) async fn deliver_wake_message(
         &self,
         workspace_id: &WorkspaceId,

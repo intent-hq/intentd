@@ -10,6 +10,11 @@
 //! restart, or a settled run) are ignored. The §5.8a `runId` spans a
 //! service's automatic restarts and never crosses the link. Transitions are
 //! published as `script:changed` only (through [`Hooks::changed`]).
+//!
+//! Monitors are the workspace's script monitors too: their rows (without
+//! the machine fields) are listed with the home runs' and their
+//! transitions published as `scriptMonitor:*` (through [`Hooks::monitor`]),
+//! so a remote agent's watch shows like a local one.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -45,12 +50,16 @@ pub(crate) type Changed = Arc<dyn Fn(WorkspaceId, String) -> BoxFuture<'static, 
 /// Wakes an agent with a monitor message.
 pub(crate) type Wake =
     Arc<dyn Fn(WorkspaceId, AgentId, String) -> BoxFuture<'static, ()> + Send + Sync>;
+/// Publishes `scriptMonitor:<kind>` with a monitor row.
+pub(crate) type MonitorChanged =
+    Arc<dyn Fn(WorkspaceId, String, Value) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// How machine runs reach the rest of the daemon.
 pub(crate) struct Hooks {
     pub link: LinkFor,
     pub changed: Changed,
     pub wake: Wake,
+    pub monitor: MonitorChanged,
     /// Wait before restarting a service that exited.
     pub restart_backoff: Duration,
     /// How long `stop` waits for the machine's acknowledgement.
@@ -86,9 +95,47 @@ struct Monitor {
     pattern: Option<regex::Regex>,
     /// Splits the run's output into lines as the home run's monitors do.
     decoder: intent_core::script_output::LineDecoder,
+    /// Lines seen, for a trigger's `observedLineCount`.
+    lines: u32,
     expires: tokio::time::Instant,
     created_at: String,
     expires_at: String,
+}
+
+impl Run {
+    /// The machine as wake messages name it: its name, else its node id.
+    fn machine(&self) -> &str {
+        if self.machine_name.trim().is_empty() {
+            &self.node_id
+        } else {
+            &self.machine_name
+        }
+    }
+}
+
+impl Monitor {
+    fn expired(&self) -> bool {
+        self.expires <= tokio::time::Instant::now()
+    }
+}
+
+/// A new monitor: the agent's reply, the terminal row of the monitor it
+/// replaced, and its own id, workspace row and expiry.
+struct Registered {
+    reply: Value,
+    replaced: Option<Value>,
+    id: String,
+    row: Value,
+    expires: tokio::time::Instant,
+}
+
+/// What ending a monitor leaves to do once the lock is released: its
+/// terminal row to publish and the wake for its owner.
+#[derive(Default)]
+#[must_use]
+struct Ended {
+    event: Option<Value>,
+    wake: Option<String>,
 }
 
 #[expect(
@@ -97,6 +144,8 @@ struct Monitor {
 )]
 struct Run {
     node_id: String,
+    /// The machine's name, for wake messages.
+    machine_name: String,
     state: ScriptRuntimeState,
     last_run: Option<ScriptLastRun>,
     def: Script,
@@ -120,6 +169,9 @@ struct Inner {
     /// Agents whose final stop is under way: no new process starts for
     /// them until the machine acknowledges it.
     ending: Mutex<HashSet<AgentId>>,
+    /// Orders `scriptMonitor:*` publications: a monitor's terminal event
+    /// never goes out before its `registered` one.
+    publishing: tokio::sync::Mutex<()>,
 }
 
 /// Every machine run of this daemon. Cloning shares them.
@@ -192,6 +244,7 @@ impl MachineRuns {
                 runs: Mutex::default(),
                 settled: watch::channel(0).0,
                 ending: Mutex::default(),
+                publishing: tokio::sync::Mutex::default(),
             }),
         }
     }
@@ -205,6 +258,31 @@ impl MachineRuns {
 
     async fn changed(&self, place: &RunPlace) {
         (self.inner.hooks.changed)(place.workspace_id.clone(), place.script_id.clone()).await;
+    }
+
+    /// Publish `ended`'s terminal row, then wake its owner.
+    async fn deliver(&self, place: &RunPlace, ended: Ended) {
+        if let Some(row) = ended.event {
+            self.publish_monitor(place, row).await;
+        }
+        if let Some(content) = ended.wake {
+            (self.inner.hooks.wake)(place.workspace_id.clone(), place.agent_id.clone(), content)
+                .await;
+        }
+    }
+
+    async fn publish_monitor(&self, place: &RunPlace, row: Value) {
+        let _lane = self.inner.publishing.lock().await;
+        self.emit_monitor(place, row).await;
+    }
+
+    /// Publish `row` (the caller holds the publishing lane).
+    async fn emit_monitor(&self, place: &RunPlace, row: Value) {
+        let kind = match row["state"].as_str() {
+            Some("active") | None => "registered".to_owned(),
+            Some(state) => state.to_owned(),
+        };
+        (self.inner.hooks.monitor)(place.workspace_id.clone(), kind, row).await;
     }
 
     fn bump(&self) {
@@ -259,6 +337,7 @@ impl MachineRuns {
             }
             let run = runs.entry(place.clone()).or_insert_with(|| Run {
                 node_id: link.node_id.clone(),
+                machine_name: link.machine_name.clone(),
                 state: ScriptRuntimeState::default(),
                 last_run: None,
                 def: def.clone(),
@@ -272,6 +351,7 @@ impl MachineRuns {
                 monitor: None,
             });
             run.node_id.clone_from(&link.node_id);
+            run.machine_name.clone_from(&link.machine_name);
             run.def = def.clone();
             run.link = Some(link.clone());
             run.spawn_id = Some(spawn_id.clone());
@@ -311,29 +391,44 @@ impl MachineRuns {
     ///
     /// `InvalidParams` when `place` has no machine run.
     pub(crate) async fn stop(&self, place: &RunPlace) -> Result<ScriptRuntimeState> {
-        self.stop_because(place, "the run was stopped").await
+        Ok(self
+            .stop_because(place, "the run was stopped", None)
+            .await?
+            .unwrap_or_default())
     }
 
     /// [`Self::stop`], settling the run's monitor as cancelled with `reason`.
-    async fn stop_because(&self, place: &RunPlace, reason: &str) -> Result<ScriptRuntimeState> {
+    /// With `watched`, only while that monitor still watches the live run:
+    /// otherwise nothing is stopped and the result is `None`.
+    async fn stop_because(
+        &self,
+        place: &RunPlace,
+        reason: &str,
+        watched: Option<&str>,
+    ) -> Result<Option<ScriptRuntimeState>> {
         let (live, link, spawn_id, cancelled) = {
             let mut runs = lock(&self.inner.runs);
             let run = runs.get_mut(place).ok_or_else(|| no_run(place))?;
+            if let Some(id) = watched {
+                if !is_live(&run.state) || run.monitor.as_ref().is_none_or(|m| m.id != id) {
+                    return Ok(None);
+                }
+            }
             if is_live(&run.state) {
                 run.stopping = true;
                 // The run being stopped takes its monitor with it: a watch
                 // never outlives its run into the next one. As the home
                 // run's, the monitor settles cancelled and wakes its owner.
-                let cancelled = cancelled_wake(run, reason);
+                let cancelled = cancelled_wake(place, run, reason);
                 (true, run.link.clone(), run.spawn_id.clone(), cancelled)
             } else {
                 runs.remove(place);
-                (false, None, None, None)
+                (false, None, None, Ended::default())
             }
         };
         if !live {
             self.changed(place).await;
-            return Ok(ScriptRuntimeState::default());
+            return Ok(Some(ScriptRuntimeState::default()));
         }
         if let (Some(link), Some(spawn_id)) = (link, spawn_id) {
             let mut settled = self.inner.settled.subscribe();
@@ -361,11 +456,8 @@ impl MachineRuns {
             }
         }
         self.changed(place).await;
-        if let Some(content) = cancelled {
-            (self.inner.hooks.wake)(place.workspace_id.clone(), place.agent_id.clone(), content)
-                .await;
-        }
-        Ok(self.state(place).unwrap_or_default())
+        self.deliver(place, cancelled).await;
+        Ok(Some(self.state(place).unwrap_or_default()))
     }
 
     /// Stop then start `place`'s run again on its machine.
@@ -386,7 +478,8 @@ impl MachineRuns {
         }
         self.link(place).await?;
         if self.state(place).as_ref().is_some_and(is_live) {
-            self.stop_because(place, "the run was restarted").await?;
+            self.stop_because(place, "the run was restarted", None)
+                .await?;
         }
         self.start(place, def).await
     }
@@ -594,6 +687,7 @@ impl MachineRuns {
             {
                 for byte in data.bytes() {
                     if let Some(line) = monitor.decoder.push(byte) {
+                        monitor.lines = monitor.lines.saturating_add(1);
                         if let Some(text) = line.text.filter(|text| {
                             monitor.pattern.as_ref().is_some_and(|p| p.is_match(text))
                         }) {
@@ -618,22 +712,14 @@ impl MachineRuns {
             if run.output.len() > OUTPUT_KEEP_BYTES {
                 run.output = tail(&run.output, OUTPUT_KEEP_BYTES).to_owned();
             }
-            matched.and_then(|line| {
-                let monitor = run.monitor.take()?;
-                (monitor.expires > tokio::time::Instant::now()).then(|| {
-                    format!(
-                        "Script \"{}\" (machine run on {}): output matched `{}`: {line}",
-                        run.def.name,
-                        run.node_id,
-                        monitor.pattern.map(|p| p.to_string()).unwrap_or_default()
-                    )
+            matched
+                .and_then(|line| {
+                    let monitor = run.monitor.take()?;
+                    Some(triggered(place, run, &monitor, &line))
                 })
-            })
+                .unwrap_or_default()
         };
-        if let Some(content) = wake {
-            (self.inner.hooks.wake)(place.workspace_id.clone(), place.agent_id.clone(), content)
-                .await;
-        }
+        self.deliver(place, wake).await;
     }
 
     /// Settle `spawn_id`'s process of `place`: a stop or a command ends the
@@ -671,7 +757,7 @@ impl MachineRuns {
                 && run.fast_restarts < MAX_FAST_RESTARTS;
             if run.stopping {
                 run.stopping = false;
-                let cancelled = cancelled_wake(run, "the run was stopped");
+                let cancelled = cancelled_wake(place, run, "the run was stopped");
                 if run.def.mode == ScriptMode::Command {
                     run.last_run = Some(last_run(
                         &run.state,
@@ -688,7 +774,7 @@ impl MachineRuns {
                 run.state.restart_count += 1;
                 run.state.pid = None;
                 run.state.exit_code = exit_code;
-                (true, None)
+                (true, Ended::default())
             } else {
                 let code = exit_code.unwrap_or(super::EXIT_CODE_UNOBSERVABLE);
                 run.state.status = ScriptStatus::Exited;
@@ -696,26 +782,24 @@ impl MachineRuns {
                 run.state.error.clone_from(&error);
                 run.state.stopped_at = Some(now_iso());
                 run.state.pid = None;
+                let outcome = if error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("remote-script-lost"))
+                {
+                    ScriptRunOutcome::Interrupted
+                } else if code == 0 {
+                    ScriptRunOutcome::Succeeded
+                } else {
+                    ScriptRunOutcome::Failed
+                };
+                let result = last_run(&run.state, outcome, Some(code), error.clone());
                 if run.def.mode == ScriptMode::Command {
-                    let outcome = if error
-                        .as_deref()
-                        .is_some_and(|e| e.starts_with("remote-script-lost"))
-                    {
-                        ScriptRunOutcome::Interrupted
-                    } else if code == 0 {
-                        ScriptRunOutcome::Succeeded
-                    } else {
-                        ScriptRunOutcome::Failed
-                    };
-                    run.last_run = Some(last_run(&run.state, outcome, Some(code), error.clone()));
+                    run.last_run = Some(result.clone());
                 }
-                let monitor = run.monitor.take().filter(|m| {
-                    m.expires > tokio::time::Instant::now()
-                        && m.run_id
-                            .as_ref()
-                            .is_none_or(|r| run.state.run_id.as_ref() == Some(r))
-                });
-                let wake = monitor.map(|mut monitor| {
+                let ended = run.monitor.take().map(|mut monitor| {
+                    if monitor.expired() {
+                        return expired(place, run, &monitor);
+                    }
                     // As the home run's monitor: the final line, unterminated
                     // at exit, is checked before the exit wake.
                     // Only the process's own EOF flushes the final line; a
@@ -723,34 +807,37 @@ impl MachineRuns {
                     let last = (ending == Ending::ProcessExit)
                         .then(|| monitor.decoder.eof())
                         .flatten()
-                        .and_then(|line| line.text)
+                        .and_then(|line| {
+                            monitor.lines = monitor.lines.saturating_add(1);
+                            line.text
+                        })
                         .filter(|text| monitor.pattern.as_ref().is_some_and(|p| p.is_match(text)));
-                    match (last, &error) {
-                        (Some(line), _) => format!(
-                            "Script \"{}\" (machine run on {}): output matched `{}`: {line}",
-                            run.def.name,
-                            run.node_id,
-                            monitor.pattern.map(|p| p.to_string()).unwrap_or_default()
-                        ),
-                        (None, Some(error)) => format!(
+                    if let Some(line) = last {
+                        return triggered(place, run, &monitor, &line);
+                    }
+                    let wake = match &error {
+                        Some(error) => format!(
                             "Script \"{}\" (machine run on {}) exited with code {code}: {error}",
-                            run.def.name, run.node_id
+                            run.def.name,
+                            run.machine()
                         ),
-                        (None, None) => format!(
+                        None => format!(
                             "Script \"{}\" (machine run on {}) exited with code {code}",
-                            run.def.name, run.node_id
+                            run.def.name,
+                            run.machine()
                         ),
+                    };
+                    Ended {
+                        event: Some(completed(place, run, &monitor, result)),
+                        wake: Some(wake),
                     }
                 });
-                (false, wake)
+                (false, ended.unwrap_or_default())
             }
         };
         self.bump();
         self.changed(place).await;
-        if let Some(content) = wake {
-            (self.inner.hooks.wake)(place.workspace_id.clone(), place.agent_id.clone(), content)
-                .await;
-        }
+        self.deliver(place, wake).await;
         if restart {
             let this = self.clone();
             let place = place.clone();
@@ -783,7 +870,7 @@ impl MachineRuns {
                 // A stop (or a final stop) came during the backoff: the
                 // service stays stopped instead of starting a new process.
                 run.stopping = false;
-                let cancelled = cancelled_wake(run, "the run was stopped");
+                let cancelled = cancelled_wake(place, run, "the run was stopped");
                 run.state = idle_after(&run.state);
                 Err(cancelled)
             } else {
@@ -800,14 +887,7 @@ impl MachineRuns {
             Err(cancelled) => {
                 self.bump();
                 self.changed(place).await;
-                if let Some(content) = cancelled {
-                    (self.inner.hooks.wake)(
-                        place.workspace_id.clone(),
-                        place.agent_id.clone(),
-                        content,
-                    )
-                    .await;
-                }
+                self.deliver(place, cancelled).await;
                 return;
             }
         };
@@ -913,25 +993,34 @@ impl MachineRuns {
         for (place, _, spawn) in &live {
             self.lose(place, spawn, reason).await;
         }
-        let dropped: Vec<RunPlace> = {
-            let mut runs = lock(&self.inner.runs);
-            let places: Vec<RunPlace> = runs
-                .keys()
-                .filter(|place| agents.contains(&place.agent_id))
-                .cloned()
-                .collect();
-            for place in &places {
-                runs.remove(place);
-            }
-            places
-        };
+        let dropped = self.drop_runs(|place| agents.contains(&place.agent_id), reason);
         // `ending` stays: an agent in it has a queued final stop, which a
         // lease end (even a failed removal) does not end; only its ack or
         // expiry does (`final_stop_acked`).
-        for place in dropped {
+        for (place, ended) in dropped {
             self.changed(&place).await;
+            self.deliver(&place, ended).await;
         }
         unacked
+    }
+
+    /// Remove the runs whose place matches `which`. A monitor still on one
+    /// (a service between processes) ends with it, lost with `reason`.
+    fn drop_runs(&self, which: impl Fn(&RunPlace) -> bool, reason: &str) -> Vec<(RunPlace, Ended)> {
+        let mut runs = lock(&self.inner.runs);
+        let places: Vec<RunPlace> = runs.keys().filter(|place| which(place)).cloned().collect();
+        places
+            .into_iter()
+            .filter_map(|place| {
+                let mut run = runs.remove(&place)?;
+                let ended = run
+                    .monitor
+                    .take()
+                    .map(|monitor| lost(&place, &run, &monitor, reason))
+                    .unwrap_or_default();
+                Some((place, ended))
+            })
+            .collect()
     }
 
     /// Settle `spawn_id`'s process of `place` as lost with `reason` (a
@@ -979,21 +1068,11 @@ impl MachineRuns {
         for (place, spawn) in &live {
             self.lose(place, spawn, reason).await;
         }
-        let dropped: Vec<RunPlace> = {
-            let mut runs = lock(&self.inner.runs);
-            let places: Vec<RunPlace> = runs
-                .keys()
-                .filter(|place| &place.agent_id == agent_id)
-                .cloned()
-                .collect();
-            for place in &places {
-                runs.remove(place);
-            }
-            places
-        };
+        let dropped = self.drop_runs(|place| &place.agent_id == agent_id, reason);
         lock(&self.inner.ending).remove(agent_id);
-        for place in dropped {
+        for (place, ended) in dropped {
             self.changed(&place).await;
+            self.deliver(&place, ended).await;
         }
     }
 
@@ -1021,27 +1100,18 @@ impl MachineRuns {
         if removed.is_empty() {
             return;
         }
-        for (place, run) in &removed {
+        let mut ended = Vec::new();
+        for (place, mut run) in removed {
             if let (Some(link), Some(spawn)) = (&run.link, &run.spawn_id) {
-                let _ = (link.send)(stop_frame(place, spawn)).await;
+                let _ = (link.send)(stop_frame(&place, spawn)).await;
             }
-            if is_live(&run.state) {
-                if let Some(monitor) = &run.monitor {
-                    let _ = monitor;
-                    (self.inner.hooks.wake)(
-                        place.workspace_id.clone(),
-                        place.agent_id.clone(),
-                        format!(
-                            "Script \"{}\" (machine run on {}) was cancelled: {reason}",
-                            run.def.name, run.node_id
-                        ),
-                    )
-                    .await;
-                }
-            }
+            ended.push((place.clone(), cancelled_wake(&place, &mut run, reason)));
         }
         self.bump();
-        self.changed(&removed[0].0).await;
+        self.changed(&ended[0].0).await;
+        for (place, ended) in ended {
+            self.deliver(&place, ended).await;
+        }
     }
 
     /// Watch `place`'s run: wake its agent when the run ends, or when an
@@ -1052,9 +1122,60 @@ impl MachineRuns {
     ///
     /// `InvalidParams` for bad options, an unknown run, or a `runId` that
     /// is not the run's current one.
-    pub(crate) fn monitor(&self, place: &RunPlace, options: &Value) -> Result<Value> {
+    pub(crate) async fn monitor(&self, place: &RunPlace, options: &Value) -> Result<Value> {
         let options = Options::parse(options)?;
-        let mut runs = lock(&self.inner.runs);
+        // Held from registration to publication: an end that takes the new
+        // monitor meanwhile publishes after its `registered`.
+        let lane = self.inner.publishing.lock().await;
+        let registered = {
+            let mut runs = lock(&self.inner.runs);
+            match Self::register(&mut runs, place, options)? {
+                Ok(registered) => registered,
+                Err(refused) => return Ok(refused),
+            }
+        };
+        if let Some(old) = registered.replaced {
+            self.emit_monitor(place, old).await;
+        }
+        self.emit_monitor(place, registered.row).await;
+        drop(lane);
+        // A monitor that runs out leaves the list, as a home-run one does.
+        let this = self.clone();
+        let place = place.clone();
+        let (id, expires) = (registered.id, registered.expires);
+        // caller-binding: allow — a machine-run monitor's TTL, as the home monitors' sweep
+        tokio::spawn(async move {
+            tokio::time::sleep_until(expires).await;
+            this.expire(&place, &id).await;
+        });
+        Ok(registered.reply)
+    }
+
+    /// Settle `place`'s monitor `id` as expired if it is still active.
+    async fn expire(&self, place: &RunPlace, id: &str) {
+        let ended = {
+            let mut runs = lock(&self.inner.runs);
+            let Some(run) = runs.get_mut(place) else {
+                return;
+            };
+            if run.monitor.as_ref().is_none_or(|m| m.id != id) {
+                return;
+            }
+            let Some(monitor) = run.monitor.take() else {
+                return;
+            };
+            expired(place, run, &monitor)
+        };
+        self.deliver(place, ended).await;
+    }
+
+    /// Register a monitor under the runs lock; the inner `Err` is a
+    /// refusal reply.
+    fn register(
+        runs: &mut HashMap<RunPlace, Run>,
+        place: &RunPlace,
+        options: Options,
+    ) -> Result<std::result::Result<Registered, Value>> {
         let run = runs.get_mut(place).ok_or_else(|| no_run(place))?;
         // As for the home run, a stale `runId` is rejected first.
         if let Some(run_id) = &options.run {
@@ -1067,13 +1188,13 @@ impl MachineRuns {
         // As for the home run: a run that already finished cannot be
         // watched, its only exit having passed.
         if !is_live(&run.state) {
-            return Ok(json!({
+            return Ok(Err(json!({
                 "ok": false,
                 "refused": true,
                 "reason": "run-finished",
                 "scriptId": place.script_id,
                 "runId": run.state.run_id,
-            }));
+            })));
         }
         let ttl = Duration::from_millis(u64::try_from(options.ttl).unwrap_or(0));
         let created = chrono::Utc::now();
@@ -1089,13 +1210,25 @@ impl MachineRuns {
             run_id: run.state.run_id.clone(),
             pattern: options.pattern,
             decoder,
+            lines: 0,
             expires: tokio::time::Instant::now() + ttl,
             created_at: created.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             expires_at: expires.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
         let row = monitor_row(place, run, &monitor);
-        run.monitor = Some(monitor);
-        Ok(json!({ "ok": true, "monitor": row }))
+        let reply = json!({ "ok": true, "monitor": row.clone() });
+        let (id, expires) = (monitor.id.clone(), monitor.expires);
+        let replaced = run
+            .monitor
+            .replace(monitor)
+            .map(|old| ended(place, run, &old, "cancelled", "unmonitored"));
+        Ok(Ok(Registered {
+            reply,
+            replaced,
+            id,
+            row,
+            expires,
+        }))
     }
 
     /// `agent_id`'s active machine-run monitors.
@@ -1113,21 +1246,156 @@ impl MachineRuns {
 
     /// Cancel `agent_id`'s machine-run monitor `monitor_id`; whether it
     /// existed.
-    pub(crate) fn unmonitor(&self, agent_id: &AgentId, monitor_id: &str) -> bool {
+    pub(crate) async fn unmonitor(&self, agent_id: &AgentId, monitor_id: &str) -> bool {
+        let Some(place) = self.place_of_monitor(None, monitor_id, Some(agent_id)) else {
+            return false;
+        };
+        self.unmonitor_at(&place, monitor_id).await
+    }
+
+    async fn unmonitor_at(&self, place: &RunPlace, monitor_id: &str) -> bool {
+        let row = {
+            let mut runs = lock(&self.inner.runs);
+            let Some(run) = runs.get_mut(place) else {
+                return false;
+            };
+            if run.monitor.as_ref().is_none_or(|m| m.id != monitor_id) {
+                return false;
+            }
+            let Some(monitor) = run.monitor.take() else {
+                return false;
+            };
+            ended(place, run, &monitor, "cancelled", "unmonitored")
+        };
+        self.publish_monitor(place, row).await;
+        true
+    }
+
+    /// The run watched by monitor `monitor_id` (in `workspace_id`, owned
+    /// by `owner`, when given).
+    fn place_of_monitor(
+        &self,
+        workspace_id: Option<&WorkspaceId>,
+        monitor_id: &str,
+        owner: Option<&AgentId>,
+    ) -> Option<RunPlace> {
         lock(&self.inner.runs)
-            .iter_mut()
-            .filter(|(place, _)| &place.agent_id == agent_id)
-            .any(|(_, run)| {
-                if run.monitor.as_ref().is_some_and(|m| m.id == monitor_id) {
-                    run.monitor = None;
-                    true
-                } else {
-                    false
-                }
+            .iter()
+            .find(|(place, run)| {
+                workspace_id.is_none_or(|ws| &place.workspace_id == ws)
+                    && owner.is_none_or(|agent| &place.agent_id == agent)
+                    && run
+                        .monitor
+                        .as_ref()
+                        .is_some_and(|m| m.id == monitor_id && !m.expired())
             })
+            .map(|(place, _)| place.clone())
+    }
+
+    /// The active machine-run monitors of `workspace_id` (only `owner`'s
+    /// when given), as workspace monitor rows, oldest first.
+    pub(crate) fn monitors_in(
+        &self,
+        workspace_id: &WorkspaceId,
+        owner: Option<&AgentId>,
+    ) -> Vec<Value> {
+        let runs = lock(&self.inner.runs);
+        let mut rows: Vec<(&str, &str, Value)> = runs
+            .iter()
+            .filter(|(place, _)| {
+                &place.workspace_id == workspace_id
+                    && owner.is_none_or(|agent| &place.agent_id == agent)
+            })
+            .filter_map(|(place, run)| {
+                let monitor = run.monitor.as_ref().filter(|m| !m.expired())?;
+                Some((
+                    monitor.created_at.as_str(),
+                    monitor.id.as_str(),
+                    monitor_row(place, run, monitor),
+                ))
+            })
+            .collect();
+        rows.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        rows.into_iter().map(|(_, _, row)| row).collect()
+    }
+
+    /// Active machine-run monitor `monitor_id` of `workspace_id`.
+    pub(crate) fn monitor_in(&self, workspace_id: &WorkspaceId, monitor_id: &str) -> Option<Value> {
+        self.monitors_in(workspace_id, None)
+            .into_iter()
+            .find(|row| row["monitorId"] == monitor_id)
+    }
+
+    /// Every active machine-run monitor (only `workspace_id`'s when given),
+    /// as `(workspace, owner, waiting row)`: the `waitingOnScriptMonitors`
+    /// projection of the home monitors.
+    pub(crate) fn waiting(
+        &self,
+        workspace_id: Option<&WorkspaceId>,
+    ) -> Vec<(WorkspaceId, AgentId, Value)> {
+        let runs = lock(&self.inner.runs);
+        let mut rows: Vec<(String, WorkspaceId, AgentId, Value)> = runs
+            .iter()
+            .filter(|(place, _)| workspace_id.is_none_or(|ws| &place.workspace_id == ws))
+            .filter_map(|(place, run)| {
+                let monitor = run.monitor.as_ref().filter(|m| !m.expired())?;
+                Some((
+                    monitor.created_at.clone(),
+                    place.workspace_id.clone(),
+                    place.agent_id.clone(),
+                    json!({
+                        "monitorId": monitor.id,
+                        "scriptId": place.script_id,
+                        "runId": monitor.run_id,
+                        "scriptName": run.def.name,
+                        "expiresAt": monitor.expires_at,
+                    }),
+                ))
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.into_iter()
+            .map(|(_, ws, agent, row)| (ws, agent, row))
+            .collect()
+    }
+
+    /// `scriptMonitor.cancel` / `cancelRun` of a machine-run monitor:
+    /// `None` when `monitor_id` is not one (in `workspace_id`, owned by
+    /// `owner` when given). Cancelling leaves the run going; with
+    /// `stop_run` the run is stopped, which settles the monitor.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::stop`].
+    pub(crate) async fn cancel_monitor(
+        &self,
+        workspace_id: &WorkspaceId,
+        monitor_id: &str,
+        owner: Option<&AgentId>,
+        stop_run: bool,
+    ) -> Result<Option<Value>> {
+        let Some(place) = self.place_of_monitor(Some(workspace_id), monitor_id, owner) else {
+            return Ok(None);
+        };
+        if !stop_run {
+            self.unmonitor_at(&place, monitor_id).await;
+            return Ok(Some(json!({ "ok": true, "monitorId": monitor_id })));
+        }
+        // Another decision may have ended the monitor (or its run) since it
+        // was found: then its run, or a successor, is never stopped.
+        let stopped = self
+            .stop_because(&place, "the run was stopped", Some(monitor_id))
+            .await?
+            .is_some();
+        Ok(Some(
+            json!({ "ok": true, "monitorId": monitor_id, "runStopped": stopped }),
+        ))
     }
 }
 
+/// The monitor row, as the agent and the workspace (`scriptMonitor.*`,
+/// `scriptMonitor:*`) see it: a home-run monitor's plus `remoteAgentId` and
+/// `nodeId`.
 fn monitor_row(place: &RunPlace, run: &Run, monitor: &Monitor) -> Value {
     let mut row = json!({
         "monitorId": monitor.id,
@@ -1149,6 +1417,83 @@ fn monitor_row(place: &RunPlace, run: &Run, monitor: &Monitor) -> Value {
         row["outputPattern"] = json!(pattern.as_str());
     }
     row
+}
+
+/// `monitor`'s terminal row: `state` for `reason`, settled now.
+fn ended(place: &RunPlace, run: &Run, monitor: &Monitor, state: &str, reason: &str) -> Value {
+    let mut row = monitor_row(place, run, monitor);
+    row["state"] = json!(state);
+    row["reason"] = json!(reason);
+    row["settledAt"] = json!(now_iso());
+    row
+}
+
+/// `monitor` ran out: it leaves the list without a wake.
+/// `monitor` ran out: as a home-run monitor's expiry, it wakes its owner
+/// once; the run goes on.
+fn expired(place: &RunPlace, run: &Run, monitor: &Monitor) -> Ended {
+    Ended {
+        event: Some(ended(place, run, monitor, "expired", "ttl-expired")),
+        wake: Some(format!(
+            "Script \"{}\" (machine run on {}): the monitor expired; the run was not stopped",
+            run.def.name,
+            run.machine()
+        )),
+    }
+}
+
+/// `monitor`'s run was dropped without an exit (lease end, final stop):
+/// it ends interrupted with `reason`.
+fn lost(place: &RunPlace, run: &Run, monitor: &Monitor, reason: &str) -> Ended {
+    if monitor.expired() {
+        return expired(place, run, monitor);
+    }
+    let code = super::EXIT_CODE_UNOBSERVABLE;
+    let result = last_run(
+        &run.state,
+        ScriptRunOutcome::Interrupted,
+        Some(code),
+        Some(reason.to_owned()),
+    );
+    Ended {
+        event: Some(completed(place, run, monitor, result)),
+        wake: Some(format!(
+            "Script \"{}\" (machine run on {}) exited with code {code}: {reason}",
+            run.def.name,
+            run.machine()
+        )),
+    }
+}
+
+/// `monitor` ended with its run, which ended with `result`.
+fn completed(place: &RunPlace, run: &Run, monitor: &Monitor, mut result: ScriptLastRun) -> Value {
+    result.run_id = None;
+    let mut row = ended(place, run, monitor, "completed", "finished");
+    row["result"] = serde_json::to_value(result).unwrap_or(Value::Null);
+    row
+}
+
+/// `monitor` matched `line`: it settles triggered and wakes its owner
+/// (unless it ran out first).
+fn triggered(place: &RunPlace, run: &Run, monitor: &Monitor, line: &str) -> Ended {
+    if monitor.expired() {
+        return expired(place, run, monitor);
+    }
+    let mut row = ended(place, run, monitor, "triggered", "output-match");
+    row["trigger"] = json!({ "observedLineCount": monitor.lines, "matchedLine": line });
+    Ended {
+        event: Some(row),
+        wake: Some(format!(
+            "Script \"{}\" (machine run on {}): output matched `{}`: {line}",
+            run.def.name,
+            run.machine(),
+            monitor
+                .pattern
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        )),
+    }
 }
 
 fn idle_after(state: &ScriptRuntimeState) -> ScriptRuntimeState {
@@ -1178,16 +1523,25 @@ fn last_run(
     }
 }
 
-/// Take `run`'s monitor and, unless it expired, the wake that settles it
-/// cancelled with `reason` (a stop or restart, as the home run's monitor).
-fn cancelled_wake(run: &mut Run, reason: &str) -> Option<String> {
-    let monitor = run.monitor.take()?;
-    (monitor.expires > tokio::time::Instant::now()).then(|| {
-        format!(
+/// Take `run`'s monitor and settle it as its run ends cancelled with
+/// `reason` (a stop, restart or definition change, as the home run's
+/// monitor): the terminal row and, unless it expired, the wake.
+fn cancelled_wake(place: &RunPlace, run: &mut Run, reason: &str) -> Ended {
+    let Some(monitor) = run.monitor.take() else {
+        return Ended::default();
+    };
+    if monitor.expired() {
+        return expired(place, run, &monitor);
+    }
+    let result = last_run(&run.state, ScriptRunOutcome::Cancelled, None, None);
+    Ended {
+        event: Some(completed(place, run, &monitor, result)),
+        wake: Some(format!(
             "Script \"{}\" (machine run on {}) was cancelled: {reason}",
-            run.def.name, run.node_id
-        )
-    })
+            run.def.name,
+            run.machine()
+        )),
+    }
 }
 
 /// `remote-script-agent-ending`: `place`'s agent is being stopped for good.

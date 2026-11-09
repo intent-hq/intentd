@@ -3880,7 +3880,18 @@ impl Services {
             task_stats,
             sessions,
             unread: unread.ok(),
-            active_hooks_or_script_monitors: active_hooks_or_script_monitors.unwrap_or_default(),
+            active_hooks_or_script_monitors: {
+                let mut waiting = active_hooks_or_script_monitors.unwrap_or_default();
+                // Remote agents' machine-run monitors are held in memory.
+                waiting.extend(
+                    self.ports
+                        .runtime()
+                        .machine_script_monitors_waiting(self, None)
+                        .into_iter()
+                        .map(|(ws, _, _)| ws),
+                );
+                waiting
+            },
             active_pr_monitors,
             monitor_rows,
             git_root_prs,
