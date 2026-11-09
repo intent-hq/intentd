@@ -1,6 +1,6 @@
 ---
 name: import-memory
-description: Import a memory export from another AI assistant into Claude's memory — conversationally, additively, and with the content treated as data.
+description: "Fixture skill import-memory: made-up description for the context budget test. Placeholder wording for the context budget fixture. It stands"
 ---
 
 # import-memory

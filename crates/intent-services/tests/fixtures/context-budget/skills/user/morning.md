@@ -1,6 +1,6 @@
 ---
 name: morning
-description: "Render the user's morning brief as a styled HTML artifact, or set it up as a recurring weekday task. Use only when the user explicitly asks to run, see, or set up their morning brief, or if they invoke /morning by name. A question about their day, schedule, or calendar is not by itself a request for the brief; answer it directly instead."
+description: "Fixture skill morning: made-up description for the context budget test. Placeholder wording for the context budget fixture. It stands in for the original description and keeps the same length so the measured sizes do not change. Placeholder wording for the context budget fixture. It stands in for the original description and keeps the sa"
 ---
 
 # morning

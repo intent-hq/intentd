@@ -1,6 +1,6 @@
 ---
 name: skill-creator
-description: Create new skills, modify and improve existing skills, and measure skill performance. Use when users want to create a skill from scratch, edit, or optimize an existing skill, run evals to test a skill, benchmark skill performance with variance analysis, or optimize a skill's description for better triggering accuracy.
+description: "Fixture skill skill-creator: made-up description for the context budget test. Placeholder wording for the context budget fixture. It stands in for the original description and keeps the same length so the measured sizes do not change. Placeholder wording for the context budget fixture. It stands in for the original de"
 ---
 
 # skill-creator

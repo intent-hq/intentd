@@ -1,6 +1,6 @@
 ---
 name: pdf
-description: Use this skill whenever the user wants to do anything with PDF files. This includes reading or extracting text/tables from PDFs, combining or merging multiple PDFs into one, splitting PDFs apart, rotating pages, adding watermarks, creating new PDFs, filling PDF forms, encrypting/decrypting PDFs, extracting images, and OCR on scanned PDFs to make them searchable. If the user mentions a .pdf file or asks to produce one, use this skill.
+description: "Fixture skill pdf: made-up description for the context budget test. Placeholder wording for the context budget fixture. It stands in for the original description and keeps the same length so the measured sizes do not change. Placeholder wording for the context budget fixture. It stands in for the original description and keeps the same length so the measured sizes do not change. Placeholder wording for the context budget fixture. It."
 license: Complete terms in LICENSE.txt
 ---
 
