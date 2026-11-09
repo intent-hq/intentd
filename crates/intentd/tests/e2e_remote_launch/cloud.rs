@@ -175,7 +175,15 @@ impl FakeE2b {
             buf.extend_from_slice(&chunk[..n]);
         }
         let body = buf[header_end..].to_vec();
-        let (status, content_type, payload) = self.route(&method, &target, &headers, &body).await;
+        // E2B's edge answers 411 to a POST without a length (intent-hq/intent#8865).
+        let unframed = matches!(method.as_str(), "POST" | "PUT" | "PATCH")
+            && !headers.contains_key("content-length")
+            && !headers.contains_key("transfer-encoding");
+        let (status, content_type, payload) = if unframed {
+            (411, "text/plain", b"Length Required".to_vec())
+        } else {
+            self.route(&method, &target, &headers, &body).await
+        };
         let reply = format!(
             "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             payload.len()
