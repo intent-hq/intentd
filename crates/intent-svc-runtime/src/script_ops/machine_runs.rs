@@ -47,9 +47,10 @@ pub(crate) type LinkFor =
     Arc<dyn Fn(AgentId) -> BoxFuture<'static, Result<MachineScriptLink>> + Send + Sync>;
 /// Publishes `script:changed` for a script.
 pub(crate) type Changed = Arc<dyn Fn(WorkspaceId, String) -> BoxFuture<'static, ()> + Send + Sync>;
-/// Wakes an agent with a monitor message.
-pub(crate) type Wake =
-    Arc<dyn Fn(WorkspaceId, AgentId, String) -> BoxFuture<'static, ()> + Send + Sync>;
+/// Wakes an agent with a monitor message and its script-run card metadata.
+pub(crate) type Wake = Arc<
+    dyn Fn(WorkspaceId, AgentId, String, Option<Value>) -> BoxFuture<'static, ()> + Send + Sync,
+>;
 /// Publishes `scriptMonitor:<kind>` with a monitor row.
 pub(crate) type MonitorChanged =
     Arc<dyn Fn(WorkspaceId, String, Value) -> BoxFuture<'static, ()> + Send + Sync>;
@@ -262,12 +263,18 @@ impl MachineRuns {
 
     /// Publish `ended`'s terminal row, then wake its owner.
     async fn deliver(&self, place: &RunPlace, ended: Ended) {
+        let metadata = ended.event.as_ref().map(card_metadata);
         if let Some(row) = ended.event {
             self.publish_monitor(place, row).await;
         }
         if let Some(content) = ended.wake {
-            (self.inner.hooks.wake)(place.workspace_id.clone(), place.agent_id.clone(), content)
-                .await;
+            (self.inner.hooks.wake)(
+                place.workspace_id.clone(),
+                place.agent_id.clone(),
+                content,
+                metadata,
+            )
+            .await;
         }
     }
 
@@ -1426,6 +1433,35 @@ fn ended(place: &RunPlace, run: &Run, monitor: &Monitor, state: &str, reason: &s
     row["reason"] = json!(reason);
     row["settledAt"] = json!(now_iso());
     row
+}
+
+/// The wake metadata of a terminal monitor `row`: a home-run wake's
+/// `script_monitor_wake` keys plus `remoteAgentId` and `nodeId`, so clients
+/// render the script-run card. The machine fields keep it out of the
+/// durable monitor-wake gates: it has no stored notification.
+fn card_metadata(row: &Value) -> Value {
+    let mut md = json!({ "type": "script_monitor_wake", "source": "system" });
+    for key in [
+        "monitorId",
+        "workspaceId",
+        "agentId",
+        "scriptId",
+        "runId",
+        "scriptName",
+        "mode",
+        "reason",
+        "expiresAt",
+        "settledAt",
+        "result",
+        "trigger",
+        "remoteAgentId",
+        "nodeId",
+    ] {
+        if let Some(value) = row.get(key) {
+            md[key] = value.clone();
+        }
+    }
+    md
 }
 
 /// `monitor` ran out: it leaves the list without a wake.

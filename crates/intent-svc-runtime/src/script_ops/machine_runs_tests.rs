@@ -16,7 +16,7 @@ use super::{Hooks, MachineRuns, RunPlace};
 struct Recorded {
     frames: Mutex<Vec<LinkFrame>>,
     changed: Mutex<Vec<String>>,
-    wakes: Mutex<Vec<(AgentId, String)>>,
+    wakes: Mutex<Vec<(AgentId, String, Option<serde_json::Value>)>>,
     monitor_events: Mutex<Vec<(String, serde_json::Value)>>,
     unreachable: std::sync::atomic::AtomicBool,
     protocol: std::sync::atomic::AtomicU32,
@@ -58,8 +58,8 @@ fn hooks(rec: &Arc<Recorded>) -> Hooks {
             changed.changed.lock().unwrap().push(script);
             Box::pin(async {})
         }),
-        wake: Arc::new(move |_ws, agent, content| {
-            wakes.wakes.lock().unwrap().push((agent, content));
+        wake: Arc::new(move |_ws, agent, content, metadata| {
+            wakes.wakes.lock().unwrap().push((agent, content, metadata));
             Box::pin(async {})
         }),
         monitor: Arc::new(move |_ws, kind, row| {
@@ -1438,4 +1438,136 @@ async fn timeout_until(done: impl Fn() -> bool) {
     )
     .await
     .expect("condition reached");
+}
+
+/// The wakes `rec` recorded, each with its card metadata.
+fn card_wakes(rec: &Recorded) -> Vec<(String, serde_json::Value)> {
+    rec.wakes
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, text, md)| (text.clone(), md.clone().expect("card metadata")))
+        .collect()
+}
+
+/// A machine-run wake renders as a script-run card: it carries the home-run
+/// wake's `script_monitor_wake` metadata plus `remoteAgentId` and `nodeId`,
+/// keeps the text naming the machine for older clients, and is not a
+/// durable monitor wake (the store-backed delivery gates skip it).
+#[tokio::test]
+async fn a_finished_machine_run_wakes_with_the_script_card_metadata() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let here = place(&agent);
+    let (start, id) = watched(
+        &runs,
+        &rec,
+        &here,
+        ScriptMode::Command,
+        serde_json::json!({ "ttlMs": 60000 }),
+    )
+    .await;
+    let run_id = runs.state(&here).unwrap().run_id.unwrap();
+    frame(&runs, exited(&start, Some(65), None)).await;
+
+    assert_eq!(rec.wakes.lock().unwrap()[0].0, agent);
+    let wakes = card_wakes(&rec);
+    assert_eq!(wakes.len(), 1, "{wakes:?}");
+    let (text, md) = &wakes[0];
+    assert!(
+        text.contains("Script \"build\" (machine run on Mac) exited with code 65"),
+        "{text}"
+    );
+    let keys: std::collections::BTreeSet<&str> =
+        md.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        std::collections::BTreeSet::from([
+            "type",
+            "source",
+            "monitorId",
+            "workspaceId",
+            "agentId",
+            "scriptId",
+            "runId",
+            "scriptName",
+            "mode",
+            "reason",
+            "expiresAt",
+            "settledAt",
+            "result",
+            "remoteAgentId",
+            "nodeId",
+        ]),
+        "{md}"
+    );
+    assert_eq!(md["type"], "script_monitor_wake");
+    assert_eq!(md["source"], "system");
+    assert_eq!(md["monitorId"], id.as_str());
+    assert_eq!(md["workspaceId"], "ws-1");
+    assert_eq!(md["agentId"], agent.as_str());
+    assert_eq!(md["scriptId"], "s1");
+    assert_eq!(md["runId"], run_id.as_str());
+    assert_eq!(md["scriptName"], "build");
+    assert_eq!(md["mode"], "command");
+    assert_eq!(md["reason"], "finished");
+    assert_eq!(md["result"]["outcome"], "failed");
+    assert_eq!(md["result"]["exitCode"], 65);
+    assert_eq!(md["remoteAgentId"], agent.as_str());
+    assert_eq!(md["nodeId"], "mac");
+    assert!(
+        md["expiresAt"].is_string() && md["settledAt"].is_string(),
+        "{md}"
+    );
+    assert_eq!(
+        intent_services::feature_api::feature_ports::monitor_id(Some(md)),
+        None
+    );
+    assert_eq!(
+        intent_services::feature_api::feature_ports::wake_id(Some(md)),
+        None
+    );
+}
+
+/// A match wakes with `output-match` and its trigger; a stop wakes with a
+/// cancelled result, as a home-run monitor's cancel-run does.
+#[tokio::test]
+async fn match_and_stop_wakes_carry_their_card_reason() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let here = place(&agent);
+    let (start, _) = watched(
+        &runs,
+        &rec,
+        &here,
+        ScriptMode::Service,
+        serde_json::json!({ "ttlMs": 60000, "outputPattern": "ready" }),
+    )
+    .await;
+    frame(&runs, output(&start, 0, "ready on 3000\n")).await;
+    let wakes = card_wakes(&rec);
+    assert_eq!(wakes.len(), 1, "{wakes:?}");
+    let (text, md) = &wakes[0];
+    assert!(
+        text.contains("(machine run on Mac): output matched"),
+        "{text}"
+    );
+    assert_eq!(md["reason"], "output-match", "{md}");
+    assert_eq!(md["trigger"]["matchedLine"], "ready on 3000", "{md}");
+    assert!(md.get("result").is_none(), "{md}");
+    assert_eq!(md["remoteAgentId"], agent.as_str());
+
+    runs.monitor(&here, &serde_json::json!({ "ttlMs": 60000 }))
+        .await
+        .unwrap();
+    stop_acked(&runs, &rec, &here).await;
+    let wakes = card_wakes(&rec);
+    assert_eq!(wakes.len(), 2, "{wakes:?}");
+    let (text, md) = &wakes[1];
+    assert!(text.contains("was cancelled"), "{text}");
+    assert_eq!(md["reason"], "finished", "{md}");
+    assert_eq!(md["result"]["outcome"], "cancelled", "{md}");
+    assert_eq!(md["nodeId"], "mac");
 }
