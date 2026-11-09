@@ -108,6 +108,12 @@ async fn forge_refresh(repository: &Path, url: &str, token: Option<&str>) -> boo
             Ok(()) => true,
             Err(error) => {
                 tracing::warn!(%error, "forge refresh from GitHub failed; serving the last fetched refs");
+                // Under the repository's lock, so one session seeds.
+                if !forge::has_refs(repository).await {
+                    if let Err(error) = forge::seed_from_origin(repository).await {
+                        tracing::warn!(%error, "could not copy the origin refs for the forge fallback");
+                    }
+                }
                 false
             }
         }
@@ -212,7 +218,7 @@ impl NodeGitAccess for HeadGitAccess {
                     warning: None,
                 });
             }
-            if !forge::has_refs(&repository).await && !forge::seed_from_origin(&repository).await? {
+            if !forge::has_refs(&repository).await {
                 return Err(unavailable("no GitHub refs fetched yet"));
             }
             Ok(ForgeServe {

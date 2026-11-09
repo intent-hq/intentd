@@ -1322,6 +1322,7 @@ impl LinkFrame {
     #[must_use]
     pub fn min_protocol(&self) -> u32 {
         match self {
+            Self::Launch(command) if command.forge_fetch.is_some() => FORGE_FETCH_PROTOCOL,
             Self::Launch(command) if command.checkout_of.is_some() => SHARED_CHECKOUT_PROTOCOL,
             Self::PushWip(_) | Self::PushWipReply(_) => SHARED_CHECKOUT_PROTOCOL,
             Self::SecretPut(_)
@@ -1330,7 +1331,6 @@ impl LinkFrame {
             | Self::SecretReply(_) => SECRETS_PROTOCOL,
             Self::ForgeToken(_) | Self::ForgeTokenReply(_) => FORGE_TOKEN_PROTOCOL,
             Self::CheckoutRead(_) | Self::CheckoutReadReply(_) => CHECKOUT_FILES_PROTOCOL,
-            Self::Launch(command) if command.forge_fetch.is_some() => FORGE_FETCH_PROTOCOL,
             Self::Launch(command) if command.forge.is_some() => FORGE_TOKEN_PROTOCOL,
             Self::Launch(command) if !command.mcp_proxies.is_empty() => MCP_PROXY_PROTOCOL,
             Self::Launch(command) if command.checkout.is_some() => PREPARED_CHECKOUT_PROTOCOL,

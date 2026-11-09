@@ -1621,6 +1621,16 @@ fn launch_forge_fetch_needs_protocol_17_and_is_closed() {
         json!({ "remoteUrl": "https://github.com/o/r.git" })
     );
     assert_eq!(frame.min_protocol(), FORGE_FETCH_PROTOCOL);
+    // A sharing sub-agent's launch needs 17 too, not just the 13 of
+    // `checkoutOf`.
+    let LinkFrame::Launch(mut sharing) = frame.clone() else {
+        unreachable!()
+    };
+    sharing.checkout_of = Some(AgentId::from("agent-owner"));
+    assert_eq!(
+        LinkFrame::Launch(sharing).min_protocol(),
+        FORGE_FETCH_PROTOCOL
+    );
     assert_eq!(
         LinkFrame::decode(value.to_string().as_bytes()).unwrap(),
         frame
