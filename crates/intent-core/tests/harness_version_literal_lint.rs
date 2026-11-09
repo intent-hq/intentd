@@ -51,6 +51,11 @@ const ALLOWED: &[(&str, Scope, &str)] = &[
         Scope::WholeFile,
         "test-only goldens pinning the frozen releases whose surfaces must never change",
     ),
+    (
+        "crates/intent-services/src/context_budget.rs",
+        Scope::WholeFile,
+        "test-only budget pinning the release the context cut is measured against",
+    ),
 ];
 
 /// Remediation printed with every report.

@@ -300,6 +300,8 @@ pub mod test_support;
 mod test_tracing;
 
 #[cfg(test)]
+mod context_budget;
+#[cfg(test)]
 mod session_surface_goldens;
 #[cfg(test)]
 mod tests;
