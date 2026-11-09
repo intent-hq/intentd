@@ -160,6 +160,62 @@ fn machine_monitors(
         .unwrap_or_default()
 }
 
+/// Merge remote agents' machine-run monitors (held in memory, not in the
+/// paged table) into a stored `scriptMonitor.list` summary page: one keyset
+/// order (`createdAt`, `monitorId`, newest first) and one `limit`, with the
+/// cursor at the last row kept so later pages reach the rest of both.
+fn merge_summary_page(
+    mut page: serde_json::Value,
+    machine: Vec<serde_json::Value>,
+    workspace_id: &WorkspaceId,
+    owner: Option<&AgentId>,
+    options: &intent_core::script_lists::ScriptListOptions,
+) -> Result<serde_json::Value> {
+    use intent_core::script_lists;
+    let scope = script_lists::scope(
+        "scriptMonitor.list",
+        workspace_id.as_str(),
+        owner.map(AgentId::as_str),
+    );
+    let boundary = options.boundary(&scope)?;
+    let key = |row: &serde_json::Value| {
+        (
+            row["createdAt"].as_str().unwrap_or_default().to_owned(),
+            row["monitorId"].as_str().unwrap_or_default().to_owned(),
+        )
+    };
+    let machine: Vec<serde_json::Value> = machine
+        .into_iter()
+        .filter(|row| boundary.as_ref().is_none_or(|b| key(row) < *b))
+        .map(summary_row)
+        .collect();
+    if machine.is_empty() {
+        return Ok(page);
+    }
+    let stored_more = page.get("nextCursor").is_some();
+    let mut rows = page["monitors"].as_array().cloned().unwrap_or_default();
+    rows.extend(machine);
+    rows.sort_by_key(|row| std::cmp::Reverse(key(row)));
+    let more = stored_more || rows.len() > options.limit;
+    rows.truncate(options.limit);
+    page["monitors"] = serde_json::Value::Array(rows);
+    let last = page["monitors"]
+        .as_array()
+        .and_then(|rows| rows.last())
+        .map(key);
+    match (more, last) {
+        (true, Some((time, id))) => {
+            page["nextCursor"] = serde_json::json!(script_lists::cursor(&scope, &time, &id));
+        }
+        _ => {
+            if let Some(map) = page.as_object_mut() {
+                map.remove("nextCursor");
+            }
+        }
+    }
+    Ok(page)
+}
+
 /// A monitor row in the `view: "summary"` shape: the pattern as a bounded
 /// preview.
 fn summary_row(mut row: serde_json::Value) -> serde_json::Value {
@@ -372,21 +428,12 @@ impl RuntimePort for RuntimeFeature {
             svc.require_member(&workspace_id).await?;
             let options = intent_core::script_lists::ScriptListOptions::parse(&options, true)?;
             if options.summary {
-                let mut page = svc
+                let page = svc
                     .store()
                     .script_summary_page(&workspace_id, agent_id.as_ref(), true, &options)
                     .await?;
-                // Remote agents' machine-run monitors live in memory, not in
-                // the paged table: they lead the first page.
-                if options.cursor.is_none() {
-                    let machine = machine_monitors(svc, &workspace_id, agent_id.as_ref());
-                    if let (false, Some(rows)) =
-                        (machine.is_empty(), page["monitors"].as_array_mut())
-                    {
-                        rows.splice(0..0, machine.into_iter().map(summary_row));
-                    }
-                }
-                Ok(page)
+                let machine = machine_monitors(svc, &workspace_id, agent_id.as_ref());
+                merge_summary_page(page, machine, &workspace_id, agent_id.as_ref(), &options)
             } else {
                 svc.script_monitor_list(workspace_id, agent_id).await
             }
@@ -1913,3 +1960,73 @@ mod test_fixtures;
 
 #[cfg(test)]
 mod workspace_delete_tests;
+
+#[cfg(test)]
+mod merge_summary_page_tests {
+    use super::merge_summary_page;
+    use intent_core::script_lists::ScriptListOptions;
+    use intent_core::WorkspaceId;
+    use serde_json::{json, Value};
+
+    fn row(id: &str, at: &str) -> Value {
+        json!({ "monitorId": id, "createdAt": at, "state": "active", "outputPattern": "x" })
+    }
+
+    fn options(limit: usize, cursor: Option<&Value>) -> ScriptListOptions {
+        ScriptListOptions {
+            summary: true,
+            limit,
+            cursor: cursor.and_then(Value::as_str).map(str::to_owned),
+        }
+    }
+
+    fn ids(page: &Value) -> Vec<&str> {
+        page["monitors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["monitorId"].as_str().unwrap())
+            .collect()
+    }
+
+    /// Review of intentd#3177: machine rows share the stored page's limit
+    /// and keyset cursor, so every row is reachable by paging.
+    #[test]
+    fn machine_rows_page_with_the_stored_ones() {
+        let ws = WorkspaceId::from("ws");
+        let machine = || vec![row("m4", "t4"), row("m2", "t2")];
+        let stored = json!({ "view": "summary", "monitors": [row("s3", "t3")] });
+        let first = merge_summary_page(stored, machine(), &ws, None, &options(2, None)).unwrap();
+        assert_eq!(ids(&first), ["m4", "s3"]);
+        assert_eq!(first["monitors"][0]["outputPatternPreview"], "x");
+        assert!(first["monitors"][0].get("outputPattern").is_none());
+        let cursor = first["nextCursor"].clone();
+        assert!(cursor.is_string(), "{first}");
+        let rest = json!({ "view": "summary", "monitors": [] });
+        let second =
+            merge_summary_page(rest, machine(), &ws, None, &options(2, Some(&cursor))).unwrap();
+        assert_eq!(ids(&second), ["m2"]);
+        assert!(second.get("nextCursor").is_none(), "{second}");
+    }
+
+    #[test]
+    fn a_limit_bounds_machine_rows_alone() {
+        let ws = WorkspaceId::from("ws");
+        let empty = || json!({ "view": "summary", "monitors": [] });
+        let machine = || vec![row("m1", "t1"), row("m2", "t2")];
+        let first = merge_summary_page(empty(), machine(), &ws, None, &options(1, None)).unwrap();
+        assert_eq!(ids(&first), ["m2"]);
+        let cursor = first["nextCursor"].clone();
+        let second =
+            merge_summary_page(empty(), machine(), &ws, None, &options(1, Some(&cursor))).unwrap();
+        assert_eq!(ids(&second), ["m1"]);
+        assert!(second.get("nextCursor").is_none());
+        // A stored page with more keeps a cursor, at the last row kept.
+        let more = json!({ "view": "summary", "monitors": [row("s0", "t0")], "nextCursor": "c" });
+        let page = merge_summary_page(more, vec![], &ws, None, &options(1, None)).unwrap();
+        assert_eq!(
+            page["nextCursor"], "c",
+            "no machine rows: the stored page as is"
+        );
+    }
+}

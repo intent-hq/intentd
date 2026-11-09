@@ -1488,8 +1488,7 @@ async fn machine_monitor_in_the_footer(
     let waiting = agents["agents"]
         .as_array()
         .and_then(|rows| rows.iter().find(|row| row["id"] == agent_id))
-        .map(|row| row["waitingOnScriptMonitors"].clone())
-        .unwrap_or(Value::Null);
+        .map_or(Value::Null, |row| row["waitingOnScriptMonitors"].clone());
     assert!(waiting.to_string().contains(monitor_id), "{agents}");
 
     let cancelled = ok(

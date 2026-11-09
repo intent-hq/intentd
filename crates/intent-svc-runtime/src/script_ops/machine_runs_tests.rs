@@ -1387,6 +1387,43 @@ async fn an_expired_monitor_leaves_the_list() {
     assert_eq!(kind, "expired");
     assert_eq!(row["monitorId"], id.as_str());
     assert_eq!(row["reason"], "ttl-expired");
+    // As a home-run monitor's expiry, the owner is told once.
+    let wakes = rec.wakes.lock().unwrap();
+    assert_eq!(wakes.len(), 1, "{wakes:?}");
+    assert_eq!(wakes[0].0, agent);
+    assert!(wakes[0].1.contains("expired"), "{}", wakes[0].1);
+}
+
+/// Review of intentd#3177: a lease end while a watched service waits out
+/// its restart backoff settles the monitor too, not only drops the run.
+#[tokio::test]
+async fn a_lease_end_between_service_processes_settles_its_monitor() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let here = place(&agent);
+    let (start, id) = watched(
+        &runs,
+        &rec,
+        &here,
+        ScriptMode::Service,
+        serde_json::json!({ "ttlMs": 60000 }),
+    )
+    .await;
+    frame(&runs, exited(&start, Some(1), None)).await;
+    assert_eq!(runs.state(&here).unwrap().status, ScriptStatus::Restarting);
+    runs.end_agents(
+        std::slice::from_ref(&agent),
+        tokio::time::Instant::now() + Duration::from_millis(100),
+        "remote-script-lost: the lease ended",
+    )
+    .await;
+    assert!(runs.monitors_in(&ws(), None).is_empty());
+    let (kind, row) = monitor_events(&rec).pop().unwrap();
+    assert_eq!(kind, "completed", "{row}");
+    assert_eq!(row["monitorId"], id.as_str());
+    assert_eq!(row["result"]["outcome"], "interrupted");
+    assert_eq!(rec.wakes.lock().unwrap().len(), 1);
 }
 
 async fn timeout_until(done: impl Fn() -> bool) {
