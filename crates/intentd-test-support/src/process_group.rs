@@ -16,14 +16,19 @@ use nix::unistd::Pid;
 /// The group is led by an anchor, a tiny `sh` that ignores `SIGTERM` and
 /// blocks reading a pipe whose only write end this process holds. When this
 /// process dies, however it dies (a nextest timeout, SIGKILL, ctrl-c), the
-/// read hits EOF and the anchor SIGKILLs the whole group, itself included.
-/// The anchor is this process's unreaped child until the group is torn down,
-/// so the group id cannot be reused while it can still be signalled.
+/// read hits EOF and the anchor sweeps the group (see below), itself
+/// included. The anchor is this process's unreaped child until the group is
+/// torn down, so the group id cannot be reused while it can still be
+/// signalled.
 ///
 /// [`ProcessGroup::terminate`] (and `Drop`) asks the members to stop
-/// (`SIGCONT`, then `SIGTERM`), waits until they have, and SIGKILLs whatever
-/// is left. A process that leaves the group (`setsid`, `setpgid`) is out of
-/// its reach: give such scripts a `setsid` that does not.
+/// (`SIGCONT`, then `SIGTERM`), waits until they have, and sweeps whatever is
+/// left. A sweep freezes (`SIGSTOP`) the members and every descendant of
+/// theirs, until no new one appears, then SIGKILLs them all: a member's
+/// child in a process group of its own (a daemon's agents) dies with it,
+/// while its parent still names it. A process whose parent already exited
+/// and that left the group (a script's `setsid ... &`) is out of reach:
+/// give such scripts a `setsid` that stays in the group.
 pub struct ProcessGroup {
     pgid: i32,
     /// `None` once the group has been torn down.
@@ -37,9 +42,61 @@ struct Anchor {
     _lifeline: io::PipeWriter,
 }
 
-/// Ignores the `SIGTERM` (and terminal signals) that [`ProcessGroup::terminate`]
-/// sends the group, so the group id stays pinned while members shut down.
-const ANCHOR_SCRIPT: &str = "trap '' TERM HUP INT; read -r _; kill -KILL 0";
+/// Freeze, then SIGKILL, the members of process group `$1` (not its leader,
+/// nor the leader's own children such as this sweep's tools) and every
+/// descendant of theirs, in any group. Repeats the freeze until the set
+/// stops growing, so nothing forks a child the sweep has not seen.
+const SWEEP_SCRIPT: &str = r#"g=$1
+tree() {
+  ps -A -o pid= -o ppid= -o pgid= | awk -v g="$g" '
+    { pid[NR] = $1; ppid[NR] = $2; pgid[NR] = $3 }
+    END {
+      own[g] = 1
+      do {
+        grown = 0
+        for (i = 1; i <= NR; i++)
+          if (!(pid[i] in own) && (ppid[i] in own)) { own[pid[i]] = 1; grown = 1 }
+      } while (grown)
+      for (i = 1; i <= NR; i++)
+        if (pgid[i] == g && !(pid[i] in own)) keep[pid[i]] = 1
+      do {
+        grown = 0
+        for (i = 1; i <= NR; i++)
+          if (!(pid[i] in keep) && !(pid[i] in own) && (ppid[i] in keep)) { keep[pid[i]] = 1; grown = 1 }
+      } while (grown)
+      for (p in keep) print p
+    }' | sort -n | tr '\n' ' '
+}
+prev=-
+cur=
+i=0
+while [ "$i" -lt 50 ]; do
+  cur=$(tree)
+  [ -n "$cur" ] && kill -STOP $cur 2>/dev/null
+  [ "$cur" = "$prev" ] && break
+  prev=$cur
+  i=$((i + 1))
+done
+[ -n "$cur" ] && kill -KILL $cur 2>/dev/null
+:
+"#;
+
+/// The anchor: ignores the `SIGTERM` (and terminal signals) that
+/// [`ProcessGroup::terminate`] sends the group, so the group id stays pinned
+/// while members shut down; sweeps the group once this process is gone.
+fn anchor_script() -> String {
+    format!("trap '' TERM HUP INT\nread -r _\nset -- $$\n{SWEEP_SCRIPT}\nkill -KILL 0\n")
+}
+
+/// Run [`SWEEP_SCRIPT`] over group `pgid` and wait for it.
+fn sweep(pgid: i32) {
+    let _ = Command::new("/bin/sh")
+        .args(["-c", SWEEP_SCRIPT, "sh", &pgid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
 
 impl ProcessGroup {
     /// A new, empty group (its anchor only).
@@ -50,7 +107,7 @@ impl ProcessGroup {
     pub fn new() -> io::Result<Self> {
         let (reader, lifeline) = io::pipe()?;
         let process = Command::new("/bin/sh")
-            .args(["-c", ANCHOR_SCRIPT])
+            .args(["-c", &anchor_script()])
             .stdin(Stdio::from(reader))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -88,7 +145,8 @@ impl ProcessGroup {
     }
 
     /// Ask every member to stop (`SIGCONT`, then `SIGTERM`), wait up to
-    /// `grace` until none is left, then SIGKILL the group, anchor included.
+    /// `grace` until none is left, then sweep the group and SIGKILL it,
+    /// anchor included.
     /// Once torn down (here or by [`ProcessGroup::kill`]) the group is done
     /// and later calls signal nothing.
     pub fn terminate(&self, grace: Duration) {
@@ -103,13 +161,16 @@ impl ProcessGroup {
             // timing-guard: poll interval while members shut down
             thread::sleep(Duration::from_millis(20));
         }
+        sweep(self.pgid);
         let _ = killpg(group, Signal::SIGKILL);
         let _ = anchor.process.wait();
     }
 
-    /// SIGKILL the whole group at once, as when its machine disappears.
+    /// Sweep and SIGKILL the whole group at once, as when its machine
+    /// disappears.
     pub fn kill(&self) {
         if let Some(mut anchor) = self.take_anchor() {
+            sweep(self.pgid);
             let _ = killpg(Pid::from_raw(self.pgid), Signal::SIGKILL);
             let _ = anchor.process.wait();
         }

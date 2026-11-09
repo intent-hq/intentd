@@ -44,6 +44,34 @@ fn detached_member(group: &ProcessGroup, script: &str) -> u32 {
         .expect("job pid on stdout")
 }
 
+/// Start a member that parents a `sleep` in a process group of its own, the
+/// way a sandbox daemon starts each agent (`process_group(0)`), and keeps
+/// running as `member_script` says. Returns the member's and the escaped
+/// child's pids.
+fn member_with_escaped_child(group: &ProcessGroup, member_script: &str) -> (u32, u32) {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("escaped.pid");
+    let member = detached_member(
+        group,
+        &format!(
+            "perl -e 'setpgrp(0, 0); exec @ARGV' sleep 600 & echo $! >'{}'; {member_script}",
+            pid_file.display()
+        ),
+    );
+    let mut escaped = None;
+    wait_until("the escaped child to report its pid", || {
+        escaped = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        escaped.is_some()
+    });
+    let escaped = escaped.unwrap();
+    wait_until("the escaped child to leave the group", || {
+        !group.members().contains(&escaped)
+    });
+    (member, escaped)
+}
+
 #[test]
 fn drop_ends_a_member_nobody_parents() {
     let group = ProcessGroup::new().unwrap();
@@ -95,4 +123,29 @@ fn terminate_kills_a_member_that_ignores_sigterm_after_the_grace() {
     // Terminated once, the group is done: a second call signals nothing.
     group.terminate(grace);
     group.kill();
+}
+
+#[test]
+fn kill_ends_children_that_left_the_group() {
+    let group = ProcessGroup::new().unwrap();
+    let (member, escaped) = member_with_escaped_child(&group, "wait");
+
+    group.kill();
+
+    wait_until("the member and its escaped child to die", || {
+        !is_running(member) && !is_running(escaped)
+    });
+}
+
+#[test]
+fn terminate_ends_children_that_left_the_group_once_the_grace_runs_out() {
+    let group = ProcessGroup::new().unwrap();
+    let (member, escaped) =
+        member_with_escaped_child(&group, "trap '' TERM; while :; do sleep 1; done");
+
+    group.terminate(Duration::from_millis(500));
+
+    wait_until("the member and its escaped child to die", || {
+        !is_running(member) && !is_running(escaped)
+    });
 }

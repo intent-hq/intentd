@@ -6,9 +6,10 @@
 //! stop` against a scratch dir that was already gone (or renamed to
 //! `failed-*`), and never ran at all when nextest killed the test. Each
 //! scenario runs [`fake_e2b_child`] as a separate test process that starts
-//! two sandbox daemons (one paused, as E2B pauses a sandbox) and then
-//! passes, fails or hangs until it is killed (`SIGKILL`); afterwards neither daemon
-//! may still run.
+//! two sandboxes (one paused, as E2B pauses a sandbox), each with its daemon
+//! and a stand-in agent in a process group of its own (as the daemon starts
+//! agents), and then passes, fails or hangs until it is killed (`SIGKILL`);
+//! afterwards none of those processes may still run.
 
 use std::process::Stdio;
 use std::time::Instant;
@@ -20,8 +21,7 @@ use super::*;
 
 /// `<mode>:<dir>` for [`fake_e2b_child`]; unset, it does nothing.
 const CHILD_ENV: &str = "INTENTD_TEST_FAKE_E2B_CHILD";
-const CHILD_TEST: &str = "e2e_remote_launch::cloud::teardown::fake_e2b_child";
-/// The daemon pids the child reports, space separated.
+/// The daemon and agent pids the child reports, space separated.
 const PIDS_FILE: &str = "pids";
 /// Written once the scenario has seen the daemons run: the child ends then.
 const GO_FILE: &str = "go";
@@ -39,14 +39,22 @@ else
 fi
 "#;
 
+/// A stand-in for an agent the sandbox daemon runs: a long-lived process in
+/// the sandbox that starts a child in a process group of its own, as the
+/// daemon starts each agent (`process_group(0)`), and stops that child on
+/// `SIGTERM`, as the daemon stops its agents when it shuts down.
+// timing-guard: the stand-in agent's child lives until the teardown kills it
+const AGENT: &str = r#"nohup sh -c 'trap "kill \$c; exit" TERM; perl -e "setpgrp(0, 0); exec @ARGV" sleep 600 & c=$!; echo $c >"$HOME/agent.pid"; wait' >/dev/null 2>&1 </dev/null &"#;
+
 fn have_node_and_git() -> bool {
     intent_providers::resolve_on_path("node").is_some()
         && intent_providers::resolve_on_path("git").is_some()
 }
 
-/// Create a sandbox on `fake` and start its daemon the way the bootstrap
-/// does; the sandbox id and the daemon's pid once it runs.
-async fn start_sandbox_daemon(fake: &FakeE2b) -> (String, u32) {
+/// Create a sandbox on `fake`, start its daemon the way the bootstrap does
+/// and its stand-in agent ([`AGENT`]); the sandbox id and the daemon's and
+/// the agent's pids once they run.
+async fn start_sandbox(fake: &FakeE2b) -> (String, u32, u32) {
     let keyed = HashMap::from([("x-api-key".to_owned(), E2B_KEY.to_owned())]);
     let create = json!({ "templateID": "intent/intent-node-4x8:0", "metadata": {} });
     let (status, _, reply) = fake
@@ -67,35 +75,46 @@ async fn start_sandbox_daemon(fake: &FakeE2b) -> (String, u32) {
             reply["envdAccessToken"].as_str().unwrap().to_owned(),
         ),
     ]);
-    let mut body = vec![0_u8; 5];
-    body.extend(
-        json!({ "process": { "cmd": "/bin/sh", "args": ["-c", LAUNCH] } })
-            .to_string()
-            .into_bytes(),
-    );
-    let (status, _, _) = fake.process(&envd, &body).await;
-    assert_eq!(status, 200);
+    for script in [LAUNCH, AGENT] {
+        let mut body = vec![0_u8; 5];
+        body.extend(
+            json!({ "process": { "cmd": "/bin/sh", "args": ["-c", script] } })
+                .to_string()
+                .into_bytes(),
+        );
+        let (status, _, _) = fake.process(&envd, &body).await;
+        assert_eq!(status, 200);
+    }
     let dir = fake.state().sandboxes[&id].dir.clone();
+    let daemon = running_pid(&dir.join("intentd.pid"), &dir.join("serve.log")).await;
+    let agent = running_pid(&dir.parent().unwrap().join("agent.pid"), Path::new("")).await;
+    (id, daemon, agent)
+}
+
+/// The pid that `pid_file` names (its first word) once that process runs;
+/// `log` is quoted if it never does.
+async fn running_pid(pid_file: &Path, log: &Path) -> u32 {
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     loop {
-        let pid = std::fs::read_to_string(dir.join("intentd.pid"))
+        let pid = std::fs::read_to_string(pid_file)
             .ok()
             .and_then(|text| text.split_whitespace().next()?.parse::<u32>().ok());
         if let Some(pid) = pid.filter(|pid| is_running(*pid)) {
-            return (id, pid);
+            return pid;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "sandbox {id}'s daemon never started: {}",
-            std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
+            "{} never named a running process: {}",
+            pid_file.display(),
+            std::fs::read_to_string(log).unwrap_or_default()
         );
-        // timing-guard: poll interval until the detached daemon writes its pid file
+        // timing-guard: poll interval until the detached process writes its pid file
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
 /// The test process the scenarios below run, end and inspect: it starts two
-/// sandbox daemons, pauses one, reports their pids, then ends as `<mode>`
+/// sandboxes, pauses one, reports their processes' pids, then ends as `<mode>`
 /// says. Outside a scenario (`CHILD_ENV` unset) it does nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "the child process of the fake E2B teardown tests, which run it"]
@@ -111,11 +130,12 @@ async fn fake_e2b_child() {
     );
     let scratch = common::test_tempdir_in(dir.to_str().unwrap(), "c-");
     let fake = FakeE2b::start(scratch, &fixture).await;
-    let (_, running) = start_sandbox_daemon(&fake).await;
-    let (paused_id, paused) = start_sandbox_daemon(&fake).await;
+    let (_, running, running_agent) = start_sandbox(&fake).await;
+    let (paused_id, paused, paused_agent) = start_sandbox(&fake).await;
     fake.signal(&paused_id, "-STOP");
+    let pids = [running, running_agent, paused, paused_agent];
     let report = dir.join(format!("{PIDS_FILE}.tmp"));
-    std::fs::write(&report, format!("{running} {paused}")).unwrap();
+    std::fs::write(&report, format!("{pids:?}").replace(['[', ']', ','], "")).unwrap();
     std::fs::rename(&report, dir.join(PIDS_FILE)).unwrap();
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
     while !dir.join(GO_FILE).exists() {
@@ -130,8 +150,8 @@ async fn fake_e2b_child() {
         "pass" => {
             drop(fake);
             assert!(
-                !is_running(running) && !is_running(paused),
-                "dropping the fake leaves no sandbox daemon"
+                pids.iter().all(|pid| !is_running(*pid)),
+                "dropping the fake leaves no sandbox process"
             );
         }
         "panic" => panic!("the fake E2B child fails on purpose"),
@@ -150,7 +170,8 @@ fn spawn_child(mode: &str, dir: &Path) -> (common::DaemonChild, std::path::PathB
     let log_path = dir.join("child.log");
     let log = std::fs::File::create(&log_path).unwrap();
     let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args([CHILD_TEST, "--exact", "--ignored", "--nocapture"])
+    let child_test = common::exact_test_name(module_path!(), "fake_e2b_child");
+    cmd.args([child_test.as_str(), "--exact", "--ignored", "--nocapture"])
         .env(CHILD_ENV, format!("{mode}:{}", dir.display()))
         .stdin(Stdio::null())
         .stdout(log.try_clone().unwrap())
@@ -176,7 +197,7 @@ fn spawn_child(mode: &str, dir: &Path) -> (common::DaemonChild, std::path::PathB
     }
 }
 
-/// Run the child in `mode` and prove both its daemons are gone soon after it
+/// Run the child in `mode` and prove all its sandbox processes are gone soon after it
 /// ends; `kill` SIGKILLs it first, as nextest does on a timeout.
 fn no_daemon_outlives(mode: &str, kill: bool) {
     if !have_node_and_git() {
@@ -202,7 +223,7 @@ fn no_daemon_outlives(mode: &str, kill: bool) {
     while pids.iter().any(|pid| is_running(*pid)) {
         assert!(
             Instant::now() < deadline,
-            "sandbox daemons {pids:?} outlived the {mode} child: {log}"
+            "sandbox processes {pids:?} outlived the {mode} child: {log}"
         );
         // timing-guard: poll interval until the orphaned daemons are gone
         std::thread::sleep(Duration::from_millis(50));
