@@ -792,7 +792,9 @@ fn help_lists_machines_providers_and_sign_in_without_routes() {
     linux.last_connected_at = Some("2026-10-30T08:00:00Z".into());
     let mut revoked = machine("d-gone", None);
     revoked.state = RemoteMachineState::Revoked;
-    let text = exposed_machines_help(&[mac, linux, revoked], &|id| id == "d-mac").unwrap();
+    let rows = [mac, linux, revoked];
+    let text =
+        exposed_machines_help(&PlacementHelpInputs::new(&rows, &|id| id == "d-mac")).unwrap();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(
         lines[0],
@@ -817,7 +819,10 @@ fn help_lists_machines_providers_and_sign_in_without_routes() {
     for secret in ["10.0.0.1", "100.64.0.1", "7443", &"ab".repeat(32), "d-gone"] {
         assert!(!text.contains(secret), "{secret} leaked: {text}");
     }
-    assert_eq!(exposed_machines_help(&[], &|_| false), None);
+    assert_eq!(
+        exposed_machines_help(&PlacementHelpInputs::new(&[], &|_| false)),
+        None
+    );
 }
 
 #[test]
@@ -827,7 +832,7 @@ fn help_caps_models_machines_and_bytes() {
     let rows: Vec<ExposedMachine> = (0..12)
         .map(|i| machine(&format!("m{i}"), Some(report(MAC, FRESH, claude(&refs)))))
         .collect();
-    let text = exposed_machines_help(&rows, &|_| false).unwrap();
+    let text = exposed_machines_help(&PlacementHelpInputs::new(&rows, &|_| false)).unwrap();
     assert!(text.contains("model-9, +5 more]"), "{text}");
     assert!(!text.contains("model-10"));
     assert_eq!(
@@ -846,10 +851,163 @@ fn help_caps_models_machines_and_bytes() {
             row
         })
         .collect();
-    let text = exposed_machines_help(&wide, &|_| false).unwrap();
+    let text = exposed_machines_help(&PlacementHelpInputs::new(&wide, &|_| false)).unwrap();
     let listed = text.lines().filter(|l| l.starts_with("- \"")).count();
     assert!(listed < 8 && listed > 0, "{listed}");
     assert!(text.contains(&format!("- … {} more not shown", 8 - listed)));
+}
+
+fn profile(base: &str, id: &str, name: &str, remote: ProfileRemote) -> PlacementProfile {
+    PlacementProfile {
+        provider_ref: format!("{base}@{id}"),
+        base_provider: base.into(),
+        name: name.into(),
+        backup: false,
+        remote,
+    }
+}
+
+#[test]
+fn help_lists_profiles_with_their_syntax_and_remote_compatibility() {
+    let rows = [machine(
+        "d-mac",
+        Some(report(MAC, FRESH, claude(&["opus"]))),
+    )];
+    let mut work = profile("claude-code", "pw1", "Work", ProfileRemote::Compatible);
+    work.backup = true;
+    let profiles = [
+        work,
+        profile(
+            "codex",
+            "px2",
+            "Personal",
+            ProfileRemote::Incompatible {
+                keys: vec!["CODEX_HOME".into()],
+            },
+        ),
+        profile("claude-code", "pu3", "Unread", ProfileRemote::Unknown),
+    ];
+    let defaults = [(
+        "claude-code".to_owned(),
+        vec!["CLAUDE_CONFIG_DIR".to_owned()],
+    )];
+    let inputs = PlacementHelpInputs {
+        profiles: &profiles,
+        incompatible_defaults: &defaults,
+        ..PlacementHelpInputs::new(&rows, &|_| true)
+    };
+    let text = exposed_machines_help(&inputs).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.starts_with("Provider profiles"))
+        .unwrap();
+    assert_eq!(
+        lines[at],
+        "Provider profiles (held by this backend, usable on every machine that has the base provider; select one with `provider: \"<base>@<profileId>\"`):"
+    );
+    assert_eq!(lines[at + 1], "- `claude-code@pw1` \"Work\" (backup)");
+    assert_eq!(
+        lines[at + 2],
+        "- `codex@px2` \"Personal\": not remote-compatible (sets `CODEX_HOME`, an account folder on this backend)"
+    );
+    assert_eq!(lines[at + 3], "- `claude-code@pu3` \"Unread\"");
+    assert_eq!(
+        lines[at + 4],
+        "- Default `claude-code`: not remote-compatible (sets `CLAUDE_CONFIG_DIR`, an account folder on this backend)"
+    );
+    assert!(
+        lines[at + 5].starts_with("To run an agent on one"),
+        "{text}"
+    );
+}
+
+#[test]
+fn help_without_profiles_has_no_profile_block() {
+    let rows = [machine(
+        "d-mac",
+        Some(report(MAC, FRESH, claude(&["opus"]))),
+    )];
+    let text = exposed_machines_help(&PlacementHelpInputs::new(&rows, &|_| true)).unwrap();
+    assert!(!text.contains("Provider profiles"), "{text}");
+}
+
+#[test]
+fn help_caps_the_profile_list() {
+    let rows = [machine(
+        "d-mac",
+        Some(report(MAC, FRESH, claude(&["opus"]))),
+    )];
+    let profiles: Vec<PlacementProfile> = (0..HELP_MAX_PROFILES + 3)
+        .map(|i| {
+            profile(
+                "claude-code",
+                &format!("p{i}"),
+                "n",
+                ProfileRemote::Compatible,
+            )
+        })
+        .collect();
+    let inputs = PlacementHelpInputs {
+        profiles: &profiles,
+        ..PlacementHelpInputs::new(&rows, &|_| true)
+    };
+    let text = exposed_machines_help(&inputs).unwrap();
+    assert_eq!(
+        text.lines()
+            .filter(|l| l.starts_with("- `claude-code@"))
+            .count(),
+        HELP_MAX_PROFILES
+    );
+    assert!(text.contains("- … 3 more profiles not shown."), "{text}");
+}
+
+#[test]
+fn help_marks_providers_the_backend_has_not_enabled() {
+    let rows = [machine(
+        "d-mac",
+        Some(report(
+            MAC,
+            FRESH,
+            vec![
+                provider("claude-code", ProviderStatus::SignedIn, &["opus"]),
+                provider("codex", ProviderStatus::SignedIn, &["gpt-5"]),
+            ],
+        )),
+    )];
+    let inputs = PlacementHelpInputs {
+        disabled: &|id| id == "codex",
+        ..PlacementHelpInputs::new(&rows, &|_| true)
+    };
+    let text = exposed_machines_help(&inputs).unwrap();
+    assert!(
+        text.contains(
+            ": claude-code signed-in [opus]; codex signed-in [gpt-5], not enabled on this backend (Settings → Providers)\n"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn help_says_the_default_configuration_travels_before_the_machine_login() {
+    let rows = [machine(
+        "d-mac",
+        Some(report(MAC, FRESH, claude(&["opus"]))),
+    )];
+    let text = exposed_machines_help(&PlacementHelpInputs::new(&rows, &|_| true)).unwrap();
+    assert!(
+        text.contains(
+            "runs with the selected provider profile's environment, or the provider's Default configuration settings when no profile is selected"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "uses the machine's own provider login only when that configuration sets nothing"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("or with the machine's own provider login when no profile is selected"));
 }
 
 #[test]

@@ -1988,6 +1988,59 @@ impl Services {
         )
     }
 
+    /// The backend's part of the remote-placement text: each saved profile
+    /// (reference, name, backup flag, remote compatibility; never a value),
+    /// the Default configurations that set an account folder, and the
+    /// providers turned off in Settings → Providers. A profile whose saved
+    /// environment cannot be read is listed with unknown compatibility.
+    #[doc(hidden)]
+    pub async fn placement_backend_facts(
+        &self,
+    ) -> intent_core::machine_selection::PlacementBackendFacts {
+        use intent_core::machine_selection::{PlacementProfile, ProfileRemote};
+        let remote = |compat: RemoteCompatibility| match compat {
+            RemoteCompatibility::Compatible => ProfileRemote::Compatible,
+            RemoteCompatibility::NotRemoteCompatible { keys, .. } => {
+                ProfileRemote::Incompatible { keys }
+            }
+        };
+        let mut facts = intent_core::machine_selection::PlacementBackendFacts::default();
+        for meta in self.provider_profiles.profiles().unwrap_or_default().iter() {
+            let compat = match load_env(&self.secrets, &meta.id).await {
+                Ok(env) => remote(remote_compatibility_of_doc(&env.unwrap_or_default())),
+                Err(_) => ProfileRemote::Unknown,
+            };
+            facts.profiles.push(PlacementProfile {
+                provider_ref: meta.provider_ref(),
+                base_provider: meta.base_provider.clone(),
+                name: meta.name.clone(),
+                backup: meta.backup,
+                remote: compat,
+            });
+        }
+        for (base, saved) in self.provider_profiles.defaults().unwrap_or_default().iter() {
+            let Ok(env) = self.load_default_env(saved).await else {
+                continue;
+            };
+            if let ProfileRemote::Incompatible { keys } = remote(remote_compatibility_of_doc(&env))
+            {
+                facts.incompatible_defaults.push((base.clone(), keys));
+            }
+        }
+        let settings = self.effective_settings();
+        facts.disabled_providers = intent_providers::ACP_PROVIDERS
+            .iter()
+            .filter(|provider| {
+                crate::agent_ops::provider_is_disabled(
+                    provider.id,
+                    settings.providers.enabled.as_ref(),
+                )
+            })
+            .map(|provider| provider.id.to_owned())
+            .collect();
+        facts
+    }
+
     /// `host.providerAuthStatus` for profile references (PROTOCOL §5.54).
     /// Each profile is probed with its own saved overlay and cached under
     /// its reference plus settings fingerprint, so a verdict never crosses

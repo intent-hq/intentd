@@ -546,11 +546,75 @@ pub const HELP_MAX_MODELS: usize = 10;
 /// The discovery text's budget for its machine lines, in bytes.
 pub const HELP_MAX_BYTES: usize = 4096;
 
-/// Renders the remote-placement text from the exposed machines and whether
-/// each is connected. Each harness version picks one;
+/// The profile list's cap in the discovery text; the rest are counted.
+pub const HELP_MAX_PROFILES: usize = 20;
+
+/// Whether a provider profile (or Default configuration) can run on
+/// another machine, as the discovery text shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileRemote {
+    Compatible,
+    /// It sets these account-folder keys, which tie it to this backend.
+    Incompatible {
+        keys: Vec<String>,
+    },
+    /// Its saved settings could not be read; placement decides.
+    Unknown,
+}
+
+/// One provider profile held by this backend, without its settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementProfile {
+    /// `<base>@<profileId>`, what `provider` takes.
+    pub provider_ref: String,
+    pub base_provider: String,
+    pub name: String,
+    /// Quota failover may switch to it.
+    pub backup: bool,
+    pub remote: ProfileRemote,
+}
+
+/// What the backend contributes to the remote-placement text: its
+/// profiles, the Default configurations that cannot run remotely, and the
+/// providers it has turned off.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlacementBackendFacts {
+    pub profiles: Vec<PlacementProfile>,
+    pub incompatible_defaults: Vec<(String, Vec<String>)>,
+    pub disabled_providers: Vec<String>,
+}
+
+/// What the remote-placement text is rendered from.
+#[derive(Clone, Copy)]
+pub struct PlacementHelpInputs<'a> {
+    pub machines: &'a [ExposedMachine],
+    /// Whether a machine's link is up now.
+    pub connected: &'a dyn Fn(&str) -> bool,
+    /// Whether this backend has a provider turned off (Settings → Providers).
+    pub disabled: &'a dyn Fn(&str) -> bool,
+    pub profiles: &'a [PlacementProfile],
+    /// Base providers whose Default configuration sets these account-folder
+    /// keys.
+    pub incompatible_defaults: &'a [(String, Vec<String>)],
+}
+
+impl<'a> PlacementHelpInputs<'a> {
+    /// The machines alone: no profiles, every provider enabled.
+    #[must_use]
+    pub fn new(machines: &'a [ExposedMachine], connected: &'a dyn Fn(&str) -> bool) -> Self {
+        Self {
+            machines,
+            connected,
+            disabled: &|_| false,
+            profiles: &[],
+            incompatible_defaults: &[],
+        }
+    }
+}
+
+/// Renders the remote-placement text. Each harness version picks one;
 /// [`exposed_machines_help`] is the renderer of harness 1.0 through 3.9.
-pub type PlacementHelpRenderer =
-    fn(machines: &[ExposedMachine], connected: &dyn Fn(&str) -> bool) -> Option<String>;
+pub type PlacementHelpRenderer = fn(inputs: &PlacementHelpInputs<'_>) -> Option<String>;
 
 /// What a remote agent is told about long commands, in the placement help
 /// and its first turn on the machine: its provider's own background shells
@@ -561,14 +625,14 @@ pub const REMOTE_LONG_COMMANDS_HINT: &str = "On a remote machine, run anything o
 /// platform, connected or last seen, each usable provider with its sign-in
 /// status and up to [`HELP_MAX_MODELS`] models, and when the report was
 /// observed. At most [`HELP_MAX_MACHINES`] machines within
-/// [`HELP_MAX_BYTES`]; the rest are counted. Never names routes,
-/// fingerprints or credentials. `None` with no usable machine.
+/// [`HELP_MAX_BYTES`]; the rest are counted. Then the backend's provider
+/// profiles (up to [`HELP_MAX_PROFILES`]) and Default configurations that
+/// cannot run remotely. Never names routes, fingerprints, credentials or
+/// setting values. `None` with no usable machine.
 #[must_use]
-pub fn exposed_machines_help(
-    machines: &[ExposedMachine],
-    connected: &dyn Fn(&str) -> bool,
-) -> Option<String> {
-    let listed: Vec<&ExposedMachine> = machines
+pub fn exposed_machines_help(inputs: &PlacementHelpInputs<'_>) -> Option<String> {
+    let listed: Vec<&ExposedMachine> = inputs
+        .machines
         .iter()
         .filter(|row| row.state != RemoteMachineState::Revoked)
         .collect();
@@ -578,7 +642,7 @@ pub fn exposed_machines_help(
     let mut lines = String::new();
     let mut shown = 0;
     for row in &listed {
-        let line = help_line(row, connected(&row.id));
+        let line = help_line(row, (inputs.connected)(&row.id), inputs.disabled);
         if shown == HELP_MAX_MACHINES || lines.len() + line.len() > HELP_MAX_BYTES {
             break;
         }
@@ -596,15 +660,58 @@ pub fn exposed_machines_help(
             listed.len() - shown
         );
     }
+    push_profiles(&mut text, inputs);
     text.push_str(
         "To run an agent on one, pass `placement: { target: \"remote\" }` (optionally `nodeId`, `os`, `arch`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, { create: { placement } })`. Without `nodeId` the backend picks a machine that runs the platform, has the provider signed in (or unknown) and the model listed, with free capacity. When none lists the model the call fails with `model-unavailable`; other refusals are `placement-unavailable` or `machine-update-required`. A remote agent's own sub-agents (`ws.agent.create`, `ws.agent.delegate`, `ws.agent.wakeOrCreate`) run on its machine when no `placement` is given, with the same checks and no fallback; pass `placement: { target: \"local\" }` to run one on the backend. A batch `ws.agent.delegate({ tasks })` takes one `placement` for all its tasks, and an object entry `{ taskNoteId, placement }` its own.\n\
-         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment (an API key or other settings; a profile or Default that sets an account folder such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR` is refused with `profile-not-remote-compatible`), or with the machine's own provider login when no profile is selected, and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree): right after each `ws.git.commit` (its result has `pushed`) and before each `ws.agent.reportToParent` is delivered, and at the end of each turn, which is when a plain `git commit` reaches the backend. `ws.agent.setModel` can switch it to another model or remote-compatible profile its machine offers; its next turn relaunches it there with the conversation history.\n",
+         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment, or the provider's Default configuration settings when no profile is selected (an API key or other settings; a profile or Default that sets an account folder such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR` is refused with `profile-not-remote-compatible`), uses the machine's own provider login only when that configuration sets nothing, and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree): right after each `ws.git.commit` (its result has `pushed`) and before each `ws.agent.reportToParent` is delivered, and at the end of each turn, which is when a plain `git commit` reaches the backend. `ws.agent.setModel` can switch it to another model or remote-compatible profile its machine offers; its next turn relaunches it there with the conversation history.\n",
     );
     text.push_str(REMOTE_LONG_COMMANDS_HINT);
     Some(text)
 }
 
-fn help_line(row: &ExposedMachine, connected: bool) -> String {
+/// The profiles block: each profile's reference, name, backup flag and
+/// remote compatibility, then each Default that cannot run remotely.
+fn push_profiles(text: &mut String, inputs: &PlacementHelpInputs<'_>) {
+    if inputs.profiles.is_empty() && inputs.incompatible_defaults.is_empty() {
+        return;
+    }
+    text.push_str(
+        "Provider profiles (held by this backend, usable on every machine that has the base provider; select one with `provider: \"<base>@<profileId>\"`):\n",
+    );
+    for profile in inputs.profiles.iter().take(HELP_MAX_PROFILES) {
+        let _ = write!(text, "- `{}` \"{}\"", profile.provider_ref, profile.name);
+        if profile.backup {
+            text.push_str(" (backup)");
+        }
+        if let ProfileRemote::Incompatible { keys } = &profile.remote {
+            push_incompatible(text, keys);
+        }
+        text.push('\n');
+    }
+    if inputs.profiles.len() > HELP_MAX_PROFILES {
+        let _ = writeln!(
+            text,
+            "- … {} more profiles not shown.",
+            inputs.profiles.len() - HELP_MAX_PROFILES
+        );
+    }
+    for (base, keys) in inputs.incompatible_defaults {
+        let _ = write!(text, "- Default `{base}`");
+        push_incompatible(text, keys);
+        text.push('\n');
+    }
+}
+
+fn push_incompatible(text: &mut String, keys: &[String]) {
+    let keys: Vec<String> = keys.iter().map(|key| format!("`{key}`")).collect();
+    let _ = write!(
+        text,
+        ": not remote-compatible (sets {}, an account folder on this backend)",
+        keys.join(", ")
+    );
+}
+
+fn help_line(row: &ExposedMachine, connected: bool, disabled: &dyn Fn(&str) -> bool) -> String {
     let platform = row
         .platform
         .map_or_else(|| "platform unknown".to_owned(), |p| p.to_string());
@@ -645,11 +752,15 @@ fn help_line(row: &ExposedMachine, connected: bool) -> String {
             if models.is_empty() {
                 models.push_str("no models listed");
             }
-            format!(
+            let mut shown = format!(
                 "{} {} [{models}]",
                 provider.id,
                 crate::machines::status_name(provider.status)
-            )
+            );
+            if disabled(&provider.id) {
+                shown.push_str(", not enabled on this backend (Settings → Providers)");
+            }
+            shown
         })
         .collect();
     if providers.is_empty() {

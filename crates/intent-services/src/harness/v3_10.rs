@@ -4,7 +4,7 @@
 //! extension point its work fills; until then each renders 3.9's bytes.
 
 use super::{ContextSurfaces, Doctrine, HarnessEntry, RepoRulesInputs, SkillsBlockInputs};
-use intent_core::machines::ExposedMachine;
+use intent_core::machine_selection::PlacementHelpInputs;
 
 static DOCTRINE: Doctrine = Doctrine {
     instructions: &crate::instructions::V3_10,
@@ -40,8 +40,8 @@ fn skills_block(inputs: &SkillsBlockInputs<'_>) -> String {
 }
 
 /// The remote-placement text: stable machine identity only.
-fn placement_help(machines: &[ExposedMachine], connected: &dyn Fn(&str) -> bool) -> Option<String> {
-    intent_core::machine_selection::exposed_machines_help(machines, connected)
+fn placement_help(inputs: &PlacementHelpInputs<'_>) -> Option<String> {
+    intent_core::machine_selection::exposed_machines_help(inputs)
 }
 
 #[cfg(test)]
@@ -130,9 +130,11 @@ mod tests {
         );
         let machines = [machine("d-mac"), machine("d-box")];
         let connected = |id: &str| id == "d-mac";
+        let inputs =
+            intent_core::machine_selection::PlacementHelpInputs::new(&machines, &connected);
         assert_eq!(
-            (current.placement_help)(&machines, &connected),
-            (previous.placement_help)(&machines, &connected)
+            (current.placement_help)(&inputs),
+            (previous.placement_help)(&inputs)
         );
     }
 }
