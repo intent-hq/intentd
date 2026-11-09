@@ -391,6 +391,73 @@ async fn content_writes_trim_edge_whitespace() {
     drop(services);
 }
 
+/// Checkbox writes keep the note's edge whitespace: callers address lines by
+/// number from an earlier read, so a trim would shift the next write onto
+/// the wrong checkbox.
+#[intent_test_macros::daemon_test]
+async fn checkbox_writes_keep_line_numbers() {
+    let (services, ws, _tmp) = setup().await;
+    let id = services
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Checklist".to_string(),
+                content: Some("- [ ] seed".to_string()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create note")
+        .note
+        .id;
+    let editor_text = "\n\n- [ ] one\n- [ ] two\n- [ ] three\n";
+    services
+        .set_note_content_guarded(
+            ws.clone(),
+            id.clone(),
+            editor_text.to_string(),
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("editor save");
+
+    for line in [3, 4] {
+        let r = services
+            .task_update(
+                ws.clone(),
+                id.clone(),
+                line,
+                None,
+                Some("done".to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("task update");
+        assert_eq!(r.line_number, line);
+    }
+    services
+        .task_update_status(
+            ws.clone(),
+            id.clone(),
+            "three".to_string(),
+            "in-progress".to_string(),
+            None,
+        )
+        .await
+        .expect("task update status");
+
+    let note = services.get_note(ws, id).await.expect("get note");
+    assert_eq!(note.content, "\n\n- [x] one\n- [x] two\n- [/] three\n");
+    drop(services);
+}
+
 /// Parallel writers per concurrency test. The issue (intent-hq/intent#7184)
 /// saw 2–3 of 8 parallel `ws.note.edit` calls fail; more writers than the
 /// 5-attempt retry bound makes the pre-fix failure deterministic.

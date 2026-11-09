@@ -11095,6 +11095,10 @@ enum ContentWritePolicy {
     /// already ran against the content the caller read; the merged text
     /// persists with its edge whitespace trimmed.
     Surgical,
+    /// `task.update` / `task.updateStatus`: like `Surgical`, but the edge
+    /// whitespace is kept. Callers address checkboxes by line number from an
+    /// earlier read, so a trim would shift their next write onto another line.
+    LineStable,
 }
 
 impl ContentWritePolicy {
@@ -11102,6 +11106,7 @@ impl ContentWritePolicy {
         match self {
             Self::SetContent { trim_edges, .. } => trim_edges,
             Self::Surgical => true,
+            Self::LineStable => false,
         }
     }
 }
@@ -11191,7 +11196,7 @@ async fn persist_merged_content(
             normalized = note_ops::normalize_set_content(incoming);
             normalized.as_str()
         }
-        ContentWritePolicy::Surgical => incoming,
+        ContentWritePolicy::Surgical | ContentWritePolicy::LineStable => incoming,
     };
     let mut attempt = 0;
     loop {
@@ -27316,7 +27321,7 @@ impl WorkspaceApi for Services {
                     seed: Some(note),
                     incoming: &updated,
                     expected_version: Some(read_rev),
-                    policy: ContentWritePolicy::Surgical,
+                    policy: ContentWritePolicy::LineStable,
                     author: &author,
                     op: "task.updateStatus",
                     base_content_bytes: None,
@@ -27510,7 +27515,7 @@ impl WorkspaceApi for Services {
                             seed: Some(note),
                             incoming: &update.content,
                             expected_version: Some(read_rev),
-                            policy: ContentWritePolicy::Surgical,
+                            policy: ContentWritePolicy::LineStable,
                             author: &author,
                             op: "task.update",
                             base_content_bytes: None,
