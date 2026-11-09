@@ -265,7 +265,8 @@ fn run_version_probe(path: &Path) -> Option<String> {
     if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || {
             let mut out = Vec::new();
-            let _ = stdout.take(64 * 1024).read_to_end(&mut out);
+            let limit = u64::try_from(MAX_OUTPUT_BYTES).unwrap_or(u64::MAX);
+            let _ = stdout.take(limit).read_to_end(&mut out);
             let _ = tx.send(out);
         });
     }
