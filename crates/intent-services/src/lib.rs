@@ -19737,11 +19737,13 @@ impl WorkspaceApi for Services {
             tokio::task::spawn_blocking(move || {
                 let provider = specialist_preview_provider(provider)?;
                 let ws_path = workspace_path.as_deref().map(Path::new);
-                let mut result = services.specialists_service().list(ws_path)?;
+                let specialists = services.specialists_service();
+                let mut result = specialists.list(ws_path)?;
                 if let Some(specs) = result
                     .get_mut("specialists")
                     .and_then(serde_json::Value::as_array_mut)
                 {
+                    specialists.attach_bundled_baselines(specs.iter_mut());
                     for def in specs {
                         decorate_specialist_resolved(&services, def, provider.as_deref());
                     }
@@ -19800,8 +19802,10 @@ impl WorkspaceApi for Services {
             tokio::task::spawn_blocking(move || {
                 let provider = specialist_preview_provider(provider)?;
                 let ws_path = workspace_path.as_deref().map(Path::new);
-                let mut result = services.specialists_service().get(&id, ws_path)?;
+                let specialists = services.specialists_service();
+                let mut result = specialists.get(&id, ws_path)?;
                 if let Some(def) = result.get_mut("specialist") {
+                    specialists.attach_bundled_baselines(std::iter::once(&mut *def));
                     decorate_specialist_resolved(&services, def, provider.as_deref());
                 }
                 Ok(result)

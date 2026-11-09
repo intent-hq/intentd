@@ -56,7 +56,22 @@ async fn list(api: &Arc<dyn WorkspaceApi>, _args: &Value) -> Result<Value, Strin
 
     // The wire shape already matches the TS reference (id, name, description,
     // model, prompt, behaviorPrompt, source, isCustomized, etc.)
-    Ok(Value::Array(specialists.clone()))
+    Ok(Value::Array(
+        specialists
+            .iter()
+            .cloned()
+            .map(without_bundled_baseline)
+            .collect(),
+    ))
+}
+
+/// Drop the Settings-only `bundled` baseline: it repeats a built-in's prompt
+/// for every override, which the Assistant does not need.
+fn without_bundled_baseline(mut specialist: Value) -> Value {
+    if let Some(obj) = specialist.as_object_mut() {
+        obj.remove("bundled");
+    }
+    specialist
 }
 
 async fn get(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
@@ -79,7 +94,7 @@ async fn get(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String>
         .get("specialist")
         .ok_or_else(|| "specialists.get returned invalid shape".to_string())?;
 
-    Ok(specialist.clone())
+    Ok(without_bundled_baseline(specialist.clone()))
 }
 
 /// MCP resource MIME type for proposals (parity with FE `proposal-resource.ts`).

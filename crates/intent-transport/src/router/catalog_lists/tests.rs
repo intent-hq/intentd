@@ -146,6 +146,18 @@ fn oversized_specialist_prompt_is_omitted_from_a_page() {
 }
 
 #[test]
+fn oversized_specialist_drops_its_bundled_baseline() {
+    let mut rows = specialists(1, 16);
+    rows["specialists"][0]["bundled"] =
+        json!({ "behaviorPrompt": "x".repeat(CATALOG_PAGE_BYTES + 1) });
+    let page = page_specialist_list(rows, &params(&json!({ "limit": 1 }))).unwrap();
+    let row = &page["specialists"][0];
+    assert!(row.get("bundled").is_none());
+    assert_eq!(row["bundledOmitted"], true);
+    assert!(frame_len(&page) <= CATALOG_PAGE_BYTES);
+}
+
+#[test]
 fn limit_clamps_into_one_to_the_row_maximum() {
     let many = specialists(CATALOG_PAGE_MAX_ROWS + 10, 0);
     let page = page_specialist_list(many.clone(), &params(&json!({ "limit": 100_000 }))).unwrap();
