@@ -316,9 +316,12 @@ async fn described_server(
     }
     .placement_help()
     .await;
-    // Head answers the agent's `ws.agent.*` calls, `machineModels` among
-    // them, wherever it lists machines for it.
-    let machine_models = help.is_some();
+    // Head answers the agent's `ws.agent.*` calls. Only a head that serves
+    // `remoteMachines.models` names the lookup in its placement text; an
+    // older one lists machines without it.
+    let machine_models = help.as_deref().is_some_and(|text| {
+        text.contains(intent_core::machine_selection::MACHINE_MODELS_SIGNATURE)
+    });
     Ok(
         server_with_setup(agent_id, workspace_id, worktree, gates, (head, push))?
             .with_remote_placement_help(help)
