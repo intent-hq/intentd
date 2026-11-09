@@ -1944,6 +1944,9 @@ mod hook_golden_tests;
 mod host_role_tests;
 
 #[cfg(test)]
+mod remote_script_monitor_watch_tests;
+
+#[cfg(test)]
 mod retire_workspace_tests;
 
 #[cfg(test)]

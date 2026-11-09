@@ -18,6 +18,8 @@ struct Recorded {
     changed: Mutex<Vec<String>>,
     wakes: Mutex<Vec<(AgentId, String, Option<serde_json::Value>)>>,
     monitor_events: Mutex<Vec<(String, serde_json::Value)>>,
+    /// Wakes and monitor-ended re-checks, in call order.
+    order: Mutex<Vec<&'static str>>,
     unreachable: std::sync::atomic::AtomicBool,
     protocol: std::sync::atomic::AtomicU32,
 }
@@ -27,6 +29,7 @@ fn hooks(rec: &Arc<Recorded>) -> Hooks {
     let changed = rec.clone();
     let wakes = rec.clone();
     let monitors = rec.clone();
+    let ended = rec.clone();
     Hooks {
         link: Arc::new(move |_agent| {
             let rec = links.clone();
@@ -60,10 +63,15 @@ fn hooks(rec: &Arc<Recorded>) -> Hooks {
         }),
         wake: Arc::new(move |_ws, agent, content, metadata| {
             wakes.wakes.lock().unwrap().push((agent, content, metadata));
+            wakes.order.lock().unwrap().push("wake");
             Box::pin(async {})
         }),
         monitor: Arc::new(move |_ws, kind, row| {
             monitors.monitor_events.lock().unwrap().push((kind, row));
+            Box::pin(async {})
+        }),
+        ended: Arc::new(move |_agent| {
+            ended.order.lock().unwrap().push("ended");
             Box::pin(async {})
         }),
         restart_backoff: Duration::from_millis(20),
@@ -1597,4 +1605,57 @@ async fn an_expiry_wake_carries_the_ttl_expired_card() {
     assert!(md["runId"].is_string(), "{md}");
     assert_eq!(md["remoteAgentId"], agent.as_str());
     assert_eq!(md["nodeId"], "mac");
+}
+
+/// A monitor's end re-checks its owner's deferred completion once, after
+/// any wake is queued; a replacement, or a run ending with no monitor,
+/// re-checks nothing.
+#[tokio::test]
+async fn a_monitor_end_rechecks_its_owner_after_the_wake() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let order = |rec: &Recorded| rec.order.lock().unwrap().clone();
+    let agent = AgentId::new();
+    let here = place(&agent);
+    let (start, _) = watched(
+        &runs,
+        &rec,
+        &here,
+        ScriptMode::Command,
+        serde_json::json!({ "ttlMs": 60000 }),
+    )
+    .await;
+    let watch = serde_json::json!({ "ttlMs": 60000 });
+    let replacement = runs.monitor(&here, &watch).await.unwrap()["monitor"]["monitorId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        order(&rec).is_empty(),
+        "a replacement keeps the agent waiting"
+    );
+
+    assert!(runs.unmonitor(&agent, &replacement).await);
+    assert_eq!(order(&rec), ["ended"], "a silent cancel re-checks once");
+
+    runs.monitor(&here, &watch).await.unwrap();
+    frame(&runs, exited(&start, Some(0), None)).await;
+    assert_eq!(
+        order(&rec),
+        ["ended", "wake", "ended"],
+        "an exit re-checks after its wake"
+    );
+
+    let unwatched = AgentId::new();
+    runs.start(&place(&unwatched), &script(ScriptMode::Command, "make"))
+        .await
+        .unwrap();
+    let other = last_start(&rec);
+    frame(&runs, started(&other)).await;
+    frame(&runs, exited(&other, Some(0), None)).await;
+    assert_eq!(
+        order(&rec).len(),
+        3,
+        "a run with no monitor re-checks nothing"
+    );
 }

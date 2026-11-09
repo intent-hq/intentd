@@ -587,7 +587,8 @@ impl ScriptManager {
         services: intent_services::feature_api::Services,
     ) -> machine_runs::MachineRuns {
         let link_svc = services.clone();
-        let wake_svc = services;
+        let wake_svc = services.clone();
+        let ended_svc = services;
         let wake_port = self.agent_wake.clone();
         let publisher = self.clone();
         let monitor_publisher = self.clone();
@@ -619,6 +620,12 @@ impl ScriptManager {
             monitor: Arc::new(move |ws, kind, row| {
                 let publisher = monitor_publisher.clone();
                 Box::pin(async move { publisher.publish_machine_monitor(&ws, &kind, row).await })
+            }),
+            ended: Arc::new(move |agent| {
+                let svc = ended_svc.clone();
+                Box::pin(async move {
+                    svc.redeliver_completion_after_queue_mutation(&agent).await;
+                })
             }),
             restart_backoff: Duration::from_secs(1),
             stop_wait: Duration::from_secs(10),
