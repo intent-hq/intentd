@@ -21,12 +21,36 @@ const AGENT_TYPES: &[&str] = &[
 /// `(agent type, bytes, SHA-256)` of the four variants joined: defaults,
 /// every gate off, plain folder, plain folder with every gate off.
 const GOLDEN: &[(&str, usize, &str)] = &[
-    ("interactive", 37_463, "792ec424fbd5ae2b54a5c0a0d40d327f5ba600b30f1a355d618897c99a9fd5e7"),
-    ("workspace", 37_463, "792ec424fbd5ae2b54a5c0a0d40d327f5ba600b30f1a355d618897c99a9fd5e7"),
-    ("workspace-agent", 52_219, "c7b5304423795047c3ddc8da0b70bb14a323d511247ff7b51ce96dae8489568e"),
-    ("task-breakdown", 71_586, "09ff31a155355b6d033c3da994e57f490240c5988bc26ee07864d4074159512a"),
-    ("chat", 38_959, "77cf8da8259d6942950891f8a85f270713a14586249a50cabd1e760c4f8aeb20"),
-    ("code-review", 14_393, "c530af1e49d099ffd8e067fb97edd8aa2e0f3b114bb68e063ec6a81ab709b45f"),
+    (
+        "interactive",
+        37_463,
+        "792ec424fbd5ae2b54a5c0a0d40d327f5ba600b30f1a355d618897c99a9fd5e7",
+    ),
+    (
+        "workspace",
+        37_463,
+        "792ec424fbd5ae2b54a5c0a0d40d327f5ba600b30f1a355d618897c99a9fd5e7",
+    ),
+    (
+        "workspace-agent",
+        52_219,
+        "c7b5304423795047c3ddc8da0b70bb14a323d511247ff7b51ce96dae8489568e",
+    ),
+    (
+        "task-breakdown",
+        71_586,
+        "09ff31a155355b6d033c3da994e57f490240c5988bc26ee07864d4074159512a",
+    ),
+    (
+        "chat",
+        38_959,
+        "77cf8da8259d6942950891f8a85f270713a14586249a50cabd1e760c4f8aeb20",
+    ),
+    (
+        "code-review",
+        14_393,
+        "c530af1e49d099ffd8e067fb97edd8aa2e0f3b114bb68e063ec6a81ab709b45f",
+    ),
 ];
 
 const CUT_HEADINGS: &[&str] = &[
@@ -106,18 +130,23 @@ fn golden_v3_10_composed_doctrine() {
 }
 
 #[test]
-fn v3_10_cuts_sections_and_keeps_the_rest_of_v3_9() {
+fn v3_10_cuts_sections_and_keeps_the_rest_of_v3_8() {
     let current = set();
-    let previous = crate::harness::resolve_entry("3.9").doctrine.instructions;
+    let previous = crate::harness::resolve_entry("3.8").doctrine.instructions;
     for heading in CUT_HEADINGS {
-        assert!(previous.common.contains(heading), "{heading} was in 3.9");
+        assert!(previous.common.contains(heading), "{heading} was in 3.8");
         assert!(!current.common.contains(heading), "{heading}");
     }
     for text in [current.common, current.workspace] {
         assert!(!text.contains("ws-block:html"));
         assert!(!text.contains("intentVisual"));
     }
-    for retired in ["get_note", "add_to_note", "create_agent", "set_workspace_title"] {
+    for retired in [
+        "get_note",
+        "add_to_note",
+        "create_agent",
+        "set_workspace_title",
+    ] {
         assert!(!current.workspace.contains(retired), "{retired}");
     }
     assert!(current.common.len() * 2 < previous.common.len());
