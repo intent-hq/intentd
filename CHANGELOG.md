@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.167] - 2026-11-09
+
+### 🚀 Features
+
+- *(remote)* List provider profiles in the remote placement help ([#3219](https://github.com/intent-hq/intentd/pull/3219))
+- *(agents)* Record the spawn prompt breakdown and serve it on agent.getSession ([#3216](https://github.com/intent-hq/intentd/pull/3216))
+- *(acp)* Compact ws.* reference for harness 3.10 ([#3221](https://github.com/intent-hq/intentd/pull/3221))
+
+### 🐛 Bug Fixes
+
+- *(remote)* Start a slow provider once more, and allow a cold first start after a machine wakes ([#3223](https://github.com/intent-hq/intentd/pull/3223))
+
+
 ## [0.11.166] - 2026-11-09
 
 ### 🚀 Features
