@@ -441,7 +441,10 @@ jobs:
             fi
             if ! GH_TOKEN="$RELEASE_PLZ_TOKEN" gh pr reopen "$number" --repo "$GITHUB_REPOSITORY" \
               && ! GH_TOKEN="$RELEASE_PLZ_TOKEN" gh pr reopen "$number" --repo "$GITHUB_REPOSITORY"; then
-              msg="Closed Release PR #$number to restart CI but could not reopen it; reopen it by hand"
+              # Rare race: a release bot run between the close and the reopen
+              # can open a new Release PR on the same branch, and the old one
+              # then cannot reopen. The next run picks up the new PR.
+              msg="Closed Release PR #$number to restart CI but could not reopen it; reopen it by hand (or, if a new Release PR replaced it, nothing is needed)"
               echo "::error::$msg"
               decide error ci-restart-failed "$msg" 1
             fi
