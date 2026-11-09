@@ -2281,7 +2281,6 @@ async fn retire_and_restore(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restored_agent_is_told_it_runs_on_a_new_machine() {
     let Some(CloudBackend {
-        scratch,
         repo,
         fake,
         head_dir,
@@ -2355,7 +2354,7 @@ async fn a_restored_agent_is_told_it_runs_on_a_new_machine() {
     retire_and_restore(&mut rpc_ws, agent, "sbx2", 900).await;
     let refs = format!("refs/intent/ws/{ws_id}/agents/{agent_id}");
     let base = git(&repo, &["rev-parse", "HEAD"]);
-    let scratch_tree = scratch.path().join("conflict");
+    let scratch_tree = fake.scratch().join("conflict");
     git(
         &repo,
         &[
