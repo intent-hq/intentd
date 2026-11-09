@@ -664,12 +664,16 @@ pub(crate) struct PrMonitorSnapshot {
     pub merge_blocked_reason_last_known: Option<String>,
 }
 
-/// `baseline` (a serialized snapshot) with the last known values of
-/// `previous` carried over the facts it reads unknown. Either side failing
-/// to parse leaves the baseline as it is.
-fn carry_last_known_from_row(baseline: String, previous: Option<&str>) -> String {
-    let Some(previous) = previous.and_then(|p| serde_json::from_str::<PrMonitorSnapshot>(p).ok())
-    else {
+/// `baseline` (a serialized snapshot) with the last known values of `m`'s
+/// emit baseline carried over the facts it reads unknown. Like the poll, a
+/// row whose emit baseline does not parse falls back to its last snapshot.
+/// Nothing to carry from, or an unparseable `baseline`, leaves it as it is.
+fn carry_last_delivered(baseline: String, m: &PrMonitor) -> String {
+    let parse = |s: &Option<String>| {
+        s.as_deref()
+            .and_then(|s| serde_json::from_str::<PrMonitorSnapshot>(s).ok())
+    };
+    let Some(previous) = parse(&m.baseline_snapshot).or_else(|| parse(&m.last_snapshot)) else {
         return baseline;
     };
     let Ok(mut snapshot) = serde_json::from_str::<PrMonitorSnapshot>(&baseline) else {
@@ -3413,10 +3417,11 @@ impl Services {
     /// and `lastPolledAt` is NOT stamped, so the first post-pause sweep
     /// polls the row first and adopts the PR's state then.
     ///
-    /// The same owner already knew the row's last known values, so a
-    /// baseline read mid-blip carries them: settling back at them is not
-    /// news. An adoption does not carry them, since the adopter was never
-    /// told them.
+    /// A baseline read mid-blip carries the values last DELIVERED to the
+    /// same owner (the emit baseline, not the latest poll): settling back at
+    /// them is not news, while a change still pending reports once the read
+    /// settles at it. An adoption does not carry them, since the adopter was
+    /// never told them.
     async fn rearm_pr_monitor(
         &self,
         mut m: PrMonitor,
@@ -3424,7 +3429,7 @@ impl Services {
         baseline: Option<String>,
         now: &str,
     ) -> Result<Option<PrMonitor>> {
-        let baseline = baseline.map(|b| carry_last_known_from_row(b, m.last_snapshot.as_deref()));
+        let baseline = baseline.map(|b| carry_last_delivered(b, &m));
         let polled_at = baseline.is_some().then_some(now);
         let _reconcile = self.sweep_rate_limit.reconcile().await;
         let pause = self

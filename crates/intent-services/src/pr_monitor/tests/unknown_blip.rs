@@ -279,3 +279,27 @@ async fn derived_merge_lines_settling_after_an_unrelated_wake_stay_silent() {
         assert!(changes.iter().any(|c| c == line), "{changes:?}");
     }
 }
+
+/// The carry on a re-register is what the agent was last told, not the
+/// latest poll: a change still pending when the agent re-registers mid-blip
+/// reports once the read settles at it.
+#[tokio::test]
+async fn re_register_mid_blip_still_reports_a_pending_change() {
+    let (_db, _root, svc, forge, ws, owner) = setup().await;
+    let id = register(&svc, &ws, &owner).await.monitor_id;
+    forge.edit(|s| full_settle(s, "dirty", false));
+    svc.poll_pr_monitors().await;
+    assert!(!pending(&svc, &id).await.is_empty());
+    forge.edit(full_blip);
+    assert_eq!(register(&svc, &ws, &owner).await.monitor_id, id);
+    forge.edit(|s| full_settle(s, "dirty", false));
+    svc.poll_pr_monitors().await;
+    let changes = pending(&svc, &id).await;
+    for line in [
+        "merge conflicts appeared",
+        "mergeable: true → false",
+        "merge state: CLEAN → DIRTY",
+    ] {
+        assert!(changes.iter().any(|c| c == line), "{changes:?}");
+    }
+}
