@@ -5640,8 +5640,10 @@ pub struct AgentDelegateInput {
     /// Retired per-agent isolation selector. `"cow"` is rejected with
     /// `-32602` / `data.code: "isolation-removed"` before any side effect
     /// (per-agent `CoW` sandboxes were removed in protocol 16); `"direct"` and
-    /// `"shared"` are accepted as no-ops. An agent that is not placed on a
-    /// remote machine works in the workspace checkout.
+    /// `"shared"` are accepted as no-ops, except on a sub-agent that inherits
+    /// a remote parent's placement, where any `isolation` is rejected. An
+    /// agent that is not placed on a remote machine works in the workspace
+    /// checkout.
     pub isolation: Option<String>,
     /// Occupancy override: a task that already has a live assigned agent
     /// rejects a second delegation unless `force: true` is passed to
