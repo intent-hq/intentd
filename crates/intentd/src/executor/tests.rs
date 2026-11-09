@@ -2306,14 +2306,19 @@ async fn a_remote_launch_carries_the_providers_remote_env() {
     let LinkFrame::Launch(mut launch) = launch_of("a1", "mock") else {
         unreachable!()
     };
-    launch.profile_env = Some(intent_core::node_link::LaunchProfileEnv(serde_json::json!({
-        "providerRef": "mock@work",
-        "fingerprint": "f1",
-        "env": [{ "key": "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "value": "0" }],
-    })));
+    launch.profile_env = Some(intent_core::node_link::LaunchProfileEnv(
+        serde_json::json!({
+            "providerRef": "mock@work",
+            "fingerprint": "f1",
+            "env": [{ "key": "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "value": "0" }],
+        }),
+    ));
     dialed.link.send(&LinkFrame::Launch(launch)).await.unwrap();
     let started = next_record(&mut dialed).await.body;
-    assert!(matches!(started, JournalBody::Started { .. }), "{started:?}");
+    assert!(
+        matches!(started, JournalBody::Started { .. }),
+        "{started:?}"
+    );
     let roots = node.service.agent_roots();
     assert_eq!(roots.len(), 1, "{roots:?}");
     let environ = std::fs::read(format!("/proc/{}/environ", roots[0].root_pid)).unwrap();
