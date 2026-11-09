@@ -1751,7 +1751,10 @@ impl Runner {
                         continue;
                     }
                     break match outcome {
-                        Outcome::Exited(code) | Outcome::ExitedAtStart(code) => (code, None),
+                        Outcome::Exited(code) | Outcome::ExitedAtStart(code, None) => (code, None),
+                        Outcome::ExitedAtStart(code, Some(error)) => {
+                            (code, Some(format!("{}: {error}", codes::START)))
+                        }
                         Outcome::Stopped => (None, None),
                         Outcome::StartFailed(error, _) => {
                             (None, Some(format!("{}: {error}", codes::START)))
@@ -2209,12 +2212,21 @@ impl Runner {
                 Ok(session) => session,
                 Err(error) => {
                     agent.note_auth_failure(&error);
+                    if intent_services::provider_auth::is_auth_required(&error) {
+                        return Outcome::StartFailed(error.to_string(), false);
+                    }
+                    // A provider that exits at start often closes its output
+                    // before its exit is seen: it exited, not failed setup.
+                    if let Ok(status) = tokio::time::timeout(EXIT_SETTLE, child.wait()).await {
+                        let code = status.ok().and_then(|s| s.code());
+                        return Outcome::ExitedAtStart(code, Some(error.to_string()));
+                    }
                     let timed_out = matches!(&error, intent_acp::AcpError::Timeout(method) if method == "initialize");
                     return Outcome::StartFailed(error.to_string(), timed_out);
                 }
             },
             status = child.wait() => {
-                return Outcome::ExitedAtStart(status.ok().and_then(|s| s.code()));
+                return Outcome::ExitedAtStart(status.ok().and_then(|s| s.code()), None);
             }
             _ = &mut *stop => return Outcome::Stopped,
         };
@@ -2925,11 +2937,16 @@ enum Push {
     Exit,
 }
 
+/// How long a provider whose setup failed is given to exit, so an exit at
+/// start is told apart from a setup error.
+const EXIT_SETTLE: Duration = Duration::from_millis(500);
+
 #[derive(Debug)]
 enum Outcome {
     Exited(Option<i32>),
-    /// The provider exited before its session was ready.
-    ExitedAtStart(Option<i32>),
+    /// The provider exited before its session was ready, with the setup
+    /// error it caused, if any.
+    ExitedAtStart(Option<i32>, Option<String>),
     Stopped,
     /// Its setup failed; `true` when `initialize` timed out.
     StartFailed(String, bool),
@@ -2939,7 +2956,7 @@ impl Outcome {
     /// Whether a second start may succeed: the provider exited before it
     /// was ready, or did not answer `initialize` in time.
     fn start_may_recover(&self) -> bool {
-        matches!(self, Self::ExitedAtStart(_) | Self::StartFailed(_, true))
+        matches!(self, Self::ExitedAtStart(..) | Self::StartFailed(_, true))
     }
 }
 

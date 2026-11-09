@@ -716,6 +716,25 @@ async fn node_runner_gives_up_after_the_second_start_and_says_why() {
     assert!(error.contains(&exit), "{error}");
 }
 
+/// A sign-in failure at start is not retried: a second start would fail
+/// the same way.
+#[tokio::test]
+async fn node_runner_does_not_retry_a_sign_in_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("starts");
+    let Some(h) = harness(
+        1,
+        &["--auth-required-setup", "--log-start", log.to_str().unwrap()],
+    ) else {
+        return;
+    };
+    h.runner.launch(launch("a1")).await;
+    let all = wait_for(&h.runner, "exit", exited("a1")).await;
+    let exit = exit_error(find(&all, exited("a1"))).unwrap();
+    assert!(exit.starts_with(codes::START), "{exit}");
+    assert_eq!(starts(&log), 1);
+}
+
 /// Only the first agent started after a link binds gets the longer cold
 /// `initialize` timeout.
 #[tokio::test]
