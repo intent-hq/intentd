@@ -565,6 +565,57 @@ pub fn placement_help_renderer(
     resolve_entry(harness_version).context.placement_help
 }
 
+/// The `workspace_api` docs a remote machine renders for the harness
+/// version its launch names (node-link.md § Launch and agent lifecycle):
+/// absent, or not `MAJOR.MINOR`, is the legacy text from before harness
+/// 3.10; a registered version is its own; a version newer than every
+/// registered one is the newest's. Never refuses: any other unknown
+/// version is the legacy text too.
+#[must_use]
+pub fn launch_workspace_api_docs(
+    harness_version: Option<&str>,
+) -> &'static dyn intent_acp::WorkspaceApiDocs {
+    launch_context(harness_version).workspace_api
+}
+
+/// The registered version the local path serves for a session's stamp —
+/// the stamp itself when registered, else the latest (as
+/// [`resolve_entry`]). The backend sends this in a launch so a machine
+/// renders what a local spawn would, even for an empty or corrupt stamp.
+#[must_use]
+pub fn launch_harness_version(stamp: &str) -> &'static str {
+    resolve_entry(stamp).version
+}
+
+/// The context row [`launch_workspace_api_docs`] reads.
+fn launch_context(harness_version: Option<&str>) -> &'static ContextSurfaces {
+    let Some(requested) = harness_version.and_then(parse_major_minor) else {
+        return &CONTEXT_V1;
+    };
+    if let Some(entry) = REGISTRY
+        .iter()
+        .find(|e| parse_major_minor(e.version) == Some(requested))
+    {
+        return entry.context;
+    }
+    let newest = REGISTRY[REGISTRY.len() - 1];
+    match parse_major_minor(newest.version) {
+        Some(known) if requested > known => newest.context,
+        _ => &CONTEXT_V1,
+    }
+}
+
+/// `MAJOR.MINOR` as numbers, compared per part (3.9 < 3.10).
+fn parse_major_minor(version: &str) -> Option<(u32, u32)> {
+    let (major, minor) = version.split_once('.')?;
+    let part = |p: &str| {
+        (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| p.parse().ok())
+            .flatten()
+    };
+    Some((part(major)?, part(minor)?))
+}
+
 /// The latest harness version identifier — intent-core's
 /// `CURRENT_HARNESS_VERSION`, the exact string stamped onto new sessions
 /// (H1, intentd#1255), consumed here so the stamp and the registry can never
@@ -807,6 +858,73 @@ pub(crate) fn resolve_entry(version: &str) -> &'static HarnessEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A remote machine renders the `workspace_api` docs of the version its
+    /// launch names, exactly as the local path resolves that stamp; absent
+    /// or malformed is the legacy row, a newer unknown version the newest.
+    #[test]
+    fn launch_docs_follow_the_launch_harness_version() {
+        let row = |v: Option<&str>| std::ptr::from_ref(launch_context(v));
+        for entry in REGISTRY {
+            assert_eq!(
+                row(Some(entry.version)),
+                std::ptr::from_ref(entry.context),
+                "{}",
+                entry.version
+            );
+        }
+        let v3_9 = resolve_entry("3.9").context;
+        let v3_10 = resolve_entry("3.10").context;
+        assert!(!std::ptr::eq(v3_9, v3_10), "3.10 has its own context row");
+        assert_eq!(row(Some("3.9")), std::ptr::from_ref(v3_9));
+        assert_eq!(row(Some("3.10")), std::ptr::from_ref(v3_10));
+        let legacy = std::ptr::from_ref(&CONTEXT_V1);
+        for absent in [
+            None,
+            Some(""),
+            Some("3"),
+            Some("3.x"),
+            Some("3.10.1"),
+            Some("v3.10"),
+            Some(" 3.10"),
+        ] {
+            assert_eq!(row(absent), legacy, "{absent:?}");
+        }
+        let newest = std::ptr::from_ref(REGISTRY[REGISTRY.len() - 1].context);
+        assert_eq!(row(Some("3.99")), newest);
+        assert_eq!(row(Some("99.0")), newest);
+        assert_eq!(
+            row(Some("0.5")),
+            legacy,
+            "an unknown older version is legacy"
+        );
+    }
+
+    /// What the backend sends, the machine renders as the local path does:
+    /// an empty or corrupt stamp gets the local fallback, not legacy text.
+    #[test]
+    fn a_launch_names_the_version_the_local_path_serves() {
+        for stamp in REGISTRY
+            .iter()
+            .map(|e| e.version)
+            .chain(["", "corrupt", "0.5"])
+        {
+            let sent = launch_harness_version(stamp);
+            assert_eq!(
+                std::ptr::from_ref(launch_context(Some(sent))),
+                std::ptr::from_ref(resolve_entry(stamp).context),
+                "{stamp:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn major_minor_compares_numerically() {
+        assert!(parse_major_minor("3.9") < parse_major_minor("3.10"));
+        assert_eq!(parse_major_minor("3.10"), Some((3, 10)));
+        assert_eq!(parse_major_minor("+3.1"), None);
+        assert_eq!(parse_major_minor("3."), None);
+    }
 
     fn data_ptr(h: &'static dyn Harness) -> *const () {
         std::ptr::from_ref::<dyn Harness>(h).cast::<()>()

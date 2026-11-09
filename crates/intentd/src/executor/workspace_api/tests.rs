@@ -30,6 +30,7 @@ fn gates() -> Gates {
         is_sub_agent: false,
         compact_tool_descriptions: false,
         mcp_proxies: Vec::new(),
+        harness_version: None,
     }
 }
 
@@ -1215,6 +1216,74 @@ async fn a_truncating_provider_gets_the_compact_tool_description() {
     );
     assert!(!compact.contains("ws.note.read("), "{compact}");
     assert!(compact.len() < full.len());
+}
+
+async fn listed_description(server: &WorkspaceMcpServer) -> String {
+    let listed = server
+        .handle_message(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .await
+        .unwrap();
+    listed["result"]["tools"][0]["description"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// The launch's `harnessVersion` picks the `workspace_api` description the
+/// machine serves, in both forms, matching that version's docs: a frozen
+/// pre-3.10 stamp and an older backend's launch (no field) get the legacy
+/// text, and every registered stamp the docs its row resolves to (which
+/// version maps to which row is pinned in intent-services' harness tests).
+/// Version strings come from the constants so a bump never breaks this.
+#[tokio::test]
+async fn the_tool_description_follows_the_launch_harness_version() {
+    use intent_acp::{WorkspaceApiDocs, WORKSPACE_API_DOCS_V1};
+    use intent_services::feature_api::harness::launch_workspace_api_docs;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cases: Vec<(Option<&str>, &'static dyn WorkspaceApiDocs)> = vec![
+        (None, &WORKSPACE_API_DOCS_V1),
+        (Some("not-a-version"), &WORKSPACE_API_DOCS_V1),
+        (Some("3.8"), &WORKSPACE_API_DOCS_V1),
+    ];
+    cases.extend(
+        intent_core::REPOSITORY_GUIDANCE_HARNESS_VERSIONS
+            .iter()
+            .map(|v| (Some(*v), launch_workspace_api_docs(Some(v)))),
+    );
+    for compact in [false, true] {
+        for &(version, docs) in &cases {
+            let launched = Gates {
+                compact_tool_descriptions: compact,
+                harness_version: version.map(str::to_owned),
+                ..gates()
+            };
+            let remote = server(
+                &agent(),
+                &workspace(),
+                dir.path(),
+                &launched,
+                HeadLink::default(),
+            )
+            .unwrap();
+            let reference = server(
+                &agent(),
+                &workspace(),
+                dir.path(),
+                &Gates {
+                    harness_version: None,
+                    ..launched
+                },
+                HeadLink::default(),
+            )
+            .unwrap()
+            .with_workspace_api_docs(docs);
+            assert_eq!(
+                listed_description(&remote).await,
+                listed_description(&reference).await,
+                "{version:?} compact={compact}"
+            );
+        }
+    }
 }
 
 /// nodeProtocol 11: each user MCP server head names becomes one more

@@ -14,6 +14,7 @@ fn sharing(id: &str, owner: &str) -> LaunchCommand {
         forge_fetch: None,
         git_identity: None,
         new_machine: None,
+        harness_version: None,
         ..launch(id)
     }
 }

@@ -320,6 +320,16 @@ async fn a_placed_agent_launches_on_its_first_runtime() {
         serde_json::to_value(f.services.session_agent_features(&session)).unwrap()
     );
     assert!(!launch.is_sub_agent);
+    // The machine builds the agent's workspace_api description for the
+    // version the local path serves the session's stamp.
+    assert_eq!(
+        launch.harness_version.as_deref(),
+        Some(
+            intent_services::feature_api::harness::launch_harness_version(
+                session.harness_version.as_str()
+            )
+        )
+    );
     assert!(runtime.is_alive());
 
     link.journal(JournalRecord {
