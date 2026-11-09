@@ -688,16 +688,17 @@ async fn node_runner_gives_up_after_the_second_start_and_says_why() {
         1,
         &[
             "--slow-initialize",
-            "5000",
+            "15000",
             "--log-start",
             log.to_str().unwrap(),
         ],
     ) else {
         return;
     };
+    // Long enough for a loaded machine to boot node and log each start.
     h.runner
-        .set_initialize_timeouts(Duration::from_millis(200), Duration::from_secs(60));
-    h.runner.launch(launch("a1")).await;
+        .set_initialize_timeouts(Duration::from_secs(3), Duration::from_secs(60));
+        h.runner.launch(launch("a1")).await;
     let all = wait_for(&h.runner, "exit", exited("a1")).await;
     let exit = exit_error(find(&all, exited("a1"))).unwrap().to_owned();
     assert_eq!(
@@ -714,6 +715,35 @@ async fn node_runner_gives_up_after_the_second_start_and_says_why() {
     let error = error.unwrap();
     assert!(error.starts_with(codes::NOT_RUNNING), "{error}");
     assert!(error.contains(&exit), "{error}");
+}
+
+/// The second start after a bind gets the ordinary timeout, not the cold
+/// one the first start used.
+#[tokio::test]
+async fn node_runner_retries_a_cold_start_with_the_ordinary_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let (marker, log) = (dir.path().join("failed-once"), dir.path().join("starts"));
+    let Some(h) = harness(
+        1,
+        &[
+            "--exit-on-first-start",
+            marker.to_str().unwrap(),
+            "--slow-initialize",
+            "15000",
+            "--log-start",
+            log.to_str().unwrap(),
+        ],
+    ) else {
+        return;
+    };
+    h.runner
+        .set_initialize_timeouts(Duration::from_secs(3), Duration::from_secs(60));
+    h.runner.adopt_head(Some("hs-1"), &[]);
+    h.runner.launch(launch("a1")).await;
+    let all = wait_for(&h.runner, "exit", exited("a1")).await;
+    let exit = exit_error(find(&all, exited("a1"))).unwrap();
+    assert!(exit.contains("request `initialize` timed out"), "{exit}");
+    assert_eq!(starts(&log), 2);
 }
 
 /// A sign-in failure at start is not retried: a second start would fail
