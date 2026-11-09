@@ -57,9 +57,10 @@ fn agent_record(node_dir: &Path, credential_id: &str, agent_id: &str) -> PathBuf
 /// never under the data dir.
 fn agent_home(node_dir: &Path, credential_id: &str, agent_id: &str) -> PathBuf {
     let record = agent_record(node_dir, credential_id, agent_id);
-    let home = std::fs::read_to_string(record.join("home"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|e| panic!("{}: {e}", record.display()));
+    let home = PathBuf::from(
+        std::fs::read_to_string(record.join("home"))
+            .unwrap_or_else(|e| panic!("{}: {e}", record.display())),
+    );
     assert!(
         home.starts_with(node_dir.join("w")) && !home.to_string_lossy().contains(' '),
         "{}",
