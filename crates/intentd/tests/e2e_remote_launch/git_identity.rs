@@ -3,8 +3,8 @@
 //! `user.name` / `user.email` from the workspace checkout's config chain at
 //! every start, so a repository-local identity beats the global one and a
 //! config change reaches the next start; a top-level agent and its sub-agent
-//! both commit as that identity; and with no identity on the backend the
-//! machine sets nothing. The machine never writes it into git config.
+//! both commit as that identity, over the machine's inherited one; and with
+//! no identity on the backend the machine sets nothing. The machine never writes it into git config.
 
 use super::forge_push::{child_named, sh_ok};
 use super::secrets::{agent_turn, create_agent};
@@ -71,7 +71,13 @@ async fn remote_agents_commit_with_the_backends_identity_for_the_workspace() {
     .await;
     let node_dir = scratch.path().join("node");
     std::fs::create_dir_all(&node_dir).unwrap();
-    let machine = start_machine(&node_dir, &backend_id).await;
+    // The machine's own inherited identity: the backend's beats it.
+    let machine = start_machine_with(
+        &node_dir,
+        &backend_id,
+        &[("GIT_AUTHOR_NAME", "Machine Person")],
+    )
+    .await;
     ok(
         &mut rpc_ws,
         3,
@@ -127,14 +133,15 @@ async fn remote_agents_commit_with_the_backends_identity_for_the_workspace() {
         "Global Person|global@example.invalid|Global Person|global@example.invalid"
     );
 
-    // No identity on the backend: the machine sets nothing.
+    // No identity on the backend: the machine sets nothing, and its own
+    // inherited value stays.
     std::fs::remove_file(&global).unwrap();
     let third = create_agent(&mut rpc_ws, &ws_id, "Nobody", 800).await;
     assert_eq!(
         sh_ok(&mut rpc_ws, &mut events, (&ws_id, &third), SHOW_ENV, 900)
             .await
             .trim(),
-        "unset|unset|unset|unset"
+        "Machine Person|unset|unset|unset"
     );
     drop(machine);
 }

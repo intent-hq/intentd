@@ -482,7 +482,8 @@ pub struct LaunchCommand {
 
 /// [`LaunchCommand::git_identity`]: the `user.name` and `user.email` the
 /// machine sets as the agent's `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
-/// environment. The body is closed.
+/// environment. The body is closed: a new member needs a nodeProtocol gate,
+/// as a machine without it would refuse the whole launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GitIdentity {
