@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.163] - 2026-11-09
+
+### 🚀 Features
+
+- *(remote)* Tell a remote agent when it resumes on a new machine ([#3192](https://github.com/intent-hq/intentd/pull/3192))
+
+### 🐛 Bug Fixes
+
+- *(file)* Cap ws.file.getAttachment copies at 200 MiB ([#3182](https://github.com/intent-hq/intentd/pull/3182))
+
+### 🧪 Testing
+
+- Stop E2B e2e tests leaking sandbox daemons ([#3193](https://github.com/intent-hq/intentd/pull/3193))
+
+
 ## [0.11.162] - 2026-11-09
 
 ### 🚀 Features
