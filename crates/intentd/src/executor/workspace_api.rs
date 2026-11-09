@@ -21,7 +21,10 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use intent_acp::session::McpServer;
-use intent_acp::{HostFrameRouter, McpBridge, NormalizedMcpServer, WorkspaceMcpServer};
+use intent_acp::{
+    default_workspace_api_timeout, HostFrameRouter, McpBridge, NormalizedMcpServer,
+    WorkspaceMcpServer,
+};
 use intent_core::node_link::{LinkOutcome, McpProxy, PREPARED_CHECKOUT_PROTOCOL, SECRETS_PROTOCOL};
 use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
@@ -98,9 +101,18 @@ pub(super) struct Gates {
 }
 
 /// Push the agent's checkout to head now, one push of it at a time;
-/// `true` once head has it. The lock wait and push share one budget that
-/// fits inside the calling script's.
-pub(super) type PushNow = Arc<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>;
+/// `true` once head has it within the given budget (lock wait included).
+pub(super) type PushNow = Arc<dyn Fn(Duration) -> BoxFuture<'static, bool> + Send + Sync>;
+
+/// The most a commit or report waits on its push.
+const IN_CALL_PUSH_MAX: Duration = Duration::from_secs(15);
+
+/// A commit or report's push budget: half the `workspace_api` script budget
+/// (at most [`IN_CALL_PUSH_MAX`]), so a slow push can't outlive the script,
+/// cancel the report, or hide the commit's hash.
+fn in_call_push_budget(script_budget: Duration) -> Duration {
+    (script_budget / 2).min(IN_CALL_PUSH_MAX)
+}
 
 /// The agent's MCP listeners: its workspace server's and one per proxied
 /// user server. They stop when this is dropped.
@@ -246,6 +258,7 @@ fn server_with_setup(
         features.secret_requests = false;
     }
     let secrets = head.secrets().clone();
+    let push = push.map(|push| (push, in_call_push_budget(default_workspace_api_timeout())));
     let router = Router {
         agent_id: agent_id.clone(),
         head,
@@ -360,8 +373,9 @@ struct Router {
     /// The agent's checkout, where the git roots head lists relative to it
     /// are resolved.
     checkout: Option<Arc<PathBuf>>,
-    /// Pushes the agent's checkout before a report reaches its parent.
-    push: Option<PushNow>,
+    /// Pushes the agent's checkout, within its budget, before a report
+    /// reaches its parent.
+    push: Option<(PushNow, Duration)>,
 }
 
 /// The forwarded call that pushes the agent's checkout first, so a commit
@@ -384,8 +398,8 @@ impl HostFrameRouter for Router {
                 let push = self.push.clone();
                 let forward = self.forward(method, args);
                 Some(Box::pin(async move {
-                    if let Some(push) = push {
-                        push().await;
+                    if let Some((push, budget)) = push {
+                        push(budget).await;
                     }
                     forward.await
                 }))
@@ -625,8 +639,8 @@ struct NodeApi {
     /// The agent this server serves: the only one whose secrets it uses.
     agent_id: AgentId,
     secrets: Arc<HeldSecrets>,
-    /// Pushes the checkout after a commit.
-    push: Option<PushNow>,
+    /// Pushes the checkout, within its budget, after a commit.
+    push: Option<(PushNow, Duration)>,
 }
 
 impl NodeApi {
@@ -946,8 +960,8 @@ impl WorkspaceApi for NodeApi {
                 tokio::task::spawn_blocking(move || commit(&worktree, &message, files.as_deref()))
                     .await
                     .map_err(|e| Error::Internal(format!("node commit task failed: {e}")))??;
-            if let Some(push) = &self.push {
-                result.pushed = Some(push().await);
+            if let Some((push, budget)) = &self.push {
+                result.pushed = Some(push(*budget).await);
             }
             Ok(result)
         })
