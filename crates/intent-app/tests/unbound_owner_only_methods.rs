@@ -500,7 +500,6 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
         ("workspace.delete", json!({ "workspaceId": ws })),
         ("workspace.detectProjectType", json!({ "workspaceId": ws })),
         ("workspace.diskUsage", json!({ "workspaceId": ws })),
-        ("workspace.duplicate", json!({ "workspaceId": ws })),
         ("workspace.export.abort", json!({ "exportId": "e1" })),
         ("workspace.export.finalize", json!({ "exportId": "e1" })),
         (

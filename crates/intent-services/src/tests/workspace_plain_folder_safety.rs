@@ -2,9 +2,9 @@
 //! folder is never deleted, moved or modified by Intent"). For both a new
 //! folder the create made and an existing folder the user picked, every
 //! lifecycle operation leaves the folder byte-identical: delete, archive,
-//! the automatic archive, manual and automatic purge (`workspace.retire`),
-//! and duplicate. Purge and duplicate are refused with the documented
-//! plain-folder errors. The delete sweep never removes a plain folder that
+//! the automatic archive, and manual and automatic purge
+//! (`workspace.retire`). Purge is refused with the documented plain-folder
+//! error. The delete sweep never removes a plain folder that
 //! sits where a `<root>/<id>` candidate points (intent-hq/intent#6229).
 
 use std::collections::BTreeMap;
@@ -423,58 +423,6 @@ async fn automatic_purge_skips_the_plain_folder() {
     }
 }
 
-/// `workspace.duplicate` is refused with the plain-folder error: no new
-/// row, no checkout, and nothing written into the folder (or, once a `.git`
-/// appeared, into the user's repository — no worktree, no branch).
-#[intent_test_macros::daemon_test]
-async fn duplicate_is_refused_and_keeps_the_plain_folder() {
-    for variant in VARIANTS {
-        for git_later in [false, true] {
-            let h = Harness::new().await;
-            let (ws, folder) = h.plain_workspace(variant, "Notes").await;
-            if git_later {
-                git_appears_later(&folder);
-            }
-            let before = snapshot(&folder);
-            let rows_before = h.row_ids().await;
-            let root_before: Vec<_> = std::fs::read_dir(&h.root)
-                .expect("root")
-                .map(|e| e.expect("entry").file_name())
-                .collect();
-            let op = format!("{variant:?} git_later={git_later}");
-
-            let err = h
-                .svc
-                .duplicate_workspace(ws.id.clone(), None)
-                .await
-                .expect_err("duplicate of a plain folder is refused");
-            assert!(
-                matches!(
-                    err,
-                    Error::PlainFolderUnsupported {
-                        operation: "workspace.duplicate"
-                    }
-                ),
-                "{op}: {err:?}"
-            );
-            assert_eq!(err.code(), -32602, "{op}: {err:?}");
-            assert_eq!(
-                err.to_string(),
-                "workspace.duplicate is not available in plain-folder workspaces",
-                "{op}"
-            );
-            assert_eq!(h.row_ids().await, rows_before, "{op}: no new row");
-            let root_after: Vec<_> = std::fs::read_dir(&h.root)
-                .expect("root")
-                .map(|e| e.expect("entry").file_name())
-                .collect();
-            assert_eq!(root_after, root_before, "{op}: nothing provisioned");
-            h.svc.store_tasks.drain_finite().await;
-            assert_untouched(&folder, &before, &op);
-        }
-    }
-}
-
 /// Services whose boot root is `root` over `store`.
 fn services_at(store: &Store, root: &Path) -> Services {
     Services::new_isolated(store.clone()).with_workspaces_root(root.to_path_buf())
@@ -875,38 +823,6 @@ async fn delete_keeps_a_plain_folder_at_the_metadata_sibling() {
     assert_untouched(&folder, &before, "metadata sibling");
 }
 
-/// Duplicate is refused before the workspaces parent is resolved: a
-/// `worktreesLocation` inside the plain folder (missing) is never created,
-/// and the error is the plain-folder refusal.
-#[intent_test_macros::daemon_test]
-async fn duplicate_refuses_before_creating_the_workspaces_parent() {
-    for variant in VARIANTS {
-        let h = Harness::new().await;
-        let (ws, folder) = h.plain_workspace(variant, "Notes").await;
-        let location = folder.join("new-child");
-        let svc = h
-            .svc
-            .clone()
-            .with_settings_registry(location_registry(&h.root, &location.to_string_lossy()));
-        let before = snapshot(&folder);
-        let err = svc
-            .duplicate_workspace(ws.id.clone(), None)
-            .await
-            .expect_err("refused");
-        assert!(
-            matches!(
-                err,
-                Error::PlainFolderUnsupported {
-                    operation: "workspace.duplicate"
-                }
-            ),
-            "{variant:?}: {err:?}"
-        );
-        assert!(!location.exists(), "{variant:?}: location not created");
-        assert_untouched(&folder, &before, &format!("{variant:?} duplicate"));
-    }
-}
-
 /// A git `workspace.create` whose `worktreesLocation` lies inside a plain
 /// folder is refused before anything is created there.
 #[intent_test_macros::daemon_test]
@@ -997,34 +913,6 @@ async fn revive_refuses_to_provision_inside_a_plain_folder() {
         .unwrap()
         .is_retired());
     assert_untouched(&parent, &before, "revive into a plain folder");
-}
-
-/// Duplicating a GIT workspace whose `worktreesLocation` lies inside a plain
-/// folder is refused before the location is created.
-#[intent_test_macros::daemon_test]
-async fn git_duplicate_refuses_a_workspaces_parent_inside_a_plain_folder() {
-    let f = crate::test_support::retire_workspace::fixture().await;
-    let git_ws = crate::test_support::retire_workspace::create_workspace(&f).await;
-    let folder = test_tempdir("intentd-plain-safety-dup-");
-    let plain = folder.path().to_path_buf();
-    std::fs::write(plain.join("notes.md"), SENTINEL).expect("sentinel");
-    f.store
-        .insert_workspace(&plain_row(&WorkspaceId::from("plain-owner"), &plain))
-        .await
-        .expect("insert plain");
-    let location = plain.join("worktrees");
-    let svc = f
-        .svc
-        .clone()
-        .with_settings_registry(location_registry(&f.root, &location.to_string_lossy()));
-    let before = snapshot(&plain);
-    let err = svc
-        .duplicate_workspace(git_ws.id.clone(), None)
-        .await
-        .expect_err("refused");
-    assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
-    assert!(!location.exists(), "location not created");
-    assert_untouched(&plain, &before, "git duplicate inside a plain folder");
 }
 
 /// With no plain folders at all, an unresolvable `worktreesLocation` keeps

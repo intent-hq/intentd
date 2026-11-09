@@ -13823,48 +13823,10 @@ async fn create_rejects_when_parent_at_max_depth() {
     .expect("create under a shallow parent succeeds");
 }
 
-/// When workspace.cowIsolation is enabled, the delegate logic attempts `CoW`
-/// provisioning; when the workspace has a repository and worktree, effectiveIsolation
-/// reports "cow". This test uses a workspace without `repository_path`, so `CoW` cannot
-/// provision and effectiveIsolation is absent (graceful fallback to shared mode).
-/// The setting is read and respected; actual provisioning is workspace-dependent.
+/// Delegations run in the workspace's shared checkout.
 #[intent_test_macros::daemon_test]
-async fn delegate_reads_cow_isolation_setting() {
+async fn delegate_defaults_to_shared_checkout() {
     let (_t, svc, ws) = setup().await;
-    // Enable workspace.cowIsolation setting
-    svc.settings_update(json!([{
-        "path": "workspace.cowIsolation",
-        "value": true
-    }]))
-    .await
-    .expect("enable cowIsolation");
-
-    // Delegate without explicit isolation parameter (workspace has no repository_path)
-    let out = svc
-        .agent_delegate_op(
-            ws.clone(),
-            AgentDelegateInput {
-                agent_instructions: Some("Do work".into()),
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .expect("delegate");
-
-    // Setting is enabled but CoW can't provision without repository; effectiveIsolation absent
-    assert!(
-        out.get("effectiveIsolation").is_none(),
-        "expected absent effectiveIsolation when repository_path is None"
-    );
-}
-
-/// When workspace.cowIsolation is disabled (default), delegations use shared mode.
-#[intent_test_macros::daemon_test]
-async fn delegate_defaults_to_shared_when_setting_disabled() {
-    let (_t, svc, ws) = setup().await;
-    // workspace.cowIsolation defaults to false, no need to set it
-
     let out = svc
         .agent_delegate_op(
             ws.clone(),
@@ -13880,23 +13842,14 @@ async fn delegate_defaults_to_shared_when_setting_disabled() {
     // effectiveIsolation should be absent (shared mode, no sandbox provisioning)
     assert!(
         out.get("effectiveIsolation").is_none(),
-        "expected absent effectiveIsolation when setting disabled"
+        "expected absent effectiveIsolation in shared mode"
     );
 }
 
-/// Explicit isolation parameter overrides workspace.cowIsolation setting.
+/// An explicit `isolation: "shared"` parameter skips provisioning.
 #[intent_test_macros::daemon_test]
-async fn delegate_explicit_isolation_overrides_setting() {
+async fn delegate_explicit_shared_isolation_skips_provisioning() {
     let (_t, svc, ws) = setup().await;
-    // Enable workspace.cowIsolation setting
-    svc.settings_update(json!([{
-        "path": "workspace.cowIsolation",
-        "value": true
-    }]))
-    .await
-    .expect("enable cowIsolation");
-
-    // Delegate WITH explicit isolation: "shared" (overriding the setting)
     let out = svc
         .agent_delegate_op(
             ws.clone(),

@@ -334,8 +334,8 @@ async fn a_remote_agents_sub_agent_on_another_machine_starts_from_its_work() {
 /// A remote parent's `target: "local"` sub-agent runs on the backend in the
 /// workspace's shared checkout (per-agent copy-on-write checkouts are
 /// retired): its instructions only say where the parent's work is, and the
-/// checkout is not touched. Created or delegated, with the setting on or
-/// not, the child never gets its own checkout.
+/// checkout is not touched. Created or delegated, the child never gets its
+/// own checkout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_remote_agents_backend_sub_agent_gets_its_work() {
     if intent_providers::resolve_on_path("node").is_none()
@@ -379,13 +379,6 @@ async fn a_remote_agents_backend_sub_agent_gets_its_work() {
     .await;
     let parent = create_remote(&mut rpc_ws, &ws_id, "Parent", 10).await;
     let parent_id = parent["agent"]["id"].as_str().unwrap().to_owned();
-    ok(
-        &mut rpc_ws,
-        4,
-        "settings.update",
-        json!({ "changes": [{ "path": "workspace.cowIsolation", "value": true }] }),
-    )
-    .await;
 
     let delegate = r#"const d = await ws.agent.delegate({ taskText: "Delegated", agentInstructions: "echo-raw", provider: "mock", model: "default", placement: { target: "local" } });"#;
     let code = format!(
