@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use base64::Engine as _;
+use intentd_test_support::ProcessGroup;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -25,6 +26,7 @@ use super::*;
 
 mod entries;
 mod sub_agents;
+mod teardown;
 
 const E2B_KEY: &str = "e2b_test_key_0123456789abcdef0123456789abcdef";
 /// The key of a second E2B project: its sandboxes are listed, connected
@@ -34,12 +36,15 @@ const PROFILE_SECRET: &str = "sk-cloud-profile-secret-7f3a91";
 /// The words of the notice a relaunch on another machine starts with.
 const NOTICE: &str = "on a new machine";
 
-/// One fake sandbox: its directory, envd token and environment.
+/// One fake sandbox: its directory, envd token and environment, and the
+/// process group every process started in it runs in (its daemon too), as
+/// all of a real sandbox's processes live and die with its VM.
 struct FakeSandbox {
     dir: std::path::PathBuf,
     template: String,
     envd_token: String,
     env: Vec<(String, String)>,
+    group: Arc<ProcessGroup>,
 }
 
 #[expect(
@@ -90,6 +95,9 @@ struct FakeState {
     missing_templates: Vec<String>,
     /// While set, E2B rejects the key (401), as after the owner revokes it.
     key_revoked: bool,
+    /// The process group of every sandbox ever created, deleted ones too,
+    /// for the teardown.
+    groups: Vec<Arc<ProcessGroup>>,
 }
 
 /// The release manifest listing `sizes` for this build's version.
@@ -97,36 +105,69 @@ fn manifest(sizes: &[&str]) -> Value {
     json!({ "schema": 1, "project": "intent", "version": env!("CARGO_PKG_VERSION"), "sizes": sizes })
 }
 
+/// A `setsid` that stays in its process group: the bootstrap starts the
+/// daemon with `setsid nohup intentd serve &`, which would take it out of its
+/// sandbox's group and out of every teardown's reach.
+const SETSID_SHIM: &str = "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in -*) shift ;; *) break ;; esac\ndone\nexec \"$@\"\n";
+
 /// The fake E2B API and envd on one loopback port.
+///
+/// It owns the test's scratch dir, and its `Drop` ends every sandbox's
+/// process group before that dir goes, so no sandbox daemon outlives the
+/// test (and if the test process dies first, each group's anchor kills it).
 struct FakeE2b {
     url: String,
     state: Arc<Mutex<FakeState>>,
     root: std::path::PathBuf,
+    /// Holds the `setsid` shim, first on every sandbox's PATH.
+    shim_dir: std::path::PathBuf,
     fixture: String,
+    scratch: tempfile::TempDir,
 }
 
 impl FakeE2b {
-    async fn start(root: &Path, fixture: &str) -> Arc<Self> {
+    /// Serve a fake E2B whose sandboxes live in `scratch`'s `e2b` dir; the
+    /// fake owns `scratch` from here on ([`FakeE2b::scratch`]).
+    async fn start(scratch: tempfile::TempDir, fixture: &str) -> Arc<Self> {
+        let root = scratch.path().join("e2b");
+        std::fs::create_dir_all(&root).unwrap();
+        let shim_dir = scratch.path().join("e2b-bin");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let shim = shim_dir.join("setsid");
+        std::fs::write(&shim, SETSID_SHIM).unwrap();
+        std::fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let fake = Arc::new(Self {
             url,
             state: Arc::default(),
-            root: root.to_path_buf(),
+            root,
+            shim_dir,
             fixture: fixture.to_owned(),
+            scratch,
         });
         fake.state().manifest = Some(manifest(&["2x4", "4x8", "8x16", "16x32"]));
-        let served = fake.clone();
+        // Weak, so the test's own handle is the last one and the teardown
+        // runs when the test drops it, not at runtime shutdown.
+        let served = Arc::downgrade(&fake);
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                let fake = served.clone();
+                let Some(fake) = served.upgrade() else {
+                    return;
+                };
                 tokio::spawn(async move { fake.serve(stream).await });
             }
         });
         fake
+    }
+
+    /// The test's scratch dir, which the fake owns.
+    fn scratch(&self) -> &Path {
+        self.scratch.path()
     }
 
     /// `INTENTD_E2B_MANIFEST_BASE_URL` for a backend using this fake.
@@ -364,6 +405,8 @@ impl FakeE2b {
                     .metadata
                     .insert(id.clone(), request["metadata"].clone());
                 self.state().projects.insert(id.clone(), key.clone());
+                let group = Arc::new(ProcessGroup::new().unwrap());
+                self.state().groups.push(group.clone());
                 self.state().sandboxes.insert(
                     id.clone(),
                     FakeSandbox {
@@ -371,6 +414,7 @@ impl FakeE2b {
                         template: template.clone(),
                         envd_token: token.clone(),
                         env,
+                        group,
                     },
                 );
                 json_reply(
@@ -396,7 +440,7 @@ impl FakeE2b {
                 let removed = self.state().sandboxes.remove(&id);
                 match removed {
                     Some(sandbox) => {
-                        stop_sandbox(&sandbox);
+                        sandbox.group.terminate(stop_grace());
                         (204, "application/json", Vec::new())
                     }
                     None => json_reply(404, json!({ "code": 404, "message": "sandbox not found" })),
@@ -483,20 +527,22 @@ impl FakeE2b {
     /// E2B removes sandbox `id` on its own: its daemon stops and every
     /// later call about it is 404.
     fn vanish(&self, id: &str) {
-        self.signal(id, "-KILL");
+        let removed = self.state().sandboxes.remove(id);
+        if let Some(sandbox) = removed {
+            sandbox.group.kill();
+        }
         self.state().paused.remove(id);
-        self.state().sandboxes.remove(id);
     }
 
     /// Sandbox `id`'s paused daemon comes back as an older intentd build on
     /// the same port and data: one that speaks only link protocol 6, below
     /// every protocol the backend speaks.
     async fn outdate(&self, id: &str, port: u16) {
-        let Some((dir, env)) = self
+        let Some((dir, env, group)) = self
             .state()
             .sandboxes
             .get(id)
-            .map(|s| (s.dir.clone(), s.env.clone()))
+            .map(|s| (s.dir.clone(), s.env.clone(), s.group.clone()))
         else {
             return;
         };
@@ -525,6 +571,7 @@ impl FakeE2b {
             .stdout(log.try_clone().unwrap())
             .stderr(log);
         common::hermetic_fixture_identity(&mut serve, &dir);
+        group.join(&mut serve);
         let mut child = tokio::process::Command::from(serve).spawn().unwrap();
         tokio::spawn(async move { child.wait().await });
         timeout(common::test_timeout(Duration::from_secs(60)), async {
@@ -562,9 +609,10 @@ impl FakeE2b {
             .unwrap()
             .to_string_lossy()
             .into_owned();
+        let shim_dir = self.shim_dir.to_string_lossy().into_owned();
         for (key, value) in toolchain {
             let value = if key == "PATH" {
-                format!("{intentd_dir}:{value}")
+                format!("{shim_dir}:{intentd_dir}:{value}")
             } else {
                 value
             };
@@ -586,7 +634,7 @@ impl FakeE2b {
         body: &[u8],
     ) -> (u16, &'static str, Vec<u8>) {
         let id = headers.get("e2b-sandbox-id").cloned().unwrap_or_default();
-        let (dir, env, fail_mint, slow_start) = {
+        let (dir, env, group, fail_mint, slow_start) = {
             let state = self.state();
             let Some(sandbox) = state.sandboxes.get(&id) else {
                 return (502, "application/json", b"{}".to_vec());
@@ -597,6 +645,7 @@ impl FakeE2b {
             (
                 sandbox.dir.clone(),
                 sandbox.env.clone(),
+                sandbox.group.pgid(),
                 state.failed_mint_templates.contains(&sandbox.template),
                 state.slow_start_templates.contains(&sandbox.template),
             )
@@ -627,6 +676,7 @@ impl FakeE2b {
             .current_dir(&dir)
             .env_clear()
             .envs(env)
+            .process_group(group)
             .stdin(Stdio::null());
         if let Some(envs) = process["envs"].as_object() {
             for (key, value) in envs {
@@ -718,26 +768,27 @@ fn frames(stdout: &[u8], stderr: &[u8], code: i32) -> Vec<u8> {
 }
 
 impl Drop for FakeE2b {
+    /// End every sandbox's processes before the scratch dir (a field, so
+    /// dropped after this) goes: signals to each sandbox's process group,
+    /// which needs neither `intentd stop` nor the sandbox's data dir.
     fn drop(&mut self) {
-        if let Ok(state) = self.state.lock() {
-            for sandbox in state.sandboxes.values() {
-                stop_sandbox(sandbox);
-            }
+        let groups = std::mem::take(
+            &mut self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .groups,
+        );
+        for group in groups {
+            group.terminate(stop_grace());
         }
     }
 }
 
-/// Stop a sandbox's daemon, as deleting the sandbox would.
-fn stop_sandbox(sandbox: &FakeSandbox) {
-    let _ = std::process::Command::new("/bin/sh")
-        .args(["-c", "intentd stop >/dev/null 2>&1 || true"])
-        .env_clear()
-        .envs(sandbox.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .env("INTENTD_DATA_DIR", &sandbox.dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+/// How long a sandbox daemon may take to shut down on `SIGTERM` before it
+/// is killed (`SIGKILL`), as deleting its sandbox would.
+fn stop_grace() -> Duration {
+    common::test_timeout(Duration::from_secs(5))
 }
 
 /// `agent.get` until `check` holds.
@@ -789,11 +840,9 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     std::fs::write(repo.join("README.md"), "base\n").unwrap();
     git(&repo, &["add", "README.md"]);
     git(&repo, &["commit", "--quiet", "-m", "base"]);
-    let sandboxes = scratch.path().join("e2b");
-    std::fs::create_dir_all(&sandboxes).unwrap();
-    let fake = FakeE2b::start(&sandboxes, &fixture).await;
+    let fake = FakeE2b::start(scratch, &fixture).await;
 
-    let head_dir = scratch.path().join("head");
+    let head_dir = fake.scratch().join("head");
     let manifest_base = fake.manifest_base();
     let (_head, port, cfg, ws_id) = start_backend_with(
         &head_dir,
@@ -1559,10 +1608,11 @@ fn configure_params(extra: Value) -> Value {
 /// unless a test lowers it) and one connection for calls. A test opens
 /// its event connection ([`agent_events`]) right before the step that
 /// waits for an event.
+///
+/// Fields drop in order: the backend and its connection go before the fake,
+/// which owns the scratch dir the backend's data dir is in.
 struct CloudBackend {
-    scratch: tempfile::TempDir,
     repo: std::path::PathBuf,
-    fake: Arc<FakeE2b>,
     head_dir: std::path::PathBuf,
     head: common::DaemonGuard,
     port: u16,
@@ -1570,6 +1620,7 @@ struct CloudBackend {
     ws_id: String,
     keyed_ref: String,
     rpc_ws: common::TlsWs,
+    fake: Arc<FakeE2b>,
 }
 
 impl CloudBackend {
@@ -1592,10 +1643,8 @@ impl CloudBackend {
         std::fs::write(repo.join("README.md"), "base\n").unwrap();
         git(&repo, &["add", "README.md"]);
         git(&repo, &["commit", "--quiet", "-m", "base"]);
-        let sandboxes = scratch.path().join("e2b");
-        std::fs::create_dir_all(&sandboxes).unwrap();
-        let fake = FakeE2b::start(&sandboxes, &fixture).await;
-        let head_dir = scratch.path().join("head");
+        let fake = FakeE2b::start(scratch, &fixture).await;
+        let head_dir = fake.scratch().join("head");
         let manifest_base = fake.manifest_base();
         let mut backend_env = vec![
             ("INTENTD_E2B_API_URL", fake.url.as_str()),
@@ -1634,9 +1683,7 @@ impl CloudBackend {
         )
         .await;
         Some(Self {
-            scratch,
             repo,
-            fake,
             head_dir,
             head,
             port,
@@ -1644,6 +1691,7 @@ impl CloudBackend {
             ws_id,
             keyed_ref,
             rpc_ws,
+            fake,
         })
     }
 }
@@ -1679,10 +1727,8 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
     std::fs::write(repo.join("README.md"), "base\n").unwrap();
     git(&repo, &["add", "README.md"]);
     git(&repo, &["commit", "--quiet", "-m", "base"]);
-    let sandboxes = scratch.path().join("e2b");
-    std::fs::create_dir_all(&sandboxes).unwrap();
-    let fake = FakeE2b::start(&sandboxes, &fixture).await;
-    let head_dir = scratch.path().join("head");
+    let fake = FakeE2b::start(scratch, &fixture).await;
+    let head_dir = fake.scratch().join("head");
     let (_head, port, cfg, ws_id) = start_backend_with(
         &head_dir,
         &repo,
@@ -2109,7 +2155,6 @@ async fn a_cloud_sandbox_pauses_resumes_and_is_deleted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paused_sandbox_that_cannot_link_after_an_update_is_deleted() {
     let Some(CloudBackend {
-        scratch: _scratch,
         repo,
         fake,
         head_dir,

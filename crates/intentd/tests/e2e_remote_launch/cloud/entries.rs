@@ -48,10 +48,8 @@ async fn two_named_entries_start_and_remove_their_own_sandboxes() {
     std::fs::write(repo.join("README.md"), "base\n").unwrap();
     git(&repo, &["add", "README.md"]);
     git(&repo, &["commit", "--quiet", "-m", "base"]);
-    let sandboxes = scratch.path().join("e2b");
-    std::fs::create_dir_all(&sandboxes).unwrap();
-    let fake = FakeE2b::start(&sandboxes, &fixture).await;
-    let head_dir = scratch.path().join("head");
+    let fake = FakeE2b::start(scratch, &fixture).await;
+    let head_dir = fake.scratch().join("head");
     let (_head, port, cfg, ws_id) = start_backend_with(
         &head_dir,
         &repo,
@@ -437,10 +435,8 @@ async fn a_removed_entrys_key_stays_until_the_reaper_deletes_its_sandbox() {
     std::fs::write(repo.join("README.md"), "base\n").unwrap();
     git(&repo, &["add", "README.md"]);
     git(&repo, &["commit", "--quiet", "-m", "base"]);
-    let sandboxes = scratch.path().join("e2b");
-    std::fs::create_dir_all(&sandboxes).unwrap();
-    let fake = FakeE2b::start(&sandboxes, &fixture).await;
-    let head_dir = scratch.path().join("head");
+    let fake = FakeE2b::start(scratch, &fixture).await;
+    let head_dir = fake.scratch().join("head");
     // A settings minute of 100 ms: the reaper lists every second.
     let (_head, port, cfg, ws_id) = start_backend_with(
         &head_dir,

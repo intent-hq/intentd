@@ -85,11 +85,9 @@ async fn a_sandbox_agents_sub_agents_share_its_sandbox_or_start_their_own() {
     std::fs::write(repo.join("README.md"), "base\n").unwrap();
     git(&repo, &["add", "README.md"]);
     git(&repo, &["commit", "--quiet", "-m", "base"]);
-    let sandboxes = scratch.path().join("e2b");
-    std::fs::create_dir_all(&sandboxes).unwrap();
-    let fake = FakeE2b::start(&sandboxes, &fixture).await;
+    let fake = FakeE2b::start(scratch, &fixture).await;
 
-    let head_dir = scratch.path().join("head");
+    let head_dir = fake.scratch().join("head");
     std::fs::create_dir_all(head_dir.join("workspaces")).unwrap();
     let ws_id = seed_workspace(&head_dir, &repo).await;
     let member_id = seed_member(&head_dir).await;
