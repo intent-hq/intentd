@@ -1099,7 +1099,7 @@ pub fn plain_folder_description(desc: &str) -> String {
     out
 }
 
-fn workspace_api_description_for_bridge(
+pub(crate) fn workspace_api_description_for_bridge(
     is_chief: bool,
     features: &AgentFeaturesSettings,
     is_sub_agent: bool,
@@ -1236,7 +1236,7 @@ const ALIAS_SUMMARY_PREFIX: &str = "Alias of `";
 ///
 /// Any other line (blank separators, lines without a comment) passes through
 /// verbatim.
-fn condensed_method_line(line: &str) -> Option<Cow<'_, str>> {
+pub(crate) fn condensed_method_line(line: &str) -> Option<Cow<'_, str>> {
     let Some(sep) = line.find("  // ") else {
         return Some(Cow::Borrowed(line));
     };
@@ -1568,7 +1568,7 @@ fn inject_into_entry(base: &str, anchor: &str, text: &str) -> Option<String> {
 /// lines of the `ws.agent.delegate` entry. Author-supplied text is flattened
 /// onto one line so a multi-line hint cannot break the description's line
 /// structure.
-fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
+pub(crate) fn model_options_block(model_options: &[SpecialistModelOptions]) -> String {
     let flat = |s: &str| s.replace(['\n', '\r'], " ");
     let mut block = String::from(
         "    Specialist model options (for `ws.agent.delegate`/`ws.agent.create` \

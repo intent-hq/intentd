@@ -42,21 +42,22 @@ const CANDIDATE: &str = intent_core::NEWEST_HARNESS_VERSION;
 const REALISTIC_MAX_RATIO: f64 = 0.5;
 
 /// Clean-fixture ceiling per provider: `(provider, top-level chars,
-/// sub-agent chars)`. Recorded from the 3.9 baseline (2026-11-09); lower
-/// each row to the newest harness's measured numbers once its cuts land.
+/// sub-agent chars)`. Measured on harness 3.10 with the compact ws.*
+/// reference and the trimmed doctrine (2026-11-09); lower each row again as
+/// further cuts land.
 const CLEAN_CEILING: &[(&str, usize, usize)] = &[
-    ("auggie", 126_821, 122_722),
-    ("claude-code", 60_251, 58_423),
-    ("codex", 126_821, 122_722),
-    ("cortex", 126_821, 122_722),
-    ("opencode", 126_821, 122_722),
-    ("unsloth", 126_821, 122_722),
-    ("pi", 126_821, 122_722),
-    ("droid", 60_251, 58_423),
-    ("grok", 60_251, 58_423),
-    ("antigravity", 126_821, 122_722),
-    ("cursor", 127_049, 122_950),
-    ("mock", 126_821, 122_722),
+    ("auggie", 27_026, 25_386),
+    ("claude-code", 27_305, 25_665),
+    ("codex", 27_026, 25_386),
+    ("cortex", 27_026, 25_386),
+    ("opencode", 27_026, 25_386),
+    ("unsloth", 27_026, 25_386),
+    ("pi", 27_026, 25_386),
+    ("droid", 27_305, 25_665),
+    ("grok", 27_305, 25_665),
+    ("antigravity", 27_026, 25_386),
+    ("cursor", 27_254, 25_614),
+    ("mock", 27_026, 25_386),
 ];
 
 /// Where the fixtures' paths appear to live, so sizes do not depend on the

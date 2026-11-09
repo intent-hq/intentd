@@ -22,6 +22,11 @@ pub struct WorkspaceApiDocsInputs<'a> {
     pub remote_placement_help: Option<&'a str>,
     /// The provider truncates long tool descriptions.
     pub truncating_provider: bool,
+    /// Capability-gated bindings this bridge installs (`namespace.method`
+    /// paths, installed only when a capability is present) that the static
+    /// docs leave out. Harness 3.10 lists them in its capability map; earlier
+    /// versions ignore them. No binding uses this yet.
+    pub capability_methods: &'a [&'a str],
 }
 
 /// One harness version's `workspace_api` text surfaces.
@@ -112,8 +117,9 @@ impl WorkspaceApiDocs for WorkspaceApiDocsV1 {
     }
 }
 
-/// Harness 3.10: the compact reference lands here. Until then it renders
-/// exactly what [`WORKSPACE_API_DOCS_V1`] renders.
+/// Harness 3.10: the compact reference (capability map, routing table, hot
+/// set; see [`super::compact_reference`]). It goes in the tool description,
+/// or in the system prompt for a provider that truncates tool descriptions.
 pub struct WorkspaceApiDocsV3_10;
 
 /// Harness 3.10.
@@ -121,14 +127,17 @@ pub static WORKSPACE_API_DOCS_V3_10: WorkspaceApiDocsV3_10 = WorkspaceApiDocsV3_
 
 impl WorkspaceApiDocs for WorkspaceApiDocsV3_10 {
     fn tool_description(&self, inputs: &WorkspaceApiDocsInputs<'_>) -> String {
-        WORKSPACE_API_DOCS_V1.tool_description(inputs)
+        super::compact_reference::tool_description(inputs)
     }
 
     fn prompt_reference(&self, inputs: &WorkspaceApiDocsInputs<'_>) -> Option<String> {
-        WORKSPACE_API_DOCS_V1.prompt_reference(inputs)
+        super::compact_reference::prompt_reference(inputs)
     }
 
     fn prompt_section(&self, reference: &str) -> String {
-        WORKSPACE_API_DOCS_V1.prompt_section(reference)
+        format!(
+            "{WORKSPACE_API_SYSTEM_PROMPT_HEADING}\n\nThe `workspace_api` tool runs JavaScript against \
+             this reference.\n\n{reference}"
+        )
     }
 }

@@ -57,7 +57,7 @@ mod tests {
     use intent_core::ids::ExecutorCredentialId;
     use intent_core::machines::{ExposedMachine, RemoteMachineState};
 
-    use crate::session_surface_goldens::{fixture, surfaces_for};
+    use crate::session_surface_goldens::fixture;
 
     fn machine(id: &str) -> ExposedMachine {
         ExposedMachine {
@@ -95,24 +95,12 @@ mod tests {
         );
     }
 
-    /// Until each builder is filled, a 3.10 session gets exactly a 3.9
-    /// session's tool description, for every provider. (The doctrine already
-    /// differs; `v3_10_goldens` pins it.)
+    /// Until each builder is filled, a 3.10 session gets a 3.9 session's
+    /// context; the `workspace_api` surfaces already differ (pinned by
+    /// `v3_10_workspace_api_surfaces`).
     #[tokio::test]
     async fn v3_10_context_matches_v3_9_until_changed() {
-        let (_db, dir, services, session) = fixture().await;
-        for provider in intent_providers::config::ACP_PROVIDERS {
-            assert_eq!(
-                surfaces_for(&services, dir.path(), &session, "3.10", provider)
-                    .await
-                    .0,
-                surfaces_for(&services, dir.path(), &session, "3.9", provider)
-                    .await
-                    .0,
-                "{}",
-                provider.id
-            );
-        }
+        let (_db, dir, _services, _session) = fixture().await;
         let (current, previous) = (
             super::super::resolve_entry("3.10").context,
             super::super::resolve_entry("3.9").context,
