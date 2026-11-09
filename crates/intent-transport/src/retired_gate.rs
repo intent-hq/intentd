@@ -110,8 +110,6 @@ pub(crate) const RETIRED_GATED_METHODS: &[&str] = &[
     "repoConfig.ensureDir",
     "repoConfig.save",
     "rules.update",
-    "sandbox.cow.discard",
-    "sandbox.cow.merge",
     "script.archive",
     "script.create",
     "script.remove",

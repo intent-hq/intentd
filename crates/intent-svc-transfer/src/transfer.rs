@@ -14,7 +14,6 @@ use intent_core::transfer::{
     TRANSFER_FORMAT_VERSION,
 };
 use intent_core::{clock::now_iso, BoxFuture, Error, Result, Workspace, WorkspaceId};
-use intent_store::SandboxStatus;
 
 use crate::transfer_export::TransferExportExt;
 use crate::transfer_import::TransferImportExt;
@@ -240,7 +239,7 @@ pub(crate) trait TransferPlanExt {
 impl TransferPlanExt for Services {
     /// Build the transfer plan for `id`: per-table row stats (spec §1
     /// inventory, `event` excluded), asset list with sizes, git state summary
-    /// (branch, dirty files, sandbox branches), an estimated git bundle size,
+    /// (branch, dirty files), an estimated git bundle size,
     /// and non-blocking pre-flight warnings. `NotFound` for unknown ids;
     /// the chief workspace is not transferable (`InvalidParams`).
     async fn workspace_transfer_plan_op(&self, id: WorkspaceId) -> Result<TransferPlan> {
@@ -255,33 +254,10 @@ impl TransferPlanExt for Services {
         let assets = self.transfer_assets(&id).await;
         let attachments = self.transfer_attachments(&id, &ws).await?;
 
-        // Sandbox branches ride in the bundle only while they can still hold
-        // unmerged work; merged/discarded sandboxes may have deleted branches.
-        let sandboxes = self.store().list_sandboxes(&id).await?;
-        let live_sandboxes: Vec<_> = sandboxes
-            .iter()
-            .filter(|s| {
-                matches!(
-                    s.status,
-                    SandboxStatus::Created
-                        | SandboxStatus::Merging
-                        | SandboxStatus::MergePending
-                        | SandboxStatus::ConflictBounced
-                )
-            })
-            .collect();
-        let sandbox_branches: Vec<String> =
-            live_sandboxes.iter().map(|s| s.branch.clone()).collect();
-        let sandbox_paths: Vec<PathBuf> = live_sandboxes
-            .iter()
-            .map(|s| PathBuf::from(&s.path))
-            .collect();
-
         let worktree = git_ops::worktree_path(&ws);
         let (git, estimated_git_bundle_bytes, nested_repo_dirs, submodule_bundle_bytes) =
             match worktree {
                 Some(root) if intent_git::is_repository(&root) => {
-                    let branches = sandbox_branches.clone();
                     tokio::task::spawn_blocking(move || {
                         let status = intent_git::status::status(&root);
                         let (branch, dirty_files) = match status {
@@ -297,17 +273,16 @@ impl TransferPlanExt for Services {
                             }
                             Err(_) => (intent_git::status::current_branch_at(&root), Vec::new()),
                         };
-                        let bundle = estimate_bundle_bytes(&root, &branches);
+                        let bundle = estimate_bundle_bytes(&root);
                         let nested =
                             intent_services::feature_api::nested_repos::nested_repo_dirs(&root);
-                        let (submodules, submodule_bytes) =
-                            scan_unpublished_submodules(&root, &sandbox_paths);
+                        let (submodules, submodule_bytes) = scan_unpublished_submodules(&root);
                         (
                             TransferGitSummary {
                                 has_repository: true,
                                 branch,
                                 dirty_files,
-                                sandbox_branches: branches,
+                                sandbox_branches: Vec::new(),
                                 submodules,
                             },
                             bundle + submodule_bytes,
@@ -323,7 +298,7 @@ impl TransferPlanExt for Services {
                         has_repository: false,
                         branch: None,
                         dirty_files: Vec::new(),
-                        sandbox_branches,
+                        sandbox_branches: Vec::new(),
                         submodules: Vec::new(),
                     },
                     0,
@@ -353,16 +328,6 @@ impl TransferPlanExt for Services {
                 message: format!(
                     "{} uncommitted file(s) will be snapshotted as a WIP commit in the bundle",
                     git.dirty_files.len()
-                ),
-            });
-        }
-        if !live_sandboxes.is_empty() {
-            warnings.push(TransferWarning {
-                code: "unmerged-sandboxes".to_string(),
-                message: format!(
-                    "{} unmerged sandbox(es); their branches ride in the bundle and are \
-                     re-provisioned on the target",
-                    live_sandboxes.len()
                 ),
             });
         }
@@ -487,38 +452,18 @@ impl TransferPlanExt for Services {
 
 /// Estimate the size of the git bundle a transfer would carry: the on-disk
 /// bytes of all objects reachable from HEAD, the remote-tracking refs (the
-/// bundler carries them so the import keeps its publication state) and the
-/// (existing) sandbox branches, via `git rev-list --disk-usage --objects`.
+/// bundler carries them so the import keeps its publication state), via
+/// `git rev-list --disk-usage --objects`.
 /// An estimate only — the real bundle also snapshots dirty state as WIP
 /// commits, drops the tracking refs of untransferable remotes and
 /// recompresses on pack — and degrades to 0 when git or the refs are
 /// unavailable.
-///
-/// Sandbox branches are resolved in the worktree repo, while the bundler
-/// (`transfer_git`) fetches each branch from its sandbox's own repo — so for
-/// `CoW` sandboxes whose branch exists only in the sandbox repo, the estimate
-/// may undercount those refs.
-fn estimate_bundle_bytes(root: &Path, sandbox_branches: &[String]) -> u64 {
-    let mut refs: Vec<String> = vec!["HEAD".to_string(), "--glob=refs/remotes".to_string()];
-    for branch in sandbox_branches {
-        let exists = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["rev-parse", "--verify", "--quiet"])
-            .arg(format!("refs/heads/{branch}"))
-            .output()
-            .is_ok_and(|o| o.status.success());
-        if exists {
-            // Push the unambiguous form: a worktree path or `-`-prefixed name
-            // matching the short branch name would otherwise break rev-list.
-            refs.push(format!("refs/heads/{branch}"));
-        }
-    }
+fn estimate_bundle_bytes(root: &Path) -> u64 {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["rev-list", "--disk-usage", "--objects"])
-        .args(&refs)
+        .args(["HEAD", "--glob=refs/remotes"])
         .output();
     match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
@@ -531,16 +476,11 @@ fn estimate_bundle_bytes(root: &Path, sandbox_branches: &[String]) -> u64 {
 
 /// Detect submodules pointing at unpublished commits in the worktree
 /// (`carried: true`, bundled — together with the published ancestors a
-/// nested finding needs, `published: true`) and in each live sandbox
-/// checkout (`carried: false`, reported only; published ancestors are
-/// skipped there since nothing is bundled), deduped by `(path, commit_sha)`
-/// with worktree findings taking precedence. Returns the summaries plus the
+/// nested finding needs, `published: true`), deduped by `(path,
+/// commit_sha)`. Returns the summaries plus the
 /// estimated bundle bytes of the carried ones. Detection failures degrade to
 /// an empty result — the plan must never fail on a submodule scan.
-fn scan_unpublished_submodules(
-    root: &Path,
-    sandbox_paths: &[PathBuf],
-) -> (Vec<TransferSubmoduleSummary>, u64) {
+fn scan_unpublished_submodules(root: &Path) -> (Vec<TransferSubmoduleSummary>, u64) {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     let mut bytes = 0u64;
@@ -556,16 +496,6 @@ fn scan_unpublished_submodules(
         if seen.insert((sub.path.clone(), sub.commit_sha.clone())) {
             bytes += estimate_submodule_bundle_bytes(&sub);
             out.push(summarize(&sub, true));
-        }
-    }
-    for sandbox in sandbox_paths {
-        if !intent_git::is_repository(sandbox) {
-            continue;
-        }
-        for sub in find_unpublished_submodules(sandbox).unwrap_or_default() {
-            if !sub.published && seen.insert((sub.path.clone(), sub.commit_sha.clone())) {
-                out.push(summarize(&sub, false));
-            }
         }
     }
     (out, bytes)
@@ -600,16 +530,8 @@ fn submodule_warning(
         .filter(|s| s.carried && s.published)
         .map(describe)
         .collect();
-    let sandbox_only: Vec<String> = submodules
-        .iter()
-        .filter(|s| !s.carried)
-        .map(describe)
-        .collect();
     let mut message = if carried.is_empty() {
-        format!(
-            "{} submodule(s) point at commits not on any remote.",
-            sandbox_only.len()
-        )
+        "Submodule(s) point at commits not on any remote.".to_string()
     } else {
         format!(
             "{} submodule(s) point at commits not on any remote and will ride in the archive (~{}): {}. \
@@ -624,13 +546,6 @@ fn submodule_warning(
             message,
             " Also bundled so the nested submodule(s) can be checked out: {}.",
             carried_parents.join(", ")
-        );
-    }
-    if !sandbox_only.is_empty() {
-        let _ = write!(
-            message,
-            " Not carried (sandbox only): {}.",
-            sandbox_only.join(", ")
         );
     }
     Some(message)
@@ -658,7 +573,7 @@ fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use intent_core::{AgentId, AgentSession, AgentStatus, NoteId, WorkspaceId};
-    use intent_store::{Sandbox, SandboxStatus, Store};
+    use intent_store::Store;
 
     use intent_services::feature_api::tests::{workspace, TempDb};
     use intent_services::feature_api::Services;
@@ -734,9 +649,6 @@ mod tests {
             is_background: false,
             metadata: None,
             stats: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -771,8 +683,9 @@ mod tests {
 
     /// Full plan over a seeded workspace: versioned manifest, `event`
     /// excluded, assets listed with sizes, git summary (branch, dirty files,
-    /// sandbox branches), bundle estimate > 0, size breakdown sums to total,
-    /// and all three pre-flight warnings raised.
+    /// no sandbox branches), bundle estimate > 0, size breakdown sums to total,
+    /// and both pre-flight warnings raised (never the retired
+    /// `unmerged-sandboxes` one).
     #[tokio::test]
     async fn transfer_plan_manifest_and_sizes() {
         let tmp = TempDb::new();
@@ -784,7 +697,6 @@ mod tests {
         std::fs::write(repo.0.join("a.txt"), "committed content").expect("write");
         run_git(&repo.0, &["add", "."]);
         run_git(&repo.0, &["commit", "-m", "init"]);
-        run_git(&repo.0, &["branch", "sandbox/agent-1"]);
         // Stage dirty.txt, then modify it again so the path has both staged and
         // unstaged changes — it must still appear once in dirtyFiles.
         std::fs::write(repo.0.join("dirty.txt"), "uncommitted").expect("write");
@@ -813,22 +725,6 @@ mod tests {
             )
             .await
             .expect("message");
-        store
-            .insert_sandbox(&Sandbox {
-                id: "sb-1".to_string(),
-                workspace_id: ws.clone(),
-                agent_id: agent.clone(),
-                path: "/tmp/sb".to_string(),
-                branch: "sandbox/agent-1".to_string(),
-                base_commit_sha: "abc".to_string(),
-                snapshot_commit_sha: None,
-                status: SandboxStatus::Created,
-                retry_count: 0,
-                created_at: intent_core::clock::now_iso(),
-                updated_at: intent_core::clock::now_iso(),
-            })
-            .await
-            .expect("sandbox");
 
         let assets_root = TempDir::new("intentd-transfer-assets");
         std::fs::create_dir_all(assets_root.0.join(&ws.0)).expect("mkdir assets");
@@ -880,7 +776,10 @@ mod tests {
         assert_eq!(table("note").row_count, 1);
         assert_eq!(table("agent_session").row_count, 1);
         assert_eq!(table("agent_message").row_count, 1);
-        assert_eq!(table("sandbox").row_count, 1);
+        assert!(
+            m.tables.iter().all(|t| t.name != "sandbox"),
+            "retired sandbox rows are not exported"
+        );
         assert!(table("note").approx_bytes > 0);
 
         assert_eq!(m.assets.len(), 1);
@@ -890,7 +789,10 @@ mod tests {
         assert!(m.git.has_repository);
         assert_eq!(m.git.branch.as_deref(), Some("main"));
         assert_eq!(m.git.dirty_files, vec!["dirty.txt".to_string()]);
-        assert_eq!(m.git.sandbox_branches, vec!["sandbox/agent-1".to_string()]);
+        assert!(
+            m.git.sandbox_branches.is_empty(),
+            "retired sandbox branches are not bundled"
+        );
 
         assert_eq!(m.attachments.len(), 2);
         let att = |id: &str| m.attachments.iter().find(|a| a.id == id).expect("att");
@@ -915,7 +817,7 @@ mod tests {
         let codes: Vec<&str> = plan.warnings.iter().map(|w| w.code.as_str()).collect();
         assert!(codes.contains(&"agents-running"));
         assert!(codes.contains(&"uncommitted-changes"));
-        assert!(codes.contains(&"unmerged-sandboxes"));
+        assert!(!codes.contains(&"unmerged-sandboxes"));
     }
 
     /// A repo whose only anomaly is an untracked nested git repo plans
@@ -1118,110 +1020,6 @@ mod tests {
         assert!(plan.estimated_git_bundle_bytes > 0);
     }
 
-    /// An unpublished submodule commit found only in a live sandbox checkout
-    /// is reported `carried: false` under "Not carried (sandbox only)" and
-    /// adds nothing to the bundle estimate; a sandbox finding that matches
-    /// the worktree's `(path, sha)` is not repeated.
-    #[tokio::test]
-    async fn transfer_plan_reports_sandbox_only_submodule_as_not_carried() {
-        use intent_services::feature_api::test_support::submodule_fixture::{
-            git, local_commit, superproject_with_submodule,
-        };
-
-        let tmp = TempDb::new();
-        let store = Store::open(&tmp.path).await.expect("open store");
-        let ws = WorkspaceId::new();
-
-        let root = TempDir::new("intentd-transfer-submodule-sb");
-        let (sup, _origin) = superproject_with_submodule(&root.0);
-        git(
-            &root.0,
-            &[
-                "clone",
-                "-q",
-                "--recurse-submodules",
-                sup.to_str().unwrap(),
-                "sandbox",
-            ],
-        );
-        let sandbox = root.0.join("sandbox");
-        let sb_sub = sandbox.join("sub");
-        git(&sb_sub, &["checkout", "-q", "-b", "feat/sb"]);
-        let sb_sha = local_commit(&sb_sub, "sandbox.txt");
-
-        let mut w = workspace(&ws);
-        w.worktree_path = Some(sup.to_string_lossy().to_string());
-        store.insert_workspace(&w).await.expect("ws");
-        let agent = AgentId::new();
-        store
-            .insert_agent_session(&session(&agent, &ws, AgentStatus::Idle))
-            .await
-            .expect("session");
-        store
-            .insert_sandbox(&Sandbox {
-                id: "sb-1".to_string(),
-                workspace_id: ws.clone(),
-                agent_id: agent,
-                path: sandbox.to_string_lossy().to_string(),
-                branch: "sandbox/agent-1".to_string(),
-                base_commit_sha: "abc".to_string(),
-                snapshot_commit_sha: None,
-                status: SandboxStatus::Created,
-                retry_count: 0,
-                created_at: intent_core::clock::now_iso(),
-                updated_at: intent_core::clock::now_iso(),
-            })
-            .await
-            .expect("sandbox");
-        let svc = crate::register(Services::new_isolated(store));
-
-        let plan = svc
-            .workspace_transfer_plan_op(ws.clone())
-            .await
-            .expect("plan");
-        let warns: Vec<_> = plan
-            .warnings
-            .iter()
-            .filter(|w| w.code == "submodule-unpublished-commits")
-            .collect();
-        assert_eq!(warns.len(), 1, "{:?}", plan.warnings);
-        let msg = &warns[0].message;
-        assert!(!msg.contains("will ride in the archive"), "{msg}");
-        assert!(
-            msg.contains(&format!(
-                "Not carried (sandbox only): sub @ {} (feat/sb)",
-                &sb_sha[..7]
-            )),
-            "{msg}"
-        );
-        assert_eq!(plan.manifest.git.submodules.len(), 1);
-        assert_eq!(plan.manifest.git.submodules[0].commit_sha, sb_sha);
-        assert!(!plan.manifest.git.submodules[0].carried);
-
-        // Same unpublished commit in the worktree and the sandbox: one
-        // carried entry, no duplicate.
-        let sub = sup.join("sub");
-        git(&sub, &["fetch", "-q", sb_sub.to_str().unwrap(), "feat/sb"]);
-        git(&sub, &["checkout", "-q", "--detach", &sb_sha]);
-        let plan = svc.workspace_transfer_plan_op(ws).await.expect("plan");
-        assert_eq!(
-            plan.manifest.git.submodules.len(),
-            1,
-            "{:?}",
-            plan.manifest.git.submodules
-        );
-        assert_eq!(plan.manifest.git.submodules[0].commit_sha, sb_sha);
-        assert!(plan.manifest.git.submodules[0].carried);
-        let msg = &plan
-            .warnings
-            .iter()
-            .find(|w| w.code == "submodule-unpublished-commits")
-            .expect("warning")
-            .message;
-        assert!(msg.contains("will ride in the archive"), "{msg}");
-        assert!(!msg.contains("Not carried"), "{msg}");
-    }
-
     /// The estimate counts objects reachable only from remote-tracking refs:
     /// the bundler carries those refs (intent-hq/intent#4438), so a remote
     /// branch ahead of HEAD grows the estimate.
@@ -1234,7 +1032,7 @@ mod tests {
         std::fs::write(root.join("a.txt"), "a\n").unwrap();
         run_git(&root, &["add", "a.txt"]);
         run_git(&root, &["commit", "-q", "-m", "a"]);
-        let head_only = super::estimate_bundle_bytes(&root, &[]);
+        let head_only = super::estimate_bundle_bytes(&root);
         assert!(head_only > 0);
 
         // A commit reachable only from `refs/remotes/origin/ahead`.
@@ -1243,40 +1041,28 @@ mod tests {
         run_git(&root, &["commit", "-q", "-m", "ahead"]);
         run_git(&root, &["update-ref", "refs/remotes/origin/ahead", "HEAD"]);
         run_git(&root, &["reset", "-q", "--hard", "HEAD~1"]);
-        assert!(super::estimate_bundle_bytes(&root, &[]) > head_only);
+        assert!(super::estimate_bundle_bytes(&root) > head_only);
     }
 
-    /// Message formatting: carried, carried-published-parent and sandbox-only
-    /// findings, short sha, optional branch, approximate size.
+    /// Message formatting: carried and carried-published-parent findings, short sha, optional branch, approximate size.
     #[test]
     fn submodule_warning_message_shape() {
         use intent_core::transfer::TransferSubmoduleSummary;
         assert_eq!(super::submodule_warning(&[], 0), None);
-        let mut subs = vec![
-            TransferSubmoduleSummary {
-                name: "intentd".to_string(),
-                path: "packages/intentd".to_string(),
-                commit_sha: "6b079e7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                branch: Some("feat/x".to_string()),
-                carried: true,
-                published: false,
-            },
-            TransferSubmoduleSummary {
-                name: "fe".to_string(),
-                path: "packages/cloudlands-fe".to_string(),
-                commit_sha: "a1b2c3dbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-                branch: None,
-                carried: false,
-                published: false,
-            },
-        ];
+        let mut subs = vec![TransferSubmoduleSummary {
+            name: "intentd".to_string(),
+            path: "packages/intentd".to_string(),
+            commit_sha: "6b079e7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            branch: Some("feat/x".to_string()),
+            carried: true,
+            published: false,
+        }];
         let msg = super::submodule_warning(&subs, 41 * 1024 * 1024).expect("message");
         assert_eq!(
             msg,
             "1 submodule(s) point at commits not on any remote and will ride in the archive \
              (~41 MB): packages/intentd @ 6b079e7 (feat/x). Transfer will not push them; \
-             publish the branches yourself when ready. \
-             Not carried (sandbox only): packages/cloudlands-fe @ a1b2c3d."
+             publish the branches yourself when ready."
         );
         subs.insert(
             0,
@@ -1295,8 +1081,7 @@ mod tests {
             "1 submodule(s) point at commits not on any remote and will ride in the archive \
              (~41 MB): packages/intentd @ 6b079e7 (feat/x). Transfer will not push them; \
              publish the branches yourself when ready. \
-             Also bundled so the nested submodule(s) can be checked out: packages @ 0f0f0f0 (main). \
-             Not carried (sandbox only): packages/cloudlands-fe @ a1b2c3d."
+             Also bundled so the nested submodule(s) can be checked out: packages @ 0f0f0f0 (main)."
         );
         assert_eq!(super::human_bytes(0), "0 B");
         assert_eq!(super::human_bytes(1536), "1.5 KB");

@@ -119,6 +119,8 @@ pub(crate) fn server_json(
     let mut capabilities = capabilities;
     capabilities["remoteAgentSkills"] = json!(1);
     capabilities["agentPlugins"] = json!(1);
+    // Per-agent CoW sandboxes are retired (protocol 16).
+    capabilities["agentIsolation"] = json!(2);
     let mut server = json!({
         "locality": if is_local { "local" } else { "remote" },
         "hasDisplay": has_display,

@@ -10,7 +10,6 @@
 //! still reports as changes (intent-hq/intent#7266): a path the worktree
 //! status no longer lists — committed, reverted, ignored, deleted — is not a
 //! file a user could stage, so it neither locks nor makes its agent locked.
-//! Sandboxed (copy-on-write) agents' paths are not judged against the worktree.
 //!
 //! The snapshot is served on demand via `file-tracking.getAgentLocks`
 //! (PROTOCOL §5.19) and pushed as the self-sufficient `changes:agent-locks`
@@ -158,23 +157,14 @@ impl Services {
                 active.insert(agent_id, paths);
             }
         }
-        // Keep only paths git still reports as changes. A sandboxed (copy-on-write)
-        // agent's paths live in its sandbox, not in the workspace worktree,
-        // so the worktree status cannot judge them; they stay as recorded.
-        let judged: BTreeMap<&String, &BTreeSet<String>> = active
-            .iter()
-            .filter(|(id, _)| {
-                by_id
-                    .get(id.as_str())
-                    .is_some_and(|s| s.sandbox_path.is_none())
-            })
-            .collect();
+        // Keep only paths git still reports as changes: every agent works in
+        // the workspace worktree, so its status judges every agent's paths.
+        let judged: BTreeMap<&String, &BTreeSet<String>> = active.iter().collect();
         let lockable = self.lockable_paths(workspace_id, &judged).await;
-        let judged_ids: HashSet<String> = judged.keys().map(|id| (*id).clone()).collect();
         let mut locked_agent_ids: BTreeSet<String> = BTreeSet::new();
         let mut locked_file_paths: BTreeSet<String> = BTreeSet::new();
         for (agent_id, mut paths) in active {
-            if let Some(lockable) = lockable.as_ref().filter(|_| judged_ids.contains(&agent_id)) {
+            if let Some(lockable) = lockable.as_ref() {
                 paths.retain(|p| lockable.contains(p));
             }
             if !paths.is_empty() {

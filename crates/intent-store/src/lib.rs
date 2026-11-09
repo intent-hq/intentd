@@ -69,7 +69,6 @@ mod principal_repo;
 mod repository_authority_repo;
 mod repository_lifecycle;
 mod repository_selection_repo;
-mod sandbox_repo;
 mod script_monitor_repo;
 pub use script_monitor_repo::ScriptNotificationJob;
 mod script_list_repo;
@@ -152,7 +151,6 @@ pub use repository_selection_repo::{
     RepositorySelectionPersistence, RepositorySelectionRevision, RepositorySelectionSnapshot,
     RepositorySelectionWriteOutcome, RepositorySelectionWriteResult, RepositoryStoredSelection,
 };
-pub use sandbox_repo::{Sandbox, SandboxStatus};
 pub use subscription_agent_repo::SubscriptionAgentProjection;
 pub use tracked_changes_repo::{NewTrackedChange, TrackedChangeRow};
 pub use transfer_repo::TRANSFER_TABLES;

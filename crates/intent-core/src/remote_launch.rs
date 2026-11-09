@@ -300,6 +300,10 @@ pub struct RemotePlacementView {
     /// parent's, starts from (nodeProtocol 13); never projected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_work: Option<ParentWork>,
+    /// The machine (`nodeId`) of the agent's last launch, kept without a
+    /// machine, so a launch on another one tells the agent; never projected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched_on: Option<String>,
     /// While the agent's cloud machine starts (`AgentLite.cloudStart`).
     /// `node_id` and `lease_id` stay empty until its link binds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -334,10 +338,9 @@ pub enum ParentWorkCopy {
 pub const BACKEND_PARENT_WORK_METADATA_KEY: &str = "backendParentWork";
 
 /// The parent's work a backend (`target: "local"`) sub-agent of a remote
-/// agent starts from: the commits of the owner of the parent's checkout
-/// and its uncommitted changes, as saved in its refs. A sub-agent with its
-/// own copy-on-write checkout starts from them (`seeded`); one in the
-/// workspace's shared checkout is told where they are.
+/// agent can read: the commits of the owner of the parent's checkout and
+/// its uncommitted changes, as saved in its refs. The sub-agent works in the
+/// workspace's shared checkout and is told where they are.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendParentWork {
@@ -352,9 +355,6 @@ pub struct BackendParentWork {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub submodules: Vec<BackendParentModule>,
     pub copied: ParentWorkCopy,
-    /// The sub-agent's own checkout was reset to this work.
-    #[serde(default)]
-    pub seeded: bool,
 }
 
 /// A submodule's part of [`BackendParentWork`].
@@ -399,13 +399,6 @@ impl BackendParentWork {
                 self.parent_ref(workspace_id, "wip")
             );
         };
-        if self.seeded {
-            return format!(
-                "This sub-agent runs on the backend in its own checkout, which starts from its parent's work: commit {} with the parent's uncommitted changes, {}. Later work of either agent is not shared.",
-                short(head),
-                self.saved()
-            );
-        }
         let wip = self.wip.as_deref().map_or_else(
             || " The parent had no uncommitted changes.".to_owned(),
             |wip| {
@@ -421,21 +414,6 @@ impl BackendParentWork {
             self.parent_ref(workspace_id, "head"),
             short(head),
             self.saved()
-        )
-    }
-
-    /// [`Self::notice`] for a sub-agent whose own copy-on-write checkout is
-    /// still being made: what it starts from once ready, and the fallback.
-    #[must_use]
-    pub fn pending_notice(&self, workspace_id: &str) -> String {
-        if self.head.is_none() {
-            return self.notice(workspace_id);
-        }
-        format!(
-            "This sub-agent runs on the backend in its own checkout, which is being made and then starts from its parent's work, {}. If that copy cannot be made or reset, it runs in the workspace's checkout and its instructions name the parent's refs: `{}` and `{}`.",
-            self.saved(),
-            self.parent_ref(workspace_id, "head"),
-            self.parent_ref(workspace_id, "wip")
         )
     }
 
@@ -621,6 +599,49 @@ pub fn sub_agent_notice(view: &RemotePlacementView) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Per-agent `CoW` sandboxes are retired: a backend sub-agent of a remote
+    /// agent always works in the shared workspace checkout, so its notice
+    /// names the parent's refs, even for metadata an older daemon marked
+    /// `seeded` (its own checkout started from the parent's work).
+    #[test]
+    fn backend_parent_work_notice_always_names_the_shared_checkout() {
+        for seeded in [false, true] {
+            let work: BackendParentWork = serde_json::from_value(serde_json::json!({
+                "agentId": "agent-parent",
+                "head": "0123456789abcdef0123",
+                "wip": "fedcba9876543210fedc",
+                "copied": "pushed",
+                "seeded": seeded,
+            }))
+            .expect("legacy metadata still parses");
+            let notice = work.notice("ws-1");
+            assert!(
+                notice.contains("in the workspace's checkout"),
+                "seeded={seeded}: {notice}"
+            );
+            assert!(
+                notice.contains("`refs/intent/ws/ws-1/agents/agent-parent/head`")
+                    && notice.contains("`refs/intent/ws/ws-1/agents/agent-parent/wip`"),
+                "seeded={seeded}: names the parent's refs: {notice}"
+            );
+            assert!(
+                !notice.contains("its own checkout"),
+                "seeded={seeded}: no own checkout: {notice}"
+            );
+        }
+        let fresh: BackendParentWork = serde_json::from_value(serde_json::json!({
+            "agentId": "agent-parent",
+            "head": "0123456789abcdef0123",
+            "copied": "pushed",
+        }))
+        .expect("metadata without seeded parses");
+        let value = serde_json::to_value(&fresh).unwrap();
+        assert!(
+            value.get("seeded").is_none(),
+            "new metadata drops seeded: {value}"
+        );
+    }
 
     #[test]
     fn placement_errors_split_the_node_code_and_cap_the_detail() {

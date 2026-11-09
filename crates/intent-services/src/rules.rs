@@ -322,66 +322,6 @@ pub(crate) struct SpecialistPromptInjection {
     pub role_reminder: Option<String>,
 }
 
-/// Build the mode-dependent isolation hint for Task 6 (`CoW` agent sandboxes).
-/// Returns `Some(hint)` when the agent's isolation mode and specialist warrant
-/// a context block, `None` otherwise. The hint selection keys off the agent's
-/// actual effective isolation (`session.sandbox_path` presence) and workspace mode,
-/// not just the workspace cowIsolation setting, so it reflects what the agent is
-/// actually running under.
-///
-/// Hint matrix (per spec line 104-110):
-/// - Sandboxed agent (`session.sandbox_path` present):
-///   isolation context block with sandbox path, branch, base commit, caches-warm
-///   notice, branch-switching warning, and conflict-bounce resolution instructions.
-/// - Coordinator in CoW-enabled workspace (specialist="spec-writer" + workspace
-///   direct-mode + `cow_supported=true`): parallel delegation safety guidance.
-/// - All other modes: no hint (worktree-mode unchanged, shared-mode direct unchanged).
-pub(crate) fn build_isolation_hint(
-    workspace: Option<&intent_core::Workspace>,
-    agent_session: Option<&intent_core::AgentSession>,
-    specialist: Option<&SpecialistPromptInjection>,
-) -> Option<String> {
-    // Isolation follows the checkout, independently of the selected specialist.
-    let is_sandboxed = agent_session
-        .and_then(|s| s.sandbox_path.as_ref())
-        .is_some();
-
-    let specialist_name = specialist
-        .and_then(|s| s.specialist_name.as_deref())
-        .unwrap_or("");
-
-    // The session's pinned harness owns the hint wording (H2); session-less
-    // calls resolve to the latest.
-    let harness = session_harness_entry(agent_session).harness;
-
-    // Case 1: Sandboxed agent — inject isolation context
-    if is_sandboxed {
-        let session = agent_session?;
-        let sandbox_path = session.sandbox_path.as_deref().unwrap_or("<sandbox-path>");
-        let sandbox_branch = session.sandbox_branch.as_deref().unwrap_or("sb/<id>");
-        return Some(harness.sandboxed_implementor_hint(sandbox_path, sandbox_branch));
-    }
-
-    // Case 2: Coordinator in CoW-enabled direct-mode workspace
-    // "spec-writer" is the coordinator specialist (per SPECIALISTS constant in FE)
-    if specialist_name.eq_ignore_ascii_case("coordinator")
-        || specialist_name.eq_ignore_ascii_case("spec-writer")
-    {
-        if let Some(ws) = workspace {
-            // Direct mode: skip_worktree=true OR worktree_path=None
-            let is_direct_mode = ws.skip_worktree || ws.worktree_path.is_none();
-            let cow_supported = ws.cow_supported.unwrap_or(false);
-
-            if is_direct_mode && cow_supported {
-                return Some(harness.coordinator_cow_hint());
-            }
-        }
-    }
-
-    // Case 3: Worktree mode or shared-mode direct — no hint (behavior unchanged)
-    None
-}
-
 /// Format the RTK instruction line for the given usable subcommands. Wording
 /// owned by the given harness (H5); session-scoped assembly passes the
 /// session's pinned harness, session-less callers pass
@@ -647,15 +587,6 @@ async fn assemble_system_prompt_layers(
              same surface; call ws.help(\"<namespace>\") for one namespace's full docs.\n\n{docs}",
             intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING
         ));
-    }
-    // Mode-dependent isolation hints (Task 6): inject context about CoW
-    // sandboxing for implementors and parallel delegation safety for coordinators
-    // when appropriate, before the specialist role section so the specialist
-    // behavior prompt can reference them.
-    if assistant.is_none() {
-        if let Some(hint) = build_isolation_hint(workspace, agent_session, specialist) {
-            parts.push(hint);
-        }
     }
     // A backend sub-agent of a remote agent: where its parent's work is.
     if let Some(session) = agent_session {
@@ -1287,9 +1218,6 @@ This is a test skill.
             context_references: None,
             image_blocks: None,
             file_blocks: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,

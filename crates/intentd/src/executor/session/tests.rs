@@ -62,11 +62,12 @@ fn harness() -> Harness {
     let runner = Runner::new(RunnerConfig {
         admission: Arc::new(Unlimited),
         launch: Arc::new(NoProviders),
-        checkouts: crate::executor::checkout::PlainCheckouts::new(storage),
+        checkouts: crate::executor::checkout::PlainCheckouts::new(storage.clone()),
         journal,
         home: None,
         mcp_bridge_exe: std::env::current_exe().unwrap(),
         git_socket: None,
+        pull_staging: storage.pull_staging_dir(),
         auth_failed: Arc::new(|_: &str| {}),
     });
     Harness { runner, _dir: dir }
@@ -98,6 +99,7 @@ fn launch(id: &str) -> LinkFrame {
         checkout_of: None,
         forge: None,
         git_identity: None,
+        new_machine: None,
     })
 }
 

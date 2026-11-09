@@ -25,8 +25,8 @@ use intent_acp::{HostFrameRouter, McpBridge, NormalizedMcpServer, WorkspaceMcpSe
 use intent_core::node_link::{LinkOutcome, McpProxy, PREPARED_CHECKOUT_PROTOCOL, SECRETS_PROTOCOL};
 use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
-    GIT_ROOTS_METHOD, MAX_LINK_ATTACHMENT_CHUNK_BYTES, MCP_PROXY_LINK_TIMEOUT,
-    PLACEMENT_HELP_METHOD,
+    GIT_ROOTS_METHOD, MAX_LINK_ATTACHMENT_CHUNK_BYTES, MAX_PULL_BYTES, MCP_PROXY_LINK_TIMEOUT,
+    PLACEMENT_HELP_METHOD, PULL_DATA_METHOD,
 };
 use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{
@@ -487,6 +487,45 @@ impl Router {
         })
     }
 
+    /// One piece of `path` in `from`'s checkout from head, for
+    /// `ws.file.pull` on this node. An older backend that refuses the frame
+    /// tells the agent what to update.
+    async fn pull_piece(
+        &self,
+        from: &AgentId,
+        path: &str,
+        offset: u64,
+        transfer_id: Option<String>,
+    ) -> Result<intent_core::node_link::CheckoutPiece> {
+        let mut args = json!({
+            "fromAgentId": from,
+            "path": path,
+            "offset": offset,
+            "length": MAX_LINK_ATTACHMENT_CHUNK_BYTES,
+        });
+        if let Some(id) = transfer_id {
+            args["transferId"] = json!(id);
+        }
+        let answer = self
+            .forward(PULL_DATA_METHOD, &args)
+            .await
+            .map_err(|error| {
+                if error.starts_with(workspace_api::UNSUPPORTED_CODE) {
+                    Error::InvalidParams(format!(
+                        "{}: ws.file.pull on a remote agent needs a newer Intent on the backend; update it",
+                        workspace_api::UNSUPPORTED_CODE
+                    ))
+                } else {
+                    Error::InvalidParams(error)
+                }
+            })?;
+        serde_json::from_value(answer).map_err(|error| {
+            Error::InvalidParams(format!(
+                "file-pull-mismatch: head sent a malformed piece ({error}); try again"
+            ))
+        })
+    }
+
     /// Whether the workspace lets agents commit on their own, as head
     /// resolves it. Fails closed: no answer is no.
     async fn auto_commit(&self) -> Result<bool> {
@@ -759,6 +798,7 @@ impl WorkspaceApi for NodeApi {
             file_ops::check_attachment_dest(&self.root(), dest_dir.as_deref())?;
             let first =
                 AttachmentData::parse(&self.head.attachment_piece(&attachment_id, 0).await?)?;
+            file_ops::check_attachment_size(first.size)?;
             if first.offset.is_none() {
                 return self
                     .blocking(&workspace_id, move |root| {
@@ -775,6 +815,34 @@ impl WorkspaceApi for NodeApi {
             }
             self.copy_attachment_pieces(&attachment_id, dest_dir, first)
                 .await
+        })
+    }
+
+    /// The pieces come from head (read on the source agent's machine, or in
+    /// head's worktree); the copy lands in this agent's checkout.
+    fn file_pull(
+        &self,
+        workspace_id: WorkspaceId,
+        _caller_agent_id: Option<AgentId>,
+        from_agent_id: AgentId,
+        path: String,
+        to: Option<String>,
+    ) -> BoxFuture<'_, Result<Value>> {
+        Box::pin(async move {
+            self.check(&workspace_id)?;
+            let to = to.unwrap_or_else(|| path.clone());
+            let head = &self.head;
+            let (from, path) = (&from_agent_id, path.as_str());
+            // The agent's own checkout: a path onto itself is refused.
+            let same = (from_agent_id == self.agent_id).then_some(path);
+            intent_services::checkout_transfer::pull_into(
+                &self.worktree,
+                &to,
+                same,
+                MAX_PULL_BYTES,
+                |offset, transfer| head.pull_piece(from, path, offset, transfer),
+            )
+            .await
         })
     }
 

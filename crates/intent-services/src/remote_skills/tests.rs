@@ -90,6 +90,7 @@ pub(crate) fn view(skills: Option<Vec<MachineSkill>>) -> RemotePlacementView {
         skills,
         shared_checkout_of: None,
         parent_work: None,
+        launched_on: None,
         cloud_start: None,
     }
 }
@@ -132,9 +133,6 @@ pub(crate) fn session(ws: &intent_core::WorkspaceId, id: &AgentId) -> AgentSessi
         metadata: None,
         created_at: ts.clone(),
         updated_at: ts,
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,

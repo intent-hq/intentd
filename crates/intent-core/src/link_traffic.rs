@@ -795,6 +795,22 @@ fn light_frame(frame: &LinkFrame) -> Value {
             "outcome": reply.outcome,
             "error": reply.error.as_deref().map(field),
         }),
+        LinkFrame::CheckoutRead(read) => json!({
+            "type": "checkoutRead",
+            "requestId": read.request_id,
+            "agentId": agent(&read.agent_id),
+            "offset": read.offset,
+            "length": read.length,
+        }),
+        LinkFrame::CheckoutReadReply(reply) => json!({
+            "type": "checkoutReadReply",
+            "requestId": reply.request_id,
+            "agentId": agent(&reply.agent_id),
+            "outcome": reply.outcome,
+            "offset": reply.piece.as_ref().map(|piece| piece.offset),
+            "size": reply.piece.as_ref().map(|piece| piece.size),
+            "error": reply.error.as_deref().map(field),
+        }),
     }
 }
 

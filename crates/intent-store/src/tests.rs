@@ -35,6 +35,7 @@ mod note_paging_removal;
 mod note_search;
 mod note_write_lock;
 mod pull_request_workspace;
+mod sandbox_removal;
 mod workspace_pr_settled;
 mod write_acquire_retry;
 
@@ -4479,9 +4480,6 @@ fn sample_agent_session(id: &AgentId, ws: &WorkspaceId) -> AgentSession {
         pinned: false,
         created_at: ts.clone(),
         updated_at: ts,
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
     }
 }
 /// The `IS NULL` guard's race contract at the store level: the first

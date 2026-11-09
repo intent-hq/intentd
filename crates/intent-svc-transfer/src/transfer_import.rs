@@ -6,7 +6,7 @@
 //! reassembles the archive, verifies its SHA-256, unpacks it, applies the row
 //! transforms (path rewrites, session-id clearing, in-flight → interrupted),
 //! materializes the git payload when the archive carries one
-//! ([`crate::transfer_materialize`]: checkout + sandboxes recreated from the
+//! ([`crate::transfer_materialize`]: the checkout recreated from the
 //! bundle, rows rewritten to the target paths), inserts every row in ONE
 //! store transaction, places assets, and rehydrates agent queues /
 //! delegation groups / completion watches / event subscriptions / hooks /
@@ -27,8 +27,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use intent_core::transfer::{TransferManifest, CREATING_INTENTD_VERSION, TRANSFER_FORMAT_VERSION};
-use intent_core::{clock::now_iso, AgentId, Error, Result, Workspace, WorkspaceId};
-use intent_store::{Sandbox, SandboxStatus};
+use intent_core::{clock::now_iso, Error, Result, Workspace, WorkspaceId};
 use sha2::Digest as _;
 
 use crate::transfer::TransferStateExt;
@@ -548,9 +547,9 @@ impl TransferImportExt for Services {
         .map_err(|e| Error::Internal(format!("import selection resolution failed: {e}")))?;
 
         // Materialize the git payload BEFORE the rows land, so the seam can
-        // rewrite the transformed workspace/sandbox rows to the target
-        // checkout (repository_path, checkout_mode, branch, sandbox paths,
-        // dropped sandboxes) and the apply()'d versions are what the store
+        // rewrite the transformed workspace row to the target checkout
+        // (repository_path, checkout_mode, branch) and the apply()'d
+        // version is what the store
         // commits. An error fails the commit: disk materialization is
         // all-or-nothing, no rows have landed, and the staging session
         // survives for retry or abort.
@@ -581,7 +580,7 @@ impl TransferImportExt for Services {
         };
 
         // If the row insert fails AFTER materialization succeeded, unwind
-        // the checkout/sandboxes so a retried commit does not hit
+        // the checkout so a retried commit does not hit
         // "materialize target already exists".
         let imported_rows = match self.store().transfer_import_rows(&outcome.rows).await {
             Ok(n) => n,
@@ -693,16 +692,14 @@ impl TransferImportExt for Services {
     /// under `extracted_dir`) via
     /// [`crate::transfer_materialize::materialize_workspace_git`]: clone the
     /// bundle into `<workspaces_root>/<wsId>/<repo-slug>`, hydrate the
-    /// bundled submodules, fetch the base ref, re-provision sandboxes, and
-    /// unwind WIP snapshots. The checkout
+    /// bundled submodules, fetch the base ref, and unwind the WIP snapshot
+    /// (an older archive's sandbox rows and refs are ignored). The checkout
     /// is workspace-owned storage and is NOT registered in `known_repo`
     /// (intent-hq/monorepo#2227). Runs BEFORE the store insert with the
     /// transformed rows passed mutably: the [`MaterializedGit::apply`] row
     /// rewrites (workspace `repository_path` → the new checkout,
     /// `worktree_path` cleared, `checkout_mode` → direct, `branch` → the
-    /// bundled branch, `base_commit_sha` backfill, sandbox path rewrites,
-    /// dropping sandbox rows whose branch is absent from the bundle) are
-    /// written back onto the JSON rows, so the `apply()`'d versions are what
+    /// bundled branch, `base_commit_sha` backfill) are written back onto the JSON rows, so the `apply()`'d versions are what
     /// land in the store. An error fails the commit: materialization is
     /// all-or-nothing on disk, no rows have been inserted, and the staging
     /// session survives for retry or abort. Returns the materialization
@@ -733,7 +730,7 @@ impl TransferImportExt for Services {
         let refs: TransferRefsManifest = serde_json::from_slice(&refs)
             .map_err(|e| Error::InvalidParams(format!("archive git/refs.json is invalid: {e}")))?;
 
-        // Rebuild just enough of the workspace/sandbox models from the
+        // Rebuild just enough of the workspace model from the
         // transformed DB-shaped rows for the materializer (repo naming
         // inputs and the `apply()` targets); everything else takes inert
         // defaults and is never written back.
@@ -747,11 +744,6 @@ impl TransferImportExt for Services {
                 )
             })?;
         let mut ws = workspace_for_materialize(workspace_id, ws_row);
-        let mut sandboxes: Vec<Sandbox> = rows
-            .iter()
-            .find(|(t, _)| t == "sandbox")
-            .map(|(_, objects)| objects.iter().map(sandbox_for_materialize).collect())
-            .unwrap_or_default();
 
         let target_root = self.feature_workspaces_root().map_or_else(
             intent_services::feature_api::default_workspaces_root,
@@ -761,55 +753,31 @@ impl TransferImportExt for Services {
             bundle,
             refs,
             ws.clone(),
-            sandboxes.clone(),
             target_root,
         )
         .await?;
-        out.apply(&mut ws, &mut sandboxes);
+        out.apply(&mut ws);
 
         // Write the applied values back onto the JSON rows.
-        for (table, objects) in rows.iter_mut() {
-            match table.as_str() {
-                "workspace" => {
-                    for row in objects.iter_mut() {
-                        let Some(map) = row.as_object_mut() else {
-                            continue;
-                        };
-                        map.insert(
-                            "repository_path".to_string(),
-                            serde_json::json!(ws.repository_path),
-                        );
-                        map.insert("worktree_path".to_string(), serde_json::Value::Null);
-                        map.insert(
-                            "checkout_mode".to_string(),
-                            serde_json::json!(ws.checkout_mode),
-                        );
-                        map.insert("branch".to_string(), serde_json::json!(ws.branch));
-                        map.insert(
-                            "base_commit_sha".to_string(),
-                            serde_json::json!(ws.base_commit_sha),
-                        );
-                    }
-                }
-                "sandbox" => {
-                    objects.retain_mut(|row| {
-                        let agent = row
-                            .get("agent_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        match sandboxes.iter().find(|sb| sb.agent_id.0 == agent) {
-                            Some(sb) => {
-                                if let Some(map) = row.as_object_mut() {
-                                    map.insert("path".to_string(), serde_json::json!(sb.path));
-                                }
-                                true
-                            }
-                            None => false,
-                        }
-                    });
-                }
-                _ => {}
+        for (_, objects) in rows.iter_mut().filter(|(table, _)| table == "workspace") {
+            for row in objects.iter_mut() {
+                let Some(map) = row.as_object_mut() else {
+                    continue;
+                };
+                map.insert(
+                    "repository_path".to_string(),
+                    serde_json::json!(ws.repository_path),
+                );
+                map.insert("worktree_path".to_string(), serde_json::Value::Null);
+                map.insert(
+                    "checkout_mode".to_string(),
+                    serde_json::json!(ws.checkout_mode),
+                );
+                map.insert("branch".to_string(), serde_json::json!(ws.branch));
+                map.insert(
+                    "base_commit_sha".to_string(),
+                    serde_json::json!(ws.base_commit_sha),
+                );
             }
         }
         Ok(Some(out))
@@ -1193,32 +1161,6 @@ fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value
     }
 }
 
-/// Rebuild the [`Sandbox`] fields the materializer consumes from a
-/// transformed DB-shaped sandbox row (`agent_id` matches bundle entries and
-/// names the target directory; `branch` labels warnings). Same contract as
-/// [`workspace_for_materialize`]: input-only, never stored.
-fn sandbox_for_materialize(row: &serde_json::Value) -> Sandbox {
-    let s = |key: &str| -> String {
-        row.get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string()
-    };
-    Sandbox {
-        id: s("id"),
-        workspace_id: WorkspaceId(s("workspace_id")),
-        agent_id: AgentId(s("agent_id")),
-        path: s("path"),
-        branch: s("branch"),
-        base_commit_sha: s("base_commit_sha"),
-        snapshot_commit_sha: None,
-        status: SandboxStatus::Created,
-        retry_count: 0,
-        created_at: s("created_at"),
-        updated_at: s("updated_at"),
-    }
-}
-
 /// Reject archives whose rows reach beyond the manifest's workspace:
 /// `workspace` rows must carry exactly the imported id, every table with a
 /// `workspace_id` column must match it, `completion_watch` must touch it
@@ -1380,7 +1322,10 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 ///   provider) keeps its model / effort on legacy model-prefix or last-turn
 ///   evidence for the provider, else the selection is cleared so the target's defaults apply
 ///   as a unit (intent-hq/intent#5815); `last_turn_*` history is untouched.
-/// - **sandbox**: `path` rewritten under the target root.
+/// - **sandbox** (older archives only): never read — the table no longer
+///   exists, so its rows file is skipped. The retired `agent_session`
+///   sandbox link columns (`sandbox_id` / `sandbox_path` / `sandbox_branch`)
+///   are removed from each session row: the columns no longer exist.
 /// - **script**: absolute `cwd` rewritten under the target root.
 /// - **draft**: dropped — drafts FK onto `client`, which never transfers.
 /// - **`workspace_discussion_message`**: keep the immutable author snapshot;
@@ -1481,6 +1426,9 @@ fn transform_rows(
                     map.insert("acp_session_id".into(), serde_json::Value::Null);
                     map.insert("backend_session_id".into(), serde_json::Value::Null);
                     map.insert("is_active".into(), serde_json::json!(0));
+                    for retired in ["sandbox_id", "sandbox_path", "sandbox_branch"] {
+                        map.remove(retired);
+                    }
                     for counter in [
                         "message_count",
                         "assistant_message_count",
@@ -1531,29 +1479,6 @@ fn transform_rows(
                             )),
                         );
                         map.insert("stop_reason_timestamp".into(), serde_json::json!(now));
-                    }
-                }
-            }
-            "sandbox" => {
-                for object in &mut objects {
-                    let map = expect_object(&table, object)?;
-                    let agent = map
-                        .get("agent_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if let Some(serde_json::Value::String(path)) = map.get_mut("path") {
-                        // <ws-dir>/sandboxes/<agentId>/<last component>
-                        let slug = Path::new(path.as_str()).file_name().map_or_else(
-                            || "repo".to_string(),
-                            |s| s.to_string_lossy().to_string(),
-                        );
-                        *path = ws_dir
-                            .join("sandboxes")
-                            .join(&agent)
-                            .join(slug)
-                            .to_string_lossy()
-                            .to_string();
                     }
                 }
             }
@@ -1645,6 +1570,7 @@ fn expect_object<'v>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use intent_core::AgentId;
 
     fn ws() -> WorkspaceId {
         WorkspaceId("ws-import".to_string())
@@ -2373,22 +2299,23 @@ mod tests {
         assert!(!outcome.rows.iter().any(|(t, _)| t == "draft"));
     }
 
-    /// Sandbox paths are re-provisioned under
-    /// `<ws-dir>/sandboxes/<agentId>/<repo-slug>`; script cwds re-root like
-    /// workspace paths.
+    /// An older archive's session sandbox link columns are removed (the
+    /// columns no longer exist); script cwds re-root like workspace paths.
     #[test]
-    fn transform_rewrites_sandbox_and_script_paths() {
+    fn transform_clears_sandbox_links_and_rewrites_script_paths() {
         let outcome = transform_one(
-            "sandbox",
+            "agent_session",
             serde_json::json!({
-                "id": "sb-1", "agent_id": "agent-a",
-                "path": "/src/ws/old/sandboxes/agent-a/repo-slug"
+                "id": "agent-a", "workspace_id": "ws-import", "status": "idle",
+                "sandbox_id": "sb-1",
+                "sandbox_path": "/src/ws/old/sandboxes/agent-a/repo-slug",
+                "sandbox_branch": "sb/agent-a"
             }),
         );
-        assert_eq!(
-            find(&outcome, "sandbox")[0]["path"],
-            "/target/workspaces/ws-import/sandboxes/agent-a/repo-slug"
-        );
+        let session = &find(&outcome, "agent_session")[0];
+        for key in ["sandbox_id", "sandbox_path", "sandbox_branch"] {
+            assert!(session.get(key).is_none(), "{key} removed: {session}");
+        }
 
         let outcome = transform_one(
             "script",
@@ -3943,16 +3870,17 @@ mod tests {
     }
 
     /// Full `begin → chunk → commit` over an archive that carries a real git
-    /// payload: a dirty workspace repo (staged + untracked) and one sandbox,
-    /// plus a sandbox row whose branch never made it into the bundle. The
+    /// payload: a dirty workspace repo (staged + untracked). It is an archive
+    /// from a daemon before per-agent `CoW` sandboxes were retired: it carries
+    /// sandbox rows and a `refs.sandboxes` entry, which the import ignores. The
     /// workspace ROW records a stale branch name (`feature-stale`) that
     /// diverges from the branch HEAD actually pointed at when the bundle was
     /// built (`feature`) — the bundle wins. Commit must materialize the
-    /// checkout and sandbox on disk, rewrite the stored workspace row
+    /// checkout on disk, rewrite the stored workspace row
     /// (`repository_path` → checkout, `worktree_path` cleared, `checkout_mode`
     /// direct, branch → the bundled branch, `base_commit_sha` backfilled),
-    /// rewrite the stored sandbox path, and drop the bundle-less sandbox
-    /// row — WITHOUT registering the workspace-owned checkout in `known_repo`
+    /// drop every sandbox row without making a sandbox folder — WITHOUT
+    /// registering the workspace-owned checkout in `known_repo`
     /// (intent-hq/monorepo#2227).
     #[tokio::test]
     async fn import_commit_materializes_git() {
@@ -3983,25 +3911,11 @@ mod tests {
         }
         std::fs::write(repo.join("untracked.txt"), "untracked\n").unwrap();
 
-        // Source sandbox: clone on `sb/<agent>` with one commit.
+        // The legacy sandbox the old archive names. Its folder and branch
+        // never reach the bundle: only the row and the refs entry do.
         let agent = "agent-sb";
         let sb_branch = format!("sb/{agent}");
         let sb_src = src.0.join("sandbox");
-        let out = std::process::Command::new("git")
-            .arg("clone")
-            .arg("--quiet")
-            .arg(&repo)
-            .arg(&sb_src)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        {
-            let r = git2::Repository::open(&sb_src).unwrap();
-            let head = r.head().unwrap().peel_to_commit().unwrap();
-            r.branch(&sb_branch, &head, false).unwrap();
-            r.set_head(&format!("refs/heads/{sb_branch}")).unwrap();
-        }
-        commit_file(&sb_src, "sb.txt", "sandbox work\n", "feat: sandbox commit");
 
         // Source-side rows (DB-shaped, source-absolute paths). The row's
         // `branch` is stale — HEAD is on `feature`, so the bundle records
@@ -4029,7 +3943,9 @@ mod tests {
         });
         let sessions = serde_json::json!([
             { "id": agent, "workspace_id": ws.0, "name": "SB",
-              "status": "idle", "created_at": t, "updated_at": t },
+              "status": "idle", "created_at": t, "updated_at": t,
+              "sandbox_id": "sb-1", "sandbox_path": sb_src.to_string_lossy(),
+              "sandbox_branch": sb_branch },
             { "id": "agent-ghost", "workspace_id": ws.0, "name": "G",
               "status": "idle", "created_at": t, "updated_at": t }
         ]);
@@ -4047,29 +3963,22 @@ mod tests {
             w.repository_name = Some("test-repo".to_string());
             w
         };
-        let src_sb = Sandbox {
-            id: "sb-1".to_string(),
-            workspace_id: ws.clone(),
-            agent_id: AgentId(agent.to_string()),
-            path: sb_src.to_string_lossy().into_owned(),
-            branch: sb_branch.clone(),
-            base_commit_sha: base.clone(),
-            snapshot_commit_sha: None,
-            status: SandboxStatus::Created,
-            retry_count: 0,
-            created_at: t.to_string(),
-            updated_at: t.to_string(),
-        };
         let staging = src.0.join("staging");
         let crate::transfer_git::TransferBundle {
-            bundle_path, refs, ..
-        } = crate::transfer_git::create_transfer_bundle(
-            &src_ws,
-            std::slice::from_ref(&src_sb),
-            &staging,
-        )
-        .expect("bundle");
+            bundle_path,
+            mut refs,
+            ..
+        } = crate::transfer_git::create_transfer_bundle(&src_ws, &staging).expect("bundle");
         assert!(refs.workspace_wip_commit_sha.is_some(), "source was dirty");
+        assert!(refs.sandboxes.is_empty(), "export carries no sandbox refs");
+        // What an older daemon wrote for a live sandbox.
+        refs.sandboxes.push(serde_json::json!({
+            "agentId": agent,
+            "branch": sb_branch,
+            "bundleRef": format!("refs/intent/transfer/{}/sandbox/{agent}", ws.0),
+            "headSha": base,
+            "baseCommitSha": base,
+        }));
 
         let m = manifest(&ws);
         let rows: Vec<(&str, Vec<serde_json::Value>)> = vec![
@@ -4128,21 +4037,21 @@ mod tests {
             "staged\n"
         );
 
-        // Sandbox rows: the bundled one rewritten on disk + in the store,
-        // the ghost dropped.
-        let sandboxes = svc.store().list_sandboxes(&ws).await.expect("sandboxes");
-        assert_eq!(sandboxes.len(), 1);
-        let expected_sb = ws_root
-            .0
-            .join(&ws.0)
-            .join("sandboxes")
-            .join(agent)
-            .join("test-repo");
-        assert_eq!(sandboxes[0].path, expected_sb.to_string_lossy());
-        assert_eq!(
-            std::fs::read_to_string(expected_sb.join("sb.txt")).unwrap(),
-            "sandbox work\n"
+        // Old sandbox refs, rows and session links are ignored: the import
+        // commits (the dropped columns never reach the store) and makes no
+        // sandbox folder.
+        assert!(
+            !ws_root.0.join(&ws.0).join("sandboxes").exists(),
+            "no sandbox folder materialised"
         );
+        for id in [agent, "agent-ghost"] {
+            let session = svc
+                .store()
+                .get_agent_session_without_messages(&AgentId(id.to_string()))
+                .await
+                .expect("agent imported");
+            assert_eq!(session.workspace_id, ws, "{id} imported");
+        }
 
         // The workspace-owned checkout stays out of known_repo.
         assert_eq!(
@@ -4253,7 +4162,7 @@ mod tests {
         let staging = src.0.join("staging");
         let crate::transfer_git::TransferBundle {
             bundle_path, refs, ..
-        } = crate::transfer_git::create_transfer_bundle(&src_ws, &[], &staging).expect("bundle");
+        } = crate::transfer_git::create_transfer_bundle(&src_ws, &staging).expect("bundle");
 
         let m = manifest(&ws);
         let rows: Vec<(&str, Vec<serde_json::Value>)> =

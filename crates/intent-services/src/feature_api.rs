@@ -100,10 +100,10 @@ pub mod delivery_tasks {
 pub mod feature_ports {
     pub use crate::feature_ports::{
         monitor_id, wake_id, AgentWakePort, CancelSettlement, CommandScriptActivity,
-        MachineScriptLink, MachineSecretAnswer, MachineSecretOp, MachineSkills, MergeOutcome,
-        ProvisionOutcome, RemoteLaunchPort, RemoteRuntime, RemoteScriptCaller, RuntimePort,
-        ScriptFrameSender, ScriptsClosing, SetupScriptRun, TransferPort, UnavailableAgentWake,
-        UnavailableRemoteLaunch, IMPORT_MAX_CHUNK_BYTES,
+        MachineScriptLink, MachineSecretAnswer, MachineSecretOp, MachineSkills, RemoteLaunchPort,
+        RemoteRuntime, RemoteScriptCaller, RuntimePort, ScriptFrameSender, ScriptsClosing,
+        SetupScriptRun, TransferPort, UnavailableAgentWake, UnavailableRemoteLaunch,
+        IMPORT_MAX_CHUNK_BYTES,
     };
 }
 
@@ -157,8 +157,9 @@ pub mod events {
 /// Workspace file locations.
 pub mod file_ops {
     pub use crate::file_ops::{
-        check_attachment_dest, delete, list, mkdir, read, rename, resolve_attachment_source,
-        workspace_root, write, write_attachment_copy, AttachmentPieces,
+        check_attachment_dest, check_attachment_size, delete, list, mkdir, read, rename,
+        resolve_attachment_source, workspace_root, write, write_attachment_copy, AttachmentPieces,
+        ATTACHMENT_COPY_MAX_BYTES,
     };
 }
 

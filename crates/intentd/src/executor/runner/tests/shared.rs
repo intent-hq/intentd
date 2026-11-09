@@ -12,6 +12,7 @@ fn sharing(id: &str, owner: &str) -> LaunchCommand {
         checkout_of: Some(AgentId::from(owner)),
         forge: None,
         git_identity: None,
+        new_machine: None,
         ..launch(id)
     }
 }

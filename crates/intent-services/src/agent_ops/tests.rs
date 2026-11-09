@@ -10462,11 +10462,10 @@ const DETAIL_ONLY_METADATA_KEYS: &[&str] = &[
 
 /// Build the worst-case-realistic `agent.list` row for the budget /
 /// allowlist goldens: one session with every optional field populated (ids,
-/// model/effort, sandbox + attention + completion-report metadata, every
+/// model/effort, attention + completion-report metadata, every
 /// raw-metadata marker, stop reason, context references / file blocks,
 /// cached session stats), every preview string AND the attention reason
-/// over the preview cap, `name` / `model` over their 128-byte cap,
-/// `sandboxPath` / `sandboxBranch` over their 256-byte cap, an over-cap
+/// over the preview cap, `name` / `model` over their 128-byte cap, an over-cap
 /// `lastToolUse` input, two active hooks, two
 /// active PR monitors, a live context-usage report, an outgoing completion
 /// watch and a pending delete — then read back through the real list path
@@ -10484,8 +10483,7 @@ async fn worst_case_agent_list_row(
     ws: &WorkspaceId,
 ) -> (AgentId, intent_core::AgentLite) {
     use intent_core::{
-        AGENT_LIST_NAME_CAP_BYTES as NAME_CAP, AGENT_LIST_PATH_CAP_BYTES as PATH_CAP,
-        AGENT_LIST_PREVIEW_BUDGET_BYTES as BUDGET,
+        AGENT_LIST_NAME_CAP_BYTES as NAME_CAP, AGENT_LIST_PREVIEW_BUDGET_BYTES as BUDGET,
     };
     let parent = create_agent(svc, ws, "Parent").await;
     let child = create_agent(svc, ws, "Child").await;
@@ -10563,15 +10561,6 @@ async fn worst_case_agent_list_row(
     s.delegation_depth = Some(2);
     s.context_references = Some(json!([{ "type": "file", "path": "src/lib.rs" }]));
     s.file_blocks = Some(json!([{ "type": "file", "path": "docs/a.md", "size": 1200 }]));
-    s.sandbox_id = Some("sbx-01HZY8Q6W1V2K3M4N5P6R7S8T9".into());
-    s.sandbox_path = Some(format!(
-        "/home/user/intent/workspaces/agent-list/.sandboxes/sbx-01HZY8Q6/{}",
-        "p".repeat(PATH_CAP)
-    ));
-    s.sandbox_branch = Some(format!(
-        "sandbox/agent-list/sbx-01HZY8Q6W1V2K3M4N5P6R7S8T9/{}",
-        "b".repeat(PATH_CAP)
-    ));
     s.stop_reason = Some("end_turn".into());
     s.stop_reason_timestamp = Some(ts.clone());
     s.metadata = Some(json!({
@@ -10655,6 +10644,7 @@ async fn worst_case_agent_list_row(
         skills: None,
         shared_checkout_of: None,
         parent_work: None,
+        launched_on: None,
         cloud_start: Some(intent_core::machines::CloudStart {
             step: intent_core::machines::CloudStartStep::CreatingSandbox,
         }),
@@ -10811,13 +10801,12 @@ async fn agent_list_strips_detail_only_fields_get_keeps_them() {
 /// per-field byte table, so the field that blew the budget is named. Also
 /// pins the fixture as genuinely worst-case: every preview slot and the
 /// attention reason sit at the preview cap, `name` / `model` at the
-/// 128-byte cap, `sandboxPath` / `sandboxBranch` at the 256-byte cap, and
-/// both idle-visibility lists carry two entries.
+/// 128-byte cap, and both idle-visibility lists carry two entries.
 #[tokio::test]
 async fn agent_list_row_stays_within_row_budget() {
     use intent_core::{
         format_key_bytes_table, serialized_key_bytes, AGENT_LIST_NAME_CAP_BYTES,
-        AGENT_LIST_PATH_CAP_BYTES, AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
+        AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
     };
     let (_t, svc, ws) = setup().await;
     let svc = FakeRuntime::install(svc);
@@ -10852,14 +10841,6 @@ async fn agent_list_row_stays_within_row_budget() {
         Some(AGENT_LIST_NAME_CAP_BYTES)
     );
     assert_eq!(
-        row.metadata.sandbox_path.as_deref().map(str::len),
-        Some(AGENT_LIST_PATH_CAP_BYTES)
-    );
-    assert_eq!(
-        row.metadata.sandbox_branch.as_deref().map(str::len),
-        Some(AGENT_LIST_PATH_CAP_BYTES)
-    );
-    assert_eq!(
         row.last_tool_use.as_ref().unwrap()["inputTruncated"],
         json!(true)
     );
@@ -10876,7 +10857,6 @@ async fn agent_list_row_stays_within_row_budget() {
     assert!(row.context_usage.is_some());
     assert!(row.pending_delete_at.is_some());
     assert!(row.metadata.attention_request_kind.is_some());
-    assert!(row.metadata.sandbox_id.is_some());
 
     let wire = serde_json::to_value(&row).unwrap();
     let (total, per_key) = serialized_key_bytes(&wire);
@@ -39253,353 +39233,6 @@ async fn delete_clears_failure_wake_dedup_in_both_roles() {
     assert!(
         !svc.failure_wake_is_duplicate(&child, &other, "bang"),
         "parent-role entry swept"
-    );
-}
-
-// Exercise the real settlement SQL and cleanup, using pre-created clone artifacts.
-// Native filesystem clone support is deliberately outside this fixture.
-async fn assert_cow_provision_shutdown(target: u8) {
-    let tmp = TempDb::new();
-    let store = Store::open(&tmp.path).await.unwrap();
-    let ws = WorkspaceId::new();
-    store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let bus = EventBus::new(store.clone());
-    let svc = Services::new_with_file_secrets(
-        store.clone(),
-        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets")),
-    )
-    .with_settings_registry(test_registry_with_default_provider(&tmp))
-    .with_event_bus(bus.clone());
-    let aid = create_agent(&svc, &ws, "Provisioning").await;
-    let (_directory, path) = fake_provisioned_sandbox(&svc, &ws, &aid).await;
-    if target == 1 {
-        let mut session = store.get_agent_session_with_transcript(&aid).await.unwrap();
-        session.status = AgentStatus::Deleted;
-        store.update_agent_session(&ws, &session).await.unwrap();
-    } else if target == 2 {
-        store.delete_agent_session(&ws, &aid).await.unwrap();
-    }
-    let connection = store.write_pool().acquire().await.unwrap();
-    let owner = svc.clone();
-    let task_ws = ws.clone();
-    let task_aid = aid.clone();
-    let task_path = path.clone();
-    let (entered, entering) = tokio::sync::oneshot::channel();
-    let (done, finished) = tokio::sync::oneshot::channel();
-    assert!(svc.spawn_sandbox_provisioning(&aid, async move {
-        let mut entered = Some(entered);
-        let settlement = owner.settle_provisioned_sandbox(
-            &task_ws,
-            &task_aid,
-            task_path,
-            "sb/test".into(),
-            "abc123".into(),
-            None,
-        );
-        tokio::pin!(settlement);
-        std::future::poll_fn(|cx| {
-            let result = std::future::Future::poll(settlement.as_mut(), cx);
-            if result.is_pending() {
-                if let Some(entered) = entered.take() {
-                    let _ = entered.send(());
-                }
-            }
-            result
-        })
-        .await;
-        let _ = done.send(());
-    }));
-    timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(5)),
-        entering,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(svc.sandbox_provisioning.lock().unwrap().contains_key(&aid));
-    let (entered, entering) = tokio::sync::oneshot::channel();
-    *svc.secrets.writer_drain_pending.lock().unwrap() = Some(entered);
-    let owner = svc.clone();
-    let mut drain = intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
-    let pending = timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(5)),
-        async {
-            tokio::select! {
-                point = entering => { assert_eq!(point.unwrap(), "store-tasks"); true }
-                result = &mut drain => { result.unwrap(); false }
-            }
-        },
-    )
-    .await
-    .unwrap();
-    drop(connection);
-    timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(5)),
-        finished,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    if pending {
-        timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            drain,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    }
-    assert!(pending, "shutdown discarded admitted CoW settlement");
-    assert!(!svc.sandbox_provisioning.lock().unwrap().contains_key(&aid));
-    bus.shutdown().await.unwrap();
-    store.close().await;
-    let reopened = Store::open(&tmp.path).await.unwrap();
-    let sandbox = reopened.get_sandbox(&ws, &aid).await.unwrap();
-    let events = reopened
-        .query_events(&intent_store::EventQuery::default())
-        .await
-        .unwrap();
-    assert_eq!(path.exists(), target == 0);
-    assert_eq!(sandbox.is_some(), target == 0);
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.event_type == "sandbox:cow:created")
-            .count(),
-        usize::from(target == 0)
-    );
-    if target == 0 {
-        assert_eq!(
-            reopened
-                .get_agent_session_with_transcript(&aid)
-                .await
-                .unwrap()
-                .sandbox_path
-                .as_deref(),
-            path.to_str()
-        );
-    } else if target == 1 {
-        assert!(reopened
-            .get_agent_session_with_transcript(&aid)
-            .await
-            .unwrap()
-            .sandbox_path
-            .is_none());
-    }
-    reopened.close().await;
-}
-
-#[intent_test_macros::daemon_test]
-async fn cow_provision_live_settlement_survives_shutdown() {
-    assert_cow_provision_shutdown(0).await;
-}
-#[intent_test_macros::daemon_test]
-async fn cow_provision_deleted_cleanup_survives_shutdown() {
-    assert_cow_provision_shutdown(1).await;
-}
-#[intent_test_macros::daemon_test]
-async fn cow_provision_missing_cleanup_survives_shutdown() {
-    assert_cow_provision_shutdown(2).await;
-}
-
-#[intent_test_macros::daemon_test]
-async fn cow_provision_refusal_leaves_no_wait_gate() {
-    let tmp = TempDb::new();
-    let store = Store::open(&tmp.path).await.unwrap();
-    let svc = Services::new_with_file_secrets(
-        store.clone(),
-        intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets")),
-    );
-    svc.shutdown_store_writers().await;
-    let aid = AgentId::new();
-    let (effect, observed) = tokio::sync::oneshot::channel();
-    let admitted = svc.spawn_sandbox_provisioning(&aid, async move {
-        let _ = effect.send(());
-    });
-    assert!(
-        !admitted,
-        "new CoW provisioning escaped closed writer admission"
-    );
-    assert!(observed.await.is_err());
-    assert!(!svc.sandbox_provisioning.lock().unwrap().contains_key(&aid));
-    timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(1)),
-        svc.await_sandbox_provisioning(&aid),
-    )
-    .await
-    .unwrap();
-    store.close().await;
-}
-
-/// Simulate a completed `CoW` clone (on-disk dir + store record) for
-/// `settle_provisioned_sandbox` tests: the real `provision_sandbox` needs a
-/// CoW-capable filesystem, but settlement only needs the artifacts.
-async fn fake_provisioned_sandbox(
-    svc: &Services,
-    ws: &WorkspaceId,
-    aid: &AgentId,
-) -> (tempfile::TempDir, std::path::PathBuf) {
-    let guard = crate::test_support::test_tempdir("intentd-orphan-sandbox-");
-    let dir = guard.path().to_path_buf();
-    std::fs::write(dir.join("file.txt"), "x").expect("write sandbox file");
-    let sandbox = intent_store::Sandbox {
-        id: uuid::Uuid::new_v4().to_string(),
-        workspace_id: ws.clone(),
-        agent_id: aid.clone(),
-        path: dir.to_string_lossy().to_string(),
-        branch: format!("sb/{}", aid.0),
-        base_commit_sha: "abc123".to_string(),
-        snapshot_commit_sha: None,
-        status: intent_store::SandboxStatus::Created,
-        retry_count: 0,
-        created_at: now_iso(),
-        updated_at: now_iso(),
-    };
-    svc.store()
-        .insert_sandbox(&sandbox)
-        .await
-        .expect("insert sandbox record");
-    (guard, dir)
-}
-
-#[tokio::test]
-async fn settle_provisioned_sandbox_discards_when_session_missing() {
-    // agent.delete raced the background clone (monorepo#871): the hard
-    // delete cascades the sandbox row away (FK ON DELETE CASCADE), so by
-    // settlement time only the cloned directory remains — it must be
-    // removed and no sandbox:cow:created event fires.
-    let (_t, svc, ws, bus) = setup_with_bus().await;
-    let aid = create_agent(&svc, &ws, "Doomed").await;
-    let (_sandbox_dir, dir) = fake_provisioned_sandbox(&svc, &ws, &aid).await;
-    svc.store()
-        .delete_agent_session(&ws, &aid)
-        .await
-        .expect("hard delete session");
-
-    let mut sub = bus.subscribe(SubscriptionFilter {
-        event_types: vec!["sandbox:cow:created".to_string()],
-        ..Default::default()
-    });
-
-    svc.settle_provisioned_sandbox(
-        &ws,
-        &aid,
-        dir.clone(),
-        format!("sb/{}", aid.0),
-        "abc123".to_string(),
-        None,
-    )
-    .await;
-
-    assert!(!dir.exists(), "sandbox directory must be removed");
-    assert!(
-        svc.store()
-            .get_sandbox(&ws, &aid)
-            .await
-            .expect("get sandbox")
-            .is_none(),
-        "sandbox record must be removed"
-    );
-    let res = timeout(
-        intentd_test_support::test_timeout(Duration::from_millis(300)),
-        sub.recv(),
-    )
-    .await;
-    assert!(
-        res.is_err(),
-        "expected no sandbox:cow:created emit for a deleted agent"
-    );
-}
-
-#[tokio::test]
-async fn settle_provisioned_sandbox_discards_when_session_soft_deleted() {
-    // Same race, soft-delete flavor: the session row survives with
-    // status=deleted, so settlement must still discard rather than attach
-    // sandbox fields to a dead session.
-    let (_t, svc, ws) = setup().await;
-    let aid = create_agent(&svc, &ws, "Doomed").await;
-    let mut session = svc
-        .store()
-        .get_agent_session_with_transcript(&aid)
-        .await
-        .expect("agent session");
-    session.status = intent_core::AgentStatus::Deleted;
-    svc.store()
-        .update_agent_session(&ws, &session)
-        .await
-        .expect("flag deleted");
-    let (_sandbox_dir, dir) = fake_provisioned_sandbox(&svc, &ws, &aid).await;
-
-    svc.settle_provisioned_sandbox(
-        &ws,
-        &aid,
-        dir.clone(),
-        format!("sb/{}", aid.0),
-        "abc123".to_string(),
-        None,
-    )
-    .await;
-
-    assert!(!dir.exists(), "sandbox directory must be removed");
-    assert!(
-        svc.store()
-            .get_sandbox(&ws, &aid)
-            .await
-            .expect("get sandbox")
-            .is_none(),
-        "sandbox record must be removed"
-    );
-    let session = svc
-        .store()
-        .get_agent_session_with_transcript(&aid)
-        .await
-        .expect("agent session");
-    assert!(
-        session.sandbox_id.is_none() && session.sandbox_path.is_none(),
-        "soft-deleted session must not gain sandbox fields"
-    );
-}
-
-#[tokio::test]
-async fn settle_provisioned_sandbox_attaches_fields_for_live_session() {
-    // Control: with a live session, settlement persists the sandbox fields.
-    let (_t, svc, ws) = setup().await;
-    let aid = create_agent(&svc, &ws, "Live").await;
-    let (_sandbox_dir, dir) = fake_provisioned_sandbox(&svc, &ws, &aid).await;
-
-    svc.settle_provisioned_sandbox(
-        &ws,
-        &aid,
-        dir.clone(),
-        format!("sb/{}", aid.0),
-        "abc123".to_string(),
-        None,
-    )
-    .await;
-
-    assert!(dir.exists(), "sandbox directory must be kept");
-    assert!(
-        svc.store()
-            .get_sandbox(&ws, &aid)
-            .await
-            .expect("get sandbox")
-            .is_some(),
-        "sandbox record must be kept"
-    );
-    let session = svc
-        .store()
-        .get_agent_session_with_transcript(&aid)
-        .await
-        .expect("agent session");
-    assert_eq!(
-        session.sandbox_path.as_deref(),
-        Some(dir.to_string_lossy().as_ref()),
-        "live session gains the sandbox path"
-    );
-    assert_eq!(
-        session.sandbox_branch.as_deref(),
-        Some(format!("sb/{}", aid.0).as_str()),
-        "live session gains the sandbox branch"
     );
 }
 

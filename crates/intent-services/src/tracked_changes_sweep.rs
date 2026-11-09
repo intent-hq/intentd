@@ -24,8 +24,7 @@
 //! so a row re-recorded or committed after it was judged survives. Rows are
 //! listed before each status scan, so every listed row's file write is
 //! visible to that scan. Any scan failure deletes nothing; paths git cannot
-//! judge ([`PathState::Unknown`]) and rows of sandboxed (copy-on-write) agents — whose
-//! files live in the sandbox, not the worktree — are kept.
+//! judge ([`PathState::Unknown`]) are kept.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -89,14 +88,6 @@ impl Services {
         if !self.worktree_presence.observe_workspace(&ws, &worktree) {
             return Ok(PruneOutcome::default());
         }
-        let sandboxed: HashSet<String> = self
-            .store
-            .list_agent_session_summaries(workspace_id)
-            .await?
-            .into_iter()
-            .filter(|s| s.sandbox_path.is_some())
-            .map(|s| s.id.as_str().to_string())
-            .collect();
         // Listed before the scan starts — see the module docs.
         let rows: Vec<_> = self
             .store
@@ -104,7 +95,6 @@ impl Services {
             .await?
             .into_iter()
             .filter(|r| r.stage == "unstaged" || r.stage == "staged")
-            .filter(|r| r.agent_id.as_ref().is_none_or(|a| !sandboxed.contains(a)))
             .collect();
         if rows.is_empty() {
             return Ok(PruneOutcome::default());

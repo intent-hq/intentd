@@ -54,6 +54,9 @@ pub(crate) type Wake = Arc<
 /// Publishes `scriptMonitor:<kind>` with a monitor row.
 pub(crate) type MonitorChanged =
     Arc<dyn Fn(WorkspaceId, String, Value) -> BoxFuture<'static, ()> + Send + Sync>;
+/// Re-checks an agent's deferred completion once one of its monitors ended
+/// and any wake for it is queued.
+pub(crate) type MonitorEnded = Arc<dyn Fn(AgentId) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// How machine runs reach the rest of the daemon.
 pub(crate) struct Hooks {
@@ -61,6 +64,8 @@ pub(crate) struct Hooks {
     pub changed: Changed,
     pub wake: Wake,
     pub monitor: MonitorChanged,
+    /// A monitor ended: its owner may have nothing left to wait on.
+    pub ended: MonitorEnded,
     /// Wait before restarting a service that exited.
     pub restart_backoff: Duration,
     /// How long `stop` waits for the machine's acknowledgement.
@@ -264,6 +269,7 @@ impl MachineRuns {
     /// Publish `ended`'s terminal row, then wake its owner.
     async fn deliver(&self, place: &RunPlace, ended: Ended) {
         let metadata = ended.event.as_ref().map(card_metadata);
+        let monitor_ended = ended.event.is_some();
         if let Some(row) = ended.event {
             self.publish_monitor(place, row).await;
         }
@@ -275,6 +281,12 @@ impl MachineRuns {
                 metadata,
             )
             .await;
+        }
+        // After the wake is queued, so a watch it defers is not settled
+        // early. A wake that failed leaves the agent nothing to wait on, so
+        // its watch settles.
+        if monitor_ended {
+            (self.inner.hooks.ended)(place.agent_id.clone()).await;
         }
     }
 
@@ -1275,6 +1287,8 @@ impl MachineRuns {
             ended(place, run, &monitor, "cancelled", "unmonitored")
         };
         self.publish_monitor(place, row).await;
+        // A silent cancel wakes nobody: settle what it alone deferred.
+        (self.inner.hooks.ended)(place.agent_id.clone()).await;
         true
     }
 

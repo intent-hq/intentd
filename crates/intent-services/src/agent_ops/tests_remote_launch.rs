@@ -51,6 +51,7 @@ fn view(placement: &AgentPlacement) -> RemotePlacementView {
         skills: None,
         shared_checkout_of: None,
         parent_work: None,
+        launched_on: None,
         cloud_start: None,
     }
 }
@@ -458,22 +459,26 @@ async fn delegate_refuses_a_remote_placement_with_isolation() {
     let (_t, svc, ws) = setup().await;
     let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
     let remote = || Some(placement(json!({"target": "remote"})));
-    let cow = svc
-        .agent_delegate_op(
+    let delegate = |isolation: &str| {
+        svc.agent_delegate_op(
             ws.clone(),
             AgentDelegateInput {
                 placement: remote(),
-                isolation: Some("cow".into()),
+                isolation: Some(isolation.into()),
                 task_text: Some("Do it".into()),
                 ..Default::default()
             },
             None,
         )
-        .await;
+    };
+    let shared = delegate("shared").await;
     assert!(
-        matches!(&cow, Err(Error::InvalidParams(m)) if m.contains("cannot be combined")),
-        "{cow:?}"
+        matches!(&shared, Err(Error::InvalidParams(m)) if m.contains("cannot be combined")),
+        "{shared:?}"
     );
+    // The retired value is refused first, whatever the placement.
+    let cow = delegate("cow").await;
+    assert!(matches!(&cow, Err(Error::IsolationRemoved)), "{cow:?}");
 }
 
 #[tokio::test]
@@ -1219,14 +1224,14 @@ async fn a_batch_refuses_bad_placements_before_any_task_starts() {
     let first = seed_task(&svc, &ws, "First").await;
     let second = seed_task(&svc, &ws, "Second").await;
     let agents = agent_count(&svc).await;
-    let cow = || Some("cow".to_string());
+    let shared = || Some("shared".to_string());
 
     let cases = [
         (
             "batch remote + isolation",
             AgentDelegateInput {
                 placement: Some(placement(json!({"target": "remote"}))),
-                isolation: cow(),
+                isolation: shared(),
                 tasks: Some(vec![bare(&first), bare(&second)]),
                 ..Default::default()
             },
@@ -1236,7 +1241,7 @@ async fn a_batch_refuses_bad_placements_before_any_task_starts() {
             "entry remote + isolation",
             AgentDelegateInput {
                 placement: Some(placement(json!({"target": "local"}))),
-                isolation: cow(),
+                isolation: shared(),
                 tasks: Some(vec![
                     bare(&first),
                     entry(json!({"taskNoteId": second.0, "placement": {"target": "remote"}})),
@@ -1248,7 +1253,7 @@ async fn a_batch_refuses_bad_placements_before_any_task_starts() {
         (
             "inherited + isolation",
             AgentDelegateInput {
-                isolation: cow(),
+                isolation: shared(),
                 tasks: Some(vec![
                     entry(json!({"taskNoteId": first.0, "placement": {"target": "local"}})),
                     bare(&second),

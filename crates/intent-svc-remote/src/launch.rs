@@ -20,8 +20,8 @@ use intent_core::machine_selection::{
 use intent_core::machines::ExposedMachine;
 use intent_core::node_link::MachineCapabilities;
 use intent_core::node_link::{
-    FinalPush, ForgeLaunch, GitIdentity, LaunchCommand, LaunchProfileEnv, PreparedCheckout,
-    SetupCommand, SubmodulePin, MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL,
+    FinalPush, ForgeLaunch, GitIdentity, LaunchCommand, LaunchProfileEnv, MachineName,
+    PreparedCheckout, SetupCommand, SubmodulePin, MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL,
     SHARED_CHECKOUT_PROTOCOL,
 };
 use intent_core::placement::{
@@ -132,6 +132,77 @@ async fn link_protocol(node: &RemoteNode) -> Result<u32> {
         node.connect().await?;
     }
     Ok(node.shared_ref().protocol())
+}
+
+/// How long the backend waits for the machine's answer to one piece of a
+/// remote agent's checkout file.
+const CHECKOUT_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One piece of a file or folder in remote agent `agent_id`'s checkout, read
+/// on its machine (`checkoutRead`, nodeProtocol 16). The machine's protocol
+/// is checked first, from its live link or its last `welcome`; a paused
+/// cloud machine is resumed before the read.
+async fn read_machine_checkout(
+    svc: &Services,
+    agent_id: &AgentId,
+    read: intent_services::checkout_transfer::PieceRequest,
+) -> Result<intent_core::node_link::CheckoutPiece> {
+    use intent_core::node_link::{CheckoutReadOutcome, CHECKOUT_FILES_PROTOCOL};
+    let unavailable = |why: &str| {
+        Error::InvalidParams(format!(
+            "file-pull-source-unavailable: agent {agent_id}'s machine {why}; retry later"
+        ))
+    };
+    let feature = svc
+        .remote_feature()
+        .ok_or_else(|| unavailable("is not reachable from this backend"))?;
+    let record = svc
+        .store()
+        .get_remote_agent(agent_id)
+        .await?
+        .ok_or_else(|| unavailable("no longer runs the agent"))?;
+    let node = feature
+        .node(svc, &record.node_id)
+        .await
+        .map_err(|_| unavailable("is not reachable"))?;
+    if node.status().lease_id != record.lease_id {
+        return Err(unavailable("no longer runs the agent"));
+    }
+    let older = |protocol: u32| {
+        Error::InvalidParams(format!(
+            "file-pull-unsupported: the machine {} runs node-link protocol {protocol}, and pulls need {CHECKOUT_FILES_PROTOCOL}; update Intent there",
+            node.status().node_name
+        ))
+    };
+    let recorded = node.shared_ref().protocol();
+    if recorded != 0 && recorded < CHECKOUT_FILES_PROTOCOL {
+        return Err(older(recorded));
+    }
+    let protocol = link_protocol(&node)
+        .await
+        .map_err(|_| unavailable("is offline or did not resume"))?;
+    if protocol < CHECKOUT_FILES_PROTOCOL {
+        return Err(older(protocol));
+    }
+    let reply = node
+        .checkout_read(
+            intent_core::node_link::CheckoutRead {
+                request_id: intent_core::node_link::LinkId::new_v4(),
+                agent_id: agent_id.clone(),
+                path: read.path,
+                offset: read.offset,
+                length: read.length,
+                transfer_id: read.transfer_id,
+            },
+            CHECKOUT_READ_WAIT,
+        )
+        .await
+        .map_err(|_| unavailable("did not answer within 60 seconds"))?;
+    match (reply.outcome, reply.piece, reply.error) {
+        (CheckoutReadOutcome::Ok, Some(piece), _) => Ok(piece),
+        (_, _, Some(error)) if error.starts_with("file-pull-") => Err(Error::InvalidParams(error)),
+        _ => Err(unavailable("sent a malformed answer")),
+    }
 }
 
 /// What a remote agent's instructions say when its machine's link is older
@@ -580,6 +651,15 @@ impl RemoteLaunchPort for RemoteLaunch {
         Box::pin(help_text(svc))
     }
 
+    fn checkout_piece<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        read: intent_services::checkout_transfer::PieceRequest,
+    ) -> BoxFuture<'a, Result<intent_core::node_link::CheckoutPiece>> {
+        Box::pin(read_machine_checkout(svc, agent_id, read))
+    }
+
     fn mcp_servers_notice<'a>(
         &'a self,
         svc: &'a Services,
@@ -689,6 +769,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                 skills: None,
                 shared_checkout_of: None,
                 parent_work: None,
+                launched_on: None,
                 cloud_start: None,
             })
         })
@@ -794,7 +875,6 @@ impl RemoteLaunchPort for RemoteLaunch {
                 } else {
                     ParentWorkCopy::LastPush
                 },
-                seeded: false,
             }))
         })
     }
@@ -1102,6 +1182,12 @@ impl RemoteLaunchPort for RemoteLaunch {
             } else {
                 forge_launch(svc, &record.workspace_id).await
             };
+            // A first launch, or one on the machine of the last, says nothing.
+            let new_machine = view
+                .launched_on
+                .as_deref()
+                .is_some_and(|last| last != record.node_id)
+                .then(|| Box::new(MachineName(status.node_name.clone())));
             let runtime = node
                 .launch(LaunchCommand {
                     agent_id: agent_id.clone(),
@@ -1119,6 +1205,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     checkout_of,
                     forge,
                     git_identity,
+                    new_machine,
                 })
                 .await?;
             Ok(runtime as Arc<RemoteRuntime>)

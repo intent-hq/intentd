@@ -3744,36 +3744,6 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `sandbox.cow.merge`: manually trigger merge-back for a sandboxed agent (PROTOCOL §5.34).
-    /// Returns `{ ok, status, ... }` with merge outcome (merged | conflict | blocked | `merge_pending`).
-    fn sandbox_merge(
-        &self,
-        workspace_id: WorkspaceId,
-        sandbox_id: AgentId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, sandbox_id);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::sandbox_merge not implemented".to_string(),
-            ))
-        })
-    }
-
-    /// `sandbox.cow.discard`: manually discard a sandbox (PROTOCOL §5.34).
-    /// Returns `{ ok }`.
-    fn sandbox_discard(
-        &self,
-        workspace_id: WorkspaceId,
-        sandbox_id: AgentId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, sandbox_id);
-        Box::pin(async {
-            Err(Error::Internal(
-                "WorkspaceApi::sandbox_discard not implemented".to_string(),
-            ))
-        })
-    }
-
     /// `comment.add`: text-anchored comment via searchContext + commentTarget (§5.3).
     ///
     /// `author_type` is the optional wire `authorType` (`"user"` | `"agent"`);
@@ -8766,7 +8736,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `file.read`: the file's UTF-8 contents as a **bare JSON string** (not an
     /// object), per the TS `ws.file.read` builder (PROTOCOL §5.10).
-    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` identifies the calling agent (it works in the workspace checkout).
     /// `git_root_id` selects a registered root owned by this workspace instead.
     fn file_read(
         &self,
@@ -8788,7 +8758,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// counterpart of the UTF-8-only `file.read` (PROTOCOL §5.9;
     /// monorepo#2458). `length` is capped at 16 MiB decoded (over-cap →
     /// `Error::InvalidParams`); a read at/past EOF returns an empty chunk.
-    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` identifies the calling agent (it works in the workspace checkout).
     /// `git_root_id` selects a registered root owned by this workspace instead.
     fn file_read_chunk(
         &self,
@@ -8817,7 +8787,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `file.write`: create/overwrite a file (parent dirs created); returns
     /// `{ ok: true, path, size }` where `size` is the content byte/char length
     /// (PROTOCOL §5.10).
-    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` identifies the calling agent (it works in the workspace checkout).
     fn file_write(
         &self,
         workspace_id: WorkspaceId,
@@ -8836,7 +8806,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `file.list`: directory entries as a **bare array** of
     /// `{ name, type }` (`type` = `"file"`/`"directory"`); `path` defaults to
     /// `"."` (PROTOCOL §5.10).
-    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` identifies the calling agent (it works in the workspace checkout).
     fn file_list(
         &self,
         workspace_id: WorkspaceId,
@@ -8853,7 +8823,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `file.delete`: remove a single file (rejects directories); returns
     /// `{ ok: true, path, deleted: true }` (PROTOCOL §5.10).
-    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` identifies the calling agent (it works in the workspace checkout).
     fn file_delete(
         &self,
         workspace_id: WorkspaceId,
@@ -8871,7 +8841,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `file.mkdir`: create a directory (recursive); returns
     /// `{ ok: true, path, created: true }`, or `{ ok: true, path, existed: true }`
     /// when the directory already exists (PROTOCOL §5.10).
-    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` identifies the calling agent (it works in the workspace checkout).
     fn file_mkdir(
         &self,
         workspace_id: WorkspaceId,
@@ -8889,7 +8859,7 @@ pub trait WorkspaceApi: Send + Sync {
     /// `file.rename`: move a file/directory (destination must not exist);
     /// returns `{ ok: true, oldPath, newPath, renamed: true, isDirectory }`
     /// (PROTOCOL §5.10).
-    /// `caller_agent_id` enables `CoW` sandbox containment (prefers sandbox path).
+    /// `caller_agent_id` identifies the calling agent (it works in the workspace checkout).
     fn file_rename(
         &self,
         workspace_id: WorkspaceId,
@@ -9129,9 +9099,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// MCP `ws.file.getAttachment` backing op: copy a registered attachment
     /// from the CANONICAL workspace store into the calling agent's own
-    /// working directory (the canonical checkout for shared-mode agents, the
-    /// sandbox clone for CoW-sandboxed agents — resolved from the caller's
-    /// session like other sandbox-aware bindings) under the git-ignored
+    /// working directory (the workspace checkout) under the git-ignored
     /// `.intent/attachments/` directory, and return `{ path, fileName,
     /// mimeType?, size, uploadedAt }` with `path` relative to that working
     /// directory. The copy is skipped when an identical file is already
@@ -9151,6 +9119,29 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::file_get_attachment not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// MCP `ws.file.pull` backing op: copy `path` (a file or folder) from
+    /// the checkout of `from_agent_id`, another agent of the same workspace,
+    /// into the caller's checkout at `to` (default: the same relative path),
+    /// and return `{ path, kind, size, sha256, files, skipped }`. Both paths
+    /// are confined to their checkout after links are followed; at most
+    /// `remote_launch::workspace_api::MAX_PULL_BYTES` are copied. Failures
+    /// are `InvalidParams` whose message starts with a `file-pull-*` code.
+    fn file_pull(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+        from_agent_id: AgentId,
+        path: String,
+        to: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, caller_agent_id, from_agent_id, path, to);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::file_pull not implemented".to_string(),
             ))
         })
     }

@@ -80,6 +80,7 @@ impl RemoteLaunchPort for FakeRemote {
                 skills: None,
                 shared_checkout_of: None,
                 parent_work: None,
+                launched_on: None,
                 cloud_start: None,
             })
         })

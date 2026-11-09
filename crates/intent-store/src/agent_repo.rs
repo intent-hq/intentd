@@ -47,7 +47,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, \
     completion_report_timestamp, attention_request_kind, attention_request_reason, \
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
-    file_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, \
+    file_blocks, is_background, metadata, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled, harness_version, \
     harness_features, retired_at, notifications_muted, pinned";
 
@@ -60,8 +60,8 @@ pub(crate) const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_sess
     name_explicitly_set, model, provider, status, is_active, created_at, updated_at, parent_agent_id, \
     specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, \
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
-    context_references, file_blocks, is_background, metadata, sandbox_id, \
-    sandbox_path, sandbox_branch, stop_reason, stop_reason_timestamp, reasoning_effort, \
+    context_references, file_blocks, is_background, metadata, \
+    stop_reason, stop_reason_timestamp, reasoning_effort, \
     effort_levels, harness_version, harness_features, retired_at, notifications_muted, pinned";
 
 /// Aggregate SQL behind [`Store::get_agent_session_message_stats`], extracted
@@ -1116,9 +1116,6 @@ fn bind_session_insert<'q>(
         .bind(json_col_to_db(s.file_blocks.as_ref())?)
         .bind(i64::from(s.is_background))
         .bind(encode_metadata(s.metadata.as_ref())?)
-        .bind(&s.sandbox_id)
-        .bind(&s.sandbox_path)
-        .bind(&s.sandbox_branch)
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
         .bind(&s.reasoning_effort)
@@ -1214,7 +1211,7 @@ impl Store {
         };
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         let query = bind_session_insert(
             sqlx::query(sqlx::AssertSqlSafe(sql.as_str())),
@@ -1297,12 +1294,16 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
-            bind_session_insert(sqlx::query(sqlx::AssertSqlSafe(session_sql.as_str())), s, false)?
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
+            bind_session_insert(
+                sqlx::query(sqlx::AssertSqlSafe(session_sql.as_str())),
+                s,
+                false,
+            )?
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("insert agent session failed: {e}")))?;
             let (import_model, _) = normalize_compound_model(s.model.clone(), s.provider.clone());
             let import_model = import_model.unwrap_or_else(|| "unknown".to_string());
             let insert_sql = format!(
@@ -3074,7 +3075,7 @@ impl Store {
         // mismatch → NotFound, provider immutable, acp_session_id write-once
         // (§9.5).
         let row = sqlx::query(
-            "SELECT workspace_id, model, provider, acp_session_id, backend_session_id, parent_agent_id, sandbox_id, sandbox_path, sandbox_branch, status FROM agent_session WHERE id = ?",
+            "SELECT workspace_id, model, provider, acp_session_id, backend_session_id, parent_agent_id, status FROM agent_session WHERE id = ?",
         )
         .bind(&s.id.0)
         .fetch_optional(self.read_pool())
@@ -3142,9 +3143,6 @@ impl Store {
                 != s.backend_session_id.as_ref().map(AgentId::as_str)
             || row.get::<Option<String>, _>("parent_agent_id").as_deref()
                 != s.parent_agent_id.as_ref().map(AgentId::as_str)
-            || row.get::<Option<String>, _>("sandbox_id") != s.sandbox_id
-            || row.get::<Option<String>, _>("sandbox_path") != s.sandbox_path
-            || row.get::<Option<String>, _>("sandbox_branch") != s.sandbox_branch
             || (row.get::<String, _>("status") == "deleted") != (s.status == AgentStatus::Deleted);
         if binding_changed {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(s.id.clone())])?;
@@ -3185,7 +3183,6 @@ impl Store {
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, file_blocks=?, \
              is_background=?, metadata={metadata_sql}, \
-             sandbox_id=?, sandbox_path=?, sandbox_branch=?, \
              stop_reason=?, stop_reason_timestamp=?, \
              reasoning_effort_auto=CASE WHEN ? THEN 0 WHEN reasoning_effort IS ? \
                  THEN reasoning_effort_auto ELSE 0 END, \
@@ -3223,9 +3220,6 @@ impl Store {
             .bind(&s.provider)
             .bind(&metadata_raw)
             .bind(&metadata_raw)
-            .bind(&s.sandbox_id)
-            .bind(&s.sandbox_path)
-            .bind(&s.sandbox_branch)
             .bind(&s.stop_reason)
             .bind(&s.stop_reason_timestamp)
             // An explicit effort write, or any effort change, clears the daemon's
@@ -5197,9 +5191,6 @@ fn map_session_row_with_heavy_cols(
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
-        sandbox_id: col(row, "sandbox_id")?,
-        sandbox_path: col(row, "sandbox_path")?,
-        sandbox_branch: col(row, "sandbox_branch")?,
     })
 }
 
@@ -9375,9 +9366,6 @@ mod tests {
             file_blocks: None,
             is_background: false,
             metadata: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -9461,9 +9449,6 @@ mod tests {
             file_blocks: None,
             is_background: false,
             metadata: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -10201,9 +10186,6 @@ mod tests {
             file_blocks: None,
             is_background: false,
             metadata: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -14162,9 +14144,6 @@ mod tests {
             file_blocks: None,
             is_background: false,
             metadata: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -14315,9 +14294,6 @@ mod tests {
             file_blocks: None,
             is_background: false,
             metadata: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -15780,9 +15756,6 @@ mod tests {
                 file_blocks: None,
                 is_background: false,
                 metadata: None,
-                sandbox_id: None,
-                sandbox_path: None,
-                sandbox_branch: None,
                 stop_reason: None,
                 stop_reason_timestamp: None,
                 session_corrupted: false,
@@ -20662,9 +20635,6 @@ mod tests {
             harness_features: None,
             created_at: ts.clone(),
             updated_at: ts,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
         }
     }
 

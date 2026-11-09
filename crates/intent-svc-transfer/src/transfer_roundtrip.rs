@@ -14,7 +14,7 @@ use intent_core::{
     HookState, Note, NoteId, PrMonitor, PrMonitorId, PrMonitorState, Script, ScriptMode,
     WorkspaceId, WorkspaceStatus,
 };
-use intent_store::{AgentQueueRow, PersistedEventSubscription, Sandbox, SandboxStatus, Store};
+use intent_store::{AgentQueueRow, PersistedEventSubscription, Store};
 
 use crate::transfer::TransferPlanExt;
 use crate::transfer::TransferStateExt;
@@ -443,9 +443,6 @@ fn session(agent_id: &AgentId, ws: &WorkspaceId, status: AgentStatus) -> AgentSe
         is_background: false,
         metadata: None,
         stats: None,
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -792,24 +789,6 @@ async fn seed_source(
         .await
         .expect("script");
 
-    // Sandbox row for the clone above.
-    svc.store()
-        .insert_sandbox(&Sandbox {
-            id: "sb-rt".to_string(),
-            workspace_id: id.clone(),
-            agent_id: sb_agent.clone(),
-            path: sandbox.to_string_lossy().into_owned(),
-            branch: sb_branch,
-            base_commit_sha: main_tip.clone(),
-            snapshot_commit_sha: None,
-            status: SandboxStatus::Created,
-            retry_count: 0,
-            created_at: t.clone(),
-            updated_at: t.clone(),
-        })
-        .await
-        .expect("sandbox");
-
     // Draft (FKs onto client; dropped by the import transform).
     let client = ClientId::from("client-rt");
     svc.store()
@@ -1061,7 +1040,8 @@ exit 91
 /// finalize on the source. Asserts the plan's size estimate is a sane
 /// predictor of the actual archive, the target's per-table row counts
 /// (events zero, drafts dropped), path rewrites, nulled ACP session ids,
-/// interrupted-agent capture, git worktree + sandbox dirty state, the
+/// interrupted-agent capture, git worktree dirty state (a legacy sandbox
+/// stays on the source, untouched), the
 /// rehydration counts, and the finalized (archived) source.
 #[intent_test_macros::daemon_test]
 async fn transfer_round_trip_between_two_stacks() {
@@ -1142,11 +1122,10 @@ async fn transfer_round_trip_between_two_stacks() {
         .expect("plan");
     assert!(plan.manifest.git.has_repository);
     assert_eq!(plan.manifest.git.branch.as_deref(), Some("main"));
-    assert!(plan
-        .manifest
-        .git
-        .sandbox_branches
-        .contains(&format!("sb/{AGENT_SB}")));
+    assert!(
+        plan.manifest.git.sandbox_branches.is_empty(),
+        "the legacy sandbox branch is not bundled"
+    );
     assert!(!plan.manifest.git.dirty_files.is_empty());
     let plan_rows = |n: &str| {
         plan.manifest
@@ -1158,6 +1137,11 @@ async fn transfer_round_trip_between_two_stacks() {
     assert_eq!(plan_rows("agent_session"), 3);
     assert_eq!(plan_rows("agent_message"), 3);
     assert_eq!(plan_rows("agent_queue"), 1);
+    assert_eq!(
+        plan_rows("sandbox"),
+        -1,
+        "the sandbox table is not exported"
+    );
     assert!(plan.total_size_bytes > 0);
 
     // ---- export (source) --------------------------------------------------
@@ -1209,7 +1193,6 @@ async fn transfer_round_trip_between_two_stacks() {
     assert_eq!(rows("event_subscription"), 1);
     assert_eq!(rows("pr_monitor"), 1);
     assert_eq!(rows("script"), 1);
-    assert_eq!(rows("sandbox"), 1);
     assert_eq!(rows("draft"), 0, "drafts never transfer");
     // Event history stays on the source.
     let events = target
@@ -1335,21 +1318,9 @@ async fn transfer_round_trip_between_two_stacks() {
         "dirty.txt untracked again"
     );
 
-    // Sandbox: row rewritten, clone materialized with its commit + dirty file.
-    let sandboxes = target.store().list_sandboxes(&id).await.expect("sandboxes");
-    assert_eq!(sandboxes.len(), 1);
-    let expected_sb = dst_ws_root
-        .0
-        .join(&id.0)
-        .join("sandboxes")
-        .join(AGENT_SB)
-        .join("test-repo");
-    assert_eq!(sandboxes[0].path, expected_sb.to_string_lossy());
-    assert_eq!(repo_head(&expected_sb), seeded.sandbox_tip);
-    assert_eq!(
-        std::fs::read_to_string(expected_sb.join("sb-dirty.txt")).unwrap(),
-        "sandbox wip\n"
-    );
+    // A leftover sandbox folder under the source workspace dir is not
+    // transferred.
+    assert!(!dst_ws_root.0.join(&id.0).join("sandboxes").exists());
 
     // Script cwd re-rooted under the target workspace dir.
     let scripts = target.store().list_all_scripts().await.expect("scripts");

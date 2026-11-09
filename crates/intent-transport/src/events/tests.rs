@@ -1173,7 +1173,7 @@ mod emit_path_taxonomy {
     /// left off `ALL_EVENT_TYPES` (owner-only by default-deny; see the core
     /// golden's `collaborator_predicate_is_default_deny`). Adding a new
     /// entry here is the wrong fix for a new emit — add it to the taxonomy.
-    const PRE_TAXONOMY_EMITS: &[&str] = &["sandbox:cow:created", "sandbox:cow:merged"];
+    const PRE_TAXONOMY_EMITS: &[&str] = &[];
 
     /// Production literals that have the `ns:name` shape but are not event
     /// types (each listed with the file that carries it). Frozen: a new

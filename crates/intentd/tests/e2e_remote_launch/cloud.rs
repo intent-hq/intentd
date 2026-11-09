@@ -31,6 +31,8 @@ const E2B_KEY: &str = "e2b_test_key_0123456789abcdef0123456789abcdef";
 /// and deleted only with this key.
 const E2B_KEY_2: &str = "e2b_test_key_second_project_fedcba9876543210";
 const PROFILE_SECRET: &str = "sk-cloud-profile-secret-7f3a91";
+/// The words of the notice a relaunch on another machine starts with.
+const NOTICE: &str = "on a new machine";
 
 /// One fake sandbox: its directory, envd token and environment.
 struct FakeSandbox {
@@ -2198,6 +2200,169 @@ async fn a_paused_sandbox_that_cannot_link_after_an_update_is_deleted() {
     .await;
     reply_containing(&mut rpc_ws, agent, "after the update", 201).await;
     machine_until(&mut rpc_ws, 300, "sbx2", |m| m.is_some()).await;
+    assert_no_secret_logged(&head_dir, &fake);
+}
+
+/// What the agent echoes of its prompt after `content`, once it replied.
+async fn echoed(rpc_ws: &mut common::TlsWs, agent: (&str, &str), content: &str, id: i64) -> String {
+    ok(
+        rpc_ws,
+        id,
+        "agent.sendMessage",
+        json!({ "workspaceId": agent.0, "agentId": agent.1, "content": content }),
+    )
+    .await;
+    reply_containing(rpc_ws, agent, content, id + 1).await
+}
+
+/// Retire `agent` and wait until its sandbox `sandbox` is gone, then
+/// restore it.
+async fn retire_and_restore(
+    rpc_ws: &mut common::TlsWs,
+    agent: (&str, &str),
+    sandbox: &str,
+    id: i64,
+) {
+    let params = json!({ "workspaceId": agent.0, "agentId": agent.1 });
+    ok(rpc_ws, id, "agent.retire", params.clone()).await;
+    machine_until(rpc_ws, id + 1, sandbox, |m| m.is_none()).await;
+    ok(rpc_ws, id + 500, "agent.restore", params).await;
+}
+
+/// A remote agent relaunched on another machine than its last run is told
+/// so on its first turn there, in one notice that names the machine and
+/// also carries the unapplied-work notice. Its first launch, a resume of
+/// the same paused sandbox and its later turns get none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restored_agent_is_told_it_runs_on_a_new_machine() {
+    let Some(CloudBackend {
+        scratch,
+        repo,
+        fake,
+        head_dir,
+        head: _head,
+        port: _,
+        cfg: _,
+        ws_id,
+        keyed_ref,
+        mut rpc_ws,
+    }) = CloudBackend::start("itd-e2bn-", &[]).await
+    else {
+        return;
+    };
+    let created = ok(
+        &mut rpc_ws,
+        5,
+        "agent.create",
+        json!({
+            "workspaceId": ws_id, "name": "Mover", "model": "default", "provider": keyed_ref,
+            "placement": { "target": "e2b" },
+        }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"].as_str().unwrap().to_owned();
+    let agent = (ws_id.as_str(), agent_id.as_str());
+    ok(
+        &mut rpc_ws,
+        6,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Keeper", "model": "default", "provider": keyed_ref }),
+    )
+    .await;
+
+    // The first launch: no notice.
+    let first = echoed(&mut rpc_ws, agent, "first launch", 10).await;
+    assert!(!first.contains(NOTICE), "{first}");
+    let machine = machine_until(&mut rpc_ws, 20, "sbx1", |m| m.is_some())
+        .await
+        .unwrap();
+
+    // The same sandbox, paused and resumed: no notice.
+    let paused = ok(
+        &mut rpc_ws,
+        30,
+        "cloudMachines.pause",
+        json!({ "machineId": machine["id"] }),
+    )
+    .await;
+    assert_eq!(paused["machine"]["cloud"]["state"], "paused", "{paused}");
+    let resumed = echoed(&mut rpc_ws, agent, "after the pause", 40).await;
+    assert!(!resumed.contains(NOTICE), "{resumed}");
+
+    // Retired then restored: a new sandbox, one notice naming it.
+    retire_and_restore(&mut rpc_ws, agent, "sbx1", 100).await;
+    let moved = echoed(&mut rpc_ws, agent, "after restore one", 700).await;
+    let second = machine_until(&mut rpc_ws, 710, "sbx2", |m| m.is_some())
+        .await
+        .unwrap();
+    let name = second["name"].as_str().unwrap();
+    assert!(
+        moved.contains(&format!("You're {NOTICE} ({name})")),
+        "{moved}"
+    );
+    assert!(moved.contains("Re-run any setup you need"), "{moved}");
+    assert_eq!(moved.matches("Note from Intent").count(), 1, "{moved}");
+    let later = echoed(&mut rpc_ws, agent, "a later turn", 800).await;
+    assert!(!later.contains(NOTICE), "{later}");
+
+    // Saved work that does not apply on the new machine: still one notice,
+    // which names the new machine and where the work is kept.
+    retire_and_restore(&mut rpc_ws, agent, "sbx2", 900).await;
+    let refs = format!("refs/intent/ws/{ws_id}/agents/{agent_id}");
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    let scratch_tree = scratch.path().join("conflict");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            scratch_tree.to_str().unwrap(),
+            &base,
+        ],
+    );
+    let commit = |text: &str| {
+        git(&scratch_tree, &["checkout", "--quiet", "--detach", &base]);
+        std::fs::write(scratch_tree.join("README.md"), text).unwrap();
+        git(&scratch_tree, &["commit", "--quiet", "-am", text]);
+        git(&scratch_tree, &["rev-parse", "HEAD"])
+    };
+    let wip = commit("wip\n");
+    let saved_head = commit("head\n");
+    git(&repo, &["update-ref", &format!("{refs}/wip"), &wip]);
+    git(&repo, &["update-ref", &format!("{refs}/head"), &saved_head]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            scratch_tree.to_str().unwrap(),
+        ],
+    );
+    let combined = echoed(&mut rpc_ws, agent, "after restore two", 1600).await;
+    let third = machine_until(&mut rpc_ws, 1610, "sbx3", |m| m.is_some())
+        .await
+        .unwrap();
+    let name = third["name"].as_str().unwrap();
+    assert!(
+        combined.contains(&format!("You're {NOTICE} ({name})")),
+        "{combined}"
+    );
+    assert!(
+        combined.contains(&format!("{refs}/unapplied/{wip}")),
+        "{combined}"
+    );
+    assert_eq!(
+        combined.matches("Note from Intent").count(),
+        1,
+        "{combined}"
+    );
+    assert_eq!(
+        try_rev(&repo, &format!("{refs}/unapplied/{wip}")),
+        Some(wip)
+    );
     assert_no_secret_logged(&head_dir, &fake);
 }
 

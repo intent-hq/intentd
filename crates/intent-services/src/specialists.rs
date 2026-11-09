@@ -216,7 +216,7 @@ pub(crate) const EMBEDDED_BUNDLED_V2_5: &[(&str, &str)] = &[
 /// default — the LATEST version's set (the file tiers above it are
 /// user-owned and unversioned). Session-scoped resolution swaps in the
 /// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
-const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V3_8;
+const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V3_9;
 
 pub(crate) const EMBEDDED_BUNDLED_V3_1: &[(&str, &str)] = &[
     (
@@ -246,6 +246,21 @@ pub(crate) const EMBEDDED_BUNDLED_V3_8: &[(&str, &str)] = &[
     EMBEDDED_BUNDLED_V3_1[4],
     EMBEDDED_BUNDLED_V3_1[6],
     EMBEDDED_BUNDLED_V3_1[8],
+];
+
+/// The v3.9 embedded specialist bundle: the v3.8 set plus the Product Manager, which
+/// writes a critiqued spec and hands it to a Developer.
+pub(crate) const EMBEDDED_BUNDLED_V3_9: &[(&str, &str)] = &[
+    EMBEDDED_BUNDLED_V3_8[0],
+    EMBEDDED_BUNDLED_V3_8[1],
+    EMBEDDED_BUNDLED_V3_8[2],
+    EMBEDDED_BUNDLED_V3_8[3],
+    EMBEDDED_BUNDLED_V3_8[4],
+    EMBEDDED_BUNDLED_V3_8[5],
+    (
+        "product-manager",
+        include_str!("../resources/specialists/v3.9/product-manager.md"),
+    ),
 ];
 
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
@@ -2953,13 +2968,14 @@ mod tests {
         assert!(svc.resolve_role_reminder("blank", None).is_none());
     }
 
-    const LATEST_EMBEDDED_IDS: [&str; 6] = [
+    const LATEST_EMBEDDED_IDS: [&str; 7] = [
         "developer",
         "chief-of-staff",
         "ralph",
         "ui-designer",
         "pr-reviewer",
         "vulnerability-scanner",
+        "product-manager",
     ];
 
     #[test]

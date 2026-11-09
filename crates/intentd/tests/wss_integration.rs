@@ -3548,9 +3548,6 @@ async fn wss_workspace_list_slims_token_usage_and_archived_agent_summary() {
         metadata: None,
         messages: vec![],
         stats: None,
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -7806,9 +7803,6 @@ async fn wss_presence_typing_sources_and_snapshot() {
             metadata: None,
             messages: vec![],
             stats: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
             stop_reason: None,
             stop_reason_timestamp: None,
             session_corrupted: false,
@@ -19897,9 +19891,6 @@ async fn wss_search_messages_fts_global_scope_and_prefer_boost() {
         metadata: None,
         messages: vec![],
         stats: None,
-        sandbox_id: None,
-        sandbox_path: None,
-        sandbox_branch: None,
         stop_reason: None,
         stop_reason_timestamp: None,
         session_corrupted: false,
@@ -22096,7 +22087,7 @@ async fn wss_workspace_import_commit_materializes_git() {
     let staging = src.path().join("staging");
     let intent_app::transfer::transfer_git::TransferBundle {
         bundle_path, refs, ..
-    } = intent_app::transfer::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
+    } = intent_app::transfer::transfer_git::create_transfer_bundle(&src_ws, &staging)
         .expect("bundle");
     assert!(
         refs.workspace_wip_commit_sha.is_some(),

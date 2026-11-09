@@ -319,14 +319,12 @@ async fn real_agent_retire_restore_delete_recreate_and_acp_aba() {
 async fn full_row_execution_binding_edits_retire_but_idle_transitions_do_not() {
     let f = Fixture::new().await;
     let mut agent = f.agent.clone();
-    for change in 0..5 {
+    for change in 0..2 {
         let old = f.probe.capture(vec![f.agent_key()]).unwrap();
-        match change {
-            0 => agent.backend_session_id = Some(AgentId::new()),
-            1 => agent.parent_agent_id = Some(AgentId::new()),
-            2 => agent.sandbox_id = Some("sandbox".into()),
-            3 => agent.sandbox_path = Some("root".into()),
-            _ => agent.sandbox_branch = Some("other".into()),
+        if change == 0 {
+            agent.backend_session_id = Some(AgentId::new());
+        } else {
+            agent.parent_agent_id = Some(AgentId::new());
         }
         f.store
             .update_agent_session(&f.workspace.id, &agent)

@@ -56,6 +56,23 @@ pub const MAX_LINK_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
 pub const MAX_LINK_ATTACHMENT_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The frame method the node forwards (never from agent code: the table
+/// refuses it there) for one piece of a file or folder another agent of the
+/// workspace has in its checkout, for `ws.file.pull`, which runs on the
+/// node. Args `{ fromAgentId, path, offset, length, transferId? }` (every
+/// piece after offset 0 names the first answer's `transferId`); head
+/// answers a `node_link::CheckoutPiece` of at most
+/// [`MAX_LINK_ATTACHMENT_CHUNK_BYTES`], or fails with `-32602` and a
+/// `file-pull-*` code. An older backend refuses the frame as unsupported.
+pub const PULL_DATA_METHOD: &str = "file.pullData";
+
+/// Most bytes one `ws.file.pull` copies: the file's size, or the packed
+/// folder's.
+pub const MAX_PULL_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Most entries one `ws.file.pull` of a folder packs.
+pub const MAX_PULL_ENTRIES: u64 = 100_000;
+
+/// The frame method the node forwards (never from agent code: the table
 /// refuses it there) for a provider's `tools/list` on one of the user MCP
 /// servers proxied to head (nodeProtocol 11). Args `{ "serverId" }`; head
 /// answers the server's raw MCP result.
@@ -82,6 +99,7 @@ pub const INTERNAL_METHODS: &[&str] = &[
     ATTACHMENTS_METHOD,
     PLACEMENT_HELP_METHOD,
     ATTACHMENT_DATA_METHOD,
+    PULL_DATA_METHOD,
     MCP_PROXY_LIST_TOOLS_METHOD,
     MCP_PROXY_CALL_TOOL_METHOD,
 ];
@@ -125,6 +143,7 @@ pub const LOCAL_METHODS: &[&str] = &[
     "file.mkdir",
     "file.rename",
     "file.getAttachment",
+    "file.pull",
     "git.commit",
     "host.exec",
     "workspace.info",
@@ -279,6 +298,7 @@ mod tests {
             "file.mkdir",
             "file.rename",
             "file.getAttachment",
+            "file.pull",
             "git.commit",
             "host.exec",
             "help.index",
@@ -401,6 +421,7 @@ mod tests {
             COMMIT_POLICY_METHOD,
             ATTACHMENTS_METHOD,
             PLACEMENT_HELP_METHOD,
+            PULL_DATA_METHOD,
             MCP_PROXY_LIST_TOOLS_METHOD,
             MCP_PROXY_CALL_TOOL_METHOD,
         ] {

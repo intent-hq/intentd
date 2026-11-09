@@ -6979,9 +6979,6 @@ impl Services {
             harness_features: Some(harness_features),
             created_at: now.clone(),
             updated_at: now,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
         };
         // The legacy per-session taskGraph pin (0095) keeps being written for
         // fallback reads; its value equals the snapshot's `taskGraph`.
@@ -7372,6 +7369,8 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
         original_claim: Option<crate::delete_grace::PendingDeleteClaim>,
     ) -> Result<Value> {
+        // Its checkout serves no more pulls.
+        self.forget_pulls_of(&agent_id);
         #[cfg(all(test, unix))]
         let _completion = self
             .pending_delete_test_gate
@@ -13190,6 +13189,13 @@ impl Services {
                 name
             }
         }
+        // Per-agent CoW sandboxes are retired (protocol 16, `methods/nodes.md`
+        // "Errors and retirement gates"): an explicit `isolation: "cow"` is
+        // refused before any side effect, on both the single and the batch
+        // form. `"direct"` / `"shared"` stay accepted as no-ops.
+        if input.isolation.as_deref() == Some("cow") {
+            return Err(Error::IsolationRemoved);
+        }
         // `greedy` was a batch-level conflict override; it is REMOVED. Any
         // supplied value — `true`, `false`, or an explicit `null` — rejects
         // on BOTH forms (the check sits before the batch routing so a
@@ -13249,7 +13255,7 @@ impl Services {
                 .is_some();
         if inherits && input.isolation.is_some() {
             return Err(Error::InvalidParams(
-                "agent.delegate: a remote agent's sub-agents run on its machine, so isolation does not apply; pass placement { target: \"local\" } to use isolation on the backend".to_string(),
+                "agent.delegate: a remote agent's sub-agents run on its machine, so isolation does not apply".to_string(),
             ));
         }
         let placed = inherits || explicit_remote;
@@ -13619,90 +13625,6 @@ impl Services {
         // when the session has none (provider CLI default applies).
         let provider = created["agent"]["provider"].as_str().map(str::to_string);
 
-        // Track effective isolation mode for the result. Provisioning runs in
-        // a background task (monorepo#871), so an eligible CoW request reports
-        // "pending" here; the settled outcome is observable via the session's
-        // sandbox fields and the `sandbox:cow:created` event.
-        let mut effective_isolation: Option<&str> = None;
-        let mut pending_notice: Option<String> = None;
-
-        // Provision sandbox if isolation=cow is requested (Task 3).
-        // Check if isolation is "cow" (explicit or defaulted from workspace setting).
-        // Default to "cow" if workspace.cowIsolation setting is enabled and no explicit
-        // isolation parameter was provided (Task 5).
-        let mut isolation = input.isolation.clone();
-        // A placed agent never takes the legacy CoW path: its node gives it
-        // its own checkout.
-        if isolation.is_none() && !placed {
-            // Check workspace.cowIsolation setting
-            // `settings_get` returns the `{ path, value, definition }`
-            // envelope (§5.9) — read the nested `value`.
-            if let Ok(setting) = self
-                .settings_get("workspace.cowIsolation".to_string())
-                .await
-            {
-                if setting["value"].as_bool().unwrap_or(false) {
-                    isolation = Some("cow".to_string());
-                }
-            }
-        }
-        if isolation.as_deref() == Some("cow") {
-            let workspace = self.store.get_workspace(&workspace_id).await.ok();
-            if let Some(ws) = workspace {
-                // Sandbox-eligible: direct-mode workspaces (no worktree or
-                // skip_worktree=true; sandbox sourced from the user's repo folder),
-                // CoW-checkout workspaces (sourced from the workspace checkout),
-                // and direct-checkout workspaces (`checkoutMode == "direct"`,
-                // standalone plain repo — cache-hydrated or isNewRepo).
-                // Worktree-mode workspaces keep the shared checkout (no sandbox).
-                let is_direct_mode = (ws.skip_worktree || ws.worktree_path.is_none())
-                    && ws.repository_path.is_some();
-                let is_standalone_checkout = matches!(
-                    ws.checkout_mode,
-                    Some(intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)
-                ) && ws.worktree_path.is_some();
-                if is_direct_mode || is_standalone_checkout {
-                    // Same root fallback as `workspace.create` (the intentd
-                    // binary configures the root via INTENTD_WORKSPACES_DIR /
-                    // `workspaces.root` rather than `.with_workspaces_root`).
-                    let root = self
-                        .workspaces_root
-                        .clone()
-                        .unwrap_or_else(crate::default_workspaces_root);
-                    let aid = AgentId::from(agent_id.as_str());
-                    // The CoW clone runs OFF the delegate critical path
-                    // (monorepo#871): on large checkouts it takes tens of
-                    // seconds, which previously blew through the 30s
-                    // `workspace_api` budget and the harness's own MCP client
-                    // timeout. Register the settlement gate BEFORE returning
-                    // so the child's turn worker (`ensure_started`) blocks its
-                    // first ACP spawn until the clone settles — the child
-                    // never spawns against a half-copied sandbox.
-                    let owner = self.clone();
-                    let ws_id = workspace_id.clone();
-                    let worker_aid = aid.clone();
-                    if self.spawn_sandbox_provisioning(&aid, async move {
-                        owner
-                            .provision_delegate_sandbox(&ws_id, &worker_aid, root)
-                            .await;
-                    }) {
-                        effective_isolation = Some("pending");
-                        // Its own checkout starts from the remote parent's
-                        // work once provisioned, if the copy and reset work.
-                        if let Ok(child) = self.store.get_agent_session_summary(&aid).await {
-                            if let Some(work) =
-                                intent_core::remote_launch::BackendParentWork::from_metadata(
-                                    child.metadata.as_ref(),
-                                )
-                            {
-                                pending_notice = Some(work.pending_notice(workspace_id.as_str()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         if let Some(task_note_id) = input.task_note_id.clone().or(input.note_id.clone()) {
             // Occupancy was already resolved by the pre-gate above (or
             // deliberately overridden), so this internal assignment must not
@@ -13807,7 +13729,6 @@ impl Services {
             }
         }
 
-        // Include effective isolation in the result when isolation was requested
         let mut result = json!({
             "ok": true,
             "agentId": agent_id,
@@ -13819,16 +13740,7 @@ impl Services {
                 .unwrap()
                 .insert("provider".to_string(), json!(provider));
         }
-        if let Some(eff_iso) = effective_isolation {
-            result
-                .as_object_mut()
-                .unwrap()
-                .insert("effectiveIsolation".to_string(), json!(eff_iso));
-        }
         copy_remote_launch_fields(&created, &mut result);
-        if let (Some(notice), Some(obj)) = (pending_notice, result.as_object_mut()) {
-            obj.insert("notice".to_string(), json!(notice));
-        }
         Ok(result)
     }
 
@@ -14391,214 +14303,6 @@ impl Services {
             }
         }
         Ok(result)
-    }
-
-    /// Keep the wait gate alive through the complete clone and settlement.
-    fn spawn_sandbox_provisioning(
-        &self,
-        agent_id: &AgentId,
-        provision: impl std::future::Future<Output = ()> + Send + 'static,
-    ) -> bool {
-        struct SettleGuard {
-            services: Services,
-            aid: AgentId,
-            _release: tokio::sync::watch::Sender<()>,
-        }
-        impl Drop for SettleGuard {
-            fn drop(&mut self) {
-                self.services.settle_sandbox_provisioning(&self.aid);
-            }
-        }
-        // Register before publishing the wait gate. The admitted task waits
-        // for that gate before cloning; rejection cannot strand a waiter or
-        // start filesystem work. No await separates admission and publication.
-        let (ready, admitted) = tokio::sync::oneshot::channel::<SettleGuard>();
-        if self
-            .store_tasks
-            .spawn_draining(async move {
-                if let Ok(_guard) = admitted.await {
-                    provision.await;
-                }
-            })
-            .is_none()
-        {
-            return false;
-        }
-        let guard = SettleGuard {
-            services: self.clone(),
-            aid: agent_id.clone(),
-            _release: self.begin_sandbox_provisioning(agent_id),
-        };
-        ready.send(guard).is_ok()
-    }
-
-    /// Background half of the delegate CoW-isolation path (monorepo#871): run
-    /// [`RuntimePort::provision_sandbox`](crate::feature_ports::RuntimePort::provision_sandbox) and settle
-    /// the outcome onto the child's session. Success persists the sandbox
-    /// fields and emits `sandbox:cow:created` (payload unchanged, §5.5);
-    /// `Unsupported`/failure falls back to shared mode exactly as before —
-    /// debug/warn log only, the session keeps no sandbox fields and the child
-    /// spawns in the shared checkout.
-    async fn provision_delegate_sandbox(
-        &self,
-        workspace_id: &WorkspaceId,
-        agent_id: &AgentId,
-        workspaces_root: std::path::PathBuf,
-    ) {
-        use crate::feature_ports::ProvisionOutcome;
-        match self
-            .ports
-            .runtime()
-            .provision_sandbox(self, workspace_id, agent_id, workspaces_root)
-            .await
-        {
-            Ok(ProvisionOutcome::Supported {
-                path,
-                branch,
-                base_commit_sha,
-                snapshot_commit_sha,
-            }) => {
-                self.settle_provisioned_sandbox(
-                    workspace_id,
-                    agent_id,
-                    path,
-                    branch,
-                    base_commit_sha,
-                    snapshot_commit_sha,
-                )
-                .await;
-            }
-            Ok(ProvisionOutcome::Unsupported) => {
-                // Fallback to shared mode (no action needed, session stays without sandbox fields)
-                tracing::debug!(
-                    workspace = %workspace_id,
-                    agent = %agent_id,
-                    "CoW not supported; fallback to shared mode"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    workspace = %workspace_id,
-                    agent = %agent_id,
-                    error = %e,
-                    "Sandbox provisioning failed; fallback to shared mode"
-                );
-            }
-        }
-    }
-
-    /// Settle a successfully provisioned sandbox onto the child's session:
-    /// persist the sandbox fields and emit `sandbox:cow:created`. Because the
-    /// clone runs off the delegate critical path (monorepo#871),
-    /// `agent.delete` can race it — if the session is gone or soft-deleted
-    /// by settlement time, discard the just-provisioned sandbox (directory +
-    /// store record) instead of stranding a multi-GB clone on disk
-    /// (`gc_orphaned_sandboxes` has no runtime caller).
-    async fn settle_provisioned_sandbox(
-        &self,
-        workspace_id: &WorkspaceId,
-        agent_id: &AgentId,
-        path: std::path::PathBuf,
-        branch: String,
-        base_commit_sha: String,
-        snapshot_commit_sha: Option<String>,
-    ) {
-        let session = match self
-            .store
-            .get_agent_session_without_messages(agent_id)
-            .await
-        {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(
-                    workspace = %workspace_id,
-                    agent = %agent_id,
-                    error = %e,
-                    "agent session lookup failed after sandbox provisioning"
-                );
-                None
-            }
-        };
-        match session {
-            Some(mut session) if session.status != AgentStatus::Deleted => {
-                // Update the session with sandbox metadata
-                session.sandbox_id = Some(format!(
-                    "sandbox-{}-{}",
-                    workspace_id.as_str(),
-                    agent_id.as_str()
-                ));
-                session.sandbox_path = Some(path.to_string_lossy().to_string());
-                session.sandbox_branch = Some(branch.clone());
-                let _ = self
-                    .store
-                    .update_agent_session(workspace_id, &session)
-                    .await;
-
-                // Emit sandbox:cow:created event
-                crate::publish_event(
-                    self.event_bus.as_ref(),
-                    intent_store::NewEvent {
-                        workspace_id: workspace_id.clone(),
-                        timestamp: crate::now_iso(),
-                        event_type: "sandbox:cow:created".to_string(),
-                        actor: crate::system_actor(),
-                        session_id: Some(agent_id.0.clone()),
-                        correlation_id: None,
-                        parent_event_id: None,
-                        metadata: None,
-                        data: json!({
-                            "workspaceId": workspace_id.as_str(),
-                            "agentId": agent_id.as_str(),
-                            "sandboxPath": path.to_string_lossy(),
-                            "branch": branch,
-                            "baseCommitSha": base_commit_sha,
-                            "snapshotCommitSha": snapshot_commit_sha,
-                        }),
-                    },
-                )
-                .await;
-            }
-            _ => {
-                tracing::warn!(
-                    workspace = %workspace_id,
-                    agent = %agent_id,
-                    sandbox_path = %path.display(),
-                    "agent session missing or deleted after sandbox provisioning (agent.delete raced the clone); discarding the sandbox"
-                );
-                // Remove the directory via the in-hand path: a hard
-                // `agent.delete` already cascaded the sandbox row away
-                // (FK ON DELETE CASCADE), so a record lookup can't be
-                // relied on for the path. The directory is a full CoW
-                // checkout (same size class as the clone), so removal runs
-                // on the blocking pool (monorepo#954).
-                if path.exists() {
-                    let dir = path.clone();
-                    let workspace_id = workspace_id.clone();
-                    let agent_id = agent_id.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Err(e) = std::fs::remove_dir_all(&dir) {
-                            tracing::warn!(
-                                workspace = %workspace_id,
-                                agent = %agent_id,
-                                error = %e,
-                                "failed to remove orphaned sandbox directory after agent deletion"
-                            );
-                        }
-                    })
-                    .await;
-                }
-                // Best-effort: drop the record too (still present on the
-                // soft-delete path; already gone after a hard delete).
-                if let Err(e) = self.store.delete_sandbox(workspace_id, agent_id).await {
-                    tracing::warn!(
-                        workspace = %workspace_id,
-                        agent = %agent_id,
-                        error = %e,
-                        "failed to delete orphaned sandbox record after agent deletion"
-                    );
-                }
-            }
-        }
     }
 
     /// Auto-subscribe `parent_agent_id` to `child_agent_id`'s completion

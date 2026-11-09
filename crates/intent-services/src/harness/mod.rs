@@ -60,6 +60,7 @@ pub(crate) mod v3_5;
 pub(crate) mod v3_6;
 pub(crate) mod v3_7;
 pub(crate) mod v3_8;
+pub(crate) mod v3_9;
 
 // Context rendering is admitted separately from the versioned text bundle.
 #[cfg_attr(not(test), expect(dead_code))]
@@ -162,11 +163,6 @@ pub(crate) trait Harness: Send + Sync {
     fn user_rules_wrapper(&self, content: &str, source: &str) -> String;
     /// RTK instruction line for the given usable subcommands.
     fn rtk_instruction_line(&self, subcommands: &[String]) -> String;
-    /// `## Workspace Isolation` hint for a sandboxed implementor.
-    fn sandboxed_implementor_hint(&self, sandbox_path: &str, sandbox_branch: &str) -> String;
-    /// `## Agent Delegation & Isolation` hint for a coordinator in a
-    /// CoW-enabled direct-mode workspace.
-    fn coordinator_cow_hint(&self) -> String;
     /// `# Your Specialist Role` section wrapping the behavior prompt.
     fn specialist_role_section(&self, behavior_prompt: &str) -> String;
     /// The status-neutral `## Commit Policy` clause (every agent).
@@ -567,6 +563,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v3_6::ENTRY,
     &v3_7::ENTRY,
     &v3_8::ENTRY,
+    &v3_9::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row

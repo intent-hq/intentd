@@ -1,0 +1,35 @@
+name: Cargo tools
+description: >-
+  Install cargo tools with taiki-e/install-action, skipping each one the runner
+  already has. install-action downloads on every run; the intent-cache runner
+  image bakes pinned builds (monorepo docs/GITHUB_RUNNERS.md, Preinstalled tools).
+inputs:
+  tools:
+    description: Space-separated install-action tool names, e.g. "cargo-llvm-cov nextest"
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Find cargo tools the runner lacks
+      id: probe
+      shell: bash
+      env:
+        TOOLS: ${{ inputs.tools }}
+      run: |
+        set -euo pipefail
+        missing=()
+        for tool in $TOOLS; do
+          bin=$tool
+          if [ "$tool" = nextest ]; then bin=cargo-nextest; fi
+          if path=$(command -v "$bin"); then
+            version=$(cargo "${bin#cargo-}" --version)
+            echo "$tool: using $path (${version%%$'\n'*})"
+          else
+            missing+=("$tool")
+          fi
+        done
+        echo "missing=$(IFS=,; echo "${missing[*]}")" >> "$GITHUB_OUTPUT"
+    - if: steps.probe.outputs.missing != ''
+      uses: taiki-e/install-action@v2
+      with:
+        tool: ${{ steps.probe.outputs.missing }}

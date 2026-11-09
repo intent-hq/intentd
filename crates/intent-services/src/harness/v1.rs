@@ -332,45 +332,6 @@ impl Harness for V1 {
         )
     }
 
-    fn sandboxed_implementor_hint(&self, sandbox_path: &str, sandbox_branch: &str) -> String {
-        // Base commit isn't on AgentSession; it is tracked in the sandbox
-        // record, so the hint names that instead of a SHA.
-        let base_sha_note = "base commit tracked in sandbox metadata";
-        format!(
-            "## Workspace Isolation\n\n\
-             You are working in an **isolated CoW (copy-on-write) sandbox** at `{sandbox_path}` \
-             on branch `{sandbox_branch}` ({base_sha_note}). Your dependency caches (node_modules, \
-             target/, .venv, etc.) are warm — you inherited them from the canonical workspace.\n\n\
-             **Critical constraints:**\n\
-             - Do NOT switch branches or checkout other refs in your sandbox.\n\
-             - On completion, the system automatically merges your branch back to the canonical workspace.\n\
-             - If your changes conflict with canonical, you will be **woken with the conflicting paths** \
-             and a ref to reconcile against. When that happens, resolve the conflicts **in your sandbox only** \
-             (rebase or merge onto the fetched canonical ref), then end your turn again. The system will \
-             retry the merge. Do NOT attempt to touch other checkouts or the canonical workspace directly.\n\
-             - You have up to 2 conflict-resolution attempts before the merge is deferred to manual intervention."
-        )
-    }
-
-    fn coordinator_cow_hint(&self) -> String {
-        "## Agent Delegation & Isolation\n\n\
-         Delegated agents in this workspace run in **isolated CoW sandboxes** when you \
-         use `isolation: \"cow\"` (or when the workspace's `cowIsolation` setting defaults it). \
-         Each sandboxed agent works in its own copy-on-write clone of the workspace directory, \
-         so parallel delegation is safe even when tasks touch overlapping files — agents cannot \
-         stomp each other's work.\n\n\
-         **Merge-back is automatic:** when a sandboxed agent completes, the system merges its \
-         commits back into the canonical workspace **before** waking you. Clean merges propagate \
-         completion normally. Conflicts suppress completion propagation and wake the agent (not you) \
-         with conflict paths and resolution instructions; the agent fixes its sandbox and retries \
-         the merge (up to 2 attempts).\n\n\
-         **You only handle `blocked` outcomes:** if the canonical workspace has uncommitted changes \
-         overlapping with the agent's work, or if conflict retries are exhausted, completion propagates \
-         with `merge_pending` status. Use `sandbox.cow.merge` or `sandbox.cow.discard` RPCs, or ask the user \
-         to commit/stash their WIP, then manually merge."
-            .to_string()
-    }
-
     fn specialist_role_section(&self, behavior_prompt: &str) -> String {
         format!(
             "# Your Specialist Role\n\n<specialist_role>\n{behavior_prompt}\n</specialist_role>\n\n\

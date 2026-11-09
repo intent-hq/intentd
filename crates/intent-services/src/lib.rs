@@ -83,14 +83,14 @@ mod auto_commit;
 pub mod browser_ops;
 mod bundled_cli;
 mod capability;
+#[doc(hidden)]
+pub mod checkout_transfer;
 #[cfg(all(test, unix))]
 mod claude_adapter_contract;
 mod clone_ops;
 pub mod codex_diagnostics;
 mod codex_session_title;
 mod complete_ops;
-#[cfg(test)]
-mod completion_interception_tests;
 #[cfg(test)]
 mod conditional_write_precedence_tests;
 mod config_watcher;
@@ -112,7 +112,6 @@ mod event_subscriptions;
 pub mod events;
 mod execution_call;
 mod executor_link;
-#[doc(hidden)]
 pub mod feature_api;
 mod feature_ports;
 mod file_ops;
@@ -956,6 +955,11 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
+    /// Serves pieces of local agents' checkout files to `ws.file.pull`,
+    /// packing folders under `<data_dir>/pulls`; made on first use.
+    pulls: Arc<std::sync::OnceLock<Arc<checkout_transfer::PieceSource>>>,
+    /// Which caller opened each `ws.file.pull` transfer.
+    pull_transfers: Arc<checkout_transfer::PullTransfers>,
     /// Test park seam (monorepo#1180) for the `script.*` supervisor
     /// pre-registration race window. `None` in production wiring; tests
     /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
@@ -1383,22 +1387,8 @@ pub struct Services {
     /// each agent's [`WorkspaceMcpServer`]) so registration and claim observe
     /// the same state.
     turn_attachments: Arc<intent_core::TurnAttachmentRegistry>,
-    /// Per-agent in-flight sandbox-provisioning gates (monorepo#871). A
-    /// delegate with `CoW` isolation kicks the clone off in a background task
-    /// and returns immediately; the child's turn worker awaits the gate
-    /// before its first ACP spawn so the child never runs against a
-    /// half-copied sandbox. The entry is removed — and the paired
-    /// `watch::Sender` dropped — when provisioning settles (success or
-    /// shared-mode fallback), releasing every waiter. Shared across clones
-    /// so the [`AgentManager`]'s turn worker and the delegate front doors
-    /// observe the same gates.
-    sandbox_provisioning: Arc<Mutex<HashMap<AgentId, tokio::sync::watch::Receiver<()>>>>,
-    #[cfg(test)]
-    sandbox_merge_marked: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     periodic_commit_hold: Arc<Mutex<Option<periodic_shutdown_tests::CommitHold>>>,
-    #[cfg(test)]
-    sandbox_merge_finish: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
     /// Single-flight registry for in-flight `git.diffs` walks: concurrent
     /// calls with an identical `(workspace_id, paths, staged, commit_hash)`
     /// identity coalesce onto one blocking-pool libgit2 walk and share its
@@ -1825,6 +1815,8 @@ impl Services {
                 max_bytes_per_run: intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
             },
             script_too_fast_ms: runtime_config::TOO_FAST_MS,
+            pulls: Arc::new(std::sync::OnceLock::new()),
+            pull_transfers: Arc::default(),
             script_parks: runtime_config::ScriptParks::default(),
             completion_classify_park: None,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -1934,13 +1926,8 @@ impl Services {
             disk_usage: Arc::new(disk_usage::DiskUsageCache::new()),
             agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
-            sandbox_provisioning: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(test)]
-            sandbox_merge_marked: Arc::default(),
             #[cfg(test)]
             periodic_commit_hold: Arc::default(),
-            #[cfg(test)]
-            sandbox_merge_finish: Arc::default(),
             git_diffs_inflight: Arc::new(git_diff_singleflight::DiffSingleFlight::default()),
             git_diffs_slow_warns: Arc::new(git_diff_singleflight::SlowWalkWarnLimiter::default()),
             git_diffs_walk_probe: None,
@@ -7648,25 +7635,6 @@ impl Services {
         };
         let child = AgentId::from(child_id.as_str());
 
-        // BEFORE waking the coordinator: if this is a sandboxed agent completion,
-        // attempt the merge-back. On clean merge, proceed normally. On conflict,
-        // suppress completion propagation and bounce the agent. On blocked or
-        // retry-exhausted, propagate with merge-pending status.
-        if event.event_type == AGENT_IDLE {
-            if let Ok(session) = self.store.get_agent_session_without_messages(&child).await {
-                if session.sandbox_path.is_some() {
-                    let should_propagate = self
-                        .handle_sandbox_merge_on_completion(&event.workspace_id, &child, &session)
-                        .await;
-                    if !should_propagate {
-                        // Conflict bounce: agent was woken with instructions; do NOT
-                        // wake coordinator yet. The agent's next completion will retry.
-                        return;
-                    }
-                }
-            }
-        }
-
         let classification = self.deliver_completion_to_watches(&child, event).await;
         // An agent going idle ends its delegating turn, so seal that parent's
         // open after_all group (the expected set is now final) and try to fire it
@@ -10539,706 +10507,6 @@ impl Services {
         Box::pin(self.redeliver_completion_after_queue_mutation(&group.parent_agent_id)).await;
     }
 
-    /// Handle sandbox merge-back on agent completion.
-    /// Returns `true` if completion should propagate normally (clean merge or blocked/retry-exhausted).
-    /// Returns `false` if completion was suppressed (conflict bounce).
-    async fn handle_sandbox_merge_on_completion(
-        &self,
-        workspace_id: &WorkspaceId,
-        agent_id: &AgentId,
-        session: &AgentSession,
-    ) -> bool {
-        // Check retry count (cap at 2 bounces)
-        const MAX_RETRIES: i64 = 2;
-        use crate::feature_ports::MergeOutcome;
-        use intent_store::SandboxStatus;
-
-        // Load sandbox record
-        let sandbox = match self.store.get_sandbox(workspace_id, agent_id).await {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                tracing::warn!(
-                    agent = %agent_id.0,
-                    "agent has sandbox_path but no sandbox record; skipping merge"
-                );
-                return true;
-            }
-            Err(e) => {
-                tracing::error!(
-                    agent = %agent_id.0,
-                    error = %e,
-                    "failed to load sandbox record; propagating completion"
-                );
-                return true;
-            }
-        };
-
-        let retry_count = self.get_sandbox_retry_count(workspace_id, agent_id).await;
-
-        // Claim the merge atomically (current status → merging) so this path
-        // never merges concurrently with the sandbox.cow.merge RPC or the
-        // background retry sweep. Losing the claim (or finding the sandbox
-        // already merging) means another path owns the merge; propagate
-        // completion normally rather than double-merging.
-        if sandbox.status == SandboxStatus::Merging {
-            tracing::info!(
-                agent = %agent_id.0,
-                "sandbox merge already in progress; propagating completion without merging"
-            );
-            return true;
-        }
-        match self
-            .store
-            .try_transition_sandbox_status(
-                workspace_id,
-                agent_id,
-                sandbox.status,
-                SandboxStatus::Merging,
-                &now_iso(),
-            )
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::info!(
-                    agent = %agent_id.0,
-                    "sandbox claimed by another merge path; propagating completion without merging"
-                );
-                return true;
-            }
-            Err(e) => {
-                tracing::error!(
-                    agent = %agent_id.0,
-                    error = %e,
-                    "failed to update sandbox status to merging"
-                );
-            }
-        }
-
-        // Attempt merge
-        let outcome = match self
-            .ports
-            .runtime()
-            .merge_sandbox(self, workspace_id, agent_id)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                tracing::error!(
-                    agent = %agent_id.0,
-                    error = %e,
-                    "sandbox merge failed with error; marking merge-pending"
-                );
-                let _ = self
-                    .store
-                    .update_sandbox_status(
-                        workspace_id,
-                        agent_id,
-                        SandboxStatus::MergePending,
-                        &now_iso(),
-                    )
-                    .await;
-                // Propagate completion with error status
-                return true;
-            }
-        };
-
-        match outcome {
-            MergeOutcome::Merged {
-                commit_range,
-                canonical_head,
-            } => {
-                // Success! Shared bookkeeping: mark merged, discard sandbox,
-                // emit sandbox:cow:merged, clear retry count.
-                self.finalize_sandbox_merged(
-                    workspace_id,
-                    agent_id,
-                    &commit_range,
-                    &canonical_head,
-                )
-                .await;
-
-                // Propagate completion normally
-                true
-            }
-            MergeOutcome::Conflict {
-                conflicting_paths,
-                canonical_head,
-            } => {
-                // Conflict: check retry limit
-                if retry_count >= MAX_RETRIES {
-                    // Exhausted retries; mark merge-pending and propagate
-                    let _ = self
-                        .store
-                        .update_sandbox_status(
-                            workspace_id,
-                            agent_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-
-                    tracing::warn!(
-                        agent = %agent_id.0,
-                        retries = retry_count,
-                        "conflict retry limit exhausted; marking merge-pending"
-                    );
-
-                    self.clear_sandbox_retry_count(workspace_id, agent_id).await;
-                    return true;
-                }
-
-                // Bounce: update status, increment retry, fetch canonical, wake agent
-                let _ = self
-                    .store
-                    .update_sandbox_status(
-                        workspace_id,
-                        agent_id,
-                        SandboxStatus::ConflictBounced,
-                        &now_iso(),
-                    )
-                    .await;
-
-                self.increment_sandbox_retry_count(workspace_id, agent_id)
-                    .await;
-
-                // Fetch canonical state into sandbox
-                if let Err(e) = self
-                    .fetch_canonical_to_sandbox(
-                        workspace_id,
-                        agent_id,
-                        session.sandbox_path.as_ref().unwrap(),
-                        &canonical_head,
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        agent = %agent_id.0,
-                        error = %e,
-                        "failed to fetch canonical to sandbox; marking merge-pending"
-                    );
-                    let _ = self
-                        .store
-                        .update_sandbox_status(
-                            workspace_id,
-                            agent_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-                    return true;
-                }
-
-                // Wake agent with conflict instructions
-                let message = format!(
-                    "⚠️ Merge conflict detected. Your sandbox branch has conflicts with the canonical repository.\n\n\
-                    **Conflicting files:**\n{}\n\n\
-                    **Instructions:**\n\
-                    1. The canonical state has been fetched to your sandbox as `refs/remotes/canonical/HEAD`\n\
-                    2. Resolve conflicts by rebasing or merging: `git rebase canonical/HEAD` or `git merge canonical/HEAD`\n\
-                    3. Fix conflicts in the listed files\n\
-                    4. Commit the resolution: `git add <files> && git commit`\n\
-                    5. **Do not switch branches or touch other checkouts**\n\
-                    6. End your turn when ready - the system will retry the merge\n\n\
-                    You are working in an isolated sandbox at: `{}`\n\
-                    Retry {}/{} - fix conflicts in your sandbox only.",
-                    conflicting_paths.join("\n- "),
-                    session.sandbox_path.as_ref().unwrap(),
-                    retry_count + 1,
-                    MAX_RETRIES
-                );
-
-                if let Err(e) = self
-                    .agent_send_message_op(
-                        agent_id.clone(),
-                        message,
-                        None, // messageId
-                        None, // imageBlocks
-                        None, // fileBlocks
-                        None, // messageMetadata
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        agent = %agent_id.0,
-                        error = %e,
-                        "failed to send conflict bounce message to agent"
-                    );
-                }
-
-                tracing::info!(
-                    agent = %agent_id.0,
-                    paths = ?conflicting_paths,
-                    retry = retry_count + 1,
-                    "conflict detected; agent bounced with instructions"
-                );
-
-                // Suppress completion propagation
-                false
-            }
-            MergeOutcome::Blocked {
-                reason,
-                overlapping_paths,
-            } => {
-                // Blocked: mark merge-pending and propagate with status
-                let _ = self
-                    .store
-                    .update_sandbox_status(
-                        workspace_id,
-                        agent_id,
-                        SandboxStatus::MergePending,
-                        &now_iso(),
-                    )
-                    .await;
-
-                tracing::warn!(
-                    agent = %agent_id.0,
-                    reason = %reason,
-                    paths = ?overlapping_paths,
-                    "merge blocked; marking merge-pending"
-                );
-
-                self.clear_sandbox_retry_count(workspace_id, agent_id).await;
-
-                // Propagate completion (coordinator/user will see merge-pending status)
-                true
-            }
-        }
-    }
-
-    /// Fetch canonical repository state into sandbox for conflict resolution.
-    async fn fetch_canonical_to_sandbox(
-        &self,
-        workspace_id: &WorkspaceId,
-        _agent_id: &AgentId,
-        sandbox_path: &str,
-        _canonical_head: &str,
-    ) -> Result<()> {
-        // Load workspace to get canonical repo path
-        let workspace = self.store.get_workspace(workspace_id).await?;
-        let canonical_path = workspace
-            .repository_path
-            .as_ref()
-            .ok_or_else(|| Error::InvalidParams("workspace has no repository_path".to_string()))?;
-
-        // Fetch canonical HEAD into sandbox as canonical/HEAD. Shell out to
-        // git with an explicit refspec and tag auto-follow disabled: the
-        // canonical repo carries non-commit refs (refs/intent/blobs/*,
-        // refs/stash) that libgit2's local transport trips over ("object is
-        // not a committish", InvalidSpec) — same failure class fixed for the
-        // merge-back fetch in sandbox_ops::merge_sandbox.
-        let fetch_out = std::process::Command::new("git")
-            .arg("fetch")
-            .arg("--no-tags")
-            .arg("--quiet")
-            .arg(canonical_path)
-            .arg("+HEAD:refs/remotes/canonical/HEAD")
-            .current_dir(sandbox_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| Error::Internal(format!("fetch canonical to sandbox failed: {e}")))?;
-        if !fetch_out.status.success() {
-            return Err(Error::Internal(format!(
-                "fetch canonical to sandbox failed: {}",
-                String::from_utf8_lossy(&fetch_out.stderr).trim()
-            )));
-        }
-
-        Ok(())
-    }
-
-    async fn get_sandbox_retry_count(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) -> i64 {
-        self.store
-            .get_sandbox_retry_count(workspace_id, agent_id)
-            .await
-            .unwrap_or(0)
-    }
-
-    async fn increment_sandbox_retry_count(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) {
-        let _ = self
-            .store
-            .increment_sandbox_retry_count(workspace_id, agent_id)
-            .await;
-    }
-
-    async fn clear_sandbox_retry_count(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) {
-        let _ = self
-            .store
-            .clear_sandbox_retry_count(workspace_id, agent_id)
-            .await;
-    }
-
-    /// Shared success bookkeeping for a merged sandbox, used by every
-    /// merge-back caller (completion interception, the `sandbox.cow.merge` RPC,
-    /// and the background retry sweep): mark the record `merged`, discard
-    /// the sandbox directory + record, emit `sandbox:cow:merged`, and clear the
-    /// retry count. All store failures are logged and swallowed — the merge
-    /// itself already landed in canonical.
-    #[cfg_attr(
-        test,
-        expect(
-            clippy::missing_panics_doc,
-            reason = "internal doc-hidden feature API, not a public library API"
-        )
-    )]
-    pub async fn finalize_sandbox_merged(
-        &self,
-        workspace_id: &WorkspaceId,
-        agent_id: &AgentId,
-        commit_range: &str,
-        canonical_head: &str,
-    ) {
-        use intent_store::SandboxStatus;
-
-        let _ = self
-            .store
-            .update_sandbox_status(workspace_id, agent_id, SandboxStatus::Merged, &now_iso())
-            .await;
-
-        #[cfg(test)]
-        {
-            let finish = self.sandbox_merge_finish.lock().unwrap().take();
-            if let Some(finish) = finish {
-                self.sandbox_merge_marked.notify_one();
-                let _ = finish.await;
-            }
-        }
-
-        if let Err(e) = self
-            .ports
-            .runtime()
-            .discard_sandbox(self, workspace_id, agent_id)
-            .await
-        {
-            tracing::warn!(
-                agent = %agent_id.0,
-                error = %e,
-                "failed to discard sandbox after successful merge"
-            );
-        }
-
-        let event = NewEvent {
-            workspace_id: workspace_id.clone(),
-            timestamp: now_iso(),
-            event_type: "sandbox:cow:merged".to_string(),
-            actor: intent_core::EventActor {
-                actor_type: ActorType::System,
-                id: Some("intentd".to_string()),
-                name: Some("intentd".to_string()),
-                ..Default::default()
-            },
-            session_id: Some(agent_id.0.clone()),
-            correlation_id: None,
-            parent_event_id: None,
-            metadata: None,
-            data: serde_json::json!({
-                "workspaceId": workspace_id.0,
-                "agentId": agent_id.0,
-                "commitRange": commit_range,
-                "canonicalHead": canonical_head,
-            }),
-        };
-        crate::publish_event(self.event_bus.as_ref(), event).await;
-
-        tracing::info!(
-            agent = %agent_id.0,
-            range = %commit_range,
-            "sandbox merged successfully"
-        );
-
-        self.clear_sandbox_retry_count(workspace_id, agent_id).await;
-    }
-
-    /// Crash-recovery for sandboxes stranded `merging`: every merge path
-    /// (completion interception, `sandbox.cow.merge` RPC, retry sweep) transits
-    /// through `merging`, so a daemon crash mid-merge leaves the row there —
-    /// invisible to the sweep and unclaimable by the RPC. On a fresh daemon
-    /// no merge can be in flight, so resetting `merging → merge_pending` is
-    /// safe by construction. The daemon calls this once at startup, before
-    /// the first sweep tick.
-    pub async fn recover_stranded_merging_sandboxes(&self) -> usize {
-        use intent_store::SandboxStatus;
-
-        let stranded = match self
-            .store
-            .list_sandboxes_by_status(SandboxStatus::Merging)
-            .await
-        {
-            Ok(list) => list,
-            Err(e) => {
-                tracing::warn!(error = %e, "merging-sandbox recovery: listing failed");
-                return 0;
-            }
-        };
-
-        let mut recovered = 0;
-        for sandbox in stranded {
-            match self
-                .store
-                .try_transition_sandbox_status(
-                    &sandbox.workspace_id,
-                    &sandbox.agent_id,
-                    SandboxStatus::Merging,
-                    SandboxStatus::MergePending,
-                    &now_iso(),
-                )
-                .await
-            {
-                Ok(true) => {
-                    recovered += 1;
-                    tracing::info!(
-                        sandbox = %sandbox.id,
-                        agent = %sandbox.agent_id.0,
-                        workspace = %sandbox.workspace_id.0,
-                        "recovered sandbox stranded merging by a previous daemon; reset to merge_pending"
-                    );
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        sandbox = %sandbox.id,
-                        agent = %sandbox.agent_id.0,
-                        workspace = %sandbox.workspace_id.0,
-                        error = %e,
-                        "merging-sandbox recovery: reset failed"
-                    );
-                }
-            }
-        }
-        recovered
-    }
-
-    /// Background retry sweep for `merge_pending` sandboxes. Merge-back
-    /// otherwise only triggers on agent completion or the manual
-    /// `sandbox.cow.merge` RPC, so a sandbox stranded `merge_pending` (daemon
-    /// restart mid-merge, or historical failures like the pre-#592 fetch bug)
-    /// never self-heals. The daemon runs this on startup and periodically.
-    ///
-    /// Per sandbox:
-    /// - already at [`SANDBOX_MERGE_SWEEP_RETRY_CAP`] → skipped (debug log);
-    ///   the WARN naming sandbox/agent/workspace/last error fired on the
-    ///   attempt that exhausted the cap, and the sandbox stays
-    ///   `merge_pending` for manual `sandbox.cow.merge` / `sandbox.cow.discard`;
-    /// - agent mid-turn ([`WorkspaceApi::agent_is_busy`]) → skipped, no merge
-    ///   under an active worker;
-    /// - claimed atomically `merge_pending → merging`
-    ///   ([`Store::try_transition_sandbox_status`]) so a concurrent
-    ///   `sandbox.cow.merge` RPC or overlapping sweep never double-merges;
-    /// - `Merged` → identical bookkeeping to the RPC path
-    ///   ([`Services::finalize_sandbox_merged`]);
-    /// - `Blocked` → logged and returned to `merge_pending` WITHOUT
-    ///   consuming the retry cap: blocked-ness (dirty canonical overlap,
-    ///   missing/unborn branch) resolves externally, and one attempt per
-    ///   sweep period is not hammering;
-    /// - `Conflict` / hard errors → `retry_count` incremented, sandbox
-    ///   returned to `merge_pending`.
-    pub async fn sweep_merge_pending_sandboxes(&self) -> MergeSweepSummary {
-        let services = self.clone();
-        let Some(owner) = self
-            .store_tasks
-            .spawn_draining(async move { services.sweep_merge_pending_sandboxes_owned().await })
-        else {
-            return MergeSweepSummary::default();
-        };
-        match owner.await {
-            Ok(summary) => summary,
-            Err(error) => {
-                tracing::error!(%error, "merge retry sweep worker failed");
-                MergeSweepSummary::default()
-            }
-        }
-    }
-
-    async fn sweep_merge_pending_sandboxes_owned(&self) -> MergeSweepSummary {
-        use crate::feature_ports::MergeOutcome;
-        use intent_store::SandboxStatus;
-
-        let mut summary = MergeSweepSummary::default();
-        let pending = match self
-            .store
-            .list_sandboxes_by_status(SandboxStatus::MergePending)
-            .await
-        {
-            Ok(list) => list,
-            Err(e) => {
-                tracing::warn!(error = %e, "merge retry sweep: listing merge_pending sandboxes failed");
-                return summary;
-            }
-        };
-
-        for sandbox in pending {
-            let workspace_id = sandbox.workspace_id.clone();
-            let agent_id = sandbox.agent_id.clone();
-
-            if sandbox.retry_count >= SANDBOX_MERGE_SWEEP_RETRY_CAP {
-                summary.skipped_capped += 1;
-                tracing::debug!(
-                    sandbox = %sandbox.id,
-                    agent = %agent_id.0,
-                    workspace = %workspace_id.0,
-                    retries = sandbox.retry_count,
-                    "merge retry sweep: retry cap reached; sandbox stays merge_pending for manual handling"
-                );
-                continue;
-            }
-
-            // Best-effort politeness check; not a correctness guard. If the
-            // agent starts a turn right after this check, the turn's own
-            // completion-path merge still cannot collide with the sweep: it
-            // goes through the same CAS claim below and loses to the sweep's
-            // `merging` claim.
-            if self.agent_is_busy(agent_id.clone()) {
-                summary.skipped_busy += 1;
-                tracing::debug!(
-                    sandbox = %sandbox.id,
-                    agent = %agent_id.0,
-                    workspace = %workspace_id.0,
-                    "merge retry sweep: agent is mid-turn; skipping"
-                );
-                continue;
-            }
-
-            // Atomic claim: only one merge path may own the transition out of
-            // merge_pending. Losing the race means another merge is in flight.
-            match self
-                .store
-                .try_transition_sandbox_status(
-                    &workspace_id,
-                    &agent_id,
-                    SandboxStatus::MergePending,
-                    SandboxStatus::Merging,
-                    &now_iso(),
-                )
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    summary.skipped_raced += 1;
-                    tracing::debug!(
-                        sandbox = %sandbox.id,
-                        agent = %agent_id.0,
-                        workspace = %workspace_id.0,
-                        "merge retry sweep: sandbox claimed by another merge path; skipping"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    summary.errors += 1;
-                    tracing::warn!(
-                        sandbox = %sandbox.id,
-                        agent = %agent_id.0,
-                        workspace = %workspace_id.0,
-                        error = %e,
-                        "merge retry sweep: claiming sandbox failed; skipping"
-                    );
-                    continue;
-                }
-            }
-
-            match self
-                .ports
-                .runtime()
-                .merge_sandbox(self, &workspace_id, &agent_id)
-                .await
-            {
-                Ok(MergeOutcome::Merged {
-                    commit_range,
-                    canonical_head,
-                }) => {
-                    self.finalize_sandbox_merged(
-                        &workspace_id,
-                        &agent_id,
-                        &commit_range,
-                        &canonical_head,
-                    )
-                    .await;
-                    summary.merged += 1;
-                }
-                Ok(MergeOutcome::Blocked {
-                    reason,
-                    overlapping_paths,
-                }) => {
-                    let _ = self
-                        .store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &agent_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-                    summary.blocked += 1;
-                    tracing::info!(
-                        sandbox = %sandbox.id,
-                        agent = %agent_id.0,
-                        workspace = %workspace_id.0,
-                        reason = %reason,
-                        paths = ?overlapping_paths,
-                        "merge retry sweep: merge blocked; will retry next sweep (retry cap not consumed)"
-                    );
-                }
-                Ok(MergeOutcome::Conflict {
-                    conflicting_paths, ..
-                }) => {
-                    let last_error = format!("merge conflict on: {}", conflicting_paths.join(", "));
-                    self.record_sweep_merge_failure(&sandbox, &last_error).await;
-                    summary.conflicts += 1;
-                }
-                Err(e) => {
-                    self.record_sweep_merge_failure(&sandbox, &e.to_string())
-                        .await;
-                    summary.errors += 1;
-                }
-            }
-        }
-
-        summary
-    }
-
-    /// Bookkeeping for a failed sweep merge attempt: return the sandbox to
-    /// `merge_pending`, consume one retry, and log — a WARN naming
-    /// sandbox/agent/workspace and the last error when the cap is exhausted
-    /// (later sweeps then skip it silently), an INFO otherwise.
-    async fn record_sweep_merge_failure(&self, sandbox: &intent_store::Sandbox, last_error: &str) {
-        use intent_store::SandboxStatus;
-
-        let workspace_id = &sandbox.workspace_id;
-        let agent_id = &sandbox.agent_id;
-        let _ = self
-            .store
-            .update_sandbox_status(
-                workspace_id,
-                agent_id,
-                SandboxStatus::MergePending,
-                &now_iso(),
-            )
-            .await;
-        self.increment_sandbox_retry_count(workspace_id, agent_id)
-            .await;
-
-        let attempts = sandbox.retry_count + 1;
-        if attempts >= SANDBOX_MERGE_SWEEP_RETRY_CAP {
-            tracing::warn!(
-                sandbox = %sandbox.id,
-                agent = %agent_id.0,
-                workspace = %workspace_id.0,
-                retries = attempts,
-                last_error = %last_error,
-                "merge retry sweep: retry cap exhausted; sandbox stays merge_pending — resolve via sandbox.cow.merge or sandbox.cow.discard"
-            );
-        } else {
-            tracing::info!(
-                sandbox = %sandbox.id,
-                agent = %agent_id.0,
-                workspace = %workspace_id.0,
-                retries = attempts,
-                error = %last_error,
-                "merge retry sweep: merge attempt failed; will retry next sweep"
-            );
-        }
-    }
-
     /// Deliver an internal parent wake through the runtime [`AgentManager`]
     /// when attached — the proven `agent.sendMessage` path: persist + spawn the
     /// turn worker, so the parent runs a REAL turn with the normal stream/idle
@@ -12797,8 +12065,7 @@ fn new_uuid() -> String {
 /// `file.getAttachmentInfo` result for one registry row (PROTOCOL §5.9):
 /// `{ attachmentId, fileName, mimeType?, size, uploadedAt, path, exists }`.
 /// `exists` reflects the file on disk NOW (the user may have deleted it
-/// out-of-band); resolved against the canonical workspace root, never a
-/// sandbox, with the same within-root containment guard as the copy path —
+/// out-of-band); resolved against the workspace root, with the same within-root containment guard as the copy path —
 /// a tampered `stored_path` must not probe file existence outside the store.
 async fn attachment_info_result(
     store: &Store,
@@ -16521,39 +15788,6 @@ fn search_done_event(
             "total": total,
             "truncated": truncated,
         }),
-    }
-}
-
-/// Maximum merge attempts the background sweep will make per sandbox before
-/// leaving it `merge_pending` for manual handling (`sandbox.cow.merge` /
-/// `sandbox.cow.discard`). `Blocked` outcomes do not consume attempts.
-pub(crate) const SANDBOX_MERGE_SWEEP_RETRY_CAP: i64 = 5;
-
-/// Outcome tally for one [`Services::sweep_merge_pending_sandboxes`] pass,
-/// used by the daemon's periodic loop for logging and by unit tests.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct MergeSweepSummary {
-    /// Sandboxes merged back into canonical and discarded.
-    pub merged: usize,
-    /// Merge attempts that hit conflicts (retry consumed, back to `merge_pending`).
-    pub conflicts: usize,
-    /// Merge attempts blocked externally (no retry consumed, back to `merge_pending`).
-    pub blocked: usize,
-    /// Sandboxes skipped because the retry cap was already exhausted.
-    pub skipped_capped: usize,
-    /// Sandboxes skipped because the owning agent is mid-turn.
-    pub skipped_busy: usize,
-    /// Sandboxes skipped because another merge path claimed them first.
-    pub skipped_raced: usize,
-    /// Hard errors (claim failures or merge errors; retry consumed on merge errors).
-    pub errors: usize,
-}
-
-impl MergeSweepSummary {
-    /// True when the sweep did nothing at all (no pending sandboxes touched).
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
     }
 }
 
@@ -21785,9 +21019,8 @@ impl WorkspaceApi for Services {
                     "unknown attachment id: {attachment_id}"
                 )));
             }
-            // Source side: ALWAYS the canonical workspace root (attachments
-            // are placed there by `file.placeAttachment`; a sandbox clone
-            // does not carry post-clone attachments).
+            // Source side: the workspace root (attachments are placed there
+            // by `file.placeAttachment`).
             let canonical_root =
                 file_ops::resolve_root(&store, &workspace_id, None, self.chief_cwd_root.as_deref())
                     .await;
@@ -21796,10 +21029,8 @@ impl WorkspaceApi for Services {
                     "workspace has no resolved filesystem root".to_string(),
                 ));
             }
-            // Destination side: the CALLER's working directory — the sandbox
-            // clone for CoW-sandboxed agents, else the canonical checkout
-            // (same session-derived resolution as other sandbox-aware
-            // bindings).
+            // Destination side: the caller's working directory, the
+            // workspace checkout.
             let dest_root = file_ops::resolve_root(
                 &store,
                 &workspace_id,
@@ -21809,6 +21040,17 @@ impl WorkspaceApi for Services {
             .await;
             file_ops::get_attachment(&canonical_root, &dest_root, &record, dest_dir.as_deref())
         })
+    }
+
+    fn file_pull(
+        &self,
+        workspace_id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+        from_agent_id: AgentId,
+        path: String,
+        to: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.file_pull_here(workspace_id, caller_agent_id, from_agent_id, path, to))
     }
 
     fn primitive_add_reference(
@@ -22227,16 +21469,6 @@ impl WorkspaceApi for Services {
                 tab_id: String,
                 force: bool,
             ) -> BoxFuture<'_, Result<serde_json::Value>> => browser_close_tab;
-            fn sandbox_merge(
-                &self,
-                workspace_id: WorkspaceId,
-                sandbox_id: AgentId,
-            ) -> BoxFuture<'_, Result<serde_json::Value>> => sandbox_merge;
-            fn sandbox_discard(
-                &self,
-                workspace_id: WorkspaceId,
-                sandbox_id: AgentId,
-            ) -> BoxFuture<'_, Result<serde_json::Value>> => sandbox_discard;
         }
     }
 
@@ -33968,11 +33200,6 @@ impl WorkspaceApi for Services {
     }
 
     // ========================================================================
-    // sandbox.* surface (PROTOCOL §5.34). Manual escape-hatch RPCs for
-    // triggering merge-back or discarding a sandbox when auto-merge fails.
-    // ========================================================================
-
-    // ========================================================================
     // pr.* read surface (PROTOCOL §5.7). Maps onto the host-agnostic
     // `SourceControl` trait (§7.5); `pr.status` requires an active PR on the
     // workspace (else `-32603`). Pure mapping/aggregation lives in `pr_ops`.
@@ -37893,79 +37120,6 @@ impl Services {
     }
 }
 
-/// Sandbox provisioning and lifecycle for `CoW` agent isolation (direct-mode and
-/// CoW-checkout workspaces).
-impl Services {
-    /// Provision a sandbox for an agent in a direct-mode or CoW-checkout workspace.
-    /// Returns `ProvisionOutcome::Supported` if `CoW` is available, or `Unsupported` for fallback.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Error::Internal` if `workspaces_root` is not configured or provisioning fails.
-    pub async fn provision_sandbox(
-        &self,
-        workspace_id: &WorkspaceId,
-        agent_id: &AgentId,
-    ) -> Result<feature_ports::ProvisionOutcome> {
-        let workspaces_root = self
-            .workspaces_root
-            .clone()
-            .ok_or_else(|| Error::Internal("workspaces_root not configured".to_string()))?;
-        self.ports
-            .runtime()
-            .provision_sandbox(self, workspace_id, agent_id, workspaces_root)
-            .await
-    }
-
-    /// Register an in-flight provisioning gate for `agent_id` (monorepo#871).
-    /// Called by the delegate op BEFORE it returns, so the child's turn
-    /// worker observes the gate before its first spawn attempt. The returned
-    /// sender is held by the background provisioning task; waiters are
-    /// released only when that sender drops — including on a panic, since
-    /// the sender drops with the task. Pair with
-    /// [`Services::settle_sandbox_provisioning`], which just removes the map
-    /// entry so later arrivals proceed immediately.
-    pub(crate) fn begin_sandbox_provisioning(
-        &self,
-        agent_id: &AgentId,
-    ) -> tokio::sync::watch::Sender<()> {
-        let (tx, rx) = tokio::sync::watch::channel(());
-        self.sandbox_provisioning
-            .lock()
-            .unwrap()
-            .insert(agent_id.clone(), rx);
-        tx
-    }
-
-    /// Remove the provisioning gate for `agent_id` once provisioning has
-    /// settled (success or shared-mode fallback). Waiters already holding a
-    /// cloned receiver are released when the paired sender drops; later
-    /// arrivals find no entry and proceed immediately.
-    pub(crate) fn settle_sandbox_provisioning(&self, agent_id: &AgentId) {
-        self.sandbox_provisioning.lock().unwrap().remove(agent_id);
-    }
-
-    /// Await settlement of an in-flight sandbox provisioning for `agent_id`,
-    /// if any (monorepo#871). No timeout by design: the `CoW` clone of a large
-    /// checkout may take tens of seconds and the whole point is that copy
-    /// time counts against no request-scoped budget. Returns immediately
-    /// when no provisioning is in flight (the common case for every turn
-    /// after the first).
-    pub(crate) async fn await_sandbox_provisioning(&self, agent_id: &AgentId) {
-        let rx = self
-            .sandbox_provisioning
-            .lock()
-            .unwrap()
-            .get(agent_id)
-            .cloned();
-        if let Some(mut rx) = rx {
-            // The provisioning task never sends a value; `changed()` resolves
-            // (with `Err`) when the sender drops, i.e. on settlement.
-            let _ = rx.changed().await;
-        }
-    }
-}
-
 /// Orchestration backing the `accept-changes.*` methods (§5.18). Kept on
 /// `Services` (not the trait) so the steps can share `self.store` /
 /// `self.source_control` / `self.event_bus` / `self.worktree_locks` and reuse the
@@ -39529,7 +38683,7 @@ async fn record_agent_file_mutation(
     // the attribution-filtered commit set is intersected against
     // `all_changed_paths` (worktree-relative), so a non-canonical path here
     // would silently drop the file from the agent's commits. When the mutation
-    // root is a sandbox (or empty), fall back to resolving against the
+    // root is empty, fall back to resolving against the
     // worktree itself; if neither resolves, skip rather than record a row
     // that can never match.
     let rel_path = match file_ops::workspace_relative(root, path)
