@@ -36,6 +36,7 @@ pub(crate) mod note;
 pub(crate) mod pr;
 pub(crate) mod primitive;
 pub(crate) mod script;
+pub(crate) mod search;
 pub(crate) mod secret;
 pub(crate) mod task;
 pub(crate) mod terminal;
@@ -95,6 +96,7 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
         discussion::PRELUDE,
         primitive::PRELUDE,
         cross_workspace::PRELUDE,
+        search::PRELUDE,
         pr.as_str(),
     ];
     if features.desktop_control {
@@ -252,6 +254,7 @@ pub(crate) const RETIRED_ALLOWED_METHODS: &[&str] = &[
     "script.monitorsPage",
     "script.output",
     "script.status",
+    "search.workspace",
     "task.getMyTask",
     "terminal.list",
     "terminal.readOutput",
@@ -377,6 +380,11 @@ pub(crate) async fn try_dispatch(
     }
     if let Some(rest) = method.strip_prefix("crossWorkspace.") {
         return cross_workspace::dispatch(api, workspace_id, rest, args)
+            .await
+            .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("search.") {
+        return search::dispatch(api, workspace_id, rest, args)
             .await
             .map(Some);
     }

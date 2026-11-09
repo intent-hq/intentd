@@ -157,9 +157,10 @@ Namespaces (index — full signatures in API below):
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot and host.exec
   ws.desktop.* — desktop control
   ws.browser.* — Chrome DevTools browser automation
-  ws.terminal.* — read workspace terminal output
+  ws.terminal.* — read terminal output
   ws.mcp.* — external MCP tools
   ws.crossWorkspace.* — search + read sibling workspaces
+  ws.search(query) — find notes + agent messages
   ws.file.* — read/write workspace project files
   ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state
   ws.mr.* — pr aliases
@@ -351,6 +352,7 @@ API:
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId, { startLine?, maxLines?, startOffset? }?) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec. A large note returns a page with `truncated: true`; pass `nextStartLine` as `startLine` (and a non-null `nextStartOffset` as `startOffset`, which resumes a cut line) to read on.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
   ws.crossWorkspace.search({ query?, pr?, includeRetired?, limit? }) → { matches, truncated }  // Find sibling workspaces (same scope as `listSiblings`) by free text and/or a PR. `query` matches title, branch, status message, tags and PR titles (every term) or note text; `pr` takes `123`, `#123`, `owner/repo#123` or a PR URL and uses the PR→workspace index. Both set = both must match. Rows: `{ id, title, branch, status, archived, updatedAt, matchedOn, pullRequests?, notes?, link, markdownLink }`, best first; `limit` defaults to 20 (max 100).
+  ws.search(query, { in?, agentId?, role?, limit? }?) → { notes?, messages?, truncated? }  // Full-text search of THIS workspace's notes and agent chat messages; `ws.crossWorkspace.search` covers the other workspaces. Every word must match and the last word also matches as a prefix. `in: "notes"` or `in: "messages"` searches one kind (default both); `agentId` and `role` (`"user"` or `"assistant"`) narrow the messages. Best matches first, up to `limit` per kind (default 10, max 20); `truncated: true` means more hits exist. Note rows: `{ noteId, title, preview, updatedAt, isArchived, link, markdownLink }`; message rows: `{ agentId, agentName, messageId, role, timestamp, preview }` (read the full message with `ws.agent.readConversation`).
 
   ws.file.read(path) → string  // Read an actual project file relative to workspace root. Do not use this for notes/spec content; use `ws.note.read()` for workspace notes. Paths outside the workspace are rejected.
   ws.file.write(path, content) → { ok, path, size }  // Writes/creates a file inside the workspace and records attribution.
@@ -443,9 +445,10 @@ Namespaces (index — full signatures in API below):
   ws.hook.* — background watchers; can call full ws.* incl. pr.snapshot
   ws.desktop.* — desktop control
   ws.browser.* — Chrome DevTools browser automation
-  ws.terminal.* — read workspace terminal output
+  ws.terminal.* — read terminal output
   ws.mcp.* — external MCP tools
   ws.crossWorkspace.* — search + read sibling workspaces
+  ws.search(query) — find notes + agent messages
   ws.file.* — read/write workspace project files
   ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state
   ws.mr.* — pr aliases
@@ -663,6 +666,7 @@ API:
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId, { startLine?, maxLines?, startOffset? }?) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec. A large note returns a page with `truncated: true`; pass `nextStartLine` as `startLine` (and a non-null `nextStartOffset` as `startOffset`, which resumes a cut line) to read on.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
   ws.crossWorkspace.search({ query?, pr?, includeRetired?, limit? }) → { matches, truncated }  // Find sibling workspaces (same scope as `listSiblings`) by free text and/or a PR. `query` matches title, branch, status message, tags and PR titles (every term) or note text; `pr` takes `123`, `#123`, `owner/repo#123` or a PR URL and uses the PR→workspace index. Both set = both must match. Rows: `{ id, title, branch, status, archived, updatedAt, matchedOn, pullRequests?, notes?, link, markdownLink }`, best first; `limit` defaults to 20 (max 100).
+  ws.search(query, { in?, agentId?, role?, limit? }?) → { notes?, messages?, truncated? }  // Full-text search of THIS workspace's notes and agent chat messages; `ws.crossWorkspace.search` covers the other workspaces. Every word must match and the last word also matches as a prefix. `in: "notes"` or `in: "messages"` searches one kind (default both); `agentId` and `role` (`"user"` or `"assistant"`) narrow the messages. Best matches first, up to `limit` per kind (default 10, max 20); `truncated: true` means more hits exist. Note rows: `{ noteId, title, preview, updatedAt, isArchived, link, markdownLink }`; message rows: `{ agentId, agentName, messageId, role, timestamp, preview }` (read the full message with `ws.agent.readConversation`).
 
   ws.file.read(path) → string  // Read an actual project file relative to workspace root. Do not use this for notes/spec content; use `ws.note.read()` for workspace notes. Paths outside the workspace are rejected.
   ws.file.write(path, content) → { ok, path, size }  // Writes/creates a file inside the workspace and records attribution.
@@ -1409,8 +1413,11 @@ pub(super) fn help_namespace(
             if let Some((name, _)) = rest.split_once(".*") {
                 Some(name.to_string())
             } else {
-                // The index's `ws.help(namespace?)` entry has no `.*`.
-                rest.starts_with("help(").then(|| "help".to_string())
+                // The index's callable entries (`ws.help(`, `ws.search(`) have no `.*`.
+                ["help", "search"]
+                    .into_iter()
+                    .find(|name| rest.starts_with(&format!("{name}(")))
+                    .map(str::to_string)
             }
         })
         .collect();
@@ -1897,14 +1904,17 @@ mod tests {
 
     // Parse the `Namespaces` index block near the top of a description into
     // the set of namespaces it names (each entry is `  ws.<ns>.* — hint`).
-    // The `ws.help(` entry is a callable, not a namespace — it has its own
-    // parity tests below and is skipped here.
+    // The `ws.help(` and `ws.search(` entries are callables, not namespaces —
+    // they have their own tests and are skipped here.
     fn index_namespaces(desc: &str) -> HashSet<String> {
         desc.lines()
             .skip_while(|l| !l.starts_with("Namespaces"))
             .skip(1)
             .take_while(|l| !l.trim().is_empty())
-            .filter(|l| !l.trim_start().starts_with("ws.help("))
+            .filter(|l| {
+                let entry = l.trim_start();
+                !entry.starts_with("ws.help(") && !entry.starts_with("ws.search(")
+            })
             .map(|l| {
                 l.trim_start()
                     .strip_prefix("ws.")

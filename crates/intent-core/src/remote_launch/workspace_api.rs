@@ -132,7 +132,7 @@ pub const LOCAL_METHODS: &[&str] = &[
 
 /// Single methods forwarded to head outside [`FORWARDED_NAMESPACES`]: the
 /// `workspace.*` calls other than `info`, the secondary-root list, the
-/// read-only terminal calls and structured questions (registered for the
+/// read-only terminal calls, `ws.search` and structured questions (registered for the
 /// agent's turn on head, so they drain onto its message there). Head runs them as the agent with a local
 /// agent's checks, so `setAgentName` renames only the caller, a sub-agent
 /// cannot propose, and `archive` / `unarchive` act on the workspace on head
@@ -157,6 +157,7 @@ pub const FORWARDED_METHODS: &[&str] = &[
     "git.listRoots",
     "terminal.list",
     "terminal.readOutput",
+    "search.workspace",
     "app.question.ask",
     "secret.request",
     "secret.list",
@@ -329,6 +330,7 @@ mod tests {
             "crossWorkspace.listSiblings",
             "crossWorkspace.readNote",
             "crossWorkspace.search",
+            "search.workspace",
             "git.listRoots",
             "terminal.list",
             "terminal.readOutput",
