@@ -81,12 +81,16 @@ async fn commit(
         )
         .await
         .map_err(map_err)?;
-    Ok(json!({
+    let mut out = json!({
         "ok": true,
         "hash": r.hash,
         "files": r.files,
         "fileCount": r.file_count,
-    }))
+    });
+    if let Some(pushed) = r.pushed {
+        out["pushed"] = json!(pushed);
+    }
+    Ok(out)
 }
 
 async fn register_root(

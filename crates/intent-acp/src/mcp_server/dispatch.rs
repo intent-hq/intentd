@@ -121,7 +121,8 @@ pub(super) const WORKSPACE_API_TIMEOUT: Duration = Duration::from_secs(30);
 /// The effective default budget: `INTENTD_WORKSPACE_API_TIMEOUT_MS` when set
 /// to a positive integer (defensive knob, monorepo#871), else
 /// [`WORKSPACE_API_TIMEOUT`]. Read at server construction time.
-pub(super) fn default_workspace_api_timeout() -> Duration {
+#[must_use]
+pub fn default_workspace_api_timeout() -> Duration {
     workspace_api_timeout_from(
         std::env::var("INTENTD_WORKSPACE_API_TIMEOUT_MS")
             .ok()

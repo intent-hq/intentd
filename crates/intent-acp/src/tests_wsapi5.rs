@@ -296,6 +296,7 @@ impl WorkspaceApi for FakeApi {
                 hash: "def456".to_string(),
                 files: vec!["a.txt".to_string(), "b.txt".to_string()],
                 file_count: 2,
+                pushed: None,
             })
         })
     }

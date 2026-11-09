@@ -3213,6 +3213,7 @@ mod mcp_tests {
                     hash: "deadbeef".to_string(),
                     files: vec!["a.txt".to_string()],
                     file_count: 1,
+                    pushed: None,
                 })
             })
         }

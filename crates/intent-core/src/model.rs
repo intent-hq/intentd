@@ -5951,6 +5951,10 @@ pub struct GitAgentCommitResult {
     pub hash: String,
     pub files: Vec<String>,
     pub file_count: i64,
+    /// A remote agent's commit only: whether its machine pushed the commit
+    /// to the backend before answering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pushed: Option<bool>,
 }
 
 /// `git.checkMergeConflicts` result, mirroring the TS `ws.git.checkMergeConflicts`

@@ -64,6 +64,7 @@ pub use mcp_env::is_likely_secret_env_key;
 pub use mcp_env::{build_baseline_mcp_env_from_process, EnvMap};
 pub use mcp_server::bindings_prelude_for_bridge;
 pub use mcp_server::bindings_prelude_for_workspace;
+pub use mcp_server::default_workspace_api_timeout;
 pub use mcp_server::dispatch_script_method;
 pub use mcp_server::workspace_api_docs::{
     WorkspaceApiDocs, WORKSPACE_API_DOCS_V1, WORKSPACE_API_DOCS_V3_10,

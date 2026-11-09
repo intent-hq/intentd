@@ -940,9 +940,15 @@ async fn placement_help_comes_from_head() {
                 }
             }
         });
-        let server = described_server(&agent(), &workspace(), dir.path(), (&gates(), None), head)
-            .await
-            .unwrap();
+        let server = described_server(
+            &agent(),
+            &workspace(),
+            dir.path(),
+            (&gates(), None),
+            (head, None),
+        )
+        .await
+        .unwrap();
         assert_eq!(asked.try_recv().unwrap(), json!(PLACEMENT_HELP_METHOD));
         let description = server.full_workspace_api_description();
         assert_eq!(description.contains(HELP), answers, "{description}");
@@ -959,7 +965,7 @@ async fn placement_help_comes_from_head() {
         &workspace(),
         dir.path(),
         (&gates(), None),
-        HeadLink::default(),
+        (HeadLink::default(), None),
     )
     .await
     .unwrap();
@@ -1270,7 +1276,7 @@ async fn proxied_user_mcp_servers_ride_session_new_and_call_head() {
         &workspace(),
         dir.path(),
         (&gates, None),
-        head,
+        (head, Arc::new(|_| Box::pin(async { false }))),
         Path::new("/opt/intent/intentd"),
     )
     .await
