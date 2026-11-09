@@ -3063,6 +3063,12 @@ async fn cmd_serve_owned(
     };
 
     let tunnel_supervisor = bootstrap.tunnel.clone();
+    // A resumed VM (paused E2B sandbox) or woken host keeps a tailcat that
+    // no dial reaches; restart it on each resume. Needs the clock-skew
+    // detector, so `wakeResume.enabled = false` turns this off too.
+    let tunnel_recycler = suspend_tracker
+        .as_ref()
+        .map(|tracker| tunnel::recycle_on_resume(tunnel_supervisor.clone(), tracker.subscribe()));
 
     // Command-script activity probe. It is created on every platform because
     // `DaemonControl.command_scripts` (read by `system.status` on non-unix)
@@ -3556,6 +3562,9 @@ async fn cmd_serve_owned(
     // separate owners before the final tunnel/listener stops below.
     if let Some(wake_resume) = wake_resume {
         let _ = wake_resume.await;
+    }
+    if let Some(tunnel_recycler) = tunnel_recycler {
+        tunnel_recycler.abort();
     }
     services.shutdown_settings().await;
     let phase = shutdown::Phase::start("agent_checkpoint");
