@@ -647,7 +647,9 @@ jobs:
           cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth -- --test-threads=2
           cargo test --locked -p intentd --features repository-test-fixtures --test suite_wss_g_r --test suite_wss_repo -- --test-threads=2 e2e_wss_invite_join_gitlab:: e2e_repository_resource_read::
 
-      - uses: taiki-e/install-action@cargo-shear
+      - uses: ./.github/actions/cargo-tools
+        with:
+          tools: cargo-shear
       # Blocking unused-dependency gate: fails when any crate declares a
       # dependency its code never uses. --deny-warnings promotes warnings
       # (e.g. unused optional dependencies) to errors so they cannot land
@@ -1603,8 +1605,9 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/cargo-tools
+        with:
+          tools: cargo-llvm-cov nextest
       # Proves coverage-report.sh on a real crate: a truncated .profraw is
       # dropped instead of ejecting a green run (run 42133300480), and an
       # empty or unreadable profile set fails as a labelled tooling fault.
@@ -1791,8 +1794,9 @@ jobs:
           fixture=$(python3 -I -B -S scripts/prepare-acp-callback-fixture.py \
             --cache-dir "$RUNNER_TEMP/acp-callback-fixture" --build-from-source)
           echo "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE=$fixture" >> "$GITHUB_ENV"
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/cargo-tools
+        with:
+          tools: cargo-llvm-cov nextest
       - name: Acquire the shared transfer selection contract
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Verify bounded coverage profile pooling
@@ -2027,10 +2031,10 @@ jobs:
           fixture=$(python3 -I -B -S scripts/prepare-acp-callback-fixture.py \
             --cache-dir "$RUNNER_TEMP/acp-callback-fixture" --build-from-source)
           echo "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE=$fixture" >> "$GITHUB_ENV"
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: ./.github/actions/cargo-tools
         if: steps.select.outputs.has_selection == 'true'
-      - uses: taiki-e/install-action@nextest
-        if: steps.select.outputs.has_selection == 'true'
+        with:
+          tools: cargo-llvm-cov nextest
       - name: Acquire the shared transfer selection contract
         if: steps.select.outputs.has_selection == 'true'
         uses: ./.github/actions/transfer-selection-fixtures
