@@ -74,22 +74,30 @@ fn is_false(value: &bool) -> bool {
 /// ([`SHARED_CHECKOUT_PROTOCOL`]); 14 adds agent secrets held on the
 /// machine ([`SECRETS_PROTOCOL`]); 15 adds the backend's forge token
 /// ([`FORGE_TOKEN_PROTOCOL`]); 16 adds reads of an agent's checkout files
-/// ([`CHECKOUT_FILES_PROTOCOL`]); each keeps everything the one before
+/// ([`CHECKOUT_FILES_PROTOCOL`]); 17 lets sub-agents fetch GitHub through the
+/// backend ([`FORGE_FETCH_PROTOCOL`]); each keeps everything the one before
 /// has. Neither 6 nor the single-node 5 ever
 /// shipped, and a protocol-6 peer cannot confirm a stop, so this build
-/// speaks 7 to 16: a backend never takes a stop as confirmed by a machine
+/// speaks 7 to 17: a backend never takes a stop as confirmed by a machine
 /// that cannot acknowledge it. The
 /// prepared enrollment-based versions 2-4 in monorepo
 /// `docs/protocol/node-link.md` are a different protocol. Within a version,
 /// later additions are optional with defaults, so peers on different builds
 /// interoperate inside their common range.
-pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 16 };
+pub const NODE_LINK_PROTOCOLS: ProtocolRange = ProtocolRange { min: 7, max: 17 };
 
 /// The first protocol with reads of an agent's checkout files for
 /// `ws.file.pull`: the [`LinkFrame::CheckoutRead`] /
 /// [`LinkFrame::CheckoutReadReply`] frames. The backend sends neither on a
 /// link that negotiated less, and a pull from an agent there fails at once.
 pub const CHECKOUT_FILES_PROTOCOL: u32 = 16;
+
+/// The first protocol where a sub-agent fetches the workspace's GitHub
+/// repository through the backend: [`LaunchCommand::forge_fetch`], the
+/// forge git remote (`intent://ws/<ws>/agents/<agent>/forge`), its ACCEPT
+/// warning and the `node-git-push-refused` close code. The backend sends
+/// none of them on a link that negotiated less.
+pub const FORGE_FETCH_PROTOCOL: u32 = 17;
 
 /// The first protocol with the backend's forge token on the machine: the
 /// [`LinkFrame::ForgeToken`] / [`LinkFrame::ForgeTokenReply`] frames and
@@ -482,6 +490,11 @@ pub struct LaunchCommand {
     /// [`FORGE_TOKEN_PROTOCOL`] or later, never for a sub-agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forge: Option<Box<ForgeLaunch>>,
+    /// A sub-agent's route to the workspace's GitHub repository through the
+    /// backend. Sent only on a link of [`FORGE_FETCH_PROTOCOL`] or later,
+    /// only for a sub-agent, never with [`Self::forge`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge_fetch: Option<Box<ForgeFetchLaunch>>,
     /// The commit identity the backend resolves for the workspace's
     /// checkout at this start, for every agent; absent when none resolves.
     /// Needs no protocol: a machine from before ignores it.
@@ -553,20 +566,52 @@ impl ForgeLaunch {
     /// with `node-checkout-failed`.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        let segment = |s: &str| {
-            !s.is_empty()
-                && !s.starts_with('.')
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        };
-        let url_ok = self
-            .remote_url
-            .strip_prefix("https://github.com/")
-            .and_then(|rest| rest.strip_suffix(".git"))
-            .and_then(|rest| rest.split_once('/'))
-            .is_some_and(|(owner, name)| segment(owner) && segment(name));
-        url_ok && valid_branch_name(&self.branch)
+        github_owner_repo(&self.remote_url).is_some() && valid_branch_name(&self.branch)
     }
+}
+
+/// [`LaunchCommand::forge_fetch`] (nodeProtocol 17): the GitHub repository a
+/// sub-agent's git reaches through the backend. The body is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForgeFetchLaunch {
+    /// `https://github.com/<owner>/<repo>.git`.
+    pub remote_url: String,
+}
+
+impl ForgeFetchLaunch {
+    /// The member for a workspace whose checkout's `origin` is `origin`:
+    /// `None` unless it names a GitHub repository.
+    #[must_use]
+    pub fn for_github(origin: &str) -> Option<Self> {
+        let repo = crate::git_remote_url::GitRemoteUrl::parse(origin)?.github_repo()?;
+        let launch = Self {
+            remote_url: format!("https://github.com/{}/{}.git", repo.owner, repo.name),
+        };
+        launch.owner_repo().is_some().then_some(launch)
+    }
+
+    /// `(owner, repo)` when `remote_url` has the form
+    /// `https://github.com/<owner>/<repo>.git`; a launch with any other
+    /// fails with `node-checkout-failed`.
+    #[must_use]
+    pub fn owner_repo(&self) -> Option<(&str, &str)> {
+        github_owner_repo(&self.remote_url)
+    }
+}
+
+/// `(owner, repo)` of `https://github.com/<owner>/<repo>.git`.
+fn github_owner_repo(url: &str) -> Option<(&str, &str)> {
+    let segment = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with('.')
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    url.strip_prefix("https://github.com/")
+        .and_then(|rest| rest.strip_suffix(".git"))
+        .and_then(|rest| rest.split_once('/'))
+        .filter(|(owner, name)| segment(owner) && segment(name))
 }
 
 /// The agent-local branch a top-level agent with [`LaunchCommand::forge`]
@@ -1277,6 +1322,7 @@ impl LinkFrame {
     #[must_use]
     pub fn min_protocol(&self) -> u32 {
         match self {
+            Self::Launch(command) if command.forge_fetch.is_some() => FORGE_FETCH_PROTOCOL,
             Self::Launch(command) if command.checkout_of.is_some() => SHARED_CHECKOUT_PROTOCOL,
             Self::PushWip(_) | Self::PushWipReply(_) => SHARED_CHECKOUT_PROTOCOL,
             Self::SecretPut(_)

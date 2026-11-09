@@ -92,9 +92,9 @@ fn the_daemon_to_daemon_link_speaks_protocols_7_to_16() {
     // frames, 9 final stops, 10 the prepared checkout, 11 the user MCP
     // server proxies, 12 the machine's skills, 13 sub-agent checkouts, 14
     // agent secrets on the machine, 15 the backend's forge token, 16 reads
-    // of an agent's checkout files; a protocol-7 peer still binds and runs
-    // agents.
-    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 16 });
+    // of an agent's checkout files, 17 sub-agent fetch through the backend;
+    // a protocol-7 peer still binds and runs agents.
+    assert_eq!(NODE_LINK_PROTOCOLS, ProtocolRange { min: 7, max: 17 });
     assert_eq!(SCRIPT_PROTOCOL, 8);
     assert_eq!(FINAL_STOP_PROTOCOL, 9);
     assert_eq!(PREPARED_CHECKOUT_PROTOCOL, 10);
@@ -104,9 +104,10 @@ fn the_daemon_to_daemon_link_speaks_protocols_7_to_16() {
     assert_eq!(SHARED_CHECKOUT_PROTOCOL, 13);
     assert_eq!(SECRETS_PROTOCOL, 14);
     assert_eq!(FORGE_TOKEN_PROTOCOL, 15);
-    assert_eq!(CHECKOUT_FILES_PROTOCOL, NODE_LINK_PROTOCOLS.max);
+    assert_eq!(CHECKOUT_FILES_PROTOCOL, 16);
+    assert_eq!(FORGE_FETCH_PROTOCOL, NODE_LINK_PROTOCOLS.max);
     assert!(offers_prepared_checkout());
-    for version in 7..=16 {
+    for version in 7..=17 {
         ensure_protocol(version).unwrap();
     }
     for peer in [0, 4, 5, 6, NODE_LINK_PROTOCOLS.max + 1] {
@@ -466,6 +467,7 @@ fn every_frame() -> Vec<LinkFrame> {
             compact_tool_descriptions: false,
             checkout_of: None,
             forge: None,
+            forge_fetch: None,
             git_identity: None,
             new_machine: None,
         }),
@@ -908,6 +910,7 @@ fn launch_profile_env_never_debug_renders_its_values() {
         compact_tool_descriptions: false,
         checkout_of: None,
         forge: None,
+        forge_fetch: None,
         git_identity: None,
         new_machine: None,
     };
@@ -938,6 +941,7 @@ fn launch_without_a_profile_omits_profile_env() {
         compact_tool_descriptions: false,
         checkout_of: None,
         forge: None,
+        forge_fetch: None,
         git_identity: None,
         new_machine: None,
     };
@@ -1281,6 +1285,7 @@ fn a_launch_with_a_checkout_needs_protocol_10() {
             compact_tool_descriptions: false,
             checkout_of: None,
             forge: None,
+            forge_fetch: None,
             git_identity: None,
             new_machine: None,
         })
@@ -1313,6 +1318,7 @@ fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
             compact_tool_descriptions: false,
             checkout_of: None,
             forge: None,
+            forge_fetch: None,
             git_identity: None,
             new_machine: None,
         };
@@ -1363,6 +1369,7 @@ fn a_launch_into_another_agents_checkout_needs_protocol_13() {
         checkout: None,
         checkout_of: Some(AgentId::from("parent")),
         forge: None,
+        forge_fetch: None,
         git_identity: None,
         new_machine: None,
         mcp_proxies: Vec::new(),
@@ -1595,6 +1602,49 @@ fn forge_tokens_never_render_in_debug_or_decode_errors() {
 /// A launch's `forge` member (protocol 15) is optional and closed, and
 /// raises the launch's protocol only when present.
 #[test]
+fn launch_forge_fetch_needs_protocol_17_and_is_closed() {
+    let LinkFrame::Launch(mut command) = every_frame()
+        .into_iter()
+        .find(|frame| matches!(frame, LinkFrame::Launch(c) if c.checkout.is_none() && c.mcp_proxies.is_empty() && c.checkout_of.is_none()))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    command.is_sub_agent = true;
+    command.forge_fetch = Some(Box::new(
+        ForgeFetchLaunch::for_github("git@github.com:o/r.git").unwrap(),
+    ));
+    let frame = LinkFrame::Launch(command);
+    let mut value = serde_json::to_value(&frame).unwrap();
+    assert_eq!(
+        value["forgeFetch"],
+        json!({ "remoteUrl": "https://github.com/o/r.git" })
+    );
+    assert_eq!(frame.min_protocol(), FORGE_FETCH_PROTOCOL);
+    // A sharing sub-agent's launch needs 17 too, not just the 13 of
+    // `checkoutOf`.
+    let LinkFrame::Launch(mut sharing) = frame.clone() else {
+        unreachable!()
+    };
+    sharing.checkout_of = Some(AgentId::from("agent-owner"));
+    assert_eq!(
+        LinkFrame::Launch(sharing).min_protocol(),
+        FORGE_FETCH_PROTOCOL
+    );
+    assert_eq!(
+        LinkFrame::decode(value.to_string().as_bytes()).unwrap(),
+        frame
+    );
+    value["forgeFetch"]["extra"] = json!(1);
+    assert!(LinkFrame::decode(value.to_string().as_bytes()).is_err());
+    assert!(ForgeFetchLaunch::for_github("https://gitlab.com/o/r.git").is_none());
+    let bad = ForgeFetchLaunch {
+        remote_url: "https://github.com/o/r".into(),
+    };
+    assert!(bad.owner_repo().is_none());
+}
+
+#[test]
 fn launch_forge_is_optional_and_needs_protocol_15() {
     let LinkFrame::Launch(mut command) = every_frame()
         .into_iter()
@@ -1683,6 +1733,7 @@ fn a_launchs_git_identity_is_optional_and_closed() {
         checkout: None,
         checkout_of: None,
         forge: None,
+        forge_fetch: None,
         git_identity: None,
         new_machine: None,
         mcp_proxies: Vec::new(),

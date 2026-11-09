@@ -108,6 +108,9 @@ pub struct SpawnOptions<'a> {
     /// folder and its contents ([`AgentTempDir::for_agent`]). `None` gives
     /// the launch a fresh folder removed with it.
     pub agent_tmp_key: Option<&'a str>,
+    /// A directory put first on the child's `PATH`, ahead of the enriched
+    /// one (a remote sub-agent's `git-remote-intent` helper).
+    pub path_prefix: Option<&'a Path>,
 }
 
 impl<'a> SpawnOptions<'a> {
@@ -174,6 +177,7 @@ impl<'a> SpawnOptions<'a> {
             profile_env: None,
             agent_tmp_root: None,
             agent_tmp_key: None,
+            path_prefix: None,
         }
     }
 }
@@ -803,7 +807,7 @@ fn build_command_in(
 
     // Enhanced PATH must include the binary's parent dir so dependencies resolve
     // (e.g., when spawning npx, node must be findable)
-    cmd.env("PATH", enhanced_path(opts.path_enrichment_binary()));
+    cmd.env("PATH", child_path(opts));
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -815,6 +819,16 @@ fn build_command_in(
     cmd.process_group(0);
     priority.apply(&mut cmd);
     cmd
+}
+
+/// The child's `PATH`: [`enhanced_path`], after [`SpawnOptions::path_prefix`].
+fn child_path(opts: &SpawnOptions<'_>) -> std::ffi::OsString {
+    let path = enhanced_path(opts.path_enrichment_binary());
+    let Some(prefix) = opts.path_prefix else {
+        return path.into();
+    };
+    std::env::join_paths(std::iter::once(prefix.to_path_buf()).chain(std::env::split_paths(&path)))
+        .unwrap_or_else(|_| path.into())
 }
 
 /// A spawned provider child paired with its live ACP [`Connection`] and, for
@@ -1103,7 +1117,7 @@ pub(crate) fn classify_not_found(
     process_cwd: Option<&Path>,
     e: &std::io::Error,
 ) -> AcpError {
-    let child_path = enhanced_path(opts.path_enrichment_binary());
+    let child_path = child_path(opts);
     classify_not_found_with_path(
         launch,
         target,

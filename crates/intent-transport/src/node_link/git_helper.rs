@@ -83,7 +83,19 @@ async fn connect(
         .read_u8()
         .await
         .map_err(|_| helper_error("the node git socket closed"))?;
-    if status != 0 {
+    if status == 2 {
+        let mut warning = Vec::new();
+        let _ = (&mut read)
+            .take(MAX_REQUEST)
+            .read_until(b'\n', &mut warning)
+            .await;
+        if String::from_utf8_lossy(&warning).trim() == super::git_session::FORGE_REFRESH_FAILED {
+            eprintln!(
+                "warning: {}",
+                super::git_session::FORGE_REFRESH_FAILED_MESSAGE
+            );
+        }
+    } else if status != 0 {
         let mut code = Vec::new();
         let _ = (&mut read)
             .take(MAX_REQUEST)
@@ -95,6 +107,9 @@ async fn connect(
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
             .collect();
+        if code == super::git_session::codes::PUSH_REFUSED {
+            eprintln!("error: {}", super::git_session::PUSH_REFUSED_MESSAGE);
+        }
         return Err(helper_error(&format!("head refused the session ({code})")));
     }
     output

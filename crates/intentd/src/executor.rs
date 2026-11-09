@@ -386,7 +386,7 @@ impl ExecutorService {
             storage.clone(),
             CheckoutCache::new(
                 storage.cache_dir(),
-                NodeGit::new(helper_dir, socket.clone()),
+                NodeGit::new(helper_dir.clone(), socket.clone()),
             ),
         );
         let runner = Runner::new(RunnerConfig {
@@ -401,6 +401,10 @@ impl ExecutorService {
             mcp_bridge_exe: self.deps.executable.clone(),
             git_socket: Some(socket),
             pull_staging: storage.pull_staging_dir(),
+            forge_git: Some(runner::ForgeGit {
+                helper_dir,
+                sessions: git_sessions.clone(),
+            }),
             auth_failed: {
                 let report = self.deps.report.clone();
                 Arc::new(move |provider: &str| report.launch_auth_failed(provider))

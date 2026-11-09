@@ -18,6 +18,8 @@ fn session_on_full_queue() -> (GitSession, GitSender, mpsc::Receiver<Vec<u8>>) {
         events: None,
         state: Arc::new(Mutex::new(NodeState::default())),
         closed: false,
+        warning: None,
+        _slot: None,
     };
     (session, sender, rx)
 }
