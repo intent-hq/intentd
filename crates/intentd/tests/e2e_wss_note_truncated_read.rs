@@ -9,7 +9,6 @@
 
 use crate::common;
 
-use std::fmt::Write as _;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
@@ -227,11 +226,12 @@ async fn next_push(ws: &mut TlsWs, sub_id: &str) -> Value {
 }
 
 /// 3,000 lines of mixed-width text, ~70 KB: large against the test limit.
+/// No trailing newline, so `note.create` stores it unchanged.
 fn large_body() -> String {
-    (0..3_000).fold(String::new(), |mut out, i| {
-        let _ = writeln!(out, "line {i}: é中😀");
-        out
-    })
+    (0..3_000)
+        .map(|i| format!("line {i}: é中😀"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn create_note(rpc: &mut TlsWs, content: &str) -> (String, String) {
@@ -437,7 +437,7 @@ async fn truncated_base_write_is_refused_over_wss() {
         );
     }
 
-    let full = format!("{body}full-read edit\n");
+    let full = format!("{body}\nfull-read edit\n");
     let ok = wss_rpc(
         &mut rpc,
         7,
@@ -507,7 +507,7 @@ async fn note_subscribe_truncates_snapshot_and_live_updates() {
         "snapshot row matches note.get"
     );
 
-    let grown = format!("{body}live line\n");
+    let grown = format!("{body}\nlive line\n");
     wss_rpc(
         &mut rpc,
         6,
