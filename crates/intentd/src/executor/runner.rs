@@ -74,6 +74,11 @@ const TERM_GRACE: Duration = Duration::from_secs(2);
 /// that left its process group can still be found after it exits (its
 /// children are reparented the moment it exits).
 const TRACK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The push inside a `ws.git.commit` or `ws.agent.reportToParent` call,
+/// lock wait included: well inside the 30 s `workspace_api` script budget,
+/// so a slow push can't cancel the report or hide the commit's hash.
+const IN_CALL_PUSH_BUDGET: Duration = Duration::from_secs(15);
 /// Set in every provider's environment to a value unique to that run, so
 /// its helpers (which inherit it) can be found after the provider exits,
 /// wherever they were reparented to.
@@ -2468,8 +2473,9 @@ impl Runner {
     }
 
     /// [`Self::push_now`] for `agent_id`'s `ws.git.commit` and
-    /// `ws.agent.reportToParent`: `true` once head has the checkout. It
-    /// holds the runner weakly, so the agent's MCP server does not keep it.
+    /// `ws.agent.reportToParent`: `true` once head has the checkout. The
+    /// lock wait and push together fit in [`IN_CALL_PUSH_BUDGET`]. It holds
+    /// the runner weakly, so the agent's MCP server does not keep it.
     fn push_now_for(&self, agent_id: &AgentId) -> workspace_api::PushNow {
         let runner = Arc::downgrade(&self.inner);
         let agent_id = agent_id.clone();
@@ -2481,10 +2487,18 @@ impl Runner {
                 // Like a turn-end push, it gives way to shutdown, so the
                 // agent's exit push starts within the budget.
                 let mut closing = runner.inner.closing_signal.subscribe();
-                tokio::select! {
-                    (pushed, _) = runner.push_now(&agent_id) => pushed == FinalPush::Pushed,
-                    Ok(_) = closing.wait_for(|closing| *closing) => false,
-                }
+                let push = async {
+                    tokio::select! {
+                        (pushed, _) = runner.push_now(&agent_id) => pushed == FinalPush::Pushed,
+                        Ok(_) = closing.wait_for(|closing| *closing) => false,
+                    }
+                };
+                tokio::time::timeout(IN_CALL_PUSH_BUDGET, push)
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::warn!(agent = %agent_id, "node: in-call push ran out of time");
+                        false
+                    })
             })
         })
     }

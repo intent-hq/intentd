@@ -97,11 +97,13 @@ pub(super) struct Gates {
     pub mcp_proxies: Vec<McpProxy>,
 }
 
+/// Push the agent's checkout to head now, one push of it at a time;
+/// `true` once head has it. The lock wait and push share one budget that
+/// fits inside the calling script's.
+pub(super) type PushNow = Arc<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>;
+
 /// The agent's MCP listeners: its workspace server's and one per proxied
 /// user server. They stop when this is dropped.
-/// Push the agent's checkout to head now, one push of it at a time;
-/// `true` once head has it. Bounded by the machine's push timeout.
-pub(super) type PushNow = Arc<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>;
 
 pub(super) struct Bridges(#[expect(dead_code, reason = "held for its drop")] Vec<McpBridge>);
 
