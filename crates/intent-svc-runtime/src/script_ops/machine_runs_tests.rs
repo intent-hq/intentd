@@ -17,6 +17,7 @@ struct Recorded {
     frames: Mutex<Vec<LinkFrame>>,
     changed: Mutex<Vec<String>>,
     wakes: Mutex<Vec<(AgentId, String)>>,
+    monitor_events: Mutex<Vec<(String, serde_json::Value)>>,
     unreachable: std::sync::atomic::AtomicBool,
     protocol: std::sync::atomic::AtomicU32,
 }
@@ -25,6 +26,7 @@ fn hooks(rec: &Arc<Recorded>) -> Hooks {
     let links = rec.clone();
     let changed = rec.clone();
     let wakes = rec.clone();
+    let monitors = rec.clone();
     Hooks {
         link: Arc::new(move |_agent| {
             let rec = links.clone();
@@ -58,6 +60,10 @@ fn hooks(rec: &Arc<Recorded>) -> Hooks {
         }),
         wake: Arc::new(move |_ws, agent, content| {
             wakes.wakes.lock().unwrap().push((agent, content));
+            Box::pin(async {})
+        }),
+        monitor: Arc::new(move |_ws, kind, row| {
+            monitors.monitor_events.lock().unwrap().push((kind, row));
             Box::pin(async {})
         }),
         restart_backoff: Duration::from_millis(20),
@@ -293,6 +299,7 @@ async fn a_lost_link_settles_live_runs_and_monitors_wake_their_agent() {
     frame(&runs, started(&start)).await;
     let monitor = runs
         .monitor(&place(&agent), &serde_json::json!({ "ttlMs": 60000 }))
+        .await
         .unwrap();
     assert_eq!(monitor["monitor"]["remoteAgentId"], agent.as_str());
     assert_eq!(monitor["monitor"]["nodeId"], "mac");
@@ -330,6 +337,7 @@ async fn an_output_pattern_monitor_wakes_once_on_a_matching_line() {
         &place(&agent),
         &serde_json::json!({ "ttlMs": 60000, "outputPattern": "ready on \\d+" }),
     )
+    .await
     .unwrap();
     frame(&runs, output(&start, 0, "booting\nready on 3000\n")).await;
     frame(&runs, output(&start, 1, "ready on 3001\n")).await;
@@ -347,6 +355,7 @@ async fn ending_an_agent_stops_its_runs_and_reports_unacknowledged_stops() {
         .await
         .unwrap();
     runs.monitor(&place(&agent), &serde_json::json!({ "ttlMs": 60000 }))
+        .await
         .unwrap();
     let deadline = tokio::time::Instant::now()
         + intentd_test_support::test_timeout(Duration::from_millis(100));
@@ -642,6 +651,7 @@ async fn a_monitor_wake_never_carries_a_huge_line() {
         &place(&agent),
         &serde_json::json!({ "ttlMs": 60000, "outputPattern": "needle" }),
     )
+    .await
     .unwrap();
     let huge = format!("{}needle{}\n", "a".repeat(200_000), "b".repeat(200_000));
     frame(&runs, output(&start, 0, &huge)).await;
@@ -676,6 +686,7 @@ async fn a_final_line_without_a_newline_matches_before_the_exit() {
         &place(&agent),
         &serde_json::json!({ "ttlMs": 60000, "outputPattern": "READY" }),
     )
+    .await
     .unwrap();
     frame(&runs, output(&start, 0, "READY")).await;
     frame(&runs, exited(&start, Some(0), None)).await;
@@ -701,6 +712,7 @@ async fn a_line_cut_off_by_a_lost_link_does_not_match() {
         &place(&agent),
         &serde_json::json!({ "ttlMs": 60000, "outputPattern": "Listening" }),
     )
+    .await
     .unwrap();
     frame(&runs, output(&start, 0, "Listening on port 30")).await;
     runs.link_lost("mac", "remote-script-lost: the machine disconnected")
@@ -758,6 +770,7 @@ async fn a_final_stop_ack_settles_the_runs_never_seen_ending() {
     let start = last_start(&rec);
     frame(&runs, started(&start)).await;
     runs.monitor(&place(&agent), &serde_json::json!({ "ttlMs": 60000 }))
+        .await
         .unwrap();
     let frames_before = rec.frames.lock().unwrap().len();
     runs.final_stop_acked(&agent, "remote-script-lost: the agent was stopped for good")
@@ -824,6 +837,7 @@ async fn a_monitor_on_a_finished_run_is_refused() {
     frame(&runs, exited(&start, Some(0), None)).await;
     let reply = runs
         .monitor(&place(&agent), &serde_json::json!({ "ttlMs": 60000 }))
+        .await
         .unwrap();
     assert_eq!(reply["ok"], false, "{reply}");
     assert_eq!(reply["refused"], true, "{reply}");
@@ -848,6 +862,7 @@ async fn a_stopped_runs_monitor_never_wakes_on_the_next_run() {
             &place(&agent),
             &serde_json::json!({ "ttlMs": 60000, "outputPattern": "ready" }),
         )
+        .await
         .unwrap();
     assert_eq!(reply["ok"], true, "{reply}");
     // An acknowledged stop of run A.
@@ -942,6 +957,7 @@ async fn stopping_or_restarting_a_monitored_run_wakes_once_cancelled() {
         runs.start(&here, &def).await.unwrap();
         frame(&runs, started(&last_start(&rec))).await;
         runs.monitor(&here, &serde_json::json!({ "ttlMs": 60000 }))
+            .await
             .unwrap();
         if restart {
             let acker = {
@@ -1008,6 +1024,7 @@ async fn a_stale_run_id_is_invalid_even_on_a_finished_run() {
             &place(&agent),
             &serde_json::json!({ "ttlMs": 60000, "runId": "not-this-run" }),
         )
+        .await
         .unwrap_err();
     assert!(
         matches!(error, intent_core::Error::InvalidParams(_)),
@@ -1080,4 +1097,304 @@ async fn a_failed_removal_keeps_refusing_until_the_final_stop_ends() {
         .await;
     runs.start(&place(&agent), &def).await.unwrap();
     assert_eq!(script_starts(&rec), 1);
+}
+
+fn monitor_events(rec: &Recorded) -> Vec<(String, serde_json::Value)> {
+    rec.monitor_events.lock().unwrap().clone()
+}
+
+/// Start `place`'s command run, mark it running and watch it with `options`;
+/// returns the start frame and the monitor id.
+async fn watched(
+    runs: &MachineRuns,
+    rec: &Arc<Recorded>,
+    here: &RunPlace,
+    mode: ScriptMode,
+    options: serde_json::Value,
+) -> (ScriptStartCommand, String) {
+    runs.start(here, &script(mode, "make")).await.unwrap();
+    let start = last_start(rec);
+    frame(runs, started(&start)).await;
+    let reply = runs.monitor(here, &options).await.unwrap();
+    let id = reply["monitor"]["monitorId"].as_str().unwrap().to_owned();
+    (start, id)
+}
+
+/// The workspace sees a machine-run monitor as it sees a home-run one: its
+/// row (plus `remoteAgentId` and `nodeId`) in the list, `scriptMonitor:registered` on
+/// registration, and a terminal event that clears it when the run ends.
+#[tokio::test]
+async fn a_machine_monitor_is_listed_and_published_until_its_run_ends() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let here = place(&agent);
+    let (start, id) = watched(
+        &runs,
+        &rec,
+        &here,
+        ScriptMode::Command,
+        serde_json::json!({ "ttlMs": 60000 }),
+    )
+    .await;
+
+    let listed = runs.monitors_in(&ws(), None);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let row = &listed[0];
+    assert_eq!(row["monitorId"], id.as_str());
+    assert_eq!(row["workspaceId"], "ws-1");
+    assert_eq!(row["agentId"], agent.as_str());
+    assert_eq!(row["scriptId"], "s1");
+    assert_eq!(row["scriptName"], "build");
+    assert_eq!(row["mode"], "command");
+    assert_eq!(row["state"], "active");
+    assert_eq!(
+        row["runId"],
+        runs.state(&here).unwrap().run_id.unwrap().as_str()
+    );
+    assert_eq!(row["remoteAgentId"], agent.as_str());
+    assert_eq!(row["nodeId"], "mac");
+    assert_eq!(runs.monitor_in(&ws(), &id).as_ref(), Some(row));
+    assert!(runs
+        .monitors_in(&WorkspaceId::from("other"), None)
+        .is_empty());
+    assert!(runs.monitors_in(&ws(), Some(&AgentId::new())).is_empty());
+    let waiting = runs.waiting(Some(&ws()));
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].1, agent);
+    assert_eq!(waiting[0].2["monitorId"], id.as_str());
+    assert_eq!(waiting[0].2["scriptName"], "build");
+
+    let events = monitor_events(&rec);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].0, "registered");
+    assert_eq!(&events[0].1, row);
+
+    frame(&runs, exited(&start, Some(0), None)).await;
+    assert!(runs.monitors_in(&ws(), None).is_empty());
+    assert!(runs.monitor_in(&ws(), &id).is_none());
+    assert!(runs.waiting(None).is_empty());
+    let events = monitor_events(&rec);
+    assert_eq!(events.len(), 2, "{events:?}");
+    let (kind, done) = &events[1];
+    assert_eq!(kind, "completed");
+    assert_eq!(done["monitorId"], id.as_str());
+    assert_eq!(done["state"], "completed");
+    assert_eq!(done["reason"], "finished");
+    assert_eq!(done["result"]["outcome"], "succeeded");
+    assert_eq!(done["result"]["exitCode"], 0);
+    assert!(done["settledAt"].is_string(), "{done}");
+    // The owner is still woken, told the machine by name.
+    let wakes = rec.wakes.lock().unwrap();
+    assert_eq!(wakes.len(), 1);
+    assert_eq!(wakes[0].0, agent);
+    assert!(
+        wakes[0].1.contains("(machine run on Mac)"),
+        "{}",
+        wakes[0].1
+    );
+}
+
+#[tokio::test]
+async fn a_failed_or_lost_run_clears_its_monitor() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let failing = AgentId::new();
+    let (start, _) = watched(
+        &runs,
+        &rec,
+        &place(&failing),
+        ScriptMode::Command,
+        serde_json::json!({ "ttlMs": 60000 }),
+    )
+    .await;
+    frame(&runs, exited(&start, Some(3), None)).await;
+    let (kind, row) = monitor_events(&rec).pop().unwrap();
+    assert_eq!(kind, "completed");
+    assert_eq!(row["result"]["outcome"], "failed");
+    assert_eq!(row["result"]["exitCode"], 3);
+
+    let lost = AgentId::new();
+    watched(
+        &runs,
+        &rec,
+        &place(&lost),
+        ScriptMode::Service,
+        serde_json::json!({ "ttlMs": 60000 }),
+    )
+    .await;
+    assert_eq!(runs.monitors_in(&ws(), None).len(), 1);
+    runs.link_lost("mac", "remote-script-lost: the machine disconnected")
+        .await;
+    assert!(runs.monitors_in(&ws(), None).is_empty());
+    let (kind, row) = monitor_events(&rec).pop().unwrap();
+    assert_eq!(kind, "completed");
+    assert_eq!(row["agentId"], lost.as_str());
+    assert_eq!(row["result"]["outcome"], "interrupted");
+    assert_eq!(
+        row["result"]["error"],
+        "remote-script-lost: the machine disconnected"
+    );
+    assert_eq!(rec.wakes.lock().unwrap().len(), 2, "both owners are woken");
+}
+
+#[tokio::test]
+async fn a_matching_line_triggers_and_clears_the_monitor() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let (start, id) = watched(
+        &runs,
+        &rec,
+        &place(&agent),
+        ScriptMode::Service,
+        serde_json::json!({ "ttlMs": 60000, "outputPattern": "ready" }),
+    )
+    .await;
+    assert_eq!(runs.monitors_in(&ws(), None)[0]["outputPattern"], "ready");
+    frame(&runs, output(&start, 0, "boot\nready\n")).await;
+    assert!(runs.monitors_in(&ws(), None).is_empty());
+    let (kind, row) = monitor_events(&rec).pop().unwrap();
+    assert_eq!(kind, "triggered");
+    assert_eq!(row["monitorId"], id.as_str());
+    assert_eq!(row["reason"], "output-match");
+    assert_eq!(row["trigger"]["matchedLine"], "ready");
+    assert_eq!(row["trigger"]["observedLineCount"], 2);
+    assert_eq!(rec.wakes.lock().unwrap().len(), 1);
+}
+
+/// `scriptMonitor.cancel` from the app: the monitor ends `cancelled`
+/// without a wake and the run keeps going; `cancelRun` also stops the run.
+#[tokio::test]
+async fn the_app_cancels_a_machine_monitor_or_its_run() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let here = place(&agent);
+    let (start, id) = watched(
+        &runs,
+        &rec,
+        &here,
+        ScriptMode::Service,
+        serde_json::json!({ "ttlMs": 60000 }),
+    )
+    .await;
+    assert!(
+        runs.cancel_monitor(&ws(), &id, Some(&AgentId::new()), false)
+            .await
+            .unwrap()
+            .is_none(),
+        "another owner's id is unknown"
+    );
+    assert!(runs
+        .cancel_monitor(&WorkspaceId::from("other"), &id, None, false)
+        .await
+        .unwrap()
+        .is_none());
+    let reply = runs
+        .cancel_monitor(&ws(), &id, None, false)
+        .await
+        .unwrap()
+        .expect("a machine monitor");
+    assert_eq!(reply["ok"], true);
+    assert_eq!(reply["monitorId"], id.as_str());
+    assert!(runs.monitors_in(&ws(), None).is_empty());
+    let (kind, row) = monitor_events(&rec).pop().unwrap();
+    assert_eq!(kind, "cancelled");
+    assert_eq!(row["reason"], "unmonitored");
+    assert!(rec.wakes.lock().unwrap().is_empty());
+    assert_eq!(runs.state(&here).unwrap().status, ScriptStatus::Running);
+
+    let again = runs
+        .monitor(&here, &serde_json::json!({ "ttlMs": 60000 }))
+        .await
+        .unwrap();
+    let id = again["monitor"]["monitorId"].as_str().unwrap().to_owned();
+    let stopping = {
+        let runs = runs.clone();
+        let id = id.clone();
+        tokio::spawn(async move { runs.cancel_monitor(&ws(), &id, None, true).await })
+    };
+    // The machine acknowledges the stop.
+    timeout_until(|| {
+        rec.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| matches!(f, LinkFrame::ScriptStop(_)))
+    })
+    .await;
+    frame(&runs, exited(&start, None, None)).await;
+    let reply = stopping.await.unwrap().unwrap().expect("a machine monitor");
+    assert_eq!(reply["runStopped"], true);
+    assert_eq!(runs.state(&here).unwrap().status, ScriptStatus::Idle);
+    let (kind, row) = monitor_events(&rec).pop().unwrap();
+    assert_eq!(kind, "completed");
+    assert_eq!(row["monitorId"], id.as_str());
+    assert_eq!(row["result"]["outcome"], "cancelled");
+}
+
+#[tokio::test]
+async fn a_replaced_monitor_leaves_the_list() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let here = place(&agent);
+    let (_, first) = watched(
+        &runs,
+        &rec,
+        &here,
+        ScriptMode::Service,
+        serde_json::json!({ "ttlMs": 60000 }),
+    )
+    .await;
+    let second = runs
+        .monitor(
+            &here,
+            &serde_json::json!({ "ttlMs": 60000, "outputPattern": "x" }),
+        )
+        .await
+        .unwrap();
+    let listed = runs.monitors_in(&ws(), None);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["monitorId"], second["monitor"]["monitorId"]);
+    let events = monitor_events(&rec);
+    let kinds: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["registered", "cancelled", "registered"],
+        "{events:?}"
+    );
+    assert_eq!(events[1].1["monitorId"], first.as_str());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_expired_monitor_leaves_the_list() {
+    let rec = Arc::new(Recorded::default());
+    let runs = MachineRuns::new(hooks(&rec));
+    let agent = AgentId::new();
+    let (_, id) = watched(
+        &runs,
+        &rec,
+        &place(&agent),
+        ScriptMode::Service,
+        serde_json::json!({ "ttlMs": 1000 }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(runs.monitors_in(&ws(), None).is_empty());
+    let (kind, row) = monitor_events(&rec).pop().unwrap();
+    assert_eq!(kind, "expired");
+    assert_eq!(row["monitorId"], id.as_str());
+    assert_eq!(row["reason"], "ttl-expired");
+}
+
+async fn timeout_until(done: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !done() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("condition reached");
 }

@@ -144,7 +144,7 @@ async fn remote_call_inner(
                 .output_reply(&place, max_lines(&args))
                 .unwrap_or_else(|| Value::String("No output yet.".to_owned())))
         }
-        "script.monitor" => runs(&mgr)?.monitor(&place(&args)?, &args),
+        "script.monitor" => runs(&mgr)?.monitor(&place(&args)?, &args).await,
         "script.monitors" => Ok(json!(runs(&mgr)?.monitors_of(&caller.agent_id))),
         "script.monitorsPage" => {
             Ok(json!({ "view": "summary", "monitors": runs(&mgr)?.monitors_of(&caller.agent_id) }))
@@ -159,7 +159,7 @@ async fn remote_call_inner(
         }
         "script.unmonitor" => {
             let id = str_arg(&args, "monitorId")?;
-            Ok(json!({ "ok": runs(&mgr)?.unmonitor(&caller.agent_id, &id), "monitorId": id }))
+            Ok(json!({ "ok": runs(&mgr)?.unmonitor(&caller.agent_id, &id).await, "monitorId": id }))
         }
         "script.create" => {
             if args.get("remoteAuthor").is_some() {

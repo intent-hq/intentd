@@ -147,6 +147,33 @@ pub fn register(services: Services) -> Services {
         .with_runtime_port(feature)
 }
 
+/// The active machine-run monitors of `workspace_id` (only `owner`'s when
+/// given), as workspace monitor rows.
+fn machine_monitors(
+    svc: &Services,
+    workspace_id: &WorkspaceId,
+    owner: Option<&AgentId>,
+) -> Vec<serde_json::Value> {
+    svc.script_manager()
+        .machine_runs()
+        .map(|runs| runs.monitors_in(workspace_id, owner))
+        .unwrap_or_default()
+}
+
+/// A monitor row in the `view: "summary"` shape: the pattern as a bounded
+/// preview.
+fn summary_row(mut row: serde_json::Value) -> serde_json::Value {
+    if let Some(map) = row.as_object_mut() {
+        if let Some(pattern) = map.remove("outputPattern") {
+            let text = pattern.as_str().unwrap_or_default();
+            let (prefix, cut) = intent_core::script_lists::prefix(text, 160);
+            map.insert("outputPatternTruncated".into(), serde_json::json!(cut));
+            map.insert("outputPatternPreview".into(), serde_json::json!(prefix));
+        }
+    }
+    row
+}
+
 impl RuntimePort for RuntimeFeature {
     fn remote_script_call<'a>(
         &'a self,
@@ -199,6 +226,17 @@ impl RuntimePort for RuntimeFeature {
                 runs.link_lost(node_id, reason).await;
             }
         })
+    }
+
+    fn machine_script_monitors_waiting(
+        &self,
+        svc: &Services,
+        workspace_id: Option<&WorkspaceId>,
+    ) -> Vec<(WorkspaceId, AgentId, serde_json::Value)> {
+        svc.script_manager()
+            .machine_runs()
+            .map(|runs| runs.waiting(workspace_id))
+            .unwrap_or_default()
     }
 
     fn machine_runs_live(&self, svc: &Services, node_id: &str) -> bool {
@@ -334,9 +372,21 @@ impl RuntimePort for RuntimeFeature {
             svc.require_member(&workspace_id).await?;
             let options = intent_core::script_lists::ScriptListOptions::parse(&options, true)?;
             if options.summary {
-                svc.store()
+                let mut page = svc
+                    .store()
                     .script_summary_page(&workspace_id, agent_id.as_ref(), true, &options)
-                    .await
+                    .await?;
+                // Remote agents' machine-run monitors live in memory, not in
+                // the paged table: they lead the first page.
+                if options.cursor.is_none() {
+                    let machine = machine_monitors(svc, &workspace_id, agent_id.as_ref());
+                    if let (false, Some(rows)) =
+                        (machine.is_empty(), page["monitors"].as_array_mut())
+                    {
+                        rows.splice(0..0, machine.into_iter().map(summary_row));
+                    }
+                }
+                Ok(page)
             } else {
                 svc.script_monitor_list(workspace_id, agent_id).await
             }
@@ -352,6 +402,18 @@ impl RuntimePort for RuntimeFeature {
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         Box::pin(async move {
             svc.require_member(&workspace_id).await?;
+            if let Some(row) = svc
+                .script_manager()
+                .machine_runs()
+                .and_then(|runs| runs.monitor_in(&workspace_id, &monitor_id))
+                .filter(|row| {
+                    owner
+                        .as_ref()
+                        .is_none_or(|id| row["agentId"] == id.as_str())
+                })
+            {
+                return Ok(row);
+            }
             let row = svc
                 .store()
                 .script_monitor(&workspace_id, &monitor_id)
@@ -489,9 +551,16 @@ impl RuntimePort for RuntimeFeature {
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         Box::pin(async move {
             svc.require_member(&workspace_id).await?;
-            Ok(
-                serde_json::json!({"monitors":svc.store().script_monitors(&workspace_id,agent_id.as_ref()).await?}),
+            let mut monitors = serde_json::to_value(
+                svc.store()
+                    .script_monitors(&workspace_id, agent_id.as_ref())
+                    .await?,
             )
+            .map_err(|e| Error::Internal(e.to_string()))?;
+            if let Some(rows) = monitors.as_array_mut() {
+                rows.extend(machine_monitors(svc, &workspace_id, agent_id.as_ref()));
+            }
+            Ok(serde_json::json!({ "monitors": monitors }))
         })
     }
 
@@ -507,8 +576,16 @@ impl RuntimePort for RuntimeFeature {
             svc.require_workspace_manager(&workspace_id, "script.stop")
                 .await?;
             svc.require_member(&workspace_id).await?;
-            svc.script_manager()
-                .cancel_monitor(&workspace_id, &monitor_id, owner.as_ref(), stop_run)
+            let mgr = svc.script_manager();
+            if let Some(runs) = mgr.machine_runs() {
+                if let Some(reply) = runs
+                    .cancel_monitor(&workspace_id, &monitor_id, owner.as_ref(), stop_run)
+                    .await?
+                {
+                    return Ok(reply);
+                }
+            }
+            mgr.cancel_monitor(&workspace_id, &monitor_id, owner.as_ref(), stop_run)
                 .await
         })
     }

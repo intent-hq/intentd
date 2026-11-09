@@ -897,6 +897,18 @@ pub trait RuntimePort: Send + Sync + 'static {
         Box::pin(async {})
     }
 
+    /// The active machine-run script monitors (remote agents' watches,
+    /// held in memory beside the stored ones), only `workspace_id`'s when
+    /// given, as `(workspace, owner, waiting row)`.
+    fn machine_script_monitors_waiting(
+        &self,
+        svc: &Services,
+        workspace_id: Option<&WorkspaceId>,
+    ) -> Vec<(WorkspaceId, AgentId, serde_json::Value)> {
+        let _ = (svc, workspace_id);
+        Vec::new()
+    }
+
     /// Whether a machine run is live on `node_id` (its link is then wanted).
     fn machine_runs_live(&self, svc: &Services, node_id: &str) -> bool {
         let _ = (svc, node_id);

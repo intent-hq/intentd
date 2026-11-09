@@ -590,6 +590,7 @@ impl ScriptManager {
         let wake_svc = services;
         let wake_port = self.agent_wake.clone();
         let publisher = self.clone();
+        let monitor_publisher = self.clone();
         machine_runs::MachineRuns::new(machine_runs::Hooks {
             link: Arc::new(move |agent| {
                 let svc = link_svc.clone();
@@ -615,9 +616,30 @@ impl ScriptManager {
                     }
                 })
             }),
+            monitor: Arc::new(move |ws, kind, row| {
+                let publisher = monitor_publisher.clone();
+                Box::pin(async move { publisher.publish_machine_monitor(&ws, &kind, row).await })
+            }),
             restart_backoff: Duration::from_secs(1),
             stop_wait: Duration::from_secs(10),
         })
+    }
+
+    /// Publish a machine-run monitor's transition as a home-run monitor's:
+    /// `scriptMonitor:<kind>`, then the workspace's `waiting` recompute.
+    async fn publish_machine_monitor(&self, ws: &WorkspaceId, kind: &str, row: Value) {
+        publish_event(
+            self.bus.as_ref(),
+            script_event(
+                ws,
+                &format!("scriptMonitor:{kind}"),
+                json!({ "monitor": row }),
+            ),
+        )
+        .await;
+        if let Some(services) = &self.owner_services {
+            services.maybe_emit_waiting_changed(ws).await;
+        }
     }
 
     /// The machine runs, when the owner's services are attached.

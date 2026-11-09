@@ -684,6 +684,14 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
     ) -> bool {
+        if !self
+            .ports
+            .runtime()
+            .machine_script_monitors_waiting(self, Some(workspace_id))
+            .is_empty()
+        {
+            return true;
+        }
         match self
             .store
             .workspaces_with_active_hooks_or_script_monitors(std::slice::from_ref(workspace_id))
