@@ -31,6 +31,8 @@ const E2B_KEY: &str = "e2b_test_key_0123456789abcdef0123456789abcdef";
 /// and deleted only with this key.
 const E2B_KEY_2: &str = "e2b_test_key_second_project_fedcba9876543210";
 const PROFILE_SECRET: &str = "sk-cloud-profile-secret-7f3a91";
+/// The words of the notice a relaunch on another machine starts with.
+const NOTICE: &str = "on a new machine";
 
 /// One fake sandbox: its directory, envd token and environment.
 struct FakeSandbox {
@@ -2248,7 +2250,6 @@ async fn a_restored_agent_is_told_it_runs_on_a_new_machine() {
     else {
         return;
     };
-    const NOTICE: &str = "on a new machine";
     let created = ok(
         &mut rpc_ws,
         5,
