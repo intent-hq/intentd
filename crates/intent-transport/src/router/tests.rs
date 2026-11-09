@@ -1574,6 +1574,7 @@ impl WorkspaceApi for FakeApi {
                 hash: hash.to_string(),
                 files,
                 file_count,
+                pushed: None,
             })
         })
     }

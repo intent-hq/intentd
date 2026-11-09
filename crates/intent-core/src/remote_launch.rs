@@ -394,7 +394,7 @@ impl BackendParentWork {
         let short = |commit: &str| commit.get(..12).unwrap_or(commit).to_owned();
         let Some(head) = self.head.as_deref() else {
             return format!(
-                "This sub-agent runs on the backend, and its parent has saved no work yet: its commits will be at `{}` and its uncommitted changes at `{}` once its machine pushes them (at the end of its turns).",
+                "This sub-agent runs on the backend, and its parent has saved no work yet: its commits will be at `{}` and its uncommitted changes at `{}` once its machine pushes them (after each `ws.git.commit`, before each report to its parent, and at the end of its turns).",
                 self.parent_ref(workspace_id, "head"),
                 self.parent_ref(workspace_id, "wip")
             );

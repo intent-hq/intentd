@@ -99,6 +99,10 @@ pub(super) struct Gates {
 
 /// The agent's MCP listeners: its workspace server's and one per proxied
 /// user server. They stop when this is dropped.
+/// Push the agent's checkout to head now, one push of it at a time;
+/// `true` once head has it. Bounded by the machine's push timeout.
+pub(super) type PushNow = Arc<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>;
+
 pub(super) struct Bridges(#[expect(dead_code, reason = "held for its drop")] Vec<McpBridge>);
 
 /// Start `agent_id`'s workspace MCP server and one listener per proxied
@@ -110,7 +114,7 @@ pub(super) async fn serve(
     workspace_id: &WorkspaceId,
     worktree: &Path,
     (gates, setup_status): (&Gates, Option<Value>),
-    head: HeadLink,
+    (head, push): (HeadLink, PushNow),
     bridge_exe: &Path,
 ) -> std::io::Result<(Bridges, Vec<McpServer>)> {
     let server = Arc::new(
@@ -119,7 +123,7 @@ pub(super) async fn serve(
             workspace_id,
             worktree,
             (gates, setup_status),
-            head.clone(),
+            (head.clone(), Some(push)),
         )
         .await?,
     );
@@ -133,6 +137,7 @@ pub(super) async fn serve(
         timeout: MCP_PROXY_LINK_TIMEOUT,
         setup_status: None,
         checkout: None,
+        push: None,
     };
     for proxy in &gates.mcp_proxies {
         // Head never names the reserved server; a proxy must not shadow it.
@@ -212,7 +217,7 @@ fn server(
     gates: &Gates,
     head: HeadLink,
 ) -> std::io::Result<WorkspaceMcpServer> {
-    server_with_setup(agent_id, workspace_id, worktree, (gates, None), head)
+    server_with_setup(agent_id, workspace_id, worktree, (gates, None), (head, None))
 }
 
 /// [`server`] whose `workspace.details` shows `setup_status`.
@@ -221,7 +226,7 @@ fn server_with_setup(
     workspace_id: &WorkspaceId,
     worktree: &Path,
     (gates, setup_status): (&Gates, Option<Value>),
-    head: HeadLink,
+    (head, push): (HeadLink, Option<PushNow>),
 ) -> std::io::Result<WorkspaceMcpServer> {
     let mut features: AgentFeaturesSettings = serde_json::from_value(gates.agent_features.clone())
         .map_err(|e| {
@@ -239,6 +244,7 @@ fn server_with_setup(
         timeout: DEFAULT_TIMEOUT,
         setup_status: setup_status.map(Arc::new),
         checkout: Some(Arc::new(worktree.to_path_buf())),
+        push: push.clone(),
     };
     let api = Arc::new(NodeApi {
         workspace_id: workspace_id.clone(),
@@ -246,6 +252,7 @@ fn server_with_setup(
         head: router.clone(),
         agent_id: agent_id.clone(),
         secrets,
+        push,
     });
     let server = WorkspaceMcpServer::new(api, workspace_id.clone())
         .with_caller_agent_id(Some(agent_id.clone()))
@@ -268,7 +275,7 @@ async fn described_server(
     workspace_id: &WorkspaceId,
     worktree: &Path,
     gates: (&Gates, Option<Value>),
-    head: HeadLink,
+    (head, push): (HeadLink, Option<PushNow>),
 ) -> std::io::Result<WorkspaceMcpServer> {
     let help = Router {
         agent_id: agent_id.clone(),
@@ -276,11 +283,12 @@ async fn described_server(
         timeout: DEFAULT_TIMEOUT,
         setup_status: None,
         checkout: None,
+        push: None,
     }
     .placement_help()
     .await;
     Ok(
-        server_with_setup(agent_id, workspace_id, worktree, gates, head)?
+        server_with_setup(agent_id, workspace_id, worktree, gates, (head, push))?
             .with_remote_placement_help(help),
     )
 }
@@ -344,7 +352,13 @@ struct Router {
     /// The agent's checkout, where the git roots head lists relative to it
     /// are resolved.
     checkout: Option<Arc<PathBuf>>,
+    /// Pushes the agent's checkout before a report reaches its parent.
+    push: Option<PushNow>,
 }
+
+/// The forwarded call that pushes the agent's checkout first, so a commit
+/// it reports is on head when the parent reads the report.
+const REPORT_METHOD: &str = "agent.reportToParent";
 
 impl HostFrameRouter for Router {
     fn route(
@@ -357,6 +371,16 @@ impl HostFrameRouter for Router {
             Route::Unsupported => {
                 let message = workspace_api::unsupported_message(method);
                 Some(Box::pin(async move { Err(message) }))
+            }
+            Route::Forward if method == REPORT_METHOD => {
+                let push = self.push.clone();
+                let forward = self.forward(method, args);
+                Some(Box::pin(async move {
+                    if let Some(push) = push {
+                        push().await;
+                    }
+                    forward.await
+                }))
             }
             Route::Forward => Some(Box::pin(self.forward(method, args))),
         }
@@ -593,6 +617,8 @@ struct NodeApi {
     /// The agent this server serves: the only one whose secrets it uses.
     agent_id: AgentId,
     secrets: Arc<HeldSecrets>,
+    /// Pushes the checkout after a commit.
+    push: Option<PushNow>,
 }
 
 impl NodeApi {
@@ -908,9 +934,14 @@ impl WorkspaceApi for NodeApi {
                 enabled,
                 user_requested,
             )?;
-            tokio::task::spawn_blocking(move || commit(&worktree, &message, files.as_deref()))
-                .await
-                .map_err(|e| Error::Internal(format!("node commit task failed: {e}")))?
+            let mut result =
+                tokio::task::spawn_blocking(move || commit(&worktree, &message, files.as_deref()))
+                    .await
+                    .map_err(|e| Error::Internal(format!("node commit task failed: {e}")))??;
+            if let Some(push) = &self.push {
+                result.pushed = Some(push().await);
+            }
+            Ok(result)
         })
     }
 }
@@ -919,9 +950,9 @@ fn no_git_roots() -> Error {
     Error::InvalidParams(workspace_api::GIT_ROOTS_MESSAGE.to_owned())
 }
 
-/// Commit in the agent's worktree: the named `files`, or every change. Its
-/// committed `HEAD` reaches head as the agent's `head` ref on the next WIP
-/// push (after the turn). The caller checked the auto-commit gate. Uses
+/// Commit in the agent's worktree: the named `files`, or every change. The
+/// caller pushes it to head right after. The caller checked the
+/// auto-commit gate. Uses
 /// the node's git identity, or a fixed agent
 /// identity when the node has none.
 fn commit(
@@ -987,6 +1018,7 @@ fn commit(
         hash,
         file_count: i64::try_from(files.len()).unwrap_or(i64::MAX),
         files,
+        pushed: None,
     })
 }
 

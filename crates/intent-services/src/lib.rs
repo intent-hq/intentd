@@ -30001,6 +30001,7 @@ impl WorkspaceApi for Services {
                     hash: outcome.hash,
                     files: outcome.files,
                     file_count,
+                    pushed: None,
                 })
             };
             let owner = tasks
