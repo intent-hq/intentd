@@ -258,7 +258,8 @@ struct State {
     /// that window still waits for the record.
     exiting: HashMap<AgentId, watch::Receiver<ExitRecord>>,
     /// Why each agent that left `agents` exited ([`exit_detail`]), for a
-    /// prompt that arrives after it; cleared by its next launch.
+    /// prompt that arrives after it; cleared by its next launch or when it
+    /// ends here for good.
     exit_details: HashMap<AgentId, String>,
     /// Agents a final stop is pushing and removing, each with the one
     /// cleanup every repeat of that stop joins (`None` until it finishes).
@@ -967,6 +968,7 @@ impl Runner {
         head.ended.insert(agent_id.clone());
         head.lease_agents.remove(agent_id);
         drop(head);
+        lock(&self.inner.state).exit_details.remove(agent_id);
         self.inner.head.secrets().forget(agent_id, None);
         self.inner.pulls.forget(agent_id.as_str());
     }
@@ -2826,9 +2828,19 @@ pub(super) fn remote_launch_env(
         .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
 }
 
+/// The most of an exit error [`exit_detail`] keeps.
+const EXIT_DETAIL_MAX: usize = 512;
+
 /// Why an agent exited, as a turn refused after it says: the start failure
 /// or exit error the exit record carries, else the provider's status.
 fn exit_detail(exit_code: Option<i32>, error: Option<&str>) -> String {
+    let error = error.map(|error| {
+        let mut end = error.len().min(EXIT_DETAIL_MAX);
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        &error[..end]
+    });
     match (error, exit_code) {
         (Some(error), _) if error.starts_with(codes::START) => {
             format!("the provider did not start ({error})")

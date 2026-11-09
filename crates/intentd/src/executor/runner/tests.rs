@@ -627,22 +627,21 @@ async fn node_runner_turn_refusal_carries_the_exit_reason() {
 /// A provider that exits with a status says so in the late turn's refusal.
 #[tokio::test]
 async fn node_runner_turn_refusal_names_the_exit_status() {
-    let Some(h) = harness(1, &["--exit-on-start", "3"]) else {
-        return;
-    };
+    let Some(h) = harness(1, &[]) else { return };
     h.runner.launch(launch("a1")).await;
-    wait_for(&h.runner, "exit", exited("a1")).await;
     h.runner
-        .prompt(&AgentId::from("a1"), "t1".into(), text("late"))
+        .prompt(&AgentId::from("a1"), "t1".into(), text("exit"))
         .await;
-    let all = wait_for(&h.runner, "late turn end", turn_ended("a1", "t1")).await;
-    let (_, error) = turn_end(find(&all, turn_ended("a1", "t1")));
-    let error = error.unwrap();
-    assert!(error.starts_with(codes::NOT_RUNNING), "{error}");
-    // The exit can win the race with `initialize` or lose it.
-    assert!(
-        error.contains("exited with status 3") || error.contains(codes::START),
-        "{error}"
+    let all = wait_for(&h.runner, "exit", exited("a1")).await;
+    assert_eq!(exit_error(find(&all, exited("a1"))), None);
+    h.runner
+        .prompt(&AgentId::from("a1"), "t2".into(), text("late"))
+        .await;
+    let all = wait_for(&h.runner, "late turn end", turn_ended("a1", "t2")).await;
+    let (_, error) = turn_end(find(&all, turn_ended("a1", "t2")));
+    assert_eq!(
+        error,
+        Some(format!("{}: the provider exited with status 0", codes::NOT_RUNNING).as_str())
     );
 }
 

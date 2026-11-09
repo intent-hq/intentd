@@ -1140,11 +1140,11 @@ fn remote_backup_failed_text(
             "{backup} uses an account folder on this backend, so it can't run on other \
              machines. Create a new agent with an API-key profile or the machine's own sign-in."
         )
-    } else if has("timed out") {
+    } else if has("request `initialize` timed out") {
         not_sign_in(format!(
             "the backup {backup} started on {machine}, but its provider did not respond in time"
         ))
-    } else if has("exited with status") || reason.ends_with("the agent has exited") {
+    } else if has("exited with status") {
         format!(
             "the provider stopped on {machine} before it was ready. Retry the message; if it \
              stops again, check that {backup} is signed in on {machine}, or create a new agent."
@@ -1159,14 +1159,21 @@ fn remote_backup_failed_text(
 }
 
 /// `reason` completed with the agent's recorded `placementError` when it
-/// does not already carry its detail: an older machine's refusal says only
-/// "the agent has exited", and the exit record may land after the turn end.
+/// carries no detail of its own: an older machine's refusal says only "the
+/// agent has exited". A reason with its own detail is kept as it is, so an
+/// error recorded for an earlier start cannot reword it.
 fn with_placement_error(
     reason: &str,
     placement: Option<&intent_core::remote_launch::PlacementError>,
 ) -> String {
     match placement {
-        Some(error) if !error.detail.is_empty() && !reason.contains(&error.detail) => {
+        Some(error)
+            if !error.detail.is_empty()
+                && reason
+                    .trim()
+                    .trim_end_matches('.')
+                    .ends_with("the agent has exited") =>
+        {
             format!("{reason} ({}: {})", error.code, error.detail)
         }
         _ => reason.to_owned(),

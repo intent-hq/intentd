@@ -824,10 +824,6 @@ fn each_provider_start_failure_names_its_own_cause() {
                  in on Mac",
             ][..],
         ),
-        (
-            "transport closed: node-agent-not-running: the agent has exited",
-            &["the provider stopped on Mac before it was ready"][..],
-        ),
     ] {
         let text =
             remote_backup_failed_text("claude-code", "claude-code@pb1", "Mac", reason, &saved());
@@ -864,6 +860,17 @@ fn the_placement_error_detail_completes_the_start_failure_reason() {
                 (node-agent-start-failed: request `initialize` timed out)";
     assert_eq!(with_placement_error(full, Some(&timeout)), full);
     assert_eq!(with_placement_error("boom", None), "boom");
+
+    // An error recorded for an earlier start never rewords a reason that
+    // carries its own detail.
+    let exited = "node-agent-not-running: the provider exited with status 1";
+    assert_eq!(with_placement_error(exited, Some(&timeout)), exited);
+    let text = remote_backup_failed_text("claude-code", "claude-code@pb1", "Mac", exited, &saved());
+    assert!(
+        text.contains("stopped on Mac before it was ready"),
+        "{text}"
+    );
+    assert!(!text.contains("did not respond in time"), "{text}");
 }
 
 /// Account and provider start failures (and failures without a code) keep
@@ -877,6 +884,12 @@ fn an_account_start_failure_still_suggests_signing_in() {
         "node-provider-unavailable: claude-code is not installed",
         "node-profile-unavailable: the account folder ~/.claude-backup does not exist",
         "the account folder ~/.claude-backup does not exist on this machine",
+        // A sign-in step that timed out is still a sign-in problem.
+        "node-agent-not-running: the provider did not start \
+         (node-agent-start-failed: request `authenticate` timed out)",
+        "node-agent-start-failed: OAuth login timed out",
+        // A bare exit with no recorded detail says nothing more.
+        "transport closed: node-agent-not-running: the agent has exited",
     ] {
         let text =
             remote_backup_failed_text("claude-code", "claude-code@pb1", "Mac", reason, &saved());
