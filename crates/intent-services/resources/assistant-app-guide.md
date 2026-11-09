@@ -908,11 +908,18 @@ until Intent sees them again.
 
 ## Home Workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence,home-workspace-menu,home-workspace-labels}.ts. Daemon: workspace.update `label`, packages/intentd/crates/intent-core/src/model.rs (normalize_workspace_label). -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence,home-workspace-menu,home-workspace-labels,home-hidden-repos}.ts. Daemon: workspace.update `label`, packages/intentd/crates/intent-core/src/model.rs (normalize_workspace_label). -->
 
 In **Home → Workspaces**, click a list row or board card to select it and show its
 preview. Double-click it, or Cmd-click (Ctrl-click on Windows and Linux), to open the
 workspace directly.
+
+Right-click a repository or local folder in the Home sidebar and choose **New
+workspace** to start one there, or **Hide** to remove it from the sidebar. A hidden
+repository's workspaces still show under **All repos**. Hidden repositories move to a
+collapsed **Hidden** section at the bottom of the sidebar; right-click one there and
+choose **Unhide** to bring it back. A hidden repository also comes back when a new
+workspace is created for it. Hidden repositories are remembered with Home's settings.
 
 Open **View options → Group by** in either list or board
 view. **Activity** keeps the broad **Needs you**, **Running**, and **Done & idle**
