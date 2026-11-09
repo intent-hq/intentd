@@ -1642,10 +1642,10 @@ fn a_launchs_git_identity_is_optional_and_closed() {
     let bare = serde_json::to_value(&command).unwrap();
     assert!(bare.get("gitIdentity").is_none(), "{bare}");
 
-    command.git_identity = Some(GitIdentity {
+    command.git_identity = Some(Box::new(GitIdentity {
         name: "Ada".into(),
         email: "ada@example.invalid".into(),
-    });
+    }));
     let wire = serde_json::to_value(&command).unwrap();
     assert_eq!(
         wire["gitIdentity"],

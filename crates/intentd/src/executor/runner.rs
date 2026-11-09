@@ -1192,6 +1192,7 @@ impl Runner {
             forge,
             git_identity,
         } = command;
+        let git_identity = git_identity.map(|identity| *identity);
         let forge = forge.map(|forge| *forge);
         let prepared = checkout.is_some();
         let both = prepared && checkout_of.is_some();

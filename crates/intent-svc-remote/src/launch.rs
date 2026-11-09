@@ -113,11 +113,11 @@ async fn forge_launch(svc: &Services, workspace_id: &WorkspaceId) -> Option<Box<
 
 /// The `launch.gitIdentity` for a workspace whose checkout is `checkout`:
 /// the identity a local agent's spawn there would get, or `None`.
-async fn git_identity(checkout: PathBuf) -> Option<GitIdentity> {
+async fn git_identity(checkout: PathBuf) -> Option<Box<GitIdentity>> {
     let (name, email) = blocking(move || Ok(intent_git::identity::commit_identity(&checkout)))
         .await
         .ok()??;
-    Some(GitIdentity { name, email })
+    Some(Box::new(GitIdentity { name, email }))
 }
 
 /// Whether an agent with `submodules` and `setup` starts from a checkout a

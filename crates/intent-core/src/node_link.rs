@@ -477,7 +477,7 @@ pub struct LaunchCommand {
     /// checkout at this start, for every agent; absent when none resolves.
     /// Needs no protocol: a machine from before ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_identity: Option<GitIdentity>,
+    pub git_identity: Option<Box<GitIdentity>>,
 }
 
 /// [`LaunchCommand::git_identity`]: the `user.name` and `user.email` the
