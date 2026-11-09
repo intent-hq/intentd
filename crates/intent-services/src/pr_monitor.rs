@@ -642,9 +642,60 @@ pub(crate) struct PrMonitorSnapshot {
     /// `branch_update_required_last_known`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unresolved_threads_last_known: Option<i64>,
+    /// The last known `requirements.mergeable`, carried while GitHub
+    /// recomputes mergeability; the same role as
+    /// `branch_update_required_last_known`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mergeable_last_known: Option<bool>,
+    /// The last known `requirements.mergeStateStatus` other than `UNKNOWN`,
+    /// carried while GitHub recomputes; the same role as
+    /// `branch_update_required_last_known`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_state_status_last_known: Option<String>,
+}
+
+/// A merge state that carries a verdict: GitHub reports `UNKNOWN` (or
+/// nothing) while it recomputes.
+pub(crate) fn known_merge_state(status: Option<&str>) -> Option<&str> {
+    status.filter(|s| *s != "UNKNOWN")
 }
 
 impl PrMonitorSnapshot {
+    /// Carry the last known value of each fact this read reports unknown
+    /// from `previous`, so the diff compares last known values.
+    pub(crate) fn carry_last_known(&mut self, previous: Option<&PrMonitorSnapshot>) {
+        let r = &self.requirements;
+        let unknown_update = r.branch_update_required.is_none();
+        let unknown_threads = r.threads.unresolved.is_none();
+        let unknown_mergeable = r.mergeable.is_none();
+        let unknown_merge_state = known_merge_state(r.merge_state_status.as_deref()).is_none();
+        self.branch_update_required_last_known = previous
+            .filter(|_| unknown_update)
+            .and_then(Self::branch_update_required_known);
+        self.unresolved_threads_last_known = previous
+            .filter(|_| unknown_threads)
+            .and_then(Self::unresolved_threads_known);
+        self.mergeable_last_known = previous
+            .filter(|_| unknown_mergeable)
+            .and_then(Self::mergeable_known);
+        self.merge_state_status_last_known = previous
+            .filter(|_| unknown_merge_state)
+            .and_then(Self::merge_state_status_known)
+            .map(str::to_string);
+    }
+
+    /// The forge's tri-state mergeability, or the last known one while
+    /// GitHub recomputes it.
+    pub(crate) fn mergeable_known(&self) -> Option<bool> {
+        self.requirements.mergeable.or(self.mergeable_last_known)
+    }
+
+    /// The merge state, or the last known one while GitHub recomputes it.
+    pub(crate) fn merge_state_status_known(&self) -> Option<&str> {
+        known_merge_state(self.requirements.merge_state_status.as_deref())
+            .or(self.merge_state_status_last_known.as_deref())
+    }
+
     /// The forge's branch-update verdict, or the last known one while the
     /// current read reports it unknown.
     pub(crate) fn branch_update_required_known(&self) -> Option<bool> {
@@ -848,14 +899,7 @@ impl SharedPrSnapshot {
         } else {
             None
         };
-        // An unknown read keeps the last known value for the diff.
-        let branch_update_required_last_known = previous
-            .filter(|_| requirements.branch_update_required.is_none())
-            .and_then(PrMonitorSnapshot::branch_update_required_known);
-        let unresolved_threads_last_known = previous
-            .filter(|_| requirements.threads.unresolved.is_none())
-            .and_then(PrMonitorSnapshot::unresolved_threads_known);
-        PrMonitorSnapshot {
+        let mut snapshot = PrMonitorSnapshot {
             title: self.title.clone(),
             url: self.url.clone(),
             head_sha: self.head_sha.clone(),
@@ -878,9 +922,14 @@ impl SharedPrSnapshot {
             latest_reviews_carried,
             checks_not_started_delivered: same_head
                 .and_then(|p| p.checks_not_started_delivered.clone()),
-            branch_update_required_last_known,
-            unresolved_threads_last_known,
-        }
+            branch_update_required_last_known: None,
+            unresolved_threads_last_known: None,
+            mergeable_last_known: None,
+            merge_state_status_last_known: None,
+        };
+        // An unknown read keeps the last known value for the diff.
+        snapshot.carry_last_known(previous);
+        snapshot
     }
 }
 
@@ -6624,6 +6673,8 @@ mod tests {
             latest_reviews_carried: false,
             branch_update_required_last_known: None,
             unresolved_threads_last_known: None,
+            mergeable_last_known: None,
+            merge_state_status_last_known: None,
         };
         f(&mut s);
         s
@@ -6984,13 +7035,34 @@ mod tests {
         });
         assert!(diff_snapshots(&base, &blip).is_empty());
 
-        // Settling FROM unknown at a known value still reports.
+        // Settling FROM a never-known value reports.
         let known = snapshot(|s| s.requirements.mergeable = Some(false));
         let changes = diff_snapshots(&blip, &known);
         assert!(changes.iter().any(|c| c == "mergeable: unknown → false"));
         assert!(changes
             .iter()
             .any(|c| c == "merge state: UNKNOWN → BLOCKED"));
+
+        // A blip carrying the last known values (an unrelated wake moved the
+        // emit baseline onto it) is silent when it settles at the same
+        // values, and reports a different value against the last known one.
+        let carried = snapshot(|s| {
+            s.requirements.mergeable = None;
+            s.requirements.merge_state_status = Some("UNKNOWN".into());
+            s.mergeable_last_known = Some(true);
+            s.merge_state_status_last_known = Some("BLOCKED".into());
+        });
+        assert!(diff_snapshots(&base, &carried).is_empty());
+        assert!(diff_snapshots(&carried, &base).is_empty());
+        let clean = snapshot(|s| s.requirements.merge_state_status = Some("CLEAN".into()));
+        assert_eq!(
+            diff_snapshots(&carried, &clean),
+            vec!["merge state: BLOCKED → CLEAN"]
+        );
+        assert_eq!(
+            diff_snapshots(&carried, &known),
+            vec!["mergeable: true → false"]
+        );
     }
 
     /// The same transient recomputation also clears the DERIVED fields
@@ -9441,6 +9513,8 @@ mod tests {
             latest_reviews_carried: !b,
             branch_update_required_last_known: Some(!b),
             unresolved_threads_last_known: Some(pick(b, 4, 6)),
+            mergeable_last_known: Some(b),
+            merge_state_status_last_known: Some(pick(b, "BEHIND", "DIRTY").into()),
         }
     }
 
@@ -9833,6 +9907,14 @@ mod tests {
         (
             "/unresolvedThreadsLastKnown",
             "read only while the thread count is unknown",
+        ),
+        (
+            "/mergeableLastKnown",
+            "read only while mergeability is unknown",
+        ),
+        (
+            "/mergeStateStatusLastKnown",
+            "read only while the merge state is unknown",
         ),
         (
             "/requirements/mergeQueueEjection/reason",

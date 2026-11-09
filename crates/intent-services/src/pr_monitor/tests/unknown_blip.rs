@@ -166,3 +166,60 @@ async fn thread_read_blip_never_wakes_unless_the_count_changed() {
         );
     }
 }
+
+/// While GitHub recomputes, GraphQL `mergeStateStatus` reads `UNKNOWN` and
+/// REST `mergeable` reads null as well.
+fn full_blip(s: &mut ForgeState) {
+    blip(s, false);
+    s.mergeable = None;
+}
+
+fn full_settle(s: &mut ForgeState, state: &str, mergeable: bool) {
+    settle(s, state);
+    s.mergeable = Some(mergeable);
+}
+
+fn merge_lines(changes: &[String]) -> Vec<&String> {
+    changes
+        .iter()
+        .filter(|c| c.starts_with("mergeable:") || c.starts_with("merge state:"))
+        .collect()
+}
+
+/// An unrelated wake delivered mid-blip moves the emit baseline onto the
+/// unknown merge state. Settling back at the value the agent was last told
+/// is silent; a different value reports against that last known value.
+#[tokio::test]
+async fn merge_state_blip_settling_after_an_unrelated_wake_reports_only_a_change() {
+    let (_db, _root, svc, forge, ws, owner) = setup().await;
+    let id = register(&svc, &ws, &owner).await.monitor_id;
+    forge.edit(|s| {
+        full_blip(s);
+        s.conversation_comments = 1;
+    });
+    svc.poll_pr_monitors().await;
+    assert_eq!(
+        pending(&svc, &id).await,
+        vec!["+1 conversation comment (1 total)"]
+    );
+    assert!(flush(&svc, &ws, &id).await);
+    forge.edit(|s| full_settle(s, "clean", true));
+    svc.poll_pr_monitors().await;
+    assert_eq!(pending(&svc, &id).await, Vec::<String>::new());
+    assert!(!flush(&svc, &ws, &id).await);
+
+    forge.edit(|s| {
+        full_blip(s);
+        s.conversation_comments = 2;
+    });
+    svc.poll_pr_monitors().await;
+    assert!(flush(&svc, &ws, &id).await);
+    forge.edit(|s| full_settle(s, "dirty", false));
+    svc.poll_pr_monitors().await;
+    let changes = pending(&svc, &id).await;
+    assert_eq!(
+        merge_lines(&changes),
+        vec!["mergeable: true → false", "merge state: CLEAN → DIRTY"],
+        "{changes:?}"
+    );
+}

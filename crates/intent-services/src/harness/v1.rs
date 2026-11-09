@@ -1213,12 +1213,11 @@ impl Harness for V1 {
         // direction is suppressed alongside the raw `mergeable`/`merge
         // state` transitions (the appearing direction always reports). A
         // blip either reverts (net silent against the emit baseline) or
-        // settles at a known value, which then reports as a single
-        // old → new line.
-        let merge_state_known = n
-            .merge_state_status
-            .as_deref()
-            .is_some_and(|s| s != "UNKNOWN");
+        // settles at a known value, which reports as a single old → new line
+        // only when it differs from the last known one, even after an
+        // unrelated wake moved the emit baseline onto the unknown read.
+        let merge_state_known =
+            crate::pr_monitor::known_merge_state(n.merge_state_status.as_deref()).is_some();
         let recomputing = n.mergeable.is_none() || !merge_state_known;
         if o.has_conflicts != n.has_conflicts && (n.has_conflicts || !recomputing) {
             changes.push(if n.has_conflicts {
@@ -1338,17 +1337,19 @@ impl Harness for V1 {
             }
             _ => {}
         }
-        if o.mergeable != n.mergeable && n.mergeable.is_some() {
+        if n.mergeable.is_some() && old.mergeable_known() != n.mergeable {
             changes.push(format!(
                 "mergeable: {} → {}",
-                describe_opt(o.mergeable),
+                describe_opt(old.mergeable_known()),
                 describe_opt(n.mergeable)
             ));
         }
-        if o.merge_state_status != n.merge_state_status && merge_state_known {
+        if merge_state_known && old.merge_state_status_known() != n.merge_state_status.as_deref() {
             changes.push(format!(
                 "merge state: {} → {}",
-                o.merge_state_status.as_deref().unwrap_or("unknown"),
+                old.merge_state_status_known()
+                    .or(o.merge_state_status.as_deref())
+                    .unwrap_or("unknown"),
                 n.merge_state_status.as_deref().unwrap_or("unknown")
             ));
         }
