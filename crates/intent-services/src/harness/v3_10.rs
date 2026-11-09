@@ -57,7 +57,7 @@ mod tests {
     use intent_core::nodes::{NodeArch, NodeOs};
     use intent_core::placement::AgentPlatform;
 
-    use crate::session_surface_goldens::{fixture, surfaces_for, variant};
+    use crate::session_surface_goldens::{fixture, variant};
 
     fn machine(id: &str) -> ExposedMachine {
         ExposedMachine {
