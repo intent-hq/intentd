@@ -293,7 +293,9 @@ impl E2bClient {
         Ok(ConnectedSandbox { sandbox, resumed })
     }
 
-    /// Pause a running sandbox, keeping its memory.
+    /// Pause a running sandbox, keeping its memory. The POST has no body, so
+    /// it states `Content-Length: 0`: E2B answers 411 without it
+    /// (intent-hq/intent#8865).
     ///
     /// # Errors
     ///
@@ -302,9 +304,12 @@ impl E2bClient {
     pub async fn pause(&self, sandbox_id: &str) -> Result<(), E2bError> {
         validate_sandbox_id(sandbox_id)?;
         let url = format!("{}/sandboxes/{sandbox_id}/pause", self.api());
-        self.execute(Op::Pause, &[], || self.rest(self.http.post(&url)))
-            .await
-            .map(drop)
+        self.execute(Op::Pause, &[], || {
+            self.rest(self.http.post(&url))
+                .header(reqwest::header::CONTENT_LENGTH, "0")
+        })
+        .await
+        .map(drop)
     }
 
     /// Set the sandbox to expire `timeout_secs` from now (replaces the old value).
