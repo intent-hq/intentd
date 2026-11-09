@@ -1749,7 +1749,9 @@ impl Runner {
                         let timed_out = matches!(outcome, Outcome::StartFailed(..));
                         tracing::info!(agent = %agent.id, timed_out, "node: provider did not start; starting it once more");
                         // The first start's processes are gone.
-                        agent.descendants.publish(agent.descendants.begin(), Vec::new());
+                        agent
+                            .descendants
+                            .publish(agent.descendants.begin(), Vec::new());
                         continue;
                     }
                     break match outcome {
@@ -2205,8 +2207,7 @@ impl Runner {
         // The agent's workspace MCP server and its proxied user servers ride
         // `session/new`, which every ACP agent accepts stdio servers on.
         let setup = async {
-            intent_acp::handshake_within(connection, &launch.config, initialize_timeout)
-                .await?;
+            intent_acp::handshake_within(connection, &launch.config, initialize_timeout).await?;
             intent_acp::session::new_session(connection, cwd, mcp, None).await
         };
         let session = tokio::select! {

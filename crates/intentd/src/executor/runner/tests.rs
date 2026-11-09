@@ -698,7 +698,7 @@ async fn node_runner_gives_up_after_the_second_start_and_says_why() {
     // Long enough for a loaded machine to boot node and log each start.
     h.runner
         .set_initialize_timeouts(Duration::from_secs(3), Duration::from_secs(60));
-        h.runner.launch(launch("a1")).await;
+    h.runner.launch(launch("a1")).await;
     let all = wait_for(&h.runner, "exit", exited("a1")).await;
     let exit = exit_error(find(&all, exited("a1"))).unwrap().to_owned();
     assert_eq!(
