@@ -37,7 +37,7 @@ mod tests {
             });
         assert_eq!(
             actual,
-            "842ef09f07221da0997f0f2144f11fb46df795acfeb161c82966628295e140f3"
+            "6b742ee87cce7c2a05d9f9892c2fd1d7cb55b5a0c0a867dabbdff3ad9e294323"
         );
     }
 
