@@ -89,10 +89,8 @@ const GUARD_PRELUDE_TEMPLATE: &str = r"
         const PASS = new Set(['then', 'toJSON', 'constructor', 'prototype', 'inspect', 'valueOf', 'toString', 'length', 'name', 'call', 'apply', 'bind', 'catch', 'finally']);
         const wrapped = new WeakMap();
         const cached = (obj, path, make) => {
-            let byPath = wrapped.get(obj);
-            if (!byPath) wrapped.set(obj, (byPath = new Map()));
-            if (!byPath.has(path)) byPath.set(path, make());
-            return byPath.get(path);
+            if (!wrapped.has(obj)) wrapped.set(obj, make());
+            return wrapped.get(obj);
         };
         const join = (path, prop) => (path ? path + '.' + prop : prop);
         const suggest = (path, known) => () => host({ method: 'help.suggest', args: { path, known } });
