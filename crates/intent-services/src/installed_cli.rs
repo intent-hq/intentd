@@ -250,10 +250,21 @@ impl InstalledContext {
         values
     }
 
+    /// A non-empty variable of the launch environment.
+    pub fn env_value(&self, key: &str) -> Option<&std::ffi::OsStr> {
+        nonempty(&self.env, key).map(OsString::as_os_str)
+    }
+
     pub fn codex_home(&self) -> Option<PathBuf> {
         nonempty(&self.env, "CODEX_HOME")
             .map(PathBuf::from)
             .or_else(|| self.home().map(|p| p.join(".codex")))
+    }
+
+    pub fn claude_config_dir(&self) -> Option<PathBuf> {
+        nonempty(&self.env, "CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(|| self.home().map(|p| p.join(".claude")))
     }
 
     fn home(&self) -> Option<PathBuf> {

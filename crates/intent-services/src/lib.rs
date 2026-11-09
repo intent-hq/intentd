@@ -227,6 +227,7 @@ mod local_work;
 mod member_removal;
 mod model_catalog;
 mod model_preference;
+mod native_rules;
 mod nested_repos;
 mod note_merge;
 pub mod note_ops;
