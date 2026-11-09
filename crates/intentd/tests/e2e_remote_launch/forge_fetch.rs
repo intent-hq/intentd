@@ -11,7 +11,6 @@
 
 use super::forge_push::{child_named, sh, sh_ok};
 use super::forge_token::backend_with_token_env;
-use super::secrets::agent_turn;
 use super::*;
 
 const ORIGIN: &str = "https://github.com/acme/widget.git";
@@ -135,13 +134,31 @@ async fn sub_agents_fetch_github_through_the_backend_and_cannot_push() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
     let parent = (ws_id.as_str(), parent.as_str());
+    // The first turn carries the forge notice; take it before the wsapi turn.
+    ok(
+        &mut rpc_ws,
+        50,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent.1, "content": "echo-raw" }),
+    )
+    .await;
+    reply_containing(&mut rpc_ws, parent, "raw: ", 51).await;
 
     // One child shares the parent's checkout; one has its own on Far.
     let code = format!(
         r#"wsapi const s = await ws.agent.create("Sharer", "echo-raw", {{ provider: "mock", model: "default" }}); const f = await ws.agent.create("Far", "echo-raw", {{ provider: "mock", model: "default", placement: {{ target: "remote", nodeId: {far_id:?} }} }}); return JSON.stringify({{ marker: "made-1", s, f }});"#,
         far_id = far.daemon_id,
     );
-    agent_turn(&mut rpc_ws, &mut events, parent, &code, "made-1", 100).await;
+    // The children's completions wake the parent, so read this turn's reply
+    // from the conversation.
+    ok(
+        &mut rpc_ws,
+        100,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": parent.1, "content": code }),
+    )
+    .await;
+    reply_containing(&mut rpc_ws, parent, "made-1", 101).await;
     let sharer = child_named(&mut rpc_ws, &ws_id, "Sharer", 200).await;
     let far_child = child_named(&mut rpc_ws, &ws_id, "Far", 300).await;
     let sharer = (ws_id.as_str(), sharer.as_str());
