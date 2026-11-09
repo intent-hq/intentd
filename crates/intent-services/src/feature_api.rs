@@ -157,8 +157,9 @@ pub mod events {
 /// Workspace file locations.
 pub mod file_ops {
     pub use crate::file_ops::{
-        check_attachment_dest, delete, list, mkdir, read, rename, resolve_attachment_source,
-        workspace_root, write, write_attachment_copy, AttachmentPieces,
+        check_attachment_dest, check_attachment_size, delete, list, mkdir, read, rename,
+        resolve_attachment_source, workspace_root, write, write_attachment_copy, AttachmentPieces,
+        ATTACHMENT_COPY_MAX_BYTES,
     };
 }
 

@@ -35829,6 +35829,76 @@ mod file_ops_service {
         assert!(!dir.join("elsewhere/spec.pdf").exists());
     }
 
+    /// `ws.file.getAttachment` copies a file of exactly the 200 MiB cap and
+    /// refuses a larger one with `-32602` `attachment-exceeds-cap` naming the
+    /// size and the cap, writing nothing at the destination.
+    #[intent_test_macros::daemon_test]
+    async fn file_get_attachment_enforces_the_size_cap() {
+        use crate::file_ops::ATTACHMENT_COPY_MAX_BYTES as CAP;
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let dir_guard = test_tempdir("intentd-attcap-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+        let svc = Services::new_isolated(store);
+
+        let placed = svc
+            .file_place_attachment(
+                ws.clone(),
+                "big.bin".to_string(),
+                Some(base64::engine::general_purpose::STANDARD.encode(b"x")),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("place");
+        let id = placed["attachmentId"].as_str().unwrap().to_string();
+        let stored = dir.join(placed["path"].as_str().unwrap());
+        let grow = |len: u64| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&stored)
+                .unwrap()
+                .set_len(len)
+                .unwrap();
+        };
+
+        grow(CAP);
+        let got = svc
+            .file_get_attachment(ws.clone(), id.clone(), None, Some("at-cap".to_string()))
+            .await
+            .expect("a file of exactly the cap copies");
+        assert_eq!(got["size"], serde_json::json!(CAP));
+        assert_eq!(
+            std::fs::metadata(dir.join("at-cap/big.bin")).unwrap().len(),
+            CAP
+        );
+
+        grow(CAP + 1);
+        match svc
+            .file_get_attachment(ws.clone(), id, None, Some("over-cap".to_string()))
+            .await
+        {
+            Err(Error::InvalidParams(msg)) => {
+                assert_eq!(
+                    msg,
+                    format!("attachment-exceeds-cap: {} bytes; limit 209715200", CAP + 1)
+                );
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        assert!(
+            !dir.join("over-cap").exists(),
+            "an over-cap copy writes nothing"
+        );
+    }
+
     /// Containment: a tampered registry row (escaping `stored_path` or
     /// `file_name`) must be rejected by the within-root guard — the copy path
     /// never reads outside the canonical store or writes outside the caller

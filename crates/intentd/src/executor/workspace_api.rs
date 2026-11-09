@@ -798,6 +798,7 @@ impl WorkspaceApi for NodeApi {
             file_ops::check_attachment_dest(&self.root(), dest_dir.as_deref())?;
             let first =
                 AttachmentData::parse(&self.head.attachment_piece(&attachment_id, 0).await?)?;
+            file_ops::check_attachment_size(first.size)?;
             if first.offset.is_none() {
                 return self
                     .blocking(&workspace_id, move |root| {

@@ -544,6 +544,27 @@ pub(crate) fn place_attachment(
     }))
 }
 
+/// The largest attachment `ws.file.getAttachment` copies, for a local agent
+/// and on a remote agent's machine: 200 MiB.
+pub const ATTACHMENT_COPY_MAX_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Refuse a `ws.file.getAttachment` copy of a `size`-byte file over
+/// [`ATTACHMENT_COPY_MAX_BYTES`] with `-32602`
+/// `attachment-exceeds-cap: <size> bytes; limit <cap>`, before anything is
+/// written.
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn check_attachment_size(size: u64) -> Result<()> {
+    if size <= ATTACHMENT_COPY_MAX_BYTES {
+        return Ok(());
+    }
+    Err(Error::InvalidParams(format!(
+        "attachment-exceeds-cap: {size} bytes; limit {ATTACHMENT_COPY_MAX_BYTES}"
+    )))
+}
+
 /// MCP `ws.file.getAttachment` copy op (PROTOCOL §6.8): copy a registered
 /// attachment from the CANONICAL workspace store (`canonical_root` +
 /// `record.stored_path`) into the caller's working directory (`dest_root`,
@@ -572,9 +593,11 @@ pub(crate) fn get_attachment(
     // Source side: the stored path must stay inside the canonical store —
     // a tampered registry row must never read outside it.
     let src = resolve_attachment_source(canonical_root, &record.stored_path)?;
-    if !src.is_file() {
-        return Err(deleted_attachment(record));
-    }
+    let src_len = match std::fs::metadata(&src) {
+        Ok(md) if md.is_file() => md.len(),
+        _ => return Err(deleted_attachment(record)),
+    };
+    check_attachment_size(src_len)?;
     let (rel, dest) = attachment_destination(dest_root, dest_dir, &record.file_name)?;
     let identical = match (std::fs::metadata(&src), std::fs::metadata(&dest)) {
         (Ok(s), Ok(d)) if s.len() == d.len() => {
@@ -837,7 +860,9 @@ impl Drop for AttachmentPieces {
 
 /// The bytes of a registered attachment for a remote agent's machine:
 /// `{ fileName, mimeType?, size, uploadedAt, data }` with `data` base64,
-/// read from the canonical store like [`get_attachment`]'s source. Without
+/// read from the canonical store like [`get_attachment`]'s source. A file
+/// over [`ATTACHMENT_COPY_MAX_BYTES`] is `-32602` `attachment-exceeds-cap`,
+/// with or without `range`. Without
 /// `range` a file larger than `max_bytes` is `-32602`
 /// `attachment-too-large-for-link`. With `range` (`offset`, `length`) the
 /// answer is one piece of a file of any size: at most `length` bytes from
@@ -861,6 +886,7 @@ pub(crate) fn attachment_data(
         Ok(md) if md.is_file() => md.len(),
         _ => return Err(deleted_attachment(record)),
     };
+    check_attachment_size(size)?;
     let (bytes, piece) = if let Some((offset, length)) = range {
         if offset > size {
             return Err(Error::InvalidParams(format!(
