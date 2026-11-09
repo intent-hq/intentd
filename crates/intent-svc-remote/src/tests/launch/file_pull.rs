@@ -319,5 +319,20 @@ async fn a_local_agent_pulls_from_a_remote_agents_machine() {
         .map(|entry| entry.unwrap().file_name())
         .collect();
     assert_eq!(parts, [".gitignore"], "no part file left");
+
+    // A pull needs an agent caller: it copies into that agent's checkout.
+    let anonymous = f
+        .services
+        .file_pull(
+            workspace(),
+            None,
+            source.clone(),
+            "out/data.bin".into(),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(anonymous.contains("needs an agent caller"), "{anonymous}");
     f.node.shutdown();
 }

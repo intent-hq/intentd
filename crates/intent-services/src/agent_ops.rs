@@ -7372,6 +7372,8 @@ impl Services {
         workspace_id: Option<WorkspaceId>,
         original_claim: Option<crate::delete_grace::PendingDeleteClaim>,
     ) -> Result<Value> {
+        // Its checkout serves no more pulls.
+        self.forget_pulls_of(&agent_id);
         #[cfg(all(test, unix))]
         let _completion = self
             .pending_delete_test_gate

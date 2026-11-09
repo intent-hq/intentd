@@ -879,6 +879,10 @@ impl Runner {
     pub(super) fn new(config: RunnerConfig) -> Self {
         let last = config.journal.last_seq();
         let pty = Arc::new(intent_pty::PtyHost::new());
+        let pulls = Arc::new(intent_services::checkout_transfer::PieceSource::new(
+            config.pull_staging,
+        ));
+        intent_services::checkout_transfer::PieceSource::spawn_sweeper(&pulls);
         Self {
             inner: Arc::new(Inner {
                 admission: config.admission,
@@ -900,9 +904,7 @@ impl Runner {
                 push_locks: Mutex::new(HashMap::new()),
                 closing_signal: watch::channel(false).0,
                 head_session: Mutex::new(HeadSession::default()),
-                pulls: Arc::new(intent_services::checkout_transfer::PieceSource::new(
-                    config.pull_staging,
-                )),
+                pulls,
             }),
         }
     }

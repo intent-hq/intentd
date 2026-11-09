@@ -23,7 +23,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use intent_core::node_link::{CheckoutEntryKind, CheckoutPiece};
+#[cfg(unix)]
+use intent_core::node_link::CheckoutEntryKind;
+use intent_core::node_link::CheckoutPiece;
 
 use super::*;
 
@@ -42,6 +44,7 @@ fn first(path: &str) -> PieceRequest {
     }
 }
 
+#[cfg(unix)]
 fn read(src: &PieceSource, checkout: &Path, path: &str) -> Result<CheckoutPiece> {
     src.read(SRC, checkout, &first(path))
 }
@@ -681,4 +684,163 @@ async fn the_destination_must_stay_inside_the_checkout_and_fit_what_is_there() {
         entries(outside.path()).is_empty(),
         "nothing written outside"
     );
+}
+
+/// One raw ustar entry: `name` is written into the header as it is, so
+/// `..` and absolute paths get through.
+fn raw_entry(
+    builder: &mut tar::Builder<Vec<u8>>,
+    name: &[u8],
+    kind: tar::EntryType,
+    mode: u32,
+    data: &[u8],
+) {
+    let mut header = tar::Header::new_ustar();
+    header.as_old_mut().name[..name.len()].copy_from_slice(name);
+    header.set_entry_type(kind);
+    header.set_mode(mode);
+    header.set_size(data.len() as u64);
+    if matches!(kind, tar::EntryType::Symlink | tar::EntryType::Link) {
+        header.set_link_name("/etc/passwd").unwrap();
+    }
+    header.set_cksum();
+    builder.append(&header, data).unwrap();
+}
+
+#[test]
+fn unpacking_refuses_what_a_snapshot_never_holds() {
+    use tar::EntryType::{Char, Directory, Link, Regular, Symlink, XGlobalHeader};
+    type Case = (&'static str, fn(&mut tar::Builder<Vec<u8>>));
+    let cases: [Case; 11] = [
+        ("a symlink", |b| raw_entry(b, b"l", Symlink, 0o644, b"")),
+        ("a hard link", |b| raw_entry(b, b"h", Link, 0o644, b"")),
+        ("a device", |b| raw_entry(b, b"c", Char, 0o644, b"")),
+        ("a global pax header", |b| {
+            raw_entry(b, b"g", XGlobalHeader, 0o644, b"9 a=b\n");
+        }),
+        ("a parent path", |b| {
+            raw_entry(b, b"../x", Regular, 0o644, b"x");
+        }),
+        ("an absolute path", |b| {
+            raw_entry(b, b"/tmp/x", Regular, 0o644, b"x");
+        }),
+        ("a .git path", |b| {
+            raw_entry(b, b"sub/.GIT/config", Regular, 0o644, b"x");
+        }),
+        ("setuid", |b| raw_entry(b, b"run", Regular, 0o4755, b"x")),
+        ("0777", |b| raw_entry(b, b"d", Directory, 0o777, b"")),
+        ("a pax linkpath", |b| {
+            b.append_pax_extensions([("linkpath", &b"/etc"[..])])
+                .unwrap();
+            raw_entry(b, b"f", Regular, 0o644, b"x");
+        }),
+        ("a path twice", |b| {
+            raw_entry(b, b"a.txt", Regular, 0o644, b"1");
+            raw_entry(b, b"a.txt", Regular, 0o644, b"2");
+        }),
+    ];
+    for (what, build) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        build(&mut builder);
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, builder.into_inner().unwrap()).unwrap();
+        let into = dir.path().join("into");
+        std::fs::create_dir(&into).unwrap();
+        assert_eq!(
+            code(unpack(&archive, &into)),
+            "file-pull-mismatch",
+            "{what}"
+        );
+        assert!(!dir.path().join("x").exists(), "{what}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_parent_swapped_for_a_link_during_the_transfer_is_refused() {
+    let staging = tempfile::tempdir().unwrap();
+    let from = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(from.path().join("a.bin"), vec![3u8; 9000]).unwrap();
+    std::fs::create_dir_all(from.path().join("dir/sub")).unwrap();
+    std::fs::write(from.path().join("dir/sub/b.bin"), vec![4u8; 9000]).unwrap();
+    let src = Arc::new(source(staging.path()));
+    for (path, to, swap) in [("a.bin", "out/a.bin", "out"), ("dir", "merge", "merge/sub")] {
+        std::fs::create_dir_all(dest.path().join(swap)).unwrap();
+        let (dest_root, outside_dir) = (dest.path().to_path_buf(), outside.path().to_path_buf());
+        let refused = pull_into(
+            dest.path(),
+            to,
+            None,
+            MAX_PULL_BYTES,
+            fetcher(&src, from.path(), path, move |n, _| {
+                if n == 1 {
+                    let parent = dest_root.join(swap);
+                    std::fs::remove_dir(&parent).unwrap();
+                    std::os::unix::fs::symlink(&outside_dir, &parent).unwrap();
+                }
+                Ok(())
+            }),
+        )
+        .await;
+        assert_eq!(code(refused), "file-pull-outside-checkout", "{path}");
+        assert!(
+            entries(outside.path()).is_empty(),
+            "{path}: nothing written outside"
+        );
+        src.forget(SRC);
+    }
+}
+
+#[test]
+fn a_file_that_shrinks_while_it_is_packed_fails_the_pack() {
+    use std::io::Read as _;
+    let changed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let mut exact = Exact {
+        inner: &b"abc"[..],
+        remaining: 5,
+        changed: changed.clone(),
+    };
+    let mut out = Vec::new();
+    let error = exact.read_to_end(&mut out).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert!(changed.get());
+    let mut grown = Exact {
+        inner: &b"abcdef"[..],
+        remaining: 3,
+        changed: std::rc::Rc::default(),
+    };
+    let mut out = Vec::new();
+    grown.read_to_end(&mut out).unwrap();
+    assert_eq!(out, b"abc", "a file that grew is cut at its opened size");
+}
+
+#[test]
+fn concurrent_first_pieces_never_pass_the_busy_cap() {
+    let staging = tempfile::tempdir().unwrap();
+    let from = tempfile::tempdir().unwrap();
+    for i in 0..8 {
+        std::fs::write(from.path().join(format!("f{i}")), vec![5u8; 9000]).unwrap();
+    }
+    let src = Arc::new(source(staging.path()));
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let results: Vec<_> = (0..8)
+        .map(|i| {
+            let (src, root, barrier) = (src.clone(), from.path().to_path_buf(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                src.read(SRC, &root, &first(&format!("f{i}")))
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    let served = results.iter().filter(|result| result.is_ok()).count();
+    assert_eq!(served, MAX_SNAPSHOTS_PER_SOURCE);
+    for result in results.into_iter().filter(Result::is_err) {
+        assert_eq!(code(result), "file-pull-busy");
+    }
 }

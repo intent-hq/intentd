@@ -152,6 +152,9 @@ struct Snapshot {
     kind: CheckoutEntryKind,
     size: u64,
     used: Instant,
+    /// False while it is being made: it holds its source's slot, but no
+    /// piece reads it and no sweep removes it.
+    ready: bool,
 }
 
 /// Serves pieces of files and folders in agents' checkouts from snapshots
@@ -209,6 +212,33 @@ impl PieceSource {
         });
     }
 
+    /// Remove every ready snapshot idle past the TTL.
+    pub fn sweep(&self) {
+        let now = Instant::now();
+        let ttl = self.ttl;
+        self.remove_where(|snapshot| snapshot.ready && now.duration_since(snapshot.used) >= ttl);
+    }
+
+    /// Sweep `source` every half TTL (at most every 30 s) on the current
+    /// tokio runtime, until it is dropped.
+    pub fn spawn_sweeper(source: &std::sync::Arc<Self>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let weak = std::sync::Arc::downgrade(source);
+        let every = (source.ttl / 2).clamp(Duration::from_secs(1), Duration::from_secs(30));
+        // caller-binding: allow — removes expired snapshot files; acts for no caller
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                let Some(source) = weak.upgrade() else {
+                    return;
+                };
+                source.sweep();
+            }
+        });
+    }
+
     /// Remove every snapshot of `source` (its checkout is gone).
     pub fn forget(&self, source: &str) {
         self.remove_where(|snapshot| snapshot.source == source);
@@ -239,9 +269,7 @@ impl PieceSource {
         checkout: &Path,
         read: &PieceRequest,
     ) -> Result<CheckoutPiece> {
-        let now = Instant::now();
-        let ttl = self.ttl;
-        self.remove_where(|snapshot| now.duration_since(snapshot.used) >= ttl);
+        self.sweep();
         let length = read.length.min(MAX_LINK_ATTACHMENT_CHUNK_BYTES);
         let expired = || refused("transfer-expired", "no live snapshot; pull again");
         let (id, first) = match &read.transfer_id {
@@ -261,7 +289,9 @@ impl PieceSource {
             let mut snapshots = self.snapshots();
             let snapshot = snapshots
                 .get_mut(&id)
-                .filter(|snapshot| snapshot.source == source && snapshot.path == read.path)
+                .filter(|snapshot| {
+                    snapshot.ready && snapshot.source == source && snapshot.path == read.path
+                })
                 .ok_or_else(expired)?;
             snapshot.used = Instant::now();
             (snapshot.file.clone(), snapshot.kind, snapshot.size)
@@ -300,64 +330,93 @@ impl PieceSource {
         rel: &str,
     ) -> Result<(String, String, Option<u64>)> {
         let (root, canonical) = resolve_source(checkout, rel)?;
-        let live = self
-            .snapshots()
-            .values()
-            .filter(|snapshot| snapshot.source == source)
-            .count();
-        if live >= MAX_SNAPSHOTS_PER_SOURCE {
-            return Err(refused(
-                "busy",
-                format!(
-                    "agent {source} already serves {MAX_SNAPSHOTS_PER_SOURCE} pulls; retry later"
-                ),
-            ));
-        }
-        std::fs::create_dir_all(&self.staging).map_err(|e| io("make the snapshot", &e))?;
         let id = uuid::Uuid::new_v4().simple().to_string();
         let file = self.staging.join(&id);
-        let meta = std::fs::metadata(&canonical).map_err(|_| refused("not-found", rel))?;
+        {
+            // Count and reserve under one lock, so concurrent first pieces
+            // never pass the cap together.
+            let mut snapshots = self.snapshots();
+            let live = snapshots
+                .values()
+                .filter(|snapshot| snapshot.source == source)
+                .count();
+            if live >= MAX_SNAPSHOTS_PER_SOURCE {
+                return Err(refused(
+                    "busy",
+                    format!(
+                        "agent {source} already serves {MAX_SNAPSHOTS_PER_SOURCE} pulls; retry later"
+                    ),
+                ));
+            }
+            snapshots.insert(
+                id.clone(),
+                Snapshot {
+                    source: source.to_owned(),
+                    path: rel.to_owned(),
+                    file: file.clone(),
+                    kind: CheckoutEntryKind::File,
+                    size: 0,
+                    used: Instant::now(),
+                    ready: false,
+                },
+            );
+        }
+        let made = self.make(&root, &canonical, &file, rel);
+        let mut snapshots = self.snapshots();
+        match (made, snapshots.get_mut(&id)) {
+            (Ok((kind, size, skipped, sha256)), Some(snapshot)) => {
+                snapshot.kind = kind;
+                snapshot.size = size;
+                snapshot.used = Instant::now();
+                snapshot.ready = true;
+                Ok((id, sha256, skipped))
+            }
+            (made, _) => {
+                snapshots.remove(&id);
+                let _ = std::fs::remove_file(&file);
+                // Forgotten while it was made: its checkout went away.
+                made.and(Err(refused(
+                    "source-unavailable",
+                    "the agent's checkout went away",
+                )))
+            }
+        }
+    }
+
+    /// Write the snapshot of `canonical` to `file`: its kind, size, skipped
+    /// entries and sha256.
+    fn make(
+        &self,
+        root: &Path,
+        canonical: &Path,
+        file: &Path,
+        rel: &str,
+    ) -> Result<(CheckoutEntryKind, u64, Option<u64>, String)> {
+        std::fs::create_dir_all(&self.staging).map_err(|e| io("make the snapshot", &e))?;
+        let meta = std::fs::metadata(canonical).map_err(|_| refused("not-found", rel))?;
         let made = if meta.is_file() {
-            copy_file(&root, &canonical, &file, self.cap, rel)
+            copy_file(root, canonical, file, self.cap, rel)
                 .map(|size| (CheckoutEntryKind::File, size, None))
         } else if meta.is_dir() {
-            pack_folder(&root, &canonical, &file, self.cap, self.max_entries)
+            pack_folder(root, canonical, file, self.cap, self.max_entries)
                 .map(|(size, skipped)| (CheckoutEntryKind::Directory, size, Some(skipped)))
         } else {
             Err(refused("not-found", rel))
         };
         let made = made.and_then(|(kind, size, skipped)| {
-            let sha256 = sha256_file(&file).map_err(|e| io("make the snapshot", &e))?;
+            let sha256 = sha256_file(file).map_err(|e| io("make the snapshot", &e))?;
             Ok((kind, size, skipped, sha256))
         });
-        let (kind, size, skipped, sha256) = match made {
-            Ok(made) => made,
-            Err(error) => {
-                let _ = std::fs::remove_file(&file);
-                return Err(match error {
-                    Error::InvalidParams(message) if message == OVER_CAP => refused(
-                        "too-large",
-                        format!(
-                            "{rel} is over the limit of {} bytes or {} entries",
-                            self.cap, self.max_entries
-                        ),
-                    ),
-                    other => other,
-                });
-            }
-        };
-        self.snapshots().insert(
-            id.clone(),
-            Snapshot {
-                source: source.to_owned(),
-                path: rel.to_owned(),
-                file,
-                kind,
-                size,
-                used: Instant::now(),
-            },
-        );
-        Ok((id, sha256, skipped))
+        made.map_err(|error| match error {
+            Error::InvalidParams(message) if message == OVER_CAP => refused(
+                "too-large",
+                format!(
+                    "{rel} is over the limit of {} bytes or {} entries",
+                    self.cap, self.max_entries
+                ),
+            ),
+            other => other,
+        })
     }
 }
 
@@ -458,6 +517,35 @@ impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
     }
 }
 
+/// Reads exactly `remaining` bytes from a file opened for packing: an end
+/// before that (the file shrank) is an error, and marks `changed`.
+struct Exact<R> {
+    inner: R,
+    remaining: u64,
+    changed: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl<R: std::io::Read> std::io::Read for Exact<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let cap = buf
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let read = self.inner.read(&mut buf[..cap])?;
+        if read == 0 {
+            self.changed.set(true);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "a file shrank while the folder was packed",
+            ));
+        }
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
 /// Packing state: the archive, the entry count and the skipped entries.
 struct Packer<W: std::io::Write> {
     builder: tar::Builder<W>,
@@ -467,6 +555,8 @@ struct Packer<W: std::io::Write> {
     skipped: u64,
     /// The folders being walked, so a link back to one is not walked twice.
     ancestors: Vec<PathBuf>,
+    /// Set when a file shrank while it was packed.
+    changed: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 /// Pack `dir` (canonical, inside the canonical `root`) into `archive` as a
@@ -500,7 +590,9 @@ fn pack_folder(
         max_entries,
         skipped: 0,
         ancestors: vec![dir.to_path_buf()],
+        changed: std::rc::Rc::default(),
     };
+    let changed = packer.changed.clone();
     let result = packer.walk(dir, Path::new("")).and_then(|()| {
         let skipped = packer.skipped;
         let mut counting = packer
@@ -515,6 +607,12 @@ fn pack_folder(
     });
     if over.get() {
         return Err(over_cap());
+    }
+    if changed.get() {
+        return Err(refused(
+            "source-unavailable",
+            "a file changed while the folder was packed; retry the pull",
+        ));
     }
     result
 }
@@ -553,12 +651,24 @@ impl<W: std::io::Write> Packer<W> {
                     self.ancestors.pop();
                 }
                 Ok(meta) if meta.is_file() => {
-                    let mode = if executable(&meta) { 0o755 } else { 0o644 };
-                    let Ok(file) = open_confined(&self.root, &canonical, "") else {
+                    let opened = open_confined(&self.root, &canonical, "").and_then(|file| {
+                        let meta = file.metadata().map_err(|e| io("read the folder", &e))?;
+                        Ok((meta, file))
+                    });
+                    let Ok((opened_meta, file)) = opened else {
                         self.skipped += 1;
                         continue;
                     };
-                    self.append(&entry_rel, tar::EntryType::Regular, mode, meta.len(), file)?;
+                    let mode = if executable(&meta) { 0o755 } else { 0o644 };
+                    // The size of the file as opened; a later change to it
+                    // fails the pack rather than corrupting the archive.
+                    let size = opened_meta.len();
+                    let exact = Exact {
+                        inner: file,
+                        remaining: size,
+                        changed: self.changed.clone(),
+                    };
+                    self.append(&entry_rel, tar::EntryType::Regular, mode, size, exact)?;
                 }
                 _ => self.skipped += 1,
             }
@@ -599,7 +709,7 @@ impl<W: std::io::Write> Packer<W> {
                 .map_err(|e| io("pack the folder", &e))?;
         }
         header.set_cksum();
-        // A file that shrank meanwhile fails here; one that grew is cut.
+        // A file that grew since it was opened is cut at `size`.
         self.builder
             .append(&header, data.take(size))
             .map_err(|e| io("pack the folder", &e))
@@ -623,13 +733,30 @@ struct Destination {
     rel: String,
     /// The canonical checkout.
     root: PathBuf,
-    /// The final path.
-    dest: PathBuf,
+    /// The final path's components below `root`, resolved when the pull
+    /// began; every write walks them again without following links.
+    parts: Vec<String>,
+}
+
+impl Destination {
+    fn dest(&self) -> PathBuf {
+        self.parts
+            .iter()
+            .fold(self.root.clone(), |path, part| path.join(part))
+    }
+
+    /// A refusal for what was found on the way to the destination.
+    fn refuse(&self) -> impl Fn(place::Entry) -> Error + '_ {
+        move |found| match found {
+            place::Entry::Other => conflict(&self.rel, "a file is in the way of its folder"),
+            _ => outside(&self.rel),
+        }
+    }
 }
 
 /// Check `to` in `dest_root` before anything is fetched: a plain relative
-/// path whose existing part resolves inside the checkout (not in `.git`)
-/// and is a folder.
+/// path (not under `.intent`) whose existing part resolves inside the
+/// checkout (not in `.git` or `.intent`) and is a folder.
 fn resolve_destination(dest_root: &Path, to: &str) -> Result<Destination> {
     let parts = plain_parts(to)
         .filter(|parts| {
@@ -661,40 +788,28 @@ fn resolve_destination(dest_root: &Path, to: &str) -> Result<Destination> {
     }
     // `to` itself, below its existing (confined) ancestor.
     let rest = dest.strip_prefix(&anchor).unwrap_or(Path::new(""));
-    let dest = canonical.join(rest);
-    let in_intent = dest
+    let resolved = canonical.join(rest);
+    let parts: Vec<String> = resolved
         .strip_prefix(&root)
-        .ok()
-        .and_then(|rel| rel.components().next())
-        .and_then(|first| first.as_os_str().to_str())
-        .is_none_or(|first| first.eq_ignore_ascii_case(".intent"));
-    if in_intent {
+        .map_err(|_| outside(to))?
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    if parts
+        .first()
+        .is_none_or(|first| first.eq_ignore_ascii_case(".intent"))
+    {
         return Err(outside(to));
     }
     Ok(Destination {
         rel: to.to_owned(),
         root,
-        dest,
+        parts,
     })
 }
 
 fn conflict(to: &str, why: &str) -> Error {
     refused("destination-conflict", format!("{to}: {why}"))
-}
-
-/// The checkout's `.intent/pulls/`, made (git-ignored) on first use.
-fn pulls_dir(root: &Path) -> Result<PathBuf> {
-    let dir = root.join(PULLS_DIR);
-    std::fs::create_dir_all(&dir).map_err(|e| io("prepare .intent/pulls", &e))?;
-    let canonical = std::fs::canonicalize(&dir).map_err(|e| io("prepare .intent/pulls", &e))?;
-    if !confined(root, &canonical) {
-        return Err(outside(PULLS_DIR));
-    }
-    let marker = canonical.join(".gitignore");
-    if !marker.exists() {
-        std::fs::write(&marker, "*\n").map_err(|e| io("prepare .intent/pulls", &e))?;
-    }
-    Ok(canonical)
 }
 
 /// A pull being written: the bytes go to a part file under
@@ -705,11 +820,17 @@ struct PieceSink {
     kind: CheckoutEntryKind,
     size: u64,
     sha256: String,
-    part: PathBuf,
+    /// The checkout's root and its `.intent/pulls/`, opened without
+    /// following links.
+    root: place::Folder,
+    pulls: place::Folder,
+    /// The part file's name in `pulls`.
+    part: String,
     file: Option<std::fs::File>,
     hasher: sha2::Sha256,
     written: u64,
-    unpacked: Option<PathBuf>,
+    /// The unpacked folder's name in `pulls`.
+    unpacked: Option<String>,
     made: Vec<PathBuf>,
 }
 
@@ -717,17 +838,27 @@ impl PieceSink {
     fn begin(to: Destination, kind: CheckoutEntryKind, size: u64, sha256: String) -> Result<Self> {
         use sha2::Digest as _;
         check_existing(&to, kind)?;
-        let part = pulls_dir(&to.root)?.join(format!("{}.part", uuid::Uuid::new_v4().simple()));
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&part)
-            .map_err(|e| io("write the copy", &e))?;
+        let root = place::Folder::root(&to.root)?;
+        let refuse = |_| outside(PULLS_DIR);
+        let mut kept = Vec::new();
+        let pulls = root
+            .child(".intent", true, &mut kept, &refuse)?
+            .child("pulls", true, &mut kept, &refuse)?;
+        if pulls.entry(".gitignore")? == place::Entry::Missing {
+            pulls
+                .create_file(".gitignore")?
+                .write_all(b"*\n")
+                .map_err(|e| io("prepare .intent/pulls", &e))?;
+        }
+        let part = format!("{}.part", uuid::Uuid::new_v4().simple());
+        let file = pulls.create_file(&part)?;
         Ok(Self {
             to,
             kind,
             size,
             sha256,
+            root,
+            pulls,
             part,
             file: Some(file),
             hasher: sha2::Sha256::new(),
@@ -762,12 +893,13 @@ impl PieceSink {
                 self.to.rel, self.written, self.size, self.sha256
             )));
         }
-        // The destination may have changed while the pieces came.
-        check_existing(&self.to, self.kind)?;
         let files = match self.kind {
             CheckoutEntryKind::File => {
-                self.make_parents()?;
-                std::fs::rename(&self.part, &self.to.dest).map_err(|e| io("place the copy", &e))?;
+                let (parent, name) = self.parent()?;
+                if parent.entry(&name)? == place::Entry::Folder {
+                    return Err(conflict(&self.to.rel, "a folder is there"));
+                }
+                self.pulls.rename(&self.part, &parent, &name)?;
                 1
             }
             CheckoutEntryKind::Directory => self.place_folder()?,
@@ -782,46 +914,68 @@ impl PieceSink {
         }))
     }
 
-    /// Make the missing parents of the destination, remembering them so a
-    /// failure removes them again.
-    fn make_parents(&mut self) -> Result<()> {
-        let Some(parent) = self.to.dest.parent() else {
-            return Ok(());
-        };
-        let mut missing = Vec::new();
-        let mut probe = parent.to_path_buf();
-        while std::fs::symlink_metadata(&probe).is_err() {
-            missing.push(probe.clone());
-            match probe.parent() {
-                Some(next) => probe = next.to_path_buf(),
-                None => break,
-            }
-        }
-        for dir in missing.into_iter().rev() {
-            std::fs::create_dir(&dir).map_err(|e| io("make the destination folder", &e))?;
-            self.made.push(dir);
-        }
-        Ok(())
+    /// The destination's parent folder, walked from the root without
+    /// following links and made where missing, and the destination's name.
+    fn parent(&mut self) -> Result<(place::Folder, String)> {
+        let (name, parents) = self
+            .to
+            .parts
+            .split_last()
+            .ok_or_else(|| outside(&self.to.rel))?;
+        let refuse = self.to.refuse();
+        let parent = self.root.walk(parents, true, &mut self.made, &refuse)?;
+        Ok((parent, name.clone()))
     }
 
     /// Unpack the verified archive into a folder under `.intent/pulls/`,
     /// then move it into place, merging into a folder already there.
     /// Returns the number of regular files written.
     fn place_folder(&mut self) -> Result<u64> {
-        let unpacked = self.part.with_extension("d");
-        std::fs::create_dir(&unpacked).map_err(|e| io("unpack the folder", &e))?;
-        self.unpacked = Some(unpacked.clone());
-        let files = unpack(&self.part, &unpacked)?;
-        if std::fs::symlink_metadata(&self.to.dest).is_err() {
-            self.make_parents()?;
-            std::fs::rename(&unpacked, &self.to.dest).map_err(|e| io("place the folder", &e))?;
-            self.unpacked = None;
-            return Ok(files);
+        let name = self.part.replace(".part", ".d");
+        let mut kept = Vec::new();
+        let unpacked = self
+            .pulls
+            .child(&name, true, &mut kept, &|_| outside(PULLS_DIR))?;
+        self.unpacked = Some(name.clone());
+        let files = unpack(&self.pulls.path().join(&self.part), unpacked.path())?;
+        let (parent, last) = self.parent()?;
+        match parent.entry(&last)? {
+            place::Entry::Missing => {
+                self.pulls.rename(&name, &parent, &last)?;
+                self.unpacked = None;
+                return Ok(files);
+            }
+            place::Entry::Folder => {}
+            place::Entry::Link => return Err(outside(&self.to.rel)),
+            place::Entry::Other => return Err(conflict(&self.to.rel, "a file is there")),
         }
+        let refuse = self.to.refuse();
+        let into = parent.child(&last, false, &mut Vec::new(), &refuse)?;
         let mut moves = Vec::new();
-        plan_merge(&unpacked, &self.to.dest, &self.to.rel, &mut moves)?;
-        for (from, to) in moves {
-            std::fs::rename(&from, &to).map_err(|e| io("place the folder", &e))?;
+        plan_merge(
+            unpacked.path(),
+            &into,
+            Path::new(""),
+            &self.to.rel,
+            &mut moves,
+        )?;
+        for rel in moves {
+            let parts: Vec<String> = rel
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            let Some((entry, parents)) = parts.split_last() else {
+                continue;
+            };
+            let from = unpacked.walk(parents, false, &mut Vec::new(), &|_| outside(PULLS_DIR))?;
+            let to = into.walk(parents, false, &mut Vec::new(), &refuse)?;
+            if to.entry(entry)? == place::Entry::Folder {
+                return Err(conflict(
+                    &self.to.rel,
+                    "a file and a folder have the same name",
+                ));
+            }
+            from.rename(entry, &to, entry)?;
         }
         Ok(files)
     }
@@ -831,7 +985,7 @@ impl PieceSink {
 /// onto a folder or a folder onto a file conflicts, and a folder onto a
 /// link would write through it. A file replaces a file or a link.
 fn check_existing(to: &Destination, kind: CheckoutEntryKind) -> Result<()> {
-    let Ok(meta) = std::fs::symlink_metadata(&to.dest) else {
+    let Ok(meta) = std::fs::symlink_metadata(to.dest()) else {
         return Ok(());
     };
     match kind {
@@ -845,7 +999,7 @@ fn check_existing(to: &Destination, kind: CheckoutEntryKind) -> Result<()> {
 /// Unpack `archive` into the empty folder `into`, allowing only what a
 /// snapshot holds: regular files and folders with plain relative paths
 /// (no `.git`), modes 0644 or 0755, and pax records setting only `path`
-/// and `size`. Returns the number of regular files.
+/// and `size`, each path once. Returns the number of regular files.
 fn unpack(archive: &Path, into: &Path) -> Result<u64> {
     let file = std::fs::File::open(archive).map_err(|e| io("unpack the folder", &e))?;
     let mut archive = tar::Archive::new(file);
@@ -853,6 +1007,7 @@ fn unpack(archive: &Path, into: &Path) -> Result<u64> {
     archive.set_preserve_mtime(false);
     archive.set_overwrite(false);
     let (mut files, mut entries) = (0, 0);
+    let mut seen = std::collections::HashSet::new();
     for entry in archive.entries().map_err(|e| io("unpack the folder", &e))? {
         let mut entry = entry.map_err(|_| mismatch("the archive is malformed"))?;
         entries += 1;
@@ -871,6 +1026,9 @@ fn unpack(archive: &Path, into: &Path) -> Result<u64> {
         }
         if plain_parts(&name).is_none_or(|parts| parts.is_empty()) {
             return Err(not_allowed("the path"));
+        }
+        if !seen.insert(name.trim_end_matches('/').to_owned()) {
+            return Err(not_allowed("twice the path"));
         }
         let mode = entry
             .header()
@@ -901,37 +1059,37 @@ fn unpack(archive: &Path, into: &Path) -> Result<u64> {
     Ok(files)
 }
 
-/// The renames that merge `from` into the existing folder `into`: a new
-/// entry moves whole, a file replaces a file or a link (as a link, never
-/// through it), and a folder merges into a folder. A folder onto a link is
-/// outside the checkout; a file against a folder conflicts. Found before
-/// anything moves.
+/// The entries (relative to `from`) that merge the unpacked folder `from`
+/// into the existing folder `into`: a new entry moves whole, a file
+/// replaces a file or a link (as a link, never through it), and a folder
+/// merges into a folder. A folder onto a link is outside the checkout; a
+/// file against a folder conflicts. Found before anything moves.
 fn plan_merge(
     from: &Path,
-    into: &Path,
+    into: &place::Folder,
+    rel: &Path,
     shown: &str,
-    moves: &mut Vec<(PathBuf, PathBuf)>,
+    moves: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    for entry in std::fs::read_dir(from).map_err(|e| io("place the folder", &e))? {
+    for entry in std::fs::read_dir(from.join(rel)).map_err(|e| io("place the folder", &e))? {
         let entry = entry.map_err(|e| io("place the folder", &e))?;
-        let name = entry.file_name();
-        let source = entry.path();
-        let target = into.join(&name);
-        let label = format!("{shown}/{}", name.to_string_lossy());
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let entry_rel = rel.join(&name);
+        let label = format!("{shown}/{}", entry_rel.display());
         let incoming_dir = entry
             .file_type()
             .map_err(|e| io("place the folder", &e))?
             .is_dir();
-        match std::fs::symlink_metadata(&target) {
-            Err(_) => moves.push((source, target)),
-            Ok(meta) if incoming_dir && meta.file_type().is_symlink() => {
-                return Err(outside(&label));
+        match (incoming_dir, into.entry(&name)?) {
+            (_, place::Entry::Missing) | (false, place::Entry::Other | place::Entry::Link) => {
+                moves.push(entry_rel);
             }
-            Ok(meta) if incoming_dir && meta.is_dir() => {
-                plan_merge(&source, &target, &label, moves)?;
+            (true, place::Entry::Link) => return Err(outside(&label)),
+            (true, place::Entry::Folder) => {
+                let inner = into.child(&name, false, &mut Vec::new(), &|_| outside(&label))?;
+                plan_merge(from, &inner, &entry_rel, shown, moves)?;
             }
-            Ok(meta) if !incoming_dir && !meta.is_dir() => moves.push((source, target)),
-            Ok(_) => return Err(conflict(&label, "a file and a folder have the same name")),
+            _ => return Err(conflict(&label, "a file and a folder have the same name")),
         }
     }
     Ok(())
@@ -940,9 +1098,9 @@ fn plan_merge(
 impl Drop for PieceSink {
     fn drop(&mut self) {
         self.file.take();
-        let _ = std::fs::remove_file(&self.part);
+        let _ = std::fs::remove_file(self.pulls.path().join(&self.part));
         if let Some(unpacked) = self.unpacked.take() {
-            let _ = std::fs::remove_dir_all(unpacked);
+            let _ = std::fs::remove_dir_all(self.pulls.path().join(unpacked));
         }
         for dir in self.made.drain(..).rev() {
             let _ = std::fs::remove_dir(dir);
@@ -1063,11 +1221,21 @@ impl crate::Services {
     fn pulls(&self) -> std::sync::Arc<PieceSource> {
         self.pulls
             .get_or_init(|| {
-                std::sync::Arc::new(PieceSource::new(
-                    self.script_output_config.data_dir.join("pulls"),
-                ))
+                // Snapshots never outlive the daemon that made them.
+                let staging = self.script_output_config.data_dir.join("pulls");
+                let _ = std::fs::remove_dir_all(&staging);
+                let source = std::sync::Arc::new(PieceSource::new(staging));
+                PieceSource::spawn_sweeper(&source);
+                source
             })
             .clone()
+    }
+
+    /// Drop the snapshots local agent `agent` serves (it is going away).
+    pub(crate) fn forget_pulls_of(&self, agent: &AgentId) {
+        if let Some(pulls) = self.pulls.get() {
+            pulls.forget(agent.as_str());
+        }
     }
 
     /// The working directory of local agent `agent` of `workspace_id` on
@@ -1165,19 +1333,15 @@ impl crate::Services {
         path: String,
         to: Option<String>,
     ) -> Result<Value> {
-        self.require_member(&workspace_id).await?;
-        let dest_root = match &caller {
-            Some(caller) => self.agent_root(&workspace_id, caller).await,
-            None => {
-                crate::file_ops::resolve_root(
-                    &self.store,
-                    &workspace_id,
-                    None,
-                    self.chief_cwd_root.as_deref(),
-                )
-                .await
-            }
+        let Some(caller) = caller else {
+            return Err(Error::InvalidParams(
+                "ws.file.pull needs an agent caller: it copies into the calling agent's checkout"
+                    .to_owned(),
+            ));
         };
+        self.require_member(&workspace_id).await?;
+        let dest_root = self.agent_root(&workspace_id, &caller).await;
+        let caller = Some(caller);
         if dest_root.is_empty() {
             return Err(Error::Internal(
                 "workspace has no resolved filesystem root".to_string(),
@@ -1232,6 +1396,8 @@ impl crate::Services {
         pulled
     }
 }
+
+mod place;
 
 #[cfg(test)]
 mod tests;
