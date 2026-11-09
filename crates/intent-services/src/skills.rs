@@ -93,7 +93,6 @@ struct PathFingerprint {
 #[derive(Debug, Clone)]
 struct CachePayload {
     skills: Vec<SkillMetadata>,
-    catalog: String,
     fingerprints: Vec<PathFingerprint>,
     watch_directories: Vec<PathBuf>,
     project_watch_directories: Vec<PathBuf>,
@@ -254,10 +253,10 @@ pub(crate) fn claude_config_dir(home: &Path) -> PathBuf {
         .map_or_else(|| home.join(".claude"), PathBuf::from)
 }
 
-/// Public API: format skills catalog for prompt injection
-pub(crate) async fn format_skills_catalog_for_prompt(workspace_path: &str) -> String {
-    let payload = load_skills_payload(workspace_path).await;
-    payload.catalog.clone()
+/// The skills a prompt's skills block lists (cached discovery); the
+/// session's harness version builds the block from them.
+pub(crate) async fn discover_skills_for_prompt(workspace_path: &str) -> Vec<SkillMetadata> {
+    load_skills_payload(workspace_path).await.skills.clone()
 }
 
 /// Public API: check if skills have changed and return new list if they have.
@@ -429,7 +428,6 @@ async fn load_skills_payload_with_home(
                 CacheEntry {
                     payload: old_payload.clone().unwrap_or_else(|| CachePayload {
                         skills: Vec::new(),
-                        catalog: String::new(),
                         fingerprints: Vec::new(),
                         watch_directories: Vec::new(),
                         project_watch_directories: Vec::new(),
@@ -585,11 +583,8 @@ fn scan_skills_sync(workspace_path: Option<&str>, home_override: Option<PathBuf>
 
     let mut watch_directories: Vec<_> = scan_state.watch_directories.into_iter().collect();
     watch_directories.sort();
-    let catalog = build_skills_catalog(&skills);
-
     CachePayload {
         skills,
-        catalog,
         fingerprints,
         watch_directories,
         project_watch_directories: project_watch_directories.into_iter().collect(),
@@ -1191,7 +1186,7 @@ mod tests {
     // Test helper: format catalog with explicit home dir (no env mutation)
     async fn format_catalog_test(workspace_path: &str, home_dir: PathBuf) -> String {
         let payload = load_skills_payload_with_home(workspace_path, Some(home_dir)).await;
-        payload.catalog
+        build_skills_catalog(&payload.skills)
     }
 
     // Clear the global cache before each test

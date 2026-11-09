@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use intent_core::machine_selection::{
-    exposed_machines_help, select_machines, PlacementMachines, PlacementRequest, RefreshFailure,
+    select_machines, PlacementHelpRenderer, PlacementMachines, PlacementRequest, RefreshFailure,
 };
 use intent_core::machines::ExposedMachine;
 use intent_core::node_link::MachineCapabilities;
@@ -544,10 +544,10 @@ impl PlacementMachines for ExposedMachines<'_> {
 /// The discovery text: the exposed machines with their providers, models
 /// and sign-in, and how to place an agent on one. `None` while no machine
 /// is exposed to this backend, so the model sees no remote-placement text.
-async fn help_text(svc: &Services) -> Option<String> {
+async fn help_text(svc: &Services, render: PlacementHelpRenderer) -> Option<String> {
     let rows = svc.store().list_exposed_machines().await.ok()?;
     let feature = svc.remote_feature();
-    exposed_machines_help(&rows, &|id| {
+    render(&rows, &|id| {
         feature
             .and_then(|feature| feature.running_node(id))
             .is_some_and(|node| node.status().connected)
@@ -662,8 +662,12 @@ impl RemoteLaunchPort for RemoteLaunch {
         Box::pin(machines_availability(svc))
     }
 
-    fn placement_help<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Option<String>> {
-        Box::pin(help_text(svc))
+    fn placement_help<'a>(
+        &'a self,
+        svc: &'a Services,
+        render: PlacementHelpRenderer,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(help_text(svc, render))
     }
 
     fn checkout_piece<'a>(

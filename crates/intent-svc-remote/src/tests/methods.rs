@@ -322,7 +322,14 @@ async fn backend_side_needs_no_setting_and_help_follows_exposed_machines() {
     let backend = Backend::new().await;
     let port = backend.services.feature_remote_launch_port();
     assert!(backend.services.remote_machines_capability());
-    assert_eq!(port.placement_help(&backend.services).await, None);
+    assert_eq!(
+        port.placement_help(
+            &backend.services,
+            intent_core::machine_selection::exposed_machines_help
+        )
+        .await,
+        None
+    );
     assert!(port
         .placements(&backend.services)
         .await
@@ -333,7 +340,10 @@ async fn backend_side_needs_no_setting_and_help_follows_exposed_machines() {
     let mut machine = backend.machine().await;
     backend.expose(&mut machine).await.shutdown();
     let help = port
-        .placement_help(&backend.services)
+        .placement_help(
+            &backend.services,
+            intent_core::machine_selection::exposed_machines_help,
+        )
         .await
         .expect("an exposed machine is listed");
     assert!(help.starts_with("Remote placement"), "{help}");
@@ -343,7 +353,14 @@ async fn backend_side_needs_no_setting_and_help_follows_exposed_machines() {
         .call("remove", json!({ "machineId": machine.id() }))
         .await
         .expect("remove");
-    assert_eq!(port.placement_help(&backend.services).await, None);
+    assert_eq!(
+        port.placement_help(
+            &backend.services,
+            intent_core::machine_selection::exposed_machines_help
+        )
+        .await,
+        None
+    );
     assert_eq!(
         backend.call("list", json!({})).await.unwrap(),
         json!({ "machines": [] })

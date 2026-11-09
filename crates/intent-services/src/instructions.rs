@@ -293,6 +293,13 @@ pub(crate) static V3_8: InstructionSet = InstructionSet {
     ..V3_7
 };
 
+/// Harness v3.10 starts from a copy of the v3.8 common guidance; the
+/// context-reduction work edits that copy.
+pub(crate) static V3_10: InstructionSet = InstructionSet {
+    common: instr!("v3.10", "common"),
+    ..V3_8
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {

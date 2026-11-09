@@ -33,6 +33,7 @@ pub(crate) static ENTRY: HarnessEntry = HarnessEntry {
     version: "1.0",
     harness: &V1,
     doctrine: &DOCTRINE,
+    context: &super::CONTEXT_V1,
     default_features: intent_core::settings_file::AgentFeaturesSettings::default,
     feature_labels: FEATURE_LABELS,
 };

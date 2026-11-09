@@ -170,7 +170,7 @@ pub mod git_ops {
 
 /// The hook wake and notice framing of the latest harness.
 pub mod harness {
-    pub use crate::harness::{latest_hook_framing, HookFraming};
+    pub use crate::harness::{latest_hook_framing, placement_help_renderer, HookFraming};
 
     /// Harness v1 constants.
     pub mod v1 {

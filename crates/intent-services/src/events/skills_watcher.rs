@@ -143,7 +143,7 @@ impl SkillsWatcher {
     /// PRIVATE fingerprint. The shared `DISCOVERY_CACHE` cannot serve as the
     /// baseline here: every `load_skills_payload` caller refreshes it, and
     /// `unarchive_workspace` kicks agent queue drains (whose prompt build
-    /// calls `format_skills_catalog_for_prompt`) before publishing the delta,
+    /// calls `discover_skills_for_prompt`) before publishing the delta,
     /// so the cache can absorb an archive-window edit before the resume flush
     /// runs and silently swallow the catch-up event.
     pub(crate) fn pause_workspace(&self, workspace_id: &WorkspaceId) {

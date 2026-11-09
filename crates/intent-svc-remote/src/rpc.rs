@@ -164,7 +164,12 @@ impl HeadCalls {
             let help = self
                 .services
                 .feature_remote_launch_port()
-                .placement_help(&self.services)
+                .placement_help(
+                    &self.services,
+                    intent_services::feature_api::harness::placement_help_renderer(
+                        &session.harness_version,
+                    ),
+                )
                 .await;
             return LinkOutcome::Ok(serde_json::json!({ "help": help }));
         }

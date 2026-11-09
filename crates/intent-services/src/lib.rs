@@ -300,6 +300,8 @@ pub mod test_support;
 mod test_tracing;
 
 #[cfg(test)]
+mod session_surface_goldens;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_secret_egress;
@@ -31794,7 +31796,21 @@ impl WorkspaceApi for Services {
     fn agent_placement_help(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Option<String>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await.ok()?;
-            self.ports.remote_launch().placement_help(self).await
+            // The calling agent's stamped harness renders it, as its tool
+            // description does; other callers get the latest.
+            let entry = match intent_core::current_caller() {
+                Some(intent_core::Caller::Agent { agent_id }) => {
+                    match self.store.get_agent_session_summary(&agent_id).await {
+                        Ok(session) => crate::harness::resolve_entry(&session.harness_version),
+                        Err(_) => crate::harness::latest_entry(),
+                    }
+                }
+                _ => crate::harness::latest_entry(),
+            };
+            self.ports
+                .remote_launch()
+                .placement_help(self, entry.context.placement_help)
+                .await
         })
     }
 
@@ -38839,6 +38855,7 @@ mod mcp_oauth;
 mod mcp_servers;
 mod plugins;
 mod rules;
+mod session_surfaces;
 pub mod skills;
 mod specialists;
 

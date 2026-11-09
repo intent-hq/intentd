@@ -46,6 +46,11 @@ const ALLOWED: &[(&str, Scope, &str)] = &[
         Scope::CfgTest,
         "version-specific doctrine tests pin the release they describe",
     ),
+    (
+        "crates/intent-services/src/session_surface_goldens.rs",
+        Scope::WholeFile,
+        "test-only goldens pinning the frozen releases whose surfaces must never change",
+    ),
 ];
 
 /// Remediation printed with every report.

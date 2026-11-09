@@ -174,8 +174,9 @@ impl crate::feature_ports::RemoteLaunchPort for MachinePort {
     fn placement_help<'a>(
         &'a self,
         svc: &'a Services,
+        render: intent_core::machine_selection::PlacementHelpRenderer,
     ) -> intent_core::BoxFuture<'a, Option<String>> {
-        self.0.placement_help(svc)
+        self.0.placement_help(svc, render)
     }
     fn admit<'a>(
         &'a self,

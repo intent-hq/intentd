@@ -546,6 +546,12 @@ pub const HELP_MAX_MODELS: usize = 10;
 /// The discovery text's budget for its machine lines, in bytes.
 pub const HELP_MAX_BYTES: usize = 4096;
 
+/// Renders the remote-placement text from the exposed machines and whether
+/// each is connected. Each harness version picks one;
+/// [`exposed_machines_help`] is the renderer of harness 1.0 through 3.9.
+pub type PlacementHelpRenderer =
+    fn(machines: &[ExposedMachine], connected: &dyn Fn(&str) -> bool) -> Option<String>;
+
 /// The `ws.agent` discovery text for the exposed machines: name, id,
 /// platform, connected or last seen, each usable provider with its sign-in
 /// status and up to [`HELP_MAX_MODELS`] models, and when the report was
