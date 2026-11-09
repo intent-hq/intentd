@@ -6,7 +6,8 @@
 //! `help.suggest` frame, and [`unknown_method_message`] answers with the
 //! closest real method, its signature and a `ws.help` pointer. Names that a
 //! disabled `[agentFeatures]` toggle removed still read as `undefined`, so
-//! feature detection (`if (ws.browser)`) keeps working.
+//! feature detection (`if (ws.browser)`) keeps working. An invented name is
+//! a truthy stub, so `'name' in ws.ns` is the reliable presence test for it.
 //!
 //! [`with_signature`] appends the method's signature to argument errors
 //! (`X is required`, `must be …`) returned by any binding.
@@ -30,7 +31,23 @@ use super::super::tools::{help_namespace, workspace_api_description};
 fn documented_paths() -> &'static BTreeSet<String> {
     static PATHS: OnceLock<BTreeSet<String>> = OnceLock::new();
     PATHS.get_or_init(|| {
-        let features = AgentFeaturesSettings::default();
+        let features = AgentFeaturesSettings {
+            background_hooks: true,
+            host_exec: true,
+            scripts: true,
+            terminal_access: true,
+            browser_automation: true,
+            desktop_control: true,
+            rich_chat_blocks: true,
+            structured_questions: true,
+            secret_requests: true,
+            attention_requests: true,
+            state_snapshot: true,
+            pr_monitor: true,
+            task_graph: true,
+            peer_agents: true,
+            mcp_tools: true,
+        };
         [false, true]
             .into_iter()
             .flat_map(|chief| {
@@ -71,6 +88,12 @@ const GUARD_PRELUDE_TEMPLATE: &str = r"
         const DOCUMENTED = new Set(__WS_DOCUMENTED__);
         const PASS = new Set(['then', 'toJSON', 'constructor', 'prototype', 'inspect', 'valueOf', 'toString', 'length', 'name', 'call', 'apply', 'bind', 'catch', 'finally']);
         const wrapped = new WeakMap();
+        const cached = (obj, path, make) => {
+            let byPath = wrapped.get(obj);
+            if (!byPath) wrapped.set(obj, (byPath = new Map()));
+            if (!byPath.has(path)) byPath.set(path, make());
+            return byPath.get(path);
+        };
         const join = (path, prop) => (path ? path + '.' + prop : prop);
         const suggest = (path, known) => () => host({ method: 'help.suggest', args: { path, known } });
         const missingNamespace = (path, known) => new Proxy(function () {}, {
@@ -78,9 +101,7 @@ const GUARD_PRELUDE_TEMPLATE: &str = r"
             apply: () => host({ method: 'help.suggest', args: { path, known } }),
         });
         const isPlain = (v) => v !== null && typeof v === 'object' && Object.getPrototypeOf(v) === Object.prototype && !Object.isFrozen(v);
-        const wrap = (obj, path) => {
-            if (wrapped.has(obj)) return wrapped.get(obj);
-            const proxy = new Proxy(obj, {
+        const wrap = (obj, path) => cached(obj, path, () => new Proxy(obj, {
                 get(target, prop, receiver) {
                     if (typeof prop !== 'string' || prop in target || PASS.has(prop) || prop.startsWith('__')) {
                         const v = Reflect.get(target, prop, receiver);
@@ -91,10 +112,7 @@ const GUARD_PRELUDE_TEMPLATE: &str = r"
                     const known = Object.keys(target);
                     return path ? suggest(full, known) : missingNamespace(full, known);
                 },
-            });
-            wrapped.set(obj, proxy);
-            return proxy;
-        };
+            }));
         globalThis.ws = wrap(globalThis.ws || {}, '');
     })();
 ";
@@ -202,6 +220,13 @@ const ALIASES: &[(&[&str], &[&str])] = &[
     (&["ls", "all", "getall"], &["list", "listPage"]),
 ];
 
+/// Names too generic to look up in other namespaces: `ws.task.get` must
+/// not confidently suggest `ws.script.get`.
+const GENERIC: &[&str] = &[
+    "get", "list", "create", "status", "delete", "update", "add", "set", "read", "start", "stop",
+    "run", "send", "info",
+];
+
 const VERBS: &[&str] = &[
     "get", "fetch", "read", "list", "show", "load", "find", "query",
 ];
@@ -264,7 +289,7 @@ fn closest<'a>(guess: &str, candidates: &[&'a str]) -> Option<&'a str> {
     }
     lower
         .iter()
-        .filter(|(l, _)| l.len() >= 4 && g.len() >= 4 && (l.contains(&g) || g.contains(l.as_str())))
+        .filter(|(l, _)| l.len() >= 4 && g.contains(l.as_str()))
         .min_by_key(|(l, _)| l.len().abs_diff(g.len()))
         .map(|(_, c)| *c)
 }
@@ -354,6 +379,10 @@ pub(crate) fn unknown_method_message(
         }
         return out;
     }
+    if GENERIC.contains(&method.to_ascii_lowercase().as_str()) {
+        let _ = write!(out, " Methods: {}. {help_ns}", names.join(", "));
+        return out;
+    }
     if let Some(e) = elsewhere(is_chief, features, is_sub_agent, &method) {
         let _ = write!(
             out,
@@ -410,7 +439,16 @@ fn is_argument_error(err: &str) -> bool {
     }
     [
         "is required",
-        "must be",
+        "must be a ",
+        "must be an ",
+        "must be one of",
+        "must be between",
+        "must be non",
+        "must be positive",
+        "must be greater",
+        "must be provided",
+        "must be '",
+        "must be \"",
         "invalid params",
         "expected a",
         "missing field",
@@ -463,6 +501,10 @@ mod tests {
         assert_eq!(closest("notes", &["note", "task"]), Some("note"));
         assert_eq!(closest("lsitPage", &["listPage", "get"]), Some("listPage"));
         assert_eq!(
+            closest("create", &["createPrerequisite", "convertBlocks"]),
+            None
+        );
+        assert_eq!(
             closest("frobnicateEverything", &["commit", "listRoots"]),
             None
         );
@@ -476,6 +518,9 @@ mod tests {
             "No agent context available. This tool must be called by an agent."
         ));
         assert!(!is_argument_error("Note not found: spec"));
+        assert!(!is_argument_error(
+            "agent must be idle before it can be retired"
+        ));
     }
 
     #[test]
@@ -488,6 +533,8 @@ mod tests {
             "app",
             "app.workspaces",
             "browser",
+            "secret",
+            "host.exec",
         ] {
             assert!(paths.contains(p), "{p}");
         }

@@ -167,3 +167,25 @@ async fn valid_calls_and_feature_detection_are_unchanged() {
         ])
     );
 }
+
+#[tokio::test]
+async fn gated_off_secret_namespace_still_reads_undefined() {
+    let server = server(AgentFeaturesSettings::default());
+    assert_eq!(
+        ok_text(&server, "return typeof ws.secret").await,
+        "\"undefined\""
+    );
+}
+
+#[tokio::test]
+async fn aliases_report_the_spelling_the_agent_used() {
+    let text = error_text("void ws.pr.snapshot; return await ws.mr.create()").await;
+    assert!(text.contains("ws.mr.create is not a function"), "{text}");
+}
+
+#[tokio::test]
+async fn generic_names_do_not_jump_to_another_namespace() {
+    let text = error_text("return await ws.task.get('x')").await;
+    assert!(!text.contains("ws.script.get"), "{text}");
+    assert!(text.contains("ws.help(\"task\")"), "{text}");
+}
