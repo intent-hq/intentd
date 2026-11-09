@@ -793,12 +793,87 @@ fn each_non_account_start_failure_names_its_own_cause() {
     }
 }
 
+/// Each provider start failure that is not a sign-in problem gets its own
+/// cause and advice, and never asks for a sign-in.
+#[test]
+fn each_provider_start_failure_names_its_own_cause() {
+    for (reason, needles) in [
+        (
+            "transport closed: node-agent-not-running: the provider did not start \
+             (node-agent-start-failed: request `initialize` timed out)",
+            &[
+                "request `initialize` timed out",
+                "the backup claude-code (PB1) started on Mac, but its provider did not respond in \
+                 time, which is not a sign-in problem",
+                "Retry the message",
+            ][..],
+        ),
+        (
+            "profile-not-remote-compatible: claude-code@pb1 sets CLAUDE_CONFIG_DIR",
+            &[
+                "claude-code (PB1) uses an account folder on this backend, so it can't run on \
+                 other machines",
+                "API-key profile",
+            ][..],
+        ),
+        (
+            "node-agent-not-running: the provider exited with status 1",
+            &[
+                "the provider stopped on Mac before it was ready",
+                "Retry the message; if it stops again, check that claude-code (PB1) is signed \
+                 in on Mac",
+            ][..],
+        ),
+        (
+            "transport closed: node-agent-not-running: the agent has exited",
+            &["the provider stopped on Mac before it was ready"][..],
+        ),
+    ] {
+        let text =
+            remote_backup_failed_text("claude-code", "claude-code@pb1", "Mac", reason, &saved());
+        assert!(text.starts_with(REMOTE_FAILOVER_UNAVAILABLE), "{text}");
+        for needle in needles {
+            assert!(text.contains(needle), "{needle:?} missing from {text:?}");
+        }
+        assert!(!text.contains("Sign in"), "{text}");
+    }
+}
+
+/// The agent's recorded `placementError` completes a reason that lacks it
+/// (an older machine sends only "the agent has exited"), so the cause is
+/// sorted on it; a reason that already carries it is left as is.
+#[test]
+fn the_placement_error_detail_completes_the_start_failure_reason() {
+    use intent_core::remote_launch::PlacementError;
+    let timeout = PlacementError::new("node-agent-start-failed", "request `initialize` timed out");
+    let reason = with_placement_error(
+        "node-agent-not-running: the agent has exited",
+        Some(&timeout),
+    );
+    assert_eq!(
+        reason,
+        "node-agent-not-running: the agent has exited \
+         (node-agent-start-failed: request `initialize` timed out)"
+    );
+    let text =
+        remote_backup_failed_text("claude-code", "claude-code@pb1", "Mac", &reason, &saved());
+    assert!(text.contains("did not respond in time"), "{text}");
+    assert!(!text.contains("Sign in"), "{text}");
+
+    let full = "node-agent-not-running: the provider did not start \
+                (node-agent-start-failed: request `initialize` timed out)";
+    assert_eq!(with_placement_error(full, Some(&timeout)), full);
+    assert_eq!(with_placement_error("boom", None), "boom");
+}
+
 /// Account and provider start failures (and failures without a code) keep
 /// the sign-in advice.
 #[test]
 fn an_account_start_failure_still_suggests_signing_in() {
     for reason in [
         "node-agent-start-failed: Claude Code is not signed in",
+        "node-agent-not-running: the provider did not start \
+         (node-agent-start-failed: Authentication required)",
         "node-provider-unavailable: claude-code is not installed",
         "node-profile-unavailable: the account folder ~/.claude-backup does not exist",
         "the account folder ~/.claude-backup does not exist on this machine",

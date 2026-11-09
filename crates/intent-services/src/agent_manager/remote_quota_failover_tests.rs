@@ -631,6 +631,52 @@ async fn a_backup_that_exits_before_starting_on_the_node_undoes_the_switch() {
     assert!(failover_rows(&messages).is_empty(), "{messages:#?}");
 }
 
+/// A usable backup whose provider did not finish `initialize` in time on
+/// the machine (it had just woken) fails with that cause, not a sign-in
+/// request.
+#[intent_test_macros::daemon_test]
+async fn a_backup_whose_provider_times_out_on_the_node_does_not_ask_for_a_sign_in() {
+    let ws = WorkspaceId::from("ws-remote-failover-timeout");
+    let id = AgentId::from("agent-remote-failover-timeout");
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let backup_run = FakeRuntime::new();
+    *backup_run.exited.lock().unwrap() = Some(
+        "the provider did not start (node-agent-start-failed: request `initialize` timed out)"
+            .into(),
+    );
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+
+    send(&mgr, &id, &ws, "hello").await;
+    wait_idle(&mgr, &id).await;
+
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert_eq!(session.provider.as_deref(), Some("claude-code"));
+    assert_eq!(session.status, AgentStatus::Error);
+    let reason = session.stop_reason.unwrap_or_default();
+    for needle in [
+        "ran out of quota on Mac",
+        "request `initialize` timed out",
+        "did not respond in time",
+        "Retry the message",
+    ] {
+        assert!(
+            reason.contains(needle),
+            "{needle:?} missing from {reason:?}"
+        );
+    }
+    assert!(!reason.contains("Sign in"), "{reason}");
+}
+
 /// Node "node-1" exposed with `claude-code` signed in and `models` listed.
 async fn expose_claude_node(mgr: &AgentManager, models: &[&str]) {
     use intent_core::node_link::{
