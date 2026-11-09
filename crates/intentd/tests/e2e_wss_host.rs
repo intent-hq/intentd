@@ -2185,12 +2185,9 @@ async fn host_provider_discovery_reports_cli_versions_over_wss() {
         .to_string();
     let mut ws = connect_ws(port, client_config(&fingerprint)).await;
 
-    let started = std::time::Instant::now();
+    // The hanging grok CLI (sleep 30) must be cut off for this call to
+    // return within the RPC helper's own timeout.
     let result = wss_rpc(&mut ws, 2, "host.providerDiscovery", json!({})).await;
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(20),
-        "a hanging CLI must not stall discovery"
-    );
     let row = |id: &str| {
         result["providers"]
             .as_array()

@@ -145,27 +145,10 @@ fn version_line(stdout: &[u8]) -> Option<String> {
         .then_some(line)
 }
 
-fn kill_group(pid: u32) {
-    #[cfg(unix)]
-    if let Ok(pgid) = i32::try_from(pid) {
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pgid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
-}
+const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
-/// `<path> --version` in its own process group with the provider spawn
-/// PATH (npm shims need `node`), bounded by [`PROBE_TIMEOUT`] including
-/// the stdout read (a grandchild may hold the pipe open). The group is
-/// killed only on timeout, before the child is reaped, so a recycled
-/// process-group id is never signalled.
-fn run_version_probe(path: &Path) -> Option<String> {
-    use std::io::Read;
+fn probe_command(path: &Path) -> std::process::Command {
     use std::process::{Command, Stdio};
-
     let mut cmd = Command::new(path);
     cmd.arg("--version")
         .env("PATH", intent_providers::enhanced_path(Some(path)))
@@ -173,19 +156,116 @@ fn run_version_probe(path: &Path) -> Option<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    cmd
+}
+
+/// `<path> --version` in its own process group with the provider spawn
+/// PATH (npm shims need `node`), bounded by [`PROBE_TIMEOUT`] including
+/// the stdout read. The child's exit is observed without reaping it, so its
+/// process-group id stays reserved while the group (helpers that may hold
+/// stdout open) is killed; only then is the child reaped.
+#[cfg(unix)]
+fn run_version_probe(path: &Path) -> Option<String> {
+    use std::os::unix::process::CommandExt;
+
+    let mut cmd = probe_command(path);
+    cmd.process_group(0);
     let mut child = cmd.spawn().ok()?;
     let pid = child.id();
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let exited = wait_unreaped(pid, deadline);
+    if let Ok(pgid) = i32::try_from(pid) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pgid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let status = child.wait().ok()?;
+    if !exited || !status.success() {
+        return None;
+    }
+    version_line(&read_until(child.stdout.take()?, deadline)?)
+}
+
+/// Whether the child exited before `deadline`, leaving it unreaped.
+#[cfg(unix)]
+fn wait_unreaped(pid: u32, deadline: Instant) -> bool {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: `info` is writable and zeroed; WNOWAIT leaves the child
+        // unreaped so its pid and process-group id cannot be recycled.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return false;
+        }
+        // SAFETY: zero-initialised above; WNOHANG leaves `si_pid` zero
+        // until the child has exited.
+        if unsafe { info.assume_init().si_pid() } != 0 {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Read `stdout` to EOF, giving up at `deadline` (a process outside the
+/// killed group may still hold the pipe open).
+#[cfg(unix)]
+fn read_until(mut stdout: std::process::ChildStdout, deadline: Instant) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    while out.len() < MAX_OUTPUT_BYTES {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout_ms = libc::c_int::try_from(remaining.as_millis()).unwrap_or(libc::c_int::MAX);
+        let mut fd = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd` whose fd `stdout` owns for the call.
+        match unsafe { libc::poll(&raw mut fd, 1, timeout_ms) } {
+            0 => return None,
+            n if n < 0 => {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return None;
+            }
+            _ => {}
+        }
+        match stdout.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+#[cfg(not(unix))]
+fn run_version_probe(path: &Path) -> Option<String> {
+    use std::io::Read;
+
+    let mut child = probe_command(path).spawn().ok()?;
     let start = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel();
-    if let Some(mut stdout) = child.stdout.take() {
+    if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || {
             let mut out = Vec::new();
-            let _ = (&mut stdout).take(64 * 1024).read_to_end(&mut out);
+            let _ = stdout.take(64 * 1024).read_to_end(&mut out);
             let _ = tx.send(out);
         });
     }
@@ -194,7 +274,6 @@ fn run_version_probe(path: &Path) -> Option<String> {
             Ok(Some(status)) if status.success() => break,
             Ok(Some(_)) | Err(_) => return None,
             Ok(None) if start.elapsed() >= PROBE_TIMEOUT => {
-                kill_group(pid);
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
@@ -235,6 +314,45 @@ mod tests {
         assert_eq!(cached_version(&bin), Some("10.20.30".into()));
         write("#!/bin/sh\nexit 1\n");
         assert_eq!(cached_version(&bin), None);
+    }
+
+    #[test]
+    fn probe_reaps_a_helper_that_keeps_stdout_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("tool");
+        let helper_pid = dir.path().join("helper.pid");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho 1.2.3\nsleep 30 &\necho $! > '{}'\n",
+                helper_pid.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A read still blocked on the helper's open stdout would time out
+        // and report no version.
+        assert_eq!(run_version_probe(&bin), Some("1.2.3".into()));
+
+        let pid: i32 = std::fs::read_to_string(&helper_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let gone = (0..100).any(|_| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            let alive = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                && !stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with('Z'));
+            if alive {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !alive
+        });
+        assert!(gone, "background helper {pid} survived the probe");
     }
 
     #[test]

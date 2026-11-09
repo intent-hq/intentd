@@ -298,12 +298,13 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return,agent_manager,complete_ops,enhance_ops}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace/workspace-selectors.ts (selectHidesProviderProfileNames). -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return,provider_version,agent_manager,complete_ops,enhance_ops}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte; packages/cloudlands-fe/src/store/renderer/slices/workspace/workspace-selectors.ts (selectHidesProviderProfileNames). -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
 the workspace creation form where offered. Available choices depend on configured
-providers; diagnose a missing provider in **Providers**. Changing a default provider
+providers; diagnose a missing provider in **Providers**, where each installed
+provider shows its CLI version. Changing a default provider
 or model affects new agents only; each existing agent keeps its own provider, model
 and reasoning level until changed in its own model picker. Specialist entries appear
 in the Settings sidebar's Agents group. Create one at
