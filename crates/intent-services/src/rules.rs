@@ -1876,6 +1876,7 @@ This is a test skill.
     /// workspace rule files.
     mod native_repo_rules {
         use super::*;
+        use crate::native_rules::test_versions::{BELOW, NEW};
         use crate::native_rules::RuleExecutor;
 
         const AGENTS: &str = "AGENTS-RULE-TEXT: run make gate before a PR.";
@@ -2002,7 +2003,7 @@ This is a test skill.
         #[tokio::test]
         async fn known_good_claude_cli_gets_a_small_agents_md_once() {
             let dir = repo(&[("AGENTS.md", AGENTS)]);
-            let cli = claude(Some("2.1.303 (Claude Code)"));
+            let cli = claude(Some(NEW));
             let new = prompt(dir.path(), "3.10", Some(&cli), false).await;
             assert!(!new.contains(AGENTS), "Claude Code loads it natively");
             let old = prompt(dir.path(), "3.8", Some(&cli), false).await;
@@ -2016,7 +2017,7 @@ This is a test skill.
         #[tokio::test]
         async fn unknown_or_old_claude_cli_keeps_the_injection() {
             let dir = repo(&[("AGENTS.md", AGENTS)]);
-            for cli in [claude(None), claude(Some("2.1.280 (Claude Code)"))] {
+            for cli in [claude(None), claude(Some(BELOW))] {
                 let p = prompt(dir.path(), "3.10", Some(&cli), false).await;
                 assert_eq!(p.matches(AGENTS).count(), 1, "{cli:?}");
             }
@@ -2050,7 +2051,7 @@ This is a test skill.
         #[tokio::test]
         async fn skipping_a_file_does_not_promote_the_next() {
             let dir = repo(&[("CLAUDE.md", CLAUDE), ("AGENTS.md", AGENTS)]);
-            let cli = claude(Some("2.1.303 (Claude Code)"));
+            let cli = claude(Some(NEW));
             let p = prompt(dir.path(), "3.10", Some(&cli), false).await;
             assert!(!p.contains(CLAUDE) && !p.contains(AGENTS), "{p}");
             // Codex never loads CLAUDE.md: it stays injected, and AGENTS.md
@@ -2084,7 +2085,7 @@ This is a test skill.
                     ),
                 ]
             );
-            let cli = claude(Some("2.1.303 (Claude Code)"));
+            let cli = claude(Some(NEW));
             let rules = workspace_rules_native_aware(&crate::harness::RepoRulesInputs {
                 workspace_path: dir.path(),
                 executor: Some(&cli),

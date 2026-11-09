@@ -221,7 +221,20 @@ fn untrusted(doc: &toml_edit::DocumentMut, workspace: &Path) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) mod test_versions {
+    // cli-fixture-version: allow — exercises the native AGENTS.md threshold, not the adapter minimum
+    pub(crate) const NEW: &str = "2.1.303 (Claude Code)";
+    // cli-fixture-version: allow — first Claude Code release that loads AGENTS.md natively
+    pub(crate) const FIRST: &str = "2.1.281 (Claude Code)";
+    // cli-fixture-version: allow — last Claude Code release without native AGENTS.md
+    pub(crate) const BELOW: &str = "2.1.280 (Claude Code)";
+    // cli-fixture-version: allow — an old CLI that still loads CLAUDE.md natively
+    pub(crate) const OLD: &str = "2.1.0 (Claude Code)";
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_versions::*;
     use super::*;
 
     fn claude(version: Option<&str>) -> RuleExecutor {
@@ -255,9 +268,9 @@ mod tests {
     fn claude_agents_md_needs_a_known_new_enough_cli() {
         let dir = repo(&[("AGENTS.md", 100)]);
         let at = |v| native_loader("AGENTS.md", dir.path(), Some(&claude(v)));
-        assert_eq!(at(Some("2.1.303 (Claude Code)")), Some("Claude Code"));
-        assert_eq!(at(Some("2.1.281 (Claude Code)")), Some("Claude Code"));
-        assert_eq!(at(Some("2.1.280 (Claude Code)")), None);
+        assert_eq!(at(Some(NEW)), Some("Claude Code"));
+        assert_eq!(at(Some(FIRST)), Some("Claude Code"));
+        assert_eq!(at(Some(BELOW)), None);
         assert_eq!(at(Some("garbled")), None);
         assert_eq!(at(None), None);
         assert_eq!(native_loader("AGENTS.md", dir.path(), None), None);
@@ -267,7 +280,7 @@ mod tests {
     fn claude_skips_agents_md_in_a_claude_md_project() {
         for other in ["CLAUDE.local.md", ".claude/CLAUDE.md"] {
             let dir = repo(&[("AGENTS.md", 100), (other, 10)]);
-            let cli = claude(Some("2.1.303 (Claude Code)"));
+            let cli = claude(Some(NEW));
             assert_eq!(
                 native_loader("AGENTS.md", dir.path(), Some(&cli)),
                 None,
@@ -278,14 +291,14 @@ mod tests {
         let nested = parent.path().join("ws");
         std::fs::create_dir(&nested).unwrap();
         std::fs::write(nested.join("AGENTS.md"), "rules").unwrap();
-        let cli = claude(Some("2.1.303 (Claude Code)"));
+        let cli = claude(Some(NEW));
         assert_eq!(native_loader("AGENTS.md", &nested, Some(&cli)), None);
     }
 
     #[test]
     fn claude_md_is_native_on_any_known_claude_cli_and_never_on_codex() {
         let dir = repo(&[("CLAUDE.md", 100)]);
-        let old = claude(Some("2.1.0 (Claude Code)"));
+        let old = claude(Some(OLD));
         assert_eq!(
             native_loader("CLAUDE.md", dir.path(), Some(&old)),
             Some("Claude Code")
@@ -331,7 +344,7 @@ mod tests {
     #[test]
     fn other_files_and_providers_are_never_native() {
         let dir = repo(&[(".intent/guidelines.md", 10), ("AGENTS.md", 10)]);
-        let cli = claude(Some("2.1.303 (Claude Code)"));
+        let cli = claude(Some(NEW));
         assert_eq!(
             native_loader(".intent/guidelines.md", dir.path(), Some(&cli)),
             None
@@ -365,7 +378,7 @@ mod tests {
         let dir = repo(&[("real.md", 10)]);
         std::os::unix::fs::symlink(dir.path().join("real.md"), dir.path().join("AGENTS.md"))
             .unwrap();
-        let cli = claude(Some("2.1.303 (Claude Code)"));
+        let cli = claude(Some(NEW));
         assert_eq!(native_loader("AGENTS.md", dir.path(), Some(&cli)), None);
     }
 
