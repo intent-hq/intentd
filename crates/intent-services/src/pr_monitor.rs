@@ -9513,7 +9513,7 @@ mod tests {
             requirements: MergeRequirements {
                 state: pick(b, "open", "closed").into(),
                 is_draft: b,
-                has_conflicts: b,
+                has_conflicts: !b,
                 is_behind: b,
                 ancestry: intent_sourcecontrol::PrAncestry::Known {
                     base_sha: pick(b, "base1", "base2").into(),
@@ -9607,6 +9607,7 @@ mod tests {
             unresolved_threads_last_known: Some(pick(b, 4, 6)),
             mergeable_last_known: Some(b),
             merge_state_status_last_known: Some(pick(b, "BEHIND", "DIRTY").into()),
+            // Matches `has_conflicts`: a stripped mergeability makes it live.
             has_conflicts_last_known: !b,
             merge_blocked_reason_last_known: Some(pick(b, "branch behind base", "draft").into()),
         }
