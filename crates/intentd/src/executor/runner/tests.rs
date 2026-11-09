@@ -724,7 +724,11 @@ async fn node_runner_does_not_retry_a_sign_in_failure() {
     let log = dir.path().join("starts");
     let Some(h) = harness(
         1,
-        &["--auth-required-setup", "--log-start", log.to_str().unwrap()],
+        &[
+            "--auth-required-setup",
+            "--log-start",
+            log.to_str().unwrap(),
+        ],
     ) else {
         return;
     };

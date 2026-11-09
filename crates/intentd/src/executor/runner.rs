@@ -246,7 +246,7 @@ const COLD_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(90);
 struct StartTimeouts {
     warm: Duration,
     cold: Duration,
-    /// A link bound and no agent has started since.
+    /// A link bound and no provider has started since.
     cold_pending: bool,
 }
 
@@ -523,8 +523,6 @@ struct Agent {
     /// Why the agent exited ([`exit_detail`]), set before `ready` closes so
     /// a turn waiting for the session can say why it never came.
     exit_detail: Mutex<Option<String>>,
-    /// How long each start of its provider may take to answer `initialize`.
-    initialize_timeout: Duration,
     /// Whether a turn is running; refuses a second one.
     busy: Mutex<bool>,
     marks: mpsc::UnboundedSender<Mark>,
@@ -993,11 +991,11 @@ impl Runner {
         lock(&self.inner.start_timeouts).cold_pending = true;
     }
 
-    /// The `initialize` timeout for an agent starting now: the cold one for
-    /// the first since a link bound.
-    fn take_initialize_timeout(&self) -> Duration {
+    /// The `initialize` timeout for a provider starting now: the cold one
+    /// for the first start since a link bound, never for a second start.
+    fn initialize_timeout(&self, second: bool) -> Duration {
         let mut timeouts = lock(&self.inner.start_timeouts);
-        if std::mem::take(&mut timeouts.cold_pending) {
+        if !second && std::mem::take(&mut timeouts.cold_pending) {
             timeouts.cold
         } else {
             timeouts.warm
@@ -1429,7 +1427,6 @@ impl Runner {
             journaled: journaled_rx,
             ready: ready_rx,
             exit_detail: Mutex::new(None),
-            initialize_timeout: self.take_initialize_timeout(),
             busy: Mutex::new(false),
             descendants: Arc::new(Descendants::default()),
             run_marker: intent_core::node_link::LinkId::new_v4().to_string(),
@@ -1731,10 +1728,11 @@ impl Runner {
                         Ok(spawned) => spawned,
                         Err(error) => break (None, Some(format!("{}: {error}", codes::START))),
                     };
+                    let timeout = self.initialize_timeout(retried);
                     let outcome = self
                         .attempt(
                             &agent,
-                            &launch,
+                            (&launch, timeout),
                             (&connection, child),
                             &mut stop,
                             &ready,
@@ -1747,7 +1745,11 @@ impl Runner {
                     // just woken is often still slow to start one.
                     if !retried && outcome.start_may_recover() {
                         retried = true;
-                        tracing::info!(agent = %agent.id, ?outcome, "node: provider did not start; starting it once more");
+                        // Not the outcome itself: its error can echo a credential.
+                        let timed_out = matches!(outcome, Outcome::StartFailed(..));
+                        tracing::info!(agent = %agent.id, timed_out, "node: provider did not start; starting it once more");
+                        // The first start's processes are gone.
+                        agent.descendants.publish(agent.descendants.begin(), Vec::new());
                         continue;
                     }
                     break match outcome {
@@ -2135,7 +2137,7 @@ impl Runner {
     async fn attempt(
         &self,
         agent: &Agent,
-        launch: &ProviderLaunch,
+        launch: (&ProviderLaunch, Duration),
         (connection, mut child): (&Arc<Connection>, Child),
         stop: &mut oneshot::Receiver<()>,
         ready: &watch::Sender<Option<Arc<Ready>>>,
@@ -2192,7 +2194,7 @@ impl Runner {
     async fn supervise(
         &self,
         agent: &Agent,
-        launch: &ProviderLaunch,
+        (launch, initialize_timeout): (&ProviderLaunch, Duration),
         connection: &Arc<Connection>,
         child: &mut Child,
         stop: &mut oneshot::Receiver<()>,
@@ -2203,7 +2205,7 @@ impl Runner {
         // The agent's workspace MCP server and its proxied user servers ride
         // `session/new`, which every ACP agent accepts stdio servers on.
         let setup = async {
-            intent_acp::handshake_within(connection, &launch.config, agent.initialize_timeout)
+            intent_acp::handshake_within(connection, &launch.config, initialize_timeout)
                 .await?;
             intent_acp::session::new_session(connection, cwd, mcp, None).await
         };
@@ -2941,7 +2943,6 @@ enum Push {
 /// start is told apart from a setup error.
 const EXIT_SETTLE: Duration = Duration::from_millis(500);
 
-#[derive(Debug)]
 enum Outcome {
     Exited(Option<i32>),
     /// The provider exited before its session was ready, with the setup
