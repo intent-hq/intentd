@@ -16,7 +16,7 @@ OUTCOMES = 'noop|throttle|hold|defer|skip|refuse|dry-run|merge|queue|error'
 DECISION = re.compile(r'^auto-cut-decision: (?P<outcome>%s) (?P<reason>[a-z0-9]+(?:-[a-z0-9]+)*) \S.*$' % OUTCOMES)
 Fixture = runpy.run_path(str(ROOT / 'scripts/test-release-pr-fast-path.py'))['Fixture']
 MOCK = r'''
-import json, os, pathlib, subprocess, sys
+import datetime, json, os, pathlib, subprocess, sys
 path = pathlib.Path(os.environ['MOCK_STATE'])
 s = json.loads(path.read_text())
 a = sys.argv[1:]
@@ -36,6 +36,12 @@ elif a[:2] == ['api', 'graphql']:
     query = a[a.index('-f') + 1]
     if 'viewer' in query:
         print('release-bot')
+    elif 'ReopenedEvent' in query:
+        if s.get('head_info_error'): sys.exit(1)
+        reopened = s.get('reopened')
+        emit({'data': {'repository': {'pullRequest': {
+            'commits': {'nodes': [{'commit': {'oid': s['detail']['headRefOid'], 'committedDate': s.get('head_committed', '2000-01-01T00:00:00Z')}}]},
+            'timelineItems': {'nodes': [{'createdAt': reopened}] if reopened else []}}}}})
     else:
         if s.get('thread_error'): sys.exit(1)
         print(s.get('unresolved', 0))
@@ -47,6 +53,15 @@ elif a[:2] == ['pr', 'merge']:
     s['merged'] = '--admin' in a
     s['submitted'] = True
     path.write_text(json.dumps(s))
+elif a[:2] in (['pr', 'close'], ['pr', 'reopen']):
+    if s.get(a[1] + '_error'): sys.exit(1)
+    if a[1] == 'reopen':
+        s['reopened'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    path.write_text(json.dumps(s))
+elif a[:1] == ['api'] and '/actions/runs?' in a[1]:
+    # Every workflow run on the Release PR head, of any workflow or event.
+    if s.get('head_runs_error'): sys.exit(1)
+    emit({'total_count': s.get('head_runs', 1), 'workflow_runs': []})
 elif a[:1] == ['api'] and '/actions/workflows/ci.yml/runs' in ' '.join(a):
     if s.get('main_runs_error'): sys.exit(1)
     emit({'total_count': len(s['main_runs']), 'workflow_runs': s['main_runs']})
@@ -220,6 +235,29 @@ path.write_text(json.dumps(s))
 
     def merge_calls(self):
         return [c for c in self.state['calls'] if c['args'][:2] == ['pr', 'merge']]
+
+    @staticmethod
+    def minutes_ago(minutes):
+        import datetime
+        moment = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=minutes)
+        return moment.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    def no_ci_runs(self, minutes_old=15, reopened=None):
+        # GitHub delivered no pull_request event for the head: it has no
+        # workflow run at all, so CI Gate never reports (intentd#3185, head
+        # 3276c2c, 2026-11-09).
+        self.state['detail']['mergeStateStatus'] = 'BLOCKED'
+        self.state['detail']['statusCheckRollup'] = []
+        self.state['head_runs'] = 0
+        self.state['head_committed'] = self.minutes_ago(minutes_old)
+        self.state['reopened'] = reopened
+
+    def restart_calls(self):
+        return [c for c in self.state['calls'] if c['args'][:2] in (['pr', 'close'], ['pr', 'reopen'])]
+
+    @staticmethod
+    def decision_line(output):
+        return next(line for line in output.splitlines() if line.startswith('auto-cut-decision:'))
 
     def test_green_metadata_direct_merge_matches_tested_head(self):
         output = self.run_workflow()
@@ -494,6 +532,82 @@ path.write_text(json.dumps(s))
         self.assertEqual(self.merge_calls(), [])
         self.assertIn('CI wait budget exhausted', output)
 
+    def test_head_without_any_workflow_run_restarts_ci_then_cuts(self):
+        # The reopen uses the PAT (a GITHUB_TOKEN reopen starts no
+        # workflows), and the run keeps waiting for the restarted CI.
+        self.no_ci_runs()
+        self.finish_ci_after_polls(2)
+        output = self.run_workflow(EVENT_NAME='schedule')
+        calls = self.restart_calls()
+        self.assertEqual([c['args'][:2] for c in calls], [['pr', 'close'], ['pr', 'reopen']])
+        self.assertEqual({c['token'] for c in calls}, {'merge-token'})
+        self.assertTrue(all(c['args'][2] == '42' for c in calls))
+        self.assertEqual(len(self.merge_calls()), 1)
+        self.assertEqual(self.last_decision, ('merge', 'direct-merge'))
+        self.assertIn('restarted CI', self.decision_line(output))
+
+    def test_restart_without_ci_budget_reports_it(self):
+        self.no_ci_runs()
+        output = self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='0')
+        self.assertEqual(len(self.restart_calls()), 2)
+        self.assertEqual(self.last_decision, ('defer', 'ci-restarted'))
+        self.assertIn('no workflow runs for 15 min', self.decision_line(output))
+
+    def test_push_run_restarts_once_when_the_head_ages_past_the_threshold(self):
+        # Head 8 min old: polls 1-3 stay under 10 min, poll 4 restarts, and
+        # the later missing reads must not close the PR again.
+        self.no_ci_runs(minutes_old=8)
+        self.finish_ci_after_polls(8)
+        self.run_workflow(EVENT_NAME='push')
+        self.assertEqual([c['args'][1] for c in self.restart_calls()], ['close', 'reopen'])
+        restart = self.state['calls'].index(self.restart_calls()[0])
+        polls_before = sum(1 for c in self.state['calls'][:restart] if c['args'][:2] == ['pr', 'view'])
+        self.assertEqual(polls_before, 5)
+        self.assertEqual(len(self.merge_calls()), 1)
+
+    def test_ci_restart_needs_an_old_head_with_no_runs_and_no_earlier_restart(self):
+        cases = [
+            ('young head', lambda: self.no_ci_runs(minutes_old=5), {}),
+            ('head has runs', lambda: (self.no_ci_runs(), self.state.update(head_runs=1)), {}),
+            ('already reopened for this head', lambda: self.no_ci_runs(reopened=self.minutes_ago(5)), {}),
+            ('head info unreadable', lambda: (self.no_ci_runs(), self.state.update(head_info_error=True)), {}),
+            ('runs unreadable', lambda: (self.no_ci_runs(), self.state.update(head_runs_error=True)), {}),
+            ('dry run', self.no_ci_runs, {'DRY_RUN': 'true'}),
+        ]
+        for name, setup, env in cases:
+            with self.subTest(name):
+                self.reset()
+                setup()
+                output = self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='0', **{'DRY_RUN': 'false', **env})
+                self.assertEqual(self.restart_calls(), [])
+                self.assertEqual(self.last_decision, ('defer', 'ci-gate-missing'))
+                if name == 'already reopened for this head':
+                    self.assertIn('already restarted', self.decision_line(output))
+                if name == 'dry run':
+                    self.assertIn('would close and reopen', output)
+
+    def test_reopen_before_the_head_commit_does_not_count_as_a_restart(self):
+        self.no_ci_runs(reopened=self.minutes_ago(30))
+        self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='0')
+        self.assertEqual(self.last_decision, ('defer', 'ci-restarted'))
+
+    def test_failed_close_leaves_the_pr_open_and_waits_as_before(self):
+        self.no_ci_runs()
+        self.state['close_error'] = True
+        self.run_workflow(EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='0')
+        self.assertEqual(self.last_decision, ('defer', 'ci-gate-missing'))
+        self.assertEqual(self.merge_calls(), [])
+
+    def test_failed_reopen_fails_loudly(self):
+        # A closed Release PR stalls every later run; a red run asks a human
+        # to reopen it.
+        self.no_ci_runs()
+        self.state['reopen_error'] = True
+        output = self.run_workflow(expect_status=1, EVENT_NAME='schedule', AUTO_CUT_CI_WAIT_MINUTES='0')
+        self.assertEqual(self.last_decision, ('error', 'ci-restart-failed'))
+        self.assertEqual([c['args'][1] for c in self.restart_calls()], ['close', 'reopen', 'reopen'])
+        self.assertIn('reopen it by hand', output)
+
     def test_untrusted_or_fork_pr_skips(self):
         for key, value in [('author', {'login': 'outsider'}), ('isCrossRepository', True), ('headRefName', 'ordinary')]:
             with self.subTest(key=key):
@@ -710,6 +824,7 @@ path.write_text(json.dumps(s))
             ('thread read error', {}, lambda: self.state.update(thread_error=True), ('defer', 'api-error')),
             ('failed gate', {}, detail(statusCheckRollup=[{'name': 'CI Gate', 'conclusion': 'FAILURE'}]), ('skip', 'ci-gate-failed')),
             ('missing gate', {'AUTO_CUT_CI_WAIT_MINUTES': '0'}, detail(mergeStateStatus='BLOCKED', statusCheckRollup=[]), ('defer', 'ci-gate-missing')),
+            ('CI restarted', {'AUTO_CUT_CI_WAIT_MINUTES': '0'}, self.no_ci_runs, ('defer', 'ci-restarted')),
             ('pending gate', {'AUTO_CUT_CI_WAIT_MINUTES': '0'}, pending, ('defer', 'ci-gate-pending')),
             ('green but blocked', {}, detail(mergeStateStatus='BLOCKED'), ('defer', 'review-or-base')),
             ('unreadable head', {}, detail(headRefOid='nope'), ('defer', 'api-error')),

@@ -62,6 +62,10 @@
 #   any other conclusion → skip until a fix or re-run turns main green.
 #   Applies to every trigger (dispatch only bypasses the throttle); a human
 #   merging the Release PR by hand is the deliberate override.
+# - Missing-CI restart: GitHub sometimes starts no workflow for a Release PR
+#   push, and CI Gate then never reports. When the head commit is
+#   AUTO_CUT_CI_RESTART_MINUTES (10) old with no workflow run of any kind,
+#   the run closes and reopens the PR once per head to start CI again.
 # - The PR branch is never updated from here: release-plz owns the Release
 #   PR branch content and refreshes it on every push to main, which is how
 #   the ruleset's strict up-to-date requirement gets satisfied. A branch
@@ -183,6 +187,7 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run == true }}
           EVENT_NAME: ${{ github.event_name }}
           AUTO_CUT_CI_WAIT_MINUTES: '25'
+          AUTO_CUT_CI_RESTART_MINUTES: '10'
           # Push events only; used to recognize the cut's own merge push.
           HEAD_COMMIT_MSG: ${{ github.event.head_commit.message || '' }}
         run: |
@@ -197,10 +202,12 @@ jobs:
           # matching the free-text messages, so reword details freely but
           # keep outcomes and reason codes stable. The EXIT trap reports an
           # unplanned exit (e.g. a `set -e` failure) as `error unexpected-exit`.
+          # A run that restarted CI (restart_ci below) says so in the detail.
           # scripts/test-auto-cut-alpha.py asserts one line on every path.
           decided=""
+          ci_restart=""
           decide() {
-            local line="auto-cut-decision: $1 $2 ${3//$'\n'/ }"
+            local line="auto-cut-decision: $1 $2 ${3//$'\n'/ }${ci_restart:+ ($ci_restart)}"
             decided=1
             echo "$line"
             if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then echo "$line" >> "$GITHUB_STEP_SUMMARY"; fi
@@ -354,6 +361,93 @@ jobs:
           }
           gate_terminal() {
             grep -E 'FAILURE|ERROR|CANCELLED|TIMED_OUT|ACTION_REQUIRED|NEUTRAL|SKIPPED|STALE' <<<"$1" >/dev/null
+          }
+
+          # Missing-CI restart (restart_ci <pr> <head>): GitHub sometimes
+          # delivers no pull_request event for a Release PR push, so the head
+          # gets no workflow run at all and CI Gate never reports until
+          # someone closes and reopens the PR (intentd#3185: head 3276c2c had
+          # zero runs from 10:01 to 10:19 on 2026-11-09 while every run
+          # decided ci-gate-missing). Once the head commit is
+          # AUTO_CUT_CI_RESTART_MINUTES old, has no workflow run of any kind,
+          # and the PR has not been reopened since that commit, close and
+          # reopen it so pull_request:reopened starts CI. The reopen marks
+          # the restart as spent, so no later run repeats it for this head.
+          # Both calls use the PAT: a reopen with the implicit GITHUB_TOKEN
+          # would start no workflows. A failed lookup leaves the PR alone
+          # (the normal missing-gate wait applies); a PR this run closed but
+          # could not reopen is a loud error, since it stalls every later run.
+          # Returns 0 after a restart; ci_restart then describes it.
+          restart_minutes=${AUTO_CUT_CI_RESTART_MINUTES:-10}
+          [[ "$restart_minutes" =~ ^[0-9]+$ ]] || restart_minutes=10
+          restart_head=""
+          restart_note=""
+          restart_ci() {
+            local number=$1 head=$2 info oid committed_at reopened_at age runs what
+            [[ -z "$ci_restart" && "$head" =~ ^[0-9a-f]{40}$ ]] || return 1
+            if [[ "$restart_head" != "$head" ]]; then
+              restart_note=""
+              # The single quotes keep $owner/$repo/$pr as GraphQL variables.
+              # shellcheck disable=SC2016
+              info=$(gh api graphql \
+                -f query='query($owner: String!, $repo: String!, $pr: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $pr) {
+                      commits(last: 1) { nodes { commit { oid committedDate } } }
+                      timelineItems(itemTypes: [REOPENED_EVENT], last: 1) {
+                        nodes { ... on ReopenedEvent { createdAt } }
+                      }
+                    }
+                  }
+                }' \
+                -f owner="${GITHUB_REPOSITORY%/*}" \
+                -f repo="${GITHUB_REPOSITORY#*/}" \
+                -F pr="$number" \
+                --jq '.data.repository.pullRequest
+                  | [(.commits.nodes[0].commit.oid // "-"),
+                     (.commits.nodes[0].commit.committedDate // "-"),
+                     (.timelineItems.nodes[0].createdAt // "-")]
+                  | join(" ")' 2>/dev/null) || return 1
+              read -r oid committed_at reopened_at <<<"$info"
+              [[ "$oid" == "$head" && "$committed_at" != "-" ]] || return 1
+              restart_committed=$(date -d "$committed_at" +%s 2>/dev/null) || return 1
+              restart_reopened=0
+              if [[ "$reopened_at" != "-" ]]; then
+                restart_reopened=$(date -d "$reopened_at" +%s 2>/dev/null) || return 1
+              fi
+              restart_head=$head
+            fi
+            age=$(( ($(date +%s) - restart_committed) / 60 ))
+            (( age >= restart_minutes )) || return 1
+            if (( restart_reopened >= restart_committed )); then
+              restart_note="; CI was already restarted for this head (the PR was reopened after its commit) and still has no workflow runs — push to the branch or re-run CI by hand"
+              return 1
+            fi
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$head&per_page=1" \
+              --jq '.total_count' 2>/dev/null) || return 1
+            [[ "$runs" == "0" ]] || return 1
+            what="Release PR #$number head ${head:0:12} had no workflow runs for $age min"
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "DRY RUN: $what; would close and reopen it to restart CI."
+              return 1
+            fi
+            if ! GH_TOKEN="$RELEASE_PLZ_TOKEN" gh pr close "$number" --repo "$GITHUB_REPOSITORY" \
+              --comment "Auto-cut: $what (GitHub started no CI). Closing and reopening it to restart CI."; then
+              # A close that failed after taking effect must not leave the
+              # Release PR closed.
+              GH_TOKEN="$RELEASE_PLZ_TOKEN" gh pr reopen "$number" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+              echo "::warning::$what, but closing it to restart CI failed"
+              return 1
+            fi
+            if ! GH_TOKEN="$RELEASE_PLZ_TOKEN" gh pr reopen "$number" --repo "$GITHUB_REPOSITORY" \
+              && ! GH_TOKEN="$RELEASE_PLZ_TOKEN" gh pr reopen "$number" --repo "$GITHUB_REPOSITORY"; then
+              msg="Closed Release PR #$number to restart CI but could not reopen it; reopen it by hand"
+              echo "::error::$msg"
+              decide error ci-restart-failed "$msg" 1
+            fi
+            ci_restart="restarted CI: $what, so this run closed and reopened it"
+            echo "::notice::$what; closed and reopened it to restart CI."
+            return 0
           }
 
           while :; do
@@ -557,7 +651,15 @@ jobs:
               decide skip ci-gate-failed "CI Gate concluded unsuccessfully on the current head (state: $gate); skipping."
             fi
             if [[ "$gate" == "missing" ]]; then
-              ci_pending ci-gate-missing "CI Gate has not reported on the current head yet" "$missing_deadline"
+              if restart_ci "$number" "$(jq -r '.headRefOid' <<<"$detail")"; then
+                # The restarted CI gets a fresh short grace to show up.
+                restart_deadline=$(( $(date +%s) + 5 * 60 ))
+                (( restart_deadline <= ci_deadline )) || restart_deadline=$ci_deadline
+                (( missing_deadline >= restart_deadline )) || missing_deadline=$restart_deadline
+              fi
+              missing_reason=ci-gate-missing
+              [[ -z "$ci_restart" ]] || missing_reason=ci-restarted
+              ci_pending "$missing_reason" "CI Gate has not reported on the current head yet$restart_note" "$missing_deadline"
               sleep 30; continue
             fi
             if [[ "$gate" == "running" ]]; then
