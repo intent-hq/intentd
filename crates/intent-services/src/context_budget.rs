@@ -305,7 +305,9 @@ async fn measure(
     let is_sub_agent = role == Role::SubAgent;
     let features = (entry.default_features)();
     let surfaces = SessionSurfaces::new(&session, provider);
-    let placement = (surfaces.placement_help())(&fixture.machines, &|_| false);
+    let placement = (surfaces.placement_help())(
+        &intent_core::machine_selection::PlacementHelpInputs::new(&fixture.machines, &|_| false),
+    );
     let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
     let server = surfaces.configure(
         WorkspaceMcpServer::for_agent_type(api, session.workspace_id.clone(), "interactive")
@@ -540,7 +542,10 @@ async fn measure_fixture(fixture: &Fixture) -> (Measured, Materialized) {
     let placement = |version: &str| {
         (crate::harness::resolve_entry(version)
             .context
-            .placement_help)(&materialized.machines, &|_| false)
+            .placement_help)(&intent_core::machine_selection::PlacementHelpInputs::new(
+            &materialized.machines,
+            &|_| false,
+        ))
     };
     let placement = (placement(BASELINE), placement(CANDIDATE));
     (Measured { rows, placement }, materialized)

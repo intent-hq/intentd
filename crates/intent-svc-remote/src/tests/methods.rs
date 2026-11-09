@@ -312,6 +312,89 @@ async fn add_rejects_malformed_params_before_dialing() {
     }
 }
 
+/// The placement text lists the backend's provider profiles with their
+/// `provider` syntax and remote compatibility, and the Default
+/// configurations that cannot run remotely, without any setting value.
+#[tokio::test]
+async fn help_lists_provider_profiles_without_their_values() {
+    use intent_core::WorkspaceApi as _;
+    const API_KEY: &str = "sk-ant-placement-help-canary";
+    let backend = Backend::new().await;
+    let mut machine = backend.machine().await;
+    backend.expose(&mut machine).await.shutdown();
+    let services = &backend.services;
+    let keyed = intent_core::caller::with_caller(
+        intent_core::caller::Caller::Daemon,
+        services.provider_profiles_create(json!({
+            "baseProviderId": "claude-code",
+            "name": "Work",
+            "env": [{ "key": "ANTHROPIC_API_KEY", "kind": "set", "value": API_KEY }],
+        })),
+    )
+    .await
+    .expect("create keyed profile");
+    let keyed_ref = keyed["profile"]["providerRef"].as_str().unwrap().to_owned();
+    let folder = intent_core::caller::with_caller(
+        intent_core::caller::Caller::Daemon,
+        services.provider_profiles_create(json!({
+            "baseProviderId": "codex",
+            "name": "Laptop",
+            "env": [{ "key": "CODEX_HOME", "kind": "set", "value": "/accounts/laptop" }],
+        })),
+    )
+    .await
+    .expect("create folder profile");
+    let folder_ref = folder["profile"]["providerRef"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let help = services
+        .feature_remote_launch_port()
+        .placement_help(
+            services,
+            &intent_core::WorkspaceId::from("ws-help"),
+            intent_core::machine_selection::exposed_machines_help,
+        )
+        .await
+        .expect("an exposed machine is listed");
+    assert!(
+        help.contains("select one with `provider: \"<base>@<profileId>\"`"),
+        "{help}"
+    );
+    assert!(
+        help.contains(&format!("- `{keyed_ref}` \"Work\"\n")),
+        "{help}"
+    );
+    assert!(
+        help.contains(&format!(
+            "- `{folder_ref}` \"Laptop\": not remote-compatible (sets `CODEX_HOME`, an account folder on this backend)\n"
+        )),
+        "{help}"
+    );
+    for value in [API_KEY, "/accounts/laptop"] {
+        assert!(!help.contains(value), "{value} leaked: {help}");
+    }
+    // Profile names are host settings a guest never reads (§5.54).
+    let guest = intent_core::caller::with_caller(
+        intent_core::caller::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Guest,
+        },
+        services.feature_remote_launch_port().placement_help(
+            services,
+            &intent_core::WorkspaceId::from("ws-help"),
+            intent_core::machine_selection::exposed_machines_help,
+        ),
+    )
+    .await
+    .expect("machines are still listed");
+    assert!(!guest.contains("Provider profiles"), "{guest}");
+    assert!(
+        !guest.contains(&keyed_ref) && !guest.contains("Laptop"),
+        "{guest}"
+    );
+}
+
 /// No setting gates the backend side: on a fresh config the capability is
 /// advertised and the mutations run. The model-facing placement text (the
 /// `ws.agent.create` / `delegate` descriptions and `ws.help("agent")`)
@@ -325,6 +408,7 @@ async fn backend_side_needs_no_setting_and_help_follows_exposed_machines() {
     assert_eq!(
         port.placement_help(
             &backend.services,
+            &intent_core::WorkspaceId::from("ws-help"),
             intent_core::machine_selection::exposed_machines_help
         )
         .await,
@@ -342,6 +426,7 @@ async fn backend_side_needs_no_setting_and_help_follows_exposed_machines() {
     let help = port
         .placement_help(
             &backend.services,
+            &intent_core::WorkspaceId::from("ws-help"),
             intent_core::machine_selection::exposed_machines_help,
         )
         .await
@@ -356,6 +441,7 @@ async fn backend_side_needs_no_setting_and_help_follows_exposed_machines() {
     assert_eq!(
         port.placement_help(
             &backend.services,
+            &intent_core::WorkspaceId::from("ws-help"),
             intent_core::machine_selection::exposed_machines_help
         )
         .await,

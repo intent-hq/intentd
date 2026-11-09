@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use intent_core::machine_selection::{
-    select_machines, PlacementHelpRenderer, PlacementMachines, PlacementRequest, RefreshFailure,
+    select_machines, PlacementHelpInputs, PlacementHelpRenderer, PlacementMachines,
+    PlacementRequest, RefreshFailure,
 };
 use intent_core::machines::ExposedMachine;
 use intent_core::node_link::MachineCapabilities;
@@ -544,13 +545,29 @@ impl PlacementMachines for ExposedMachines<'_> {
 /// The discovery text: the exposed machines with their providers, models
 /// and sign-in, and how to place an agent on one. `None` while no machine
 /// is exposed to this backend, so the model sees no remote-placement text.
-async fn help_text(svc: &Services, render: PlacementHelpRenderer) -> Option<String> {
+async fn help_text(
+    svc: &Services,
+    workspace_id: &intent_core::WorkspaceId,
+    render: PlacementHelpRenderer,
+) -> Option<String> {
     let rows = svc.store().list_exposed_machines().await.ok()?;
+    if rows.is_empty() {
+        return None;
+    }
     let feature = svc.remote_feature();
-    render(&rows, &|id| {
+    let connected = |id: &str| {
         feature
             .and_then(|feature| feature.running_node(id))
             .is_some_and(|node| node.status().connected)
+    };
+    let facts = svc.placement_backend_facts(workspace_id).await;
+    let disabled = |id: &str| facts.disabled_providers.iter().any(|off| off == id);
+    render(&PlacementHelpInputs {
+        machines: &rows,
+        connected: &connected,
+        disabled: &disabled,
+        profiles: &facts.profiles,
+        incompatible_defaults: &facts.incompatible_defaults,
     })
 }
 
@@ -665,9 +682,10 @@ impl RemoteLaunchPort for RemoteLaunch {
     fn placement_help<'a>(
         &'a self,
         svc: &'a Services,
+        workspace_id: &'a intent_core::WorkspaceId,
         render: PlacementHelpRenderer,
     ) -> BoxFuture<'a, Option<String>> {
-        Box::pin(help_text(svc, render))
+        Box::pin(help_text(svc, workspace_id, render))
     }
 
     fn checkout_piece<'a>(

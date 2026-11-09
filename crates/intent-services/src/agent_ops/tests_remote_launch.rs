@@ -85,6 +85,7 @@ impl RemoteLaunchPort for FakeRemote {
     fn placement_help<'a>(
         &'a self,
         _svc: &'a Services,
+        _workspace_id: &'a intent_core::WorkspaceId,
         _render: intent_core::machine_selection::PlacementHelpRenderer,
     ) -> BoxFuture<'a, Option<String>> {
         Box::pin(async { Some("Remote placement: node \"Mac Studio\"".into()) })

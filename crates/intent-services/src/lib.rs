@@ -31028,7 +31028,7 @@ impl WorkspaceApi for Services {
             };
             self.ports
                 .remote_launch()
-                .placement_help(self, entry.context.placement_help)
+                .placement_help(self, &workspace_id, entry.context.placement_help)
                 .await
         })
     }

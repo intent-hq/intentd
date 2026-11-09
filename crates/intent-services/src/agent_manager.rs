@@ -3715,7 +3715,7 @@ impl AgentManager {
         let remote_placement_help = self
             .services
             .feature_remote_launch_port()
-            .placement_help(&self.services, surfaces.placement_help())
+            .placement_help(&self.services, &workspace_id, surfaces.placement_help())
             .await;
         let server_blueprint = {
             let workspace_id = workspace_id.clone();

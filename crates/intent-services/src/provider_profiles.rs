@@ -1988,6 +1988,89 @@ impl Services {
         )
     }
 
+    /// The backend's part of the remote-placement text for `workspace_id`:
+    /// each saved profile (reference, name, backup flag, remote
+    /// compatibility; never a value), the Default configurations that set an
+    /// account folder or cannot be read, and the providers turned off in
+    /// Settings → Providers. Profile and Default names are host settings: as
+    /// in `providers.catalog` (§5.54 "Guest reads"), no profile is listed for
+    /// a guest caller or a workspace shared with guests (or with open
+    /// invites), nor when sharing cannot be read. Only key names are read, so
+    /// the cached environment is enough.
+    #[doc(hidden)]
+    pub async fn placement_backend_facts(
+        &self,
+        workspace_id: &intent_core::WorkspaceId,
+    ) -> intent_core::machine_selection::PlacementBackendFacts {
+        use intent_core::machine_selection::{PlacementProfile, ProfileRemote};
+        let remote = |compat: RemoteCompatibility| match compat {
+            RemoteCompatibility::Compatible => ProfileRemote::Compatible,
+            RemoteCompatibility::NotRemoteCompatible { keys, .. } => {
+                ProfileRemote::Incompatible { keys }
+            }
+        };
+        let cached = |id: String| async move {
+            let raw = self.secrets.load(&env_account(&id)).await.ok()?;
+            match raw {
+                None => Some(EnvDoc::default()),
+                Some(raw) => serde_json::from_str::<EnvDoc>(&raw).ok(),
+            }
+        };
+        let mut facts = intent_core::machine_selection::PlacementBackendFacts::default();
+        let guest = match intent_core::current_caller() {
+            Some(intent_core::Caller::Wire { principal_id, .. }) => !matches!(
+                self.store.get_host_role(&principal_id).await,
+                Ok(intent_core::HostRole::Owner | intent_core::HostRole::Member)
+            ),
+            Some(intent_core::Caller::Executor { .. }) => true,
+            Some(intent_core::Caller::Agent { .. } | intent_core::Caller::Daemon) | None => false,
+        };
+        let shared = self
+            .store
+            .count_workspace_guests(workspace_id)
+            .await
+            .map_or(true, |count| count.committed() > 0);
+        if !guest && !shared {
+            for meta in self.provider_profiles.profiles().unwrap_or_default().iter() {
+                let compat = match cached(meta.id.clone()).await {
+                    Some(env) => remote(remote_compatibility_of_doc(&env)),
+                    None => ProfileRemote::Unknown,
+                };
+                facts.profiles.push(PlacementProfile {
+                    provider_ref: meta.provider_ref(),
+                    base_provider: meta.base_provider.clone(),
+                    name: meta.name.clone(),
+                    backup: meta.backup,
+                    remote: compat,
+                });
+            }
+        }
+        for (base, saved) in self.provider_profiles.defaults().unwrap_or_default().iter() {
+            let compat = match &saved.env_id {
+                None => ProfileRemote::Compatible,
+                Some(env_id) => match cached(env_id.clone()).await {
+                    Some(env) => remote(remote_compatibility_of_doc(&env)),
+                    None => ProfileRemote::Unknown,
+                },
+            };
+            if compat != ProfileRemote::Compatible {
+                facts.incompatible_defaults.push((base.clone(), compat));
+            }
+        }
+        let settings = self.effective_settings();
+        facts.disabled_providers = intent_providers::ACP_PROVIDERS
+            .iter()
+            .filter(|provider| {
+                crate::agent_ops::provider_is_disabled(
+                    provider.id,
+                    settings.providers.enabled.as_ref(),
+                )
+            })
+            .map(|provider| provider.id.to_owned())
+            .collect();
+        facts
+    }
+
     /// `host.providerAuthStatus` for profile references (PROTOCOL §5.54).
     /// Each profile is probed with its own saved overlay and cached under
     /// its reference plus settings fingerprint, so a verdict never crosses
