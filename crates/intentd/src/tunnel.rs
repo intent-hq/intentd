@@ -397,9 +397,15 @@ async fn supervise(
     let mut backoff = RESTART_BACKOFF_INITIAL;
     loop {
         let mut delay = backoff;
-        // Own the live child until it exits or a stop arrives.
+        // Own the live child until it exits, a resume recycles it, or a stop
+        // arrives. Stop wins any tie.
         let started = tokio::time::Instant::now();
         tokio::select! {
+            biased;
+            _ = stop_rx.changed() => {
+                let _ = child.kill().await;
+                return;
+            }
             status = child.wait() => {
                 if *stop_rx.borrow() {
                     return;
@@ -425,21 +431,28 @@ async fn supervise(
                 backoff = RESTART_BACKOFF_INITIAL;
                 delay = Duration::ZERO;
             }
-            _ = stop_rx.changed() => {
-                let _ = child.kill().await;
-                return;
-            }
         }
 
         // Restart with capped exponential backoff until a spawn succeeds or
         // a stop arrives.
         child = loop {
+            // A resume during the wait ends it and takes the pending signal,
+            // so it does not recycle the child spawned next.
             tokio::select! {
-                () = tokio::time::sleep(delay) => {}
+                biased;
                 _ = stop_rx.changed() => return,
+                () = recycle.notified() => {
+                    backoff = RESTART_BACKOFF_INITIAL;
+                    delay = Duration::ZERO;
+                }
+                () = tokio::time::sleep(delay) => {}
             }
-            delay = backoff;
-            backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
+            if *stop_rx.borrow() {
+                return;
+            }
+            if !delay.is_zero() {
+                backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
+            }
             match spawn_and_read_address(
                 &bin,
                 &key_path,
@@ -465,6 +478,7 @@ async fn supervise(
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "tailcat tunnel restart failed; will retry");
+                    delay = backoff;
                 }
             }
         };
@@ -624,7 +638,7 @@ case "$1" in
     printf 'k' > "$key"
     ;;
   serve)
-    echo run >> "$dir/runs"
+    echo $$ >> "$dir/runs"
     printf '{"listenAddr":"tcTest"}\n'
     exec sleep 600
     ;;
@@ -640,8 +654,14 @@ esac
         let now = std::time::Instant::now();
         tracker.record_suspend(now, now, Duration::from_secs(60));
 
-        let runs =
-            || std::fs::read_to_string(dir.path().join("runs")).map_or(0, |s| s.lines().count());
+        let pids = || {
+            std::fs::read_to_string(dir.path().join("runs"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let runs = || pids().len();
         let deadline = tokio::time::Instant::now()
             + intentd_test_support::test_timeout(Duration::from_secs(10));
         while runs() < 2 || sup.address().await.is_none() {
@@ -654,6 +674,14 @@ esac
         }
         assert_eq!(runs(), 2);
         assert_eq!(sup.address().await.as_deref(), Some("tcTest"));
+        let first = pids()[0].clone();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &first])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the frozen tailcat (pid {first}) is still running");
 
         recycler.abort();
         sup.stop().await;

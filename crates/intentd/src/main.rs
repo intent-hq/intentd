@@ -3064,7 +3064,8 @@ async fn cmd_serve_owned(
 
     let tunnel_supervisor = bootstrap.tunnel.clone();
     // A resumed VM (paused E2B sandbox) or woken host keeps a tailcat that
-    // no dial reaches; restart it on each resume.
+    // no dial reaches; restart it on each resume. Needs the clock-skew
+    // detector, so `wakeResume.enabled = false` turns this off too.
     let tunnel_recycler = suspend_tracker
         .as_ref()
         .map(|tracker| tunnel::recycle_on_resume(tunnel_supervisor.clone(), tracker.subscribe()));
