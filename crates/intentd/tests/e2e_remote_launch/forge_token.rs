@@ -26,6 +26,15 @@ pub(super) async fn backend_with_token(
     scratch: &Path,
     origin: Option<&str>,
 ) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String, String) {
+    backend_with_token_env(scratch, origin, &[]).await
+}
+
+/// [`backend_with_token`] with extra environment for the backend.
+pub(super) async fn backend_with_token_env(
+    scratch: &Path,
+    origin: Option<&str>,
+    env: &[(&str, &str)],
+) -> (common::DaemonGuard, u16, Arc<ClientConfig>, String, String) {
     let repo = scratch.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     // The workspace branch follows the checkout's branch.
@@ -45,7 +54,7 @@ pub(super) async fn backend_with_token(
     let (head, port, cfg, ws_id) = start_backend_with(
         &head_dir,
         &repo,
-        &[("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:1")],
+        &[&[("INTENTD_GITHUB_API_BASE_URI", "http://127.0.0.1:1")], env].concat(),
     )
     .await;
     let mut rpc_ws = connect(port, cfg.clone()).await;
