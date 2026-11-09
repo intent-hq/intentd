@@ -2017,7 +2017,14 @@ impl Services {
             }
         };
         let mut facts = intent_core::machine_selection::PlacementBackendFacts::default();
-        let guest = self.catalog_caller_is_guest().await.unwrap_or(true);
+        let guest = match intent_core::current_caller() {
+            Some(intent_core::Caller::Wire { principal_id, .. }) => !matches!(
+                self.store.get_host_role(&principal_id).await,
+                Ok(intent_core::HostRole::Owner | intent_core::HostRole::Member)
+            ),
+            Some(intent_core::Caller::Executor { .. }) => true,
+            Some(intent_core::Caller::Agent { .. } | intent_core::Caller::Daemon) | None => false,
+        };
         let shared = self
             .store
             .count_workspace_guests(workspace_id)
