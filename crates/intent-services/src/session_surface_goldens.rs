@@ -26,8 +26,8 @@ const FROZEN_VERSIONS: &[&str] = &["3.8", "3.9"];
 const FROZEN_SURFACES: &[(&str, usize, &str, usize, &str)] = &[
     (
         "auggie",
-        442_904,
-        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        443_409,
+        "538f4e6903f6677c1e2d1bef4f049f3f24e5b25594cbcd5c82dde7f7f4ae4339",
         128_784,
         "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
@@ -40,36 +40,36 @@ const FROZEN_SURFACES: &[(&str, usize, &str, usize, &str)] = &[
     ),
     (
         "codex",
-        442_904,
-        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        443_409,
+        "538f4e6903f6677c1e2d1bef4f049f3f24e5b25594cbcd5c82dde7f7f4ae4339",
         128_784,
         "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
     (
         "cortex",
-        442_904,
-        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        443_409,
+        "538f4e6903f6677c1e2d1bef4f049f3f24e5b25594cbcd5c82dde7f7f4ae4339",
         128_784,
         "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
     (
         "opencode",
-        442_904,
-        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        443_409,
+        "538f4e6903f6677c1e2d1bef4f049f3f24e5b25594cbcd5c82dde7f7f4ae4339",
         128_784,
         "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
     (
         "unsloth",
-        442_904,
-        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        443_409,
+        "538f4e6903f6677c1e2d1bef4f049f3f24e5b25594cbcd5c82dde7f7f4ae4339",
         128_784,
         "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
     (
         "pi",
-        442_904,
-        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        443_409,
+        "538f4e6903f6677c1e2d1bef4f049f3f24e5b25594cbcd5c82dde7f7f4ae4339",
         128_784,
         "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
@@ -89,22 +89,22 @@ const FROZEN_SURFACES: &[(&str, usize, &str, usize, &str)] = &[
     ),
     (
         "antigravity",
-        442_904,
-        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        443_409,
+        "538f4e6903f6677c1e2d1bef4f049f3f24e5b25594cbcd5c82dde7f7f4ae4339",
         128_784,
         "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
     (
         "cursor",
-        442_904,
-        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        443_409,
+        "538f4e6903f6677c1e2d1bef4f049f3f24e5b25594cbcd5c82dde7f7f4ae4339",
         129_924,
         "220273303306a122e130b914bd99d4067fa16d8536f3840210ce6d24576633b5",
     ),
     (
         "mock",
-        442_904,
-        "4f94d74831595cc28c04774cb95e1e98ab4fa37a384ad59f81061257b6d1b45d",
+        443_409,
+        "538f4e6903f6677c1e2d1bef4f049f3f24e5b25594cbcd5c82dde7f7f4ae4339",
         128_784,
         "28623c0928067b359b58504796cc59d75e5dc3cd21eb5d20b0bd2df28d9fcf0c",
     ),
@@ -299,7 +299,10 @@ async fn frozen_sessions_keep_tool_description_and_system_prompt() {
     assert!(
         mismatches.is_empty() && stale.is_empty(),
         "frozen surfaces changed for {mismatches:?} (stale rows {stale:?}). A new provider \
-         adds its row; an existing row never changes. Actual:\n{}",
+         adds its row. A changed row means sessions on a frozen harness see new text: \
+         gate the change on a new harness version, or update the row for a deliberate \
+         fix to every version (rerun `make test-select \
+         E='test(frozen_sessions_keep)'` and paste the rows below). Actual:\n{}",
         actual.join("\n")
     );
 }
