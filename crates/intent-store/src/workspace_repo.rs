@@ -2167,7 +2167,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         plain_folder: col::<i64>(row, "plain_folder")? != 0,
         // The remaining fields are never persisted: `activity` is derived
         // (§9.9), the emit-only fields (card aggregates, `displayStatus`, the
-        // wait/script/background flags, `cowSupported`, `diskUsage`,
+        // wait/script/background flags, `diskUsage`,
         // `pendingDeleteAt`, `membership`) are filled by intent-services, and
         // `pullRequestsTotal` by list-row slimming (intent-core). A new
         // persisted column must be read above;

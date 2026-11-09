@@ -58,7 +58,7 @@ pub enum Error {
     },
 
     /// An operation that needs git or a forge, called for a plain-folder
-    /// workspace (§5.1 "Plain-folder workspaces"), e.g. `workspace.duplicate`.
+    /// workspace (§5.1 "Plain-folder workspaces"), e.g. `git.push`.
     /// Nothing is changed. Surfaces as `-32602` with `error.data = { code:
     /// "plain-folder-unsupported", operation }`.
     #[error("{operation} is not available in plain-folder workspaces")]

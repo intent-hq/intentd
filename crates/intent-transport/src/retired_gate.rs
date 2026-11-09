@@ -144,7 +144,6 @@ pub(crate) const RETIRED_GATED_METHODS: &[&str] = &[
     "terminal.write",
     "workspace.archive",
     "workspace.cleanup",
-    "workspace.duplicate",
     "workspace.export.abort",
     "workspace.export.finalize",
     "workspace.export.start",

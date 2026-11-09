@@ -525,13 +525,6 @@ pub struct Workspace {
     /// Omitted (not `null`) until the first scan writes a snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
-    /// Whether `CoW` isolation is supported on this machine. Computed as:
-    /// `cow_probe(workspacesRoot, workspacesRoot)` Supported — a machine
-    /// capability of the workspaces root's filesystem, independent of the
-    /// workspace or checkout mode. Used by the FE to gate the Copy-on-Write
-    /// opt-in toggle.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cow_supported: Option<bool>,
     /// How the workspace checkout was provisioned by `workspace.create` (§5.1):
     /// `worktree` (linked git worktree), `cow` (standalone copy-on-write
     /// clone), or `direct` (standalone plain repository — a local git clone
@@ -739,7 +732,6 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "diffSummary",
     "displayStatus",
     "waiting",
-    "cowSupported",
     "checkoutMode",
     "browserClientId",
     "pendingDeleteAt",
@@ -1308,7 +1300,7 @@ pub struct RepoConfig {
     pub scripts: Option<Vec<RepoScript>>,
 
     /// Repo-root-relative directory prefixes excluded from `CoW` checkout
-    /// provisioning (`workspace.create`/`workspace.duplicate`): matching
+    /// provisioning: matching
     /// directories are not cloned into the checkout (e.g. huge caches that
     /// slow the clone down). `.git` and the repo root itself cannot be
     /// excluded (such entries are ignored with a warning). Absent ⇒ clone

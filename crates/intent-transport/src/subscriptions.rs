@@ -1050,8 +1050,8 @@ pub(crate) async fn channel_snapshot(
         // Archived workspaces are included so the snapshot agrees with the
         // deltas (which upsert archived workspaces as `updated`); clients
         // filter by `status` (intent-hq/monorepo#775).
-        // Lite list: cheap status aggregates (taskStats/displayStatus/
-        // cowSupported) only — no notes/sessions enrichment. Full list was
+        // Lite list: cheap status aggregates (taskStats/displayStatus)
+        // only — no notes/sessions enrichment. Full list was
         // multi-MB.
         // Retired workspaces are opt-in: the generic path never includes
         // them; `workspace.subscribe { includeRetired: true }` routes

@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 use intent_core::{DiskUsageBreakdownEntry, WorkspaceDiskUsage};
 use tokio::sync::Semaphore;
 
-use crate::workspace_aggregates::try_begin;
+use crate::single_flight::try_begin;
 
 /// How long a computed entry is served without triggering a refresh.
 const DISK_USAGE_TTL: Duration = Duration::from_secs(60);
