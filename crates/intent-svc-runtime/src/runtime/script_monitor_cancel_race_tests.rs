@@ -338,7 +338,7 @@ async fn script_monitor_cancel_redelivers_a_watched_childs_completion_once() {
 /// owner's cleanup is the only thing that removes it: it must leave neither
 /// the live queue nor the persisted one, or a restart would rehydrate a wake
 /// for a cancelled watch.
-#[tokio::test]
+#[intent_test_macros::daemon_test]
 async fn owner_cleanup_drops_a_persisted_machine_run_wake() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
