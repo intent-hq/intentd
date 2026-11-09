@@ -25,7 +25,9 @@ use intent_acp::{
     default_workspace_api_timeout, HostFrameRouter, McpBridge, NormalizedMcpServer,
     WorkspaceMcpServer,
 };
-use intent_core::node_link::{LinkOutcome, McpProxy, PREPARED_CHECKOUT_PROTOCOL, SECRETS_PROTOCOL};
+use intent_core::node_link::{
+    GitIdentity, LinkOutcome, McpProxy, PREPARED_CHECKOUT_PROTOCOL, SECRETS_PROTOCOL,
+};
 use intent_core::remote_launch::workspace_api::{
     self, Route, ATTACHMENTS_METHOD, ATTACHMENT_DATA_METHOD, CALL_METHOD, COMMIT_POLICY_METHOD,
     GIT_ROOTS_METHOD, MAX_LINK_ATTACHMENT_CHUNK_BYTES, MAX_PULL_BYTES, MCP_PROXY_LINK_TIMEOUT,
@@ -102,6 +104,9 @@ pub(super) struct Gates {
     /// `workspace_api` description; absent (an older head) is the legacy
     /// text.
     pub harness_version: Option<String>,
+    /// The backend's commit identity from the launch: `ws.git.commit`
+    /// commits with it, as the agent's own `git commit` does.
+    pub git_identity: Option<GitIdentity>,
 }
 
 /// Push the agent's checkout to head now, one push of it at a time;
@@ -277,6 +282,7 @@ fn server_with_setup(
         agent_id: agent_id.clone(),
         secrets,
         push,
+        git_identity: gates.git_identity.clone(),
     });
     let server = WorkspaceMcpServer::new(api, workspace_id.clone())
         .with_caller_agent_id(Some(agent_id.clone()))
@@ -662,6 +668,8 @@ struct NodeApi {
     secrets: Arc<HeldSecrets>,
     /// Pushes the checkout, within its budget, after a commit.
     push: Option<(PushNow, Duration)>,
+    /// The backend's commit identity from the launch.
+    git_identity: Option<GitIdentity>,
 }
 
 impl NodeApi {
@@ -965,6 +973,11 @@ impl WorkspaceApi for NodeApi {
     ) -> BoxFuture<'_, Result<GitAgentCommitResult>> {
         let checked = self.check(&workspace_id);
         let worktree = self.worktree.clone();
+        let identity = self
+            .git_identity
+            .as_ref()
+            .and_then(GitIdentity::usable)
+            .map(|(name, email)| (name.to_owned(), email.to_owned()));
         Box::pin(async move {
             checked?;
             if git_root_id.is_some() {
@@ -977,10 +990,11 @@ impl WorkspaceApi for NodeApi {
                 enabled,
                 user_requested,
             )?;
-            let mut result =
-                tokio::task::spawn_blocking(move || commit(&worktree, &message, files.as_deref()))
-                    .await
-                    .map_err(|e| Error::Internal(format!("node commit task failed: {e}")))??;
+            let mut result = tokio::task::spawn_blocking(move || {
+                commit(&worktree, &message, files.as_deref(), identity.as_ref())
+            })
+            .await
+            .map_err(|e| Error::Internal(format!("node commit task failed: {e}")))??;
             if let Some((push, budget)) = &self.push {
                 // Its own task, so the push still finishes when the
                 // script's budget ends first.
@@ -998,19 +1012,31 @@ fn no_git_roots() -> Error {
 
 /// Commit in the agent's worktree: the named `files`, or every change. The
 /// caller pushes it to head right after. The caller checked the
-/// auto-commit gate. Uses
-/// the node's git identity, or a fixed agent
-/// identity when the node has none.
+/// auto-commit gate. Uses the backend's `identity` from the launch, as the
+/// agent's own `git commit` does; without it the node's git identity, or a
+/// fixed agent identity when the node has none.
 fn commit(
     worktree: &Path,
     message: &str,
     files: Option<&[String]>,
+    identity: Option<&(String, String)>,
 ) -> Result<GitAgentCommitResult> {
+    // Env outranks every git config file, as in the agent's own shell.
+    let identity_env = identity
+        .into_iter()
+        .flat_map(|(name, email)| {
+            intent_git::identity::GIT_IDENTITY_ENV_VARS.map(|key| {
+                let value = if key.ends_with("EMAIL") { email } else { name };
+                (key, value.as_str())
+            })
+        })
+        .collect::<Vec<_>>();
     let git = |args: &[&str]| -> Result<std::process::Output> {
         std::process::Command::new("git")
             .arg("-C")
             .arg(worktree)
             .args(args)
+            .envs(identity_env.iter().copied())
             .output()
             .map_err(|e| Error::Internal(format!("git could not run: {e}")))
     };
@@ -1038,9 +1064,8 @@ fn commit(
     if git(&["diff", "--cached", "--quiet"])?.status.success() {
         return Err(Error::InvalidParams("nothing to commit".into()));
     }
-    let has_identity = git(&["config", "user.email"])?.status.success();
     let mut args = Vec::new();
-    if !has_identity {
+    if identity.is_none() && !git(&["config", "user.email"])?.status.success() {
         args.extend([
             "-c",
             "user.name=Intent remote agent",

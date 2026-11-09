@@ -31,6 +31,7 @@ fn gates() -> Gates {
         compact_tool_descriptions: false,
         mcp_proxies: Vec::new(),
         harness_version: None,
+        git_identity: None,
     }
 }
 
@@ -213,6 +214,119 @@ async fn git_commit_commits_the_agents_work_in_its_worktree() {
     assert!(
         empty.0 && empty.1.contains("nothing to commit"),
         "{empty:?}"
+    );
+}
+
+/// Hide the host's global and system git config and any inherited identity
+/// env, so only the repo's own config and the launch decide. Nextest runs
+/// each test in its own process.
+fn isolate_git_identity() {
+    std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+    std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+    for key in intent_git::identity::GIT_IDENTITY_ENV_VARS {
+        std::env::remove_var(key);
+    }
+}
+
+fn identity_of_head(dir: &Path) -> String {
+    git(dir, &["log", "-1", "--format=%an <%ae>|%cn <%ce>"])
+}
+
+async fn commit_file(server: &WorkspaceMcpServer, dir: &Path, name: &str) {
+    std::fs::write(dir.join(name), name).unwrap();
+    ok_json(
+        call(
+            server,
+            &format!(
+                r#"return JSON.stringify(await ws.git.commit("{name}", {{ userRequested: true }}));"#
+            ),
+        )
+        .await,
+    );
+}
+
+/// A remote agent's `ws.git.commit` commits as the backend's identity from
+/// the launch, as the agent's own `git commit` does (intentd#3165), over
+/// the node's git config too.
+#[tokio::test]
+async fn git_commit_uses_the_launch_identity_of_the_backend() {
+    if intent_providers::resolve_on_path("git").is_none() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    isolate_git_identity();
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--quiet"]);
+    let gates = Gates {
+        git_identity: Some(intent_core::node_link::GitIdentity {
+            name: "Backend User".into(),
+            email: "backend@example.com".into(),
+        }),
+        ..gates()
+    };
+    let server = server(
+        &agent(),
+        &workspace(),
+        dir.path(),
+        &gates,
+        HeadLink::default(),
+    )
+    .unwrap();
+
+    commit_file(&server, dir.path(), "one.txt").await;
+    assert_eq!(
+        identity_of_head(dir.path()),
+        "Backend User <backend@example.com>|Backend User <backend@example.com>"
+    );
+
+    git(dir.path(), &["config", "user.name", "Node User"]);
+    git(dir.path(), &["config", "user.email", "node@example.com"]);
+    commit_file(&server, dir.path(), "two.txt").await;
+    assert_eq!(
+        identity_of_head(dir.path()),
+        "Backend User <backend@example.com>|Backend User <backend@example.com>"
+    );
+}
+
+/// Without a launch identity the node's git config decides, and with
+/// neither the commit uses the fixed agent identity.
+#[tokio::test]
+async fn git_commit_without_a_launch_identity_uses_config_then_the_placeholder() {
+    if intent_providers::resolve_on_path("git").is_none() {
+        eprintln!("skipping: git not on PATH");
+        return;
+    }
+    isolate_git_identity();
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--quiet"]);
+    let gates = Gates {
+        git_identity: Some(intent_core::node_link::GitIdentity {
+            name: String::new(),
+            email: "half@example.com".into(),
+        }),
+        ..gates()
+    };
+    let server = server(
+        &agent(),
+        &workspace(),
+        dir.path(),
+        &gates,
+        HeadLink::default(),
+    )
+    .unwrap();
+
+    commit_file(&server, dir.path(), "one.txt").await;
+    assert_eq!(
+        identity_of_head(dir.path()),
+        "Intent remote agent <remote-agent@intent.invalid>|Intent remote agent <remote-agent@intent.invalid>"
+    );
+
+    git(dir.path(), &["config", "user.name", "Node User"]);
+    git(dir.path(), &["config", "user.email", "node@example.com"]);
+    commit_file(&server, dir.path(), "two.txt").await;
+    assert_eq!(
+        identity_of_head(dir.path()),
+        "Node User <node@example.com>|Node User <node@example.com>"
     );
 }
 
