@@ -53,17 +53,11 @@ mod tests {
         assert!(std::ptr::addr_eq(current.harness, previous.harness));
         assert_eq!((current.default_features)(), (previous.default_features)());
         assert_eq!(current.feature_labels, previous.feature_labels);
-        let (added, kept): (Vec<_>, Vec<_>) = current
-            .doctrine
-            .specialists
-            .iter()
-            .partition(|(id, _)| *id == "planner");
-        assert_eq!(added.len(), 1);
-        assert_eq!(
-            kept,
-            previous.doctrine.specialists.iter().collect::<Vec<_>>()
-        );
-        let (meta, body) = crate::specialists::parse_frontmatter(added[0].1);
+        let specialists: &[(&str, &str)] = current.doctrine.specialists;
+        let (planner, kept) = specialists.split_last().expect("non-empty bundle");
+        assert_eq!(planner.0, "planner");
+        assert_eq!(kept, previous.doctrine.specialists);
+        let (meta, body) = crate::specialists::parse_frontmatter(planner.1);
         assert_eq!(meta["name"], "Planner");
         assert_eq!(meta["icon"], "coordinator");
         assert!(meta.get("model").is_none());
