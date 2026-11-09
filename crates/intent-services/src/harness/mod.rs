@@ -54,6 +54,7 @@ pub(crate) mod v2_7;
 pub(crate) mod v2_8;
 pub(crate) mod v2_9;
 pub(crate) mod v3_1;
+pub(crate) mod v3_10;
 pub(crate) mod v3_3;
 pub(crate) mod v3_4;
 pub(crate) mod v3_5;
@@ -481,6 +482,8 @@ pub(crate) struct HarnessEntry {
     pub harness: &'static dyn Harness,
     /// The version's bundled doctrine set.
     pub doctrine: &'static Doctrine,
+    /// The version's spawn-time context builders.
+    pub context: &'static ContextSurfaces,
     /// The `agentFeatures` default values this version's doctrine assumes —
     /// what a NULL-snapshot gate would have resolved to when the version was
     /// current. Not consumed at runtime yet: legacy NULL-features rows keep
@@ -509,6 +512,54 @@ pub(crate) struct Doctrine {
     pub specialists: &'static [(&'static str, &'static str)],
 }
 
+/// What the repo-rule policy decides from. Later versions add the provider
+/// and its CLI version here.
+pub(crate) struct RepoRulesInputs<'a> {
+    pub workspace_path: &'a std::path::Path,
+}
+
+/// What the skills block is built from.
+pub(crate) struct SkillsBlockInputs<'a> {
+    pub skills: &'a [crate::skills::SkillMetadata],
+}
+
+/// A version's builders for the context an agent gets at spawn, beyond its
+/// doctrine: rebuilt live at every spawn and respawn, so each one is read
+/// through the session's stamped version.
+pub(crate) struct ContextSurfaces {
+    /// The `workspace_api` tool description, the system-prompt reference
+    /// and the section around it.
+    pub workspace_api: &'static dyn intent_acp::WorkspaceApiDocs,
+    /// The workspace rule text injected as user rules, with its source;
+    /// `None` injects none.
+    pub repo_rules: fn(&RepoRulesInputs<'_>) -> Option<(String, String)>,
+    /// The `<available_skills>` block; empty adds no layer.
+    pub skills_block: fn(&SkillsBlockInputs<'_>) -> String,
+    /// The remote-placement text in the `ws.agent` docs.
+    pub placement_help: intent_core::machine_selection::PlacementHelpRenderer,
+}
+
+/// The context builders of harness 1.0 through 3.9.
+pub(crate) static CONTEXT_V1: ContextSurfaces = ContextSurfaces {
+    workspace_api: &intent_acp::WORKSPACE_API_DOCS_V1,
+    repo_rules: crate::rules::workspace_rules_v1,
+    skills_block: skills_block_v1,
+    placement_help: intent_core::machine_selection::exposed_machines_help,
+};
+
+fn skills_block_v1(inputs: &SkillsBlockInputs<'_>) -> String {
+    crate::skills::build_skills_catalog(inputs.skills)
+}
+
+/// The placement renderer of the harness version a session is stamped
+/// with, for the backend's answer to a remote agent's machine.
+#[must_use]
+pub fn placement_help_renderer(
+    harness_version: &str,
+) -> intent_core::machine_selection::PlacementHelpRenderer {
+    resolve_entry(harness_version).context.placement_help
+}
+
 /// The latest harness version identifier — intent-core's
 /// `CURRENT_HARNESS_VERSION`, the exact string stamped onto new sessions
 /// (H1, intentd#1255), consumed here so the stamp and the registry can never
@@ -522,6 +573,7 @@ static V3_ENTRY: HarnessEntry = HarnessEntry {
     version: "3.0",
     harness: v2_10::ENTRY.harness,
     doctrine: v2_10::ENTRY.doctrine,
+    context: &CONTEXT_V1,
     default_features: AgentFeaturesSettings::default,
     feature_labels: v1::FEATURE_LABELS,
 };
@@ -533,6 +585,7 @@ static V3_2_ENTRY: HarnessEntry = HarnessEntry {
     version: "3.2",
     harness: v3_1::ENTRY.harness,
     doctrine: v3_1::ENTRY.doctrine,
+    context: &CONTEXT_V1,
     default_features: AgentFeaturesSettings::default,
     feature_labels: v1::FEATURE_LABELS,
 };
@@ -564,6 +617,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v3_7::ENTRY,
     &v3_8::ENTRY,
     &v3_9::ENTRY,
+    &v3_10::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
@@ -681,6 +735,54 @@ impl HookFraming {
     }
 }
 
+/// Eval-only: the harness version new sessions get, so an agent eval can
+/// compare two versions on one build. Counts only with [`EVAL_MODE_ENV`].
+/// Not a user setting.
+pub(crate) const EVAL_HARNESS_VERSION_ENV: &str = "INTENTD_EVAL_HARNESS_VERSION";
+
+/// Eval-only: `1` lets [`EVAL_HARNESS_VERSION_ENV`] stamp new sessions.
+pub(crate) const EVAL_MODE_ENV: &str = "INTENTD_AGENT_EVAL";
+
+/// The harness version a new session is stamped with: [`LATEST_VERSION`],
+/// or in an agent eval the registered version [`EVAL_HARNESS_VERSION_ENV`]
+/// names. Read once per process.
+///
+/// # Errors
+///
+/// In eval mode, when the named version has no registry row: creating the
+/// agent fails rather than silently run the eval on another version.
+pub(crate) fn new_session_harness_version() -> Result<&'static str, String> {
+    static STAMP: std::sync::OnceLock<Result<&'static str, String>> = std::sync::OnceLock::new();
+    STAMP
+        .get_or_init(|| {
+            eval_stamp(
+                std::env::var(EVAL_MODE_ENV).ok().as_deref(),
+                std::env::var(EVAL_HARNESS_VERSION_ENV).ok().as_deref(),
+            )
+        })
+        .clone()
+}
+
+fn eval_stamp(eval_mode: Option<&str>, version: Option<&str>) -> Result<&'static str, String> {
+    let Some(version) = version.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(LATEST_VERSION);
+    };
+    if eval_mode != Some("1") {
+        tracing::warn!(
+            version,
+            "{EVAL_HARNESS_VERSION_ENV} is ignored without {EVAL_MODE_ENV}=1"
+        );
+        return Ok(LATEST_VERSION);
+    }
+    REGISTRY
+        .iter()
+        .find(|entry| entry.version == version)
+        .map(|entry| entry.version)
+        .ok_or_else(|| {
+            format!("{EVAL_HARNESS_VERSION_ENV}={version} is not a harness version of this build")
+        })
+}
+
 /// Resolve a session's stamped `harnessVersion` to its registry row. Unknown
 /// versions fall back to the latest with a WARN (never fail a turn over a
 /// stale or corrupt stamp).
@@ -721,8 +823,8 @@ mod tests {
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(
             REGISTRY[REGISTRY.len() - 1].version,
-            intent_core::CURRENT_HARNESS_VERSION,
-            "the current version is the newest registry row"
+            intent_core::NEWEST_HARNESS_VERSION,
+            "the current (or staged) version is the newest registry row"
         );
         let repository_guidance = resolve_entry("3.0");
         let previous = resolve_entry("2.10");
@@ -851,6 +953,48 @@ mod tests {
             data_ptr(resolve_entry("").harness),
             data_ptr(latest())
         ));
+    }
+
+    #[test]
+    fn eval_stamp_needs_eval_mode_and_a_registered_version() {
+        assert_eq!(eval_stamp(None, None), Ok(LATEST_VERSION));
+        assert_eq!(eval_stamp(Some("1"), None), Ok(LATEST_VERSION));
+        assert_eq!(eval_stamp(Some("1"), Some(" ")), Ok(LATEST_VERSION));
+        for mode in [None, Some("0"), Some("true"), Some("")] {
+            assert_eq!(
+                eval_stamp(mode, Some("3.8")),
+                Ok(LATEST_VERSION),
+                "{mode:?}"
+            );
+            assert_eq!(
+                eval_stamp(mode, Some("9.9")),
+                Ok(LATEST_VERSION),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(eval_stamp(Some("1"), Some("3.8")), Ok("3.8"));
+        assert_eq!(
+            eval_stamp(Some("1"), Some(intent_core::NEWEST_HARNESS_VERSION)),
+            Ok(intent_core::NEWEST_HARNESS_VERSION)
+        );
+        for unknown in ["9.9", "v3.8", "3.8.0"] {
+            let error = eval_stamp(Some("1"), Some(unknown)).unwrap_err();
+            assert!(error.contains(unknown), "{error}");
+        }
+    }
+
+    /// A staged version is registered, and the stamp of new sessions stays
+    /// the current one.
+    #[test]
+    fn staged_version_is_registered_but_not_stamped() {
+        assert_eq!(
+            REGISTRY.last().map(|entry| entry.version),
+            Some(intent_core::NEWEST_HARNESS_VERSION)
+        );
+        if let Some(staged) = intent_core::STAGED_HARNESS_VERSION {
+            assert_ne!(LATEST_VERSION, staged);
+            assert_eq!(resolve_entry(staged).version, staged);
+        }
     }
 
     #[test]

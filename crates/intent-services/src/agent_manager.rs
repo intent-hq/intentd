@@ -3711,10 +3711,11 @@ impl AgentManager {
         let plain_folder = self.services.is_plain_folder(&workspace_id).await;
         // Platform discovery for remote placement; `None` (the default
         // description) unless an execution node is configured.
+        let surfaces = crate::session_surfaces::SessionSurfaces::new(&session, opts.provider);
         let remote_placement_help = self
             .services
             .feature_remote_launch_port()
-            .placement_help(&self.services)
+            .placement_help(&self.services, surfaces.placement_help())
             .await;
         let server_blueprint = {
             let workspace_id = workspace_id.clone();
@@ -3722,10 +3723,14 @@ impl AgentManager {
             let agent_type = agent_type.to_string();
             let attachments = self.services.turn_attachments();
             let features = agent_features.clone();
-            let compact = opts.provider.truncates_tool_descriptions;
             let remote_placement_help = remote_placement_help.clone();
             ServerBlueprint::new(read_owner, move || {
-                WorkspaceMcpServer::for_agent_type(api.clone(), workspace_id.clone(), &agent_type)
+                surfaces.configure(
+                    WorkspaceMcpServer::for_agent_type(
+                        api.clone(),
+                        workspace_id.clone(),
+                        &agent_type,
+                    )
                     .with_caller_agent_id(Some(agent_id.clone()))
                     .with_turn_attachments(Some(attachments.clone()))
                     .with_agent_features(features.clone())
@@ -3749,9 +3754,9 @@ impl AgentManager {
                             })
                             .collect(),
                     )
-                    .with_compact_tool_descriptions(compact)
                     .with_plain_folder(plain_folder)
-                    .with_remote_placement_help(remote_placement_help.clone())
+                    .with_remote_placement_help(remote_placement_help.clone()),
+                )
             })
             .with_original_services(original_services, session.clone())
         };
@@ -3923,10 +3928,7 @@ impl AgentManager {
             // unconditionally, so a caller-supplied rules file would leave
             // its "Workspace API Reference" pointer dangling (ws.help() as
             // the only fallback).
-            let workspace_api_docs = opts
-                .provider
-                .truncates_tool_descriptions
-                .then(|| server.condensed_workspace_api_description());
+            let workspace_api_docs = surfaces.prompt_docs(&server);
             if let Some(prompt) = crate::rules::assemble_system_prompt(
                 &self.services.store,
                 Some(&cwd),
@@ -14902,13 +14904,15 @@ fn remote_workspace_api_docs(
     let provider = intent_providers::find_provider(intent_providers::base_provider_id(
         session.provider.as_deref()?,
     ))?;
-    provider.truncates_tool_descriptions.then(|| {
-        let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
-        WorkspaceMcpServer::new(api, workspace_id.clone())
-            .with_agent_features(agent_features.clone())
-            .with_sub_agent(is_sub_agent)
-            .condensed_workspace_api_description()
-    })
+    let surfaces = crate::session_surfaces::SessionSurfaces::new(session, provider);
+    let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
+    surfaces.prompt_docs(
+        &surfaces.configure(
+            WorkspaceMcpServer::new(api, workspace_id.clone())
+                .with_agent_features(agent_features.clone())
+                .with_sub_agent(is_sub_agent),
+        ),
+    )
 }
 
 /// Resolve `provider_id` (a base provider or a profile of one) the way a

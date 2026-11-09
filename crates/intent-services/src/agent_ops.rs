@@ -6910,6 +6910,8 @@ impl Services {
         // session's life. Creation time is the only input — delegated /
         // wakeOrCreate children funnel through this op and mint the latest
         // version, never inheriting the parent's pinned one.
+        let harness_version = crate::harness::new_session_harness_version()
+            .map_err(|e| AgentPersistError::Internal(format!("{method}: {e}")))?;
         let settings = self.effective_settings();
         let harness_features = agent_features_snapshot(&settings.agent_features).map_err(|e| {
             AgentPersistError::Internal(format!(
@@ -6975,7 +6977,7 @@ impl Services {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
-            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_version: harness_version.to_string(),
             harness_features: Some(harness_features),
             created_at: now.clone(),
             updated_at: now,

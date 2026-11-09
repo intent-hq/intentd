@@ -300,6 +300,8 @@ pub mod test_support;
 mod test_tracing;
 
 #[cfg(test)]
+mod session_surface_goldens;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_secret_egress;
@@ -31784,7 +31786,10 @@ impl WorkspaceApi for Services {
     fn agent_placement_help(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Option<String>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await.ok()?;
-            self.ports.remote_launch().placement_help(self).await
+            self.ports
+                .remote_launch()
+                .placement_help(self, crate::harness::latest_entry().context.placement_help)
+                .await
         })
     }
 
@@ -38829,6 +38834,7 @@ mod mcp_oauth;
 mod mcp_servers;
 mod plugins;
 mod rules;
+mod session_surfaces;
 pub mod skills;
 mod specialists;
 

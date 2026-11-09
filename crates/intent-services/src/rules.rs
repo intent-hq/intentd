@@ -198,6 +198,14 @@ fn load_workspace_rules(
     }
 }
 
+/// The repo-rule policy of harness 1.0 through 3.9: the first live rule
+/// source, injected whatever the provider loads itself.
+pub(crate) fn workspace_rules_v1(
+    inputs: &crate::harness::RepoRulesInputs<'_>,
+) -> Option<(String, String)> {
+    load_workspace_rules(inputs.workspace_path, None)
+}
+
 /// Read the `endUserRules` overrides map (`{ ruleType: { enabled, content,
 /// updatedAt } }`); a missing/garbled row yields an empty map.
 async fn read_overrides(store: &Store) -> Map<String, Value> {
@@ -532,7 +540,10 @@ async fn assemble_system_prompt_layers(
             parts.push(c);
         }
         if let Some(path) = workspace_path {
-            if let Some((content, source)) = load_workspace_rules(path, None) {
+            let rules = crate::harness::RepoRulesInputs {
+                workspace_path: path,
+            };
+            if let Some((content, source)) = (entry.context.repo_rules)(&rules) {
                 if !content.trim().is_empty() {
                     parts.push(harness.user_rules_wrapper(&content, &source));
                 }
@@ -566,9 +577,11 @@ async fn assemble_system_prompt_layers(
     // warn, omit layer) — never fail prompt assembly.
     if let Some(ws) = workspace.filter(|_| skills_catalog) {
         if let Some(repo_path) = crate::git_ops::worktree_path(ws) {
-            match crate::skills::format_skills_catalog_for_prompt(&repo_path.to_string_lossy())
-                .await
-            {
+            let skills =
+                crate::skills::discover_skills_for_prompt(&repo_path.to_string_lossy()).await;
+            match (entry.context.skills_block)(&crate::harness::SkillsBlockInputs {
+                skills: &skills,
+            }) {
                 catalog if !catalog.trim().is_empty() => {
                     parts.push(catalog);
                 }
@@ -581,12 +594,7 @@ async fn assemble_system_prompt_layers(
     // description points at. Placed with the other reference material —
     // after skills, before isolation hint / specialist role.
     if let Some(docs) = workspace_api_docs.map(str::trim).filter(|d| !d.is_empty()) {
-        parts.push(format!(
-            "{}\n\nThe `workspace_api` (ws.*) API reference: every method's signature with \
-             a one-line summary. The MCP tool description you see is a compact index of the \
-             same surface; call ws.help(\"<namespace>\") for one namespace's full docs.\n\n{docs}",
-            intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING
-        ));
+        parts.push(entry.context.workspace_api.prompt_section(docs));
     }
     // A backend sub-agent of a remote agent: where its parent's work is.
     if let Some(session) = agent_session {

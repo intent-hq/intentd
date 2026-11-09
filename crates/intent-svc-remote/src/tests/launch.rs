@@ -237,7 +237,14 @@ async fn admission_matches_the_machines_platform_and_capacity() {
         json!([{"os":"macos","arch":"aarch64"}])
     );
 
-    let help = f.port().placement_help(&f.services).await.unwrap();
+    let help = f
+        .port()
+        .placement_help(
+            &f.services,
+            intent_core::machine_selection::exposed_machines_help,
+        )
+        .await
+        .unwrap();
     assert!(help.contains("\"Test machine\""), "{help}");
     assert!(
         help.contains(&format!("nodeId `{id}`, macos/aarch64, connected")),
@@ -1340,7 +1347,14 @@ async fn head_answers_placement_help_for_lease_agents() {
     use intent_core::remote_launch::workspace_api::PLACEMENT_HELP_METHOD;
     let (f, link, machine) = fixture().await;
     let (agent, _) = f.placed().await;
-    let expected = f.port().placement_help(&f.services).await.unwrap();
+    let expected = f
+        .port()
+        .placement_help(
+            &f.services,
+            intent_core::machine_selection::exposed_machines_help,
+        )
+        .await
+        .unwrap();
     let answer = answered(forward(&link, &agent, PLACEMENT_HELP_METHOD, Value::Null).await);
     assert_eq!(answer, json!({ "help": expected }));
     assert!(

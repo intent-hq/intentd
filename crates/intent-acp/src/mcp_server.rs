@@ -23,10 +23,12 @@ pub mod private_results;
 pub mod repository_guidance;
 pub mod request_context;
 mod tools;
+pub mod workspace_api_docs;
 
 use private_results::DeliveryResponse;
 use repository_guidance::{BridgeResponse, GuidanceBinding, RepositoryGuidanceSource};
 use request_context::{CapturedRequestContext, McpRequestContext};
+use workspace_api_docs::{WorkspaceApiDocs, WorkspaceApiDocsInputs, WorkspaceApiDocsV1};
 
 pub(crate) use tools::ToolDef;
 pub use tools::{
@@ -132,6 +134,9 @@ pub struct WorkspaceMcpServer {
     /// dispatch and `ws.help` read the persisted flag themselves. Defaults
     /// to `false`, which keeps every description byte-identical.
     plain_folder: bool,
+    /// The session's harness-versioned `workspace_api` text surfaces.
+    /// Defaults to [`workspace_api_docs::WORKSPACE_API_DOCS_V1`].
+    workspace_api_docs: &'static dyn WorkspaceApiDocs,
     /// Optional trusted producer; disabled for all existing construction paths.
     repository_guidance: Option<GuidanceBinding>,
     /// Original endpoint context; no runtime construction path installs it yet.
@@ -192,6 +197,7 @@ impl WorkspaceMcpServer {
             is_sub_agent: false,
             compact_tool_descriptions: false,
             plain_folder: false,
+            workspace_api_docs: &workspace_api_docs::WORKSPACE_API_DOCS_V1,
             repository_guidance: None,
             request_context: None,
             frame_router: None,
@@ -357,40 +363,52 @@ impl WorkspaceMcpServer {
         self
     }
 
-    /// A description variant as THIS bridge serves it: unchanged, or with
-    /// the plain-folder surfaces removed.
-    fn shape_description(&self, desc: String) -> String {
-        if self.plain_folder {
-            tools::plain_folder_description(&desc)
-        } else {
-            desc
-        }
+    /// Render the `workspace_api` text surfaces with `docs`, the session's
+    /// harness version's (the spawn-time wiring point).
+    #[must_use]
+    pub fn with_workspace_api_docs(mut self, docs: &'static dyn WorkspaceApiDocs) -> Self {
+        self.workspace_api_docs = docs;
+        self
+    }
+
+    /// This bridge's captured spawn state, rendered by a docs version.
+    fn render_docs<T>(&self, render: impl FnOnce(&WorkspaceApiDocsInputs<'_>) -> T) -> T {
+        let features = self.effective_agent_features();
+        render(&WorkspaceApiDocsInputs {
+            is_chief: self.is_chief,
+            features: &features,
+            model_options: &self.specialist_model_options,
+            is_sub_agent: self.is_sub_agent,
+            plain_folder: self.plain_folder,
+            remote_placement_help: self.remote_placement_help.as_deref(),
+            truncating_provider: self.compact_tool_descriptions,
+        })
     }
 
     /// The fully assembled `workspace_api` description for THIS bridge —
     /// chief-ness, effective `[agentFeatures]` gating (sub-agent question
     /// gate folded in), and specialist model options all applied — exactly
-    /// what a non-truncating provider's `tools/list` serves.
+    /// what a non-truncating provider's `tools/list` serves on harness 1.0
+    /// through 3.9.
     #[must_use]
     pub fn full_workspace_api_description(&self) -> String {
-        let description = tools::workspace_api_description_with_model_options(
-            self.is_chief,
-            &self.effective_agent_features(),
-            &self.specialist_model_options,
-            self.is_sub_agent,
-        );
-        // Remote agents start from a git commit, so a plain folder (§5.1)
-        // never lists placement.
-        self.shape_description(
-            match self
-                .remote_placement_help
-                .as_ref()
-                .filter(|_| !self.plain_folder)
-            {
-                Some(help) => tools::inject_remote_placement_help(&description, help),
-                None => description.into_owned(),
-            },
-        )
+        self.render_docs(WorkspaceApiDocsV1::full)
+    }
+
+    /// The `workspace_api` description `tools/list` serves on THIS bridge:
+    /// the compact variant for a provider that truncates tool descriptions,
+    /// else [`Self::full_workspace_api_description`].
+    #[must_use]
+    pub fn workspace_api_tool_description(&self) -> String {
+        self.render_docs(|inputs| self.workspace_api_docs.tool_description(inputs))
+    }
+
+    /// The `workspace_api` reference the session's system prompt carries,
+    /// as this bridge's docs version renders it; `None` when the tool
+    /// description carries everything.
+    #[must_use]
+    pub fn workspace_api_prompt_reference(&self) -> Option<String> {
+        self.render_docs(|inputs| self.workspace_api_docs.prompt_reference(inputs))
     }
 
     /// The condensed `workspace_api` reference for THIS bridge — the same
@@ -399,26 +417,10 @@ impl WorkspaceMcpServer {
     /// its first summary sentence and continuation lines dropped (full docs
     /// stay reachable via `ws.help()`). Used by the spawn path to append the
     /// reference to the system prompt when `tools/list` serves the compact
-    /// variant.
+    /// variant, on harness 1.0 through 3.9.
     #[must_use]
     pub fn condensed_workspace_api_description(&self) -> String {
-        let description = tools::condensed_workspace_api_description(
-            self.is_chief,
-            &self.effective_agent_features(),
-            &self.specialist_model_options,
-        );
-        // Remote agents start from a git commit, so a plain folder (§5.1)
-        // never lists placement.
-        self.shape_description(
-            match self
-                .remote_placement_help
-                .as_ref()
-                .filter(|_| !self.plain_folder)
-            {
-                Some(help) => tools::inject_remote_placement_help(&description, help),
-                None => description,
-            },
-        )
+        self.render_docs(WorkspaceApiDocsV1::condensed)
     }
 
     /// Override the wall-clock budget for one `workspace_api` invocation
@@ -585,14 +587,7 @@ impl WorkspaceMcpServer {
                 // the condensed reference rides the system prompt
                 // (`condensed_workspace_api_description`).
                 let description = if t.name == "workspace_api" {
-                    if self.compact_tool_descriptions {
-                        self.shape_description(tools::compact_workspace_api_description(
-                            self.is_chief,
-                            &self.effective_agent_features(),
-                        ))
-                    } else {
-                        self.full_workspace_api_description()
-                    }
+                    self.workspace_api_tool_description()
                 } else {
                     t.description.to_string()
                 };

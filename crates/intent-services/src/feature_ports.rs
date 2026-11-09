@@ -1265,8 +1265,13 @@ pub trait RemoteLaunchPort: Send + Sync + 'static {
 
     /// Platform discovery for `ws.help("agent")` and the tool description:
     /// the configured node, its platforms and how to place an agent on it.
-    /// `None` when no node is configured.
-    fn placement_help<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Option<String>>;
+    /// `None` when no node is configured. `render` is the session's
+    /// harness version's renderer (`harness::placement_help_renderer`).
+    fn placement_help<'a>(
+        &'a self,
+        svc: &'a Services,
+        render: intent_core::machine_selection::PlacementHelpRenderer,
+    ) -> BoxFuture<'a, Option<String>>;
 
     /// The line a remote agent's instructions carry when its machine's link
     /// is older than nodeProtocol 11 and the agent would have had user MCP
@@ -1656,7 +1661,11 @@ impl RemoteLaunchPort for UnavailableRemoteLaunch {
         Box::pin(async { Ok(PlatformAvailability::none(intent_core::now_iso())) })
     }
 
-    fn placement_help<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Option<String>> {
+    fn placement_help<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _render: intent_core::machine_selection::PlacementHelpRenderer,
+    ) -> BoxFuture<'a, Option<String>> {
         Box::pin(async { None })
     }
 
@@ -2725,7 +2734,11 @@ mod tests {
         assert!(placements.supported_platforms.is_empty());
         assert!(placements.available_platforms.is_empty());
         assert!(placements.available_os.is_empty());
-        assert_eq!(port.placement_help(&svc).await, None);
+        assert_eq!(
+            port.placement_help(&svc, intent_core::machine_selection::exposed_machines_help)
+                .await,
+            None
+        );
 
         let placement: AgentPlacement =
             serde_json::from_str(r#"{"target":"remote","os":"linux"}"#).unwrap();

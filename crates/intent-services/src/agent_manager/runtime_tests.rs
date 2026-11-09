@@ -371,7 +371,11 @@ impl crate::feature_ports::RemoteLaunchPort for RemoteRuntimes {
     ) -> BoxFuture<'a, intent_core::Result<intent_core::placement::PlatformAvailability>> {
         Box::pin(async { Ok(intent_core::placement::PlatformAvailability::none(now_iso())) })
     }
-    fn placement_help<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Option<String>> {
+    fn placement_help<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _render: intent_core::machine_selection::PlacementHelpRenderer,
+    ) -> BoxFuture<'a, Option<String>> {
         Box::pin(async { None })
     }
     fn admit<'a>(

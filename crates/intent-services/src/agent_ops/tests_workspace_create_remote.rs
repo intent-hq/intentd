@@ -42,7 +42,11 @@ impl RemoteLaunchPort for FakeRemote {
         Box::pin(async { Ok(PlatformAvailability::none(intent_core::now_iso())) })
     }
 
-    fn placement_help<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Option<String>> {
+    fn placement_help<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _render: intent_core::machine_selection::PlacementHelpRenderer,
+    ) -> BoxFuture<'a, Option<String>> {
         Box::pin(async { None })
     }
 
