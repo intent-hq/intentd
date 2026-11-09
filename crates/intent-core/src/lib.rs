@@ -47,6 +47,7 @@ pub mod note_read_bounds;
 pub mod path_utils;
 pub mod placement;
 pub mod process_policy;
+pub mod prompt_breakdown;
 pub mod pull_request_key;
 pub use pull_request_key::{pull_request_key, PullRequestSelector};
 #[doc(hidden)]

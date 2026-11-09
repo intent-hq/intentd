@@ -3939,7 +3939,7 @@ impl AgentManager {
             } else {
                 None
             };
-            if let Some(prompt) = crate::rules::assemble_agent_system_prompt(
+            if let Some(mut assembled) = crate::rules::assemble_system_prompt_sections(
                 &self.services.store,
                 Some(&cwd),
                 agent_type,
@@ -3955,7 +3955,19 @@ impl AgentManager {
             )
             .await
             {
-                let prompt = crate::rules::with_provider_prompt_note(prompt, opts.provider);
+                assembled.append(&crate::rules::provider_note_tag(), |prompt| {
+                    crate::rules::with_provider_prompt_note(prompt, opts.provider)
+                });
+                // The per-section breakdown (3.10+), stored in the same
+                // write as the prompt it describes.
+                let breakdown = spawn_prompt_breakdown(
+                    &session,
+                    &assembled,
+                    &server.workspace_api_tool_description(),
+                    server.remote_placement_help(),
+                    workspace_api_docs.is_some(),
+                );
+                let prompt = assembled.prompt;
                 let path = config_dir.join(format!("intentd-rules-{}.md", Uuid::new_v4()));
                 std::fs::write(&path, prompt.as_bytes())
                     .map_err(|e| Error::Internal(format!("write rules file failed: {e}")))?;
@@ -3971,7 +3983,12 @@ impl AgentManager {
                 if let Err(e) = self
                     .services
                     .store
-                    .set_agent_session_system_prompt(&workspace_id, &agent_id, &prompt)
+                    .set_agent_session_system_prompt_with_breakdown(
+                        &workspace_id,
+                        &agent_id,
+                        &prompt,
+                        breakdown.as_ref(),
+                    )
                     .await
                 {
                     tracing::warn!(agent = %agent_id, error = %e, "failed to persist system_prompt on session");
@@ -12600,14 +12617,17 @@ impl AgentManager {
         let settings = self.services.effective_settings();
         let auto_commit_enabled = self.services.effective_auto_commit(workspace_id).await;
         let agent_features = self.services.session_agent_features(session);
-        let workspace_api_docs = remote_workspace_api_docs(
+        let bridge = remote_workspace_api_bridge(
             &self.services,
             workspace_id,
             session,
             &agent_features,
             is_sub_agent,
         );
-        let Some(prompt) = crate::rules::assemble_remote_system_prompt(
+        let workspace_api_docs = bridge
+            .as_ref()
+            .and_then(WorkspaceMcpServer::workspace_api_prompt_reference);
+        let Some(mut assembled) = crate::rules::assemble_remote_system_prompt(
             &self.services.store,
             cwd.as_deref(),
             &agent_type,
@@ -12624,22 +12644,40 @@ impl AgentManager {
         else {
             return Ok(());
         };
-        let mut prompt =
-            match session.provider.as_deref().and_then(|p| {
-                intent_providers::find_provider(intent_providers::base_provider_id(p))
-            }) {
-                Some(provider) => crate::rules::with_provider_prompt_note(prompt, provider),
-                None => prompt,
-            };
+        if let Some(provider) = session
+            .provider
+            .as_deref()
+            .and_then(|p| intent_providers::find_provider(intent_providers::base_provider_id(p)))
+        {
+            assembled.append(&crate::rules::provider_note_tag(), |prompt| {
+                crate::rules::with_provider_prompt_note(prompt, provider)
+            });
+        }
         if let Some(notice) = self
             .services
             .feature_remote_launch_port()
             .mcp_servers_notice(&self.services, agent_id)
             .await
         {
-            prompt.push_str("\n\n");
-            prompt.push_str(&notice);
+            assembled.append(
+                &crate::prompt_sections::LayerTag::intent("mcp-servers", "MCP servers notice")
+                    .hint(
+                        intent_core::prompt_breakdown::ControlHintKind::McpSettings,
+                        "Change MCP servers in Intent's MCP settings",
+                    ),
+                |mut prompt| {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&notice);
+                    prompt
+                },
+            );
         }
+        // No breakdown for a remote agent: its machine serves the
+        // `workspace_api` description from its own build, so the backend
+        // cannot size what the agent actually receives. Storing `None`
+        // clears any earlier one; `agent.getSession` reports
+        // `not-recorded`.
+        let prompt = assembled.prompt;
         self.services
             .store
             .set_agent_session_system_prompt(workspace_id, agent_id, &prompt)
@@ -14907,25 +14945,51 @@ pub struct ProviderLaunchSpec {
 /// workspace server describes the tool (the session's feature gates; no
 /// specialist model options or placement help, which the machine does not
 /// add). `None` for every other provider, which reads the full description.
-fn remote_workspace_api_docs(
+/// The `workspace_api` bridge a remote agent's surfaces are rendered from:
+/// its prompt reference and tool description. `None` without a known
+/// provider.
+fn remote_workspace_api_bridge(
     services: &Services,
     workspace_id: &WorkspaceId,
     session: &AgentSession,
     agent_features: &intent_core::settings_file::AgentFeaturesSettings,
     is_sub_agent: bool,
-) -> Option<String> {
+) -> Option<WorkspaceMcpServer> {
     let provider = intent_providers::find_provider(intent_providers::base_provider_id(
         session.provider.as_deref()?,
     ))?;
     let surfaces = crate::session_surfaces::SessionSurfaces::new(session, provider);
     let api: Arc<dyn WorkspaceApi> = Arc::new(services.clone());
-    surfaces
-        .configure(
+    Some(
+        surfaces.configure(
             WorkspaceMcpServer::new(api, workspace_id.clone())
                 .with_agent_features(agent_features.clone())
                 .with_sub_agent(is_sub_agent),
-        )
-        .workspace_api_prompt_reference()
+        ),
+    )
+}
+
+/// The prompt breakdown a spawn records for `session`: `None` before
+/// harness 3.10, so older sessions never get one.
+fn spawn_prompt_breakdown(
+    session: &AgentSession,
+    assembled: &crate::prompt_sections::AssembledPrompt,
+    tool_description: &str,
+    placement_help: Option<&str>,
+    reference_in_prompt: bool,
+) -> Option<intent_core::prompt_breakdown::PromptBreakdown> {
+    if !intent_core::prompt_breakdown::harness_records_prompt_breakdown(&session.harness_version) {
+        return None;
+    }
+    Some(assembled.breakdown(
+        &session.harness_version,
+        intent_core::now_iso(),
+        crate::prompt_sections::tool_description_sections(
+            tool_description,
+            placement_help,
+            reference_in_prompt,
+        ),
+    ))
 }
 
 /// Resolve `provider_id` (a base provider or a profile of one) the way a

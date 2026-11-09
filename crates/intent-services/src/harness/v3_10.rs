@@ -16,6 +16,7 @@ static CONTEXT: ContextSurfaces = ContextSurfaces {
     repo_rules,
     repo_rules_reads_executor: true,
     skills_block,
+    hidden_skills,
     placement_help,
 };
 
@@ -37,6 +38,13 @@ fn repo_rules(inputs: &RepoRulesInputs<'_>) -> crate::rules::RepoRules {
 /// The skills block: budget and hidden skills.
 fn skills_block(inputs: &SkillsBlockInputs<'_>) -> String {
     super::skills_block_v1(inputs)
+}
+
+/// The skills the skills block leaves out, with why.
+fn hidden_skills(
+    inputs: &SkillsBlockInputs<'_>,
+) -> Vec<intent_core::prompt_breakdown::HiddenSkill> {
+    super::no_hidden_skills(inputs)
 }
 
 /// The remote-placement text: stable machine identity only.

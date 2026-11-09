@@ -3178,7 +3178,9 @@ impl Store {
         );
         let sql = format!(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
-             name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
+             name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, \
+             prompt_breakdown=CASE WHEN system_prompt IS ? THEN prompt_breakdown ELSE NULL END, \
+             system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, file_blocks=?, \
@@ -3198,6 +3200,8 @@ impl Store {
             .bind(&s.provider)
             .bind(enum_to_db(&s.status)?)
             .bind(i64::from(s.is_active))
+            // Twice: the breakdown survives only an unchanged prompt.
+            .bind(&s.system_prompt)
             .bind(&s.system_prompt)
             .bind(&s.updated_at)
             .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
@@ -3887,21 +3891,81 @@ impl Store {
         id: &AgentId,
         system_prompt: &str,
     ) -> Result<()> {
-        let rows =
-            sqlx::query("UPDATE agent_session SET system_prompt=? WHERE id=? AND workspace_id=?")
-                .bind(system_prompt)
-                .bind(&id.0)
-                .bind(&workspace_id.0)
-                .execute(self.write_pool())
-                .await
-                .map_err(|e| {
-                    Error::Internal(format!("set agent session system prompt failed: {e}"))
-                })?
-                .rows_affected();
+        self.set_agent_session_system_prompt_with_breakdown(workspace_id, id, system_prompt, None)
+            .await
+    }
+
+    /// [`Store::set_agent_session_system_prompt`] that stores the prompt's
+    /// per-section breakdown in the same write. `None` clears any stored
+    /// breakdown, so one never outlives the prompt it describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the breakdown cannot be serialized or the database operation fails.
+    pub async fn set_agent_session_system_prompt_with_breakdown(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        system_prompt: &str,
+        breakdown: Option<&intent_core::prompt_breakdown::PromptBreakdown>,
+    ) -> Result<()> {
+        let breakdown = breakdown
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| Error::Internal(format!("serialize prompt breakdown failed: {e}")))?;
+        let rows = sqlx::query(
+            "UPDATE agent_session SET system_prompt=?, prompt_breakdown=? \
+             WHERE id=? AND workspace_id=?",
+        )
+        .bind(system_prompt)
+        .bind(breakdown)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set agent session system prompt failed: {e}")))?
+        .rows_affected();
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
         Ok(())
+    }
+
+    /// The stored prompt breakdown of a session, provided the stored
+    /// `system_prompt` is still `system_prompt` (the prompt the caller read
+    /// with the session row). One statement checks both, so a respawn
+    /// landing between the caller's session read and this read never pairs
+    /// an old prompt with a new breakdown. `None` when none was recorded,
+    /// the prompt moved on, or the stored JSON no longer parses (a breakdown
+    /// is display data and never fails a session read).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist; `Error::Internal` if the database operation fails.
+    pub async fn get_agent_session_prompt_breakdown(
+        &self,
+        id: &AgentId,
+        system_prompt: Option<&str>,
+    ) -> Result<Option<intent_core::prompt_breakdown::PromptBreakdown>> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT CASE WHEN system_prompt IS ? THEN prompt_breakdown END \
+             FROM agent_session WHERE id=?",
+        )
+        .bind(system_prompt)
+        .bind(&id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("get prompt breakdown failed: {e}")))?;
+        let Some((stored,)) = row else {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        };
+        Ok(stored.and_then(|json| match serde_json::from_str(&json) {
+            Ok(breakdown) => Some(breakdown),
+            Err(e) => {
+                tracing::warn!(agent = %id, error = %e, "stored prompt breakdown does not parse");
+                None
+            }
+        }))
     }
 
     /// Persist a metadata change: a narrow write of `metadata` and
@@ -15617,6 +15681,126 @@ mod tests {
             ],
             "newest first, bounded, identity rows only"
         );
+    }
+
+    /// The prompt breakdown is written with the prompt it describes and
+    /// never outlives it: a prompt rewrite without a breakdown (the narrow
+    /// write or a full-row write with a different prompt) clears it, while a
+    /// full-row write that keeps the prompt keeps the breakdown.
+    #[tokio::test]
+    async fn prompt_breakdown_follows_the_stored_system_prompt() {
+        use intent_core::now_iso;
+        use intent_core::prompt_breakdown::{
+            est_tokens, PromptBreakdown, PromptSection, SectionLocation, SectionOwner,
+        };
+        use uuid::Uuid;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-breakdown".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        store.insert_agent_session(&session).await.expect("insert");
+        assert_eq!(
+            store
+                .get_agent_session_prompt_breakdown(&agent_id, None)
+                .await
+                .expect("read"),
+            None,
+            "a new session has no breakdown"
+        );
+
+        let breakdown = PromptBreakdown::new(
+            intent_core::NEWEST_HARNESS_VERSION,
+            ts.clone(),
+            vec![PromptSection {
+                id: "doctrine".into(),
+                label: "Intent instructions".into(),
+                owner: SectionOwner::Intent,
+                location: SectionLocation::SystemPrompt,
+                chars: 6,
+                est_tokens: est_tokens(6),
+                control_hint: None,
+            }],
+            vec![],
+        );
+        store
+            .set_agent_session_system_prompt_with_breakdown(
+                &ws_id,
+                &agent_id,
+                "prompt",
+                Some(&breakdown),
+            )
+            .await
+            .expect("persist");
+        let read = || async {
+            let prompt = store
+                .get_agent_session_with_transcript(&agent_id)
+                .await
+                .expect("get")
+                .system_prompt;
+            store
+                .get_agent_session_prompt_breakdown(&agent_id, prompt.as_deref())
+                .await
+                .expect("read")
+        };
+        assert_eq!(read().await.as_ref(), Some(&breakdown));
+        assert_eq!(
+            store
+                .get_agent_session_prompt_breakdown(&agent_id, Some("an older prompt"))
+                .await
+                .expect("read"),
+            None,
+            "a reader holding another prompt never gets this breakdown"
+        );
+
+        let mut full = store
+            .get_agent_session_with_transcript(&agent_id)
+            .await
+            .expect("get");
+        full.name = "renamed".into();
+        store
+            .update_agent_session(&ws_id, &full)
+            .await
+            .expect("update");
+        assert_eq!(
+            read().await.as_ref(),
+            Some(&breakdown),
+            "a full-row write with the same prompt keeps the breakdown"
+        );
+
+        full.system_prompt = Some("hand-edited prompt".into());
+        store
+            .update_agent_session(&ws_id, &full)
+            .await
+            .expect("update");
+        assert_eq!(read().await, None, "a different prompt clears it");
+
+        store
+            .set_agent_session_system_prompt_with_breakdown(
+                &ws_id,
+                &agent_id,
+                "prompt",
+                Some(&breakdown),
+            )
+            .await
+            .expect("persist");
+        store
+            .set_agent_session_system_prompt(&ws_id, &agent_id, "respawned prompt")
+            .await
+            .expect("persist");
+        assert_eq!(read().await, None, "a narrow rewrite without one clears it");
+
+        let missing = store
+            .get_agent_session_prompt_breakdown(&AgentId("agent-missing".into()), None)
+            .await
+            .expect_err("unknown session");
+        assert!(matches!(missing, Error::NotFound(_)), "got: {missing:?}");
     }
 
     /// monorepo#1936 regression: the spawn path's system-prompt persist is a

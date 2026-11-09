@@ -15,7 +15,9 @@ use intent_core::{Error, Result};
 use intent_store::Store;
 use serde_json::{json, Map, Value};
 
+use crate::prompt_sections::{AssembledPrompt, LayerTag};
 use crate::rtk;
+use intent_core::prompt_breakdown::ControlHintKind;
 
 /// Settings-store key the per-rule-type user overrides persist under (§9.12).
 const END_USER_RULES_KEY: &str = "endUserRules";
@@ -170,6 +172,8 @@ pub(crate) struct RepoRuleFile {
     pub source: String,
     /// File size in bytes.
     pub bytes: usize,
+    /// File length in UTF-16 code units, the breakdown's `chars`.
+    pub chars: u64,
     pub loading: RuleLoading,
 }
 
@@ -188,10 +192,6 @@ pub(crate) enum RuleLoading {
 impl RuleLoading {
     /// The breakdown wording, e.g. "loaded natively by Claude Code".
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the prompt breakdown (section map)")
-    )]
     pub(crate) fn describe(self) -> String {
         match self {
             Self::Injected => "injected".to_owned(),
@@ -279,6 +279,7 @@ pub(crate) fn workspace_rules_v1(inputs: &crate::harness::RepoRulesInputs<'_>) -
             .map(|(i, f)| RepoRuleFile {
                 source: f.source.clone(),
                 bytes: f.content.len(),
+                chars: intent_core::prompt_breakdown::utf16_len(&f.content),
                 loading: if is_selected(&selection, i) {
                     RuleLoading::Injected
                 } else {
@@ -314,6 +315,7 @@ pub(crate) fn workspace_rules_native_aware(
             .map(|(i, f)| RepoRuleFile {
                 source: f.source.clone(),
                 bytes: f.content.len(),
+                chars: intent_core::prompt_breakdown::utf16_len(&f.content),
                 loading: match native[i] {
                     Some(provider) => RuleLoading::LoadedNatively(provider),
                     None if injected.is_some() && is_selected(&selection, i) => {
@@ -375,7 +377,7 @@ fn enabled_override(overrides: &Map<String, Value>, rule_type: &str) -> Option<S
 /// bodies only; tier 1/2 user-supplied content is never filtered.
 ///
 /// Latest-bound convenience form kept for unit tests; prompt assembly
-/// resolves the session's pinned set via [`get_specialization_rules_for`].
+/// resolves the session's pinned set via [`get_specialization_rules_sourced`].
 #[cfg(test)]
 pub(crate) async fn get_specialization_rules(
     store: &Store,
@@ -383,7 +385,7 @@ pub(crate) async fn get_specialization_rules(
     agent_type: &str,
     agent_features: &intent_core::settings_file::AgentFeaturesSettings,
 ) -> String {
-    get_specialization_rules_for(
+    get_specialization_rules_sourced(
         crate::harness::latest_entry().doctrine.instructions,
         store,
         workspace_path,
@@ -392,6 +394,31 @@ pub(crate) async fn get_specialization_rules(
         false,
     )
     .await
+    .0
+}
+
+/// Which tier of [`get_specialization_rules_sourced`] supplied the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpecializationSource {
+    /// The user's settings override.
+    SettingsOverride,
+    /// `<ws>/.intent/agent-rules/{agent_type}.md`.
+    WorkspaceFile,
+    /// Intent's bundled instructions.
+    Bundled,
+}
+
+impl SpecializationSource {
+    fn layer_tag(self) -> LayerTag {
+        match self {
+            Self::SettingsOverride => {
+                LayerTag::user("agent-rules-override", "Agent instructions override")
+            }
+            Self::WorkspaceFile => LayerTag::user("agent-rules-file", "Agent instructions file")
+                .hint(ControlHintKind::EditRepoRules, "Edit .intent/agent-rules"),
+            Self::Bundled => LayerTag::intent("doctrine", "Intent instructions"),
+        }
+    }
 }
 
 /// [`get_specialization_rules`] with an explicit tier-3 instruction set —
@@ -400,18 +427,20 @@ pub(crate) async fn get_specialization_rules(
 /// built-in comes from `set`. `plain_folder` (from
 /// [`crate::instructions::plain_folder_gated`]) swaps the bundled git and
 /// forge guidance for the plain-folder note.
-pub(crate) async fn get_specialization_rules_for(
+///
+/// Returns the text with the tier that supplied it.
+pub(crate) async fn get_specialization_rules_sourced(
     set: &'static crate::instructions::InstructionSet,
     store: &Store,
     workspace_path: Option<&Path>,
     agent_type: &str,
     agent_features: &intent_core::settings_file::AgentFeaturesSettings,
     plain_folder: bool,
-) -> String {
+) -> (String, SpecializationSource) {
     // 1. User-settings override (highest precedence — settings win over file/bundled).
     let overrides = read_overrides(store).await;
     if let Some(c) = enabled_override(&overrides, agent_type) {
-        return c;
+        return (c, SpecializationSource::SettingsOverride);
     }
     // 2. Workspace file `<ws>/.intent/agent-rules/{agent_type}.md` (non-empty wins).
     if let Some(path) = workspace_path {
@@ -421,17 +450,20 @@ pub(crate) async fn get_specialization_rules_for(
             .join(format!("{agent_type}.md"));
         if let Ok(content) = std::fs::read_to_string(&file) {
             if !content.trim().is_empty() {
-                return content;
+                return (content, SpecializationSource::WorkspaceFile);
             }
         }
     }
     // 3. Bundled built-in (composed with common/workspace per the reference),
     // from the caller's pinned instruction set.
-    crate::instructions::get_instruction_with_common_in(
-        set,
-        agent_type,
-        agent_features,
-        plain_folder,
+    (
+        crate::instructions::get_instruction_with_common_in(
+            set,
+            agent_type,
+            agent_features,
+            plain_folder,
+        ),
+        SpecializationSource::Bundled,
     )
 }
 
@@ -489,6 +521,11 @@ async fn build_rtk_instruction(
     Some(rtk_instruction_line(harness, &status.subcommands))
 }
 
+/// The section tag of [`with_provider_prompt_note`]'s note.
+pub(crate) fn provider_note_tag() -> LayerTag {
+    LayerTag::intent("provider-note", "Provider note")
+}
+
 /// Append the provider's prompt-only note
 /// ([`intent_providers::ProviderConfig::system_prompt_note`]; Cursor's
 /// native-subagent restriction) to an assembled prompt. Other providers'
@@ -525,7 +562,7 @@ pub(crate) fn with_provider_prompt_note(
 /// snapshot resolved by the caller via `session_agent_features`, falling back
 /// to live settings only for legacy NULL-snapshot rows) gates
 /// feature-specific prompt sections: the bundled specialization bodies via
-/// [`get_specialization_rules_for`], and the `## Asking the User Questions`
+/// [`get_specialization_rules_sourced`], and the `## Asking the User Questions`
 /// footer block (`structuredQuestions`). With all defaults on the assembled
 /// prompt is byte-identical to the ungated one.
 ///
@@ -542,6 +579,8 @@ pub(crate) fn with_provider_prompt_note(
 /// the prompt under [`intent_acp::WORKSPACE_API_SYSTEM_PROMPT_HEADING`] (the
 /// section the compact header points at). `None` — every non-flagged
 /// provider — leaves the prompt byte-identical to before.
+///
+/// Test form: the spawn path calls [`assemble_system_prompt_sections`].
 #[cfg(test)]
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn assemble_system_prompt(
@@ -573,11 +612,12 @@ pub(crate) async fn assemble_system_prompt(
         None,
     )
     .await
+    .map(|assembled| assembled.prompt)
 }
 
-/// [`assemble_system_prompt`] for a local agent spawn: `rule_executor` says
-/// what runs the agent, so the session's harness can skip rule files the
-/// provider loads by itself ([`crate::native_rules`]).
+/// [`assemble_system_prompt_sections`] without the sections: the prompt
+/// text alone, for tests that do not check the breakdown.
+#[cfg(test)]
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn assemble_agent_system_prompt(
     store: &Store,
@@ -593,6 +633,43 @@ pub(crate) async fn assemble_agent_system_prompt(
     workspace_api_docs: Option<&str>,
     rule_executor: Option<&crate::native_rules::RuleExecutor>,
 ) -> Option<String> {
+    assemble_system_prompt_sections(
+        store,
+        workspace_path,
+        agent_type,
+        specialist,
+        is_sub_agent,
+        auto_commit_enabled,
+        rtk_enabled,
+        agent_features,
+        workspace,
+        agent_session,
+        workspace_api_docs,
+        rule_executor,
+    )
+    .await
+    .map(|assembled| assembled.prompt)
+}
+
+/// [`assemble_system_prompt`] for a local agent spawn, with the prompt's
+/// measured sections for the `promptBreakdown` the spawn path records.
+/// `rule_executor` says what runs the agent, so the session's harness can
+/// skip rule files the provider loads by itself ([`crate::native_rules`]).
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn assemble_system_prompt_sections(
+    store: &Store,
+    workspace_path: Option<&Path>,
+    agent_type: &str,
+    specialist: Option<&SpecialistPromptInjection>,
+    is_sub_agent: bool,
+    auto_commit_enabled: bool,
+    rtk_enabled: bool,
+    agent_features: &intent_core::settings_file::AgentFeaturesSettings,
+    workspace: Option<&intent_core::Workspace>,
+    agent_session: Option<&intent_core::AgentSession>,
+    workspace_api_docs: Option<&str>,
+    rule_executor: Option<&crate::native_rules::RuleExecutor>,
+) -> Option<AssembledPrompt> {
     assemble_system_prompt_layers(
         store,
         workspace_path,
@@ -628,7 +705,7 @@ pub(crate) async fn assemble_remote_system_prompt(
     workspace: Option<&intent_core::Workspace>,
     agent_session: Option<&intent_core::AgentSession>,
     workspace_api_docs: Option<&str>,
-) -> Option<String> {
+) -> Option<AssembledPrompt> {
     let remote = agent_session
         .and_then(|s| s.provider.as_deref())
         .map(|p| crate::native_rules::RuleExecutor::remote(intent_providers::base_provider_id(p)));
@@ -665,7 +742,7 @@ async fn assemble_system_prompt_layers(
     workspace_api_docs: Option<&str>,
     skills_catalog: bool,
     rule_executor: Option<&crate::native_rules::RuleExecutor>,
-) -> Option<String> {
+) -> Option<AssembledPrompt> {
     // The session's pinned harness + doctrine (H2): a stamped session keeps
     // assembling the exact version it was created with; session-less calls
     // (previews, background one-shots) resolve to the latest.
@@ -682,14 +759,19 @@ async fn assemble_system_prompt_layers(
     let plain_folder =
         crate::instructions::plain_folder_gated(entry.doctrine.instructions, workspace);
     let overrides = read_overrides(store).await;
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts: Vec<(LayerTag, String)> = Vec::new();
+    let mut hidden_skills = Vec::new();
+    let mut provider_sections = Vec::new();
     if let Some(c) = enabled_override(&overrides, "base-system-prompt") {
-        parts.push(c);
+        parts.push((LayerTag::user("base-override", "Base prompt override"), c));
     }
     if let Some(instructions) = assistant {
-        parts.push(instructions.to_string());
+        parts.push((
+            LayerTag::intent("assistant-instructions", "Assistant instructions"),
+            instructions.to_string(),
+        ));
     } else {
-        let specialization = get_specialization_rules_for(
+        let (specialization, source) = get_specialization_rules_sourced(
             entry.doctrine.instructions,
             store,
             workspace_path,
@@ -699,19 +781,27 @@ async fn assemble_system_prompt_layers(
         )
         .await;
         if !specialization.trim().is_empty() {
-            parts.push(specialization);
+            parts.push((source.layer_tag(), specialization));
         }
         if let Some(c) = enabled_override(&overrides, "workspace") {
-            parts.push(c);
+            parts.push((
+                LayerTag::user("workspace-override", "Workspace prompt override"),
+                c,
+            ));
         }
         if let Some(path) = workspace_path {
             let rules = crate::harness::RepoRulesInputs {
                 workspace_path: path,
                 executor: rule_executor,
             };
-            if let Some((content, source)) = (entry.context.repo_rules)(&rules).injected {
+            let repo_rules = (entry.context.repo_rules)(&rules);
+            provider_sections = native_repo_rule_sections(&repo_rules.files);
+            if let Some((content, source)) = repo_rules.injected {
                 if !content.trim().is_empty() {
-                    parts.push(harness.user_rules_wrapper(&content, &source));
+                    parts.push((
+                        repo_rules_tag(&source, path),
+                        harness.user_rules_wrapper(&content, &source),
+                    ));
                 }
             }
         }
@@ -723,7 +813,11 @@ async fn assemble_system_prompt_layers(
                 if let Some(instructions) = repo_config.instructions {
                     if !instructions.trim().is_empty() {
                         let source = format!("{}/.intent/config.json", repo_path.display());
-                        parts.push(harness.user_rules_wrapper(&instructions, &source));
+                        parts.push((
+                            LayerTag::user("repo-config", "Repo config instructions")
+                                .hint(ControlHintKind::EditRepoRules, "Edit .intent/config.json"),
+                            harness.user_rules_wrapper(&instructions, &source),
+                        ));
                     }
                 }
             }
@@ -733,7 +827,7 @@ async fn assemble_system_prompt_layers(
         // harness). Placed after workspace-rules, before skills / isolation hint /
         // specialist role.
         if let Some(rtk_instruction) = build_rtk_instruction(harness, rtk_enabled).await {
-            parts.push(rtk_instruction);
+            parts.push((LayerTag::intent("rtk", "RTK command hint"), rtk_instruction));
         }
     }
     // Skills catalog layer (reference layer 4.7: after specialization rules, user
@@ -749,10 +843,13 @@ async fn assemble_system_prompt_layers(
                 skills: &skills,
             }) {
                 catalog if !catalog.trim().is_empty() => {
-                    parts.push(catalog);
+                    parts.push((LayerTag::user("skills", "Skills"), catalog));
                 }
                 _ => {}
             }
+            hidden_skills = (entry.context.hidden_skills)(&crate::harness::SkillsBlockInputs {
+                skills: &skills,
+            });
         }
     }
     // Workspace API reference layer (truncating providers only): the
@@ -760,16 +857,22 @@ async fn assemble_system_prompt_layers(
     // description points at. Placed with the other reference material —
     // after skills, before isolation hint / specialist role.
     if let Some(docs) = workspace_api_docs.map(str::trim).filter(|d| !d.is_empty()) {
-        parts.push(entry.context.workspace_api.prompt_section(docs));
+        parts.push((
+            LayerTag::intent("ws-reference", "Workspace API reference"),
+            entry.context.workspace_api.prompt_section(docs),
+        ));
     }
     // A backend sub-agent of a remote agent: where its parent's work is.
     if let Some(session) = agent_session {
         if let Some(work) =
             intent_core::remote_launch::BackendParentWork::from_metadata(session.metadata.as_ref())
         {
-            parts.push(format!(
-                "## Parent's work\n\n{}",
-                work.notice(session.workspace_id.as_str())
+            parts.push((
+                LayerTag::intent("parent-work", "Parent's work"),
+                format!(
+                    "## Parent's work\n\n{}",
+                    work.notice(session.workspace_id.as_str())
+                ),
             ));
         }
     }
@@ -780,14 +883,21 @@ async fn assemble_system_prompt_layers(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        parts.push(harness.specialist_role_section(bp));
+        parts.push((
+            LayerTag::user("specialist-prompt", "Specialist prompt")
+                .hint(ControlHintKind::ChangeSpecialist, "Change the specialist"),
+            harness.specialist_role_section(bp),
+        ));
     }
     // Repository agents retain the commit policy; the Assistant uses app proposals.
     // The prompt no longer branches on the effective auto-commit state — the
     // OFF-state gate in `git_ops` and the auto-commit-on-idle subscriber
     // enforce the actual behavior.
     if assistant.is_none() && !plain_folder {
-        parts.push(harness.commit_policy_clause());
+        parts.push((
+            LayerTag::intent("commit-policy", "Commit policy"),
+            harness.commit_policy_clause(),
+        ));
     }
     // Mandatory-actions footer (reference layer 9 / `getMandatoryActionsFooter`,
     // pinned to the VERY END of the prompt to leverage recency bias). Three
@@ -806,7 +916,11 @@ async fn assemble_system_prompt_layers(
             .and_then(|s| s.role_reminder.as_deref())
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        parts.push(harness.role_reminder_footer(name, reminder));
+        parts.push((
+            LayerTag::intent("role-reminder", "Role reminder")
+                .hint(ControlHintKind::ChangeSpecialist, "Change the specialist"),
+            harness.role_reminder_footer(name, reminder),
+        ));
     }
     // Asking the User Questions + Suggested Next Steps — top-level
     // interactive agents only. Sub-agents don't own a user-facing chat turn
@@ -815,7 +929,13 @@ async fn assemble_system_prompt_layers(
     // `agentFeatures.structuredQuestions` (spec audit row 8).
     if !is_sub_agent {
         if agent_features.structured_questions {
-            parts.push(harness.ask_questions_block());
+            parts.push((
+                LayerTag::intent("ask-questions", "Asking the user questions").hint(
+                    ControlHintKind::AgentFeatures,
+                    "Turn off Structured questions in Agent features",
+                ),
+                harness.ask_questions_block(),
+            ));
         }
         // Per-session effective state for the SP-1 footer wording: a session
         // that opted out via `skipAutoCommit` (delegation/creation while the
@@ -825,7 +945,7 @@ async fn assemble_system_prompt_layers(
         let effective_auto_commit =
             auto_commit_enabled && !agent_session.is_some_and(|s| s.skip_auto_commit);
         if assistant.is_none() {
-            match entry
+            let next_steps = match entry
                 .doctrine
                 .instructions
                 .plain_folder
@@ -834,16 +954,70 @@ async fn assemble_system_prompt_layers(
                 // Plain folders have no commits, branches or pull requests:
                 // their footer examples and wording say so (no auto-commit
                 // clause either).
-                Some(doctrine) => parts.push(doctrine.suggested_next_steps.to_string()),
-                None => parts.push(harness.suggested_next_steps_block(effective_auto_commit)),
-            }
+                Some(doctrine) => doctrine.suggested_next_steps.to_string(),
+                None => harness.suggested_next_steps_block(effective_auto_commit),
+            };
+            parts.push((next_steps_tag(), next_steps));
         }
     }
     if parts.is_empty() {
-        None
-    } else {
-        Some(harness.join_prompt_layers(&parts))
+        return None;
     }
+    let texts: Vec<String> = parts.iter().map(|(_, text)| text.clone()).collect();
+    let joined = harness.join_prompt_layers(&texts);
+    let mut assembled = AssembledPrompt::from_layers(&parts, joined, hidden_skills);
+    assembled.provider_sections = provider_sections;
+    Some(assembled)
+}
+
+fn next_steps_tag() -> LayerTag {
+    LayerTag::intent("suggested-next-steps", "Suggested next steps")
+}
+
+/// The section tag of the repo-rules layer, with a hint naming the rule
+/// file (or rules folder) it came from, relative to the workspace.
+/// The `provider` sections for rule files the provider loads by itself
+/// (harness 3.10 skips injecting them): one per provider, sized by its
+/// files, e.g. "Repo rules: loaded natively by Claude Code".
+pub(crate) fn native_repo_rule_sections(
+    files: &[RepoRuleFile],
+) -> Vec<intent_core::prompt_breakdown::PromptSection> {
+    let mut by_provider: Vec<(RuleLoading, Vec<&str>, u64)> = Vec::new();
+    for f in files {
+        if !matches!(f.loading, RuleLoading::LoadedNatively(_)) {
+            continue;
+        }
+        match by_provider.iter_mut().find(|(l, _, _)| *l == f.loading) {
+            Some((_, sources, chars)) => {
+                sources.push(&f.source);
+                *chars += f.chars;
+            }
+            None => by_provider.push((f.loading, vec![&f.source], f.chars)),
+        }
+    }
+    by_provider
+        .into_iter()
+        .map(|(loading, sources, chars)| {
+            let tag = LayerTag::user("repo-rules", &format!("Repo rules: {}", loading.describe()))
+                .hint(
+                    ControlHintKind::EditRepoRules,
+                    format!("Edit {}", sources.join(", ")),
+                );
+            crate::prompt_sections::provider_section(&tag, chars)
+        })
+        .collect()
+}
+
+fn repo_rules_tag(source: &str, workspace_path: &Path) -> LayerTag {
+    let path = Path::new(source);
+    let shown = path
+        .strip_prefix(workspace_path)
+        .ok()
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .or_else(|| path.file_name().map(Path::new))
+        .map_or_else(|| source.to_string(), |p| p.to_string_lossy().into_owned());
+    let text = format!("Edit {shown}");
+    LayerTag::user("repo-rules", "Repo rules").hint(ControlHintKind::EditRepoRules, text)
 }
 
 /// Stateless executor for the `rules.*` namespace over the settings [`Store`].
@@ -1980,6 +2154,7 @@ This is a test skill.
                     None,
                 )
                 .await
+                .map(|assembled| assembled.prompt)
             } else {
                 assemble_agent_system_prompt(
                     &store,
@@ -2098,6 +2273,95 @@ This is a test skill.
                     RuleLoading::NotLoaded
                 ]
             );
+        }
+
+        async fn sections(
+            dir: &Path,
+            version: &str,
+            executor: &RuleExecutor,
+        ) -> crate::prompt_sections::AssembledPrompt {
+            let tmp_db = TempDb::new();
+            let store = Store::open(&tmp_db.path).await.unwrap();
+            let session = session_on(version, &executor.provider_id);
+            let features = intent_core::settings_file::AgentFeaturesSettings::default();
+            assemble_system_prompt_sections(
+                &store,
+                Some(dir),
+                "workspace",
+                None,
+                false,
+                false,
+                false,
+                &features,
+                None,
+                Some(&session),
+                None,
+                Some(executor),
+            )
+            .await
+            .unwrap()
+        }
+
+        /// The section map names a skipped rule file as a `provider`
+        /// section, outside the `systemPrompt` sum.
+        #[tokio::test]
+        async fn a_skipped_rule_file_is_a_provider_section() {
+            use intent_core::prompt_breakdown::{utf16_len, SectionLocation};
+            let dir = repo(&[("CLAUDE.md", CLAUDE), ("AGENTS.md", AGENTS)]);
+            let a = sections(
+                dir.path(),
+                intent_core::NEWEST_HARNESS_VERSION,
+                &claude(Some(NEW)),
+            )
+            .await;
+            let native: Vec<_> = a
+                .provider_sections
+                .iter()
+                .map(|s| {
+                    (
+                        s.id.as_str(),
+                        s.label.as_str(),
+                        s.location,
+                        s.chars,
+                        s.control_hint.as_ref().map(|h| h.text.as_str()),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                native,
+                [(
+                    "repo-rules",
+                    "Repo rules: loaded natively by Claude Code",
+                    SectionLocation::Provider,
+                    utf16_len(CLAUDE),
+                    Some("Edit CLAUDE.md"),
+                )]
+            );
+            assert!(!a.sections.iter().any(|s| s.id == "repo-rules"));
+            let b = a.breakdown(intent_core::NEWEST_HARNESS_VERSION, "t".into(), Vec::new());
+            assert_eq!(b.system_prompt_chars, utf16_len(&a.prompt));
+            let in_prompt: u64 = b
+                .sections
+                .iter()
+                .filter(|s| s.location == SectionLocation::SystemPrompt)
+                .map(|s| s.chars)
+                .sum();
+            assert_eq!(in_prompt, b.system_prompt_chars);
+            assert_eq!(b.total_chars, b.system_prompt_chars);
+
+            // Codex loads AGENTS.md itself; CLAUDE.md stays injected.
+            let a = sections(dir.path(), intent_core::NEWEST_HARNESS_VERSION, &codex()).await;
+            assert_eq!(a.provider_sections.len(), 1);
+            assert_eq!(
+                a.provider_sections[0].label,
+                "Repo rules: loaded natively by Codex"
+            );
+            assert_eq!(a.provider_sections[0].chars, utf16_len(AGENTS));
+            assert!(a.sections.iter().any(|s| s.id == "repo-rules"));
+
+            // Older harnesses inject as before: nothing is loaded natively.
+            let a = sections(dir.path(), "3.8", &claude(Some(NEW))).await;
+            assert!(a.provider_sections.is_empty());
         }
 
         #[test]

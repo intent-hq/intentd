@@ -30774,6 +30774,103 @@ async fn submission_correlation_partial_flush_retains_persisted_head_and_tail() 
     }
 }
 
+/// The local spawn path (`create_agent`) records the prompt breakdown with
+/// the prompt on harness 3.10+: the `systemPrompt` sections add up to the
+/// stored prompt, the `toolDescription` sections to the bridge's
+/// description, and `agent.getSession` serves it. A pre-3.10 spawn stores
+/// none.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_local_spawn_records_the_prompt_breakdown() {
+    use intent_core::prompt_breakdown::{utf16_len, SectionLocation};
+    use std::os::unix::fs::PermissionsExt;
+
+    for version in [intent_core::NEWEST_HARNESS_VERSION, "3.8"] {
+        let root = crate::test_support::test_tempdir("breakdown-spawn-");
+        std::fs::write(root.path().join("AGENTS.md"), "# Rules\n\nBe brief.\n").unwrap();
+        let store = Store::open(&root.path().join("spawn.db")).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let services = Services::new_with_file_secrets(
+            store,
+            intent_core::FileSecretStore::with_path(root.path().join("secrets.json")),
+        )
+        .with_event_bus(bus.clone());
+        let mgr = AgentManager::new(services.clone(), Arc::new(BusEventSink::new(bus)), 4);
+        let ws = WorkspaceId::from("ws-breakdown-spawn");
+        let id = AgentId::from("agent-breakdown-spawn");
+        seed_agent(&mgr, &ws, &id).await;
+        sqlx::query("UPDATE agent_session SET harness_version=? WHERE id=?")
+            .bind(version)
+            .bind(id.as_str())
+            .execute(services.store.write_pool())
+            .await
+            .unwrap();
+        // A stand-in adapter that just stays alive until killed.
+        let adapter = root.path().join("adapter");
+        std::fs::write(&adapter, "#!/bin/sh\nread -r request\nsleep 60\n").unwrap();
+        std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut provider = *intent_providers::find_provider("pi").unwrap();
+        provider.mcp_via_pi_extension = false;
+        let mut opts = intent_acp::spawn::SpawnOptions::new(&provider);
+        opts.npx_fallback_binary = Some(&adapter);
+        opts.npx_fallback_package = provider.npx_only_package;
+        mgr.create_agent(
+            id.clone(),
+            ws.clone(),
+            "Breakdown",
+            "implementor",
+            root.path().to_owned(),
+            &opts,
+        )
+        .await
+        .unwrap();
+        let prompt = services
+            .store
+            .get_agent_session_with_transcript(&id)
+            .await
+            .unwrap()
+            .system_prompt
+            .expect("the spawn stores its prompt");
+        let stored = services
+            .store
+            .get_agent_session_prompt_breakdown(&id, Some(&prompt))
+            .await
+            .unwrap();
+        let wire = services
+            .agent_get_session_bounded_op(id.clone())
+            .await
+            .unwrap()["promptBreakdown"]
+            .clone();
+        mgr.kill_child_only(&id).await;
+        if version == "3.8" {
+            assert_eq!(stored, None, "a pre-3.10 spawn stores no breakdown");
+            assert_eq!(
+                wire,
+                json!({"available": false, "reason": "harness-predates-breakdown"})
+            );
+            continue;
+        }
+        let b = stored.expect("a 3.10+ spawn stores a breakdown");
+        let sum = |location| {
+            b.sections
+                .iter()
+                .filter(|s| s.location == location)
+                .map(|s| s.chars)
+                .sum::<u64>()
+        };
+        assert_eq!(b.system_prompt_chars, utf16_len(&prompt));
+        assert_eq!(sum(SectionLocation::SystemPrompt), utf16_len(&prompt));
+        assert!(b.tool_description_chars > 0);
+        assert_eq!(
+            sum(SectionLocation::ToolDescription),
+            b.tool_description_chars
+        );
+        assert!(b.sections.iter().any(|s| s.id == "repo-rules"), "{b:?}");
+        assert_eq!(wire["available"], json!(true));
+        assert_eq!(wire["systemPromptChars"], json!(utf16_len(&prompt)));
+    }
+}
+
 /// A foreground npm process held before ACP initialize, using the real manager
 /// spawn and resource ownership paths. Pi's extension is irrelevant to this race.
 #[cfg(unix)]

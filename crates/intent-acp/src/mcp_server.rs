@@ -411,6 +411,13 @@ impl WorkspaceMcpServer {
         self.render_docs(|inputs| self.workspace_api_docs.prompt_reference(inputs))
     }
 
+    /// The remote-placement text this bridge's `ws.agent` docs carry, if
+    /// any: the machine list a prompt breakdown reports as its own section.
+    #[must_use]
+    pub fn remote_placement_help(&self) -> Option<&str> {
+        self.remote_placement_help.as_deref()
+    }
+
     /// The condensed `workspace_api` reference for THIS bridge — the same
     /// per-agent assembly as [`Self::full_workspace_api_description`]
     /// (chief-ness, gating, model options) with every API method line cut at

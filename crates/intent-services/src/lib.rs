@@ -38073,6 +38073,7 @@ mod instructions;
 mod mcp_oauth;
 mod mcp_servers;
 mod plugins;
+mod prompt_sections;
 mod rules;
 mod session_surfaces;
 pub mod skills;
