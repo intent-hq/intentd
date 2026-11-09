@@ -151,19 +151,26 @@ def target_fns(root_file):
 
 @functools.lru_cache(maxsize=None)
 def crate_targets(root):
-    """Map package name to its lib root and its test targets' roots."""
+    """Map package name to the roots of its lib, bin and test targets."""
     crates = {}
     for manifest in sorted(Path(root).glob("crates/*/Cargo.toml")):
         data = tomllib.loads(manifest.read_text())
         base = manifest.parent
         lib = base / data.get("lib", {}).get("path", "src/lib.rs")
-        tests = {}
+        bins, tests = {}, {}
+        if data["package"].get("autobins", True):
+            if (base / "src/main.rs").is_file():
+                bins[data["package"]["name"]] = base / "src/main.rs"
+            bins.update({p.stem: p for p in (base / "src/bin").glob("*.rs")})
+            bins.update({p.parent.name: p for p in (base / "src/bin").glob("*/main.rs")})
+        for binary in data.get("bin", []):
+            bins[binary["name"]] = base / binary.get("path", f"src/bin/{binary['name']}.rs")
         if data["package"].get("autotests", True):
             tests.update({p.stem: p for p in (base / "tests").glob("*.rs")})
             tests.update({p.parent.name: p for p in (base / "tests").glob("*/main.rs")})
         for test in data.get("test", []):
             tests[test["name"]] = base / test.get("path", f"tests/{test['name']}.rs")
-        crates[data["package"]["name"]] = {"lib": lib if lib.is_file() else None, "tests": tests}
+        crates[data["package"]["name"]] = {"lib": lib if lib.is_file() else None, "bins": bins, "tests": tests}
     return crates
 
 
@@ -171,13 +178,12 @@ CARGO_VALUE_FLAGS = {"-p", "--package", "--test", "--target", "--features", "-F"
                      "--bench", "-j", "--jobs", "--manifest-path", "--profile", "--target-dir",
                      "--message-format", "--color", "--config", "-Z", "--exclude"}
 LIBTEST_VALUE_FLAGS = {"--test-threads", "--skip", "--format", "--color", "--logfile", "-Z", "--shuffle-seed"}
-SHELL_END = {"|", "||", "&&", ";", ">", ">>", "2>&1", "<", "<<<"}
 
 
 def cargo_test_selection(words):
     """Parse the words after `cargo test` into the targets and names it selects."""
-    selection = {"packages": [], "lib": False, "tests": [], "workspace": False,
-                 "filters": [], "exact": False, "listed": []}
+    selection = {"packages": [], "lib": False, "bins": [], "tests": [], "all": set(),
+                 "workspace": False, "filters": [], "exact": False, "listed": []}
     libtest, index = False, 0
     while index < len(words):
         word = words[index]
@@ -192,11 +198,13 @@ def cargo_test_selection(words):
                 index += 1
             if not libtest and flag in ("-p", "--package"):
                 selection["packages"].append(value)
-            elif not libtest and flag == "--test":
-                selection["tests"].append(value)
+            elif not libtest and flag in ("--test", "--bin"):
+                selection[flag[2:] + "s"].append(value)
         elif word.startswith("-"):
             if not libtest and word == "--lib":
                 selection["lib"] = True
+            elif not libtest and word in ("--bins", "--tests", "--all-targets"):
+                selection["all"].add(word)
             elif not libtest and word in ("--workspace", "--all"):
                 selection["workspace"] = True
             elif libtest and word == "--exact":
@@ -204,6 +212,20 @@ def cargo_test_selection(words):
         else:
             selection["filters"].append(word)
     return selection
+
+
+def command_words(text, raw):
+    """Shell words of one command, ending at an operator, redirect or comment."""
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        words = list(lexer)
+    except ValueError as error:
+        raise ValueError(f"cannot parse cargo test line {raw!r}: {error}") from None
+    end = next((i for i, word in enumerate(words) if set(word) <= set("();<>|&")), len(words))
+    if end < len(words) and words[end][0] in "<>" and end and words[end - 1].isdigit():
+        end -= 1
+    return words[:end]
 
 
 def shell_lines(run):
@@ -240,8 +262,15 @@ def shell_selections(run):
             line = expand(raw, scalars, arrays)
             if line.startswith("#"):
                 continue
+            loop = re.fullmatch(r"for (\w+) in (.*?);\s*do\s+(.*?);?\s*done", line)
+            if loop:
+                for value in shlex.split(loop.group(2)):
+                    execute(re.split(r";\s*", loop.group(3)), {**scalars, loop.group(1): value}, arrays)
+                continue
             loop = re.fullmatch(r"for (\w+) in (.*?)(?:;\s*do)?", line)
             if loop:
+                if re.search(r"\bdone\b", loop.group(2)):
+                    raise ValueError(f"cannot unroll loop {raw!r}")
                 if not line.endswith("do") and index < len(lines) and lines[index] == "do":
                     index += 1
                 depth, body = 1, []
@@ -269,17 +298,11 @@ def shell_selections(run):
                     continue
             cargo = re.search(r"\bcargo\s+test\b", line)
             if cargo:
-                rest = line[cargo.end():]
-                if "$(" in line[:cargo.start()]:
-                    rest = rest.rstrip().removesuffix(")")
-                try:
-                    words = shlex.split(rest)
-                except ValueError as error:
-                    raise ValueError(f"cannot parse cargo test line {raw!r}: {error}") from None
-                ends = [i for i, word in enumerate(words) if word in SHELL_END]
-                selections.append(cargo_test_selection(words[:ends[0]] if ends else words))
+                selections.append(cargo_test_selection(command_words(line[cargo.end():], raw)))
                 continue
-            for flags, _, name in re.findall(r"\bgrep\s+-(F\w*)\s+(['\"])(.*?): test\2", line):
+            for flags, _, name in re.findall(r"\bgrep\s+((?:-[A-Za-z]+\s+)+)(['\"])(.*?): test\2", line):
+                if "F" not in flags:
+                    continue
                 if not selections:
                     raise ValueError(f"listing proof {name!r} follows no cargo test command")
                 selections[-1]["listed"].append((name, "x" in flags))
@@ -291,7 +314,7 @@ def shell_selections(run):
 def python_selections(run):
     """Selections from a Python heredoc's literal `[(cargo args, [exact names])]` groups."""
     selections = []
-    for _, body in re.findall(r"<<\s*'(\w+)'\n(.*?)\n\1[ \t]*$", run, re.S | re.M):
+    for _, body in re.findall(r"\bpython3?\b[^\n]*<<\s*'(\w+)'\n(.*?)\n\1[ \t]*$", run, re.S | re.M):
         for node in ast.walk(ast.parse(body)):
             if not isinstance(node, ast.Assign):
                 continue
@@ -307,7 +330,7 @@ def python_selections(run):
 
 def step_selections(run):
     return [s for s in python_selections(run) + shell_selections(run)
-            if s["filters"] or s["listed"] or s["tests"]]
+            if s["filters"] or s["listed"] or s["tests"] or s["bins"]]
 
 
 def selection_violations(selection, crates, root):
@@ -318,18 +341,24 @@ def selection_violations(selection, crates, root):
         if crate is None:
             errors.append(f"names no package {package}")
             continue
-        if selection["lib"] or not selection["tests"]:
+        every = not (selection["lib"] or selection["bins"] or selection["tests"] or selection["all"])
+        every_bin = every or selection["all"] & {"--bins", "--tests", "--all-targets"}
+        every_test = every or selection["all"] & {"--tests", "--all-targets"}
+        if selection["lib"] or every or every_test:
             if crate["lib"] is not None:
                 targets.append(crate["lib"])
             elif selection["lib"]:
                 errors.append(f"names no lib target in {package}")
-        if not selection["lib"] and not selection["tests"]:
+        if every_bin:
+            targets += crate["bins"].values()
+        if every_test:
             targets += crate["tests"].values()
-        for pattern in selection["tests"]:
-            matched = fnmatch.filter(crate["tests"], pattern)
-            if not matched and not selection["workspace"]:
-                errors.append(f"names no test target {pattern} in {package}")
-            targets += [crate["tests"][name] for name in matched]
+        for kind, label in (("bins", "bin"), ("tests", "test")):
+            for pattern in selection[kind]:
+                matched = fnmatch.filter(crate[kind], pattern)
+                if not matched and not selection["workspace"]:
+                    errors.append(f"names no {label} target {pattern} in {package}")
+                targets += [crate[kind][name] for name in matched]
     if not targets:
         return errors or ["selects no test target"]
     scope = " / ".join(sorted(str(t.relative_to(root)) for t in set(targets)))
@@ -1010,6 +1039,30 @@ listed=$(cargo test -p demo --lib "$test" -- --exact --list)
 grep -Fx "$test: test" <<< "$listed" > /dev/null
 cargo test -p demo --test suite case:: -- --nocapture
 """
+# A crate with only binary targets, as intentd is (its tests live in main.rs).
+FIXTURE_BIN_FILES = {
+    "Cargo.toml": '[package]\nname = "daemon"\n',
+    "src/main.rs": "mod cli;\nfn main() {}\n",
+    "src/cli.rs": "#[test]\nfn bin_test() {}\n",
+    "src/bin/tool.rs": "fn main() {}\n#[test]\nfn tool_test() {}\n",
+}
+# (run, expected violations after the "queue: Shapes: " prefix). Valid shell
+# around a test must not be read as a name; shapes naming a missing test fail.
+FIXTURE_SHELL_SHAPES = (
+    ("cargo test -p daemon cli::bin_test\ncargo test -p daemon --bin tool tool_test", []),
+    ("cargo test -p daemon --bin tool cli::bin_test", ["'cli::bin_test' names no test in crates/daemon/src/bin/tool.rs"]),
+    ("cargo test -p daemon --bins cli::", []),
+    ("cargo test -p daemon --bin gone cli::", ["names no bin target gone in daemon"]),
+    ("cat > check.sh <<'SCRIPT'\nif [ -n \"$x\" ]; then echo; fi\nSCRIPT\ncargo test -p demo --lib inline::", []),
+    ("for t in inline::inline_test inline::gone; do cargo test -p demo --lib \"$t\" -- --exact; done\n"
+     "cargo test -p demo --lib dir::", ["'inline::gone' names no test in crates/demo/src/lib.rs"]),
+    ("listed=$(cargo test -p demo --lib inline:: -- --list)\ngrep -qFx 'inline::gone: test' <<< \"$listed\"",
+     ["listing proof 'inline::gone' names no selected test in crates/demo/src/lib.rs"]),
+    ("listed=$(cargo test -p demo --lib inline:: -- --list)\ngrep -xF 'inline::inline_test: test' <<< \"$listed\"", []),
+    ("cargo test -p demo --lib inline::inline_test >/dev/null 2>&1 # quiet\n"
+     "cargo test -p demo --lib dir:: 2>/dev/null\n"
+     "out=$(cargo test -p demo --lib flat:: -- --list) && echo \"$out\"", []),
+)
 
 
 class NamedTestTests(unittest.TestCase):
@@ -1032,7 +1085,7 @@ class NamedTestTests(unittest.TestCase):
                 selections = step_selections(str(step.get("run", "")))
                 if selections:
                     discovered[(job_id, step["name"])] = sum(
-                        len(s["filters"]) + len(s["listed"]) + len(s["tests"]) for s in selections)
+                        len(s["filters"]) + len(s["listed"]) + len(s["tests"]) + len(s["bins"]) for s in selections)
         self.assertEqual(discovered, NAMED_TEST_STEPS)
 
     def test_queue_step_naming_deleted_tests_fails(self):
@@ -1066,13 +1119,13 @@ class NamedTestTests(unittest.TestCase):
         for job, step_name in NAMED_TEST_STEPS:
             for selection in step_selections(self.step(self.workflow, job, step_name)["run"]):
                 for package in selection["packages"]:
-                    for target in selection["tests"]:
+                    for kind, target in [("bins", t) for t in selection["bins"]] + [("tests", t) for t in selection["tests"]]:
                         with self.subTest(job=job, step=step_name, target=target):
                             crates = copy.deepcopy(real)
-                            del crates[package]["tests"][target]
+                            del crates[package][kind][target]
                             with mock.patch.dict(globals(), crate_targets=lambda root: crates):
                                 errors = named_test_violations(self.workflow)
-                            self.assertIn(f"{job}: {step_name}: names no test target {target} in {package}", errors)
+                            self.assertIn(f"{job}: {step_name}: names no {kind[:-1]} target {target} in {package}", errors)
 
     def test_source_lister_follows_module_rules_and_sees_deleted_functions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1108,6 +1161,18 @@ class NamedTestTests(unittest.TestCase):
                         (crate / path).write_text(original)
                         target_fns.cache_clear()
                         crate_targets.cache_clear()
+
+    def test_shell_shapes_and_binary_targets_resolve_like_cargo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for crate, files in (("demo", FIXTURE_FILES), ("daemon", FIXTURE_BIN_FILES)):
+                for name, content in files.items():
+                    path = Path(tmp) / "crates" / crate / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content)
+            for run, expected in FIXTURE_SHELL_SHAPES:
+                with self.subTest(run=run):
+                    workflow = {"jobs": {"queue": {"steps": [{"name": "Shapes", "run": run}]}}}
+                    self.assertEqual(named_test_violations(workflow, tmp), ["queue: Shapes: " + e for e in expected])
 
 
 class TunnelArtifactTests(unittest.TestCase):
