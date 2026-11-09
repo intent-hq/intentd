@@ -500,20 +500,15 @@ impl Services {
         let timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
 
         if run_provider != "auggie" {
-            // A named profile default runs the one-shot with that profile's
-            // saved overlay on its base provider's installation; a missing
-            // profile or disabled base needs a replacement (PROTOCOL §5.54).
-            let profile = Box::pin(self.resolve_selected_profile(&run_provider)).await?;
             return self
-                .complete_once_via_acp(
-                    intent_providers::base_provider_id(&run_provider),
+                .complete_once_failing_over(
+                    &run_provider,
                     &prompt,
                     system_prompt,
                     model.as_deref(),
                     cwd,
                     timeout,
                     &effort,
-                    profile,
                 )
                 .await;
         }
@@ -572,13 +567,141 @@ impl Services {
         Ok(json!({ "text": text }))
     }
 
-    /// The non-auggie route: run `prompt` (+ `system_prompt`, shaped per
-    /// provider by [`one_shot_session_shape`]) through an ephemeral ACP
-    /// session on the provider's adapter. A provider with no one-shot support
-    /// and one whose adapter cannot be resolved (no binary, no npx) both
-    /// return `{ available: false, reason }`; a resolved adapter that then
-    /// fails the turn surfaces as an error, matching the auggie route's
-    /// spawn/exit failures.
+    /// The non-auggie route with backup failover (PROTOCOL §5.54 Backup
+    /// failover). A quick action whose configuration is out of quota runs
+    /// again on the next `backup: true` profile of the same base provider,
+    /// in saved order, each at most once, with the same prompt and model and
+    /// within the caller's one time budget. The configured selection plays
+    /// the part of a conversation's home: once on a backup, it is a
+    /// candidate again. Like a chat turn, the action starts on the first
+    /// configuration the shared quota cache does not mark exhausted and
+    /// reports what it sees to that cache. With no candidate
+    /// left the last quota error is returned; every other failure is
+    /// returned at once.
+    ///
+    /// A named profile runs with its saved overlay on its base provider's
+    /// installation; a missing profile or disabled base needs a replacement.
+    #[expect(clippy::too_many_arguments)]
+    async fn complete_once_failing_over(
+        &self,
+        selection: &str,
+        prompt: &str,
+        system_prompt: Option<&str>,
+        model: Option<&str>,
+        cwd: Option<PathBuf>,
+        timeout_ms: u64,
+        effort: &OneShotEffort,
+    ) -> Result<Value> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let home = crate::provider_profiles::canonical_selection(selection);
+        let mut current = home.clone();
+        if self
+            .provider_quota_cache
+            .is_exhausted(&current, chrono::Utc::now())
+        {
+            if let Some(start) = self.quick_action_backup(&current, &home, None) {
+                tracing::info!(from_provider = %current, to_provider = %start, "quick action starts on a backup: provider marked out of quota");
+                current = start;
+            }
+        }
+        let mut tried = Vec::new();
+        loop {
+            tried.push(current.clone());
+            let profile = Box::pin(self.resolve_selected_profile(&current)).await?;
+            let fingerprint = profile.as_ref().map(|p| p.fingerprint().to_owned());
+            let still_current = || {
+                fingerprint
+                    .as_deref()
+                    .is_none_or(|fp| self.profile_activation().fingerprint_is_saved(&current, fp))
+            };
+            let started = chrono::Utc::now();
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let result = self
+                .complete_once_attempt(
+                    intent_providers::base_provider_id(&current),
+                    prompt,
+                    system_prompt,
+                    model,
+                    cwd.clone(),
+                    u64::try_from(remaining.as_millis())
+                        .unwrap_or(u64::MAX)
+                        .max(1),
+                    effort,
+                    profile,
+                )
+                .await;
+            let failure = match result {
+                Ok(value) => {
+                    if value.get("text").is_some() {
+                        self.provider_quota_cache.mark_working(
+                            &current,
+                            started,
+                            chrono::Utc::now(),
+                            still_current,
+                        );
+                    }
+                    return Ok(value);
+                }
+                Err(failure) if failure.quota => failure,
+                Err(failure) => return Err(failure.error),
+            };
+            let now = chrono::Utc::now();
+            let reported =
+                crate::provider_return::parse_reset_time(&failure.error.to_string(), now);
+            self.provider_quota_cache
+                .mark_exhausted(&current, reported, now, still_current);
+            if std::time::Instant::now() >= deadline {
+                return Err(failure.error);
+            }
+            let Some(next) = self.quick_action_backup(&current, &home, Some(&tried)) else {
+                return Err(failure.error);
+            };
+            tracing::info!(from_provider = %current, to_provider = %next, "provider quota exhausted; quick action retries on backup profile");
+            current = next;
+        }
+    }
+
+    /// The next configuration of `current`'s backup rotation for a quick
+    /// action whose configured selection is `home` (a candidate again once
+    /// the action is on a backup). With `tried`, the walk after a quota failure
+    /// ([`crate::quota_failover::next_candidate_avoiding`]); without, where
+    /// to start instead of a configuration marked exhausted
+    /// ([`crate::quota_failover::first_unmarked_candidate`]).
+    fn quick_action_backup(
+        &self,
+        current: &str,
+        home: &str,
+        tried: Option<&[String]>,
+    ) -> Option<String> {
+        let profiles = self
+            .provider_profiles
+            .profiles()
+            .inspect_err(|e| tracing::warn!(error = %e, "quick-action failover skipped: profiles unreadable"))
+            .ok()?;
+        let settings = self.effective_settings();
+        let enabled = settings.providers.enabled.as_ref();
+        let exhausted = self.exhausted_providers();
+        match tried {
+            Some(tried) => crate::quota_failover::next_candidate_avoiding(
+                current,
+                Some(home),
+                tried,
+                &exhausted,
+                &profiles,
+                enabled,
+            ),
+            None => crate::quota_failover::first_unmarked_candidate(
+                current,
+                Some(home),
+                &exhausted,
+                &profiles,
+                enabled,
+            ),
+        }
+    }
+
+    /// [`Self::complete_once_attempt`] without the quota flag.
+    #[cfg(test)]
     #[expect(clippy::too_many_arguments)]
     async fn complete_once_via_acp(
         &self,
@@ -591,6 +714,39 @@ impl Services {
         effort: &OneShotEffort,
         profile: Option<std::sync::Arc<intent_acp::ProfileEnv>>,
     ) -> Result<Value> {
+        self.complete_once_attempt(
+            provider_id,
+            prompt,
+            system_prompt,
+            model,
+            cwd,
+            timeout_ms,
+            effort,
+            profile,
+        )
+        .await
+        .map_err(|failure| failure.error)
+    }
+
+    /// One attempt on the non-auggie route: run `prompt` (+ `system_prompt`,
+    /// shaped per provider by [`one_shot_session_shape`]) through an
+    /// ephemeral ACP session on the provider's adapter. A provider with no
+    /// one-shot support and one whose adapter cannot be resolved (no binary,
+    /// no npx) both return `{ available: false, reason }`; a resolved adapter
+    /// that then fails the turn surfaces as an error, matching the auggie
+    /// route's spawn/exit failures, flagged when it is a quota rejection.
+    #[expect(clippy::too_many_arguments)]
+    async fn complete_once_attempt(
+        &self,
+        provider_id: &str,
+        prompt: &str,
+        system_prompt: Option<&str>,
+        model: Option<&str>,
+        cwd: Option<PathBuf>,
+        timeout_ms: u64,
+        effort: &OneShotEffort,
+        profile: Option<std::sync::Arc<intent_acp::ProfileEnv>>,
+    ) -> std::result::Result<Value, AttemptFailure> {
         if !ACP_ONE_SHOT_PROVIDERS.contains(&provider_id) {
             return Ok(unavailable(format!(
                 "completeOnce is not supported for the resolved provider: {provider_id}"
@@ -691,11 +847,40 @@ impl Services {
                 provider: provider_id.to_string(),
                 waited_ms,
                 limit,
+            }
+            .into()),
+            Err(OneShotError::InvalidEffort(message)) => Err(Error::InvalidParams(message).into()),
+            Err(err) => Err(AttemptFailure {
+                quota: is_quota_rejection(&err),
+                error: Error::Internal(format!("{provider_id}: {err}")),
             }),
-            Err(OneShotError::InvalidEffort(message)) => Err(Error::InvalidParams(message)),
-            Err(err) => Err(Error::Internal(format!("{provider_id}: {err}"))),
         }
     }
+}
+
+/// A failed one-shot attempt, and whether the provider rejected it for
+/// quota: exactly the failures a chat turn fails over on
+/// ([`intent_acp::is_quota_exceeded`]).
+struct AttemptFailure {
+    error: Error,
+    quota: bool,
+}
+
+impl From<Error> for AttemptFailure {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            quota: false,
+        }
+    }
+}
+
+/// Whether a one-shot failure is a provider quota rejection: an adapter
+/// error, or an adapter exit whose stderr says so. Spawn and transport
+/// failures are local, like the variants the chat classifier excludes.
+fn is_quota_rejection(err: &OneShotError) -> bool {
+    matches!(err, OneShotError::Rpc(_) | OneShotError::Exited(_))
+        && intent_acp::message_is_quota_exceeded(&err.to_string())
 }
 
 #[cfg(test)]

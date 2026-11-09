@@ -1104,3 +1104,154 @@ async fn provider_default_overrides_contract_over_wss() {
     }
     drop(daemon);
 }
+
+/// The bridge-wrapped 429 the quota classifier reads
+/// (`intent_acp::message_is_quota_exceeded`), as mock behavior.
+fn quota_behavior() -> String {
+    json!({ "promptRpcError": {
+        "code": -32603,
+        "message": "Internal error",
+        "data": "{\"type\":\"rate_limit_error\",\"message\":\"usage limit reached\"}",
+    } })
+    .to_string()
+}
+
+fn prompt_count(log: &Path) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
+}
+
+/// Quick actions fail over on quota like chat turns (PROTOCOL §5.54 Backup
+/// failover): `agent.completeOnce` on a Default configuration out of quota
+/// tries the `backup: true` profiles of the same base in saved order, each at
+/// most once, and returns the first reply. Each configuration's mock
+/// behavior comes from its own profile environment, so the reply names the
+/// configuration that answered. The shared quota state then starts the next
+/// quick action on the backup that worked, and with no untried candidate
+/// left the quota error is returned as before.
+#[tokio::test]
+async fn quick_actions_fail_over_to_backup_profiles_over_wss() {
+    let script = format!(
+        "{}/tests/fixtures/mock-acp-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    if intent_providers::resolve_on_path("node").is_none() {
+        eprintln!("skipping quick-action failover e2e: node not on PATH");
+        return;
+    }
+    let root = scratch_dir("qa-failover");
+    let data_dir = root.path().join("data");
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data");
+    std::fs::create_dir_all(&scratch).expect("mkdir scratch");
+    let toolchain = common::codex_npx::install(&data_dir, &script);
+    let prompts = scratch.join("prompts.jsonl");
+    let quota = quota_behavior();
+    let mut env: Vec<(&str, &str)> = toolchain
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    env.extend([
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_BEHAVIOR", quota.as_str()),
+        (
+            "MOCK_AGENT_PROMPT_LOG",
+            prompts.to_str().expect("utf-8 path"),
+        ),
+    ]);
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, &env),
+        data_dir: data_dir.clone(),
+        scratch,
+    };
+    let (mut ws, _sub) = connect(&data_dir).await;
+    ok(
+        &mut ws,
+        1,
+        "settings.update",
+        json!({ "changes": [{ "path": "model.defaultProvider", "value": "codex" }] }),
+    )
+    .await;
+
+    let mut ids = Vec::new();
+    for (id, (name, behavior, backup)) in (2_i64..).zip([
+        (
+            "Personal",
+            json!({ "response": "🤖\nfrom-personal" }).to_string(),
+            false,
+        ),
+        ("Drained", quota.clone(), true),
+        (
+            "Spare",
+            json!({ "response": "🤖\nfrom-spare" }).to_string(),
+            true,
+        ),
+    ]) {
+        let created = ok(
+            &mut ws,
+            id,
+            "providers.profiles.create",
+            json!({
+                "baseProviderId": "codex",
+                "name": name,
+                "backup": backup,
+                "env": [{ "key": "MOCK_AGENT_BEHAVIOR", "kind": "set", "value": behavior }],
+            }),
+        )
+        .await;
+        ids.push(created["profile"]["id"].as_str().unwrap().to_owned());
+    }
+
+    // Default, then Drained, then Spare answers; Personal is not a backup.
+    let reply = rpc(
+        &mut ws,
+        10,
+        "agent.completeOnce",
+        json!({ "prompt": "write a commit message" }),
+    )
+    .await;
+    assert_eq!(reply["id"], 10);
+    assert_eq!(reply["result"], json!({ "text": "from-spare" }), "{reply}");
+    assert_eq!(prompt_count(&prompts), 3, "one attempt per configuration");
+
+    // Default and Drained are marked out of quota: the next quick action
+    // starts on Spare.
+    let reply = rpc(
+        &mut ws,
+        11,
+        "agent.completeOnce",
+        json!({ "prompt": "write a commit message" }),
+    )
+    .await;
+    assert_eq!(reply["result"], json!({ "text": "from-spare" }), "{reply}");
+    assert_eq!(
+        prompt_count(&prompts),
+        4,
+        "the marked configurations are skipped"
+    );
+
+    // With Spare no longer a backup, every candidate is spent: each is
+    // tried once more (marks are advisory) and the quota error comes back.
+    ok(
+        &mut ws,
+        12,
+        "providers.profiles.update",
+        json!({ "profileId": ids[2], "backup": false }),
+    )
+    .await;
+    let reply = rpc(
+        &mut ws,
+        13,
+        "agent.completeOnce",
+        json!({ "prompt": "write a commit message" }),
+    )
+    .await;
+    assert_eq!(reply["id"], 13);
+    assert!(reply.get("result").is_none(), "{reply}");
+    assert!(reply["error"]["code"].is_i64(), "{reply}");
+    assert_eq!(prompt_count(&prompts), 6, "Default and Drained, once each");
+    drop(daemon);
+}

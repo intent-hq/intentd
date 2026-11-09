@@ -244,6 +244,22 @@ impl ProfileActivation {
             .is_none_or(|p| state.saved.get(&profile_id) == Some(&p.fingerprint))
     }
 
+    /// Whether a process that read `reference`'s settings under
+    /// `fingerprint` (a quick action, which registers no live process) still
+    /// runs the saved ones: false once an edit moved the saved fingerprint.
+    /// True when no saved fingerprint is recorded.
+    pub(crate) fn fingerprint_is_saved(&self, reference: &str, fingerprint: &str) -> bool {
+        let Some(profile_id) = profile_id_of(reference) else {
+            return true;
+        };
+        self.state
+            .lock()
+            .unwrap()
+            .saved
+            .get(&profile_id)
+            .is_none_or(|saved| saved == fingerprint)
+    }
+
     /// The fingerprint `agent_id`'s live process started with, when it runs
     /// under `reference`.
     pub(crate) fn live_fingerprint(&self, agent_id: &AgentId, reference: &str) -> Option<String> {
