@@ -1736,6 +1736,7 @@ impl Services {
             .with_tasks(pending_delete_tasks.clone());
         let mcp_hub = Arc::new(McpHub::with_oauth_store(store.clone()));
         let daemon_boot_id = uuid::Uuid::new_v4().to_string();
+        let profile_activation = Arc::new(profile_activation::ProfileActivation::default());
         let repository_connection_directory = Arc::new(
             repository_credentials::RepositoryConnectionDirectory::new(daemon_boot_id.clone()),
         );
@@ -1842,7 +1843,7 @@ impl Services {
             settings_revision_gate: Arc::new(tokio::sync::RwLock::new(())),
             settings_secret_gates: Arc::new(settings::SecretSettingsGates::default()),
             provider_profiles: Arc::new(provider_profiles::ProviderProfileStore::in_memory()),
-            profile_activation: Arc::default(),
+            profile_activation: profile_activation.clone(),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
             mcp_hub,
@@ -1857,7 +1858,7 @@ impl Services {
             pending_remote_failovers: Arc::new(Mutex::new(HashMap::new())),
             remote_model_switches: Arc::new(Mutex::new(HashMap::new())),
             provider_return_announcements: Arc::new(Mutex::new(HashSet::new())),
-            provider_quota_cache: provider_quota_cache::ProviderQuotaCache::default(),
+            provider_quota_cache: provider_quota_cache::ProviderQuotaCache::new(profile_activation),
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),

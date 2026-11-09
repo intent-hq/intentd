@@ -2170,7 +2170,11 @@ async fn a_replayed_retry_after_a_restart_still_announces_the_return() {
 fn mark_exhausted_elsewhere(fx: &Fixture, selection: &str) -> chrono::DateTime<chrono::Utc> {
     let cache = &fx.mgr.services.provider_quota_cache;
     let now = chrono::Utc::now();
-    cache.mark_exhausted(selection, None, now, || true);
+    cache.mark_exhausted(
+        &crate::profile_activation::SettingsRead::elsewhere(selection),
+        None,
+        now,
+    );
     cache.exhausted_until(selection, now).expect("just marked")
 }
 
@@ -2178,10 +2182,11 @@ fn mark_exhausted_elsewhere(fx: &Fixture, selection: &str) -> chrono::DateTime<c
 /// output on `selection`.
 fn mark_working_elsewhere(fx: &Fixture, selection: &str) {
     let later = chrono::Utc::now() + chrono::Duration::seconds(1);
-    fx.mgr
-        .services
-        .provider_quota_cache
-        .mark_working(selection, later, later, || true);
+    fx.mgr.services.provider_quota_cache.mark_working(
+        &crate::profile_activation::SettingsRead::elsewhere(selection),
+        later,
+        later,
+    );
 }
 
 /// A configuration another conversation found out of quota is skipped at the

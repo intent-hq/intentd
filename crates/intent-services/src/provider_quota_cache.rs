@@ -20,10 +20,12 @@
 //!   [`ProviderQuotaCache::forget`]). A process still running on the
 //!   settings from before an environment edit or a delete keeps reporting on
 //!   the old account or key, so its observations are dropped: each mark
-//!   takes a `still_current` check, run under the cache lock, and the edit
-//!   moves the saved settings fingerprint before it forgets. An observation
-//!   racing the edit is therefore either rejected by the check or cleared by
-//!   the forget. Lock order: this cache, then the profile activation registry.
+//!   takes the [`SettingsRead`] the run started with, and the cache checks it
+//!   against the saved settings under its lock
+//!   ([`ProfileActivation::is_current`]). The edit moves the saved settings
+//!   fingerprint before it forgets, so an observation racing the edit is
+//!   either rejected by the check or cleared by the forget. Lock order: this
+//!   cache, then the profile activation registry.
 //!
 //! Exhausted marks are advisory: when every candidate is marked the turn
 //! still tries them (see `next_candidate_avoiding`). In-memory only — after a
@@ -35,6 +37,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
 
+use crate::profile_activation::{ProfileActivation, SettingsRead};
 use crate::provider_profiles;
 
 /// How long an exhausted mark lasts when the quota error reports no usable
@@ -54,30 +57,39 @@ pub(crate) enum QuotaHealth {
 }
 
 /// Shared across `Services` clones (see the module docs).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct ProviderQuotaCache {
     entries: Arc<Mutex<HashMap<String, QuotaHealth>>>,
+    /// The registry of saved settings every mark is checked against.
+    activation: Arc<ProfileActivation>,
 }
 
 impl ProviderQuotaCache {
-    /// Record a quota failure on `selection` at `now`. The mark lasts until
-    /// `reported` (the reset time parsed from the error) when usable, else
-    /// [`MARK_DURATION`]. The newest failure always replaces the entry.
-    /// Nothing is recorded when `still_current` (run under the cache lock)
-    /// says the failing process runs settings that were since edited or
-    /// deleted.
+    /// A cache whose marks are checked against `activation`'s saved
+    /// settings (the daemon's one registry).
+    pub(crate) fn new(activation: Arc<ProfileActivation>) -> Self {
+        Self {
+            entries: Arc::default(),
+            activation,
+        }
+    }
+
+    /// Record a quota failure on the configuration `read` belongs to at
+    /// `now`. The mark lasts until `reported` (the reset time parsed from
+    /// the error) when usable, else [`MARK_DURATION`]. The newest failure
+    /// always replaces the entry. Nothing is recorded when `read` is no
+    /// longer the saved settings (edited or deleted since).
     pub(crate) fn mark_exhausted(
         &self,
-        selection: &str,
+        read: &SettingsRead,
         reported: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
-        still_current: impl FnOnce() -> bool,
     ) {
         let until =
             crate::provider_return::usable_reset(reported, now).unwrap_or(now + MARK_DURATION);
-        let selection = provider_profiles::canonical_selection(selection);
+        let selection = read.selection().to_owned();
         let mut entries = self.entries.lock().unwrap();
-        if !still_current() {
+        if !self.activation.is_current(read) {
             tracing::info!(provider = %selection, "quota failure on earlier provider settings; shared quota state unchanged");
             return;
         }
@@ -91,22 +103,21 @@ impl ProviderQuotaCache {
         );
     }
 
-    /// Record that an attempt on `selection` which started at
-    /// `attempt_started` produced output at `now`. An exhausted mark is only
-    /// replaced when it was recorded before the attempt started: a turn
-    /// already in flight when another one hit the quota proves nothing about
-    /// the quota now. Like [`Self::mark_exhausted`], nothing is recorded
-    /// when `still_current` is false.
+    /// Record that an attempt on the configuration `read` belongs to, which
+    /// started at `attempt_started`, produced output at `now`. An exhausted
+    /// mark is only replaced when it was recorded before the attempt
+    /// started: a turn already in flight when another one hit the quota
+    /// proves nothing about the quota now. Like [`Self::mark_exhausted`],
+    /// nothing is recorded when `read` is no longer the saved settings.
     pub(crate) fn mark_working(
         &self,
-        selection: &str,
+        read: &SettingsRead,
         attempt_started: DateTime<Utc>,
         now: DateTime<Utc>,
-        still_current: impl FnOnce() -> bool,
     ) {
-        let selection = provider_profiles::canonical_selection(selection);
+        let selection = read.selection().to_owned();
         let mut entries = self.entries.lock().unwrap();
-        if !still_current() {
+        if !self.activation.is_current(read) {
             return;
         }
         match entries.get(&selection) {

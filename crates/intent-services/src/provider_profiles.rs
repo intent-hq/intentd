@@ -44,6 +44,7 @@ use intent_store::NewEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::profile_activation::SettingsRead;
 use crate::settings::AsyncSecretStore;
 use crate::Services;
 
@@ -120,6 +121,15 @@ pub(crate) fn canonical_selection(provider_id: &str) -> String {
     } else {
         intent_providers::provider_config(provider_id).id.to_owned()
     }
+}
+
+/// What [`Services::resolve_selected_profile`] read for a new process.
+#[derive(Debug)]
+pub(crate) struct SelectedProfile {
+    /// The saved overlay to run with (`None`: no overrides).
+    pub(crate) overlay: Option<Arc<intent_acp::ProfileEnv>>,
+    /// The settings read, for the shared quota cache.
+    pub(crate) read: SettingsRead,
 }
 
 /// A human-readable label for a selection in daemon-written text: a bare id
@@ -1930,13 +1940,16 @@ impl Services {
 
     /// [`Self::ensure_provider_ref_selectable`] then
     /// [`Self::resolve_profile_env`]: the overlay a new process for
-    /// `reference` must run with (`None` = Default configuration).
+    /// `reference` must run with, and the [`SettingsRead`] its quota
+    /// observations are recorded with.
     pub(crate) async fn resolve_selected_profile(
         &self,
         reference: &str,
-    ) -> Result<Option<Arc<intent_acp::ProfileEnv>>> {
+    ) -> Result<SelectedProfile> {
         self.ensure_provider_ref_selectable(reference)?;
-        Ok(self.resolve_profile_env(reference).await?.map(Arc::new))
+        let overlay = self.resolve_profile_env(reference).await?.map(Arc::new);
+        let read = SettingsRead::resolved(reference, overlay.as_deref());
+        Ok(SelectedProfile { overlay, read })
     }
 
     /// `providers.catalog` `profiles`: one summary per saved profile (no env

@@ -611,8 +611,7 @@ impl Services {
         loop {
             tried.push(current.clone());
             let attempt = async {
-                let profile = Box::pin(self.resolve_selected_profile(&current)).await?;
-                let fingerprint = quick_action_fingerprint(&current, profile.as_deref());
+                let selected = Box::pin(self.resolve_selected_profile(&current)).await?;
                 let started = chrono::Utc::now();
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 let result = self
@@ -626,10 +625,10 @@ impl Services {
                             .unwrap_or(u64::MAX)
                             .max(1),
                         effort,
-                        profile,
+                        selected.overlay,
                     )
                     .await;
-                Ok::<_, Error>((fingerprint, started, result))
+                Ok::<_, Error>((selected.read, started, result))
             };
             // A backup is bounded by the call's deadline as a whole, setup
             // included; dropping the attempt reaps its adapter. The first
@@ -638,7 +637,7 @@ impl Services {
                 Some(_) => tokio::time::timeout_at(deadline.into(), attempt).await,
                 None => Ok(attempt.await),
             };
-            let (fingerprint, started, result) = match outcome {
+            let (read, started, result) = match outcome {
                 Ok(Ok(outcome)) => outcome,
                 Ok(Err(error)) => return Err(last_quota.unwrap_or(error)),
                 Err(_) => {
@@ -648,20 +647,11 @@ impl Services {
                     }));
                 }
             };
-            let still_current = || {
-                fingerprint
-                    .as_deref()
-                    .is_none_or(|fp| self.profile_activation().fingerprint_is_saved(&current, fp))
-            };
             let quota_error = match result {
                 Ok(value) => {
                     if value.get("text").is_some() {
-                        self.provider_quota_cache.mark_working(
-                            &current,
-                            started,
-                            chrono::Utc::now(),
-                            still_current,
-                        );
+                        self.provider_quota_cache
+                            .mark_working(&read, started, chrono::Utc::now());
                     }
                     return Ok(value);
                 }
@@ -674,7 +664,7 @@ impl Services {
             let now = chrono::Utc::now();
             let reported = crate::provider_return::parse_reset_time(&quota_error.to_string(), now);
             self.provider_quota_cache
-                .mark_exhausted(&current, reported, now, still_current);
+                .mark_exhausted(&read, reported, now);
             if deadline.saturating_duration_since(std::time::Instant::now()) < MIN_BACKUP_BUDGET {
                 return Err(quota_error);
             }
@@ -923,22 +913,6 @@ impl From<Error> for AttemptFailure {
             error,
             kind: FailureKind::Other,
         }
-    }
-}
-
-/// The settings fingerprint a quick action on `reference` runs with, for
-/// the shared quota cache's stale-settings check: its overlay's, or `""`
-/// for a Default configuration with no overrides (as
-/// `profile_process_fingerprint` reads it), so overrides added mid-call make
-/// its observation stale. `None` for a bare id that cannot carry overrides.
-fn quick_action_fingerprint(
-    reference: &str,
-    profile: Option<&intent_acp::ProfileEnv>,
-) -> Option<String> {
-    match profile {
-        Some(profile) => Some(profile.fingerprint().to_owned()),
-        None if crate::provider_profiles::is_default_config_ref(reference) => Some(String::new()),
-        None => None,
     }
 }
 

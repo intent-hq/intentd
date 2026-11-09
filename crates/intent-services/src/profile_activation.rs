@@ -230,36 +230,45 @@ impl ProfileActivation {
         state.live.get(agent_id).is_some_and(|p| state.stale(p))
     }
 
-    /// Whether what `agent_id`'s process reports about `reference`'s quota
-    /// applies to the saved settings: false when its live process under
-    /// `reference` started with settings that were edited or deleted since.
-    /// True when no such process is registered (nothing says otherwise).
-    pub(crate) fn runs_saved_settings(&self, agent_id: &AgentId, reference: &str) -> bool {
-        let Some(profile_id) = profile_id_of(reference) else {
-            return true;
+    /// The settings `agent_id`'s process runs for `selection` (a chat turn):
+    /// what its live registration recorded at start, or
+    /// [`SettingsRead`]'s untracked read when this daemon saw no process
+    /// start (a remote agent).
+    pub(crate) fn process_read(&self, agent_id: &AgentId, selection: &str) -> SettingsRead {
+        let selection = crate::provider_profiles::canonical_selection(selection);
+        let Some(profile_id) = profile_id_of(&selection) else {
+            return SettingsRead::new(selection, Read::NoSettings);
         };
-        let state = self.state.lock().unwrap();
-        state
+        let live = self
+            .state
+            .lock()
+            .unwrap()
             .live
             .get(agent_id)
             .filter(|p| p.profile_id == profile_id)
-            .is_none_or(|p| state.saved.get(&profile_id) == Some(&p.fingerprint))
+            .map(|p| p.fingerprint.clone());
+        let read = live.map_or(Read::Untracked, Read::Fingerprint);
+        SettingsRead::new(selection, read)
     }
 
-    /// Whether a process that read `reference`'s settings under
-    /// `fingerprint` (a quick action, which registers no live process) still
-    /// runs the saved ones: false once an edit moved the saved fingerprint
-    /// or the profile was deleted. True when nothing is recorded.
-    pub(crate) fn fingerprint_is_saved(&self, reference: &str, fingerprint: &str) -> bool {
-        let Some(profile_id) = profile_id_of(reference) else {
+    /// Whether `read` still describes the saved settings: false once an
+    /// edit moved the saved fingerprint away from the one read, or the
+    /// profile was deleted. The quota cache's only stale-settings check.
+    pub(crate) fn is_current(&self, read: &SettingsRead) -> bool {
+        let Some(profile_id) = profile_id_of(&read.selection) else {
             return true;
         };
         let state = self.state.lock().unwrap();
-        !state.deleted.contains(&profile_id)
-            && state
+        if state.deleted.contains(&profile_id) {
+            return false;
+        }
+        match &read.read {
+            Read::NoSettings | Read::Untracked => true,
+            Read::Fingerprint(fingerprint) => state
                 .saved
                 .get(&profile_id)
-                .is_none_or(|saved| saved == fingerprint)
+                .is_none_or(|saved| saved == fingerprint),
+        }
     }
 
     /// The fingerprint `agent_id`'s live process started with, when it runs
@@ -272,6 +281,77 @@ impl ProfileActivation {
             .get(agent_id)
             .filter(|p| p.profile_id == *profile_id)
             .map(|p| p.fingerprint.clone())
+    }
+}
+
+/// What a run read of a configuration's settings when it started: the
+/// canonical selection and the fingerprint read. The shared quota cache
+/// records an observation only together with this value and checks it
+/// against the saved settings itself
+/// ([`crate::provider_quota_cache::ProviderQuotaCache::mark_exhausted`]), so
+/// no caller can skip or misjudge the check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SettingsRead {
+    selection: String,
+    read: Read,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Read {
+    /// A bare id that carries no saved settings: always current.
+    NoSettings,
+    /// Settings read under this fingerprint (`""` for a Default
+    /// configuration with no overrides).
+    Fingerprint(String),
+    /// A process this daemon did not see start (a remote agent's node):
+    /// current unless the profile was deleted.
+    Untracked,
+}
+
+impl SettingsRead {
+    fn new(selection: String, read: Read) -> Self {
+        Self { selection, read }
+    }
+
+    /// What a process started for `reference` with `overlay` (its resolved
+    /// saved overlay, `None` for none) reads: the overlay's fingerprint, or
+    /// `""` for a Default configuration with no overrides.
+    pub(crate) fn resolved(reference: &str, overlay: Option<&intent_acp::ProfileEnv>) -> Self {
+        let selection = crate::provider_profiles::canonical_selection(reference);
+        let read = match overlay {
+            Some(overlay) => Read::Fingerprint(overlay.fingerprint().to_owned()),
+            None if profile_id_of(&selection).is_some() => Read::Fingerprint(String::new()),
+            None => Read::NoSettings,
+        };
+        Self::new(selection, read)
+    }
+
+    /// The canonical selection the settings belong to.
+    pub(crate) fn selection(&self) -> &str {
+        &self.selection
+    }
+
+    /// A read of `selection` under `fingerprint`, for tests that drive the
+    /// check without an overlay.
+    #[cfg(test)]
+    pub(crate) fn fingerprinted(selection: &str, fingerprint: &str) -> Self {
+        Self::new(
+            crate::provider_profiles::canonical_selection(selection),
+            Read::Fingerprint(fingerprint.to_owned()),
+        )
+    }
+
+    /// Another conversation's process this daemon did not see start, for
+    /// tests that simulate an observation made elsewhere.
+    #[cfg(test)]
+    pub(crate) fn elsewhere(selection: &str) -> Self {
+        let selection = crate::provider_profiles::canonical_selection(selection);
+        let read = if profile_id_of(&selection).is_some() {
+            Read::Untracked
+        } else {
+            Read::NoSettings
+        };
+        Self::new(selection, read)
     }
 }
 
@@ -331,29 +411,58 @@ mod tests {
     /// while the settings it read are still saved, never after an edit or a
     /// delete.
     #[test]
-    fn a_read_fingerprint_is_saved_until_an_edit_or_a_delete() {
+    fn a_resolved_read_is_current_until_an_edit_or_a_delete() {
         for base in BASES {
             let reg = ProfileActivation::default();
             let work = format!("{base}@pwork");
-            assert!(
-                reg.fingerprint_is_saved(&work, "f1"),
-                "{base}: nothing recorded"
-            );
+            let f1 = SettingsRead::fingerprinted(&work, "f1");
+            assert!(reg.is_current(&f1), "{base}: nothing recorded");
             reg.saved_changed("pwork", Some("f2"));
-            assert!(!reg.fingerprint_is_saved(&work, "f1"), "{base}: edited");
-            assert!(reg.fingerprint_is_saved(&work, "f2"), "{base}");
+            assert!(!reg.is_current(&f1), "{base}: edited");
+            let f2 = SettingsRead::fingerprinted(&work, "f2");
+            assert!(reg.is_current(&f2), "{base}");
             reg.saved_changed("pwork", None);
-            assert!(!reg.fingerprint_is_saved(&work, "f2"), "{base}: deleted");
+            assert!(!reg.is_current(&f2), "{base}: deleted");
+            assert!(
+                !reg.is_current(&SettingsRead::elsewhere(&work)),
+                "{base}: deleted, whatever was read"
+            );
 
             // A Default configuration with no overrides reads as "": adding
             // overrides moves it on.
             let key = crate::provider_profiles::default_activation_key(base);
-            assert!(reg.fingerprint_is_saved(base, ""), "{base}");
+            let bare = SettingsRead::resolved(base, None);
+            assert_eq!(bare, SettingsRead::fingerprinted(base, ""), "{base}");
+            assert!(reg.is_current(&bare), "{base}");
             reg.saved_changed(&key, Some("f3"));
-            assert!(
-                !reg.fingerprint_is_saved(base, ""),
-                "{base}: overrides added"
-            );
+            assert!(!reg.is_current(&bare), "{base}: overrides added");
+        }
+        // A provider that cannot carry settings is always current.
+        let reg = ProfileActivation::default();
+        assert!(reg.is_current(&SettingsRead::resolved("auggie", None)));
+    }
+
+    /// A chat turn's read is its live process's registration: stale once an
+    /// edit or a delete lands, untracked (current unless deleted) when this
+    /// daemon saw no process start.
+    #[test]
+    fn a_process_read_follows_the_live_registration() {
+        for base in BASES {
+            let reg = ProfileActivation::default();
+            let work = format!("{base}@pwork");
+            let a = AgentId::from("a-1");
+            let untracked = reg.process_read(&a, &work);
+            assert_eq!(untracked, SettingsRead::elsewhere(&work), "{base}");
+            assert!(reg.is_current(&untracked), "{base}");
+
+            reg.register(&ws(), &a, &work, "f1").unwrap();
+            let read = reg.process_read(&a, &work);
+            assert_eq!(read, SettingsRead::fingerprinted(&work, "f1"), "{base}");
+            assert!(reg.is_current(&read), "{base}");
+            reg.saved_changed("pwork", Some("f2"));
+            assert!(!reg.is_current(&reg.process_read(&a, &work)), "{base}");
+            reg.saved_changed("pwork", None);
+            assert!(!reg.is_current(&untracked), "{base}: deleted");
         }
     }
 
