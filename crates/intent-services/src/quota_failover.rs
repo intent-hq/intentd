@@ -968,6 +968,18 @@ impl Services {
             }
         }
         let from = provider_profiles::canonical_selection(&pending.from);
+        let placement = match self
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await
+        {
+            Ok(session) => intent_core::remote_launch::RemotePlacementView::from_metadata(
+                session.metadata.as_ref(),
+            )
+            .and_then(|view| view.placement_error),
+            Err(_) => None,
+        };
+        let reason = &with_placement_error(reason, placement.as_ref());
         Some(intent_core::Error::InvalidParams(match pending.kind {
             RemoteSwitchKind::Failover => remote_backup_failed_text(
                 &from,
@@ -1115,19 +1127,57 @@ fn remote_backup_failed_text(
     let from = provider_profiles::readable_selection(from, Some(profiles));
     let backup = provider_profiles::readable_selection(backup, Some(profiles));
     let reason = reason.trim().trim_end_matches('.');
-    let advice = match non_account_start_cause(reason, machine) {
-        Some(cause) => format!(
-            "{cause}, which is not a sign-in problem. Retry the message, or create a new \
-             agent."
-        ),
-        None => {
-            format!("Sign in to {backup} on {machine}, or create a new agent with another account.")
-        }
+    let not_sign_in = |cause: String| {
+        format!(
+            "{cause}, which is not a sign-in problem. Retry the message, or create a new agent."
+        )
+    };
+    let has = |text: &str| reason.contains(text);
+    let advice = if let Some(cause) = non_account_start_cause(reason, machine) {
+        not_sign_in(cause)
+    } else if has(provider_profiles::PROFILE_NOT_REMOTE_COMPATIBLE) {
+        format!(
+            "{backup} uses an account folder on this backend, so it can't run on other \
+             machines. Create a new agent with an API-key profile or the machine's own sign-in."
+        )
+    } else if has("request `initialize` timed out") {
+        not_sign_in(format!(
+            "the backup {backup} started on {machine}, but its provider did not respond in time"
+        ))
+    } else if has("exited with status") {
+        format!(
+            "the provider stopped on {machine} before it was ready. Retry the message; if it \
+             stops again, check that {backup} is signed in on {machine}, or create a new agent."
+        )
+    } else {
+        format!("Sign in to {backup} on {machine}, or create a new agent with another account.")
     };
     format!(
         "{REMOTE_FAILOVER_UNAVAILABLE} {from} ran out of quota on {machine}, and the backup \
          {backup} couldn't start there: {reason}. {advice}"
     )
+}
+
+/// `reason` completed with the agent's recorded `placementError` when it
+/// carries no detail of its own: an older machine's refusal says only "the
+/// agent has exited". A reason with its own detail is kept as it is, so an
+/// error recorded for an earlier start cannot reword it.
+fn with_placement_error(
+    reason: &str,
+    placement: Option<&intent_core::remote_launch::PlacementError>,
+) -> String {
+    match placement {
+        Some(error)
+            if !error.detail.is_empty()
+                && reason
+                    .trim()
+                    .trim_end_matches('.')
+                    .ends_with("the agent has exited") =>
+        {
+            format!("{reason} ({}: {})", error.code, error.detail)
+        }
+        _ => reason.to_owned(),
+    }
 }
 
 /// What stopped a remote start when it was not the provider or its account

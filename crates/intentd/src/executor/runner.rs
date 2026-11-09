@@ -257,6 +257,10 @@ struct State {
     /// free) whose exit record is not journaled yet, so a stop arriving in
     /// that window still waits for the record.
     exiting: HashMap<AgentId, watch::Receiver<ExitRecord>>,
+    /// Why each agent that left `agents` exited ([`exit_detail`]), for a
+    /// prompt that arrives after it; cleared by its next launch or when it
+    /// ends here for good.
+    exit_details: HashMap<AgentId, String>,
     /// Agents a final stop is pushing and removing, each with the one
     /// cleanup every repeat of that stop joins (`None` until it finishes).
     /// The bind sweep leaves their checkouts to it, and a launch waits for
@@ -489,6 +493,9 @@ struct Agent {
     /// Whether the agent's exit record reached the journal.
     journaled: watch::Receiver<ExitRecord>,
     ready: watch::Receiver<Option<Arc<Ready>>>,
+    /// Why the agent exited ([`exit_detail`]), set before `ready` closes so
+    /// a turn waiting for the session can say why it never came.
+    exit_detail: Mutex<Option<String>>,
     /// Whether a turn is running; refuses a second one.
     busy: Mutex<bool>,
     marks: mpsc::UnboundedSender<Mark>,
@@ -961,6 +968,7 @@ impl Runner {
         head.ended.insert(agent_id.clone());
         head.lease_agents.remove(agent_id);
         drop(head);
+        lock(&self.inner.state).exit_details.remove(agent_id);
         self.inner.head.secrets().forget(agent_id, None);
         self.inner.pulls.forget(agent_id.as_str());
     }
@@ -1369,6 +1377,7 @@ impl Runner {
             stop: Mutex::new(Some(stop_tx)),
             journaled: journaled_rx,
             ready: ready_rx,
+            exit_detail: Mutex::new(None),
             busy: Mutex::new(false),
             descendants: Arc::new(Descendants::default()),
             run_marker: intent_core::node_link::LinkId::new_v4().to_string(),
@@ -1391,6 +1400,7 @@ impl Runner {
             }),
         });
         state.agents.insert(agent_id.clone(), agent.clone());
+        state.exit_details.remove(&agent_id);
         match checkout_of {
             Some(owner) => state.shares.insert(agent_id.clone(), owner),
             None => state.shares.remove(&agent_id),
@@ -1719,6 +1729,8 @@ impl Runner {
                 result
             }
         };
+        let detail = exit_detail(exit_code, error.as_deref());
+        *lock(&agent.exit_detail) = Some(detail.clone());
         // Turns still waiting for the session see it is gone.
         drop(ready);
         // Whatever the agent did is sent back before head hears it exited.
@@ -1731,6 +1743,7 @@ impl Runner {
                 .is_some_and(|current| Arc::ptr_eq(current, &agent))
             {
                 state.agents.remove(&agent.id);
+                state.exit_details.insert(agent.id.clone(), detail);
                 self.inner.admission.release(&agent.id);
                 // Its process is gone: its token no longer needs masking.
                 *lock(&agent.forge_lease) = None;
@@ -2184,8 +2197,12 @@ impl Runner {
             if workspace.is_none() {
                 tracing::warn!(agent = %agent_id, "node: prompt for an unknown agent");
             }
-            return workspace
-                .map(|workspace| refuse(workspace, codes::NOT_RUNNING, "the agent has exited"));
+            let detail = lock(&self.inner.state)
+                .exit_details
+                .get(agent_id)
+                .cloned()
+                .unwrap_or_else(|| exit_detail(None, None));
+            return workspace.map(|workspace| refuse(workspace, codes::NOT_RUNNING, &detail));
         };
         {
             let mut busy = lock(&agent.busy);
@@ -2811,6 +2828,29 @@ pub(super) fn remote_launch_env(
         .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
 }
 
+/// The most of an exit error [`exit_detail`] keeps.
+const EXIT_DETAIL_MAX: usize = 512;
+
+/// Why an agent exited, as a turn refused after it says: the start failure
+/// or exit error the exit record carries, else the provider's status.
+fn exit_detail(exit_code: Option<i32>, error: Option<&str>) -> String {
+    let error = error.map(|error| {
+        let mut end = error.len().min(EXIT_DETAIL_MAX);
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        &error[..end]
+    });
+    match (error, exit_code) {
+        (Some(error), _) if error.starts_with(codes::START) => {
+            format!("the provider did not start ({error})")
+        }
+        (Some(error), _) => format!("the agent has exited ({error})"),
+        (None, Some(code)) => format!("the provider exited with status {code}"),
+        (None, None) => "the agent has exited".to_owned(),
+    }
+}
+
 /// Wait for the session, then run one ACP prompt and report its stop reason
 /// and any error.
 async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, Option<String>) {
@@ -2827,8 +2867,14 @@ async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, 
         Ok(session) => session.clone(),
         Err(_) => None,
     };
+    let not_running = || {
+        let detail = lock(&agent.exit_detail)
+            .clone()
+            .unwrap_or_else(|| exit_detail(None, None));
+        failed(format!("{}: {detail}", codes::NOT_RUNNING))
+    };
     let Some(session) = session else {
-        return failed(format!("{}: the agent has exited", codes::NOT_RUNNING));
+        return not_running();
     };
     // Set before the agent is ready, so the first turn takes it.
     if let Some(catalog) = lock(&agent.skills_catalog).take() {
@@ -2856,7 +2902,7 @@ async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, 
         ack,
     };
     if agent.marks.send(started).is_err() || switched.await.is_err() {
-        return failed(format!("{}: the agent has exited", codes::NOT_RUNNING));
+        return not_running();
     }
     agent.activity.touch();
     match intent_acp::session::prompt(

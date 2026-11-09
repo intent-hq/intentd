@@ -588,6 +588,63 @@ async fn node_runner_journals_a_provider_that_dies_at_start() {
     assert!(h.runner.running().is_empty());
 }
 
+/// A turn waiting for a provider that never starts, and a turn sent after
+/// it exited, say why it exited instead of only "the agent has exited".
+#[tokio::test]
+async fn node_runner_turn_refusal_carries_the_exit_reason() {
+    let Some(h) = harness(1, &["--auth-required-setup"]) else {
+        return;
+    };
+    h.runner.launch(launch("a1")).await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hello"))
+        .await;
+    let all = wait_for(&h.runner, "waiting turn end", turn_ended("a1", "t1")).await;
+    let all = if all.iter().any(exited("a1")) {
+        all
+    } else {
+        wait_for(&h.runner, "exit", exited("a1")).await
+    };
+    let exit = exit_error(find(&all, exited("a1"))).unwrap().to_owned();
+    assert!(exit.starts_with(codes::START), "{exit}");
+    h.runner
+        .prompt(&AgentId::from("a1"), "t2".into(), text("late"))
+        .await;
+    let all = wait_for(&h.runner, "late turn end", turn_ended("a1", "t2")).await;
+    for turn in ["t1", "t2"] {
+        let (stop_reason, error) = turn_end(find(&all, turn_ended("a1", turn)));
+        let error = error.unwrap();
+        assert_eq!(stop_reason, "refusal");
+        assert!(error.starts_with(codes::NOT_RUNNING), "{turn}: {error}");
+        assert!(
+            error.contains("the provider did not start"),
+            "{turn}: {error}"
+        );
+        assert!(error.contains(&exit), "{turn}: {error}");
+    }
+}
+
+/// A provider that exits with a status says so in the late turn's refusal.
+#[tokio::test]
+async fn node_runner_turn_refusal_names_the_exit_status() {
+    let Some(h) = harness(1, &[]) else { return };
+    h.runner.launch(launch("a1")).await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("exit"))
+        .await;
+    let all = wait_for(&h.runner, "exit", exited("a1")).await;
+    assert_eq!(exit_error(find(&all, exited("a1"))), None);
+    h.runner
+        .prompt(&AgentId::from("a1"), "t2".into(), text("late"))
+        .await;
+    let all = wait_for(&h.runner, "late turn end", turn_ended("a1", "t2")).await;
+    let (_, error) = turn_end(find(&all, turn_ended("a1", "t2")));
+    assert_eq!(
+        error,
+        Some(format!("{}: the provider exited with status 0", codes::NOT_RUNNING).as_str())
+    );
+}
+
 #[tokio::test]
 async fn node_runner_stop_during_setup_ends_waiting_turns() {
     let Some(h) = harness(1, &["--hang-setup"]) else {
