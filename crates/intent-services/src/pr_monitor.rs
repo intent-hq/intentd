@@ -629,9 +629,39 @@ pub(crate) struct PrMonitorSnapshot {
     /// it. Internal persisted bookkeeping only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub latest_reviews_carried: bool,
+    /// The last known `requirements.branchUpdateRequired`, carried while
+    /// reads report it unknown (GitHub recomputing after the base moves).
+    /// The diff compares last known values, so an unknown blip that settles
+    /// back is silent, even after an unrelated wake moved the emit baseline
+    /// onto the unknown read (intent-hq/intent#8843). Internal persisted
+    /// bookkeeping only; the checklist still renders the read as unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_update_required_last_known: Option<bool>,
+    /// The last known `requirements.threads.unresolved`, carried while the
+    /// thread read is unavailable; the same role as
+    /// `branch_update_required_last_known`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved_threads_last_known: Option<i64>,
 }
 
 impl PrMonitorSnapshot {
+    /// The forge's branch-update verdict, or the last known one while the
+    /// current read reports it unknown.
+    pub(crate) fn branch_update_required_known(&self) -> Option<bool> {
+        self.requirements
+            .branch_update_required
+            .or(self.branch_update_required_last_known)
+    }
+
+    /// The unresolved thread count, or the last known one while the current
+    /// read cannot see threads.
+    pub(crate) fn unresolved_threads_known(&self) -> Option<i64> {
+        self.requirements
+            .threads
+            .unresolved
+            .or(self.unresolved_threads_last_known)
+    }
+
     pub(crate) fn known_required_checks(&self) -> BTreeSet<String> {
         self.required_check_names.clone().unwrap_or_else(|| {
             self.requirements
@@ -818,6 +848,13 @@ impl SharedPrSnapshot {
         } else {
             None
         };
+        // An unknown read keeps the last known value for the diff.
+        let branch_update_required_last_known = previous
+            .filter(|_| requirements.branch_update_required.is_none())
+            .and_then(PrMonitorSnapshot::branch_update_required_known);
+        let unresolved_threads_last_known = previous
+            .filter(|_| requirements.threads.unresolved.is_none())
+            .and_then(PrMonitorSnapshot::unresolved_threads_known);
         PrMonitorSnapshot {
             title: self.title.clone(),
             url: self.url.clone(),
@@ -841,6 +878,8 @@ impl SharedPrSnapshot {
             latest_reviews_carried,
             checks_not_started_delivered: same_head
                 .and_then(|p| p.checks_not_started_delivered.clone()),
+            branch_update_required_last_known,
+            unresolved_threads_last_known,
         }
     }
 }
@@ -5528,6 +5567,7 @@ mod tests {
     mod quota_regression;
     mod qwen_regression;
     mod registration_visibility;
+    mod unknown_blip;
     use std::path::PathBuf;
 
     use async_trait::async_trait;
@@ -5584,6 +5624,10 @@ mod tests {
         head_sha: String,
         mergeable: Option<bool>,
         mergeable_state: String,
+        /// The GraphQL `mergeStateStatus` when it differs from the REST
+        /// `mergeable_state` (which REST can lag as `unknown`); `None`
+        /// mirrors `mergeable_state`.
+        merge_state_status: Option<String>,
         conversation_comments: usize,
         approvals: Vec<String>,
         /// Reviews served after the `approvals` stand-ins, verbatim (ids,
@@ -5685,6 +5729,7 @@ mod tests {
                 head_sha: "aaaaaaaa".into(),
                 mergeable: Some(true),
                 mergeable_state: "clean".into(),
+                merge_state_status: None,
                 conversation_comments: 0,
                 approvals: vec![],
                 extra_reviews: vec![],
@@ -5766,7 +5811,11 @@ mod tests {
         /// folds in and the observation leaves to `branch_rules`.
         fn signals(&self) -> MergeRequirementSignals {
             MergeRequirementSignals {
-                merge_state_status: Some(self.mergeable_state.to_uppercase()),
+                merge_state_status: Some(
+                    self.merge_state_status
+                        .clone()
+                        .unwrap_or_else(|| self.mergeable_state.to_uppercase()),
+                ),
                 review_decision: (!self.approvals.is_empty()).then_some(ReviewDecision::Approved),
                 checks: self.checks.clone(),
                 checks_head_sha: None,
@@ -6573,6 +6622,8 @@ mod tests {
             pr_updated_at: None,
             checks_not_started_delivered: None,
             latest_reviews_carried: false,
+            branch_update_required_last_known: None,
+            unresolved_threads_last_known: None,
         };
         f(&mut s);
         s
@@ -6745,31 +6796,31 @@ mod tests {
         assert_eq!(wire["lastSnapshot"]["threads"]["unresolved"], json!(3));
     }
 
-    /// A thread-count delta is never reported when either side is unknown.
-    /// Baseline `Some(1)` → degraded `None` → recovered `Some(1)`: the
-    /// degraded diff carries exactly one readability line and no
-    /// `thread(s)` delta, the recovery diff a neutral "readable again" line
-    /// (no `thread(s) resolved` verb), the baseline→recovered diff (same
-    /// count) no thread line at all, and unknown→unknown is silent.
+    /// A thread-count delta is never reported against an unknown count.
+    /// Baseline `Some(1)` → degraded `None` is silent; a count never known
+    /// before recovers as a neutral "readable again" line (no `thread(s)
+    /// resolved` verb); a degraded read carrying the last known count
+    /// reports only a recovered count that differs from it; the
+    /// baseline→recovered diff (same count) has no thread line at all, and
+    /// unknown→unknown is silent.
     #[test]
     fn diff_never_fabricates_a_thread_delta_across_an_unknown_count() {
         let baseline = snapshot(|_| {});
         assert_eq!(baseline.requirements.threads.unresolved, Some(1));
         let degraded = snapshot(|s| s.requirements.threads.unresolved = None);
+        let carried = snapshot(|s| {
+            s.requirements.threads.unresolved = None;
+            s.unresolved_threads_last_known = Some(1);
+        });
         let recovered = snapshot(|_| {});
 
-        let changes = diff_snapshots(&baseline, &degraded);
-        assert!(
-            changes.iter().all(|c| !c.starts_with("thread(s)")),
-            "no thread delta on degradation: {changes:?}"
-        );
+        assert_eq!(diff_snapshots(&baseline, &degraded), Vec::<String>::new());
+        assert_eq!(diff_snapshots(&baseline, &carried), Vec::<String>::new());
+        assert_eq!(diff_snapshots(&carried, &recovered), Vec::<String>::new());
+        let resolved = snapshot(|s| s.requirements.threads.unresolved = Some(0));
         assert_eq!(
-            changes
-                .iter()
-                .filter(|c| c.as_str() == "review threads unreadable (resolution state unavailable)")
-                .count(),
-            1,
-            "exactly one readability line: {changes:?}"
+            diff_snapshots(&carried, &resolved),
+            vec!["thread(s) resolved: 1 → 0 unresolved"]
         );
 
         let changes = diff_snapshots(&degraded, &recovered);
@@ -6946,7 +6997,7 @@ mod tests {
     /// (`hasConflicts` / `mergeBlockedReason`): while the NEW
     /// snapshot's mergeability is unknown, the clearing direction of those
     /// lines is suppressed too — a DIRTY/BEHIND/blocked PR blipping to
-    /// UNKNOWN reports only the neutral update-requirement availability.
+    /// UNKNOWN reports nothing (its unknown update verdict is not news).
     /// A real clear to a known state still reports, and the appearing direction reports even while unknown.
     #[test]
     fn diff_suppresses_derived_clears_while_mergeability_is_unknown() {
@@ -6959,24 +7010,18 @@ mod tests {
             s.requirements.merge_blocked_reason = Some("merge conflicts".into());
         });
         // DIRTY → UNKNOWN blip: the recomputation resets the derived fields
-        // alongside the raw ones; only lost availability reports.
+        // alongside the raw ones, and the unknown verdict is not news.
         let blip = snapshot(|s| {
             s.requirements.mergeable = None;
             s.requirements.merge_state_status = Some("UNKNOWN".into());
         });
-        assert_eq!(
-            diff_snapshots(&dirty, &blip),
-            vec!["forge branch-update requirement unknown"]
-        );
+        assert_eq!(diff_snapshots(&dirty, &blip), Vec::<String>::new());
         // Same with the merge state absent entirely.
         let blip_none = snapshot(|s| {
             s.requirements.mergeable = None;
             s.requirements.merge_state_status = None;
         });
-        assert_eq!(
-            diff_snapshots(&dirty, &blip_none),
-            vec!["forge branch-update requirement unknown"]
-        );
+        assert_eq!(diff_snapshots(&dirty, &blip_none), Vec::<String>::new());
 
         // A real clear to a known state still reports all three.
         let cleared = snapshot(|s| {
@@ -9394,6 +9439,8 @@ mod tests {
             pr_updated_at: Some(pick(b, "2026-10-24T11:00:00Z", "2026-10-25T11:00:00Z").into()),
             checks_not_started_delivered: Some(head.into()),
             latest_reviews_carried: !b,
+            branch_update_required_last_known: Some(!b),
+            unresolved_threads_last_known: Some(pick(b, 4, 6)),
         }
     }
 
@@ -9778,6 +9825,14 @@ mod tests {
         (
             "/requirements/threads/resolutionRequired",
             "a rule flag; unresolved counts report",
+        ),
+        (
+            "/branchUpdateRequiredLastKnown",
+            "read only while the verdict is unknown",
+        ),
+        (
+            "/unresolvedThreadsLastKnown",
+            "read only while the thread count is unknown",
         ),
         (
             "/requirements/mergeQueueEjection/reason",
