@@ -80,7 +80,15 @@ fn json_headers_secret_keys_and_nested_args_are_redacted() {
 #[test]
 fn secret_flags_hide_their_values() {
     assert_eq!(
-        redact(&["tool", "--token", "t1", "--api-key=k1", "--password", "p1", "x"]),
+        redact(&[
+            "tool",
+            "--token",
+            "t1",
+            "--api-key=k1",
+            "--password",
+            "p1",
+            "x"
+        ]),
         format!("tool --token {REDACTED} --api-key={REDACTED} --password {REDACTED} x")
     );
     assert_eq!(
@@ -94,7 +102,13 @@ fn secret_flags_hide_their_values() {
 #[test]
 fn secret_env_assignments_are_redacted() {
     assert_eq!(
-        redact(&["env", "OPENAI_API_KEY=sk-1", "GH_TOKEN=gh-2", "PATH=/usr/bin", "node"]),
+        redact(&[
+            "env",
+            "OPENAI_API_KEY=sk-1",
+            "GH_TOKEN=gh-2",
+            "PATH=/usr/bin",
+            "node"
+        ]),
         format!("env OPENAI_API_KEY={REDACTED} GH_TOKEN={REDACTED} PATH=/usr/bin node")
     );
 }

@@ -4825,9 +4825,7 @@ fn descendant_tree_usage<K: Clone + Eq + std::hash::Hash>(
                 // Secrets in an agent's argv (its MCP bridge token, env
                 // values) never leave the sampler.
                 let cmdline = cmdline_redact::redact_args(
-                    p.cmd()
-                        .iter()
-                        .map(|arg| arg.to_string_lossy().into_owned()),
+                    p.cmd().iter().map(|arg| arg.to_string_lossy().into_owned()),
                 );
                 (p.name().to_string_lossy().into_owned(), cmdline)
             })
