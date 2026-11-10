@@ -195,6 +195,26 @@ pub(crate) fn workspace_revived_prompt_notice(previous_branch: &str, branch: &st
     )
 }
 
+/// Trailing prompt block telling the model the workspace's `archiveScript`
+/// ran while it was archived (intent-hq/intent#8850), so resources the
+/// setup created may be gone. Left pending
+/// ([`intent_core::PENDING_ARCHIVE_SCRIPT_NOTICE_KEY`]) for every agent's next
+/// turn, which starts only once the workspace is unarchived.
+pub(crate) fn archive_script_prompt_notice(failure: Option<&str>) -> String {
+    let outcome = match failure {
+        Some(failure) => format!("It did not finish cleanly: {failure}"),
+        None => "It finished successfully.".to_string(),
+    };
+    format!(
+        "[SYSTEM NOTICE] When this workspace was archived, Intent ran the repository's \
+         `archiveScript` from `.intent/config.json` in this folder to clean up what the \
+         workspace used (for example a database or containers). {outcome} The workspace has \
+         since been unarchived, and its setup script was not run again. Before you rely on \
+         those resources, read `.intent/config.json` and rerun the steps of its `setupScript` \
+         if the workspace needs to be set up again."
+    )
+}
+
 /// Queued-message size (chars) above which a turn failing with a
 /// context-size error (HTTP 413, [`crate::is_context_size_error`]) is
 /// treated as the MESSAGE being too large rather than the accumulated
@@ -6403,7 +6423,30 @@ impl AgentManager {
         let revive_now = notice
             .as_deref()
             .is_some_and(|text| text != AUTO_UNARCHIVE_PROMPT_NOTICE);
-        for text in notice.into_iter().chain(pending.filter(|_| !revive_now)) {
+        // Archive-script notice (intent-hq/intent#8850): left by the script
+        // run at archive or purge time, taken once by the first turn after
+        // the unarchive.
+        let archive_script = match self
+            .services
+            .store
+            .take_agent_session_metadata_key(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_ARCHIVE_SCRIPT_NOTICE_KEY,
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "pending archive script notice read failed");
+                None
+            }
+        };
+        for text in notice
+            .into_iter()
+            .chain(pending.filter(|_| !revive_now))
+            .chain(archive_script)
+        {
             blocks.extend(text_prompt(&text));
         }
         Ok(blocks)

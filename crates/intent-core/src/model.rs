@@ -4420,6 +4420,14 @@ pub const LAST_SEEN_MESSAGE_ID_KEY: &str = "lastSeenMessageId";
 /// free-form `metadata` column and survives daemon restarts.
 pub const PENDING_WORKSPACE_PURGE_NOTICE_KEY: &str = "pendingWorkspacePurgeNotice";
 
+/// Metadata key under which a one-time "archive script ran" prompt notice
+/// waits on `agent_session.metadata` (intent-hq/intent#8850): written for the
+/// workspace's agents after its `archiveScript` runs at archive or purge, and
+/// taken by the agent's next turn — which only starts once the workspace is
+/// unarchived — so the model knows to check `.intent/config.json` before it
+/// relies on resources the script removed.
+pub const PENDING_ARCHIVE_SCRIPT_NOTICE_KEY: &str = "pendingArchiveScriptNotice";
+
 /// Metadata key under which the initial-agent flag is persisted on the
 /// `agent_session.metadata` JSON (PROTOCOL §5.1/§5.5): stamped `true` by the
 /// daemon's `workspace.create` initial-agent orchestration so clients can

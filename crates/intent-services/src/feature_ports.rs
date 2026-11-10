@@ -666,6 +666,16 @@ pub trait RuntimePort: Send + Sync + 'static {
         run: SetupScriptRun,
     ) -> BoxFuture<'static, (bool, Option<u32>)>;
 
+    /// Run a workspace's `archiveScript` (intent-hq/intent#8850) in its
+    /// folder as a plain child process and wait for it to exit (bounded by
+    /// [`ARCHIVE_SCRIPT_TIMEOUT`]). Never fails the caller: every outcome,
+    /// including a spawn failure, is reported in the result.
+    fn run_archive_script(
+        &self,
+        svc: &Services,
+        run: ArchiveScriptRun,
+    ) -> BoxFuture<'static, ArchiveScriptOutcome>;
+
     // Hook and script-monitor state agents read and settle (agent views,
     // waiting annotations, retire/delete sweeps, turn admission). Each
     // behaves exactly as the runtime `Services` method of the same name; the
@@ -1030,6 +1040,78 @@ pub struct SetupScriptRun {
     pub branch_name: String,
     /// `SOURCE_BRANCH`.
     pub source_branch: String,
+}
+
+/// How long an archive script may run before its process group is killed.
+pub const ARCHIVE_SCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Which lifecycle step ran an archive script; logged as `trigger`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveScriptTrigger {
+    Archive,
+    Delete,
+    Retire,
+}
+
+impl ArchiveScriptTrigger {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Archive => "archive",
+            Self::Delete => "delete",
+            Self::Retire => "retire",
+        }
+    }
+}
+
+/// One archive-script run ([`RuntimePort::run_archive_script`]). The env
+/// matches the setup script's.
+pub struct ArchiveScriptRun {
+    pub workspace_id: WorkspaceId,
+    pub trigger: ArchiveScriptTrigger,
+    /// The workspace folder: the script's cwd and `.intent/` parent.
+    pub worktree: PathBuf,
+    /// The `archiveScript` body.
+    pub script: String,
+    /// `MAIN_CHECKOUT`.
+    pub repo_path: String,
+    /// `BRANCH_NAME`.
+    pub branch_name: String,
+    /// `SOURCE_BRANCH`.
+    pub source_branch: String,
+}
+
+/// How an archive-script run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveScriptOutcome {
+    /// No runtime is registered to run it.
+    NotRun,
+    Succeeded,
+    /// Exited non-zero; `None` when no exit code was observed (a signal).
+    Failed {
+        exit_code: Option<i32>,
+    },
+    TimedOut,
+    CouldNotStart,
+}
+
+impl ArchiveScriptOutcome {
+    /// The workspace card message for a failed run; `None` otherwise.
+    #[must_use]
+    pub fn failure_message(self) -> Option<String> {
+        match self {
+            Self::NotRun | Self::Succeeded => None,
+            Self::Failed {
+                exit_code: Some(code),
+            } => Some(format!("Archive script failed (exit code {code}).")),
+            Self::Failed { exit_code: None } => Some("Archive script failed.".to_string()),
+            Self::TimedOut => Some(format!(
+                "Archive script timed out after {} minutes.",
+                ARCHIVE_SCRIPT_TIMEOUT.as_secs() / 60
+            )),
+            Self::CouldNotStart => Some("Archive script could not start.".to_string()),
+        }
+    }
 }
 
 /// Command-mode run activity for the idle update handshake (see
@@ -2144,6 +2226,14 @@ impl RuntimePort for UnavailableRuntime {
         _run: SetupScriptRun,
     ) -> BoxFuture<'static, (bool, Option<u32>)> {
         Box::pin(async { (false, None) })
+    }
+
+    fn run_archive_script(
+        &self,
+        _svc: &Services,
+        _run: ArchiveScriptRun,
+    ) -> BoxFuture<'static, ArchiveScriptOutcome> {
+        Box::pin(async { ArchiveScriptOutcome::NotRun })
     }
 
     fn active_hooks_for_agent<'a>(

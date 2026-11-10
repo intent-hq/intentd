@@ -31,8 +31,8 @@ use intent_core::{
 use serde_json::{json, Value};
 
 use crate::feature_ports::{
-    monitor_id, wake_id, CommandScriptActivity, RuntimePort, ScriptsClosing, SetupScriptRun,
-    UnavailableRuntime,
+    monitor_id, wake_id, ArchiveScriptOutcome, ArchiveScriptRun, CommandScriptActivity,
+    RuntimePort, ScriptsClosing, SetupScriptRun, UnavailableRuntime,
 };
 use crate::Services;
 
@@ -725,6 +725,7 @@ impl RuntimePort for FakeRuntime {
         fn browser_navigate_tab<'a>(&'a self, svc: &'a Services, tab_id: String, url: String) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn browser_close_tab<'a>(&'a self, svc: &'a Services, tab_id: String, force: bool) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn run_setup_script(&self, svc: &Services, run: SetupScriptRun) -> BoxFuture<'static, (bool, Option<u32>)>;
+        fn run_archive_script(&self, svc: &Services, run: ArchiveScriptRun) -> BoxFuture<'static, ArchiveScriptOutcome>;
         fn script_monitor_lane<'a>(&'a self, svc: &'a Services) -> &'a tokio::sync::Mutex<()>;
         fn close_workspace_scripts<'a>(&'a self, svc: &'a Services, workspace_id: &'a WorkspaceId) -> BoxFuture<'a, Box<dyn ScriptsClosing>>;
         fn hydrate_scripts<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<usize>>;
