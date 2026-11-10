@@ -212,9 +212,13 @@ struct HeadSession {
 
 /// Head side: answer the node's git sessions on `connection` until it
 /// closes. A protocol violation closes the connection; dropping the future
-/// stops every running service.
+/// ends every running session (see [`Service`] for what becomes of its
+/// service).
 pub async fn serve_git(mut connection: GitConnection, access: Arc<dyn NodeGitAccess>) {
     let sender = connection.sender();
+    // A slot is held until the session's service exits, so services that
+    // outlive their sessions still count against [`MAX_SESSIONS`].
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_SESSIONS));
     let binding = connection.binding().clone();
     let mut tasks = tokio::task::JoinSet::new();
     let mut sessions: HashMap<u32, HeadSession> = HashMap::new();
@@ -236,10 +240,10 @@ pub async fn serve_git(mut connection: GitConnection, access: Arc<dyn NodeGitAcc
                 if sessions.contains_key(&id) {
                     break;
                 }
-                if sessions.len() >= MAX_SESSIONS {
+                let Ok(slot) = slots.clone().try_acquire_owned() else {
                     let _ = sender.send(close_message(id, Some(codes::BUSY))).await;
                     continue;
-                }
+                };
                 let (stdin, stdin_rx) = mpsc::channel(SESSION_QUEUE);
                 let task = tasks.spawn(head_session(
                     id,
@@ -248,6 +252,7 @@ pub async fn serve_git(mut connection: GitConnection, access: Arc<dyn NodeGitAcc
                     access.clone(),
                     sender.clone(),
                     stdin_rx,
+                    slot,
                 ));
                 sessions.insert(
                     id,
@@ -286,8 +291,18 @@ async fn head_session(
     access: Arc<dyn NodeGitAccess>,
     sender: GitSender,
     stdin_rx: mpsc::Receiver<Vec<u8>>,
+    slot: tokio::sync::OwnedSemaphorePermit,
 ) -> u32 {
-    let result = run_service(id, &open, &binding, access.as_ref(), &sender, stdin_rx).await;
+    let result = run_service(
+        id,
+        &open,
+        &binding,
+        access.as_ref(),
+        &sender,
+        stdin_rx,
+        slot,
+    )
+    .await;
     let _ = sender.send(close_message(id, result.err())).await;
     id
 }
@@ -311,6 +326,7 @@ async fn run_service(
     access: &dyn NodeGitAccess,
     sender: &GitSender,
     mut stdin_rx: mpsc::Receiver<Vec<u8>>,
+    slot: tokio::sync::OwnedSemaphorePermit,
 ) -> std::result::Result<(), &'static str> {
     let open: OpenRequest = serde_json::from_slice(open).map_err(|_| codes::INVALID)?;
     let service = GitService::parse(&open.service).map_err(|_| codes::INVALID)?;
@@ -346,9 +362,11 @@ async fn run_service(
             Vec::new(),
         )
     };
+    // A push is not killed with its session: see [`Service`]. A fetch
+    // writes no ref, so it is.
+    let drain = service == GitService::ReceivePack;
     let mut command = command;
-    // Never killed with its session: see [`Service`].
-    command.kill_on_drop(false);
+    command.kill_on_drop(!drain);
     let mut child = command.spawn().map_err(|_| codes::FAILED)?;
     let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         return Err(codes::FAILED);
@@ -356,6 +374,8 @@ async fn run_service(
     let mut service = Service {
         child: Some(child),
         stdout: Some(stdout),
+        drain,
+        slot: Some(slot),
     };
     sender
         .send(encode(ACCEPT, id, &accept))
@@ -405,16 +425,19 @@ async fn run_service(
 /// killed.
 const SERVICE_DRAIN: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// A session's git service. When the session ends before it does (a
-/// `CLOSE`, a lost link), the service is not killed: `SIGKILL` during a
-/// receive-pack's ref update leaves the ref's `.lock` behind for good,
-/// and every later write to that ref fails. Its input is closed instead
-/// and its output drained, so it ends on its own: a push received whole
-/// still lands, a partial one aborts without touching a ref. Only one
-/// still running after [`SERVICE_DRAIN`] is killed.
+/// A session's git service. When the session ends before a receive-pack
+/// does (a `CLOSE`, a lost link), it is not killed: `SIGKILL` during its
+/// ref update leaves the ref's `.lock` behind for good, and every later
+/// write to that ref fails. Its input is closed instead and its output
+/// drained, so it ends on its own: a push received whole still lands, a
+/// partial one aborts without touching a ref. Only one still running
+/// after [`SERVICE_DRAIN`] is killed. It holds its session's slot until
+/// it exits. An upload-pack is killed with its session.
 struct Service {
     child: Option<tokio::process::Child>,
     stdout: Option<tokio::process::ChildStdout>,
+    drain: bool,
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Drop for Service {
@@ -422,11 +445,16 @@ impl Drop for Service {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        if !self.drain {
+            // `kill_on_drop`.
+            return;
+        }
         let stdout = self.stdout.take();
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             // No runtime to wait on: the service runs on unattended.
             return;
         };
+        let slot = self.slot.take();
         runtime.spawn(async move {
             let drain = async {
                 if let Some(mut stdout) = stdout {
@@ -438,6 +466,7 @@ impl Drop for Service {
                 tracing::warn!("node git: a service outlived its session; killing it");
                 let _ = child.kill().await;
             }
+            drop(slot);
         });
     }
 }
