@@ -7,8 +7,9 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use serde_json::{json, Value};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Longest name or title cell, in characters.
+/// Widest text cell, in terminal columns.
 const MAX_CELL_CHARS: usize = 32;
 /// Most `workspace.list` pages read for local workspace titles.
 const MAX_TITLE_PAGES: usize = 50;
@@ -106,7 +107,7 @@ fn render_table(payload: &Value, titles: &HashMap<String, String>) -> String {
     let mut widths = [0; 6];
     for row in &table {
         for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.chars().count());
+            *width = (*width).max(cell.width());
         }
     }
     let mut out = String::new();
@@ -116,11 +117,15 @@ fn render_table(payload: &Value, titles: &HashMap<String, String>) -> String {
             if index > 0 {
                 line.push_str("  ");
             }
+            // Padded by terminal columns, so wide characters stay aligned.
             // MEMORY and PROCS are numbers: right-aligned.
+            let pad = " ".repeat(width.saturating_sub(cell.width()));
             if index >= 4 {
-                let _ = write!(line, "{cell:>width$}");
+                line.push_str(&pad);
+                line.push_str(cell);
             } else {
-                let _ = write!(line, "{cell:<width$}");
+                line.push_str(cell);
+                line.push_str(&pad);
             }
         }
         out.push_str(line.trim_end());
@@ -148,12 +153,12 @@ fn cells(row: &Value, titles: &HashMap<String, String>) -> [String; 6] {
             .get(workspace_id)
             .map_or(workspace_id, String::as_str),
     };
-    let provider = match (text("provider"), text("model")) {
+    let provider = cut(&match (text("provider"), text("model")) {
         (Some(provider), Some(model)) => format!("{provider} · {model}"),
         (Some(provider), None) => provider.to_owned(),
         (None, Some(model)) => model.to_owned(),
         (None, None) => "?".to_owned(),
-    };
+    });
     let owner = owner.map_or_else(
         || "this backend".to_owned(),
         |owner| {
@@ -179,11 +184,27 @@ fn short_id(id: &str) -> &str {
     id.char_indices().nth(8).map_or(id, |(end, _)| &id[..end])
 }
 
+/// A cell's text: control characters (escapes and newlines a backend could
+/// put in a label) become spaces, and a cell wider than
+/// [`MAX_CELL_CHARS`] columns is cut with an ellipsis.
 fn cut(value: &str) -> String {
-    if value.chars().count() <= MAX_CELL_CHARS {
-        return value.to_owned();
+    let value: String = value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if value.width() <= MAX_CELL_CHARS {
+        return value;
     }
-    let mut out: String = value.chars().take(MAX_CELL_CHARS - 1).collect();
+    let mut out = String::new();
+    let mut used = 0;
+    for c in value.chars() {
+        let width = c.width().unwrap_or(0);
+        if used + width > MAX_CELL_CHARS - 1 {
+            break;
+        }
+        used += width;
+        out.push(c);
+    }
     out.push('…');
     out
 }

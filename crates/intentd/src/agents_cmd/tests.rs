@@ -142,3 +142,58 @@ fn memory_is_shown_in_binary_units() {
     assert_eq!(format_bytes(524_288_000), "500 MiB");
     assert_eq!(format_bytes(12_884_901_888), "12.0 GiB");
 }
+
+/// Labels come from another backend: control characters (terminal escapes,
+/// newlines) never reach the terminal, and the table keeps one line per row.
+#[test]
+fn control_characters_in_labels_are_replaced() {
+    let mut payload = payload();
+    payload["agents"] = json!([payload["agents"][0].clone()]);
+    payload["agents"][0]["agentName"] = json!("evil\u{1b}[2J\nname");
+    payload["agents"][0]["workspaceTitle"] = json!("tab\there");
+    payload["agents"][0]["model"] = json!("op\u{7}us");
+    payload["agents"][0]["remoteOwner"]["backendName"] = json!("St\u{9b}udio");
+    let table = render_table(&payload, &HashMap::new());
+    assert!(
+        !table.chars().any(|c| c.is_control() && c != '\n'),
+        "{table:?}"
+    );
+    assert_eq!(table.lines().count(), 4, "{table}");
+    let row = table.lines().nth(1).unwrap();
+    assert!(row.starts_with("evil [2J name  tab here"), "{row:?}");
+    assert!(row.contains("claude-code · op us"), "{row:?}");
+    assert!(row.contains("for St udio"), "{row:?}");
+}
+
+/// Wide characters take two terminal columns: the columns after them stay
+/// aligned, and a long wide label is cut to the column budget.
+#[test]
+fn wide_characters_keep_columns_aligned() {
+    let mut payload = payload();
+    payload["agents"] = json!([payload["agents"][0].clone(), payload["agents"][1].clone()]);
+    payload["agents"][0]["agentName"] = json!("修复登录");
+    let table = render_table(&payload, &titles());
+    let lines: Vec<&str> = table.lines().collect();
+    let column = |line: &str, needle: &str| {
+        unicode_width::UnicodeWidthStr::width(&line[..line.find(needle).unwrap()])
+    };
+    assert_eq!(
+        column(lines[1], "Auth work"),
+        column(lines[0], "WORKSPACE"),
+        "{table}"
+    );
+    assert_eq!(
+        column(lines[2], "Billing"),
+        column(lines[0], "WORKSPACE"),
+        "{table}"
+    );
+
+    payload["agents"][0]["agentName"] = json!("长".repeat(40));
+    let table = render_table(&payload, &titles());
+    let name = table.lines().nth(1).unwrap().split("  ").next().unwrap();
+    assert!(name.ends_with('…'), "{name}");
+    assert!(
+        unicode_width::UnicodeWidthStr::width(name) <= MAX_CELL_CHARS,
+        "{name}"
+    );
+}
