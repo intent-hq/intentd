@@ -126,7 +126,10 @@ fn url_credentials_and_bearer_tokens_are_redacted() {
     assert!(!out.contains("ghs_abc"), "{out}");
     assert!(!out.contains("eyJhbGciOi"), "{out}");
     assert!(out.contains("@github.com/o/r.git"), "{out}");
-    assert!(out.contains("Bearer"), "{out}");
+    assert!(
+        out.ends_with(&format!("-H Authorization: {REDACTED}")),
+        "{out}"
+    );
 }
 
 /// Ordinary command lines are unchanged; a trailing secret flag with no
@@ -140,4 +143,49 @@ fn ordinary_arguments_are_unchanged() {
     assert_eq!(redact(&["tool", "--token"]), "tool --token");
     assert_eq!(redact(&["tool", "{not json", "[1,"]), "tool {not json [1,");
     assert_eq!(redact(&[]), "");
+}
+
+/// Header-shaped arguments (`Name: value`, with or without the space) hide
+/// secret-named headers and any `Bearer` / `Basic` credential, including
+/// one quoted inside a config string; ordinary headers stay.
+#[test]
+fn secret_headers_are_redacted() {
+    for arg in [
+        "Authorization:Bearer abc",
+        "Authorization: token abc",
+        "X-Api-Key: abc",
+        "mcp_servers.intent.http_headers={Authorization=\"Bearer abc\"}",
+    ] {
+        let out = redact(&["npx", "mcp-remote", "--header", arg]);
+        assert!(!out.contains("abc"), "{arg} leaked: {out}");
+    }
+    assert_eq!(
+        redact(&["curl", "-H", "Content-Type: application/json"]),
+        "curl -H Content-Type: application/json"
+    );
+}
+
+/// Secret-named URL query parameters go, in free text and inside JSON; the
+/// rest of the URL stays.
+#[test]
+fn secret_url_query_parameters_are_redacted() {
+    assert_eq!(
+        redact(&["x", "--url", "https://h/mcp?token=abc&region=eu#top"]),
+        format!("x --url https://h/mcp?token={REDACTED}&region=eu#top")
+    );
+    let out = redact(&[r#"{"mcpServers":{"i":{"url":"https://h/mcp?api_key=abc"}}}"#]);
+    assert!(!out.contains("abc"), "{out}");
+    assert!(out.contains("https://h/mcp?api_key="), "{out}");
+}
+
+/// A flag whose `=` value is itself an assignment (`--env=GH_TOKEN=x`) and
+/// a JSON array mixing strings and other values keep the argument rules.
+#[test]
+fn nested_assignments_and_mixed_arrays_are_redacted() {
+    assert_eq!(
+        redact(&["docker", "run", "--env=GH_TOKEN=abc", "--env=LANG=C", "img"]),
+        format!("docker run --env=GH_TOKEN={REDACTED} --env=LANG=C img")
+    );
+    let out = redact(&[r#"{"args":["--api-key","abc",1]}"#]);
+    assert!(!out.contains("abc"), "{out}");
 }

@@ -17,8 +17,9 @@ pub(crate) const REDACTED: &str = "[redacted]";
 ///   string arrays get these same argument rules;
 /// - a secret-named flag hides its value (`--token x`, `--api-key=x`);
 /// - a secret-named assignment hides its value (`GH_TOKEN=x`);
-/// - URL credentials (`https://user:pass@host`) and `Bearer` / `Basic`
-///   credentials inside an argument are hidden.
+/// - a secret-named header (`Authorization: x`, `X-Api-Key:x`), URL
+///   credentials (`https://user:pass@host`, `?token=x`) and `Bearer` /
+///   `Basic` credentials inside an argument are hidden.
 pub(crate) fn redact_args(args: impl IntoIterator<Item = String>) -> String {
     let args: Vec<String> = args.into_iter().collect();
     redact_list(&args).join(" ")
@@ -63,9 +64,9 @@ fn redact_arg(arg: &str) -> String {
             if is_secret_name(bare) {
                 return format!("{name}={REDACTED}");
             }
-            if let Some(json) = redact_json_text(value) {
-                return format!("{name}={json}");
-            }
+            // The value gets the argument rules: JSON, a nested assignment
+            // (`--env=GH_TOKEN=x`), free text.
+            return format!("{name}={}", redact_arg(value));
         }
     }
     redact_inline(arg)
@@ -94,14 +95,26 @@ fn redact_json(value: &mut Value) {
                 }
             }
         }
-        Value::Array(items) if items.iter().all(Value::is_string) => {
-            let args: Vec<String> = items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_owned))
-                .collect();
-            *items = redact_list(&args).into_iter().map(Value::String).collect();
+        Value::Array(items) => {
+            // An argv-like array: a secret-named flag hides the next item.
+            let mut hide_next = false;
+            for item in items.iter_mut() {
+                if std::mem::take(&mut hide_next) && !item.is_null() {
+                    *item = Value::String(REDACTED.to_owned());
+                    continue;
+                }
+                if let Value::String(arg) = item {
+                    if flag_name(arg).is_some_and(|name| !arg.contains('=') && is_secret_name(name))
+                    {
+                        hide_next = true;
+                        continue;
+                    }
+                    *arg = redact_arg(arg);
+                } else {
+                    redact_json(item);
+                }
+            }
         }
-        Value::Array(items) => items.iter_mut().for_each(redact_json),
         Value::String(text) => *text = redact_inline(text),
         _ => {}
     }
@@ -117,17 +130,36 @@ fn hide_values(value: &mut Value) {
     }
 }
 
-/// URL credentials and `Bearer` / `Basic` credentials inside free text.
+/// Secret-named headers, URL credentials and secret query parameters, and
+/// `Bearer` / `Basic` credentials inside free text.
 fn redact_inline(text: &str) -> String {
+    if let Some(header) = redact_header(text) {
+        return header;
+    }
     let text = if text.contains("://") {
-        redact_url_userinfo(text)
+        redact_urls(text)
     } else {
         text.to_owned()
     };
     redact_auth_schemes(&text)
 }
 
-fn redact_url_userinfo(text: &str) -> String {
+/// A `Name: value` / `Name:value` header whose name is secret-named
+/// (`Authorization`, `X-Api-Key`), with its value hidden.
+fn redact_header(text: &str) -> Option<String> {
+    let (name, rest) = text.split_once(':')?;
+    let valid_name = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let value = rest.trim_start();
+    if !valid_name || rest.starts_with("//") || value.is_empty() || !is_secret_name(name) {
+        return None;
+    }
+    Some(format!("{}{REDACTED}", &text[..text.len() - value.len()]))
+}
+
+fn redact_urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(scheme_end) = rest.find("://") {
@@ -144,8 +176,37 @@ fn redact_url_userinfo(text: &str) -> String {
             None => out.push_str(&rest[..end]),
         }
         rest = &rest[end..];
+        let url_end = rest
+            .find([' ', '\t', '\n', '"', '\''])
+            .unwrap_or(rest.len());
+        out.push_str(&redact_query(&rest[..url_end]));
+        rest = &rest[url_end..];
     }
     out.push_str(rest);
+    out
+}
+
+/// A URL's path, query and fragment with secret-named query values hidden.
+fn redact_query(tail: &str) -> String {
+    let Some((path, query)) = tail.split_once('?') else {
+        return tail.to_owned();
+    };
+    let (query, fragment) = match query.split_once('#') {
+        Some((query, fragment)) => (query, Some(fragment)),
+        None => (query, None),
+    };
+    let params: Vec<String> = query
+        .split('&')
+        .map(|param| match param.split_once('=') {
+            Some((key, _)) if is_secret_name(key) => format!("{key}={REDACTED}"),
+            _ => param.to_owned(),
+        })
+        .collect();
+    let mut out = format!("{path}?{}", params.join("&"));
+    if let Some(fragment) = fragment {
+        out.push('#');
+        out.push_str(fragment);
+    }
     out
 }
 
@@ -159,7 +220,9 @@ fn redact_auth_schemes(text: &str) -> String {
             out.push(REDACTED);
             continue;
         }
-        hide_next = word.eq_ignore_ascii_case("bearer") || word.eq_ignore_ascii_case("basic");
+        // `Bearer`, also glued to a quote or `=` (`Authorization="Bearer x"`).
+        let scheme = word.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+        hide_next = scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic");
         out.push(word);
     }
     out.join(" ")
