@@ -13,6 +13,7 @@
 //! call sites read as before. [`RuntimeServicesExt`] is the part the daemon
 //! calls directly.
 
+mod archive_runner;
 mod browser_tabs;
 mod hook_manager;
 mod host_execution;

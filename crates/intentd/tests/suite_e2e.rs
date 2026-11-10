@@ -14,6 +14,7 @@ mod common;
 
 mod auggie_context_e2e;
 mod durable_command;
+mod e2e_archive_script;
 mod e2e_config_precedence;
 mod e2e_core_cli_commands;
 mod e2e_core_hermetic_workspaces_guard;

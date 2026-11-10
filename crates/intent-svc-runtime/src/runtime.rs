@@ -31,7 +31,8 @@ use crate::{
     browser_tabs, hook_manager, script_ops, script_output_store, setup_runner, terminal_ops,
 };
 use intent_services::feature_api::feature_ports::{
-    CommandScriptActivity, RuntimePort, ScriptsClosing, SetupScriptRun,
+    ArchiveScriptOutcome, ArchiveScriptRun, CommandScriptActivity, RuntimePort, ScriptsClosing,
+    SetupScriptRun,
 };
 use intent_services::feature_api::{
     browser_ops, capability, record_setup_running, write_private_script, Services,
@@ -1507,6 +1508,14 @@ impl RuntimePort for RuntimeFeature {
                 }
             }
         })
+    }
+
+    fn run_archive_script(
+        &self,
+        _svc: &Services,
+        run: ArchiveScriptRun,
+    ) -> BoxFuture<'static, ArchiveScriptOutcome> {
+        Box::pin(crate::archive_runner::run(run))
     }
 
     fn active_hooks_for_agent<'a>(

@@ -3863,6 +3863,48 @@ async fn agent_triggered_revive_leaves_the_purge_notice_pending_for_other_agents
     );
 }
 
+/// After an archive script ran, every agent's first turn (which starts only
+/// once the workspace is unarchived) is told once, with the outcome and the
+/// pointer to `.intent/config.json`; later turns carry nothing.
+#[tokio::test]
+async fn archive_script_notice_reaches_each_agents_next_turn_once() {
+    let (_tmp, mgr, _bus) = manager_with_bus_in(None).await;
+    let ws = WorkspaceId::from("ws-archive-script-notice");
+    let agent = AgentId::from("a-archive-script");
+    seed_agent(&mgr, &ws, &agent).await;
+    mgr.services
+        .leave_archive_script_notice(
+            &ws,
+            crate::feature_ports::ArchiveScriptOutcome::Failed { exit_code: Some(7) },
+        )
+        .await;
+
+    let notices = |prompt: &serde_json::Value| {
+        serde_json::to_string(prompt)
+            .unwrap()
+            .matches("Intent ran the repository's `archiveScript` from `.intent/config.json`")
+            .count()
+    };
+    let next_prompt = || async {
+        assert!(mgr.try_begin(&agent, &ws).await, "claim wins");
+        let prompt = mgr
+            .build_turn_prompt(&agent, &ws, "hello", &super::TurnOptions::default())
+            .await
+            .unwrap();
+        mgr.end_turn(&agent).await;
+        serde_json::to_value(prompt).unwrap()
+    };
+    let first = next_prompt().await;
+    assert_eq!(notices(&first), 1, "told once: {first}");
+    assert!(
+        first
+            .to_string()
+            .contains("Archive script failed (exit code 7)."),
+        "names the outcome: {first}"
+    );
+    assert_eq!(notices(&next_prompt().await), 0, "one-shot");
+}
+
 /// A manual unarchive of a purged workspace starts no turn, writes no
 /// transcript row, and leaves the notice pending (durably, on the session
 /// row) for every agent; each agent's next turn carries it exactly once and

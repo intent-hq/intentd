@@ -972,12 +972,21 @@ not hide the workspace for collaborators or mark its work complete.
 
 ## Archive, auto-archive and disk cleanup
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, workspace.update `autoArchiveDisabled`, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, workspace.update `autoArchiveDisabled`, packages/intentd/crates/intent-services/src/{archive_script,auto_archive,retire,auto_retire,local_work}.rs. -->
 
 In **Home → Workspaces**, right-click a workspace and choose **Archive**.
 Archiving stops its agents, hooks and PR monitors and keeps its folder. Archived
 workspaces appear under the **Archived** filter. Choose **Unarchive**, or send an
 agent a message, to continue.
+
+If the repository's `.intent/config.json` sets `archiveScript`, Intent runs it once
+in the workspace folder when the workspace stops being active: when it is archived,
+or when an active workspace is deleted or purged (before the folder is removed).
+Deleting or purging an archived workspace does not run it again. Unarchiving does
+not rerun the setup script; instead, each agent's first message after unarchiving
+tells it the archive script ran and to check `.intent/config.json` if the workspace
+needs to be set up again. If the script fails or runs longer than 10 minutes, the
+workspace is still archived and its card's status shows the failure.
 
 Intent can archive idle workspaces automatically. It is off by default; turn on
 **Workspace setup → Archive idle workspaces** (`/settings?tab=setup#git-workspace`)

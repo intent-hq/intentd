@@ -61,6 +61,7 @@ mod agent_session;
 mod agent_subscriptions;
 mod agent_wake;
 mod agent_workers;
+mod archive_script;
 mod auto_archive;
 mod auto_retire;
 mod executor_capabilities;
@@ -724,6 +725,9 @@ pub struct Services {
     /// started at create time can observe it. In-memory only — a workspace
     /// absent from the map reads `unknown` — shared across clones.
     workspace_setup_states: WorkspaceSetupStates,
+    /// Per-workspace gates held while an `archiveScript` runs, so a delete or
+    /// purge waits for it before removing the folder.
+    archive_script_gates: archive_script::ArchiveScriptGates,
     /// Daemon-global parent→child completion-watch registry (AS-2). One table
     /// for all workspaces: each watch/group carries its own workspace anchors
     /// (parent home + child workspace), so the same code path serves
@@ -1771,6 +1775,7 @@ impl Services {
             auto_commit_cooldowns: Arc::new(Mutex::new(HashMap::new())),
             worktree_presence: worktree_presence::WorktreePresence::default(),
             workspace_setup_states: WorkspaceSetupStates::default(),
+            archive_script_gates: archive_script::ArchiveScriptGates::default(),
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
@@ -18510,6 +18515,7 @@ impl Services {
             let branch_auto_generated_bg = branch_auto_generated;
             #[cfg(all(test, unix))]
             let cleanup_gate = services.pending_delete_test_gate.clone();
+            let services_bg = services.clone();
             let cleanup_task = services.store_tasks.spawn_draining(async move {
                 #[cfg(all(test, unix))]
                 cleanup_gate.pause("background", &id_bg.0).await;
@@ -18523,6 +18529,35 @@ impl Services {
                 known_completion &=
                     matches!(&recreated_observation, Ok(_) | Err(Error::NotFound(_)));
                 let recreated = recreated_observation.ok();
+                // Archive script (intent-hq/intent#8850): an Active workspace
+                // runs it now, before its folder goes; an archived one ran it
+                // at archive time, so only wait for a run still going. A
+                // same-slug recreate that reuses the folder owns it now.
+                let folder_reused = recreated.as_ref().is_some_and(|r| {
+                    ws_for_cleanup
+                        .as_ref()
+                        .is_some_and(|w| r.worktree_path == w.worktree_path)
+                });
+                if !folder_reused {
+                    match ws_for_cleanup
+                        .as_ref()
+                        .filter(|w| !w.archived && !w.is_retired())
+                    {
+                        Some(active) => {
+                            if let Some(claimed) = services_bg
+                                .claim_archive_script(
+                                    active,
+                                    feature_ports::ArchiveScriptTrigger::Delete,
+                                )
+                                .await
+                            {
+                                services_bg.run_claimed_archive_script(claimed, false).await;
+                            }
+                        }
+                        None => services_bg.wait_for_archive_script(&id_bg).await,
+                    }
+                }
+                services_bg.forget_archive_script_gate(&id_bg);
                 // Plain folders (§5.1 "Plain-folder workspaces") are never
                 // deleted. The `<parent>/<id>` candidates are derived from
                 // the id and the roots alone (intent-hq/intent#6229), so a
@@ -39344,6 +39379,20 @@ impl Services {
         caller_agent_id: Option<AgentId>,
         automatic: bool,
     ) -> BoxFuture<'_, Result<Option<Workspace>>> {
+        self.archive_workspace_inner(id, caller_agent_id, automatic, true)
+    }
+
+    /// [`Self::archive_workspace_with_mode`]; with `run_archive_script` the
+    /// committed archive starts the workspace's `archiveScript` in the
+    /// background. Retire passes `false`: it runs the script itself, and
+    /// waits for it, before it removes the folder.
+    pub(crate) fn archive_workspace_inner(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+        automatic: bool,
+        run_archive_script: bool,
+    ) -> BoxFuture<'_, Result<Option<Workspace>>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let this = self.clone();
@@ -39589,6 +39638,23 @@ impl Services {
                         ),
                     )
                     .await;
+                }
+                // The gate is taken before the caller sees the archived
+                // row, so a delete or purge right after waits for the run.
+                let claimed = if run_archive_script && still_archived {
+                    this.claim_archive_script(
+                        &ws,
+                        feature_ports::ArchiveScriptTrigger::Archive,
+                    )
+                    .await
+                } else {
+                    None
+                };
+                if let Some(claimed) = claimed {
+                    let runner = this.clone();
+                    let _ = this.store_tasks.spawn_draining(async move {
+                        runner.run_claimed_archive_script(claimed, true).await;
+                    });
                 }
                 ws
             });

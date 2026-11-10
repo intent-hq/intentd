@@ -172,9 +172,11 @@ impl Services {
         // cancel hooks / PR monitors / script monitors, detach guests) and
         // its `workspace:updated` archived delta. An already-archived
         // workspace went through it when it was archived.
+        // The archive script runs below, right before the folder goes.
         if !current.archived {
-            intent_core::WorkspaceApi::archive_workspace(self, id.clone(), caller_agent_id.clone())
-                .await?;
+            self.archive_workspace_inner(id.clone(), caller_agent_id.clone(), false, false)
+                .await?
+                .ok_or_else(|| Error::Internal("manual archive refused".into()))?;
         }
         // Same fence as archive ↔ unarchive, held from before the script
         // stop through the whole destructive tail (flip, uploads, agents,
@@ -319,6 +321,16 @@ impl Services {
         }
         if let Some(worktree) = git_ops::worktree_path(&ws) {
             self.git_status_cache.evict(&worktree);
+        }
+        // An Active workspace runs its archive script here, with its agents
+        // and terminals stopped; an archived one ran it at archive time.
+        if current.archived {
+            self.wait_for_archive_script(&id).await;
+        } else if let Some(claimed) = self
+            .claim_archive_script(&ws, crate::feature_ports::ArchiveScriptTrigger::Retire)
+            .await
+        {
+            self.run_claimed_archive_script(claimed, true).await;
         }
         self.remove_retired_checkout(&ws, fence).await;
         let mut ws = ws;
