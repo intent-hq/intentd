@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.170] - 2026-11-10
+
+### 🚀 Features
+
+- *(specialists)* Add bundled Maintenance Coordinator specialist (harness 3.10) ([#3236](https://github.com/intent-hq/intentd/pull/3236))
+- *(node-link)* Send display labels on launch and show them for hosted agents ([#3238](https://github.com/intent-hq/intentd/pull/3238))
+
+### 🐛 Bug Fixes
+
+- Enable released inline visuals for new agents ([#3240](https://github.com/intent-hq/intentd/pull/3240))
+
+### 🧪 Testing
+
+- Wait for the agent's own stream end in remote launch e2e tests ([#3237](https://github.com/intent-hq/intentd/pull/3237))
+
+
 ## [0.11.169] - 2026-11-10
 
 ### 🐛 Bug Fixes
