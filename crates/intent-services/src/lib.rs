@@ -18525,15 +18525,13 @@ impl Services {
                 // the branch and directory now. Still sweep the
                 // `<workspaces_root>/<id>/` directory if it doesn't match the
                 // recreated workspace's path, for orphan-cleanup parity.
-                let recreated_observation = store_bg.get_workspace(&id_bg).await;
-                known_completion &=
-                    matches!(&recreated_observation, Ok(_) | Err(Error::NotFound(_)));
-                let recreated = recreated_observation.ok();
                 // Archive script (intent-hq/intent#8850): an Active workspace
                 // runs it now, before its folder goes; an archived one ran it
                 // at archive time, so only wait for a run still going. A
-                // same-slug recreate that reuses the folder owns it now.
-                let folder_reused = recreated.as_ref().is_some_and(|r| {
+                // same-slug recreate that already reuses the folder owns it.
+                // Runs BEFORE the recreate check below, which must see a
+                // recreate that landed while the script ran.
+                let folder_reused = store_bg.get_workspace(&id_bg).await.ok().is_some_and(|r| {
                     ws_for_cleanup
                         .as_ref()
                         .is_some_and(|w| r.worktree_path == w.worktree_path)
@@ -18558,6 +18556,10 @@ impl Services {
                     }
                 }
                 services_bg.forget_archive_script_gate(&id_bg);
+                let recreated_observation = store_bg.get_workspace(&id_bg).await;
+                known_completion &=
+                    matches!(&recreated_observation, Ok(_) | Err(Error::NotFound(_)));
+                let recreated = recreated_observation.ok();
                 // Plain folders (§5.1 "Plain-folder workspaces") are never
                 // deleted. The `<parent>/<id>` candidates are derived from
                 // the id and the roots alone (intent-hq/intent#6229), so a
@@ -36143,7 +36145,7 @@ impl Services {
         let (flipped, revived) = {
             let _fence = match held_fence {
                 Some(fence) => fence,
-                None => self.archive_fence.acquire(&id).await,
+                None => self.archive_fence_after_archive_script(&id).await,
             };
             let current = store.get_workspace(&id).await?;
             if current.is_retired() {
@@ -36328,7 +36330,10 @@ impl Services {
             return None;
         }
         match self.store.get_workspace(workspace_id).await {
-            Ok(ws) if ws.archived => Some(self.archive_fence.acquire(workspace_id).await),
+            // Waits for a running archive script: this turn may unarchive.
+            Ok(ws) if ws.archived => {
+                Some(self.archive_fence_after_archive_script(workspace_id).await)
+            }
             _ => None,
         }
     }
@@ -39425,6 +39430,10 @@ impl Services {
             // tail never drops a message a CURRENT member queued nor
             // announces the removal of a member who is seated again.
             let fence = this.archive_fence.acquire(&id).await;
+            // The archive script runs only on a real Active → Archived flip,
+            // decided under the fence so a repeated or concurrent archive
+            // never reruns the cleanup.
+            let leaves_active = run_archive_script && !store.get_workspace(&id).await?.archived;
             let now = now_iso();
             // Archiving removes guests: the Archived flip, every non-owner
             // membership delete and every open-invite revoke commit in ONE
@@ -39641,7 +39650,7 @@ impl Services {
                 }
                 // The gate is taken before the caller sees the archived
                 // row, so a delete or purge right after waits for the run.
-                let claimed = if run_archive_script && still_archived {
+                let claimed = if leaves_active && still_archived {
                     this.claim_archive_script(
                         &ws,
                         feature_ports::ArchiveScriptTrigger::Archive,

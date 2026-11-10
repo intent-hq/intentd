@@ -192,12 +192,21 @@ async fn archive_runs_archive_script_once_in_the_workspace_folder() {
         expected_line(&worktree, &branch)
     );
 
-    // Deleting the archived workspace does not run the script a second time.
+    // Archiving again, then deleting, does not run the script a second time.
+    // A rerun would hold the gate the delete waits on before removing the
+    // folder, so it would land before the folder is gone.
+    daemon
+        .rpc(5, "workspace.archive", json!({ "workspaceId": id }))
+        .await;
     daemon
         .rpc(4, "workspace.delete", json!({ "workspaceId": id }))
         .await;
     eventually("folder removed", || !worktree.exists()).await;
-    assert_eq!(marker_lines(&marker).len(), 1, "script re-ran on delete");
+    assert_eq!(
+        marker_lines(&marker).len(),
+        1,
+        "script re-ran on re-archive or delete"
+    );
 
     let log = std::fs::read_to_string(daemon.log_path()).unwrap_or_default();
     assert!(
@@ -277,5 +286,33 @@ async fn failing_archive_script_still_archives_and_shows_the_failure_on_the_card
     assert!(
         log.contains("cleanup broke"),
         "script output tail not logged"
+    );
+}
+
+#[tokio::test]
+async fn unarchive_waits_for_a_running_archive_script() {
+    let marker_dir = common::test_tempdir("archscript-marker-");
+    let marker = marker_dir.path().join("runs.log");
+    let script = format!(
+        // timing-guard: the script must still be running when unarchive is called
+        "printf start >> '{m}'; sleep 2; printf ' end' >> '{m}'",
+        m = marker.display()
+    );
+    let repo = repo_with_archive_script(&script);
+    let daemon = Daemon::start().await;
+    let (id, _worktree) = daemon.create_workspace(repo.path()).await;
+
+    daemon
+        .rpc(3, "workspace.archive", json!({ "workspaceId": id }))
+        .await;
+    eventually("archive script started", || marker.exists()).await;
+    let unarchived = daemon
+        .rpc(4, "workspace.unarchive", json!({ "workspaceId": id }))
+        .await;
+    assert_eq!(unarchived["workspace"]["archived"], json!(false));
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap_or_default(),
+        "start end",
+        "unarchive returned while the archive script was still running"
     );
 }

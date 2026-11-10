@@ -4,7 +4,11 @@
 //! or automatic), on delete of an Active workspace, and on purge (retire) of
 //! an Active workspace. Deleting or purging an already archived workspace
 //! does not run it again, but waits for a run that is still going so the
-//! folder outlives it. A failed run never blocks the lifecycle step; for
+//! folder outlives it. Unarchive also waits for it, so work never resumes
+//! while the cleanup is still running. A run is claimed only under the
+//! workspace's archive fence (archive tail, retire) or after the row is gone
+//! (delete), so "fence held and gate free" means no run starts until the
+//! fence is released. A failed run never blocks the lifecycle step; for
 //! archive and purge it is shown on the workspace card (`statusMessage`).
 
 use std::collections::HashMap;
@@ -38,10 +42,16 @@ impl ArchiveScriptGates {
     }
 }
 
-/// A resolved run that already holds its workspace's gate.
+/// A resolved run with its workspace's gate: held when it was free, else
+/// taken once the run still in progress ends.
 pub(crate) struct ClaimedArchiveScript {
     run: ArchiveScriptRun,
-    gate: OwnedMutexGuard<()>,
+    gate: GateClaim,
+}
+
+enum GateClaim {
+    Held(OwnedMutexGuard<()>),
+    Busy(Arc<tokio::sync::Mutex<()>>),
 }
 
 impl Services {
@@ -68,7 +78,12 @@ impl Services {
             .archive_script
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())?;
-        let gate = self.archive_script_gates.gate(&ws.id).lock_owned().await;
+        // Never waits here: callers may hold the archive fence.
+        let gate = self.archive_script_gates.gate(&ws.id);
+        let gate = match gate.clone().try_lock_owned() {
+            Ok(guard) => GateClaim::Held(guard),
+            Err(_) => GateClaim::Busy(gate),
+        };
         Some(ClaimedArchiveScript {
             run: ArchiveScriptRun {
                 workspace_id: ws.id.clone(),
@@ -91,6 +106,10 @@ impl Services {
         report_on_card: bool,
     ) -> ArchiveScriptOutcome {
         let ClaimedArchiveScript { run, gate } = claimed;
+        let gate = match gate {
+            GateClaim::Held(guard) => guard,
+            GateClaim::Busy(gate) => gate.lock_owned().await,
+        };
         let workspace_id = run.workspace_id.clone();
         let trigger = run.trigger;
         let outcome = self.ports.runtime().run_archive_script(self, run).await;
@@ -174,6 +193,24 @@ impl Services {
     /// Wait until no archive script is running for `id`.
     pub(crate) async fn wait_for_archive_script(&self, id: &WorkspaceId) {
         drop(self.archive_script_gates.gate(id).lock_owned().await);
+    }
+
+    /// The archive fence for an unarchive: taken only once no archive script
+    /// runs, so agents never resume while the cleanup is still going. Waits
+    /// without the fence; a run claimed meanwhile (under the fence) is
+    /// waited for in turn.
+    pub(crate) async fn archive_fence_after_archive_script(
+        &self,
+        id: &WorkspaceId,
+    ) -> crate::ArchiveFenceGuard {
+        loop {
+            self.wait_for_archive_script(id).await;
+            let fence = self.archive_fence.acquire(id).await;
+            if self.archive_script_gates.gate(id).try_lock().is_ok() {
+                return fence;
+            }
+            drop(fence);
+        }
     }
 
     /// Drop `id`'s gate once the workspace is deleted.

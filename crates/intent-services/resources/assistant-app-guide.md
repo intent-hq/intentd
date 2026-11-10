@@ -982,8 +982,8 @@ agent a message, to continue.
 If the repository's `.intent/config.json` sets `archiveScript`, Intent runs it once
 in the workspace folder when the workspace stops being active: when it is archived,
 or when an active workspace is deleted or purged (before the folder is removed).
-Deleting or purging an archived workspace does not run it again. Unarchiving does
-not rerun the setup script; instead, each agent's first message after unarchiving
+Deleting or purging an archived workspace does not run it again. Unarchiving waits
+for a script that is still running, and does not rerun the setup script; instead, each agent's first message after unarchiving
 tells it the archive script ran and to check `.intent/config.json` if the workspace
 needs to be set up again. If the script fails or runs longer than 10 minutes, the
 workspace is still archived and its card's status shows the failure.
