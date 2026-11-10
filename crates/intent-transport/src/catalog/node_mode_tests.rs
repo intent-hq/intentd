@@ -109,6 +109,7 @@ fn node_mode_list_is_the_documented_list() {
     assert_eq!(
         listed,
         [
+            "agent.memoryUsage",
             "client.hello",
             "executor.invite.create",
             "executor.list",
@@ -135,6 +136,7 @@ fn node_mode_list_is_the_documented_list() {
 #[test]
 fn node_mode_lookup_denies_by_default() {
     for method in [
+        "agent.memoryUsage",
         "client.hello",
         "system.status",
         "executor.mint",

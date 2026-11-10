@@ -1075,6 +1075,10 @@ pub fn node_mode_error_data(detail: &str) -> serde_json::Value {
 /// frame list is a second, separate opt-in.
 pub const NODE_MODE_METHODS: &[(&str, &str)] = &[
     (
+        "agent.memoryUsage",
+        "Owner: the hosted agents' memory (`intentd agents`, the Agent memory dialog).",
+    ),
+    (
         "client.hello",
         "Session handshake; every client sends it first.",
     ),

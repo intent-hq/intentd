@@ -135,6 +135,49 @@ fn workspace_titles_read_each_page() {
     );
 }
 
+/// Agents keep running in archived workspaces, so every `workspace.list`
+/// page asks for archived workspaces too, and the next-page request keeps
+/// asking.
+#[tokio::test]
+async fn workspace_titles_include_archived_workspaces() {
+    let mut requests = Vec::new();
+    let titles = collect_titles(|params: Value| {
+        requests.push(params.clone());
+        let archived = params["includeArchived"] == json!(true);
+        let page = match (params["nextToken"].as_str(), archived) {
+            (None, true) => json!({
+                "workspaces": [{ "id": "ws-live", "title": "Live" }],
+                "nextToken": "p2",
+            }),
+            (Some("p2"), true) => json!({
+                "workspaces": [{ "id": "ws-archived", "title": "Old work" }],
+            }),
+            _ => json!({ "workspaces": [{ "id": "ws-live", "title": "Live" }] }),
+        };
+        async move { Ok(page) }
+    })
+    .await;
+    assert_eq!(
+        titles,
+        HashMap::from([
+            ("ws-live".to_owned(), "Live".to_owned()),
+            ("ws-archived".to_owned(), "Old work".to_owned()),
+        ])
+    );
+    assert_eq!(requests.len(), 2, "{requests:?}");
+}
+
+/// A refused or failed `workspace.list` (node mode) leaves the titles empty,
+/// so rows show their ids.
+#[tokio::test]
+async fn workspace_titles_stop_on_a_refusal() {
+    let titles = collect_titles(|_| async {
+        Err::<Value, _>("workspace.list failed: Not available in node mode".to_owned())
+    })
+    .await;
+    assert!(titles.is_empty());
+}
+
 #[test]
 fn memory_is_shown_in_binary_units() {
     assert_eq!(format_bytes(512), "512 B");

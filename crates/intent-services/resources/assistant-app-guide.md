@@ -1412,7 +1412,8 @@ version differs from this guide; do not infer launcher support from daemon versi
 
 `intentd agents` lists the daemon's running agents: name, workspace, provider and
 model, owner, memory and process count, then the total and sample time. `--json`
-prints the raw data.
+prints the raw data, with secret values in process command lines replaced by
+`[redacted]`. It also works on a machine in node mode (`intentd serve --node`).
 
 If note or chat writes fail with a code 267 error ("database disk image is malformed", or
 "fts5: corruption ..." on newer builds), run
