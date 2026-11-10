@@ -21,9 +21,9 @@ use intent_core::machine_selection::{
 use intent_core::machines::ExposedMachine;
 use intent_core::node_link::MachineCapabilities;
 use intent_core::node_link::{
-    FinalPush, ForgeFetchLaunch, ForgeLaunch, GitIdentity, LaunchCommand, LaunchProfileEnv,
-    MachineName, PreparedCheckout, SetupCommand, SubmodulePin, MCP_PROXY_PROTOCOL,
-    PREPARED_CHECKOUT_PROTOCOL, SHARED_CHECKOUT_PROTOCOL,
+    FinalPush, ForgeFetchLaunch, ForgeLaunch, GitIdentity, LaunchCommand, LaunchLabels,
+    LaunchProfileEnv, MachineName, PreparedCheckout, SetupCommand, SubmodulePin,
+    MCP_PROXY_PROTOCOL, PREPARED_CHECKOUT_PROTOCOL, SHARED_CHECKOUT_PROTOCOL,
 };
 use intent_core::placement::{
     AgentPlacement, MachineRef, PlacementCheckout, PlacementTarget, PlacementUnavailable,
@@ -1232,6 +1232,12 @@ impl RemoteLaunchPort for RemoteLaunch {
             } else {
                 None
             };
+            let workspace_title = svc
+                .store()
+                .get_workspace(&record.workspace_id)
+                .await
+                .ok()
+                .map(|workspace| workspace.title);
             let runtime = node
                 .launch(LaunchCommand {
                     agent_id: agent_id.clone(),
@@ -1257,6 +1263,12 @@ impl RemoteLaunchPort for RemoteLaunch {
                     harness_version: Some(
                         harness::launch_harness_version(session.harness_version.as_str()).into(),
                     ),
+                    // Every launch, so a rename shows on the machine after
+                    // the next one.
+                    labels: Box::new(LaunchLabels::new(
+                        Some(&session.name),
+                        workspace_title.as_deref(),
+                    )),
                 })
                 .await?;
             Ok(runtime as Arc<RemoteRuntime>)

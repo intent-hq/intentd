@@ -12093,6 +12093,8 @@ for line in sys.stdin:
             workspace_id: intent_core::WorkspaceId::from("ws-on-head"),
             provider: "claude-code".into(),
             model: Some("opus".into()),
+            agent_name: None,
+            workspace_title: None,
             owner: owner.clone(),
             root_pid,
         };

@@ -15,6 +15,7 @@ fn sharing(id: &str, owner: &str) -> LaunchCommand {
         git_identity: None,
         new_machine: None,
         harness_version: None,
+        labels: Box::default(),
         ..launch(id)
     }
 }

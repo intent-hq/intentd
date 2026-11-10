@@ -19591,7 +19591,7 @@ impl WorkspaceApi for Services {
             }
             // Agents this machine runs for other backends: no session row
             // here, so the row is what the launch said, tagged with the
-            // backend it runs for. No name (the launch carries none).
+            // backend it runs for, with the launch's display labels.
             for crate::agent_manager::RemoteAgentMemory {
                 agent,
                 mut processes,
@@ -19624,6 +19624,12 @@ impl WorkspaceApi for Services {
                 });
                 if let Some(model) = agent.model {
                     row["model"] = serde_json::Value::String(model);
+                }
+                if let Some(name) = agent.agent_name {
+                    row["agentName"] = serde_json::Value::String(name);
+                }
+                if let Some(title) = agent.workspace_title {
+                    row["workspaceTitle"] = serde_json::Value::String(title);
                 }
                 agents.push(row);
             }

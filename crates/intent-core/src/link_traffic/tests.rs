@@ -56,6 +56,7 @@ fn launch_frame() -> LinkFrame {
         git_identity: None,
         new_machine: None,
         harness_version: None,
+        labels: Box::default(),
         profile_env: Some(LaunchProfileEnv(json!({
             "providerRef": "claude-code@work",
             "fingerprint": "fp-1",
