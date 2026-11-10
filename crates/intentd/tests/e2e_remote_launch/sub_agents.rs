@@ -33,6 +33,31 @@ async fn agent_named(rpc_ws: &mut common::TlsWs, ws_id: &str, name: &str, id: i6
     }
 }
 
+/// Poll the agent until it is idle: its reply is recorded just before its
+/// turn ends, and retiring its parent is refused while that turn runs.
+async fn idle(rpc_ws: &mut common::TlsWs, (ws_id, agent_id): (&str, &str), id: i64) {
+    let mut id = id;
+    let idle = timeout(wait(), async {
+        loop {
+            id += 1;
+            let got = ok(
+                rpc_ws,
+                id,
+                "agent.get",
+                json!({ "workspaceId": ws_id, "agentId": agent_id }),
+            )
+            .await;
+            if got["agent"]["status"] == "idle" {
+                return;
+            }
+            // timing-guard: poll interval for the agent's turn to end (its end event may be consumed by another wait)
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(idle.is_ok(), "{agent_id} never went idle");
+}
+
 /// Poll `git show <rev>` in `repo` until it prints `want`.
 async fn shows(repo: &Path, rev: &str, want: &str) {
     let found = timeout(wait(), async {
@@ -287,6 +312,7 @@ async fn a_remote_agents_sub_agent_on_another_machine_starts_from_its_work() {
     let record = agent_record(&far_dir, &far.credential_id, &child_id);
     let checkout = agent_home(&far_dir, &far.credential_id, &child_id);
     assert!(checkout.exists(), "{}", checkout.display());
+    idle(&mut rpc_ws, (&ws_id, &child_id), 250).await;
     ok(
         &mut rpc_ws,
         300,
