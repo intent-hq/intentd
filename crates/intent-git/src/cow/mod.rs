@@ -8,7 +8,7 @@
 
 use intent_core::{Error, Result};
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -46,15 +46,13 @@ pub enum CowSupport {
     Unsupported,
 }
 
-/// Statistics from a successful [`cow_clone_with_excludes`] call, for
-/// attribution of slow clones in provisioning logs.
+/// Statistics from a successful [`cow_clone`] call, for attribution of slow
+/// clones in provisioning logs.
 #[derive(Debug, Default)]
-pub(crate) struct CowCloneStats {
+pub struct CowCloneStats {
     /// The whole tree was cloned with a single primitive call (macOS fast
-    /// path); no per-entry walk ran, so the other fields are all zero/empty.
+    /// path); no per-entry walk ran, so `subtree_timings` is empty.
     pub whole_tree: bool,
-    /// Directories skipped because they matched a caller exclusion.
-    pub skipped_excluded: u64,
     /// Per-subtree fast-path clone durations (root-relative path, duration),
     /// one entry per whole-directory clone during the best-effort walk.
     pub subtree_timings: Vec<(PathBuf, Duration)>,
@@ -65,7 +63,6 @@ impl From<best_effort::WalkStats> for CowCloneStats {
     fn from(stats: best_effort::WalkStats) -> Self {
         CowCloneStats {
             whole_tree: false,
-            skipped_excluded: stats.skipped_excluded,
             subtree_timings: stats.subtree_timings,
         }
     }
@@ -150,6 +147,9 @@ fn get_volume_pair(_src: &Path, _dst: &Path) -> Option<(u64, u64)> {
 /// nodes, nested mounts, per-entry unsupported errnos) with logging instead
 /// of failing the clone; real I/O errors on regular files still fail.
 ///
+/// Returns clone statistics (whole-tree fast path vs. walk, per-subtree
+/// timings) for provisioning logs.
+///
 /// `dst` must not exist. Never falls back to a byte copy — returns
 /// `Error::Unsupported` if `CoW` is unavailable. On failure, a partially
 /// cloned `dst` is removed best-effort (safe: `dst` did not exist on entry).
@@ -158,22 +158,7 @@ fn get_volume_pair(_src: &Path, _dst: &Path) -> Option<(u64, u64)> {
 /// - `Error::Unsupported` if `CoW` is not available for this (src, dst) pair
 /// - `Error::InvalidInput` if `dst` already exists or `src` doesn't exist
 /// - `Error::Internal` for other I/O failures
-pub fn cow_clone(src: &Path, dst: &Path) -> Result<()> {
-    cow_clone_with_excludes(src, dst, &[]).map(|_| ())
-}
-
-/// [`cow_clone`] with caller-supplied directory exclusions and clone
-/// statistics. `excludes` are repo-root-relative directory paths whose whole
-/// subtrees are left out of the clone; entries are sanitized first (see
-/// [`sanitize_excludes`]) — `.git`, the repo root, and non-relative paths are
-/// ignored with a warning. With a non-empty exclusion list the whole-tree
-/// fast path is skipped (it cannot exclude anything) and the best-effort walk
-/// runs directly, still fast-cloning subtrees without excluded descendants.
-pub(crate) fn cow_clone_with_excludes(
-    src: &Path,
-    dst: &Path,
-    excludes: &[String],
-) -> Result<CowCloneStats> {
+pub fn cow_clone(src: &Path, dst: &Path) -> Result<CowCloneStats> {
     if !src.exists() {
         return Err(Error::InvalidInput(format!(
             "source does not exist: {}",
@@ -193,20 +178,15 @@ pub(crate) fn cow_clone_with_excludes(
             ));
         }
     }
-    let excludes = sanitize_excludes(excludes);
-
     #[cfg(target_os = "macos")]
-    let result = macos::clone(src, dst, &excludes);
+    let result = macos::clone(src, dst);
     #[cfg(target_os = "linux")]
-    let result = linux::clone(src, dst, &excludes);
+    let result = linux::clone(src, dst);
     #[cfg(target_os = "windows")]
-    let result = {
-        let _ = &excludes;
-        windows::clone(src, dst).map(|()| CowCloneStats::default())
-    };
+    let result = windows::clone(src, dst).map(|()| CowCloneStats::default());
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let result: Result<CowCloneStats> = {
-        let _ = (src, dst, &excludes);
+        let _ = (src, dst);
         Err(Error::Unsupported(
             "CoW cloning is not supported on this platform".to_string(),
         ))
@@ -217,46 +197,7 @@ pub(crate) fn cow_clone_with_excludes(
         // clone; remove it so fallback provisioning finds a clean path.
         let _ = std::fs::remove_dir_all(dst);
     }
-    if let Ok(stats) = &result {
-        if stats.skipped_excluded > 0 {
-            tracing::info!(
-                src = %src.display(),
-                skipped_excluded = stats.skipped_excluded,
-                "cow_clone: skipped excluded directories"
-            );
-        }
-    }
     result
-}
-
-/// Sanitize caller-supplied exclusion entries into root-relative directory
-/// paths. Entries that are empty, name the repo root, are absolute, contain
-/// `.`/`..` components, or start with `.git` are ignored with a warning —
-/// excluding `.git` or the root would corrupt the checkout rather than speed
-/// it up.
-fn sanitize_excludes(excludes: &[String]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for raw in excludes {
-        let trimmed = raw.trim();
-        let path = Path::new(trimmed);
-        if trimmed.is_empty() || path.components().next().is_none() {
-            tracing::warn!(entry = %raw, "cow_clone: ignoring exclusion of the repo root");
-            continue;
-        }
-        if !path.components().all(|c| matches!(c, Component::Normal(_))) {
-            tracing::warn!(
-                entry = %raw,
-                "cow_clone: ignoring non-relative exclusion (absolute path or ./.. components)"
-            );
-            continue;
-        }
-        if path.components().next() == Some(Component::Normal(".git".as_ref())) {
-            tracing::warn!(entry = %raw, "cow_clone: ignoring exclusion of .git");
-            continue;
-        }
-        out.push(path.to_path_buf());
-    }
-    out
 }
 
 #[cfg(test)]
@@ -264,41 +205,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
-
-    #[test]
-    fn sanitize_excludes_drops_git_root_and_non_relative_entries() {
-        let raw = vec![
-            ".git".to_string(),
-            ".git/objects".to_string(),
-            String::new(),
-            "   ".to_string(),
-            ".".to_string(),
-            "..".to_string(),
-            "../outside".to_string(),
-            "/abs/path".to_string(),
-            "a/../b".to_string(),
-            "node_modules".to_string(),
-            "packages/big/cache".to_string(),
-        ];
-        let sanitized = sanitize_excludes(&raw);
-        assert_eq!(
-            sanitized,
-            vec![
-                PathBuf::from("node_modules"),
-                PathBuf::from("packages/big/cache")
-            ]
-        );
-    }
-
-    #[test]
-    fn sanitize_excludes_keeps_dotfile_dirs_other_than_git() {
-        let raw = vec![".cache".to_string(), ".gitignored".to_string()];
-        let sanitized = sanitize_excludes(&raw);
-        assert_eq!(
-            sanitized,
-            vec![PathBuf::from(".cache"), PathBuf::from(".gitignored")]
-        );
-    }
 
     #[test]
     fn test_cow_probe_same_volume() {

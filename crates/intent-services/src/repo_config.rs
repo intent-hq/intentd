@@ -541,7 +541,6 @@ mod tests {
                     auto_start: None,
                 },
             ]),
-            cow_clone_exclude: Some(vec!["node_modules".to_string()]),
             extra: BTreeMap::new(),
         };
 
@@ -556,7 +555,6 @@ mod tests {
         assert_eq!(read_config.run_script, config.run_script);
         assert_eq!(read_config.archive_script, config.archive_script);
         assert_eq!(read_config.scripts, config.scripts);
-        assert_eq!(read_config.cow_clone_exclude, config.cow_clone_exclude);
     }
 
     #[tokio::test]

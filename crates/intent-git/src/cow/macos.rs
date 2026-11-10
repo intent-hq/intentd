@@ -4,7 +4,7 @@
 use intent_core::{Error, Result};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::{CowCloneStats, CowSupport};
 
@@ -130,12 +130,7 @@ fn clone_file(src: &Path, dst: &Path) -> Result<()> {
     }
 }
 
-pub fn clone(src: &Path, dst: &Path, excludes: &[PathBuf]) -> Result<CowCloneStats> {
-    // A non-empty exclusion list rules out the whole-tree fast path (a single
-    // recursive clonefile cannot leave anything out), so walk directly.
-    if !excludes.is_empty() {
-        return walk(src, dst, excludes);
-    }
+pub fn clone(src: &Path, dst: &Path) -> Result<CowCloneStats> {
     match clone_tree_fast(src, dst) {
         Ok(()) => Ok(CowCloneStats {
             whole_tree: true,
@@ -164,7 +159,7 @@ pub fn clone(src: &Path, dst: &Path, excludes: &[PathBuf]) -> Result<CowCloneSta
                     ))
                 })?;
             }
-            walk(src, dst, excludes)
+            walk(src, dst)
         }
         Err(e) => Err(e),
     }
@@ -172,10 +167,9 @@ pub fn clone(src: &Path, dst: &Path, excludes: &[PathBuf]) -> Result<CowCloneSta
 
 /// Best-effort per-entry walk with `clone_tree_fast` as the subtree fast path:
 /// each directory below the root is first cloned whole, and only subtrees
-/// whose directory-level clone fails (or which hold an excluded descendant)
-/// are walked per-entry.
-fn walk(src: &Path, dst: &Path, excludes: &[PathBuf]) -> Result<CowCloneStats> {
-    super::best_effort::clone_tree(src, dst, clone_file, Some(clone_tree_fast), excludes)
+/// whose directory-level clone fails are walked per-entry.
+fn walk(src: &Path, dst: &Path) -> Result<CowCloneStats> {
+    super::best_effort::clone_tree(src, dst, clone_file, Some(clone_tree_fast))
         .map(CowCloneStats::from)
 }
 
@@ -262,7 +256,7 @@ mod tests {
 
         let listener = UnixListener::bind(src.join("live.sock")).expect("bind unix socket");
 
-        let stats = clone(&src, &dst, &[]).unwrap();
+        let stats = clone(&src, &dst).unwrap();
 
         assert!(
             stats.whole_tree,
