@@ -869,7 +869,8 @@ window finishes. Older clients may show the initial messages together.
 In **Home → Assistant**, click **New chat** at the top of the sidebar to start a
 chat; a blank chat is reused rather than duplicated. Select a thread in the
 sidebar to open it. To rename it, click its title in the conversation header.
-The title field uses the available header width. Press **Enter** or click away
+The title stays in place with the same text style while you edit, using the available
+header width. Press **Enter** or click away
 to save; press **Escape** to cancel. Sidebar titles select conversations and
 cannot be edited there.
 
