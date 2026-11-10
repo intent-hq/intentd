@@ -121,7 +121,7 @@ mod tests {
     fn golden_v3_10_maintenance_coordinator_bytes() {
         assert_eq!(
             sha256_hex(maintenance_coordinator()),
-            "084368bd55f21123920a41406acb5bb29c4ce432f814f87935bc46497c18c1ef"
+            "9c21e1ba7b65b2e02e868ba286288d98f5237a5da528441b87a16481f69a57f6"
         );
     }
 
@@ -180,6 +180,7 @@ mod tests {
             "`## Maintenance ledger`",
             r#"ws.agent.delegate({ taskNoteId: "<lane task note id>", specialist: "developer" })"#,
             r#"specialist: "pr-reviewer""#,
+            "Give each check its own task note",
             "**outside the primary checkout**",
             "`ws.git.registerRoot`",
             "ws.git.commit(message, { gitRootId })",

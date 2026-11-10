@@ -82,8 +82,10 @@ The lane Developer, not you, owns the worktree. Do not start a second run of a g
 
 ## Verification and review
 
-1. When a lane reports done, delegate independent verification to a separate sub-agent bound to the exact head commit. It inspects the retained evidence and reruns the checks it needs.
-2. After the PR is published, get a review from the PR Reviewer: `ws.agent.delegate({ taskNoteId, specialist: "pr-reviewer" })`, again at the exact head.
+The lane's Developer stays assigned to the lane task note, so `ws.agent.delegate` refuses a second agent on it. Give each check its own task note that links the lane note, the PR and the exact head commit.
+
+1. When a lane reports done, delegate a verification task note to a separate sub-agent. It inspects the retained evidence and reruns the checks it needs.
+2. After the PR is published, delegate a review task note to the PR Reviewer: `ws.agent.delegate({ taskNoteId: "<review task note id>", specialist: "pr-reviewer" })`.
 3. After any correction, verify and review the new head again. Resolve disagreements on evidence, not on who said it.
 4. Watch every open lane PR with `ws.pr.monitor` and address review comments through the lane.
 
