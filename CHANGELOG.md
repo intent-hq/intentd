@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.168] - 2026-11-10
+
+### 🚀 Features
+
+- *(specialists)* Expose the bundled baseline on overrides ([#3208](https://github.com/intent-hq/intentd/pull/3208))
+- *(harness)* Stable 3.10 machine list and remoteMachines.models lookup ([#3222](https://github.com/intent-hq/intentd/pull/3222))
+
+### 🐛 Bug Fixes
+
+- *(remote)* Ws.git.commit on a remote agent uses the backend's git identity ([#3231](https://github.com/intent-hq/intentd/pull/3231))
+- *(remote)* Turn off fetch recursion into a machine checkout's submodules ([#3232](https://github.com/intent-hq/intentd/pull/3232))
+
+### 🔧 Refactor
+
+- Remove cowCloneExclude and the dead CoW clone exclude path ([#3233](https://github.com/intent-hq/intentd/pull/3233))
+
+### 📚 Documentation
+
+- *(assistant-guide)* Describe the Auto-archive switch and Markdown preview label ([#3224](https://github.com/intent-hq/intentd/pull/3224))
+
+### 🧪 Testing
+
+- Make provider discovery payload tests hermetic ([#3227](https://github.com/intent-hq/intentd/pull/3227))
+
+
 ## [0.11.167] - 2026-11-09
 
 ### 🚀 Features
