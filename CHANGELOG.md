@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.177] - 2026-11-10
+
+### 🐛 Bug Fixes
+
+- *(proposals)* Never report a resolved proposal as pending ([#3260](https://github.com/intent-hq/intentd/pull/3260))
+
+
 ## [0.11.176] - 2026-11-10
 
 ### ⚙️ Miscellaneous Tasks
