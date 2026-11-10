@@ -316,6 +316,7 @@ remoteLinkTraffic.start
 remoteLinkTraffic.stop
 remoteMachines.add
 remoteMachines.backendInfo
+remoteMachines.claim
 remoteMachines.list
 remoteMachines.models
 remoteMachines.refresh

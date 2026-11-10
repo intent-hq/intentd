@@ -401,7 +401,7 @@ async fn executor_credentials_are_owner_only_over_wss() {
         "{unknown}"
     );
     let listed = rpc(&mut owner, 8, "executor.list", json!({})).await;
-    assert_eq!(listed["result"], json!({ "backends": [] }));
+    assert_eq!(listed["result"], json!({ "backends": [], "invites": [] }));
 
     let log = std::fs::read_to_string(daemon.data_dir.join("daemon.log")).unwrap_or_default();
     assert!(
