@@ -57,7 +57,20 @@ base64 = "0.23"
 # snapshot on `PromptResponse` (cumulative-per-session token counts).
 # `unstable_session_notices` keeps provider diagnostics separate from assistant text.
 agent-client-protocol = { version = "2.0", features = ["unstable_end_turn_token_usage", "unstable_session_notices"] }
-octocrab = "0.54"
+# octocrab 0.54.9 switched its default JWT backend to aws-lc-rs, whose aws-lc-sys
+# build needs NASM and breaks the x86_64-pc-windows-gnu cross lint. Keep the
+# pre-0.54.9 defaults (ring TLS, RustCrypto JWT) spelled out explicitly, and
+# re-check this list against octocrab's [features].default on every bump.
+octocrab = { version = "0.54.9", default-features = false, features = [
+    "default-client",
+    "follow-redirect",
+    "jwt-rust-crypto",
+    "retry",
+    "rustls",
+    "rustls-ring",
+    "timeout",
+    "tracing",
+] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 git2 = { version = "0.21", features = ["https", "ssh"] }
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
