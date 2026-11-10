@@ -35,6 +35,7 @@ use sqlx::Row;
 
 mod agents_cmd;
 mod client;
+mod cmdline_redact;
 #[cfg(unix)]
 mod command_evidence;
 mod db_repair;
@@ -4821,12 +4822,13 @@ fn descendant_tree_usage<K: Clone + Eq + std::hash::Hash>(
         },
         &|pid| {
             sys.process(pid).map_or_else(Default::default, |p| {
-                let cmdline = p
-                    .cmd()
-                    .iter()
-                    .map(|arg| arg.to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                // Secrets in an agent's argv (its MCP bridge token, env
+                // values) never leave the sampler.
+                let cmdline = cmdline_redact::redact_args(
+                    p.cmd()
+                        .iter()
+                        .map(|arg| arg.to_string_lossy().into_owned()),
+                );
                 (p.name().to_string_lossy().into_owned(), cmdline)
             })
         },

@@ -310,6 +310,23 @@ async fn serve_node_serves_only_the_node_mode_list() {
     assert!(status.is_object());
     assert_ok(&uds.call("principal.me", json!({})).await, "principal.me");
     assert_ok(&uds.call("executor.list", json!({})).await, "executor.list");
+    // `intentd agents` works on a node: it reads `agent.memoryUsage` and
+    // skips the workspace titles a node cannot list.
+    assert_ok(
+        &uds.call("agent.memoryUsage", json!({})).await,
+        "agent.memoryUsage",
+    );
+    let agents = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
+        .arg("agents")
+        .env("INTENTD_DATA_DIR", dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run intentd agents");
+    assert!(
+        agents.status.success(),
+        "intentd agents on a node: {}",
+        String::from_utf8_lossy(&agents.stderr)
+    );
     let permission = assert_ok(
         &uds.call("settings.get", json!({ "path": "remoteAgents.permission" }))
             .await,

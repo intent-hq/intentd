@@ -1361,7 +1361,8 @@ pub struct ProcessSample {
     pub parent_pid: u32,
     /// Short process name (Linux: the 15-char `comm`).
     pub name: String,
-    /// Full command line joined with single spaces; empty when unreadable.
+    /// Full command line joined with single spaces, secret values redacted
+    /// by the sampler; empty when unreadable.
     pub cmdline: String,
     /// Resident bytes.
     pub memory_bytes: u64,

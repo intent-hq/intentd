@@ -47,18 +47,28 @@ async fn call(socket: &Path, method: &str, params: Value) -> Result<Value, Strin
 /// Titles of the local rows' workspaces. A machine that only hosts agents
 /// refuses `workspace.list` (node mode); its rows then show their ids.
 async fn workspace_titles(socket: &Path, payload: &Value) -> HashMap<String, String> {
-    let mut titles = HashMap::new();
     let has_local = rows(payload).any(|row| row.get("remoteOwner").is_none());
     if !has_local {
-        return titles;
+        return HashMap::new();
     }
-    let mut params = json!({});
+    collect_titles(|params| call(socket, "workspace.list", params)).await
+}
+
+/// Read `workspace.list` page by page through `list`. Archived workspaces
+/// are included: their agents can still be running.
+async fn collect_titles<F, Fut>(mut list: F) -> HashMap<String, String>
+where
+    F: FnMut(Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    let mut titles = HashMap::new();
+    let mut params = json!({ "includeArchived": true });
     for _ in 0..MAX_TITLE_PAGES {
-        let Ok(page) = call(socket, "workspace.list", params).await else {
+        let Ok(page) = list(params).await else {
             break;
         };
         match add_titles(&mut titles, &page) {
-            Some(token) => params = json!({ "nextToken": token }),
+            Some(token) => params = json!({ "includeArchived": true, "nextToken": token }),
             None => break,
         }
     }
