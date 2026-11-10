@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use git2::{BranchType, Repository};
 use intent_core::{Error, Result};
 
-use crate::cow::cow_clone_with_excludes;
+use crate::cow::cow_clone;
 use crate::map_git_err;
 use crate::repo_cache::remove_remote_local_only;
 
@@ -36,8 +36,6 @@ pub(crate) struct CowProvisionTimings {
     /// sorted slowest-first (root-relative path, duration). Empty for
     /// whole-tree clones and walks without a subtree fast path.
     pub slowest_subtrees: Vec<(PathBuf, Duration)>,
-    /// Directories skipped because they matched a `cowCloneExclude` entry.
-    pub skipped_excluded: u64,
     /// Duration of stripping `.git/worktrees` registrations from the clone.
     pub strip_registrations: Duration,
     /// Duration of branch creation + checkout + hard reset in the clone.
@@ -113,23 +111,15 @@ pub fn provision_cow_checkout(
     branch: &str,
     base_ref: Option<&str>,
     remote: &str,
-    clone_excludes: &[String],
 ) -> Result<String> {
-    let (sha, timings) = provision_cow_checkout_timed(
-        repo_path,
-        checkout_path,
-        branch,
-        base_ref,
-        remote,
-        clone_excludes,
-    )?;
+    let (sha, timings) =
+        provision_cow_checkout_timed(repo_path, checkout_path, branch, base_ref, remote)?;
     tracing::info!(
         checkout = %checkout_path.display(),
         total_ms = u64::try_from(timings.total.as_millis()).unwrap_or(u64::MAX),
         cow_clone_ms = u64::try_from(timings.cow_clone.as_millis()).unwrap_or(u64::MAX),
         whole_tree_clone = timings.whole_tree_clone,
         slowest_subtrees = %timings.slowest_subtrees_display(),
-        skipped_excluded = timings.skipped_excluded,
         strip_registrations_ms = u64::try_from(timings.strip_registrations.as_millis()).unwrap_or(u64::MAX),
         checkout_ms = u64::try_from(timings.checkout.as_millis()).unwrap_or(u64::MAX),
         reset_fast_path = timings.reset_fast_path,
@@ -147,7 +137,6 @@ pub(crate) fn provision_cow_checkout_timed(
     branch: &str,
     base_ref: Option<&str>,
     remote: &str,
-    clone_excludes: &[String],
 ) -> Result<(String, CowProvisionTimings)> {
     let started = Instant::now();
     let mut timings = CowProvisionTimings::default();
@@ -177,10 +166,9 @@ pub(crate) fn provision_cow_checkout_timed(
     }
 
     let clone_started = Instant::now();
-    let clone_stats = cow_clone_with_excludes(repo_path, checkout_path, clone_excludes)?;
+    let clone_stats = cow_clone(repo_path, checkout_path)?;
     timings.cow_clone = clone_started.elapsed();
     timings.whole_tree_clone = clone_stats.whole_tree;
-    timings.skipped_excluded = clone_stats.skipped_excluded;
     let mut subtrees = clone_stats.subtree_timings;
     subtrees.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     subtrees.truncate(SLOWEST_SUBTREES_LOGGED);
@@ -775,9 +763,8 @@ mod tests {
 
         let checkout = unique_checkout("base");
         let _cleanup = Cleanup(checkout.clone());
-        let sha =
-            provision_cow_checkout(dir.path(), &checkout, "cow-ws", Some("base"), "origin", &[])
-                .unwrap();
+        let sha = provision_cow_checkout(dir.path(), &checkout, "cow-ws", Some("base"), "origin")
+            .unwrap();
         assert_eq!(sha, base_sha);
 
         let clone = Repository::open(&checkout).unwrap();
@@ -807,15 +794,7 @@ mod tests {
 
         let checkout = unique_checkout("dirty");
         let _cleanup = Cleanup(checkout.clone());
-        provision_cow_checkout(
-            dir.path(),
-            &checkout,
-            "cow-ws",
-            Some(&branch),
-            "origin",
-            &[],
-        )
-        .unwrap();
+        provision_cow_checkout(dir.path(), &checkout, "cow-ws", Some(&branch), "origin").unwrap();
 
         // Tracked file is reset to the base commit; untracked artifact survives.
         assert_eq!(
@@ -924,8 +903,7 @@ mod tests {
         let checkout = unique_checkout("reuse");
         let _cleanup = Cleanup(checkout.clone());
         let sha =
-            provision_cow_checkout(dir.path(), &checkout, "cow-ws", Some(&base), "origin", &[])
-                .unwrap();
+            provision_cow_checkout(dir.path(), &checkout, "cow-ws", Some(&base), "origin").unwrap();
         assert_eq!(sha, pinned_sha, "existing branch is reused, not recreated");
     }
 
@@ -1001,9 +979,8 @@ mod tests {
 
         let checkout = unique_checkout("gitfile-dst");
         let _cleanup = Cleanup(checkout.clone());
-        let err =
-            provision_cow_checkout(&wt_path, &checkout, "cow-ws", Some(&branch), "origin", &[])
-                .unwrap_err();
+        let err = provision_cow_checkout(&wt_path, &checkout, "cow-ws", Some(&branch), "origin")
+            .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got: {err:?}");
         assert!(!checkout.exists(), "nothing is cloned for a gitfile source");
         // The source worktree is untouched.
@@ -1045,7 +1022,7 @@ mod tests {
         // worktree; without the strip, git refuses ("already checked out").
         let checkout = unique_checkout("strip-dst");
         let _cleanup = Cleanup(checkout.clone());
-        provision_cow_checkout(dir.path(), &checkout, "busy", Some(&base), "origin", &[]).unwrap();
+        provision_cow_checkout(dir.path(), &checkout, "busy", Some(&base), "origin").unwrap();
 
         let clone = Repository::open(&checkout).unwrap();
         assert_eq!(clone.head().unwrap().shorthand().unwrap(), "busy");
@@ -1072,85 +1049,12 @@ mod tests {
             "cow-ws",
             Some("no-such-ref"),
             "origin",
-            &[],
         )
         .unwrap_err();
         assert!(
             matches!(err, Error::BaseRefUnresolvable { ref base_ref } if base_ref == "no-such-ref")
         );
         assert!(!checkout.exists(), "partial checkout is removed on failure");
-    }
-
-    #[test]
-    fn clone_excludes_skip_untracked_directories() {
-        let dir = init_repo("cowchk-exclude");
-        commit_file(dir.path(), "a.txt", "x\n");
-        if !cow_available(dir.path()) {
-            return;
-        }
-        let branch = head_branch(&dir);
-        // Untracked heavy directories: one excluded, one kept.
-        write_file(dir.path(), "node_modules/pkg/index.js", "js\n");
-        write_file(dir.path(), "vendor/keep.txt", "keep\n");
-
-        let checkout = unique_checkout("exclude");
-        let _cleanup = Cleanup(checkout.clone());
-        let (_, timings) = provision_cow_checkout_timed(
-            dir.path(),
-            &checkout,
-            "cow-ws",
-            Some(&branch),
-            "origin",
-            &["node_modules".to_string()],
-        )
-        .unwrap();
-
-        assert!(
-            !checkout.join("node_modules").exists(),
-            "excluded directory is absent from the checkout"
-        );
-        assert_eq!(
-            std::fs::read_to_string(checkout.join("vendor/keep.txt")).unwrap(),
-            "keep\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
-            "x\n"
-        );
-        assert_eq!(timings.skipped_excluded, 1);
-        assert!(
-            !timings.whole_tree_clone,
-            "exclusions force the best-effort walk"
-        );
-        // The source repo keeps its directory.
-        assert!(dir.path().join("node_modules/pkg/index.js").exists());
-    }
-
-    #[test]
-    fn git_exclusion_is_ignored_and_clone_stays_valid() {
-        let dir = init_repo("cowchk-gitexclude");
-        commit_file(dir.path(), "a.txt", "x\n");
-        if !cow_available(dir.path()) {
-            return;
-        }
-        let branch = head_branch(&dir);
-
-        let checkout = unique_checkout("gitexclude");
-        let _cleanup = Cleanup(checkout.clone());
-        let (_, timings) = provision_cow_checkout_timed(
-            dir.path(),
-            &checkout,
-            "cow-ws",
-            Some(&branch),
-            "origin",
-            &[".git".to_string(), ".git/objects".to_string()],
-        )
-        .unwrap();
-
-        // `.git` exclusions are ignored: the clone is a working repository.
-        assert_eq!(timings.skipped_excluded, 0);
-        let clone = Repository::open(&checkout).unwrap();
-        assert_eq!(clone.head().unwrap().shorthand().unwrap(), "cow-ws");
     }
 
     #[test]
@@ -1164,15 +1068,9 @@ mod tests {
 
         let checkout = unique_checkout("timing");
         let _cleanup = Cleanup(checkout.clone());
-        let (sha, timings) = provision_cow_checkout_timed(
-            dir.path(),
-            &checkout,
-            "cow-ws",
-            Some(&branch),
-            "origin",
-            &[],
-        )
-        .unwrap();
+        let (sha, timings) =
+            provision_cow_checkout_timed(dir.path(), &checkout, "cow-ws", Some(&branch), "origin")
+                .unwrap();
 
         assert!(!sha.is_empty());
         assert!(timings.total >= timings.cow_clone);
@@ -1221,7 +1119,7 @@ mod tests {
 
         let checkout = unique_checkout("cowchk-relorigin");
         let _cleanup = Cleanup(checkout.clone());
-        provision_cow_checkout(&source, &checkout, "cow-ws", None, "origin", &[]).unwrap();
+        provision_cow_checkout(&source, &checkout, "cow-ws", None, "origin").unwrap();
 
         let clone = Repository::open(&checkout).unwrap();
         let origin = clone.find_remote("origin").unwrap();
@@ -1254,7 +1152,7 @@ mod tests {
 
         let checkout = unique_checkout("cowchk-selforigin");
         let _cleanup = Cleanup(checkout.clone());
-        provision_cow_checkout(source.path(), &checkout, "cow-ws", None, "origin", &[]).unwrap();
+        provision_cow_checkout(source.path(), &checkout, "cow-ws", None, "origin").unwrap();
 
         let clone = Repository::open(&checkout).unwrap();
         assert!(
@@ -1284,7 +1182,7 @@ mod tests {
 
         let checkout = unique_checkout("cowchk-selforigin-prune");
         let _cleanup = Cleanup(checkout.clone());
-        provision_cow_checkout(source.path(), &checkout, "cow-ws", None, "origin", &[]).unwrap();
+        provision_cow_checkout(source.path(), &checkout, "cow-ws", None, "origin").unwrap();
 
         let clone = Repository::open(&checkout).unwrap();
         assert!(
@@ -1327,7 +1225,6 @@ mod tests {
             "cow-ws",
             Some("only-remote"),
             "origin",
-            &[],
         )
         .unwrap();
 
@@ -1361,7 +1258,7 @@ mod tests {
 
         let checkout = unique_checkout("cowchk-neturl");
         let _cleanup = Cleanup(checkout.clone());
-        provision_cow_checkout(source.path(), &checkout, "cow-ws", None, "origin", &[]).unwrap();
+        provision_cow_checkout(source.path(), &checkout, "cow-ws", None, "origin").unwrap();
 
         let clone = Repository::open(&checkout).unwrap();
         assert_eq!(
@@ -1402,7 +1299,7 @@ mod tests {
 
         let checkout = unique_checkout("cowchk-pushrel");
         let _cleanup = Cleanup(checkout.clone());
-        provision_cow_checkout(&source, &checkout, "cow-ws", None, "origin", &[]).unwrap();
+        provision_cow_checkout(&source, &checkout, "cow-ws", None, "origin").unwrap();
 
         let clone = Repository::open(&checkout).unwrap();
         let origin = clone.find_remote("origin").unwrap();
@@ -1445,7 +1342,7 @@ mod tests {
 
         let checkout = unique_checkout("cowchk-selfpush");
         let _cleanup = Cleanup(checkout.clone());
-        provision_cow_checkout(source.path(), &checkout, "cow-ws", None, "origin", &[]).unwrap();
+        provision_cow_checkout(source.path(), &checkout, "cow-ws", None, "origin").unwrap();
 
         let clone = Repository::open(&checkout).unwrap();
         let origin = clone.find_remote("origin").unwrap();
@@ -1566,7 +1463,7 @@ mod tests {
 
         let checkout = unique_checkout("cowchk-sub-dst");
         let _cleanup = Cleanup(checkout.clone());
-        provision_cow_checkout(&source, &checkout, "cow-ws", Some("base"), "origin", &[]).unwrap();
+        provision_cow_checkout(&source, &checkout, "cow-ws", Some("base"), "origin").unwrap();
 
         assert_eq!(
             sub_head(&checkout),
@@ -1609,8 +1506,7 @@ mod tests {
 
         let checkout = unique_checkout("cowchk-subdeg-dst");
         let _cleanup = Cleanup(checkout.clone());
-        let sha =
-            provision_cow_checkout(&source, &checkout, "cow-ws", None, "origin", &[]).unwrap();
+        let sha = provision_cow_checkout(&source, &checkout, "cow-ws", None, "origin").unwrap();
 
         assert!(!sha.is_empty(), "provisioning succeeds despite the anomaly");
         let clone = Repository::open(&checkout).unwrap();
@@ -1645,7 +1541,7 @@ mod tests {
 
         let checkout = unique_checkout("cowchk-orph-dst");
         let _cleanup = Cleanup(checkout.clone());
-        provision_cow_checkout(&source, &checkout, "cow-ws", Some("base"), "origin", &[]).unwrap();
+        provision_cow_checkout(&source, &checkout, "cow-ws", Some("base"), "origin").unwrap();
 
         assert!(
             !checkout.join("sub").exists(),
@@ -1709,7 +1605,7 @@ mod tests {
 
         let checkout = unique_checkout("cowchk-nestorph-dst");
         let _cleanup = Cleanup(checkout.clone());
-        provision_cow_checkout(&source, &checkout, "cow-ws", Some("base"), "origin", &[]).unwrap();
+        provision_cow_checkout(&source, &checkout, "cow-ws", Some("base"), "origin").unwrap();
 
         assert!(
             checkout.join("sub").join("c.txt").exists(),
@@ -1785,7 +1681,7 @@ mod tests {
 
         let checkout = unique_checkout("cowchk-url-dst");
         let _cleanup = Cleanup(checkout.clone());
-        provision_cow_checkout(&source, &checkout, "cow-ws", None, "origin", &[]).unwrap();
+        provision_cow_checkout(&source, &checkout, "cow-ws", None, "origin").unwrap();
 
         let gitmodules_url = git2::Config::open(&checkout.join(".gitmodules"))
             .unwrap()
@@ -1880,7 +1776,7 @@ mod tests {
         let run_before = |tag: &str| -> Duration {
             let checkout = bench_checkout(tag);
             let _cleanup = Cleanup(checkout.clone());
-            cow_clone_with_excludes(&repo_path, &checkout, &[]).unwrap();
+            cow_clone(&repo_path, &checkout).unwrap();
             strip_worktree_registrations(&checkout).unwrap();
             let started = Instant::now();
             let (_, fast) = checkout_in_clone_impl(
@@ -1911,7 +1807,6 @@ mod tests {
                 "cow-bench",
                 Some(&branch),
                 "origin",
-                &[],
             )
             .unwrap();
             assert!(

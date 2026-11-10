@@ -23099,18 +23099,12 @@ impl WorkspaceApi for Services {
                                             }
                                             let result = match mode {
                                                 intent_core::CheckoutMode::Cow => {
-                                                    // No cowCloneExclude here: the
-                                                    // source is the pristine
-                                                    // cache clone — tracked files
-                                                    // only, no deps/build artifacts
-                                                    // for excludes to skip.
                                                     let sha = intent_git::cow_checkout::provision_cow_checkout(
                                                         &cache,
                                                         &checkout,
                                                         &branch,
                                                         base_ref.as_deref(),
                                                         "origin",
-                                                        &[],
                                                     )?;
                                                     // The CoW clone inherits the
                                                     // cache's `origin` (already the

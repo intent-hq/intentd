@@ -642,7 +642,6 @@ pub fn repo_config_json() -> String {
             "mode": "command",
             "cwd": "packages/app",
         })).collect::<Vec<_>>(),
-        "cowCloneExclude": (0..20).map(|i| format!("cache/dir-{i}")).collect::<Vec<_>>(),
     })
     .to_string()
 }
