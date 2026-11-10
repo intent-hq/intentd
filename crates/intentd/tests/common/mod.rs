@@ -910,7 +910,7 @@ fn connect_phase_timeout() -> Duration {
 
 /// One failed connection-establishment phase. `transient` marks the
 /// load-induced I/O errors worth retrying; everything else is fatal.
-struct ConnectAttemptError {
+pub struct ConnectAttemptError {
     phase: &'static str,
     message: String,
     transient: bool,
@@ -978,7 +978,7 @@ async fn try_tls_connect(
 }
 
 /// One full connection-establishment attempt: TCP + TLS + WebSocket upgrade.
-async fn try_wss_connect(
+pub async fn try_wss_connect(
     port: u16,
     cfg: Arc<rustls::ClientConfig>,
     url: &str,
