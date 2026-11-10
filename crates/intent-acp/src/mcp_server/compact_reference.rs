@@ -83,10 +83,10 @@ pub(crate) const HOT_SET: &[&str] = &[
 const DELEGATE_OCCUPANCY: (&str, &str, &str) = (
     "skipAutoCommit?",
     ", force?",
-    " The single-task form refuses a task note whose assigned agent is still live, unless the \
-     task is complete or cancelled: reach that agent with `ws.agent.sendToTask` or \
-     `ws.agent.wakeOrCreate`, use a separate task note, or pass `force: true` to add a second \
-     agent.",
+    " The single-task form refuses a task note that still has an assigned agent, even an idle \
+     or finished one (only a deleted or retired agent frees it), unless the task is complete or \
+     cancelled: reach that agent with `ws.agent.sendToTask` or `ws.agent.wakeOrCreate`, use a \
+     separate task note, or pass `force: true` to add a second agent.",
 );
 
 const DELEGATE_LINE: &str = "  ws.agent.delegate(";

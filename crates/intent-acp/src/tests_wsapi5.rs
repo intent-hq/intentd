@@ -1920,7 +1920,8 @@ async fn help_agent_delegate_line_follows_the_docs_version() {
     assert!(!before.contains("force?"), "{before}");
     assert!(after.contains("skipAutoCommit?, force?, tasks?"), "{after}");
     for named in [
-        "still live, unless the task is complete or cancelled",
+        "still has an assigned agent, even an idle or finished one",
+        "unless the task is complete or cancelled",
         "`ws.agent.sendToTask`",
         "`ws.agent.wakeOrCreate`",
         "a separate task note",
