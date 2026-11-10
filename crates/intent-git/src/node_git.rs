@@ -1298,15 +1298,20 @@ impl CheckoutCache {
         self.no_fetch_recursion(parent, name).await
     }
 
-    /// Set `submodule.<name>.fetchRecurseSubmodules = false` in `parent`'s
-    /// own worktree config: a machine's submodule has no remote, so git's
-    /// on-demand recursion would fail every fetch in `parent` whose commits
-    /// move its gitlink. The per-module key wins over `.gitmodules`.
+    /// Set `submodule.<name>.fetchRecurseSubmodules` and
+    /// `fetch.recurseSubmodules` to `false` in `parent`'s own worktree
+    /// config: a machine's submodule has no remote, so git's on-demand
+    /// recursion would fail every fetch in `parent` whose commits move its
+    /// gitlink. The per-module key wins over `.gitmodules`; the worktree's
+    /// `fetch.recurseSubmodules` wins over a global `submodule.recurse` or
+    /// `fetch.recurseSubmodules`, which outrank the per-module key.
     async fn no_fetch_recursion(&self, parent: &Path, name: &str) -> Result<()> {
-        let key = format!("submodule.{name}.fetchRecurseSubmodules");
-        self.git
-            .git(parent, &["config", "--worktree", &key, "false"])
-            .await?;
+        let module = format!("submodule.{name}.fetchRecurseSubmodules");
+        for key in [module.as_str(), "fetch.recurseSubmodules"] {
+            self.git
+                .git(parent, &["config", "--worktree", key, "false"])
+                .await?;
+        }
         Ok(())
     }
 

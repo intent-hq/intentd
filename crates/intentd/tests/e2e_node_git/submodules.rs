@@ -559,11 +559,14 @@ async fn removed_submodules_are_re_added_by_hand_and_stay_removed_by_commit() {
     assert!(files.lines().all(|file| file != "c"), "{files}");
 }
 
-/// `git fetch` in `dir`, as an agent runs it: its exit status and stderr.
-fn fetch(dir: &Path) -> (bool, String) {
+/// `git fetch` in `dir`, as an agent runs it, with a global
+/// `submodule.recurse = true` (which outranks a per-module
+/// `fetchRecurseSubmodules`): its exit status and stderr.
+fn fetch(dir: &Path, global: &Path) -> (bool, String) {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
+        .env("GIT_CONFIG_GLOBAL", global)
         .args(["fetch", "--quiet", "origin"])
         .output()
         .unwrap();
@@ -580,6 +583,8 @@ async fn fetching_origin_does_not_fail_on_the_submodules() {
     let worktree = fixture.worktree("a");
     checkout(&fixture, &worktree, &layout.pins).await;
     let head = fixture.head.path().to_path_buf();
+    let global = fixture.node.path().join("recurse.gitconfig");
+    std::fs::write(&global, "[submodule]\n\trecurse = true\n").unwrap();
     tokio::time::timeout(
         wait(),
         fixture
@@ -597,7 +602,7 @@ async fn fetching_origin_does_not_fail_on_the_submodules() {
     commit_file(&layout.a, "upstream.txt", "new in a\n");
     git(&head, &["add", "a"]);
     commit(&head, "move a");
-    let (ok, stderr) = fetch(&worktree);
+    let (ok, stderr) = fetch(&worktree, &global);
     assert!(ok, "git fetch origin: {stderr}");
     // Nested: `a` given a remote of its own still does not recurse into
     // `a/b`.
@@ -605,21 +610,18 @@ async fn fetching_origin_does_not_fail_on_the_submodules() {
         &worktree.join("a"),
         &["remote", "add", "origin", layout.a.to_str().unwrap()],
     );
-    let (ok, stderr) = fetch(&worktree.join("a"));
+    let (ok, stderr) = fetch(&worktree.join("a"), &global);
     assert!(ok, "git fetch origin in a: {stderr}");
 
     // A checkout whose modules an earlier launch populated gets the same
     // config on a relaunch.
     for (dir, name) in [(&worktree, "a"), (&worktree.join("a"), "b")] {
-        git(
-            dir,
-            &[
-                "config",
-                "--worktree",
-                "--unset",
-                &format!("submodule.{name}.fetchRecurseSubmodules"),
-            ],
-        );
+        for key in [
+            format!("submodule.{name}.fetchRecurseSubmodules"),
+            "fetch.recurseSubmodules".to_owned(),
+        ] {
+            git(dir, &["config", "--worktree", "--unset", &key]);
+        }
     }
     let modules = tokio::time::timeout(
         wait(),
@@ -634,6 +636,6 @@ async fn fetching_origin_does_not_fail_on_the_submodules() {
     commit_file(&layout.a, "again.txt", "again\n");
     git(&head, &["add", "a"]);
     commit(&head, "move a again");
-    let (ok, stderr) = fetch(&worktree);
+    let (ok, stderr) = fetch(&worktree, &global);
     assert!(ok, "git fetch origin after a relaunch: {stderr}");
 }
