@@ -207,6 +207,22 @@ async fn event(ws: &mut common::TlsWs, kind: &str) -> Value {
     .unwrap_or_else(|_| panic!("no {kind} event"))
 }
 
+/// The next `agent:stream:end` of `agent_id`. Other agents' turn ends
+/// (a sub-agent's, a parent's wake) arrive on the same subscription and
+/// are skipped.
+async fn stream_end(ws: &mut common::TlsWs, agent_id: &str) -> Value {
+    timeout(wait(), async {
+        loop {
+            let end = event(ws, "agent:stream:end").await;
+            if end["data"]["agentId"] == agent_id {
+                return end;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no agent:stream:end for {agent_id}"))
+}
+
 #[track_caller]
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -315,8 +331,7 @@ async fn turn(
         json!({ "workspaceId": ws_id, "agentId": agent_id, "content": content }),
     )
     .await;
-    let end = event(events, "agent:stream:end").await;
-    assert_eq!(end["data"]["agentId"], agent_id, "{end}");
+    stream_end(events, agent_id).await;
     let got = ok(
         rpc_ws,
         id + 1,
@@ -535,8 +550,7 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
     )
     .await;
     let first_message = first["messageId"].as_str().unwrap().to_owned();
-    let end = event(&mut events, "agent:stream:end").await;
-    assert_eq!(end["data"]["agentId"], agent_id, "{end}");
+    stream_end(&mut events, &agent_id).await;
     let got = ok(
         &mut rpc_ws,
         92,
@@ -928,7 +942,7 @@ async fn remote_hooks_questions_and_client_calls(
     .await;
     assert!(scheduled.starts_with("wsapi: "), "{scheduled}");
     // The wake is the agent's next turn on the machine; the provider echoes it.
-    event(events, "agent:stream:end").await;
+    stream_end(events, agent_id).await;
     let woke = reply_containing(rpc_ws, (ws_id, agent_id), "hook-woke-remote", 710).await;
     assert!(woke.contains("echo: [Background hook"), "{woke}");
     let repo = std::fs::canonicalize(repo).unwrap();
@@ -975,7 +989,7 @@ async fn remote_hooks_questions_and_client_calls(
         }),
     )
     .await;
-    event(events, "agent:stream:end").await;
+    stream_end(events, agent_id).await;
     let answered = reply_containing(rpc_ws, (ws_id, agent_id), "A: Left", 821).await;
     assert!(answered.contains("A: Left"), "{answered}");
     let cleared = ok(
@@ -1082,7 +1096,7 @@ async fn remote_hooks_questions_and_client_calls(
     assert_eq!(controlled["e"]["withdrawn"], true, "{controlled}");
     // The withdrawn request wakes the agent once, as it would a local agent;
     // take that turn here so later steps see only their own turns.
-    event(events, "agent:stream:end").await;
+    stream_end(events, agent_id).await;
     let woke = reply_containing(rpc_ws, (ws_id, agent_id), "Desktop permission", 960).await;
     assert!(woke.contains("echo: "), "{woke}");
     served.abort();
@@ -1288,8 +1302,7 @@ async fn machine_runs(
     assert_eq!(body["m"]["monitor"]["nodeId"], node_id, "{body}");
 
     // The monitor wakes the agent when the run ends on the machine.
-    let end = event(events, "agent:stream:end").await;
-    assert_eq!(end["data"]["agentId"], agent_id, "{end}");
+    stream_end(events, agent_id).await;
     let woken = ok(
         rpc_ws,
         202,

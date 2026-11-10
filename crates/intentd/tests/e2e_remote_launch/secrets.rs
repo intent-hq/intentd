@@ -100,10 +100,7 @@ pub(super) async fn agent_turn(
     let mut next = id + 1;
     let found = timeout(wait(), async {
         loop {
-            let end = event(events, "agent:stream:end").await;
-            if end["data"]["agentId"] != agent_id {
-                continue;
-            }
+            stream_end(events, agent_id).await;
             // The turn's reply may be recorded just after its end event.
             for _ in 0..20 {
                 let got = ok(

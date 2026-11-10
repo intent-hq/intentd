@@ -125,12 +125,7 @@ async fn a_remote_agents_sub_agent_on_its_machine_shares_its_checkout() {
 
     // The child's turn end comes first, so the parent's next turn waits
     // for its own.
-    loop {
-        let end = event(&mut events, "agent:stream:end").await;
-        if end["data"]["agentId"] == child_id.as_str() {
-            break;
-        }
-    }
+    stream_end(&mut events, &child_id).await;
     let seen = reply_containing(&mut rpc_ws, (&ws_id, &child_id), "child-1", 100).await;
     let seen: Value = serde_json::from_str(&seen).unwrap();
     let text = seen.to_string();
@@ -536,12 +531,7 @@ async fn a_remote_sub_agent_that_retires_itself_finishes_its_turn() {
     )
     .await;
     let child_id = agent_named(&mut rpc_ws, &ws_id, "Child", 60).await;
-    loop {
-        let end = event(&mut events, "agent:stream:end").await;
-        if end["data"]["agentId"] == child_id.as_str() {
-            break;
-        }
-    }
+    stream_end(&mut events, &child_id).await;
     reply_containing(&mut rpc_ws, (&ws_id, &child_id), "child-1", 100).await;
 
     // A follow-up after both turns ended.
