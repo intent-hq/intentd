@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.172] - 2026-11-10
+
+### 🚀 Features
+
+- *(workspace)* Run archiveScript when a workspace leaves Active ([#3245](https://github.com/intent-hq/intentd/pull/3245))
+
+### 🐛 Bug Fixes
+
+- Keep a git session's service alive until it ends on its own ([#3246](https://github.com/intent-hq/intentd/pull/3246))
+
+
 ## [0.11.171] - 2026-11-10
 
 ### 🚀 Features
