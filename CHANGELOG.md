@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.176] - 2026-11-10
+
+### ⚙️ Miscellaneous Tasks
+
+- *(deps)* Bump tower-http from 0.6 to 0.7 ([#3256](https://github.com/intent-hq/intentd/pull/3256))
+
+
 ## [0.11.175] - 2026-11-10
 
 ### 🐛 Bug Fixes
