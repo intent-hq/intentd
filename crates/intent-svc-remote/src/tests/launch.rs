@@ -331,6 +331,20 @@ async fn a_placed_agent_launches_on_its_first_runtime() {
             )
         )
     );
+    // Display labels for the machine's memory rows: the session's name
+    // and the workspace's title at this launch.
+    let title = f
+        .services
+        .store()
+        .get_workspace(&workspace())
+        .await
+        .unwrap()
+        .title;
+    assert_eq!(
+        *launch.labels,
+        intent_core::node_link::LaunchLabels::new(Some(&session.name), Some(&title))
+    );
+    assert!(launch.labels.agent_name.is_some(), "{:?}", launch.labels);
     assert!(runtime.is_alive());
 
     link.journal(JournalRecord {

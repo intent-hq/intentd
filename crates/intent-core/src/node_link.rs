@@ -512,6 +512,69 @@ pub struct LaunchCommand {
     /// machine from before ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_version: Option<Box<str>>,
+    /// Display labels for the hosted agent, top-level `agentName` and
+    /// `workspaceTitle` on the wire. Needs no protocol: a machine from
+    /// before ignores them.
+    #[serde(flatten)]
+    pub labels: Box<LaunchLabels>,
+}
+
+/// [`LaunchCommand::labels`]: the agent's name and its workspace's title on
+/// the backend, sent on every launch so the machine can name the agents it
+/// hosts. Display only: never identity, routing or authorization.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchLabels {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "accept_label"
+    )]
+    pub agent_name: Option<Box<str>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "accept_label"
+    )]
+    pub workspace_title: Option<Box<str>>,
+}
+
+impl LaunchLabels {
+    /// Longest label, in UTF-8 bytes.
+    pub const MAX_BYTES: usize = 256;
+
+    /// The backend's labels: each trimmed, dropped when blank and cut at a
+    /// character boundary at or below [`Self::MAX_BYTES`].
+    #[must_use]
+    pub fn new(agent_name: Option<&str>, workspace_title: Option<&str>) -> Self {
+        Self {
+            agent_name: agent_name.and_then(Self::outgoing),
+            workspace_title: workspace_title.and_then(Self::outgoing),
+        }
+    }
+
+    fn outgoing(value: &str) -> Option<Box<str>> {
+        let value = value.trim();
+        let mut end = value.len().min(Self::MAX_BYTES);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        let value = value[..end].trim_end();
+        (!value.is_empty()).then(|| value.into())
+    }
+}
+
+/// A label the machine accepts: a string, not blank, within the cap. Any
+/// other value counts as absent and never refuses the launch.
+fn accept_label<'de, D>(deserializer: D) -> std::result::Result<Option<Box<str>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.as_ref().and_then(Value::as_str).and_then(|label| {
+        let label = label.trim();
+        (!label.is_empty() && label.len() <= LaunchLabels::MAX_BYTES).then(|| label.into())
+    }))
 }
 
 /// [`LaunchCommand::new_machine`]: a machine's name, a plain string on the

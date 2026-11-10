@@ -1371,6 +1371,7 @@ mod stop_acks {
             git_identity: None,
             new_machine: None,
             harness_version: None,
+            labels: Box::default(),
             profile_env: None,
         }
     }

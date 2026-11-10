@@ -471,6 +471,7 @@ fn every_frame() -> Vec<LinkFrame> {
             git_identity: None,
             new_machine: None,
             harness_version: None,
+            labels: Box::default(),
         }),
         LinkFrame::Prompt {
             agent_id: agent_id.clone(),
@@ -915,6 +916,7 @@ fn launch_profile_env_never_debug_renders_its_values() {
         git_identity: None,
         new_machine: None,
         harness_version: None,
+        labels: Box::default(),
     };
     let rendered = format!("{command:?} {:?}", LinkFrame::Launch(command.clone()));
     assert!(!rendered.contains("canary-secret-7f3a"), "{rendered}");
@@ -947,6 +949,7 @@ fn launch_without_a_profile_omits_profile_env() {
         git_identity: None,
         new_machine: None,
         harness_version: None,
+        labels: Box::default(),
     };
     let wire = serde_json::to_value(&command).unwrap();
     assert!(wire.get("profileEnv").is_none(), "{wire}");
@@ -1292,6 +1295,7 @@ fn a_launch_with_a_checkout_needs_protocol_10() {
             git_identity: None,
             new_machine: None,
             harness_version: None,
+            labels: Box::default(),
         })
     };
     assert_eq!(launch(None).min_protocol(), NODE_LINK_PROTOCOLS.min);
@@ -1326,6 +1330,7 @@ fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
             git_identity: None,
             new_machine: None,
             harness_version: None,
+            labels: Box::default(),
         };
     let proxy = McpProxy {
         name: "Linear".into(),
@@ -1381,6 +1386,7 @@ fn a_launch_carries_the_harness_version_on_any_protocol() {
         git_identity: None,
         new_machine: None,
         harness_version,
+        labels: Box::default(),
     };
     let with = launch(Some("7.42".into()));
     assert_eq!(
@@ -1418,6 +1424,7 @@ fn a_launch_into_another_agents_checkout_needs_protocol_13() {
         git_identity: None,
         new_machine: None,
         harness_version: None,
+        labels: Box::default(),
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
     };
@@ -1783,6 +1790,7 @@ fn a_launchs_git_identity_is_optional_and_closed() {
         git_identity: None,
         new_machine: None,
         harness_version: None,
+        labels: Box::default(),
         mcp_proxies: Vec::new(),
         compact_tool_descriptions: false,
     };
@@ -1804,6 +1812,7 @@ fn a_launchs_git_identity_is_optional_and_closed() {
             git_identity: None,
             new_machine: None,
             harness_version: None,
+            labels: Box::default(),
             ..command.clone()
         })
         .min_protocol()
@@ -1830,5 +1839,104 @@ fn a_launchs_git_identity_is_optional_and_closed() {
     assert_eq!(
         command.git_identity.as_ref().unwrap().usable(),
         Some(("Ada", "ada@example.invalid"))
+    );
+}
+
+fn labelled_launch(labels: LaunchLabels) -> LaunchCommand {
+    LaunchCommand {
+        agent_id: AgentId::from("a1"),
+        workspace_id: WorkspaceId::from("ws-1"),
+        provider: "codex".into(),
+        model: None,
+        base_commit: "base".into(),
+        repo_key: "repo".into(),
+        agent_features: json!({}),
+        is_sub_agent: false,
+        profile_env: None,
+        checkout: None,
+        mcp_proxies: Vec::new(),
+        compact_tool_descriptions: false,
+        checkout_of: None,
+        forge: None,
+        forge_fetch: None,
+        git_identity: None,
+        new_machine: None,
+        harness_version: None,
+        labels: Box::new(labels),
+    }
+}
+
+/// The display labels ride every launch at the top level of the body as
+/// `agentName` / `workspaceTitle`, need no protocol, and an older
+/// backend's launch (no labels) decodes to none and sends no keys.
+#[test]
+fn a_launch_carries_display_labels_on_any_protocol() {
+    let with = labelled_launch(LaunchLabels::new(Some("Fix login"), Some("Auth work")));
+    assert_eq!(
+        LinkFrame::Launch(with.clone()).min_protocol(),
+        NODE_LINK_PROTOCOLS.min
+    );
+    let wire = serde_json::to_value(LinkFrame::Launch(with)).unwrap();
+    assert_eq!(wire["agentName"], json!("Fix login"), "{wire}");
+    assert_eq!(wire["workspaceTitle"], json!("Auth work"), "{wire}");
+    let LinkFrame::Launch(decoded) = serde_json::from_value(wire).unwrap() else {
+        panic!("not a launch");
+    };
+    assert_eq!(decoded.labels.agent_name.as_deref(), Some("Fix login"));
+    assert_eq!(decoded.labels.workspace_title.as_deref(), Some("Auth work"));
+
+    let bare = serde_json::to_value(labelled_launch(LaunchLabels::default())).unwrap();
+    assert!(bare.get("agentName").is_none(), "{bare}");
+    assert!(bare.get("workspaceTitle").is_none(), "{bare}");
+    let decoded: LaunchCommand = serde_json::from_value(bare).unwrap();
+    assert_eq!(*decoded.labels, LaunchLabels::default());
+}
+
+/// The machine treats a label that is not a string, is blank or is over
+/// the byte cap as absent, and still accepts the launch.
+#[test]
+fn a_bad_display_label_counts_as_absent_and_keeps_the_launch() {
+    let mut wire = serde_json::to_value(labelled_launch(LaunchLabels::default())).unwrap();
+    for bad in [
+        json!(42),
+        json!(null),
+        json!({ "name": "x" }),
+        json!("   "),
+        json!("x".repeat(LaunchLabels::MAX_BYTES + 1)),
+    ] {
+        wire["agentName"] = bad.clone();
+        wire["workspaceTitle"] = bad.clone();
+        let decoded: LaunchCommand = serde_json::from_value(wire.clone())
+            .unwrap_or_else(|error| panic!("{bad} refused the launch: {error}"));
+        assert_eq!(*decoded.labels, LaunchLabels::default(), "{bad}");
+    }
+    wire["agentName"] = json!("x".repeat(LaunchLabels::MAX_BYTES));
+    let decoded: LaunchCommand = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        decoded.labels.agent_name.as_deref().map(str::len),
+        Some(LaunchLabels::MAX_BYTES)
+    );
+}
+
+/// The backend trims each label, drops a blank one and cuts a long one at
+/// a character boundary at or below the cap, so the machine never drops a
+/// label the backend meant to send.
+#[test]
+fn the_backend_trims_and_cuts_display_labels() {
+    let labels = LaunchLabels::new(Some("  Fix login \n"), Some("   "));
+    assert_eq!(labels.agent_name.as_deref(), Some("Fix login"));
+    assert_eq!(labels.workspace_title, None);
+
+    let long = format!("{}é", "a".repeat(LaunchLabels::MAX_BYTES - 1));
+    let labels = LaunchLabels::new(None, Some(&long));
+    assert_eq!(labels.agent_name, None);
+    let title = labels.workspace_title.clone().unwrap();
+    assert_eq!(&*title, "a".repeat(LaunchLabels::MAX_BYTES - 1));
+    let wire = serde_json::to_value(labelled_launch(labels)).unwrap();
+    let decoded: LaunchCommand = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        decoded.labels.workspace_title,
+        Some(title),
+        "a cut label survives the machine's check"
     );
 }

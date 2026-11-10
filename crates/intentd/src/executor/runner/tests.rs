@@ -162,6 +162,7 @@ fn launch(id: &str) -> LaunchCommand {
         git_identity: None,
         new_machine: None,
         harness_version: None,
+        labels: Box::default(),
     }
 }
 

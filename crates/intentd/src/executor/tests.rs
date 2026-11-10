@@ -468,6 +468,7 @@ fn launch_of(id: &str, provider: &str) -> LinkFrame {
         git_identity: None,
         new_machine: None,
         harness_version: None,
+        labels: Box::default(),
     })
 }
 
@@ -827,6 +828,7 @@ async fn executor_shutdown_settles_launches_arriving_on_a_live_link() {
             git_identity: None,
             new_machine: None,
             harness_version: None,
+            labels: Box::default(),
         })
     };
     dialed.link.send(&launch("a0".into())).await.unwrap();
@@ -1211,6 +1213,18 @@ async fn running_agent(
     ExecutorCredentialId,
     DialedLink,
 )> {
+    running_agent_from(dir, launch_of("a1", "mock")).await
+}
+
+async fn running_agent_from(
+    dir: &std::path::Path,
+    launch: LinkFrame,
+) -> Option<(
+    Running,
+    Arc<CountAdmission>,
+    ExecutorCredentialId,
+    DialedLink,
+)> {
     let providers = fixture_providers()?;
     let admission = CountAdmission::new(4);
     let node = Running::start_with(dir, MachineApi::new(), admission.clone(), providers).await;
@@ -1218,7 +1232,7 @@ async fn running_agent(
         .await
         .unwrap();
     replay_complete(&mut dialed).await;
-    dialed.link.send(&launch_of("a1", "mock")).await.unwrap();
+    dialed.link.send(&launch).await.unwrap();
     assert!(matches!(
         next_record(&mut dialed).await.body,
         JournalBody::Started { .. }
@@ -1525,6 +1539,8 @@ async fn a_running_agent_reports_its_root_pid_and_owner() {
     assert_eq!(root.workspace_id, WorkspaceId::from("ws-1"));
     assert_eq!(root.provider, "mock");
     assert_eq!(root.model, None);
+    assert_eq!(root.agent_name, None, "a launch without labels has none");
+    assert_eq!(root.workspace_title, None);
     assert_eq!(
         root.owner,
         intent_services::RemoteOwner {
@@ -1538,6 +1554,31 @@ async fn a_running_agent_reports_its_root_pid_and_owner() {
     node.api.revocations.send(id).unwrap();
     wait_released(&admission).await;
     assert!(node.service.agent_roots().is_empty());
+    node.stop().await;
+}
+
+/// A hosted agent keeps the display labels its launch carried, so the
+/// machine's memory rows can name it and its workspace.
+#[tokio::test]
+async fn a_running_agent_reports_its_launch_display_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    let LinkFrame::Launch(mut command) = launch_of("a1", "mock") else {
+        unreachable!()
+    };
+    command.labels = Box::new(intent_core::node_link::LaunchLabels::new(
+        Some("Fix login"),
+        Some("Auth work"),
+    ));
+    let Some((node, _admission, _id, _dialed)) =
+        running_agent_from(dir.path(), LinkFrame::Launch(command)).await
+    else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let roots = node.service.agent_roots();
+    assert_eq!(roots.len(), 1, "{roots:?}");
+    assert_eq!(roots[0].agent_name.as_deref(), Some("Fix login"));
+    assert_eq!(roots[0].workspace_title.as_deref(), Some("Auth work"));
     node.stop().await;
 }
 

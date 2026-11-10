@@ -471,6 +471,8 @@ struct Agent {
     /// The launch's provider id and model, for the memory report.
     provider: String,
     model: Option<String>,
+    /// The launch's display labels, for the memory report only.
+    labels: intent_core::node_link::LaunchLabels,
     /// The provider process's pid while it runs, for the memory sampler.
     root_pid: Mutex<Option<u32>>,
     /// The commit head launched the agent at, and the checkout cache key.
@@ -1188,6 +1190,8 @@ impl Runner {
                     workspace_id: agent.workspace_id.clone(),
                     provider: agent.provider.clone(),
                     model: agent.model.clone(),
+                    agent_name: agent.labels.agent_name.as_deref().map(str::to_owned),
+                    workspace_title: agent.labels.workspace_title.as_deref().map(str::to_owned),
                     owner: owner.clone(),
                     root_pid,
                 })
@@ -1296,6 +1300,7 @@ impl Runner {
             git_identity,
             new_machine,
             harness_version,
+            labels,
         } = command;
         let git_identity = git_identity.map(|identity| *identity);
         let forge = forge.map(|forge| *forge);
@@ -1401,6 +1406,7 @@ impl Runner {
             workspace_id: workspace_id.clone(),
             provider: provider.clone(),
             model: model.clone(),
+            labels: *labels,
             root_pid: Mutex::new(None),
             base_commit,
             repo_key,

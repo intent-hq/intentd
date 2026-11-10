@@ -1410,6 +1410,10 @@ pub struct RemoteAgentRoot {
     pub workspace_id: WorkspaceId,
     pub provider: String,
     pub model: Option<String>,
+    /// The launch's display labels (`agentName`, `workspaceTitle`), absent
+    /// from an older backend's launch. Display only.
+    pub agent_name: Option<String>,
+    pub workspace_title: Option<String>,
     pub owner: RemoteOwner,
     pub root_pid: u32,
 }

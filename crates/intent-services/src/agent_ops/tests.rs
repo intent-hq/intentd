@@ -20837,8 +20837,9 @@ async fn diagnostics_reports_queue_snapshots() {
 /// Agents this machine runs for another backend (the executor) have no
 /// session row here: `agent.memoryUsage` still lists them, from the launch
 /// the probe reports, tagged with `remoteOwner` and counted in `totalBytes`.
-/// They carry no `agentName` (the launch has none) and omit `model` when the
-/// launch gave none; a local row beside them is unchanged and has no
+/// They carry the launch's display labels (`agentName`, `workspaceTitle`),
+/// omitted when the launch had none, and omit `model` when the launch gave
+/// none; a local row beside them is unchanged and has no
 /// `remoteOwner`. Rows of both kinds sort together by `memoryBytes`.
 #[tokio::test]
 async fn agent_memory_usage_lists_executor_run_agents_with_their_owner() {
@@ -20892,6 +20893,8 @@ async fn agent_memory_usage_lists_executor_run_agents_with_their_owner() {
                     workspace_id: WorkspaceId("ws-on-head".to_string()),
                     provider: "claude-code".to_string(),
                     model: Some("opus".to_string()),
+                    agent_name: Some("Fix login".to_string()),
+                    workspace_title: Some("Auth work".to_string()),
                     owner: owner.clone(),
                     root_pid: 500,
                 },
@@ -20903,6 +20906,8 @@ async fn agent_memory_usage_lists_executor_run_agents_with_their_owner() {
                     workspace_id: WorkspaceId("ws-on-head".to_string()),
                     provider: "codex".to_string(),
                     model: None,
+                    agent_name: None,
+                    workspace_title: None,
                     owner,
                     root_pid: 600,
                 },
@@ -20926,7 +20931,9 @@ async fn agent_memory_usage_lists_executor_run_agents_with_their_owner() {
         agents[0],
         json!({
             "agentId": "agent-remote-big",
+            "agentName": "Fix login",
             "workspaceId": "ws-on-head",
+            "workspaceTitle": "Auth work",
             "provider": "claude-code",
             "model": "opus",
             "remoteOwner": { "backendId": "head-1", "backendName": "Studio" },
@@ -20943,10 +20950,15 @@ async fn agent_memory_usage_lists_executor_run_agents_with_their_owner() {
         agents[2].get("model").is_none(),
         "no model: omitted, never null"
     );
-    assert!(agents[2].get("agentName").is_none());
+    assert!(
+        agents[2].get("agentName").is_none() && agents[2].get("workspaceTitle").is_none(),
+        "a launch from an older backend has no labels: omitted, never null: {}",
+        agents[2]
+    );
     let local_row = &agents[1];
     assert_eq!(local_row["agentName"], json!("Local"));
     assert_eq!(local_row["workspaceId"], json!(ws.0));
+    assert!(local_row.get("workspaceTitle").is_none(), "{local_row}");
     assert!(
         local_row.get("remoteOwner").is_none(),
         "local rows carry no owner tag: {local_row}"
