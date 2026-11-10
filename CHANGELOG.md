@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.173] - 2026-11-10
+
+### 🚀 Features
+
+- *(acp)* Document delegate occupancy refusal in harness 3.10 ([#3248](https://github.com/intent-hq/intentd/pull/3248))
+
+### 🧪 Testing
+
+- *(services)* Keep versioned note writes in note_write.rs with a source lint ([#3250](https://github.com/intent-hq/intentd/pull/3250))
+
+
 ## [0.11.172] - 2026-11-10
 
 ### 🚀 Features
