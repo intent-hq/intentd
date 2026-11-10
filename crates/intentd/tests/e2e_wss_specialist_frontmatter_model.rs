@@ -681,6 +681,7 @@ async fn embedded_bundled_catalog_over_wss() {
         [
             "chief-of-staff",
             "developer",
+            "maintenance-coordinator",
             "pr-reviewer",
             "product-manager",
             "ui-designer",

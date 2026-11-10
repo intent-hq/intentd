@@ -1909,7 +1909,7 @@ async fn sub_agent_question_ask_denied_over_wss() {
     let mut bridge_top = BridgeClient::connect(&bridge_addr_from_config(&configs_top[0])).await;
     let desc_top = bridge_top.workspace_api_description().await;
     assert!(
-        desc_top.contains("ws.app.question.ask("),
+        common::lists_method(&desc_top, "app.question.ask"),
         "top-level description must advertise ws.app.question.ask"
     );
     let (err, text) = bridge_top
@@ -1967,7 +1967,7 @@ async fn sub_agent_question_ask_denied_over_wss() {
         "sub-agent description must not advertise ws.app.question.*"
     );
     assert!(
-        desc_bg.contains("ws.agent.requestDiscussion("),
+        common::lists_method(&desc_bg, "agent.requestDiscussion"),
         "attention-request docs must survive the sub-agent gate"
     );
 

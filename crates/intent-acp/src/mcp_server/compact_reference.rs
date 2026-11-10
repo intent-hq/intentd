@@ -42,6 +42,9 @@ const HOT_HEADER: &str = "Common methods (signature + first sentence; the rest v
 /// mining: 93% of historical calls). `ws.help` is in the map and the
 /// preamble, so `agent.list` takes its slot. `agent.delegate` is listed for
 /// its occupancy refusal (see [`DELEGATE_OCCUPANCY`]), not its call count.
+/// `app.question.ask` joins because the eval showed agents guess its
+/// required arguments from the map alone; it appears only on bridges that
+/// install it.
 pub(crate) const HOT_SET: &[&str] = &[
     "agent.send",
     "note.add",
@@ -74,6 +77,20 @@ pub(crate) const HOT_SET: &[&str] = &[
     "workspace.details",
     "hook.list",
     "agent.delegate",
+    "app.question.ask",
+];
+
+/// Rules the first sentence of a hot-set line drops but agents need to call
+/// it right (agent eval, 2026-11-10): appended after that sentence.
+pub(crate) const HOT_NOTES: &[(&str, &str)] = &[
+    (
+        "script.create",
+        "`purpose`: \"saved\" (reusable) or \"oneOff\".",
+    ),
+    (
+        "app.question.ask",
+        "Requires `header`, `question` and 2+ `options` objects.",
+    ),
 ];
 
 /// The single-task `agent.delegate` option and rule the shared doc line
@@ -103,12 +120,15 @@ fn with_delegate_occupancy(line: &str) -> String {
     format!("{}{option}{}{rule}", &line[..at], &line[at..])
 }
 
-/// A hot-set entry as 3.10 renders it.
+/// A hot-set entry as 3.10 renders it: the delegate occupancy rule, or a
+/// [`HOT_NOTES`] note after the first sentence.
 fn hot_line(path: &str, condensed: &str) -> String {
     if path == "agent.delegate" {
-        with_delegate_occupancy(condensed)
-    } else {
-        condensed.to_owned()
+        return with_delegate_occupancy(condensed);
+    }
+    match HOT_NOTES.iter().find(|(p, _)| *p == path) {
+        Some((_, note)) => format!("{condensed} {note}"),
+        None => condensed.to_owned(),
     }
 }
 

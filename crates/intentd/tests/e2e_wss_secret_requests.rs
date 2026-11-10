@@ -662,7 +662,10 @@ async fn secret_request_round_trip_over_wss() {
     );
     let mut bridge_a = BridgeClient::connect(&bridge_addr_from_config(&configs_a[0])).await;
     let desc = bridge_a.workspace_api_description().await;
-    assert!(desc.contains("ws.secret.request("), "feature advertised");
+    assert!(
+        common::lists_method(&desc, "secret.request"),
+        "feature advertised"
+    );
     let (err, text) = bridge_a
         .call_js(
             "return await ws.host.exec({ command: 'sh', args: ['-c', 'printf \"v=%s\" \"$E2E_KEY\"; printf \"e=%s\" \"$E2E_KEY\" >&2'], secretEnv: ['E2E_KEY'] });",

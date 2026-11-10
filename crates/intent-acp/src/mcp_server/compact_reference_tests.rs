@@ -187,6 +187,37 @@ fn hot_set_and_routes_name_real_methods() {
     }
 }
 
+/// Each hot-set note follows its method's first sentence on the same line,
+/// and a method absent from the bridge brings no note.
+#[test]
+fn hot_notes_follow_their_lines() {
+    let top = CompactReference::build(&inputs(Shape::Top, &all_on()));
+    for (path, note) in super::HOT_NOTES {
+        assert!(HOT_SET.contains(path), "{path} note without a hot line");
+        let line = top
+            .hot
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("ws.{path}(")))
+            .unwrap_or_else(|| panic!("hot line for {path}"));
+        assert!(line.ends_with(note), "{line}");
+    }
+    assert!(top
+        .hot
+        .contains("`purpose`: \"saved\" (reusable) or \"oneOff\"."));
+    assert!(top
+        .hot
+        .contains("ws.app.question.ask({ header, question, options"));
+    // A sub-agent bridge runs with structured questions forced off.
+    let sub_features = AgentFeaturesSettings {
+        structured_questions: false,
+        ..all_on()
+    };
+    let sub = CompactReference::build(&inputs(Shape::Sub, &sub_features));
+    assert!(!sub
+        .hot
+        .contains("Requires `header`, `question` and 2+ `options`"));
+}
+
 /// A disabled toggle drops its methods from the map, the hot set and the
 /// routing rows that name them.
 #[test]

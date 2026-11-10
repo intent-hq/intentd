@@ -56,6 +56,7 @@ pub(crate) mod v2_9;
 pub(crate) mod v3_1;
 pub(crate) mod v3_10;
 pub(crate) mod v3_11;
+pub(crate) mod v3_12;
 pub(crate) mod v3_3;
 pub(crate) mod v3_4;
 pub(crate) mod v3_5;
@@ -696,6 +697,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v3_9::ENTRY,
     &v3_10::ENTRY,
     &v3_11::ENTRY,
+    &v3_12::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row

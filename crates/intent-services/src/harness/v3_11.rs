@@ -35,8 +35,9 @@ mod tests {
         let current = super::super::resolve_entry("3.11");
         let previous = super::super::resolve_entry("3.9");
         let staged = super::super::resolve_entry("3.10");
-        assert_eq!(intent_core::CURRENT_HARNESS_VERSION, current.version);
-        assert_eq!(intent_core::STAGED_HARNESS_VERSION, Some(staged.version));
+        // 3.11 was current until 3.12 released the 3.10 surfaces.
+        assert_eq!(current.version, "3.11");
+        assert_eq!(staged.version, "3.10");
         assert!(std::ptr::eq(current.context, previous.context));
         assert!(!std::ptr::eq(current.context, staged.context));
         assert!(std::ptr::addr_eq(current.harness, previous.harness));

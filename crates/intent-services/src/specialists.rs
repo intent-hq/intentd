@@ -2454,8 +2454,8 @@ mod tests {
         assert_eq!(def["name"], "File Implementor");
     }
 
-    /// A 3.10-pinned session resolves the bundled Maintenance Coordinator;
-    /// the current (3.9) floor does not offer it until 3.10 is promoted.
+    /// A 3.10-pinned session resolves the bundled Maintenance Coordinator, and
+    /// so does the current floor since 3.12 released the 3.10 bundle.
     #[test]
     fn v3_10_session_resolves_the_maintenance_coordinator() {
         let empty = TempSpecialistsDir::new();
@@ -2473,7 +2473,7 @@ mod tests {
         assert!(def.get("codingAgent").is_none_or(Value::is_null));
         assert!(service_over(&empty)
             .resolve("maintenance-coordinator", None)
-            .is_none());
+            .is_some());
     }
 
     /// Role-based orchestrator resolution (§18.4): an explicit
@@ -3064,7 +3064,7 @@ mod tests {
         assert!(svc.resolve_role_reminder("blank", None).is_none());
     }
 
-    const LATEST_EMBEDDED_IDS: [&str; 7] = [
+    const LATEST_EMBEDDED_IDS: [&str; 8] = [
         "developer",
         "chief-of-staff",
         "ralph",
@@ -3072,6 +3072,7 @@ mod tests {
         "pr-reviewer",
         "vulnerability-scanner",
         "product-manager",
+        "maintenance-coordinator",
     ];
 
     #[test]

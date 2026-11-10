@@ -26,6 +26,24 @@ pub(crate) const PRELUDE: &str = r"
 /// workspace, matching the dispatch refusal of their methods.
 const PLAIN_FOLDER_NAMESPACES: &[&str] = &["git", "pr", "mr"];
 
+/// `ws.help` topics that also get the live remote-placement reference: the
+/// agent namespace, and `agent.machineModels`, whose docs live only there.
+const PLACEMENT_HELP_TOPICS: &[&str] = &["agent", "agent.machineModels"];
+
+/// `ws.help`'s argument without the `ws.` prefix or a trailing `.` / `.*`.
+fn normalize(topic: &str) -> &str {
+    topic
+        .trim()
+        .trim_start_matches("ws.")
+        .trim_end_matches('*')
+        .trim_end_matches('.')
+}
+
+/// Whether `ws.help(topic)` should carry the remote-placement reference.
+pub(crate) fn wants_placement_help(topic: Option<&str>) -> bool {
+    topic.is_some_and(|topic| PLACEMENT_HELP_TOPICS.contains(&normalize(topic)))
+}
+
 pub(crate) fn dispatch(
     workspace_id: &WorkspaceId,
     features: &AgentFeaturesSettings,
@@ -46,17 +64,28 @@ pub(crate) fn dispatch(
             let is_chief = workspace_id.is_chief();
             match opt_str(args, "namespace") {
                 Some(ns) => {
-                    let name = ns
-                        .trim()
-                        .trim_start_matches("ws.")
-                        .trim_end_matches('*')
-                        .trim_end_matches('.');
-                    if plain_folder && PLAIN_FOLDER_NAMESPACES.contains(&name) {
+                    let name = normalize(&ns);
+                    let top = name.split('.').next().unwrap_or_default();
+                    if plain_folder && PLAIN_FOLDER_NAMESPACES.contains(&top) {
                         return Err(format!(
-                            "ws.{name} is not available in plain-folder workspaces"
+                            "ws.{top} is not available in plain-folder workspaces"
                         ));
                     }
-                    help_namespace(is_chief, features, is_sub_agent, &ns).map(shape)
+                    // A method path (`"agent.machineModels"`) gets its own doc
+                    // line when it has one, else its namespace's docs. Only an
+                    // unknown topic falls back: a gated namespace or method
+                    // keeps its "disabled" or denial error.
+                    help_namespace(is_chief, features, is_sub_agent, name)
+                        .or_else(|err| {
+                            let parent = name
+                                .rsplit_once('.')
+                                .map(|(parent, _)| parent)
+                                .filter(|_| err.starts_with("unknown namespace"))
+                                .ok_or_else(|| err.clone())?;
+                            help_namespace(is_chief, features, is_sub_agent, parent)
+                                .map_err(|_| err)
+                        })
+                        .map(shape)
                 }
                 None => Ok(shape(help_index(is_chief, features))),
             }
@@ -103,6 +132,81 @@ mod tests {
         )
         .unwrap();
         assert!(app.as_str().unwrap().contains("ws.app.workspaces.list("));
+    }
+
+    #[test]
+    fn method_paths_return_the_method_or_its_namespace() {
+        let ws: WorkspaceId = "ws-1".parse().unwrap();
+        let features = AgentFeaturesSettings::default();
+        let get = |topic: &str| {
+            dispatch(
+                &ws,
+                &features,
+                false,
+                false,
+                "get",
+                &json!({ "namespace": topic }),
+            )
+        };
+        // A documented method: its own doc line.
+        let create = get("ws.script.create").unwrap();
+        let create = create.as_str().unwrap();
+        assert!(create.contains("ws.script.create("));
+        assert!(!create.contains("ws.script.start("));
+        // A method without its own line (capability-gated): the namespace.
+        let models = get("agent.machineModels").unwrap();
+        assert!(models.as_str().unwrap().contains("ws.agent.create("));
+        assert!(wants_placement_help(Some("agent.machineModels")));
+        assert!(wants_placement_help(Some("ws.agent")));
+        assert!(!wants_placement_help(Some("agent.create")));
+        // Unknown namespaces and methods of unknown namespaces still error.
+        assert!(get("nope.method").is_err());
+        assert!(get("nope").is_err());
+    }
+
+    #[test]
+    fn method_paths_keep_the_namespace_gates() {
+        let ws: WorkspaceId = "ws-1".parse().unwrap();
+        let features = AgentFeaturesSettings {
+            background_hooks: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let err = dispatch(
+            &ws,
+            &features,
+            false,
+            false,
+            "get",
+            &json!({ "namespace": "hook.schedule" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("disabled in settings"), "{err}");
+        // A method-level gate keeps its error too, rather than falling back
+        // to the namespace docs that leave the method out.
+        let features = AgentFeaturesSettings {
+            attention_requests: false,
+            ..AgentFeaturesSettings::default()
+        };
+        let err = dispatch(
+            &ws,
+            &features,
+            false,
+            false,
+            "get",
+            &json!({ "namespace": "agent.requestDiscussion" }),
+        )
+        .unwrap_err();
+        assert!(err.contains("attentionRequests"), "{err}");
+        let plain = dispatch(
+            &ws,
+            &AgentFeaturesSettings::default(),
+            false,
+            true,
+            "get",
+            &json!({ "namespace": "git.commit" }),
+        )
+        .unwrap_err();
+        assert!(plain.contains("plain-folder"), "{plain}");
     }
 
     #[test]

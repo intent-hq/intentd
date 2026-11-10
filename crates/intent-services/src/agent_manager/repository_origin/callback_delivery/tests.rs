@@ -8719,9 +8719,12 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                 .trim(),
             launch_cwd.to_str().unwrap()
         );
+        // The launch's identity probe, plus harness 3.10's native repo-rule
+        // check (`native_rules::local_executor`), whose process-wide cache
+        // probes the CLI once per daemon and CLI build.
         assert_eq!(
             std::fs::read_to_string(h.scratch.path().join("cli-versions")).unwrap(),
-            "version\n"
+            "version\nversion\n"
         );
         let name = h.confirmed(0).await;
         let a = h.call(0, &name, "const a=await ws.mr.snapshot(4); const b=await ws.pr.snapshot(4); if(JSON.stringify(a)!==JSON.stringify(b)) throw Error('alias mismatch'); return a;").await;
