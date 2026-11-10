@@ -781,8 +781,8 @@ async fn event_created_maps(svc: &Services, ws: &WorkspaceId, agent: &AgentId) -
 
 /// `metadata.proposalCreatedWorkspaces` follows the resolution: the
 /// `agent:updated` event carries it, a client-side `agent.resolveProposal`
-/// (no created id) never invents one, and a re-proposed card dismissed later
-/// drops its stale link.
+/// (no created id) never invents one, and a re-proposed card drops its stale
+/// link as soon as it is recorded as a fresh pending card.
 #[tokio::test]
 async fn created_workspace_link_follows_the_resolution() {
     let (_t, svc, ws, _bus) = setup().await;
@@ -833,6 +833,16 @@ async fn created_workspace_link_follows_the_resolution() {
 
     let blocks = create_proposal_blocks("tc-1", None);
     seed(&svc, &ws, &agent, "tc-1", &blocks).await;
+    let session = svc
+        .store()
+        .get_agent_session_with_transcript(&agent)
+        .await
+        .expect("session");
+    assert!(
+        session.proposal_created_workspaces().is_empty()
+            && !session.proposal_resolutions().contains_key("tc-1"),
+        "re-proposing reopens the card as fresh pending, dropping its old outcome and link"
+    );
     svc.agent_resolve_proposal_op(
         ws.clone(),
         agent.clone(),
@@ -857,8 +867,9 @@ async fn created_workspace_link_follows_the_resolution() {
         vec![
             json!({ "tc-1": "ws-created" }).to_string(),
             json!({}).to_string(),
+            json!({}).to_string(),
         ],
-        "the dismissal event carries the cleared (empty) map"
+        "the re-proposal and the dismissal events both carry the cleared (empty) map"
     );
 }
 

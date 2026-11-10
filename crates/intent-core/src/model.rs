@@ -4373,9 +4373,11 @@ pub const PENDING_PROPOSALS_KEY: &str = "pendingProposals";
 /// `proposalId -> "applied" | "dismissed"` map recording how each formerly
 /// pending proposal was resolved. Doubles as the durable idempotency marker
 /// for `agent.resolveProposal`: re-resolving an id that is no longer pending
-/// succeeds without a duplicate notice, across daemon restarts. A
-/// re-proposed id re-enters the pending list; its re-resolution overwrites
-/// the earlier outcome (latest wins). Bounded: the resolver evicts the
+/// succeeds without a duplicate notice, across daemon restarts. An id is
+/// never both pending and resolved: a re-proposed id re-enters the pending
+/// list as a fresh card and its earlier outcome is dropped; its
+/// re-resolution records a new one. Legacy metadata holding an id in both
+/// reads as resolved ([`AgentSession::pending_proposals`]). Bounded: the resolver evicts the
 /// oldest entries past its retention cap, so the map (and the `AgentLite`
 /// projection lifting it into hot `agent.list` / `agent.get` payloads) never
 /// grows without bound. No schema migration — the map rides the existing
@@ -4766,13 +4768,37 @@ impl AgentSession {
             .is_some_and(serde_json::Value::is_string)
     }
 
-    /// The pending-proposals list persisted under [`PENDING_PROPOSALS_KEY`]
-    /// in the session's free-form `metadata`: the ordered
-    /// `{ proposalId, messageId }` entries still awaiting resolution. Order
-    /// is preserved; malformed entries (non-object, missing/empty ids) are
+    /// The effective pending-proposals list: [`Self::pending_proposals_raw`]
+    /// minus every id that also has an outcome in
+    /// [`Self::proposal_resolutions`]. Invariant (PROTOCOL §5.5): a proposal
+    /// id is never both pending and resolved. Legacy metadata can still hold
+    /// such a contradiction (an id-less card re-proposed under a resolved
+    /// title before re-recording cleared the stale outcome, or a resolve that
+    /// failed between its two writes); it reads as RESOLVED here, matching
+    /// what clients render for the card. Every reader (the `AgentLite`
+    /// projection, `agent.resolveProposal`, `workspace.create { origin }`,
+    /// `ws.workspace.applyProposal`) goes through this view; only the
+    /// pending-list writers read the raw list so they can drop the stale
+    /// entry on their next write.
+    #[must_use]
+    pub fn pending_proposals(&self) -> Vec<PendingProposal> {
+        let resolutions = self.proposal_resolutions();
+        let mut pending = self.pending_proposals_raw();
+        if !resolutions.is_empty() {
+            pending.retain(|p| !resolutions.contains_key(&p.proposal_id));
+        }
+        pending
+    }
+
+    /// The pending-proposals list exactly as persisted under
+    /// [`PENDING_PROPOSALS_KEY`] in the session's free-form `metadata`: the
+    /// ordered `{ proposalId, messageId }` entries recorded as awaiting
+    /// resolution, NOT filtered against [`Self::proposal_resolutions`] — use
+    /// [`Self::pending_proposals`] for what is really pending. Order is
+    /// preserved; malformed entries (non-object, missing/empty ids) are
     /// skipped defensively. Absent key, non-array value, or an empty array
     /// all read as an empty list.
-    pub fn pending_proposals(&self) -> Vec<PendingProposal> {
+    pub fn pending_proposals_raw(&self) -> Vec<PendingProposal> {
         self.metadata
             .as_ref()
             .and_then(|m| m.get(PENDING_PROPOSALS_KEY))
