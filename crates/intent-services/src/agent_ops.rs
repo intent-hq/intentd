@@ -638,6 +638,9 @@ mod tests_suggested_prompts_contract;
 mod tests_proposal_origin;
 
 #[cfg(test)]
+mod tests_proposal_invariant;
+
+#[cfg(test)]
 mod tests_parent_provider;
 
 #[cfg(test)]
@@ -10990,6 +10993,17 @@ impl Services {
     /// same message) writes and emits nothing. Returns `true` only when this
     /// call committed a change. Best-effort: a failure is logged and never
     /// fails the turn (the list simply stays as it was).
+    ///
+    /// A proposal id is never both pending and resolved (PROTOCOL §5.5). A
+    /// recorded id that already has an outcome in
+    /// [`intent_core::PROPOSAL_RESOLUTIONS_KEY`] — an id-less card keyed by
+    /// its `preview.title`, re-proposed under a title the user already
+    /// resolved — is a NEW card the user has not acted on: it lands pending
+    /// and its stale outcome (and any created-workspace link) is dropped.
+    /// The pending list is written first, so a failure before the outcome is
+    /// dropped leaves the id reading as resolved (the previous behavior)
+    /// rather than neither pending nor resolved. Raw entries contradicted by
+    /// a resolution (legacy data) are dropped from the rewritten list.
     pub(crate) async fn record_pending_proposals(
         &self,
         workspace_id: &WorkspaceId,
@@ -11010,10 +11024,14 @@ impl Services {
                 return false;
             }
         };
-        let existing = session.pending_proposals();
+        let existing = session.pending_proposals_raw();
+        let previous_resolutions = session.proposal_resolutions();
         let mut merged: Vec<intent_core::PendingProposal> = existing
             .iter()
-            .filter(|entry| !proposal_ids.contains(&entry.proposal_id))
+            .filter(|entry| {
+                !proposal_ids.contains(&entry.proposal_id)
+                    && !previous_resolutions.contains_key(&entry.proposal_id)
+            })
             .cloned()
             .collect();
         for id in proposal_ids {
@@ -11022,10 +11040,18 @@ impl Services {
                 message_id: message_id.to_string(),
             });
         }
-        if merged == existing {
+        let mut resolutions = previous_resolutions.clone();
+        resolutions.retain(|id, _| !proposal_ids.contains(id));
+        let reopened = resolutions.len() != previous_resolutions.len();
+        if merged == existing && !reopened {
             return false;
         }
-        self.persist_pending_proposals(workspace_id, agent_id, &merged)
+        let cleared = reopened.then(|| {
+            let mut created = session.proposal_created_workspaces();
+            created.retain(|id, _| resolutions.contains_key(id));
+            (resolutions, created)
+        });
+        self.persist_pending_proposals_with(workspace_id, agent_id, &merged, cleared)
             .await
     }
 
@@ -11056,10 +11082,13 @@ impl Services {
                 return;
             }
         };
-        let existing = session.pending_proposals();
+        let existing = session.pending_proposals_raw();
         if existing.is_empty() {
             return;
         }
+        // Raw entries contradicted by a recorded resolution (legacy data)
+        // read as resolved and are dropped from the rebuilt list.
+        let resolutions = session.proposal_resolutions();
         // Newest carrying assistant row per proposal id in the post-swap
         // transcript (later rows overwrite earlier ones).
         let mut carriers: std::collections::HashMap<String, &str> =
@@ -11075,6 +11104,7 @@ impl Services {
         }
         let reconciled: Vec<intent_core::PendingProposal> = existing
             .iter()
+            .filter(|entry| !resolutions.contains_key(&entry.proposal_id))
             .filter_map(|entry| {
                 carriers
                     .get(&entry.proposal_id)
@@ -11103,6 +11133,25 @@ impl Services {
         agent_id: &AgentId,
         proposals: &[intent_core::PendingProposal],
     ) -> bool {
+        self.persist_pending_proposals_with(workspace_id, agent_id, proposals, None)
+            .await
+    }
+
+    /// [`Services::persist_pending_proposals`], optionally also rewriting the
+    /// `(proposalResolutions, proposalCreatedWorkspaces)` maps AFTER the
+    /// pending list (re-recording a resolved id drops its stale outcome). The
+    /// map writes are best-effort: a failure is logged, the pending write
+    /// still counts as committed, and the event carries only what persisted.
+    async fn persist_pending_proposals_with(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        proposals: &[intent_core::PendingProposal],
+        cleared: Option<(
+            serde_json::Map<String, Value>,
+            serde_json::Map<String, Value>,
+        )>,
+    ) -> bool {
         let value = match serde_json::to_string(proposals) {
             Ok(value) => value,
             Err(e) => {
@@ -11122,16 +11171,21 @@ impl Services {
             .await
         {
             Ok(()) => {
-                self.publish_agent_mutation_event(
-                    workspace_id,
-                    agent_id,
-                    AGENT_UPDATED,
-                    json!({
-                        "agentId": agent_id.0,
-                        "pendingProposals": proposals,
-                    }),
-                )
-                .await;
+                let mut payload = json!({
+                    "agentId": agent_id.0,
+                    "pendingProposals": proposals,
+                });
+                if let Some((resolutions, created)) = cleared {
+                    if self
+                        .persist_proposal_maps(workspace_id, agent_id, &resolutions, &created)
+                        .await
+                    {
+                        payload["proposalResolutions"] = Value::Object(resolutions);
+                        payload["proposalCreatedWorkspaces"] = Value::Object(created);
+                    }
+                }
+                self.publish_agent_mutation_event(workspace_id, agent_id, AGENT_UPDATED, payload)
+                    .await;
                 true
             }
             Err(e) => {
@@ -11139,6 +11193,46 @@ impl Services {
                 false
             }
         }
+    }
+
+    /// Write the `proposalResolutions` and `proposalCreatedWorkspaces` maps
+    /// (two atomic single-key `json_set`s, resolutions first). Callers hold
+    /// the per-agent mutation lock. Returns `true` only when both committed;
+    /// a failure is logged and swallowed.
+    async fn persist_proposal_maps(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        resolutions: &serde_json::Map<String, Value>,
+        created: &serde_json::Map<String, Value>,
+    ) -> bool {
+        for (key, map) in [
+            (intent_core::PROPOSAL_RESOLUTIONS_KEY, resolutions),
+            (intent_core::PROPOSAL_CREATED_WORKSPACES_KEY, created),
+        ] {
+            let value = match serde_json::to_string(map) {
+                Ok(value) => value,
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, key, error = %e, "failed to serialize proposal map");
+                    return false;
+                }
+            };
+            if let Err(e) = self
+                .store
+                .set_agent_session_metadata_key_json(
+                    workspace_id,
+                    agent_id,
+                    key,
+                    &value,
+                    &now_iso(),
+                )
+                .await
+            {
+                tracing::warn!(agent = %agent_id, key, error = %e, "failed to persist proposal map");
+                return false;
+            }
+        }
+        true
     }
 
     /// Re-derive the pending-questions marker after a transcript swap that
@@ -11620,8 +11714,8 @@ impl Services {
     /// entries evicted past [`MAX_PROPOSAL_RESOLUTIONS`]), THEN removes the
     /// entry from the session's `pendingProposals` list (two atomic
     /// single-key `json_set`s in that order, so a failure between them
-    /// leaves the entry pending with its outcome recorded and a retry
-    /// converges instead of losing the resolution — sibling metadata keys
+    /// leaves the outcome recorded (the id reads as resolved) with a stale
+    /// pending entry a retry drops, instead of losing the resolution — sibling metadata keys
     /// preserved), emits `agent:updated` carrying both, and delivers the
     /// proposal-resolved system notice
     /// ([`Services::notify_proposal_resolved`]) for BOTH outcomes. The whole
@@ -11631,8 +11725,10 @@ impl Services {
     /// takes the idempotent path. **Idempotent**: re-resolving an id that is
     /// no longer pending but present in the resolutions map succeeds
     /// (echoing the CURRENT persisted outcome) without a duplicate notice or
-    /// event. An id that was never pending and never resolved →
-    /// `NotFound`. Nonexistent agent or workspace mismatch → `NotFound`.
+    /// event. An id that is still listed as pending but already has an
+    /// outcome (legacy contradictory metadata) reads as resolved and takes
+    /// the same idempotent path, dropping the stale pending entry. An id
+    /// that was never pending and never resolved → `NotFound`. Nonexistent agent or workspace mismatch → `NotFound`.
     pub(crate) async fn agent_resolve_proposal_op(
         &self,
         workspace_id: WorkspaceId,
@@ -11691,6 +11787,14 @@ impl Services {
             // persisted outcome — no rewrite, no duplicate notice), NotFound
             // when the id was never tracked.
             if let Some(existing) = resolutions.get(&proposal_id).and_then(Value::as_str) {
+                // Self-heal legacy metadata that still lists a resolved id
+                // as pending (it already reads as resolved): drop the stale
+                // raw entries — best-effort, no notice, since the outcome was
+                // recorded earlier.
+                if session.pending_proposals_raw().len() != pending.len() {
+                    self.persist_pending_proposals(&workspace_id, &agent_id, &pending)
+                        .await;
+                }
                 return Ok(json!({
                     "success": true,
                     "proposalId": proposal_id,
@@ -11746,10 +11850,13 @@ impl Services {
         let created_changed = created_workspaces != previous_created;
         // Persist the resolution FIRST (it doubles as the durable idempotency
         // marker), then shrink the pending list. A failure between the two
-        // writes leaves the entry pending WITH its outcome recorded: the RPC
-        // errors and a retry re-runs this path — the re-insert is an
-        // idempotent overwrite, and no notice was sent (the notice follows
-        // both writes), so none can duplicate. The reverse order could
+        // writes leaves the entry listed pending WITH its outcome recorded:
+        // it already reads as resolved (`AgentSession::pending_proposals`),
+        // the RPC errors, and a retry takes the idempotent path, which drops
+        // the stale entry. No notice was sent (the notice follows both
+        // writes), so none can duplicate; that rare retry delivers none
+        // either — the persisted outcome stays the source of truth, as for a
+        // failed notice delivery. The reverse order could
         // permanently lose the resolution: pending entry gone, no recorded
         // outcome, every retry NotFound.
         if created_changed {
