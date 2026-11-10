@@ -247,9 +247,10 @@ impl Transport {
 }
 
 /// Follow redirects with tower-http's `Standard` policy (at most 20 hops,
-/// credentials dropped cross-origin). Request extensions are not replayed on a
-/// redirected hop: tower-http 0.7 replays them by default, 0.6 never did, and
-/// each hop must reach `counted` as a fresh, separately admitted attempt.
+/// credentials dropped cross-origin). Kept at tower-http 0.6 parity: request
+/// extensions set above this layer (by octocrab or the outer layers) are not
+/// replayed on redirected hops; 0.7 replays them by default. `AdmittedAttempt`
+/// is unaffected either way: `AdmittedRetry` inserts it below this layer.
 fn redirect_layer() -> tower_http::follow_redirect::FollowRedirectLayer {
     tower_http::follow_redirect::FollowRedirectLayer::new().preserve_extensions(false)
 }
