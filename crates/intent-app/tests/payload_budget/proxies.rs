@@ -642,6 +642,8 @@ pub fn repo_config_json() -> String {
             "mode": "command",
             "cwd": "packages/app",
         })).collect::<Vec<_>>(),
+        // Retired key that older repo configs still carry through `extra`.
+        "cowCloneExclude": (0..20).map(|i| format!("cache/dir-{i}")).collect::<Vec<_>>(),
     })
     .to_string()
 }
