@@ -81,8 +81,12 @@ pub(super) struct MachineApi {
     binds: Mutex<HashMap<ExecutorCredentialId, LeaseBinding>>,
     unbindable: Mutex<Vec<ExecutorCredentialId>>,
     revocations: broadcast::Sender<ExecutorCredentialId>,
-    lookups: Mutex<Vec<String>>,
+    pub(super) lookups: Mutex<Vec<String>>,
     node_mode: AtomicBool,
+    /// `/node/claim`: never answer a claim (a machine that stalls after
+    /// the frame was written).
+    pub(super) claim_stalls: AtomicBool,
+    pub(super) claims: Mutex<Vec<String>>,
 }
 
 impl MachineApi {
@@ -96,6 +100,8 @@ impl MachineApi {
             revocations: broadcast::channel(16).0,
             lookups: Mutex::new(Vec::new()),
             node_mode: AtomicBool::new(false),
+            claim_stalls: AtomicBool::new(false),
+            claims: Mutex::new(Vec::new()),
         }
     }
 
@@ -122,6 +128,20 @@ impl MachineApi {
 }
 
 impl WorkspaceApi for MachineApi {
+    fn claim_node_invite(
+        &self,
+        frame: intent_core::node_invite::ClaimFrame,
+    ) -> BoxFuture<'_, intent_core::Result<intent_core::node_invite::ClaimReply>> {
+        Box::pin(async move {
+            self.claims.lock().unwrap().push(frame.invite_id.clone());
+            if self.claim_stalls.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            Ok(intent_core::node_invite::ClaimReply::refused(
+                intent_core::node_invite::codes::USED,
+            ))
+        })
+    }
     fn node_mode(&self) -> bool {
         self.node_mode.load(Ordering::SeqCst)
     }
@@ -1411,4 +1431,33 @@ async fn both_ends_capture_link_traffic_only_while_on() {
         node[0]["peer"],
         serde_json::json!({ "kind": "backend", "id": BACKEND, "name": "Backend" })
     );
+}
+
+/// `/node/claim` admission (node-link.md "Node invite claim"): the gate's
+/// path, API flag, Origin and readiness steps apply, but no credential is
+/// resolved, so an anonymous upgrade is admitted and a token is ignored.
+#[tokio::test]
+async fn the_claim_path_is_anonymous_but_gated() {
+    use intent_core::node_invite::CLAIM_PATH;
+    let mut machine = Machine::start(Mode::Secure { ws_enabled: true }).await;
+    let (status, _) = machine.upgrade(CLAIM_PATH, &[]).await;
+    assert_eq!(status, 101, "no token needed");
+    let auth = bearer(&owner_token());
+    let (status, _) = machine
+        .upgrade(CLAIM_PATH, &[("authorization", auth.as_str())])
+        .await;
+    assert_eq!(status, 101, "a token is ignored");
+    let (status, _) = machine
+        .upgrade(CLAIM_PATH, &[("origin", "https://intent.local")])
+        .await;
+    assert_eq!(status, 403);
+    assert!(machine.api.lookups.lock().unwrap().is_empty());
+    machine.set_ready(false);
+    let (status, _) = machine.upgrade(CLAIM_PATH, &[]).await;
+    assert_eq!(status, 404);
+    machine.nothing_accepted().await;
+
+    let off = Machine::start(Mode::Secure { ws_enabled: false }).await;
+    let (status, _) = off.upgrade(CLAIM_PATH, &[]).await;
+    assert_eq!(status, 403);
 }

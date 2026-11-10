@@ -196,7 +196,10 @@ pub(crate) async fn claim(
     };
     let tuning = feature.tuning().connect.clone();
     let mut attempts = Vec::new();
-    let reply = tokio::time::timeout(tuning.total, async {
+    // No overall deadline: each step is bounded (the TCP race per route,
+    // then `dial_claim`'s connect and reply), so a deadline can never fire
+    // after the frame was written and misreport the invite as still open.
+    let reply = async {
         let mut racing = race_direct(target.direct_routes(), &tuning);
         while let Some(joined) = racing.join_next().await {
             let Ok((route, reached)) = joined else {
@@ -220,12 +223,12 @@ pub(crate) async fn claim(
             }
         }
         Ok::<_, Error>(None)
-    })
+    }
     .await;
     let reply = match reply {
-        Ok(Ok(Some(reply))) => reply,
-        Ok(Err(error)) => return Err(error),
-        Ok(Ok(None)) | Err(_) => {
+        Ok(Some(reply)) => reply,
+        Err(error) => return Err(error),
+        Ok(None) => {
             if attempts.is_empty() {
                 attempts.push(Attempt {
                     route: "none".into(),
