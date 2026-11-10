@@ -8,3 +8,8 @@ pub const COMMAND: &str = "agy";
 /// never appear there. agy resolves it under `~/.gemini` and rejects an
 /// absolute path. The sign-in is shared with the default directory.
 pub const PROBE_APP_DATA_DIR: &str = "antigravity-intent-probe";
+
+/// First agy release with the `acp` subcommand. A launch updates an older
+/// agy (intent-services `agy_cli`).
+pub const MIN_VERSION: &str = "1.5.0";
+pub const MIN_VERSION_TRIPLE: (u64, u64, u64) = (1, 5, 0);

@@ -243,6 +243,11 @@ where
     ]
     .map(String::from)
     .to_vec();
+    if !session_only {
+        crate::agy_cli::ensure_current(&bin)
+            .await
+            .map_err(ProbeError::Spawn)?;
+    }
     let cmd = AcpProbeCommand::binary(bin, args);
     if session_only {
         probe::run_acp_session_probe(cmd, extract).await

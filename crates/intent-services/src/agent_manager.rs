@@ -12034,6 +12034,15 @@ impl AgentManager {
             .map_err(|e| Error::Internal(format!("auggie version probe task failed: {e}")))??;
             resolved.provider_binary = Some(selected);
         }
+        // `agy acp` needs agy `MIN_VERSION`+; a fresh spawn updates an older
+        // agy first, as the Codex/Claude minimum does at launch.
+        if resolved.provider.id == "antigravity" && !self.contains(agent_id) {
+            if let Some(binary) = resolved.provider_binary.clone() {
+                crate::agy_cli::ensure_current(&binary)
+                    .await
+                    .map_err(Error::InvalidParams)?;
+            }
+        }
         // npx version gate (intent-hq/intent#5725): before a fresh child spawns
         // through npx (npx-only providers and optional npx fallbacks), reject
         // an npm-6 npx with an actionable error instead of three doomed

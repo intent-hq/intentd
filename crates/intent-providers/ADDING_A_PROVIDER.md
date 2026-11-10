@@ -403,7 +403,10 @@ Antigravity runs the user's `agy` CLI as an ACP server: `agy acp` (agy 1.5.0 or
 later). Intent does not install, update, or isolate it. `providers.paths.antigravity`
 overrides the `agy` executable.
 
-1. Install `agy` and sign in on the daemon host: `agy acp --login`.
+1. Install `agy` and sign in on the daemon host: `agy acp --login`. An agent
+   launch or a model refresh runs `agy update` when agy is older than
+   `intent_providers::antigravity::MIN_VERSION` (`intent-services/src/agy_cli.rs`);
+   discovery never updates. Raise the minimum when Intent needs a newer agy.
 2. Refresh provider status and enable Antigravity in Settings.
 
 The daemon never sends `authenticate`, because it opens a browser. A signed-out

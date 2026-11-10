@@ -88,6 +88,7 @@ fn antigravity_mock_adapter(dir: &std::path::Path, session_result: &str) -> std:
     let requests = dir.join("requests.jsonl");
     let script = format!(
         r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 1.5.5; exit 0; fi
 printf '%s\n' "$*" > '{}'
 IFS= read -r init
 printf '%s\n' "$init" >> '{}'
