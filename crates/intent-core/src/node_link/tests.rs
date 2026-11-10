@@ -1930,12 +1930,12 @@ fn the_backend_trims_and_cuts_display_labels() {
     let long = format!("{}é", "a".repeat(LaunchLabels::MAX_BYTES - 1));
     let labels = LaunchLabels::new(None, Some(&long));
     assert_eq!(labels.agent_name, None);
-    let title = labels.workspace_title.as_deref().unwrap();
-    assert_eq!(title, "a".repeat(LaunchLabels::MAX_BYTES - 1));
+    let title = labels.workspace_title.clone().unwrap();
+    assert_eq!(&*title, "a".repeat(LaunchLabels::MAX_BYTES - 1));
     let wire = serde_json::to_value(labelled_launch(labels)).unwrap();
     let decoded: LaunchCommand = serde_json::from_value(wire).unwrap();
     assert_eq!(
-        decoded.labels.workspace_title.as_deref(),
+        decoded.labels.workspace_title,
         Some(title),
         "a cut label survives the machine's check"
     );
