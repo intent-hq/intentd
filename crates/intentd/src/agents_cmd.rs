@@ -2,6 +2,7 @@
 //! memory dialog shows them, read from `agent.memoryUsage` (§5.5).
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -117,9 +118,9 @@ fn render_table(payload: &Value, titles: &HashMap<String, String>) -> String {
             }
             // MEMORY and PROCS are numbers: right-aligned.
             if index >= 4 {
-                line.push_str(&format!("{cell:>width$}"));
+                let _ = write!(line, "{cell:>width$}");
             } else {
-                line.push_str(&format!("{cell:<width$}"));
+                let _ = write!(line, "{cell:<width$}");
             }
         }
         out.push_str(line.trim_end());
@@ -128,10 +129,11 @@ fn render_table(payload: &Value, titles: &HashMap<String, String>) -> String {
     let count = agents.len();
     let noun = if count == 1 { "agent" } else { "agents" };
     let total = payload["totalBytes"].as_u64().unwrap_or(0);
-    out.push_str(&format!(
-        "\n{count} {noun}, {} in total, sampled {sampled_at}\n",
+    let _ = writeln!(
+        out,
+        "\n{count} {noun}, {} in total, sampled {sampled_at}",
         format_bytes(total)
-    ));
+    );
     out
 }
 
