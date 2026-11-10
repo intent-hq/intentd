@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.169] - 2026-11-10
+
+### 🐛 Bug Fixes
+
+- *(specialists)* UI Designer reports via ws.agent.reportToParent (harness 3.10) ([#3230](https://github.com/intent-hq/intentd/pull/3230))
+
+### 📚 Documentation
+
+- *(guide)* Describe iOS read-only mode while reconnecting ([#3140](https://github.com/intent-hq/intentd/pull/3140))
+
+### ⚙️ Miscellaneous Tasks
+
+- Update Cargo.lock dependencies
+
+
 ## [0.11.168] - 2026-11-10
 
 ### 🚀 Features
