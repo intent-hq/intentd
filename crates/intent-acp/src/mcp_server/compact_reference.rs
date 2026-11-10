@@ -40,7 +40,8 @@ const HOT_HEADER: &str = "Common methods (signature + first sentence; the rest v
 
 /// The most-called methods (intent-hq/intent `scripts/agent-context`
 /// mining: 93% of historical calls). `ws.help` is in the map and the
-/// preamble, so `agent.list` takes its slot.
+/// preamble, so `agent.list` takes its slot. `agent.delegate` is listed for
+/// its occupancy refusal (see [`DELEGATE_OCCUPANCY`]), not its call count.
 pub(crate) const HOT_SET: &[&str] = &[
     "agent.send",
     "note.add",
@@ -72,7 +73,61 @@ pub(crate) const HOT_SET: &[&str] = &[
     "pr.monitor",
     "workspace.details",
     "hook.list",
+    "agent.delegate",
 ];
+
+/// The single-task `agent.delegate` option and rule the shared doc line
+/// leaves out. That line's bytes are frozen for older harnesses, so 3.10
+/// adds them to its hot-set entry and its `ws.help` page. The refusal is
+/// the occupancy pre-gate in intent-services `agent_ops.rs`.
+const DELEGATE_OCCUPANCY: (&str, &str, &str) = (
+    "skipAutoCommit?",
+    ", force?",
+    " The single-task form refuses a task note that still has an assigned agent, even an idle \
+     or finished one (only a deleted or retired agent frees it), unless the task is complete or \
+     cancelled: reach that agent with `ws.agent.sendToTask` or `ws.agent.wakeOrCreate`, use a \
+     separate task note, or pass `force: true` to add a second agent.",
+);
+
+const DELEGATE_LINE: &str = "  ws.agent.delegate(";
+
+/// A shared `agent.delegate` line, full or condensed, with
+/// [`DELEGATE_OCCUPANCY`] added.
+fn with_delegate_occupancy(line: &str) -> String {
+    let (after, option, rule) = DELEGATE_OCCUPANCY;
+    let Some(at) = line.find(after) else {
+        debug_assert!(false, "agent.delegate signature lost `{after}`: {line}");
+        return line.to_owned();
+    };
+    let at = at + after.len();
+    format!("{}{option}{}{rule}", &line[..at], &line[at..])
+}
+
+/// A hot-set entry as 3.10 renders it.
+fn hot_line(path: &str, condensed: &str) -> String {
+    if path == "agent.delegate" {
+        with_delegate_occupancy(condensed)
+    } else {
+        condensed.to_owned()
+    }
+}
+
+/// A `ws.help` reply as 3.10 serves it.
+pub(crate) fn help(text: String) -> String {
+    if !text.contains(DELEGATE_LINE) {
+        return text;
+    }
+    text.split('\n')
+        .map(|line| {
+            if line.starts_with(DELEGATE_LINE) {
+                with_delegate_occupancy(line)
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// One routing row and the methods it names. A row whose methods are not
 /// all on the bridge (feature-gated, plain folder, sub-agent) is dropped.
@@ -322,7 +377,7 @@ impl CompactReference {
             }
             seen.push(path);
             if let Some(condensed) = tools::condensed_method_line(line) {
-                hot.push_str(&condensed);
+                hot.push_str(&hot_line(path, &condensed));
                 hot.push('\n');
             }
         }

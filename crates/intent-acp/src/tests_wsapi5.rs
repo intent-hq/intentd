@@ -1900,6 +1900,44 @@ async fn plain_folder_help_omits_git_and_forge_surfaces() {
     assert!(pr.contains("ws.pr.snapshot("), "{pr}");
 }
 
+/// `ws.help("agent")` follows the session's docs version: harness 3.10
+/// documents `force` and the occupancy refusal on `ws.agent.delegate`, and
+/// changes no other line; older harnesses keep the shared line.
+#[tokio::test]
+async fn help_agent_delegate_line_follows_the_docs_version() {
+    let page = |resp: Value| body(&resp).as_str().unwrap().to_string();
+    let delegate = |page: &str| {
+        page.lines()
+            .find(|l| l.starts_with("  ws.agent.delegate("))
+            .expect("delegate line")
+            .to_string()
+    };
+    let (srv, _api) = server();
+    let shared = page(call(&srv, "return await ws.help('agent');").await);
+    let srv = srv.with_workspace_api_docs(&crate::WORKSPACE_API_DOCS_V3_10);
+    let staged = page(call(&srv, "return await ws.help('agent');").await);
+    let (before, after) = (delegate(&shared), delegate(&staged));
+    assert!(!before.contains("force?"), "{before}");
+    assert!(after.contains("skipAutoCommit?, force?, tasks?"), "{after}");
+    for named in [
+        "still has an assigned agent, even an idle or finished one",
+        "unless the task is complete or cancelled",
+        "`ws.agent.sendToTask`",
+        "`ws.agent.wakeOrCreate`",
+        "a separate task note",
+        "`force: true`",
+    ] {
+        assert!(after.contains(named), "{named}: {after}");
+    }
+    assert_eq!(staged.replace(&after, &before), shared);
+    let note = page(call(&srv, "return await ws.help('note');").await);
+    let (srv, _api) = server();
+    assert_eq!(
+        note,
+        page(call(&srv, "return await ws.help('note');").await)
+    );
+}
+
 /// The advertised `workspace_api` description — full, compact (truncating
 /// providers' `tools/list`) and condensed (their system-prompt copy) —
 /// leaves out the git and forge surfaces on a plain-folder bridge, under

@@ -38,6 +38,10 @@ pub trait WorkspaceApiDocs: Send + Sync {
     fn prompt_reference(&self, inputs: &WorkspaceApiDocsInputs<'_>) -> Option<String>;
     /// The system-prompt section around a [`Self::prompt_reference`].
     fn prompt_section(&self, reference: &str) -> String;
+    /// A `ws.help` reply as this version serves it, from the shared text.
+    fn help(&self, text: String) -> String {
+        text
+    }
 }
 
 /// The surfaces of harness 1.0 through 3.9.
@@ -139,5 +143,9 @@ impl WorkspaceApiDocs for WorkspaceApiDocsV3_10 {
             "{WORKSPACE_API_SYSTEM_PROMPT_HEADING}\n\nThe `workspace_api` tool runs JavaScript against \
              this reference.\n\n{reference}"
         )
+    }
+
+    fn help(&self, text: String) -> String {
+        super::compact_reference::help(text)
     }
 }

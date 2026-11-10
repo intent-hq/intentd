@@ -4,7 +4,8 @@
 //! namespace's full doc lines, both cut from the same assembled description
 //! the MCP tool advertises (`super::super::tools::workspace_api_description`),
 //! so chief-ness and `[agentFeatures]` gating apply automatically and the two
-//! surfaces cannot drift. This gives agents whose MCP client truncated the
+//! surfaces cannot drift. The host then passes each reply through the
+//! session's `WorkspaceApiDocs::help`, which harness 3.10 extends. This gives agents whose MCP client truncated the
 //! tool description an in-sandbox way to recover the full API reference.
 //! In a plain-folder workspace (§5.1) the git and forge surfaces are left out
 //! exactly as in the tool description (`plain_folder_description`).
