@@ -123,9 +123,9 @@ async fn a_remote_agents_sub_agent_on_its_machine_shares_its_checkout() {
     );
     let child_id = agent_named(&mut rpc_ws, &ws_id, "Child", 60).await;
 
-    // The child's turn end comes first, so the parent's next turn waits
-    // for its own.
-    stream_end(&mut events, &child_id).await;
+    // The child's turn may end before or after the parent's, and the
+    // parent's turn skips other agents' ends, so the child's reply is
+    // polled instead.
     let seen = reply_containing(&mut rpc_ws, (&ws_id, &child_id), "child-1", 100).await;
     let seen: Value = serde_json::from_str(&seen).unwrap();
     let text = seen.to_string();
@@ -531,10 +531,9 @@ async fn a_remote_sub_agent_that_retires_itself_finishes_its_turn() {
     )
     .await;
     let child_id = agent_named(&mut rpc_ws, &ws_id, "Child", 60).await;
-    stream_end(&mut events, &child_id).await;
     reply_containing(&mut rpc_ws, (&ws_id, &child_id), "child-1", 100).await;
 
-    // A follow-up after both turns ended.
+    // A follow-up after the parent's turn ended.
     let reply = child_turn(
         &mut rpc_ws,
         (&ws_id, &child_id),

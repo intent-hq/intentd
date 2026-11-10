@@ -209,7 +209,8 @@ async fn event(ws: &mut common::TlsWs, kind: &str) -> Value {
 
 /// The next `agent:stream:end` of `agent_id`. Other agents' turn ends
 /// (a sub-agent's, a parent's wake) arrive on the same subscription and
-/// are skipped.
+/// are consumed, so a later wait for another agent's end may never see
+/// it: poll that agent's reply with [`reply_containing`] instead.
 async fn stream_end(ws: &mut common::TlsWs, agent_id: &str) -> Value {
     timeout(wait(), async {
         loop {
