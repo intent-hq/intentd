@@ -51,6 +51,7 @@ impl Daemon {
         let socket = daemon.socket();
         let ready = timeout(common::daemon_startup_timeout(), async {
             while !common::daemon_is_ready(&socket).await {
+                // timing-guard: poll interval between reads of an observable state, not a wait for time to pass
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
@@ -138,6 +139,7 @@ async fn eventually<F: FnMut() -> bool>(what: &str, mut done: F) {
         tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(20));
     while !done() {
         assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        // timing-guard: poll interval between reads of an observable state, not a wait for time to pass
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -267,6 +269,7 @@ async fn failing_archive_script_still_archives_and_shows_the_failure_on_the_card
             tokio::time::Instant::now() < deadline,
             "statusMessage never reported the failure: {ws}"
         );
+        // timing-guard: poll interval between reads of an observable state, not a wait for time to pass
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(worktree.exists(), "archive keeps the folder");
