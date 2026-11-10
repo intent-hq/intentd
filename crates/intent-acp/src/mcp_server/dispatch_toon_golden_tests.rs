@@ -13,11 +13,11 @@ fn cases() -> Vec<(&'static str, Value, &'static str)> {
         (
             "flat_object",
             json!({"ok": true, "noteId": "spec", "count": 3, "ratio": 0.5, "missing": null}),
-            r#"ok: true
+            r"ok: true
 noteId: spec
 count: 3
 ratio: 0.5
-missing: null"#,
+missing: null",
         ),
         (
             "hyphenated_ids",
@@ -30,37 +30,37 @@ branch: chore/toon-format-0-6"#,
         (
             "tabular_rows",
             json!({"agents": [{"id": "agent-1", "name": "Ada", "status": "idle"}, {"id": "agent-2", "name": "Bob", "status": "responding"}]}),
-            r#"agents[2]{id,name,status}:
+            r"agents[2]{id,name,status}:
   agent-1,Ada,idle
-  agent-2,Bob,responding"#,
+  agent-2,Bob,responding",
         ),
         (
             "list_rows_with_nested_object",
             json!({"tasks": [{"id": "t-1", "status": "todo", "owner": {"agentId": "agent-1"}}, {"id": "t-2", "status": "done", "owner": null}]}),
-            r#"tasks[2]:
+            r"tasks[2]:
   - id: t-1
     status: todo
     owner:
       agentId: agent-1
   - id: t-2
     status: done
-    owner: null"#,
+    owner: null",
         ),
         (
             "uniform_nested_rows",
             json!({"monitors": [{"pr": 1, "checks": {"passed": 3, "failed": 0}}, {"pr": 2, "checks": {"passed": 1, "failed": 2}}]}),
-            r#"monitors[2]{pr,checks{passed,failed}}:
+            r"monitors[2]{pr,checks{passed,failed}}:
   1,3,0
-  2,1,2"#,
+  2,1,2",
         ),
         (
             "empty_collections",
             json!({"tags": [], "meta": {}, "hooks": [[], {}]}),
-            r#"tags: []
+            r"tags: []
 meta:
 hooks[2]:
   - [0]:
-  -"#,
+  -",
         ),
         (
             "quoting",
@@ -79,11 +79,11 @@ unicode: café ✓
         (
             "mixed_array",
             json!({"values": [1, "two", {"three": 3}, [4, 5]]}),
-            r#"values[4]:
+            r"values[4]:
   - 1
   - two
   - three: 3
-  - [2]: 4,5"#,
+  - [2]: 4,5",
         ),
         (
             "top_level_array",
