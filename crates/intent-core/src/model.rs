@@ -4141,20 +4141,42 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "3.9";
+pub const CURRENT_HARNESS_VERSION: &str = "3.11";
 
-/// The next harness version while it is built: registered and admitted
+/// A harness experiment while it is built: registered and admitted
 /// like a released one, but stamped only through the eval-only override
 /// (`INTENTD_EVAL_HARNESS_VERSION`). Making it [`CURRENT_HARNESS_VERSION`]
-/// sets this back to `None`.
+/// sets this back to `None`. A later narrow release may bypass this version
+/// without promoting the experiment or changing its existing session pins.
 pub const STAGED_HARNESS_VERSION: Option<&str> = Some("3.10");
 
-/// The newest version this build knows: [`STAGED_HARNESS_VERSION`], else
-/// [`CURRENT_HARNESS_VERSION`].
+/// The numerically newest registered version, regardless of rollout status.
 pub const NEWEST_HARNESS_VERSION: &str = match STAGED_HARNESS_VERSION {
-    Some(version) => version,
-    None => CURRENT_HARNESS_VERSION,
+    Some(version) if version_is_newer(version, CURRENT_HARNESS_VERSION) => version,
+    _ => CURRENT_HARNESS_VERSION,
 };
+
+// Constants here are validated MAJOR.MINOR strings with small numeric parts.
+const fn version_is_newer(a: &str, b: &str) -> bool {
+    const fn parts(version: &str) -> (u32, u32) {
+        let bytes = version.as_bytes();
+        let (mut major, mut minor, mut after_dot, mut i) = (0, 0, false, 0);
+        while i < bytes.len() {
+            if bytes[i] == b'.' {
+                after_dot = true;
+            } else if after_dot {
+                minor = minor * 10 + (bytes[i] - b'0') as u32;
+            } else {
+                major = major * 10 + (bytes[i] - b'0') as u32;
+            }
+            i += 1;
+        }
+        (major, minor)
+    }
+    let (a_major, a_minor) = parts(a);
+    let (b_major, b_minor) = parts(b);
+    a_major > b_major || (a_major == b_major && a_minor > b_minor)
+}
 
 /// Harness versions that receive repository guidance, oldest first. The single
 /// source for every admission gate and boundary test: bumping
@@ -4163,14 +4185,14 @@ pub const NEWEST_HARNESS_VERSION: &str = match STAGED_HARNESS_VERSION {
 /// check below fails the build until that is done. Exact strings only, so
 /// malformed or unknown stamps are never admitted.
 pub const REPOSITORY_GUIDANCE_HARNESS_VERSIONS: &[&str] = &[
-    "3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10",
+    "3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10", "3.11",
 ];
 
 /// Harness versions that receive monitor-style repository guidance and the
 /// repository-callback prompt envelope, oldest first. Always the newest part
 /// of [`REPOSITORY_GUIDANCE_HARNESS_VERSIONS`] (checked at compile time).
 pub const REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS: &[&str] = &[
-    "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10",
+    "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10", "3.11",
 ];
 
 const fn const_str_eq(a: &str, b: &str) -> bool {
@@ -4188,15 +4210,29 @@ const fn const_str_eq(a: &str, b: &str) -> bool {
     true
 }
 
-/// `versions` ends with [`NEWEST_HARNESS_VERSION`], preceded by
-/// [`CURRENT_HARNESS_VERSION`] while a version is staged.
+/// `versions` ends with the newest registered version and includes both
+/// current and staged, even when a narrow release bypasses an experiment.
 const fn ends_with_current(versions: &[&str]) -> bool {
     let n = versions.len();
     if n == 0 || !const_str_eq(versions[n - 1], NEWEST_HARNESS_VERSION) {
         return false;
     }
     match STAGED_HARNESS_VERSION {
-        Some(_) => n >= 2 && const_str_eq(versions[n - 2], CURRENT_HARNESS_VERSION),
+        Some(staged) => {
+            let other = if const_str_eq(staged, NEWEST_HARNESS_VERSION) {
+                CURRENT_HARNESS_VERSION
+            } else {
+                staged
+            };
+            let mut i = 0;
+            while i + 1 < n {
+                if const_str_eq(versions[i], other) {
+                    return true;
+                }
+                i += 1;
+            }
+            false
+        }
         None => true,
     }
 }
@@ -4239,7 +4275,10 @@ const _: () = {
         "CURRENT_HARNESS_VERSION must be MAJOR.MINOR (e.g. \"3.3\")"
     );
     assert!(
-        is_major_minor(NEWEST_HARNESS_VERSION),
+        match STAGED_HARNESS_VERSION {
+            Some(version) => is_major_minor(version),
+            None => true,
+        },
         "STAGED_HARNESS_VERSION must be MAJOR.MINOR (e.g. \"3.3\")"
     );
     assert!(
@@ -9631,7 +9670,10 @@ mod tests {
         assert!(!const_str_eq("3.3", "3.30"));
         assert!(!const_str_eq("3.3", "3.4"));
         let newest: &[&str] = match STAGED_HARNESS_VERSION {
-            Some(staged) => &["2.9", CURRENT_HARNESS_VERSION, staged],
+            Some(staged) if NEWEST_HARNESS_VERSION == staged => {
+                &["2.9", CURRENT_HARNESS_VERSION, staged]
+            }
+            Some(staged) => &["2.9", staged, CURRENT_HARNESS_VERSION],
             None => &["2.9", CURRENT_HARNESS_VERSION],
         };
         assert!(ends_with_current(newest));
@@ -9640,7 +9682,7 @@ mod tests {
         if let Some(staged) = STAGED_HARNESS_VERSION {
             assert!(
                 !ends_with_current(&["2.9", staged]),
-                "current precedes staged"
+                "both current and staged must be present"
             );
         }
         assert!(is_suffix_of(&["b", "c"], &["a", "b", "c"]));

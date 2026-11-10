@@ -319,7 +319,7 @@ mod tests {
         };
         let placement = "Remote placement (experimental): fixture machine list.";
         let mut session = base.clone();
-        session.harness_version = intent_core::NEWEST_HARNESS_VERSION.into();
+        session.harness_version = "3.10".into();
         let mut sub = session.clone();
         sub.parent_agent_id = Some(AgentId::from("agent-parent"));
         for provider in intent_providers::config::ACP_PROVIDERS {
@@ -384,7 +384,7 @@ mod tests {
                 );
                 let tool = server.workspace_api_tool_description();
                 let b = assembled.breakdown(
-                    intent_core::NEWEST_HARNESS_VERSION,
+                    "3.10",
                     "t".into(),
                     tool_description_sections(
                         &tool,
@@ -421,7 +421,7 @@ mod tests {
             500,
         )];
         let b = a.breakdown(
-            intent_core::NEWEST_HARNESS_VERSION,
+            "3.10",
             "t".into(),
             tool_description_sections("tool", None, false),
         );

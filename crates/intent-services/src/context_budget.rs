@@ -36,7 +36,7 @@ use crate::Services;
 /// The release the cut is measured against.
 const BASELINE: &str = "3.9";
 /// The harness under test.
-const CANDIDATE: &str = intent_core::NEWEST_HARNESS_VERSION;
+const CANDIDATE: &str = "3.10";
 /// The newest harness may carry at most this share of the baseline on the
 /// realistic fixture.
 const REALISTIC_MAX_RATIO: f64 = 0.5;

@@ -838,7 +838,7 @@ async fn a_remote_spawn_records_no_prompt_breakdown() {
     });
     let (_tmp, mgr) = remote_manager(port, &id, &ws).await;
     let store = &mgr.services.store;
-    let newest = intent_core::NEWEST_HARNESS_VERSION;
+    let newest = "3.10";
     let seeded = PromptBreakdown::new(newest, now_iso(), Vec::new(), Vec::new());
     stamp_harness(store, &id, newest).await;
     store
