@@ -43,21 +43,22 @@ const REALISTIC_MAX_RATIO: f64 = 0.5;
 
 /// Clean-fixture ceiling per provider: `(provider, top-level chars,
 /// sub-agent chars)`. Measured on harness 3.10 with the compact ws.*
-/// reference, the trimmed doctrine and the skills cut (2026-11-09); lower
-/// each row again as further cuts land.
+/// reference, the trimmed doctrine and the skills cut (2026-11-09), plus
+/// the `ws.agent.delegate` occupancy entry (2026-11-10); lower each row
+/// again as further cuts land.
 const CLEAN_CEILING: &[(&str, usize, usize)] = &[
-    ("auggie", 24_859, 23_219),
-    ("claude-code", 25_138, 23_498),
-    ("codex", 24_859, 23_219),
-    ("cortex", 24_859, 23_219),
-    ("opencode", 24_859, 23_219),
-    ("unsloth", 24_859, 23_219),
-    ("pi", 24_859, 23_219),
-    ("droid", 25_138, 23_498),
-    ("grok", 25_138, 23_498),
-    ("antigravity", 24_859, 23_219),
-    ("cursor", 25_087, 23_447),
-    ("mock", 24_859, 23_219),
+    ("auggie", 25_447, 23_807),
+    ("claude-code", 25_726, 24_086),
+    ("codex", 25_447, 23_807),
+    ("cortex", 25_447, 23_807),
+    ("opencode", 25_447, 23_807),
+    ("unsloth", 25_447, 23_807),
+    ("pi", 25_447, 23_807),
+    ("droid", 25_726, 24_086),
+    ("grok", 25_726, 24_086),
+    ("antigravity", 25_447, 23_807),
+    ("cursor", 25_675, 24_035),
+    ("mock", 25_447, 23_807),
 ];
 
 /// Where the fixtures' paths appear to live, so sizes do not depend on the
