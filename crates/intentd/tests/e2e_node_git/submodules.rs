@@ -558,3 +558,84 @@ async fn removed_submodules_are_re_added_by_hand_and_stay_removed_by_commit() {
     let files = git(fixture.head.path(), &["ls-tree", "--name-only", &again.wip]);
     assert!(files.lines().all(|file| file != "c"), "{files}");
 }
+
+/// `git fetch` in `dir`, as an agent runs it, with a global
+/// `submodule.recurse = true` (which outranks a per-module
+/// `fetchRecurseSubmodules`): its exit status and stderr.
+fn fetch(dir: &Path, global: &Path) -> (bool, String) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .env("GIT_CONFIG_GLOBAL", global)
+        .args(["fetch", "--quiet", "origin"])
+        .output()
+        .unwrap();
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetching_origin_does_not_fail_on_the_submodules() {
+    let mut fixture = Fixture::start().await;
+    let layout = layout(&mut fixture);
+    let worktree = fixture.worktree("a");
+    checkout(&fixture, &worktree, &layout.pins).await;
+    let head = fixture.head.path().to_path_buf();
+    let global = fixture.node.path().join("recurse.gitconfig");
+    std::fs::write(&global, "[submodule]\n\trecurse = true\n").unwrap();
+    tokio::time::timeout(
+        wait(),
+        fixture
+            .cache
+            .ensure_origin(&worktree, head.to_str().unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // Upstream moves both submodule gitlinks to commits the machine has not
+    // seen, so git's on-demand recursion would fetch in `a` and `a/b`.
+    commit_file(&layout.b, "upstream.txt", "new in b\n");
+    git(&layout.a, &["add", "b"]);
+    commit_file(&layout.a, "upstream.txt", "new in a\n");
+    git(&head, &["add", "a"]);
+    commit(&head, "move a");
+    let (ok, stderr) = fetch(&worktree, &global);
+    assert!(ok, "git fetch origin: {stderr}");
+    // Nested: `a` given a remote of its own still does not recurse into
+    // `a/b`.
+    git(
+        &worktree.join("a"),
+        &["remote", "add", "origin", layout.a.to_str().unwrap()],
+    );
+    let (ok, stderr) = fetch(&worktree.join("a"), &global);
+    assert!(ok, "git fetch origin in a: {stderr}");
+
+    // A checkout whose modules an earlier launch populated gets the same
+    // config on a relaunch.
+    for (dir, name) in [(&worktree, "a"), (&worktree.join("a"), "b")] {
+        for key in [
+            format!("submodule.{name}.fetchRecurseSubmodules"),
+            "fetch.recurseSubmodules".to_owned(),
+        ] {
+            git(dir, &["config", "--worktree", "--unset", &key]);
+        }
+    }
+    let modules = tokio::time::timeout(
+        wait(),
+        fixture
+            .cache
+            .checkout_modules(REPO, &remote(AGENT), &worktree, &layout.pins),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(modules.is_empty());
+    commit_file(&layout.a, "again.txt", "again\n");
+    git(&head, &["add", "a"]);
+    commit(&head, "move a again");
+    let (ok, stderr) = fetch(&worktree, &global);
+    assert!(ok, "git fetch origin after a relaunch: {stderr}");
+}
