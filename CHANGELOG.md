@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.171] - 2026-11-10
+
+### 🚀 Features
+
+- *(cli)* Add intentd agents to list running agents ([#3242](https://github.com/intent-hq/intentd/pull/3242))
+- *(remote)* Intentd pair --node and remoteMachines.claim ([#3241](https://github.com/intent-hq/intentd/pull/3241))
+
+### 🔧 Refactor
+
+- *(notes)* Move note write paths into note_write.rs ([#3244](https://github.com/intent-hq/intentd/pull/3244))
+
+
 ## [0.11.170] - 2026-11-10
 
 ### 🚀 Features
