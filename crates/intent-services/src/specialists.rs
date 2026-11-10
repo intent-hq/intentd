@@ -212,12 +212,6 @@ pub(crate) const EMBEDDED_BUNDLED_V2_5: &[(&str, &str)] = &[
     ),
 ];
 
-/// The embedded bundled floor the specialist 3-tier resolution uses by
-/// default — the LATEST version's set (the file tiers above it are
-/// user-owned and unversioned). Session-scoped resolution swaps in the
-/// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
-const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V3_9;
-
 pub(crate) const EMBEDDED_BUNDLED_V3_1: &[(&str, &str)] = &[
     (
         "chief-of-staff",
@@ -261,6 +255,22 @@ pub(crate) const EMBEDDED_BUNDLED_V3_9: &[(&str, &str)] = &[
         "product-manager",
         include_str!("../resources/specialists/v3.9/product-manager.md"),
     ),
+];
+
+/// The v3.10 embedded specialist bundle: the v3.9 set with the UI Designer
+/// reporting through `ws.agent.reportToParent` instead of the retired
+/// `report_to_parent` tool.
+pub(crate) const EMBEDDED_BUNDLED_V3_10: &[(&str, &str)] = &[
+    EMBEDDED_BUNDLED_V3_9[0],
+    EMBEDDED_BUNDLED_V3_9[1],
+    EMBEDDED_BUNDLED_V3_9[2],
+    EMBEDDED_BUNDLED_V3_9[3],
+    (
+        "ui-designer",
+        include_str!("../resources/specialists/v3.10/ui-designer.md"),
+    ),
+    EMBEDDED_BUNDLED_V3_9[5],
+    EMBEDDED_BUNDLED_V3_9[6],
 ];
 
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
@@ -1291,7 +1301,10 @@ impl SpecialistsService {
         Self {
             user_dir: user_dir.or_else(default_user_dir),
             bundled_dir: bundled_dir.or_else(default_bundled_dir),
-            embedded: EMBEDDED_BUNDLED,
+            // The current harness version's bundle (the file tiers above it are
+            // user-owned and unversioned). Session-scoped resolution swaps in the
+            // session's pinned bundle via [`Self::with_embedded`] (H2).
+            embedded: crate::harness::latest_entry().doctrine.specialists,
             base_replaced: false,
         }
     }
@@ -2391,6 +2404,17 @@ mod tests {
 
     fn service_over(dir: &TempSpecialistsDir) -> SpecialistsService {
         SpecialistsService::new(Some(dir.path.clone()), Some(dir.path.clone()))
+    }
+
+    /// The default floor is the current harness version's bundle, never a
+    /// staged one, so `specialist.list` and the override baseline match what
+    /// new agents run and switch over when a version goes live.
+    #[test]
+    fn default_floor_is_the_current_harness_bundle() {
+        let empty = TempSpecialistsDir::new();
+        let svc = service_over(&empty);
+        let current = crate::harness::resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
+        assert!(std::ptr::eq(svc.embedded, current.doctrine.specialists));
     }
 
     /// `with_embedded` swaps the embedded floor (H2): resolution and `list`
