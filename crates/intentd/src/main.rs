@@ -33,6 +33,7 @@ use intent_transport::{
 use serde_json::{json, Value};
 use sqlx::Row;
 
+mod agents_cmd;
 mod client;
 #[cfg(unix)]
 mod command_evidence;
@@ -150,6 +151,15 @@ enum Command {
     /// Probe daemon liveness and print live status (transports, port, clients,
     /// agents, cert fingerprint, host OS/arch + hasDisplay + locality, §5.7).
     Status,
+    /// List the running agents (`agent.memoryUsage`, §5.5): one row each with
+    /// name, workspace, provider and model, owner (this backend, or the
+    /// backend a hosted agent runs for), memory and process count, then the
+    /// total and sample time.
+    Agents {
+        /// Print the raw `agent.memoryUsage` JSON instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Shut down gracefully and confirm exit; already stopped succeeds.
     /// Escalates within a bounded wait if needed (Unix signals or Windows
     /// process control). Uses the current data directory (§5.7).
@@ -476,6 +486,10 @@ async fn async_main(cli: Cli) -> ExitCode {
             }
             Command::Call { method, params } => to_exit(cmd_call(&method, params.as_deref()).await),
             Command::Status => cmd_status().await,
+            Command::Agents { json } => match resolve_config() {
+                Ok(config) => agents_cmd::run(&config.socket_path, json).await,
+                Err(e) => to_exit(Err(e)),
+            },
             Command::Stop => cmd_stop().await,
             Command::Doctor { codex_models } => cmd_doctor(codex_models).await,
             Command::RepairIndexes { all } => db_repair::cmd_repair_indexes(all).await,
