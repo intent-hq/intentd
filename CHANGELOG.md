@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.175] - 2026-11-10
+
+### 🐛 Bug Fixes
+
+- *(cli)* Make intentd agents work on nodes, hide cmdline secrets, title archived workspaces ([#3255](https://github.com/intent-hq/intentd/pull/3255))
+
+### ⚙️ Miscellaneous Tasks
+
+- Update Cargo.toml dependencies
+
+
 ## [0.11.174] - 2026-11-10
 
 ### 🚀 Features
