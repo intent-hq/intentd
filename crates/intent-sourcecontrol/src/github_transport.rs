@@ -216,7 +216,7 @@ impl Transport {
             },
             counted,
         );
-        let redirects = tower_http::follow_redirect::FollowRedirectLayer::new().layer(retry);
+        let redirects = redirect_layer().layer(retry);
         let headers = ExtraHeadersLayer::new(Arc::new(vec![(
             http::header::USER_AGENT,
             HeaderValue::from_static("octocrab"),
@@ -244,6 +244,15 @@ impl Transport {
             .build()
             .unwrap()
     }
+}
+
+/// Follow redirects with tower-http's `Standard` policy (at most 20 hops,
+/// credentials dropped cross-origin). Kept at tower-http 0.6 parity: request
+/// extensions set above this layer (by octocrab or the outer layers) are not
+/// replayed on redirected hops; 0.7 replays them by default. `AdmittedAttempt`
+/// is unaffected either way: `AdmittedRetry` inserts it below this layer.
+fn redirect_layer() -> tower_http::follow_redirect::FollowRedirectLayer {
+    tower_http::follow_redirect::FollowRedirectLayer::new().preserve_extensions(false)
 }
 
 fn classify(
@@ -314,6 +323,64 @@ mod tests {
                 return String::from_utf8(bytes).ok();
             }
         }
+    }
+
+    /// Pins the redirect behaviour the transport relied on under tower-http
+    /// 0.6: extensions are never replayed on a redirected hop, `Authorization`
+    /// follows a same-origin redirect and is dropped on a cross-origin one.
+    #[tokio::test]
+    async fn redirect_layer_drops_extensions_and_cross_origin_credentials() {
+        #[derive(Clone)]
+        struct Marker;
+        type Seen = Arc<std::sync::Mutex<Vec<(String, bool, Option<String>)>>>;
+        let seen: Seen = Arc::default();
+        let log = seen.clone();
+        let inner = tower::service_fn(move |request: http::Request<String>| {
+            let log = log.clone();
+            async move {
+                let uri = request.uri().to_string();
+                log.lock().unwrap().push((
+                    uri.clone(),
+                    request.extensions().get::<Marker>().is_some(),
+                    request
+                        .headers()
+                        .get(http::header::AUTHORIZATION)
+                        .map(|v| v.to_str().unwrap().to_owned()),
+                ));
+                let location = match uri.as_str() {
+                    "https://api.example/old" => Some("https://api.example/new"),
+                    "https://api.example/new" => Some("https://other.example/final"),
+                    _ => None,
+                };
+                let mut response = http::Response::builder();
+                response = match location {
+                    Some(to) => response
+                        .status(http::StatusCode::MOVED_PERMANENTLY)
+                        .header(http::header::LOCATION, to),
+                    None => response.status(http::StatusCode::OK),
+                };
+                Ok::<_, std::convert::Infallible>(response.body(String::new()).unwrap())
+            }
+        });
+        let mut service = redirect_layer().layer(inner);
+        let mut request = http::Request::get("https://api.example/old")
+            .header(http::header::AUTHORIZATION, "Bearer t")
+            .body(String::new())
+            .unwrap();
+        request.extensions_mut().insert(Marker);
+        let response = tower::ServiceExt::oneshot(&mut service, request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let auth = Some("Bearer t".to_owned());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                ("https://api.example/old".to_owned(), true, auth.clone()),
+                ("https://api.example/new".to_owned(), false, auth),
+                ("https://other.example/final".to_owned(), false, None),
+            ]
+        );
     }
 
     #[tokio::test]
