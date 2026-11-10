@@ -47,10 +47,6 @@ fastpath note.presence.update
 fastpath pairing.getInfo
 fastpath pairing.getSelfInfo
 fastpath presence.update
-fastpath providers.setup.cancel
-fastpath providers.setup.login
-fastpath providers.setup.start
-fastpath providers.setup.status
 fastpath server.pairingInfo
 fastpath server.rotateToken
 fastpath system.gitCredential
@@ -71,7 +67,6 @@ reverse desktop.control
 reverse host.openExternal
 reverse host.openInEditor
 reverse host.pickApplication
-reverse providers.setup.openLogin
 router accept-changes.addRemote
 router accept-changes.execute
 router accept-changes.getStatus

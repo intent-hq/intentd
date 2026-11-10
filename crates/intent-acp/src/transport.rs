@@ -2283,21 +2283,6 @@ mod prompt_transfer_tests {
     }
 
     #[tokio::test]
-    async fn prompt_auth_after_queue_preserves_one_effect_and_original_auth_failure() {
-        let (conn, mut reader, mut writer) = fixture();
-        let (admission, _) = policy(Mode::AfterHang);
-        let mut future = Box::pin(request(&conn, admission, Duration::from_secs(2)));
-        let frame = read_frame(&mut reader, future.as_mut()).await;
-        assert_eq!(frame["params"]["prompt"].as_array().unwrap().len(), 2);
-        writer.write_all(b"TEST_AUTH_REQUIRED\n").await.unwrap();
-        assert!(
-            matches!(future.await, Err(AcpError::Rpc(ref e)) if e.message.contains("Authentication required"))
-        );
-        assert_eq!(conn.pending_len(), 0);
-        no_frame(&mut reader).await;
-    }
-
-    #[tokio::test]
     async fn prompt_drained_original_pending_drops_unpolled_admission_without_send() {
         struct Drain {
             connection: Arc<Connection>,

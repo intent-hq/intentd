@@ -306,10 +306,6 @@ providers.profiles.delete
 providers.profiles.reorder
 providers.profiles.update
 providers.profiles.updateDefault
-providers.setup.cancel
-providers.setup.login
-providers.setup.start
-providers.setup.status
 remoteLinkTraffic.snapshot
 remoteLinkTraffic.start
 remoteLinkTraffic.stop
