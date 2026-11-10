@@ -1405,6 +1405,10 @@ builds and the desktop-bundled daemon are distinct from this installed launcher;
 start/restart are launcher commands. Check the installed launcher's help when its
 version differs from this guide; do not infer launcher support from daemon version.
 
+`intentd agents` lists the daemon's running agents: name, workspace, provider and
+model, owner, memory and process count, then the total and sample time. `--json`
+prints the raw data.
+
 If note or chat writes fail with a code 267 error ("database disk image is malformed", or
 "fts5: corruption ..." on newer builds), run
 `intentd doctor`. When it reports only a damaged search index, quit Intent, run
@@ -1413,4 +1417,4 @@ If note or chat writes fail with a code 267 error ("database disk image is malfo
 without changing them. If doctor reports damage outside the search indexes, stop and
 copy the whole data folder before any recovery.
 
-<!-- Sources: packages/intentd/README.md (Start, status, stop, and restart; Repairing a damaged search index); packages/intentd/crates/intentd-sitter/src/{cli.rs,main.rs,startup.rs,supervisor.rs,paths.rs,readiness.rs}; packages/intentd/crates/intentd/src/main.rs (Serve, Status, Stop, Doctor, RepairIndexes); packages/intentd/crates/intentd/src/db_repair.rs; packages/intentd/crates/intent-store/src/derived_index.rs. -->
+<!-- Sources: packages/intentd/README.md (Start, status, stop, and restart; Repairing a damaged search index); packages/intentd/crates/intentd-sitter/src/{cli.rs,main.rs,startup.rs,supervisor.rs,paths.rs,readiness.rs}; packages/intentd/crates/intentd/src/main.rs (Serve, Status, Agents, Stop, Doctor, RepairIndexes); packages/intentd/crates/intentd/src/agents_cmd.rs; packages/intentd/crates/intentd/src/db_repair.rs; packages/intentd/crates/intent-store/src/derived_index.rs. -->
