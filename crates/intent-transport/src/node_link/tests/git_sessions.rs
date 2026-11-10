@@ -406,3 +406,129 @@ async fn link_loss_ends_open_sessions() {
     .await
     .is_ok());
 }
+
+/// A one-commit repository in `dir` and that commit's id.
+fn source_commit(dir: &Path) -> (PathBuf, String) {
+    let source = dir.join("source");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    std::fs::create_dir_all(&source).unwrap();
+    git(&["init", "--quiet"]);
+    git(&["commit", "--quiet", "--allow-empty", "-m", "work"]);
+    let commit = git(&["rev-parse", "HEAD"]);
+    (source, commit)
+}
+
+/// The receive-pack request creating `ref_name` at `commit`: its command,
+/// a flush and a pack of `commit` from `source`.
+fn push_request(source: &Path, commit: &str, ref_name: &str) -> Vec<u8> {
+    let zero = "0".repeat(commit.len());
+    let line = format!("{zero} {commit} {ref_name}\0report-status\n");
+    let mut request = format!("{:04x}{line}0000", line.len() + 4).into_bytes();
+    let mut pack = Command::new("git")
+        .arg("-C")
+        .arg(source)
+        .args(["pack-objects", "--quiet", "--stdout", "--revs"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write as _;
+        let mut stdin = pack.stdin.take().unwrap();
+        writeln!(stdin, "{commit}").unwrap();
+    }
+    let out = pack.wait_with_output().unwrap();
+    assert!(out.status.success());
+    request.extend(out.stdout);
+    request
+}
+
+/// A link that drops while head's receive-pack holds the pushed ref's lock
+/// (a cloud sandbox paused during the agent's turn-end push) lets the push
+/// finish: the ref lands and no `.lock` is left behind. Killing the
+/// receive-pack there left `head.lock` for good, so every later write to
+/// the agent's `head` failed.
+#[cfg(unix)]
+#[tokio::test]
+async fn link_loss_during_a_ref_update_leaves_no_ref_lock() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (node, _link, sessions, serving) = connected().await;
+    let dir = node.dir.path();
+    let hooks = dir.join("node-git-hooks");
+    intent_git::node_git::configure_receive_hooks(dir).unwrap();
+    // Runs while receive-pack holds the ref locks: it signals, then holds
+    // them until the test releases it.
+    let (locked, release) = (dir.join("locked"), dir.join("release"));
+    let hook = hooks.join("reference-transaction");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\n[ \"$1\" = prepared ] || exit 0\n: > '{}'\n\
+             n=0\nwhile [ ! -e '{}' ] && [ $n -lt 600 ]; do sleep 0.05; n=$((n+1)); done\n",
+            locked.display(),
+            release.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let (source, commit) = source_commit(dir);
+    let ref_name = format!("{}head", remote("agent-1").ref_prefix());
+    let session = tokio::time::timeout(
+        wait(),
+        sessions.open(GitService::ReceivePack, &remote("agent-1")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    session
+        .send(&push_request(&source, &commit, &ref_name))
+        .await
+        .unwrap();
+    session.finish().await.unwrap();
+    tokio::time::timeout(wait(), async {
+        while !locked.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("receive-pack reaches the ref update");
+
+    serving.abort();
+    let _ = serving.await;
+    std::fs::write(&release, "").unwrap();
+
+    let repository = dir.join("head");
+    let lock = repository.join(".git").join(format!("{ref_name}.lock"));
+    let landed = tokio::time::timeout(wait(), async {
+        loop {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(["rev-parse", "--verify", "--quiet", &ref_name])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&out.stdout).trim() == commit && !lock.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        landed.is_ok(),
+        "the push did not land; lock left behind: {}",
+        lock.exists()
+    );
+}

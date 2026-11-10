@@ -347,9 +347,15 @@ async fn run_service(
         )
     };
     let mut command = command;
+    // Never killed with its session: see [`Service`].
+    command.kill_on_drop(false);
     let mut child = command.spawn().map_err(|_| codes::FAILED)?;
-    let (Some(mut stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
+    let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         return Err(codes::FAILED);
+    };
+    let mut service = Service {
+        child: Some(child),
+        stdout: Some(stdout),
     };
     sender
         .send(encode(ACCEPT, id, &accept))
@@ -363,6 +369,7 @@ async fn run_service(
         }
         // Dropping stdin tells the service the client is done.
     };
+    let stdout = service.stdout.as_mut().ok_or(codes::FAILED)?;
     let output = async {
         let mut buffer = vec![0; CHUNK];
         loop {
@@ -385,11 +392,53 @@ async fn run_service(
         }
     };
     streamed?;
+    let mut child = service.child.take().ok_or(codes::FAILED)?;
     let status = child.wait().await.map_err(|_| codes::FAILED)?;
     if status.success() {
         Ok(())
     } else {
         Err(codes::FAILED)
+    }
+}
+
+/// Longest a service whose session ended early may run on before it is
+/// killed.
+const SERVICE_DRAIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A session's git service. When the session ends before it does (a
+/// `CLOSE`, a lost link), the service is not killed: `SIGKILL` during a
+/// receive-pack's ref update leaves the ref's `.lock` behind for good,
+/// and every later write to that ref fails. Its input is closed instead
+/// and its output drained, so it ends on its own: a push received whole
+/// still lands, a partial one aborts without touching a ref. Only one
+/// still running after [`SERVICE_DRAIN`] is killed.
+struct Service {
+    child: Option<tokio::process::Child>,
+    stdout: Option<tokio::process::ChildStdout>,
+}
+
+impl Drop for Service {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let stdout = self.stdout.take();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            // No runtime to wait on: the service runs on unattended.
+            return;
+        };
+        runtime.spawn(async move {
+            let drain = async {
+                if let Some(mut stdout) = stdout {
+                    let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
+                }
+                child.wait().await
+            };
+            if tokio::time::timeout(SERVICE_DRAIN, drain).await.is_err() {
+                tracing::warn!("node git: a service outlived its session; killing it");
+                let _ = child.kill().await;
+            }
+        });
     }
 }
 
