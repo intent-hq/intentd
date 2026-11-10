@@ -98,8 +98,9 @@ impl Services {
         })
     }
 
-    /// Run a claimed script and release its gate. With `report_on_card`, a
-    /// failure becomes the workspace's `statusMessage`.
+    /// Run a claimed script, leave its agent notices and card status, then
+    /// release its gate. With `report_on_card`, a failure becomes the
+    /// workspace's `statusMessage`.
     pub(crate) async fn run_claimed_archive_script(
         &self,
         claimed: ClaimedArchiveScript,
@@ -113,7 +114,6 @@ impl Services {
         let workspace_id = run.workspace_id.clone();
         let trigger = run.trigger;
         let outcome = self.ports.runtime().run_archive_script(self, run).await;
-        drop(gate);
         let ran = matches!(
             outcome,
             ArchiveScriptOutcome::Succeeded
@@ -144,6 +144,10 @@ impl Services {
                 }
             }
         }
+        // Released only once the notices and the card are written: an
+        // unarchive waits on this gate, so every agent's first turn after
+        // it finds its notice.
+        drop(gate);
         outcome
     }
 
