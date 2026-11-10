@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.174] - 2026-11-10
+
+### 🚀 Features
+
+- *(harness)* Release the 3.10 context cuts as harness 3.12 ([#3252](https://github.com/intent-hq/intentd/pull/3252))
+
+
 ## [0.11.173] - 2026-11-10
 
 ### 🚀 Features
