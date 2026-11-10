@@ -92,6 +92,53 @@ unicode: café ✓
   tab-1,"http://daemon.localhost:5173/",true
   tab-2,"https://example.com/a-b",false"#,
         ),
+        (
+            "keyed_object_field",
+            json!({"results": {"a": {"ok": true, "noteId": "x"}, "b": {"ok": true, "noteId": "y"}}}),
+            r"results[2:]{ok,noteId}:
+  a: true,x
+  b: true,y",
+        ),
+        (
+            "keyed_object_root",
+            json!({"spec": {"ok": true, "lines": 10}, "plan": {"ok": false, "lines": 3}}),
+            r"[2:]{ok,lines}:
+  spec: true,10
+  plan: false,3",
+        ),
+        (
+            "version_and_date_strings",
+            json!({"version": "0.6.1", "date": "2026-11-10", "range": "10-20", "zero": "05"}),
+            r#"version: 0.6.1
+date: 2026-11-10
+range: 10-20
+zero: "05""#,
+        ),
+        (
+            "leading_hash_and_plus",
+            json!({"title": "# Heading", "delta": "+1"}),
+            r##"title: "# Heading"
+delta: "+1""##,
+        ),
+        (
+            "control_characters",
+            json!({"exitCode": 0, "output": "\u{1b}[31mred\u{1b}[0m"}),
+            r#"exitCode: 0
+output: "\u001b[31mred\u001b[0m""#,
+        ),
+        (
+            "non_ascii_key",
+            json!({"café": 1, "plain": 2}),
+            r#""café": 1
+plain: 2"#,
+        ),
+        (
+            "empty_array_list_element",
+            json!({"rows": [[], [1]]}),
+            r"rows[2]:
+  - [0]:
+  - [1]: 1",
+        ),
     ]
 }
 
@@ -104,6 +151,8 @@ fn toon_output_matches_golden() {
     }
 }
 
+/// Self-consistency with the same crate's decoder only; the frontend decodes
+/// with `@toon-format/toon`, which this test does not exercise.
 #[test]
 fn toon_output_round_trips_to_the_same_json() {
     for (name, value, _) in cases() {
