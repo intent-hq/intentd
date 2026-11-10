@@ -3235,50 +3235,6 @@ impl Services {
         })
     }
 
-    /// Commit only a confirmed Antigravity candidate. A concurrent winner is
-    /// never used with this candidate's configuration or first-turn context.
-    pub(crate) async fn commit_antigravity_acp_session(
-        &self,
-        prepared: PreparedAcpSession,
-        expected_old: Option<&str>,
-    ) -> Result<AcpSessionOpened> {
-        let candidate = prepared.response.session_id.0.to_string();
-        if candidate.is_empty() {
-            return Err(Error::InvalidParams(
-                "Antigravity returned an empty session ID".into(),
-            ));
-        }
-        let canonical = self
-            .store
-            .replace_acp_session_id(
-                &prepared.stored.workspace_id,
-                &prepared.stored.id,
-                expected_old.unwrap_or(""),
-                &candidate,
-            )
-            .await?;
-        self.finish_antigravity_acp_session(prepared, expected_old, canonical)
-            .await
-    }
-
-    /// Finish the original Antigravity candidate after its one persistence
-    /// operation. A canonical loser is never paired with this candidate's config.
-    pub(crate) async fn finish_antigravity_acp_session(
-        &self,
-        prepared: PreparedAcpSession,
-        expected_old: Option<&str>,
-        canonical: String,
-    ) -> Result<AcpSessionOpened> {
-        if canonical != prepared.response.session_id.0.as_ref() {
-            return Err(Error::Conflict {
-                current: json!({"acpSessionId": canonical}),
-            });
-        }
-        Ok(self
-            .finish_created_acp_session(prepared, canonical, expected_old.is_some())
-            .await)
-    }
-
     /// Open the first session with the ordinary write-once behavior when no
     /// original repository creation context was available to the physical handle.
     pub(crate) async fn open_acp_session(

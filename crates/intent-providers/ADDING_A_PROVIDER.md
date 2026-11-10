@@ -397,49 +397,30 @@ Verified against Cursor CLI 2026.11.05-86047df. Code: `intent-providers/src/curs
   (`ProviderConfig::system_prompt_note`, appended by `rules::with_provider_prompt_note`).
   Task runs map to `Subagent` in the timeline.
 
-## Antigravity setup and compatibility boundary
+## Antigravity
 
-Antigravity uses the official native ACP server, not `agy` and not an npm adapter.
-The initial verified target is macOS Apple Silicon with personal Google OAuth.
-The tested upstream build is `agy_acp_server_20260818_01_RC01`.
+Antigravity runs the user's `agy` CLI as an ACP server: `agy acp` (agy 1.5.0 or
+later). Intent does not install, update, or isolate it. `providers.paths.antigravity`
+overrides the `agy` executable.
 
-1. Get the archive from the [official ACP registry](https://github.com/agentclientprotocol/registry/blob/a3d294f480dee2e506a1c51f802455d4d49783a2/antigravity-acp/agent.json).
-   Keep `agy_acp_server.par` and `localharness_external` together.
-2. Set `providers.paths.antigravity` to the server executable, or provide an
-   `antigravity-acp` launcher that starts it. Intent does not install or update this archive.
-3. On the daemon host, run `intentd provider login antigravity`.
-   Use `--path /absolute/path/to/agy_acp_server.par` for an explicit login-path override.
-   Follow the official Google authorization URL printed in that terminal.
-   The command verifies a fresh guarded session after authentication.
-4. Refresh provider status and enable Antigravity explicitly in Settings.
-   Refresh the model list before selecting a model.
+1. Install `agy` and sign in on the daemon host: `agy acp --login`.
+2. Refresh provider status and enable Antigravity in Settings.
 
-The [official setup guide](https://antigravity.google/docs/ide/extensions/zed)
-describes the upstream authentication choices. Intent currently uses only personal OAuth.
-Credentials stay in the official macOS Keychain entry. Intent never copies tokens into profiles.
-Normal sessions and discovery probes cannot open a browser. Unknown authentication stays unknown.
+The daemon never sends `authenticate`, because it opens a browser. A signed-out
+`session/new` returns "Authentication required".
 
-`intent-services/src/antigravity.rs` owns profile isolation and the native tool guard.
-Profiles use private permissions and persist under `<data-dir>/antigravity/` by workspace and agent identity.
-They contain conversation state, not token copies. They survive daemon restarts and are not temporary configuration files.
-Global Gemini MCP settings and hooks are excluded, without changing those global files.
+Catalog and auth probes start `agy acp --app-data-dir antigravity-intent-probe`
+(`intent_providers::antigravity::PROBE_APP_DATA_DIR`), so probe sessions do not
+appear in the user's agy history. The directory is relative to `~/.gemini`;
+agy rejects an absolute path.
 
-The guard permits only known native tools and the caller-filtered workspace tool set.
-Native subagent aliases are always denied. Permission mode stays `default`. Unrestricted Intent permissions do not select `yolo`.
-User MCP tools require an exact schema under the permitted server in the current private conversation:
-`antigravity-acp/brain/<conversationId>/mcp/<server>/<tool>.json`.
-This is an observed upstream layout, not a public contract. A missing or changed schema denies the tool.
-Recheck this behavior before certifying another server build. These hooks are provider policy controls, not an OS sandbox.
+The catalog lists the base models of `configOptions[id="model"]` with the
+`thought_level` select as reasoning efforts. `session/set_config_option` accepts
+a base id or an effort variant (`gemini-3.8-flash-low`).
 
-Cold load can reset the upstream model. Intent reapplies the exact saved ID and requires confirmation before sending a prompt.
-Model rejection is an actionable setup error, never silent fallback.
-This ACP build does not emit usage events. Do not infer usage from stderr or display missing accounting as measured zero.
-One-shot quick actions and the generic onboarding test prompt are not enabled for this provider.
-
-To roll back, disable Antigravity and select another provider. Do not delete global credentials or configuration.
-Private conversation profiles remain under the daemon data directory. If their history is no longer needed, remove the profiles.
-Backend protocol support must land before frontend support. Do not create a manual submodule-pin bump.
-After authorized merges, monitor the carrying cloudlands-fe alpha release before calling the work shipped.
+`agy acp` has no flag to remove tools. Role restrictions are prompt-only; MCP-side
+filtering still covers workspace tools. Sessions use the user's own agy settings,
+hooks, and MCP servers.
 
 ### Codex policy compatibility regression
 

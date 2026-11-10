@@ -84,7 +84,6 @@ mod private_output;
 mod retired_gate;
 pub use private_output::OutboundFrame;
 mod protocol;
-mod provider_setup;
 pub mod reverse;
 pub mod router;
 pub(crate) mod rpc_limit;

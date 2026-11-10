@@ -1494,11 +1494,6 @@ pub fn rows(c: &Ctx<'_>) -> Vec<Row> {
             vec![v("default", json!({}), Fixed("/providers"))],
         ),
         fixed(
-            "providers.setup.status",
-            "One provider-setup operation's phase; the connection authorizes setup in its client.hello (`antigravitySetup: 1`).",
-            vec![v("default", json!({ "providerId": "antigravity" }), Fixed("/phase"))],
-        ),
-        fixed(
             "providers.profiles.list",
             "Administrator-defined provider profiles; a handful.",
             vec![

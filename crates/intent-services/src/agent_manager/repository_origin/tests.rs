@@ -108,7 +108,6 @@ pub(super) fn handle(
                     cleanup_services: None,
                 },
             ),
-            antigravity_profile: None,
             session_mcp_servers: vec![],
             spawned_model: None,
             session_open_filled_model: None,
@@ -1220,87 +1219,6 @@ async fn actual_retired_create_keeps_its_successful_result_without_an_owner() {
             .count(),
         1
     );
-}
-
-#[tokio::test]
-async fn actual_antigravity_confirms_setup_before_its_single_commit() {
-    for scenario in ["replace", "first", "rejected", "lost-cas"] {
-        let mut f = Fixture::with_provider("antigravity").await;
-        let original = (scenario != "first").then_some("old-session");
-        f.seed_session(original, "antigravity", Some("model-a"))
-            .await;
-        f.count_writes().await;
-        let (origin, reader, writer) = f.mount().await;
-        let PausedSession {
-            peer,
-            arrived: entered,
-            release,
-        } = paused_session(reader, writer, false, "session/set_config_option");
-        let control = async {
-            let request = arrived(entered).await;
-            assert_eq!(request["params"]["sessionId"], "candidate");
-            assert_eq!(request["params"]["value"], "model-a");
-            assert_eq!(f.writes().await, 0);
-            assert_eq!(f.stored().await.acp_session_id.as_deref(), original);
-            assert!(callback(&origin).is_none());
-            if scenario == "lost-cas" {
-                f.manager
-                    .services
-                    .store
-                    .replace_acp_session_id(&f.row.workspace_id, &f.row.id, "old-session", "winner")
-                    .await
-                    .unwrap();
-            }
-            if scenario == "rejected" {
-                release
-                    .send(Err(json!({"code":-32602,"message":"model was rejected"})))
-                    .unwrap();
-            } else {
-                release
-                    .send(Ok(session_reply(&request, false, "candidate")))
-                    .unwrap();
-            }
-        };
-        let (response, ()) = tokio::join!(f.start("antigravity"), control);
-        match scenario {
-            "rejected" => {
-                assert!(response.is_err());
-                assert_eq!(f.writes().await, 0);
-                assert_eq!(f.stored().await.acp_session_id.as_deref(), original);
-            }
-            "lost-cas" => {
-                assert!(matches!(response, Err(intent_core::Error::Conflict { .. })));
-                assert_eq!(f.writes().await, 1);
-                assert_eq!(f.stored().await.acp_session_id.as_deref(), Some("winner"));
-            }
-            _ => {
-                assert_eq!(response.unwrap(), "candidate");
-                assert_eq!(f.writes().await, 1);
-                assert_eq!(
-                    f.stored().await.acp_session_id.as_deref(),
-                    Some("candidate")
-                );
-            }
-        }
-        let calls = peer.calls.lock().unwrap().clone();
-        let methods: Vec<_> = calls.iter().filter_map(|r| r["method"].as_str()).collect();
-        assert_eq!(methods.iter().filter(|m| **m == "session/new").count(), 1);
-        let new = methods.iter().position(|m| *m == "session/new").unwrap();
-        let mode = methods
-            .iter()
-            .position(|m| *m == "session/set_mode")
-            .unwrap();
-        let model = methods
-            .iter()
-            .position(|m| *m == "session/set_config_option")
-            .unwrap();
-        assert!(new < mode && mode < model);
-        if scenario == "replace" {
-            assert!(current(&callback(&origin).unwrap().capture(), f.caller()).await);
-        } else {
-            assert!(callback(&origin).is_none());
-        }
-    }
 }
 
 #[tokio::test]

@@ -338,7 +338,24 @@ fn collect_codex_model_groups(
 /// and the adapter's `default` pseudo-row is dropped whenever a real row
 /// exists (kept only when it is the catalog's sole row).
 pub(super) fn parse_acp_models(payload: &Value, provider: &str) -> Vec<Value> {
-    let Some(candidates) = extract_available_models(payload) else {
+    acp_model_rows(payload, provider, extract_available_models(payload))
+}
+
+/// [`parse_acp_models`] preferring the `configOptions` model select. For
+/// agents whose `models.availableModels` lists one row per effort variant
+/// while the select lists base models and `thought_level` holds the effort.
+pub(super) fn parse_acp_config_option_models(payload: &Value, provider: &str) -> Vec<Value> {
+    let update = payload
+        .get("update")
+        .or_else(|| payload.get("sessionUpdate"))
+        .unwrap_or(payload);
+    let candidates =
+        extract_config_options_models(update).or_else(|| extract_standard_available_models(update));
+    acp_model_rows(payload, provider, candidates)
+}
+
+fn acp_model_rows(payload: &Value, provider: &str, candidates: Option<&Vec<Value>>) -> Vec<Value> {
+    let Some(candidates) = candidates else {
         return Vec::new();
     };
     let session_effort_levels = extract_thought_level_values(payload);

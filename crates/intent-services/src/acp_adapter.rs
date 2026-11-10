@@ -194,7 +194,6 @@ pub(crate) struct AcpAdapterCommand {
     args: Vec<String>,
     envs: Vec<(String, OsString)>,
     envs_removed: Vec<String>,
-    auth_required_stdout_marker: Option<&'static str>,
     /// The `session/new` `cwd`, and the process cwd of a resolved binary.
     /// `None` means the system temp dir (the ephemeral default).
     cwd: Option<PathBuf>,
@@ -424,7 +423,6 @@ impl AcpAdapterCommand {
             ],
             envs: Vec::new(),
             envs_removed: Vec::new(),
-            auth_required_stdout_marker: None,
             cwd: None,
             via_npx: true,
             npx_launch_root: None,
@@ -443,7 +441,6 @@ impl AcpAdapterCommand {
             args,
             envs: Vec::new(),
             envs_removed: Vec::new(),
-            auth_required_stdout_marker: None,
             cwd: None,
             via_npx: false,
             npx_launch_root: None,
@@ -528,12 +525,6 @@ impl AcpAdapterCommand {
     /// Must be set before installed preparation.
     pub(crate) fn with_profile(mut self, profile: Option<Arc<intent_acp::ProfileEnv>>) -> Self {
         self.profile = profile;
-        self
-    }
-
-    /// Recognize the controlled browser helper's immediate auth signal.
-    pub(crate) fn auth_required_marker(mut self, marker: &'static str) -> Self {
-        self.auth_required_stdout_marker = Some(marker);
         self
     }
 
@@ -904,7 +895,6 @@ fn spawn_admitted_adapter(
     let (note_tx, notifications) = mpsc::unbounded_channel();
     let (req_tx, requests) = mpsc::unbounded_channel();
     let hooks = ConnectionHooks {
-        auth_required_stdout_marker: cmd.auth_required_stdout_marker,
         notifications: Some(note_tx),
         requests: Some(req_tx),
         ..Default::default()

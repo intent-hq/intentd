@@ -553,10 +553,6 @@ pub(crate) const FASTPATH_METHODS: &[&str] = &[
     "pairing.getInfo",
     "pairing.getSelfInfo",
     "presence.update",
-    "providers.setup.cancel",
-    "providers.setup.login",
-    "providers.setup.start",
-    "providers.setup.status",
     "server.pairingInfo",
     "server.rotateToken",
     "system.gitCredential",
@@ -595,7 +591,6 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
     "host.openExternal",
     "host.openInEditor",
     "host.pickApplication",
-    "providers.setup.openLogin",
 ];
 
 /// Methods a connection bound to a **non-administrator** principal may call
@@ -1598,10 +1593,6 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     mutation("providers.profiles.reorder", "Writes provider profiles."),
     mutation("providers.profiles.update", "Writes provider profiles."),
     mutation("providers.profiles.updateDefault", "Writes provider profiles."),
-    mutation("providers.setup.cancel", "Cancels provider setup."),
-    mutation("providers.setup.login", "Starts provider login."),
-    mutation("providers.setup.start", "Starts provider setup."),
-    bounded("providers.setup.status", "Provider setup status."),
     bounded("remoteLinkTraffic.snapshot", "Captured executor-link traffic, bounded."),
     mutation("remoteLinkTraffic.start", "Starts capturing executor-link traffic."),
     mutation("remoteLinkTraffic.stop", "Stops and clears the executor-link traffic capture."),

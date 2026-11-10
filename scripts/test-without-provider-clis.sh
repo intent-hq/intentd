@@ -32,7 +32,7 @@ set -euo pipefail
 # Keep in sync with the provider registry; intent-providers'
 # `hide_list_covers_every_provider_cli` test fails when a name is missing.
 PROVIDER_CLIS=(
-  antigravity-acp
+  agy
   auggie
   claude
   claude-agent-acp

@@ -337,14 +337,6 @@ fn stdout_closed_error() -> JsonRpcError {
     }
 }
 
-fn authentication_required() -> JsonRpcError {
-    JsonRpcError {
-        code: -32000,
-        message: "Authentication required; run intentd provider login antigravity".into(),
-        data: None,
-    }
-}
-
 fn prompt_response(
     response: Result<Result<Value, JsonRpcError>, oneshot::error::RecvError>,
 ) -> AcpResult<Value> {
@@ -508,9 +500,6 @@ pub struct IncomingNotification {
 /// stderr drain matches against.
 #[derive(Default)]
 pub struct ConnectionHooks {
-    /// Exact out-of-band stdout signal from a configured browser guard.
-    /// Disabled by default. A match fails requests without exposing a URL.
-    pub auth_required_stdout_marker: Option<&'static str>,
     /// Sink for agent→client requests (client-served handlers).
     pub requests: Option<mpsc::UnboundedSender<IncomingRequest>>,
     /// Sink for agent notifications (streaming router).
@@ -864,7 +853,6 @@ pub struct Connection {
     auth_error: Arc<AtomicBool>,
     stderr_settled: watch::Receiver<bool>,
     stderr_captured: Arc<AtomicBool>,
-    auth_required: Arc<AtomicBool>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -895,7 +883,6 @@ impl Connection {
         let client_request_seq = Arc::new(AtomicU64::new(0));
         let stderr_buf = Arc::new(Mutex::new(StderrBuffer::default()));
         let auth_error = Arc::new(AtomicBool::new(false));
-        let auth_required = Arc::new(AtomicBool::new(false));
         let mut tasks = Vec::new();
         let review_monitoring = Arc::new(Mutex::new(
             crate::review_monitoring::ConnectionState::default(),
@@ -937,30 +924,12 @@ impl Connection {
         let requests = hooks.requests;
         let notifications = hooks.notifications;
         let workers = hooks.workers;
-        let auth_marker = hooks.auth_required_stdout_marker;
-        let auth_required_reader = Arc::clone(&auth_required);
-        let auth_error_reader = Arc::clone(&auth_error);
         let agent_id_reader = hooks.agent_id;
         let review_reader = review_monitoring.clone();
         tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.trim().is_empty() {
-                    continue;
-                }
-                if auth_marker.is_some_and(|marker| line.trim() == marker) {
-                    review_reader.lock().unwrap().close();
-                    auth_required_reader.store(true, Ordering::SeqCst);
-                    auth_error_reader.store(true, Ordering::SeqCst);
-                    prompt_pending_reader.lock().unwrap().close();
-                    for (_, sender) in pending_reader.lock().unwrap().drain() {
-                        let _ = sender.sender.send(Err(authentication_required()));
-                    }
-                    // Continue draining stdout, but never parse OAuth banners
-                    // printed after the browser guard. The caller reaps the child.
-                    continue;
-                }
-                if auth_required_reader.load(Ordering::SeqCst) {
                     continue;
                 }
                 match serde_json::from_str::<Value>(&line) {
@@ -1092,7 +1061,6 @@ impl Connection {
             auth_error,
             stderr_settled,
             stderr_captured,
-            auth_required,
             tasks,
         }
     }
@@ -1116,10 +1084,7 @@ impl Connection {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap();
-            // An auth-required agent closes stdout too; its error wins.
-            if !self.auth_required.load(Ordering::SeqCst)
-                && self.stdout_closed.load(Ordering::SeqCst)
-            {
+            if self.stdout_closed.load(Ordering::SeqCst) {
                 return CallbackRequestOutcome::NotSent(CallbackFailure::Connection(
                     AcpError::Rpc(stdout_closed_error()),
                 ));
@@ -1141,11 +1106,6 @@ impl Connection {
             queued: false,
             completed: false,
         };
-        if self.auth_required.load(Ordering::SeqCst) {
-            return CallbackRequestOutcome::NotSent(CallbackFailure::Connection(AcpError::Rpc(
-                authentication_required(),
-            )));
-        }
         let line = match encode_message(Some(id), method, &params) {
             Ok(line) => line,
             Err(error) => {
@@ -1336,12 +1296,8 @@ impl Connection {
         {
             // Under the lock the reader drains with: either the EOF drain
             // fails this entry, or the closed flag is already visible here.
-            // An auth-required agent closes stdout too; its error (checked
-            // below) wins.
             let mut pending = self.pending.lock().unwrap();
-            if !self.auth_required.load(Ordering::SeqCst)
-                && self.stdout_closed.load(Ordering::SeqCst)
-            {
+            if self.stdout_closed.load(Ordering::SeqCst) {
                 return Err(AcpError::Rpc(stdout_closed_error()));
             }
             pending.insert(
@@ -1362,12 +1318,6 @@ impl Connection {
             pending: Arc::clone(&self.pending),
             id,
         };
-
-        // Check after insertion so a signal racing this request either drains
-        // its sender or is observed here. No request can miss the auth failure.
-        if self.auth_required.load(Ordering::SeqCst) {
-            return Err(AcpError::Rpc(authentication_required()));
-        }
 
         let line = encode_message(Some(id), method, &params)?;
         // Arm right before enqueueing. Until the line is queued the guard
@@ -1520,9 +1470,6 @@ impl Connection {
             prompts: &self.prompt_pending,
             state: Arc::clone(&state),
         };
-        if self.auth_required.load(Ordering::SeqCst) {
-            return Err(AcpError::Rpc(authentication_required()));
-        }
         if state.load(Ordering::SeqCst) != PROMPT_OPEN {
             return Err(AcpError::Transport("agent stdout closed".into()));
         }
@@ -1587,9 +1534,6 @@ impl Connection {
             }
         }
         if !slot.queued {
-            if self.auth_required.load(Ordering::SeqCst) {
-                return Err(AcpError::Rpc(authentication_required()));
-            }
             match rx.try_recv() {
                 Ok(response) => return prompt_response(Ok(response)),
                 Err(oneshot::error::TryRecvError::Closed) => {
@@ -1608,20 +1552,16 @@ impl Connection {
                 writer: &self.writer_tx,
                 slot: &mut slot,
             };
+            // Reader retirement precedes dispatch/drain. A retired transfer
+            // keeps the original receiver's exact result if it has not arrived yet.
             if !matches!(
                 packet.transfer(&boundary, PromptVariant::Base),
                 AcpPromptAdmissionOutcome::Transferred(_)
-            ) {
-                if self.auth_required.load(Ordering::SeqCst) {
-                    return Err(AcpError::Rpc(authentication_required()));
-                }
-                if state.load(Ordering::SeqCst) != PROMPT_RETIRED {
-                    return Err(AcpError::Transport(
-                        "original prompt transfer closed".into(),
-                    ));
-                }
-                // Reader retirement precedes dispatch/drain. Preserve that
-                // original receiver's exact result if it has not arrived yet.
+            ) && state.load(Ordering::SeqCst) != PROMPT_RETIRED
+            {
+                return Err(AcpError::Transport(
+                    "original prompt transfer closed".into(),
+                ));
             }
         }
         drop(slot);
@@ -1949,15 +1889,7 @@ mod prompt_transfer_tests {
     ) {
         let (input, output) = tokio::io::duplex(4096);
         let (reply, read) = tokio::io::duplex(4096);
-        let conn = Connection::new(
-            input,
-            read,
-            None,
-            ConnectionHooks {
-                auth_required_stdout_marker: Some("TEST_AUTH_REQUIRED"),
-                ..ConnectionHooks::default()
-            },
-        );
+        let conn = Connection::new(input, read, None, ConnectionHooks::default());
         (conn, BufReader::new(output), reply)
     }
 
@@ -2250,36 +2182,6 @@ mod prompt_transfer_tests {
     }
 
     #[tokio::test]
-    async fn prompt_auth_drain_during_queue_or_admission_prevents_transfer() {
-        for during_queue in [true, false] {
-            let (conn, mut reader, mut writer) = fixture();
-            let reserved = if during_queue {
-                reserve_all(&conn)
-            } else {
-                Vec::new()
-            };
-            let (admission, seen) = policy(Mode::Hold);
-            let mut future = Box::pin(request(&conn, admission, Duration::from_secs(2)));
-            poll_pending(future.as_mut()).await;
-            writer.write_all(b"TEST_AUTH_REQUIRED\n").await.unwrap();
-            until(|| conn.auth_required.load(Ordering::SeqCst)).await;
-            seen.release.notify_one();
-            drop(reserved);
-            assert!(
-                matches!(future.await,Err(AcpError::Rpc(ref e)) if e.message.contains("Authentication required"))
-            );
-            assert_eq!(conn.pending_len(), 0);
-            no_frame(&mut reader).await;
-            let (admission, later) = policy(Mode::Accept);
-            assert!(matches!(
-                request(&conn, admission, Duration::from_secs(2)).await,
-                Err(AcpError::Rpc(_))
-            ));
-            assert_eq!(later.calls.load(Ordering::SeqCst), 0);
-        }
-    }
-
-    #[tokio::test]
     async fn prompt_stdout_close_and_writer_close_are_original_failures() {
         for close_writer in [false, true] {
             let (conn, reader, writer) = fixture();
@@ -2415,7 +2317,11 @@ mod prompt_transfer_tests {
                     .remove(&1)
                     .unwrap()
                     .sender
-                    .send(Err(authentication_required()))
+                    .send(Err(JsonRpcError {
+                        code: -32000,
+                        message: "Authentication required".into(),
+                        data: None,
+                    }))
                     .unwrap();
                 let cleanup = FutureDrop {
                     seen: Arc::clone(&self.seen),

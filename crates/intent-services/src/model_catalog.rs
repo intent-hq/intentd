@@ -159,15 +159,18 @@ pub(crate) struct AntigravityModelSource {
 impl AntigravityModelSource {
     pub(crate) fn resolve(explicit_path: Option<&str>) -> Self {
         use sha2::{Digest, Sha256};
-        let binary =
-            intent_providers::find_provider_binary("antigravity", "antigravity-acp", explicit_path);
+        let binary = intent_providers::find_provider_binary(
+            "antigravity",
+            intent_providers::antigravity::COMMAND,
+            explicit_path,
+        );
         let version_key = binary.as_ref().map_or_else(
-            || "antigravity-executable-v1:missing".to_string(),
+            || "antigravity-agy-v1:missing".to_string(),
             |path| {
                 use std::fmt::Write;
                 Sha256::digest(path.as_os_str().as_encoded_bytes())
                     .iter()
-                    .fold("antigravity-executable-v1:".to_string(), |mut key, byte| {
+                    .fold("antigravity-agy-v1:".to_string(), |mut key, byte| {
                         let _ = write!(key, "{byte:02x}");
                         key
                     })

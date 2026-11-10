@@ -524,16 +524,10 @@ async fn sweep_rows(
     }
 }
 
-/// Bind the fixture's draft client, so `drafts.get` reads its drafts, and
-/// authorize the provider-setup surface.
+/// Bind the fixture's draft client, so `drafts.get` reads its drafts.
 async fn hello(client: &mut harness::Client) {
     let hello = client
-        .call(
-            "client.hello",
-            // `antigravitySetup` authorizes the local-app provider setup
-            // surface (`providers.setup.status`) on this connection.
-            &json!({ "clientId": "large-state-client", "capabilities": { "antigravitySetup": 1 } }),
-        )
+        .call("client.hello", &json!({ "clientId": "large-state-client" }))
         .await;
     assert!(hello.error().is_none(), "client.hello: {}", hello.frame);
 }

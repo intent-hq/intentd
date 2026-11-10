@@ -1211,7 +1211,7 @@ async function dispatch(msg) {
   if (process.env.MOCK_AGENT_RPC_LOG) {
     fs.appendFileSync(process.env.MOCK_AGENT_RPC_LOG, JSON.stringify({
       method: msg.method, params: msg.params, pid: process.pid,
-      geminiHome: process.env.GEMINI_HOME,
+      argv: process.argv.slice(2),
     }) + '\n');
   }
   let behavior = {};

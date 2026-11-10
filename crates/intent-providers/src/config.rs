@@ -316,7 +316,6 @@ pub struct ProviderConfig {
     /// by onboarding to verify the provider actually answers. `false` for
     /// unsloth — its first prompt can trigger a very long model
     /// download/load cycle, so a bounded probe would time out spuriously.
-    /// Antigravity also opts out because it requires a private guarded profile.
     pub supports_test_prompt: bool,
     /// When true, an auto-approved permission prompt (headless `AllowAll` /
     /// `AutoByRisk` policies) selects the provider's `allow_once` option
@@ -699,18 +698,30 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     },
     ProviderConfig {
         short_name: "Antigravity",
+        // `agy acp` (agy >= 1.5.0) is the official ACP server.
+        base_args: &["acp"],
         can_be_disabled: true,
-        // Generic one-shot probes bypass the private Antigravity profile.
-        supports_test_prompt: false,
-        supports_config_option_model: true,
         supports_session_mcp_servers: true,
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
-        auth_error_patterns: Some(&["authentication required", "intent_acp_auth_required"]),
-        login_command_hint: Some("intentd provider login antigravity"),
-        login_docs_url: Some("https://antigravity.google/docs/ide/extensions"),
-        // Saved personal OAuth is reused by session/new. Do not send the
-        // generic authenticate method "none", or map AllowAll to yolo.
-        ..ProviderConfig::empty("antigravity", "Google Antigravity", "antigravity-acp")
+        // `configOptions[id="model"]` takes the base id ("gemini-3.8-flash")
+        // or an effort variant ("gemini-3.8-flash-low"); `thought_level`
+        // carries the effort.
+        supports_config_option_model: true,
+        // A saved sign-in is reused by `session/new`. `authenticate` starts
+        // a browser login, which a headless daemon must not do.
+        supports_authenticate: false,
+        // `session/new` signed out: "Authentication required".
+        auth_error_patterns: Some(&["authentication required"]),
+        login_command_hint: Some("agy acp --login"),
+        login_docs_url: Some("https://antigravity.google/docs"),
+        // No spawn-time tool removal: `agy acp` has no disable-tool flag.
+        // Role restrictions are prompt-only; MCP-side filtering still covers
+        // workspace tools.
+        ..ProviderConfig::empty(
+            "antigravity",
+            "Google Antigravity",
+            crate::antigravity::COMMAND,
+        )
     },
     ProviderConfig {
         // `cursor-agent` is a bash launcher that runs Cursor's bundled `node`
