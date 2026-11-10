@@ -186,6 +186,7 @@ impl WorkspaceMcpServer {
             pending.clone(),
             self.frame_router.clone(),
             Some(ledger.clone()),
+            self.workspace_api_docs,
         );
         // Wrap user code so the engine sees a small `{__k, __v}` envelope,
         // preserving the `undefined` vs `null` distinction that
@@ -877,6 +878,7 @@ pub fn make_workspace_host_for_bridge(
         None,
         None,
         None,
+        &super::workspace_api_docs::WORKSPACE_API_DOCS_V1,
     )
 }
 
@@ -889,7 +891,8 @@ pub fn make_workspace_host_for_bridge(
 /// wall-clock budget of the enclosing eval, threaded to the bindings; its
 /// clock starts HERE (both callers build the host immediately before the
 /// eval), so a binding dispatched late in the eval sees only the remaining
-/// time (intent-hq/intent#5387).
+/// time (intent-hq/intent#5387). `docs` shapes `ws.help` replies for the
+/// session's harness version; hook runs get the shared text.
 #[expect(clippy::too_many_arguments)]
 fn make_workspace_host_with_pending(
     api: Arc<dyn WorkspaceApi>,
@@ -902,6 +905,7 @@ fn make_workspace_host_with_pending(
     pending: Option<PendingAttachments>,
     router: Option<Arc<dyn super::HostFrameRouter>>,
     ledger: Option<CallLedger>,
+    docs: &'static dyn super::workspace_api_docs::WorkspaceApiDocs,
 ) -> HostFn {
     let features = Arc::new(agent_features);
     let eval_budget = super::bindings::EvalBudget::starting_now(eval_budget);
@@ -932,6 +936,7 @@ fn make_workspace_host_with_pending(
             let method = arg.get("method").and_then(Value::as_str).unwrap_or("?");
             (ledger.clone(), ledger.start(method))
         });
+        let help = arg.get("method").and_then(Value::as_str) == Some("help.get");
         let frame = async move {
             let claimed = router.as_ref().and_then(|router| {
                 let method = arg.get("method").and_then(Value::as_str)?;
@@ -953,6 +958,10 @@ fn make_workspace_host_with_pending(
                     )
                     .await
                 }
+            };
+            let result = match result {
+                Ok(Value::String(text)) if help => Ok(Value::String(docs.help(text))),
+                result => result,
             };
             if let Some((ledger, slot)) = &slot {
                 ledger.finish(*slot, &result);
