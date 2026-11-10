@@ -1416,6 +1416,7 @@ impl Runner {
                 compact_tool_descriptions,
                 mcp_proxies,
                 harness_version: harness_version.map(String::from),
+                git_identity: git_identity.clone(),
             },
             worktree: Mutex::new(None),
             notice: Mutex::new(None),
