@@ -22,47 +22,41 @@ missing: null"#,
         (
             "hyphenated_ids",
             json!({"agentId": "agent-9c54aaa4", "taskNoteId": "74881932-d1aa-4c27-a368-b7f0c1aa5360", "time": "2026-11-10T14:03:27Z", "branch": "chore/toon-format-0-6"}),
-            r#"agentId: "agent-9c54aaa4"
-taskNoteId: "74881932-d1aa-4c27-a368-b7f0c1aa5360"
+            r#"agentId: agent-9c54aaa4
+taskNoteId: 74881932-d1aa-4c27-a368-b7f0c1aa5360
 time: "2026-11-10T14:03:27Z"
-branch: "chore/toon-format-0-6""#,
+branch: chore/toon-format-0-6"#,
         ),
         (
             "tabular_rows",
             json!({"agents": [{"id": "agent-1", "name": "Ada", "status": "idle"}, {"id": "agent-2", "name": "Bob", "status": "responding"}]}),
             r#"agents[2]{id,name,status}:
-  "agent-1",Ada,idle
-  "agent-2",Bob,responding"#,
+  agent-1,Ada,idle
+  agent-2,Bob,responding"#,
         ),
         (
             "list_rows_with_nested_object",
             json!({"tasks": [{"id": "t-1", "status": "todo", "owner": {"agentId": "agent-1"}}, {"id": "t-2", "status": "done", "owner": null}]}),
             r#"tasks[2]:
-  - id: "t-1"
+  - id: t-1
     status: todo
     owner:
-      agentId: "agent-1"
-  - id: "t-2"
+      agentId: agent-1
+  - id: t-2
     status: done
     owner: null"#,
         ),
         (
             "uniform_nested_rows",
             json!({"monitors": [{"pr": 1, "checks": {"passed": 3, "failed": 0}}, {"pr": 2, "checks": {"passed": 1, "failed": 2}}]}),
-            r#"monitors[2]:
-  - pr: 1
-    checks:
-      passed: 3
-      failed: 0
-  - pr: 2
-    checks:
-      passed: 1
-      failed: 2"#,
+            r#"monitors[2]{pr,checks{passed,failed}}:
+  1,3,0
+  2,1,2"#,
         ),
         (
             "empty_collections",
             json!({"tags": [], "meta": {}, "hooks": [[], {}]}),
-            r#"tags[0]:
+            r#"tags: []
 meta:
 hooks[2]:
   - [0]:
@@ -95,8 +89,8 @@ unicode: café ✓
             "top_level_array",
             json!([{"tabId": "tab-1", "url": "http://daemon.localhost:5173/", "mounted": true}, {"tabId": "tab-2", "url": "https://example.com/a-b", "mounted": false}]),
             r#"[2]{tabId,url,mounted}:
-  "tab-1","http://daemon.localhost:5173/",true
-  "tab-2","https://example.com/a-b",false"#,
+  tab-1,"http://daemon.localhost:5173/",true
+  tab-2,"https://example.com/a-b",false"#,
         ),
     ]
 }
