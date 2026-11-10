@@ -304,6 +304,13 @@ pub(crate) static V3_10: InstructionSet = InstructionSet {
     ..V3_8
 };
 
+/// Released inline visuals: only common guidance changes from 3.9's
+/// instruction set. The separate 3.10 context experiment stays opt-in.
+pub(crate) static V3_11: InstructionSet = InstructionSet {
+    common: instr!("v3.11", "common"),
+    ..V3_8
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
@@ -695,13 +702,10 @@ mod tests {
         defaults()
     }
 
-    /// The current common body includes workspace links, development-only
-    /// visuals, the long-running-process (Intent scripts) guidance and the
-    /// private-`$TMPDIR` scratch-file sentence.
-    const COMMON_LATEST: &str = V3_8.common;
-    /// The latest set's workspace body. Harness v2.2 rewrites the workspace
-    /// status-message guidance to one short plain sentence.
-    const WORKSPACE_LATEST: &str = V2_2.workspace;
+    fn latest_bodies() -> (&'static str, &'static str) {
+        let set = crate::harness::latest_entry().doctrine.instructions;
+        (set.common, set.workspace)
+    }
 
     #[test]
     fn discussion_guidance_reaches_interactive_roles_and_respects_attention_gate() {
@@ -772,7 +776,7 @@ mod tests {
     fn common_only_is_not_self_wrapped() {
         assert_eq!(
             get_instruction_with_common("common", &all_on()),
-            COMMON_LATEST
+            latest_bodies().0
         );
     }
 
@@ -813,8 +817,9 @@ mod tests {
 
     #[test]
     fn workspace_gets_common_prepended_once() {
+        let (common, workspace) = latest_bodies();
         let out = get_instruction_with_common("workspace", &all_on());
-        assert_eq!(out, format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}"));
+        assert_eq!(out, format!("{common}\n\n---\n\n{workspace}"));
     }
 
     #[test]
@@ -851,24 +856,27 @@ mod tests {
 
     #[test]
     fn workspace_agent_gets_common_workspace_specific() {
+        let (common, workspace) = latest_bodies();
         let out = get_instruction_with_common("task-loop", &all_on());
         assert_eq!(
             out,
-            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}\n\n---\n\n{TASK_LOOP}")
+            format!("{common}\n\n---\n\n{workspace}\n\n---\n\n{TASK_LOOP}")
         );
     }
 
     #[test]
     fn legacy_ralph_loop_gets_its_pinned_specific_instructions() {
+        let (common, workspace) = latest_bodies();
         let out = get_instruction_with_common("ralph-loop", &all_on());
         assert_eq!(
             out,
-            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}\n\n---\n\n{RALPH_LOOP}")
+            format!("{common}\n\n---\n\n{workspace}\n\n---\n\n{RALPH_LOOP}")
         );
     }
 
     #[test]
     fn unknown_type_falls_back_to_workspace_specific() {
+        let (common, workspace) = latest_bodies();
         // The spawn default agent type is unknown → fallbackToWorkspace. From
         // harness 3.3 the fallback body is the workspace layer itself, so it
         // appears exactly once (intent-hq/intent#5835).
@@ -876,10 +884,10 @@ mod tests {
             let out = get_instruction_with_common(agent_type, &all_on());
             assert_eq!(
                 out,
-                format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}"),
+                format!("{common}\n\n---\n\n{workspace}"),
                 "agent type {agent_type}"
             );
-            assert_eq!(out.matches(WORKSPACE_LATEST).count(), 1);
+            assert_eq!(out.matches(workspace).count(), 1);
             assert_eq!(out, get_instruction_with_common("workspace", &all_on()));
         }
     }
@@ -948,25 +956,27 @@ mod tests {
 
     #[test]
     fn fix_alias_resolves_to_debug() {
+        let (common, workspace) = latest_bodies();
         let out = get_instruction_with_common("fix", &all_on());
         assert_eq!(
             out,
-            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}\n\n---\n\n{DEBUG}")
+            format!("{common}\n\n---\n\n{workspace}\n\n---\n\n{DEBUG}")
         );
     }
 
     #[test]
     fn review_and_walkthrough_aliases_resolve_bodies_but_keep_raw_id_semantics() {
+        let (common, workspace) = latest_bodies();
         // The alias resolves to the utility *body*, but the utility/non-interactive
         // membership checks use the raw id ("review"/"walkthrough"), which are not
         // in those sets — so they take the full common+workspace+specific path.
         assert_eq!(
             get_instruction_with_common("review", &all_on()),
-            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}\n\n---\n\n{CODE_REVIEW}")
+            format!("{common}\n\n---\n\n{workspace}\n\n---\n\n{CODE_REVIEW}")
         );
         assert_eq!(
             get_instruction_with_common("walkthrough", &all_on()),
-            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}\n\n---\n\n{CODE_WALKTHROUGH}")
+            format!("{common}\n\n---\n\n{workspace}\n\n---\n\n{CODE_WALKTHROUGH}")
         );
     }
 
@@ -1123,7 +1133,7 @@ mod tests {
     #[test]
     fn scripts_off_removes_only_long_running_processes_section() {
         let heading = format!("## {COMMON_LONG_RUNNING_PROCESSES}\n");
-        assert!(COMMON_LATEST.contains(&heading));
+        assert!(latest_bodies().0.contains(&heading));
         let on = get_instruction_with_common("task-loop", &defaults());
         assert!(on.contains(&heading));
         let features = AgentFeaturesSettings {

@@ -30785,7 +30785,7 @@ async fn a_local_spawn_records_the_prompt_breakdown() {
     use intent_core::prompt_breakdown::{utf16_len, SectionLocation};
     use std::os::unix::fs::PermissionsExt;
 
-    for version in [intent_core::NEWEST_HARNESS_VERSION, "3.8"] {
+    for version in ["3.10", "3.8"] {
         let root = crate::test_support::test_tempdir("breakdown-spawn-");
         std::fs::write(root.path().join("AGENTS.md"), "# Rules\n\nBe brief.\n").unwrap();
         let store = Store::open(&root.path().join("spawn.db")).await.unwrap();

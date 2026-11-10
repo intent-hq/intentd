@@ -1,7 +1,7 @@
 //! What Intent put into an agent's context at spawn, by section: the
 //! `promptBreakdown` field of `agent.getSession` (PROTOCOL §5.5, agents.md
-//! "promptBreakdown"). Recorded only for sessions stamped with harness
-//! [`FIRST_BREAKDOWN_HARNESS_VERSION`] or later, and stored next to the
+//! "promptBreakdown"). Recorded only for sessions admitted to the
+//! staged experiment, and stored next to the
 //! session's `systemPrompt` so the two always describe the same spawn.
 
 use serde::{Deserialize, Serialize};
@@ -10,18 +10,12 @@ use serde_json::{json, Value};
 /// The first harness version whose spawns record a breakdown.
 pub const FIRST_BREAKDOWN_HARNESS_VERSION: (u32, u32) = (3, 10);
 
-/// Whether a session stamped `harness_version` records a breakdown at spawn:
-/// 3.10 or later, comparing each part as a number (so 3.9 is older). A stamp
-/// that does not parse as `MAJOR.MINOR` never records one.
+/// Recording belongs to the staged 3.10 experiment, not every numerically
+/// later harness. Released 3.11 only corrects visual guidance and does not
+/// promote prompt-breakdown recording. Admit future versions explicitly.
 #[must_use]
 pub fn harness_records_prompt_breakdown(harness_version: &str) -> bool {
-    let Some((major, minor)) = harness_version.trim().split_once('.') else {
-        return false;
-    };
-    match (major.parse::<u32>(), minor.parse::<u32>()) {
-        (Ok(major), Ok(minor)) => (major, minor) >= FIRST_BREAKDOWN_HARNESS_VERSION,
-        _ => false,
-    }
+    harness_version == "3.10"
 }
 
 /// Display estimate for `chars`: `ceil(chars / 4)`. Not a provider token
@@ -161,9 +155,9 @@ impl PromptBreakdown {
 /// Why no breakdown is served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnavailableReason {
-    /// The session's harness is older than 3.10.
+    /// The session's harness does not admit the breakdown experiment.
     HarnessPredatesBreakdown,
-    /// A 3.10+ session with no stored breakdown.
+    /// An admitted session with no stored breakdown.
     NotRecorded,
 }
 
@@ -178,8 +172,8 @@ impl UnavailableReason {
 }
 
 /// The wire `promptBreakdown` value for a session stamped
-/// `harness_version` with `stored` read back from the store. A pre-3.10
-/// session is always unavailable, whatever is stored.
+/// `harness_version` with `stored` read back from the store. A session outside
+/// the experiment is always unavailable, whatever is stored.
 #[must_use]
 pub fn prompt_breakdown_wire(harness_version: &str, stored: Option<&PromptBreakdown>) -> Value {
     if !harness_records_prompt_breakdown(harness_version) {
@@ -227,24 +221,14 @@ mod tests {
     }
 
     #[test]
-    fn versions_compare_numerically_per_part() {
-        let (major, minor) = FIRST_BREAKDOWN_HARNESS_VERSION;
-        assert!(!harness_records_prompt_breakdown(&before_first()));
-        assert!(!harness_records_prompt_breakdown("1.0"));
+    fn breakdown_is_opt_in_to_the_staged_experiment() {
         assert!(harness_records_prompt_breakdown(&first()));
-        assert!(harness_records_prompt_breakdown(&format!(
-            "{major}.{}",
-            minor + 1
-        )));
-        assert!(harness_records_prompt_breakdown(&format!(
-            "{}.0",
-            major + 1
-        )));
-        assert!(harness_records_prompt_breakdown(
-            crate::NEWEST_HARNESS_VERSION
+        for version in ["3.9", "3.12", "4.0", "garbage", "3", " 3.10", "3.10 "] {
+            assert!(!harness_records_prompt_breakdown(version), "{version}");
+        }
+        assert!(!harness_records_prompt_breakdown(
+            crate::CURRENT_HARNESS_VERSION
         ));
-        assert!(!harness_records_prompt_breakdown("garbage"));
-        assert!(!harness_records_prompt_breakdown("3"));
     }
 
     #[test]

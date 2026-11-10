@@ -2320,12 +2320,7 @@ This is a test skill.
         async fn a_skipped_rule_file_is_a_provider_section() {
             use intent_core::prompt_breakdown::{utf16_len, SectionLocation};
             let dir = repo(&[("CLAUDE.md", CLAUDE), ("AGENTS.md", AGENTS)]);
-            let a = sections(
-                dir.path(),
-                intent_core::NEWEST_HARNESS_VERSION,
-                &claude(Some(NEW)),
-            )
-            .await;
+            let a = sections(dir.path(), "3.10", &claude(Some(NEW))).await;
             let native: Vec<_> = a
                 .provider_sections
                 .iter()
@@ -2350,7 +2345,7 @@ This is a test skill.
                 )]
             );
             assert!(!a.sections.iter().any(|s| s.id == "repo-rules"));
-            let b = a.breakdown(intent_core::NEWEST_HARNESS_VERSION, "t".into(), Vec::new());
+            let b = a.breakdown("3.10", "t".into(), Vec::new());
             assert_eq!(b.system_prompt_chars, utf16_len(&a.prompt));
             let in_prompt: u64 = b
                 .sections
@@ -2362,7 +2357,7 @@ This is a test skill.
             assert_eq!(b.total_chars, b.system_prompt_chars);
 
             // Codex loads AGENTS.md itself; CLAUDE.md stays injected.
-            let a = sections(dir.path(), intent_core::NEWEST_HARNESS_VERSION, &codex()).await;
+            let a = sections(dir.path(), "3.10", &codex()).await;
             assert_eq!(a.provider_sections.len(), 1);
             assert_eq!(
                 a.provider_sections[0].label,
