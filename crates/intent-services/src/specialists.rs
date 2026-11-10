@@ -259,7 +259,8 @@ pub(crate) const EMBEDDED_BUNDLED_V3_9: &[(&str, &str)] = &[
 
 /// The v3.10 embedded specialist bundle: the v3.9 set with the UI Designer
 /// reporting through `ws.agent.reportToParent` instead of the retired
-/// `report_to_parent` tool.
+/// `report_to_parent` tool, plus the Maintenance Coordinator, which runs an
+/// ongoing pipeline of reviewed maintenance PRs.
 pub(crate) const EMBEDDED_BUNDLED_V3_10: &[(&str, &str)] = &[
     EMBEDDED_BUNDLED_V3_9[0],
     EMBEDDED_BUNDLED_V3_9[1],
@@ -271,6 +272,10 @@ pub(crate) const EMBEDDED_BUNDLED_V3_10: &[(&str, &str)] = &[
     ),
     EMBEDDED_BUNDLED_V3_9[5],
     EMBEDDED_BUNDLED_V3_9[6],
+    (
+        "maintenance-coordinator",
+        include_str!("../resources/specialists/v3.10/maintenance-coordinator.md"),
+    ),
 ];
 
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
@@ -2447,6 +2452,28 @@ mod tests {
         );
         let def = svc.resolve("implementor", None).expect("resolves");
         assert_eq!(def["name"], "File Implementor");
+    }
+
+    /// A 3.10-pinned session resolves the bundled Maintenance Coordinator;
+    /// the current (3.9) floor does not offer it until 3.10 is promoted.
+    #[test]
+    fn v3_10_session_resolves_the_maintenance_coordinator() {
+        let empty = TempSpecialistsDir::new();
+        let staged = service_over(&empty).with_embedded(EMBEDDED_BUNDLED_V3_10);
+        let def = staged
+            .resolve("maintenance-coordinator", None)
+            .expect("resolves");
+        assert_eq!(def["source"], "bundled");
+        assert_eq!(def["name"], "Maintenance Coordinator");
+        assert_eq!(def["icon"], "ralph");
+        assert!(def["description"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("Keeps a steady pipeline")));
+        assert!(def.get("model").is_none_or(Value::is_null));
+        assert!(def.get("codingAgent").is_none_or(Value::is_null));
+        assert!(service_over(&empty)
+            .resolve("maintenance-coordinator", None)
+            .is_none());
     }
 
     /// Role-based orchestrator resolution (§18.4): an explicit

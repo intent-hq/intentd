@@ -3,7 +3,8 @@
 //! the eval-only override stamps it. Each spawn-time builder below is the
 //! extension point its work fills; until then each renders 3.9's bytes.
 //! Its specialist bundle is 3.9's with the UI Designer's completion step
-//! moved from the retired `report_to_parent` tool to `ws.agent.reportToParent`.
+//! moved from the retired `report_to_parent` tool to `ws.agent.reportToParent`,
+//! plus the bundled Maintenance Coordinator.
 
 use super::{ContextSurfaces, Doctrine, HarnessEntry, RepoRulesInputs, SkillsBlockInputs};
 
@@ -96,18 +97,48 @@ mod tests {
         );
     }
 
-    /// 3.10 changes one bundled specialist: the UI Designer reports through
-    /// `ws.agent.reportToParent`, since agents no longer get a discrete
-    /// `report_to_parent` tool.
+    fn sha256_hex(content: &str) -> String {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+        Sha256::digest(content)
+            .iter()
+            .fold(String::new(), |mut hex, byte| {
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            })
+    }
+
+    fn maintenance_coordinator() -> &'static str {
+        super::ENTRY
+            .doctrine
+            .specialists
+            .iter()
+            .find_map(|(id, content)| (*id == "maintenance-coordinator").then_some(*content))
+            .expect("maintenance coordinator specialist")
+    }
+
     #[test]
-    fn v3_10_bundle_only_fixes_the_ui_designer_report() {
+    fn golden_v3_10_maintenance_coordinator_bytes() {
+        assert_eq!(
+            sha256_hex(maintenance_coordinator()),
+            "9c21e1ba7b65b2e02e868ba286288d98f5237a5da528441b87a16481f69a57f6"
+        );
+    }
+
+    /// 3.10 changes the bundle in two ways: the UI Designer reports through
+    /// `ws.agent.reportToParent`, since agents no longer get a discrete
+    /// `report_to_parent` tool, and the Maintenance Coordinator is appended.
+    #[test]
+    fn v3_10_bundle_fixes_ui_designer_and_adds_maintenance_coordinator() {
         let current: &[(&str, &str)] = super::super::resolve_entry("3.10").doctrine.specialists;
         let previous: &[(&str, &str)] = super::super::resolve_entry("3.9").doctrine.specialists;
+        let (added, kept) = current.split_last().expect("non-empty bundle");
+        assert_eq!(added.0, "maintenance-coordinator");
         let ids = |bundle: &[(&'static str, &'static str)]| -> Vec<&'static str> {
             bundle.iter().map(|(id, _)| *id).collect()
         };
-        assert_eq!(ids(current), ids(previous));
-        for ((id, now), (_, before)) in current.iter().zip(previous) {
+        assert_eq!(ids(kept), ids(previous));
+        for ((id, now), (_, before)) in kept.iter().zip(previous) {
             if *id == "ui-designer" {
                 continue;
             }
@@ -129,6 +160,52 @@ mod tests {
                 "Call `ws.agent.reportToParent` via the `workspace_api` tool with:",
             )
         );
+    }
+
+    #[test]
+    fn v3_10_maintenance_coordinator_shape() {
+        let (meta, body) = crate::specialists::parse_frontmatter(maintenance_coordinator());
+        assert_eq!(meta["name"], "Maintenance Coordinator");
+        assert_eq!(meta["icon"], "ralph");
+        for key in ["description", "roleReminder"] {
+            assert!(meta[key].as_str().is_some_and(|v| !v.is_empty()), "{key}");
+        }
+        for absent in ["model", "codingAgent", "role", "teamAgents", "hidden"] {
+            assert!(meta.get(absent).is_none(), "{absent} is set");
+        }
+        for required in [
+            "Never merge, arm auto-merge, or add a PR to a merge queue without explicit human permission",
+            "`ws.app.question.ask`",
+            "If `ws.app.question` is unavailable, ask in your reply, or with `ws.agent.reportToParent`",
+            "`## Maintenance ledger`",
+            r#"ws.agent.delegate({ taskNoteId: "<lane task note id>", specialist: "developer" })"#,
+            r#"specialist: "pr-reviewer""#,
+            "Give each check its own task note",
+            "**outside the primary checkout**",
+            "`ws.git.registerRoot`",
+            "ws.git.commit(message, { gitRootId })",
+            "`.git/info/exclude`",
+            "`ws.pr.monitor`",
+            "`ws.crossWorkspace.readNote`",
+            "**Bugs and issues**",
+            "**Dependencies and security alerts**",
+            "**CI failures and flakes**",
+            "**Small maintenance tasks**",
+        ] {
+            assert!(body.contains(required), "missing: {required}");
+        }
+        let lower = body.to_lowercase();
+        for banned in [
+            "intentd",
+            "cloudlands",
+            "intent-hq",
+            "submodule pin",
+            "make check",
+            "make test",
+            "`make ",
+        ] {
+            assert!(!lower.contains(banned), "repo-specific: {banned}");
+        }
     }
 
     /// Until each builder is filled, a 3.10 session gets a 3.9 session's
