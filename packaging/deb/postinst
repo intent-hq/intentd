@@ -14,7 +14,7 @@ if [ "$1" = "configure" ]; then
     echo "once the service runs:"
     echo "    intentd settings daemon.mode node && intentd settings server.tunnel.enabled true"
     echo "    intentd restart"
-    echo "    intentd pair --tunnel"
+    echo "    intentd pair --node --tunnel"
 fi
 
 exit 0

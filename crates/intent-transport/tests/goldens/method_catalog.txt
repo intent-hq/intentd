@@ -163,6 +163,7 @@ router discussion.stopAgent
 router event.agentActivity
 router event.query
 router event.workspaceSummary
+router executor.invite.create
 router executor.list
 router executor.mint
 router executor.revoke
@@ -336,6 +337,7 @@ router remoteLinkTraffic.start
 router remoteLinkTraffic.stop
 router remoteMachines.add
 router remoteMachines.backendInfo
+router remoteMachines.claim
 router remoteMachines.list
 router remoteMachines.models
 router remoteMachines.refresh

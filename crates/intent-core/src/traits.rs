@@ -6298,6 +6298,51 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `executor.invite.create` (owner-only): params `{ label?,
+    /// expiresInSecs?, host? }` → `{ invite, secret, uri, hosts, port,
+    /// fingerprint, tcAddress? }`. The secret is returned once and never
+    /// logged.
+    fn executor_invite_create(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::executor_invite_create not implemented".into(),
+            ))
+        })
+    }
+
+    /// `executor.revoke { inviteId }` (owner-only): `{ ok: true }`; a used or
+    /// already revoked invite is a no-op, an unknown id `Error::NotFound`.
+    fn executor_invite_revoke(
+        &self,
+        invite_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = invite_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::executor_invite_revoke not implemented".into(),
+            ))
+        })
+    }
+
+    /// Transport seam (`/node/claim`): decide one claim and, when the invite
+    /// is open, spend it and mint the executor credential in one
+    /// transaction. Default: every invite is unknown.
+    fn claim_node_invite(
+        &self,
+        frame: crate::node_invite::ClaimFrame,
+    ) -> BoxFuture<'_, Result<crate::node_invite::ClaimReply>> {
+        let _ = frame;
+        Box::pin(async {
+            Ok(crate::node_invite::ClaimReply::refused(
+                crate::node_invite::codes::INVALID,
+            ))
+        })
+    }
+
     /// `remoteLinkTraffic.*` (owner-only capture of executor-link traffic):
     /// `method` is the part after `remoteLinkTraffic.` (`start`, `stop`,
     /// `snapshot`) and `params` the request's params object. Results and

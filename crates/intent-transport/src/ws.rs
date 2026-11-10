@@ -15,6 +15,7 @@
 //! serves plain `ws://` with no TLS acceptor and no bearer-token enforcement;
 //! it is the only path in this module that ever bypasses those checks.
 
+mod claim;
 mod executor;
 mod startup;
 
@@ -417,6 +418,9 @@ pub(crate) struct WsInner {
     /// ([`MAX_INVITE_CONNECTIONS`]); a permit is acquired before the `101`
     /// and travels with the connection task.
     pub invite_permits: Arc<Semaphore>,
+    /// Admission permits for `/node/claim` connections
+    /// ([`MAX_INVITE_CONNECTIONS`]), held from before the `101` to the close.
+    pub claim_permits: Arc<Semaphore>,
     /// Listener-wide rate limit over the `/invite` requests that hash a
     /// secret ([`crate::invite::RedeemThrottle`]); shared by every `/invite`
     /// connection so a reconnect never resets it.
@@ -484,6 +488,7 @@ impl WsApiServer {
             heartbeat_gate: options.heartbeat_gate,
             recovery_bulk_gate: options.recovery_bulk_gate,
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
+            claim_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
             executor_links: None,
@@ -532,6 +537,7 @@ impl WsApiServer {
             heartbeat_gate: options.heartbeat_gate,
             recovery_bulk_gate: options.recovery_bulk_gate,
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
+            claim_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
             executor_links: None,
@@ -574,6 +580,7 @@ impl WsApiServer {
             heartbeat_gate: options.heartbeat_gate,
             recovery_bulk_gate: options.recovery_bulk_gate,
             invite_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
+            claim_permits: Arc::new(Semaphore::new(MAX_INVITE_CONNECTIONS)),
             redeem_throttle: crate::invite::new_redeem_throttle(),
             guests: GuestRegistry::new(options.guest_limits),
             executor_links: None,
@@ -918,6 +925,9 @@ impl WsInner {
         // bootstrap seat, which serves only `/ws` with the startup status.
         if node_mode && !crate::catalog::node_mode_serves_path(path) {
             return reject(&mut stream, 403, "Forbidden").await;
+        }
+        if path == intent_core::node_invite::CLAIM_PATH {
+            return self.claim_upgrade(stream, has_origin, ws_key).await;
         }
         if path == crate::node_link::LINK_PATH || path == crate::node_link::GIT_PATH {
             return self

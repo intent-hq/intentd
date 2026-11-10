@@ -305,6 +305,19 @@ enum Command {
         /// is not checked for reachability.
         #[arg(long, value_name = "HOST", value_parser = parse_pair_host)]
         host: Option<String>,
+        /// Print a node link (`intent://node`) instead of the owner pairing
+        /// link: a single-use, expiring invite that lets one other backend
+        /// run agents on this machine and nothing else. The link carries no
+        /// owner token. Works in full and node mode.
+        #[arg(long, conflicts_with_all = ["rotate", "select_endpoints"])]
+        node: bool,
+        /// How long the node link stays valid: `30m`, `24h`, `7d`, or
+        /// seconds (5 minutes to 7 days; default 24h).
+        #[arg(long, value_name = "DURATION", requires = "node", value_parser = parse_invite_expiry)]
+        expires: Option<u64>,
+        /// A label for the node invite, shown in this machine's settings.
+        #[arg(long, value_name = "TEXT", requires = "node")]
+        label: Option<String>,
     },
     /// Daemon-backed git credential helper (monorepo#884): speaks the
     /// git-credential protocol on stdin/stdout and answers `get` for HTTPS
@@ -521,9 +534,30 @@ async fn async_main(cli: Cli) -> ExitCode {
                 tunnel,
                 rotate,
                 host,
+                node,
+                expires,
+                label,
             } => {
                 if select_endpoints {
                     to_exit(cmd_pair_select_endpoints().await)
+                } else if node {
+                    to_exit(
+                        cmd_pair_node(
+                            png.as_deref(),
+                            svg.as_deref(),
+                            PairOptions {
+                                yes,
+                                tunnel,
+                                rotate: false,
+                            },
+                            host.as_deref(),
+                            NodeInviteOptions {
+                                expires_in_secs: expires,
+                                label,
+                            },
+                        )
+                        .await,
+                    )
                 } else {
                     to_exit(
                         cmd_pair(
@@ -1592,6 +1626,15 @@ async fn cmd_pair(
         println!("             Tailcat tunnel address — reachable from other networks; embedded in the QR payload as tc=.");
     }
 
+    write_qr_exports(&code, png, svg)
+}
+
+/// Write `code` as a PNG and/or SVG with owner-only permissions.
+fn write_qr_exports(
+    code: &qrcode::QrCode,
+    png: Option<&Path>,
+    svg: Option<&Path>,
+) -> anyhow::Result<()> {
     if let Some(path) = png {
         let img = code.render::<image::Luma<u8>>().build();
         // Always encode PNG regardless of the path's extension: extension-based
@@ -1610,6 +1653,98 @@ async fn cmd_pair(
         eprintln!("wrote {}", path.display());
     }
     Ok(())
+}
+
+/// `intentd pair --node` options for the invite itself.
+struct NodeInviteOptions {
+    expires_in_secs: Option<u64>,
+    label: Option<String>,
+}
+
+/// Parse `--expires`: `<n>s`, `<n>m`, `<n>h`, `<n>d` or bare seconds, from
+/// 5 minutes to 7 days.
+fn parse_invite_expiry(value: &str) -> Result<u64, String> {
+    use intent_core::node_invite::{MAX_EXPIRES_SECS, MIN_EXPIRES_SECS};
+    let value = value.trim();
+    let (digits, unit) = match value.char_indices().last() {
+        Some((at, c)) if c.is_ascii_alphabetic() => (&value[..at], c),
+        _ => (value, 's'),
+    };
+    let scale = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        _ => return Err("use a number with s, m, h or d, for example 24h".into()),
+    };
+    let secs = digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(scale))
+        .ok_or_else(|| "use a number with s, m, h or d, for example 24h".to_owned())?;
+    if !(MIN_EXPIRES_SECS..=MAX_EXPIRES_SECS).contains(&secs) {
+        return Err("the expiry must be from 5m to 7d".into());
+    }
+    Ok(secs)
+}
+
+/// Print a node link (monorepo `docs/protocol/methods/nodes.md`, "Node
+/// invites and claim"): turn external connections and the tunnel on as
+/// [`cmd_pair`] does, then mint a node invite with `executor.invite.create`
+/// over UDS and print its QR code and `intent://node` link. The owner token
+/// is never printed.
+async fn cmd_pair_node(
+    png: Option<&Path>,
+    svg: Option<&Path>,
+    opts: PairOptions,
+    host: Option<&str>,
+    invite: NodeInviteOptions,
+) -> anyhow::Result<()> {
+    let config = resolve_config()?;
+    // Only for its side effects: the listener (and tunnel) is on and has a
+    // dialable route, or this fails with the same guidance as `pair`.
+    let _ = match host {
+        None => pairing_payload_from_get_info(&config.socket_path, opts).await?,
+        Some(host) => pairing_payload_for_host(&config.socket_path, host, opts).await?,
+    };
+    let mut params = json!({});
+    if let Some(host) = host {
+        params["host"] = json!(host);
+    }
+    if let Some(secs) = invite.expires_in_secs {
+        params["expiresInSecs"] = json!(secs);
+    }
+    if let Some(label) = &invite.label {
+        params["label"] = json!(label);
+    }
+    let response = rpc_call(&config.socket_path, "executor.invite.create", params).await?;
+    if let Some(error) = response.get("error") {
+        let message = error["message"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("cannot create a node invite: {message}");
+    }
+    let result = &response["result"];
+    let uri = result["uri"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("malformed executor.invite.create result: no `uri`"))?;
+    let expires_at = result["invite"]["expiresAt"].as_str().unwrap_or("later");
+
+    let code = qrcode::QrCode::new(uri.as_bytes())
+        .map_err(|e| anyhow::anyhow!("cannot encode the node link as a QR code: {e}"))?;
+    let art = code
+        .render::<qrcode::render::unicode::Dense1x2>()
+        .quiet_zone(true)
+        .build();
+    println!("{art}");
+    println!();
+    println!("  Open this link in Intent on the computer that should run agents here.");
+    println!();
+    println!("URL:         {uri}");
+    println!("             Same link as the QR code — it lets one backend run agents on this machine, nothing else.");
+    println!();
+    println!(
+        "This link works once and expires at {expires_at}. Run `intentd pair --node` to make another."
+    );
+    write_qr_exports(&code, png, svg)
 }
 
 /// Run the daemon-backed git credential helper (monorepo#884). ALWAYS exits 0:

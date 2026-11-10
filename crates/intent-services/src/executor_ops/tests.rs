@@ -316,7 +316,7 @@ async fn mint_validates_params_and_needs_a_running_listener() {
         .unwrap();
     assert_eq!(
         listed,
-        json!({ "backends": [] }),
+        json!({ "backends": [], "invites": [] }),
         "a failed mint stores nothing"
     );
 }

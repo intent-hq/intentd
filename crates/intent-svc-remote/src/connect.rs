@@ -292,7 +292,10 @@ where
 /// Race `routes` at the TCP level: each task yields its route and whether
 /// it accepted a connection within [`ConnectTuning::attempt`], in the order
 /// they finish.
-fn race_direct(routes: Vec<Route>, tuning: &ConnectTuning) -> tokio::task::JoinSet<(Route, bool)> {
+pub(crate) fn race_direct(
+    routes: Vec<Route>,
+    tuning: &ConnectTuning,
+) -> tokio::task::JoinSet<(Route, bool)> {
     let mut racing = tokio::task::JoinSet::new();
     for route in routes {
         let limit = tuning.attempt;

@@ -39,6 +39,7 @@ mod forge_fetch;
 mod forge_push;
 mod forge_token;
 mod git_identity;
+mod node_invite;
 mod push_on_commit;
 mod secrets;
 mod sub_agents;
@@ -268,6 +269,28 @@ async fn start_machine(dir: &Path, backend_id: &str) -> Machine {
 
 /// [`start_machine`] with extra environment for the machine process.
 async fn start_machine_with(dir: &Path, backend_id: &str, env: &[(&str, &str)]) -> Machine {
+    let (daemon, port, fingerprint) = spawn_machine(dir, env).await;
+    let mut ws = connect(port, client_config(&fingerprint)).await;
+    let minted = ok(
+        &mut ws,
+        2,
+        "executor.mint",
+        json!({ "backendId": backend_id, "backendName": "E2E head" }),
+    )
+    .await;
+    Machine {
+        daemon,
+        port,
+        fingerprint,
+        daemon_id: minted["machine"]["daemonId"].as_str().unwrap().to_owned(),
+        credential_id: minted["credentialId"].as_str().unwrap().to_owned(),
+        token: minted["token"].as_str().unwrap().to_owned(),
+    }
+}
+
+/// The machine's `intentd serve` alone, with no executor credential yet:
+/// its guard, WSS port and certificate fingerprint.
+async fn spawn_machine(dir: &Path, env: &[(&str, &str)]) -> (common::DaemonGuard, u16, String) {
     let fixture = format!(
         "{}/tests/fixtures/node-test-agent.mjs",
         env!("CARGO_MANIFEST_DIR")
@@ -298,22 +321,7 @@ async fn start_machine_with(dir: &Path, backend_id: &str, env: &[(&str, &str)]) 
     let status = common::await_wss_status(&dir.join("intentd.sock")).await;
     let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
     let fingerprint = status["result"]["fingerprint"].as_str().unwrap().to_owned();
-    let mut ws = connect(port, client_config(&fingerprint)).await;
-    let minted = ok(
-        &mut ws,
-        2,
-        "executor.mint",
-        json!({ "backendId": backend_id, "backendName": "E2E head" }),
-    )
-    .await;
-    Machine {
-        daemon,
-        port,
-        fingerprint,
-        daemon_id: minted["machine"]["daemonId"].as_str().unwrap().to_owned(),
-        credential_id: minted["credentialId"].as_str().unwrap().to_owned(),
-        token: minted["token"].as_str().unwrap().to_owned(),
-    }
+    (daemon, port, fingerprint)
 }
 
 /// Send `content` to the agent, wait for its turn to end, and return its

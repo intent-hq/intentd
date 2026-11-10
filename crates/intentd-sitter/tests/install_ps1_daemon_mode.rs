@@ -64,7 +64,7 @@ printf '%s\n' "$*" >>"$FAKE_STATE/calls"
 [ "$*" = "${FAKE_FAIL_ON:-}" ] && exit 1
 case "$*" in
   "settings daemon.mode") printf 'daemon.mode = %s\n' "$(cat "$FAKE_STATE/mode" 2>/dev/null || echo regular)" ;;
-  "pair --tunnel --yes") echo 'URL:         intent://pair?v=1&host=&port=5181&fp=FP&token=fake&mode=node' ;;
+  "pair --node --tunnel --yes") echo 'URL:         intent://node?v=1&host=&port=5181&fp=FP&invite=ni-1&secret=s&tc=tc-fake' ;;
 esac
 exit 0
 "#;
@@ -173,12 +173,16 @@ fn a_node_install_sets_the_mode_and_tunnel_restarts_then_pairs_unattended() {
             "settings daemon.mode node",
             "settings server.tunnel.enabled true",
             "restart",
-            "pair --tunnel --yes",
+            "pair --node --tunnel --yes",
         ],
         "{}",
         outcome.output
     );
-    assert!(outcome.output.contains("mode=node"), "{}", outcome.output);
+    assert!(
+        outcome.output.contains("intent://node?") && !outcome.output.contains("token="),
+        "{}",
+        outcome.output
+    );
 }
 
 #[test]
@@ -197,7 +201,7 @@ fn a_failed_restart_names_the_commands_and_skips_pairing() {
     );
     assert!(
         outcome.output.contains("did not come back in node mode")
-            && outcome.output.contains("intentd pair --tunnel"),
+            && outcome.output.contains("intentd pair --node --tunnel"),
         "{}",
         outcome.output
     );

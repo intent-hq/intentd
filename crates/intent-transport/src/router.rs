@@ -1942,8 +1942,25 @@ async fn dispatch(
             .await
             .map_err(domain_to_rpc),
         "executor.list" => api.executor_list().await.map_err(domain_to_rpc),
-        "executor.revoke" => api
-            .executor_revoke(require_str_param(params, "credentialId")?)
+        "executor.revoke" => {
+            let credential = params.get("credentialId").filter(|v| !v.is_null());
+            let invite = params.get("inviteId").filter(|v| !v.is_null());
+            match (credential, invite) {
+                (Some(_), None) => api
+                    .executor_revoke(require_str_param(params, "credentialId")?)
+                    .await
+                    .map_err(domain_to_rpc),
+                (None, Some(_)) => api
+                    .executor_invite_revoke(require_str_param(params, "inviteId")?)
+                    .await
+                    .map_err(domain_to_rpc),
+                _ => Err(invalid_params(
+                    "executor.revoke takes exactly one of credentialId and inviteId",
+                )),
+            }
+        }
+        "executor.invite.create" => api
+            .executor_invite_create(Value::Object(params.clone()))
             .await
             .map_err(domain_to_rpc),
         // Daemon-to-daemon exposed machines (nodes.md "Backend methods:
@@ -1952,6 +1969,7 @@ async fn dispatch(
         // result or error ever echoes.
         "remoteMachines.backendInfo" => remote_machines(api, "backendInfo", params).await,
         "remoteMachines.add" => remote_machines(api, "add", params).await,
+        "remoteMachines.claim" => remote_machines(api, "claim", params).await,
         "remoteMachines.list" => remote_machines(api, "list", params).await,
         "remoteMachines.remove" => remote_machines(api, "remove", params).await,
         "remoteMachines.models" => remote_machines(api, "models", params).await,

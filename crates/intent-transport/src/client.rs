@@ -175,6 +175,9 @@ pub(crate) fn with_runtime_capabilities(
                 // `remoteMachines.models`, the experimental machine model
                 // lookup (and the agents' `ws.agent.machineModels`).
                 capabilities["remoteMachineModels"] = json!(1);
+                // `remoteMachines.claim`: add a machine from an
+                // `intent://node` link.
+                capabilities["remoteMachineClaim"] = json!(1);
             }
         }
         value.to_string()

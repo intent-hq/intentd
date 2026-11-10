@@ -137,6 +137,7 @@ pub(crate) async fn call(
         "list" => list(feature, svc).await,
         "models" => models(feature, svc, &params).await,
         "add" => add(feature, svc, &params).await,
+        "claim" => crate::claim::claim(feature, svc, &params).await,
         "remove" => remove(feature, svc, &params).await,
         "refresh" => refresh(feature, svc, &params).await,
         other => Err(Error::InvalidParams(format!(

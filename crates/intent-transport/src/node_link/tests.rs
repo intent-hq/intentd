@@ -1315,3 +1315,57 @@ mod executor;
 mod git_sessions;
 mod script_lane;
 mod stop_ack;
+
+fn claim_frame() -> intent_core::node_invite::ClaimFrame {
+    intent_core::node_invite::ClaimFrame {
+        invite_id: "ni-1".into(),
+        secret: "s".repeat(64),
+        backend_id: HEAD.into(),
+        backend_name: "Head".into(),
+        backend_fingerprint: None,
+        protocol: NODE_LINK_PROTOCOLS,
+    }
+}
+
+#[tokio::test]
+async fn a_claim_gets_one_reply_and_sends_no_token() {
+    let mut node = Node::start(token("t")).await;
+    let reply = dial_claim(&node.endpoint(), &claim_frame()).await.unwrap();
+    assert_eq!(
+        reply,
+        intent_core::node_invite::ClaimReply::refused(intent_core::node_invite::codes::USED)
+    );
+    assert_eq!(*node.api.claims.lock().unwrap(), ["ni-1"]);
+    assert!(
+        node.api.lookups.lock().unwrap().is_empty(),
+        "no credential lookup"
+    );
+    node.nothing_admitted().await;
+}
+
+#[tokio::test]
+async fn a_claim_whose_reply_stalls_counts_as_sent() {
+    let node = Node::start(token("t")).await;
+    node.api
+        .claim_stalls
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let failure = dial_claim(&node.endpoint(), &claim_frame())
+        .await
+        .unwrap_err();
+    assert!(
+        failure.sent,
+        "the frame was written: the invite may be spent"
+    );
+    assert_eq!(*node.api.claims.lock().unwrap(), ["ni-1"]);
+}
+
+#[tokio::test]
+async fn a_claim_to_the_wrong_pin_sends_nothing() {
+    let node = Node::start(token("t")).await;
+    let mut endpoint = node.endpoint();
+    endpoint.pin = CertificatePin::parse(&certificate().fingerprint256).unwrap();
+    let failure = dial_claim(&endpoint, &claim_frame()).await.unwrap_err();
+    assert!(!failure.sent);
+    assert_eq!(code(&failure.error), codes::CERTIFICATE_MISMATCH);
+    assert!(node.api.claims.lock().unwrap().is_empty());
+}

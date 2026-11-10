@@ -31,7 +31,9 @@ mod reconnect;
 mod secret;
 
 pub(crate) use dial::socket_config;
-pub use dial::{dial_git, dial_link, DialedLink, NodeEndpoint, TailcatRoute};
+pub use dial::{
+    dial_claim, dial_git, dial_link, ClaimDialError, DialedLink, NodeEndpoint, TailcatRoute,
+};
 pub(crate) use executor::ExecutorRoute;
 pub use executor::{
     ExecutorHost, ExecutorLinks, NodeConnection, REVOKED_CLOSE_CODE, REVOKED_CLOSE_REASON,
