@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.178] - 2026-11-10
+
+### 📚 Documentation
+
+- Clarify inline title editing ([#3262](https://github.com/intent-hq/intentd/pull/3262))
+
+
 ## [0.11.177] - 2026-11-10
 
 ### 🐛 Bug Fixes
