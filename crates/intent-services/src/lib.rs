@@ -385,9 +385,10 @@ pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData}
 pub use note_write::persist_system_new_note;
 pub(crate) use note_write::{
     live_comment_ids, new_note_content, persist_merged_content, persist_new_note,
-    persist_note_content, reanchor_note_comments, resolve_note_version_author,
-    system_version_author, user_version_author, ContentWrite, ContentWritePolicy,
-    MergedContentWrite, ReanchorPlan, SET_CONTENT_MAX_ATTEMPTS,
+    persist_note_content, persist_note_content_new_version, persist_note_content_with_children,
+    reanchor_note_comments, resolve_note_version_author, system_version_author,
+    user_version_author, ContentWrite, ContentWritePolicy, MergedContentWrite, ReanchorPlan,
+    SET_CONTENT_MAX_ATTEMPTS,
 };
 pub use pr_ops::PrRefreshOutcome;
 #[cfg(test)]
@@ -16244,7 +16245,7 @@ impl Services {
     ///
     /// The conversion is derived from one read of the parent and committed
     /// in one store transaction gated on exactly that rev
-    /// ([`Store::update_note_with_version_and_children`]): the new child
+    /// ([`persist_note_content_with_children`]): the new child
     /// task notes exist only if the parent rewrite (fence → link) lands. A
     /// save that landed in between — including one that already converted
     /// the same fence (`note.setContent` auto-converts) — makes the gate
@@ -16376,18 +16377,17 @@ impl Services {
             note.content = std::mem::take(&mut plan.content);
             note.updated_at = now_iso();
             let children: Vec<Note> = created.iter().map(|(child, _)| child.clone()).collect();
-            match store
-                .update_note_with_version_and_children(
-                    &write_lane,
-                    &note,
-                    Some(read_rev),
-                    &children,
-                    &author,
-                    &note.updated_at,
-                )
-                .await
+            match persist_note_content_with_children(
+                store,
+                &write_lane,
+                &note,
+                Some(read_rev),
+                &children,
+                &author,
+            )
+            .await
             {
-                Ok((rev, _)) => {
+                Ok(rev) => {
                     tracing::debug!(
                         note = %note_id.0,
                         op = "task.convertBlocks",
@@ -25697,9 +25697,8 @@ impl WorkspaceApi for Services {
                 reanchor_note_comments(&store, &workspace_id, &note_id, version.content).await?;
             note.content = std::mem::take(&mut plan.content);
             note.updated_at = now_iso();
-            let (_, new_v) = store
-                .update_note_with_version(&write_lane, &note, None, &author, &note.updated_at)
-                .await?;
+            let new_v =
+                persist_note_content_new_version(&store, &write_lane, &note, &author).await?;
             plan.apply_orphaned(&store, &workspace_id).await?;
             drop(write_lane);
             services

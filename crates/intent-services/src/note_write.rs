@@ -232,6 +232,47 @@ pub(crate) async fn persist_note_content(
         .map(|(rev, _)| rev)
 }
 
+/// [`persist_note_content`] for a write that also creates child notes, in one
+/// store transaction ([`Store::update_note_with_version_and_children`]): the
+/// children exist only if the parent's content write and its version snapshot
+/// land (the `task.convertBlocks` fence → link rewrite). Gated on
+/// `expected_version` when `Some`. Returns the post-write `rev`.
+pub(crate) async fn persist_note_content_with_children(
+    store: &Store,
+    lock: &NoteWriteLock,
+    note: &Note,
+    expected_version: Option<i64>,
+    children: &[Note],
+    author: &NoteVersionAuthor,
+) -> Result<i64> {
+    store
+        .update_note_with_version_and_children(
+            lock,
+            note,
+            expected_version,
+            children,
+            author,
+            &note.updated_at,
+        )
+        .await
+        .map(|(rev, _)| rev)
+}
+
+/// [`persist_note_content`] without a version gate that returns the new
+/// version number instead of the `rev` (`note.restoreVersion` reports which
+/// snapshot the restore created).
+pub(crate) async fn persist_note_content_new_version(
+    store: &Store,
+    lock: &NoteWriteLock,
+    note: &Note,
+    author: &NoteVersionAuthor,
+) -> Result<i64> {
+    store
+        .update_note_with_version(lock, note, None, author, &note.updated_at)
+        .await
+        .map(|(_, version)| version)
+}
+
 /// [`persist_new_note`] with the daemon-internal system author, for
 /// noninteractive note inserts that live outside this crate (the `intentd`
 /// importers). Imported notes are loaded by clients like any other, so their
