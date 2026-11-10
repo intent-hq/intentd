@@ -56,6 +56,11 @@ const ALLOWED: &[(&str, Scope, &str)] = &[
         Scope::WholeFile,
         "test-only budget pinning the release the context cut is measured against",
     ),
+    (
+        "crates/intent-core/src/prompt_breakdown.rs",
+        Scope::WholeFile,
+        "admits the harness versions that record a prompt breakdown by name",
+    ),
 ];
 
 /// Remediation printed with every report.

@@ -123,8 +123,24 @@ async fn app_file_links_in_assembled_prompts_are_session_pinned() {
                 "Ordinary Markdown app file links work independently of rich chat blocks",
             ] {
                 assert!(
+                    prompts[3].contains(guidance),
+                    "v2.10 missing guidance: {guidance}"
+                );
+            }
+            // Harness 3.10 keeps every rule in a shorter section.
+            for guidance in [
+                "For any workspace file the user should open in Intent",
+                "Percent-encode each segment",
+                "Absolute OS paths",
+                "`file://` URLs",
+                "plain relative links",
+                "PDFs are links, not embeds",
+                "Preview and editing depend on the file's viewer",
+                "App file links work without rich chat blocks",
+            ] {
+                assert!(
                     prompts[0].contains(guidance),
-                    "missing guidance: {guidance}"
+                    "3.10 missing guidance: {guidance}"
                 );
             }
             for prompt in &prompts {

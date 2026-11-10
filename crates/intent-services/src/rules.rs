@@ -1246,27 +1246,20 @@ This is a test skill.
         assert!(prompt.is_some());
         let prompt_text = prompt.unwrap();
 
-        // Assert the skills catalog is present
+        // Assert the skills catalog is present (harness 3.10's budgeted
+        // form: the root once, then one `- name: description` line each).
         assert!(
-            prompt_text.contains("<available_skills>"),
+            prompt_text.contains("<available_skills root="),
             "Skills catalog block should be present"
         );
         assert!(
-            prompt_text.contains("<skill>"),
-            "Skills catalog should contain skill entries"
-        );
-        assert!(
-            prompt_text.contains("<name>test-skill</name>"),
-            "Skills catalog should contain the test skill name"
-        );
-        assert!(
-            prompt_text.contains("<description>A test skill for prompt assembly</description>"),
-            "Skills catalog should contain the test skill description"
+            prompt_text.contains("- test-skill: A test skill for prompt assembly"),
+            "Skills catalog should contain the test skill name and description"
         );
 
         // Assert layer ordering: skills should come after user rules but before
         // specialist role (if present)
-        let skills_pos = prompt_text.find("<available_skills>").unwrap();
+        let skills_pos = prompt_text.find("<available_skills").unwrap();
         let specialist_pos = prompt_text.find("<specialist_role>");
 
         // If specialist role is present, skills should come before it
@@ -1743,7 +1736,7 @@ This is a test skill.
             "attention-request bindings should not be referenced when off"
         );
         assert!(
-            prompt.contains("## Waiting on External Conditions"),
+            prompt.contains("## Response Organization") && prompt.contains("## Show media"),
             "neighboring sections must survive attentionRequests gating"
         );
     }
@@ -1771,7 +1764,9 @@ This is a test skill.
         )
         .await
         .unwrap();
-        assert!(with_defaults.contains("## Waiting on External Conditions"));
+        // 3.10 moved Waiting on External Conditions into the ws.* routing
+        // table, so it is no longer a doctrine section.
+        assert!(!with_defaults.contains("## Waiting on External Conditions"));
         assert!(with_defaults.contains("## Rich Chat Rendering"));
         assert!(with_defaults.contains("## Asking the User Questions"));
         assert!(with_defaults.contains("## Raising Attention"));
@@ -1859,7 +1854,7 @@ This is a test skill.
                     "Confirm with the user before you delete files or rewrite many files",
                     "Do not run `git init`",
                     "## Delegating Tasks",
-                    "## Note Editing",
+                    "## Raising Attention",
                 ] {
                     assert!(
                         prompt.contains(present),
@@ -1882,7 +1877,6 @@ This is a test skill.
             "## Commit Policy",
             "## Follow-up Workspaces",
             "## Link other workspaces",
-            "## Waiting on External Conditions",
         ] {
             assert!(prompt.contains(present), "git workspace lacks {present:?}");
         }

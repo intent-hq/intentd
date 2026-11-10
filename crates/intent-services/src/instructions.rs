@@ -311,6 +311,13 @@ pub(crate) static V3_11: InstructionSet = InstructionSet {
     ..V3_8
 };
 
+/// Harness 3.12 releases 3.10's trimmed doctrine with 3.11's released
+/// inline-visuals guidance appended to Rich Chat Rendering (verbatim).
+pub(crate) static V3_12: InstructionSet = InstructionSet {
+    common: instr!("v3.12", "common"),
+    ..V3_10
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
@@ -707,46 +714,73 @@ mod tests {
         (set.common, set.workspace)
     }
 
+    /// The current common body: harness 3.12's trimmed doctrine (3.10's cuts:
+    /// no Note Editing, Waiting on External Conditions or Long-running
+    /// Processes prose; plus 3.11's released inline-visuals guidance).
+    const COMMON_LATEST: &str = V3_12.common;
+
     #[test]
     fn discussion_guidance_reaches_interactive_roles_and_respects_attention_gate() {
-        let set = crate::harness::latest_entry().doctrine.instructions;
-        for attention_requests in [true, false] {
-            let features = AgentFeaturesSettings {
-                attention_requests,
-                ..defaults()
-            };
-            for role in [
-                "interactive",
-                "workspace-agent",
-                "task-focused",
-                "task-loop",
-                "chat",
-            ] {
-                let prompt = get_instruction_with_common_for(set, role, &features);
-                for guidance in [
-                    "ordinary conversation or the normal question flow",
-                    "back-and-forth, routine clarification, and plan approval",
-                    "Check the available context and use your judgment for routine choices",
-                    "concrete assigned work",
-                    "an issue encountered during that work",
-                    "unsure how to proceed",
-                    "a user or coordinator decision before continuing",
-                    "direct user assignments and delegated work",
-                    "a formal task note is not required",
-                    "State the issue and the specific decision needed",
-                    "After the call, end your turn normally",
-                    "ws.agent.requestDiscussion(reason)",
-                    "ws.agent.reportBlocker(reason)",
+        // 3.8 wording (kept for 3.8 and 3.9 sessions), then 3.10's shorter one.
+        const V3_8_GUIDANCE: &[&str] = &[
+            "ordinary conversation or the normal question flow",
+            "back-and-forth, routine clarification, and plan approval",
+            "Check the available context and use your judgment for routine choices",
+            "concrete assigned work",
+            "an issue encountered during that work",
+            "unsure how to proceed",
+            "a user or coordinator decision before continuing",
+            "direct user assignments and delegated work",
+            "a formal task note is not required",
+            "State the issue and the specific decision needed",
+            "After the call, end your turn normally",
+            "ws.agent.requestDiscussion(reason)",
+            "ws.agent.reportBlocker(reason)",
+        ];
+        const V3_10_GUIDANCE: &[&str] = &[
+            "ordinary conversation or the normal question flow",
+            "back-and-forth, routine clarification, and plan approval",
+            "Check the available context and decide routine choices yourself",
+            "concrete assigned work (direct or delegated; no task note needed)",
+            "a user or coordinator decision before continuing",
+            "State the issue and the decision needed",
+            "Then end your turn normally",
+            "ws.agent.requestDiscussion(reason)",
+            "ws.agent.reportBlocker(reason)",
+        ];
+        let latest = crate::harness::latest_entry().doctrine.instructions;
+        assert!(std::ptr::eq(latest, &raw const V3_12));
+        for (set, guidance_list, waiting) in [
+            (&V3_8, V3_8_GUIDANCE, true),
+            (latest, V3_10_GUIDANCE, false),
+        ] {
+            for attention_requests in [true, false] {
+                let features = AgentFeaturesSettings {
+                    attention_requests,
+                    ..defaults()
+                };
+                for role in [
+                    "interactive",
+                    "workspace-agent",
+                    "task-focused",
+                    "task-loop",
+                    "chat",
                 ] {
+                    let prompt = get_instruction_with_common_for(set, role, &features);
+                    for guidance in guidance_list {
+                        assert_eq!(
+                            prompt.contains(guidance),
+                            attention_requests,
+                            "role={role}, attention={attention_requests}: {guidance}"
+                        );
+                    }
+                    assert!(!prompt.contains("you need user/coordinator input to continue"));
+                    assert!(prompt.contains("## Plain language for the user"));
                     assert_eq!(
-                        prompt.contains(guidance),
-                        attention_requests,
-                        "role={role}, attention={attention_requests}: {guidance}"
+                        prompt.contains("## Waiting on External Conditions"),
+                        waiting
                     );
                 }
-                assert!(!prompt.contains("you need user/coordinator input to continue"));
-                assert!(prompt.contains("## Plain language for the user"));
-                assert!(prompt.contains("## Waiting on External Conditions"));
             }
         }
     }
@@ -1121,7 +1155,10 @@ mod tests {
             background_hooks: false,
             ..defaults()
         };
-        let out = get_instruction_with_common("task-loop", &features);
+        // 3.10 dropped the section (now a routing-table row), so the gate is
+        // pinned on 3.8's body, which still carries it.
+        assert!(!COMMON_LATEST.contains("## Waiting on External Conditions"));
+        let out = get_instruction_with_common_for(&V3_8, "task-loop", &features);
         assert!(!out.contains("## Waiting on External Conditions"));
         assert!(!out.contains("ws.hook."));
         // Neighboring sections survive intact, with clean separation.
@@ -1133,14 +1170,17 @@ mod tests {
     #[test]
     fn scripts_off_removes_only_long_running_processes_section() {
         let heading = format!("## {COMMON_LONG_RUNNING_PROCESSES}\n");
-        assert!(latest_bodies().0.contains(&heading));
-        let on = get_instruction_with_common("task-loop", &defaults());
+        // 3.10 dropped the section (now a routing-table row), so the gate is
+        // pinned on 3.8's body, which still carries it.
+        assert!(!COMMON_LATEST.contains(&heading));
+        assert!(V3_8.common.contains(&heading));
+        let on = get_instruction_with_common_for(&V3_8, "task-loop", &defaults());
         assert!(on.contains(&heading));
         let features = AgentFeaturesSettings {
             scripts: false,
             ..defaults()
         };
-        let out = get_instruction_with_common("task-loop", &features);
+        let out = get_instruction_with_common_for(&V3_8, "task-loop", &features);
         assert!(!out.contains(&heading));
         assert!(!out.contains("run_in_background"));
         // Neighboring sections survive intact, with clean separation.
@@ -1265,9 +1305,13 @@ mod tests {
         // The section is last in common.md: the body ends cleanly after the
         // previous section, and composition keeps the layer separator intact.
         assert!(common.ends_with("work as closing tags."));
-        let out = get_instruction_with_common("task-loop", &features);
+        let out = get_instruction_with_common_for(&V3_8, "task-loop", &features);
         assert!(out.contains("work as closing tags.\n\n---\n\n"));
         assert!(out.contains("## Waiting on External Conditions"));
+        // 3.10 keeps Rich Chat Rendering last, with the same clean separator.
+        let latest = get_instruction_with_common("task-loop", &features);
+        assert!(!latest.contains("## Rich Chat Rendering"));
+        assert!(latest.contains("close a group.\n\n---\n\n"));
     }
 
     #[test]
@@ -1276,7 +1320,14 @@ mod tests {
             attention_requests: false,
             ..defaults()
         };
-        let out = get_instruction_with_common("task-loop", &features);
+        let latest = get_instruction_with_common("task-loop", &features);
+        assert!(!latest.contains("## Raising Attention"));
+        assert!(!latest.contains("ws.agent.reportBlocker"));
+        assert!(!latest.contains("ws.agent.requestDiscussion"));
+        assert!(latest.contains("ws.agent.reportToParent"));
+        assert!(latest.contains("\n\n## Response Organization"));
+        // 3.8's neighbors (several dropped in 3.10) keep a clean separation.
+        let out = get_instruction_with_common_for(&V3_8, "task-loop", &features);
         assert!(!out.contains("## Raising Attention"));
         assert!(!out.contains("ws.agent.reportBlocker"));
         assert!(!out.contains("ws.agent.requestDiscussion"));
@@ -1417,8 +1468,14 @@ mod tests {
             assert_eq!(git, gated_common(set, &features).as_ref());
             let plain = get_instruction_with_common_in(set, "common", &features, true);
             for heading in PLAIN_FOLDER_COMMON_SECTIONS {
-                // Every removed heading exists in the git body (no stale marker).
-                assert!(git.contains(&format!("## {heading}\n")), "{heading}");
+                // Every removed heading exists in the git body (no stale
+                // marker), except the section 3.10 dropped; 3.8 still has it.
+                if *heading == "Waiting on External Conditions" {
+                    assert!(!git.contains(&format!("## {heading}")), "{heading}");
+                    assert!(V3_8.common.contains(&format!("## {heading}\n")));
+                } else {
+                    assert!(git.contains(&format!("## {heading}\n")), "{heading}");
+                }
                 assert!(!plain.contains(&format!("## {heading}")), "{heading}");
             }
             assert!(plain.ends_with(note));
@@ -1431,7 +1488,7 @@ mod tests {
                 "## Plain language for the user",
                 "## Delegating Tasks",
                 "## Browser tabs",
-                "## Note Editing",
+                "## Raising Attention",
                 "## Show media",
             ] {
                 assert!(plain.contains(kept), "{kept}");

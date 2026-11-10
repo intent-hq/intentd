@@ -1,7 +1,6 @@
-//! Harness 3.10: less context per agent. Staged
-//! (`intent_core::STAGED_HARNESS_VERSION`) until it becomes current; only
-//! the eval-only override stamps it. Each spawn-time builder below is the
-//! extension point its work fills; until then each renders 3.9's bytes.
+//! Harness 3.10: less context per agent. Never released on its own: 3.11
+//! shipped first, and 3.12 releases these context surfaces with 3.11's
+//! visual guidance. Sessions stamped 3.10 (eval runs) keep this text.
 //! Its specialist bundle is 3.9's with the UI Designer's completion step
 //! moved from the retired `report_to_parent` tool to `ws.agent.reportToParent`,
 //! plus the bundled Maintenance Coordinator.
@@ -13,7 +12,7 @@ static DOCTRINE: Doctrine = Doctrine {
     specialists: crate::specialists::EMBEDDED_BUNDLED_V3_10,
 };
 
-static CONTEXT: ContextSurfaces = ContextSurfaces {
+pub(super) static CONTEXT: ContextSurfaces = ContextSurfaces {
     workspace_api: &intent_acp::WORKSPACE_API_DOCS_V3_10,
     repo_rules,
     repo_rules_reads_executor: true,
@@ -90,11 +89,10 @@ mod tests {
         assert!(std::ptr::addr_eq(current.harness, previous.harness));
         assert_eq!((current.default_features)(), (previous.default_features)());
         assert_eq!(current.feature_labels, previous.feature_labels);
-        assert_eq!(
-            Some(current.version),
-            intent_core::STAGED_HARNESS_VERSION,
-            "3.10 is staged until it becomes current"
-        );
+        // Registered (old eval sessions resolve it) but never stamped: 3.12
+        // releases its surfaces.
+        assert_ne!(current.version, intent_core::CURRENT_HARNESS_VERSION);
+        assert_eq!(intent_core::STAGED_HARNESS_VERSION, None);
     }
 
     fn sha256_hex(content: &str) -> String {
@@ -372,9 +370,7 @@ mod tests {
             assert_eq!(first, second, "{}", provider.id);
         }
 
-        let old = super::super::resolve_entry(intent_core::CURRENT_HARNESS_VERSION)
-            .context
-            .placement_help;
+        let old = super::super::resolve_entry("3.9").context.placement_help;
         assert_ne!(
             old(&PlacementHelpInputs::new(&before, &connected_before)),
             old(&PlacementHelpInputs::new(&after, &connected_after)),

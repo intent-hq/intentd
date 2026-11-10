@@ -1,6 +1,6 @@
-//! Harness 3.10 doctrine goldens: the composed bundled rules are pinned per
-//! agent type and feature/plain-folder variant, the cut sections stay out,
-//! and every feature gate and plain-folder rewrite still bites.
+//! Harness 3.10 and 3.12 doctrine goldens: the composed bundled rules are
+//! pinned per agent type and feature/plain-folder variant, the cut sections
+//! stay out, and every feature gate and plain-folder rewrite still bites.
 
 use std::fmt::Write as _;
 
@@ -60,6 +60,42 @@ const CUT_HEADINGS: &[&str] = &[
     "### Inline visuals",
 ];
 
+/// 3.12's composed doctrine (3.10's with a shorter Follow-up Workspaces
+/// section and 3.11's released visuals block), in the same layout as
+/// [`GOLDEN`]. Released: change it only through a new harness version.
+const GOLDEN_V3_12: &[(&str, usize, &str)] = &[
+    (
+        "interactive",
+        40_825,
+        "20309a977e493258a7458f74a0cdfcad7cb47edb872a12ccde0bfa14d2f5efb7",
+    ),
+    (
+        "workspace",
+        40_825,
+        "20309a977e493258a7458f74a0cdfcad7cb47edb872a12ccde0bfa14d2f5efb7",
+    ),
+    (
+        "workspace-agent",
+        55_581,
+        "4da9c7e761b91990f53bb3721f055b0cf80506c3596f442d607b0c7899a7ebf9",
+    ),
+    (
+        "task-breakdown",
+        74_948,
+        "d53b714646cd26a303a4e3e60804de837b2b849ff2dda25d0719e6b3c4dbecae",
+    ),
+    (
+        "chat",
+        42_321,
+        "b4584e6f896a3361cd2c0ee759cc680a095fde343e4075d21f389c6fc6005de4",
+    ),
+    (
+        "code-review",
+        14_393,
+        "c530af1e49d099ffd8e067fb97edd8aa2e0f3b114bb68e063ec6a81ab709b45f",
+    ),
+];
+
 fn set() -> &'static InstructionSet {
     crate::harness::resolve_entry("3.10").doctrine.instructions
 }
@@ -79,6 +115,10 @@ fn gates_off() -> AgentFeaturesSettings {
 }
 
 fn composed(agent_type: &str) -> String {
+    composed_in(set(), agent_type)
+}
+
+fn composed_in(set: &'static InstructionSet, agent_type: &str) -> String {
     let defaults = AgentFeaturesSettings::default();
     let off = gates_off();
     [
@@ -88,7 +128,7 @@ fn composed(agent_type: &str) -> String {
         (&off, true),
     ]
     .iter()
-    .map(|(features, plain)| get_instruction_with_common_in(set(), agent_type, features, *plain))
+    .map(|(features, plain)| get_instruction_with_common_in(set, agent_type, features, *plain))
     .collect::<Vec<_>>()
     .join("\n\u{0}\n")
 }
@@ -118,9 +158,10 @@ fn golden_v3_10_composed_doctrine() {
             .all(|(a, g)| a.0 == g.0 && a.1 == g.1 && a.2 == g.2);
     assert!(
         matches,
-        "harness 3.10 doctrine changed. While 3.10 is staged, paste the rows below into \
-         GOLDEN (rerun `make test-select E='test(golden_v3_10_composed)'`); once it is \
-         current, gate the change on a new harness version instead:\n{}",
+        "harness 3.10 doctrine changed. 3.10 never shipped on its own (3.12 releases \
+         its surfaces), but eval sessions carry it: gate a change on a new harness \
+         version, or for a deliberate fix paste the rows below into GOLDEN (rerun \
+         `make test-select E='test(golden_v3_10_composed)'`):\n{}",
         actual
             .iter()
             .map(|(t, len, sha)| format!("    (\"{t}\", {len}, \"{sha}\"),"))
@@ -223,4 +264,32 @@ fn v3_10_plain_folder_drops_forge_sections_and_rewrites_examples() {
             assert!(plain.contains(to), "{to}");
         }
     }
+}
+
+#[test]
+fn golden_v3_12_composed_doctrine() {
+    let set = &crate::instructions::V3_12;
+    let actual: Vec<(&str, usize, String)> = AGENT_TYPES
+        .iter()
+        .map(|agent_type| {
+            let text = composed_in(set, agent_type);
+            (*agent_type, text.len(), sha256_hex(&text))
+        })
+        .collect();
+    let matches = actual.len() == GOLDEN_V3_12.len()
+        && actual
+            .iter()
+            .zip(GOLDEN_V3_12)
+            .all(|(a, g)| a.0 == g.0 && a.1 == g.1 && a.2 == g.2);
+    assert!(
+        matches,
+        "harness 3.12 doctrine changed. 3.12 is released, so live sessions carry it: \
+         gate the change on a new harness version, or for a deliberate all-session fix \
+         paste the rows below into GOLDEN_V3_12:\n{}",
+        actual
+            .iter()
+            .map(|(t, len, sha)| format!("    (\"{t}\", {len}, \"{sha}\"),"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }

@@ -232,6 +232,10 @@ Check the provider's official setup instructions before choosing a URL or local 
 
 A failed local server start or restart reports `error` with `lastError`. Fix its configuration and retry; the failure remains visible until the server is stopped or another start replaces it.
 
+**Skills that need an MCP server.** New agents don't see a skill that names tools from an MCP server that isn't enabled here. They also don't see a skill whose `compatibility` field names other agent products but not Intent or the agent's provider. For Claude Code and Codex, servers set up in the provider's own config also count; for other providers, only Intent's settings do. To bring such a skill back, add or enable its server in **Connections → MCP servers**; the next new agent sees it. Existing agents keep the skills they started with. Long skill lists are shortened: descriptions are trimmed, and the last skills appear by name only.
+
+<!-- Sources: packages/intentd/crates/intent-services/src/skills.rs; packages/intentd/crates/intent-services/src/harness/v3_10.rs. -->
+
 <!-- Sources: packages/intentd/crates/intent-services/src/plugins.rs; packages/intentd/crates/intent-services/src/plugins/ops.rs; packages/cloudlands-fe/src/lib/components/settings/{PluginsSettings.svelte,plugins/PluginList.svelte}. -->
 
 Plugins follow the [Agent Plugins](https://agent-plugins.org/specification) format: a folder with `plugin.json`, optional `skills/` and an optional `mcp.json`. Install one once in **Connections → Plugins** (`/settings?tab=connections#plugins`) from a folder path or a git URL, and every agent gets it on any provider. Its skills appear as `<plugin>:<skill>`. Its MCP servers appear in **Connections → MCP servers** as `<plugin>-<server>`, labelled with the plugin; they work like the user's own servers (status, sign-in, switches, `ws.app.mcp` reads) but can only be changed by updating or removing the plugin. Changes reach new agents only. The row shows warnings for parts that were skipped, and **Update** fetches the source again. The Assistant cannot install plugins for the user yet: send the user to that page.
@@ -310,11 +314,14 @@ screenshots of the rendered result. Product Manager never edits code: it asks
 clarifying questions, explores the code, and writes the spec in the workspace **Spec**
 note. A second Product Manager critiques the spec; after you approve it, Product
 Manager starts a top-level Developer to implement it (this uses **Top-level agent
-spawning & retirement**, on by default). A new harness version
+spawning & retirement**, on by default). Maintenance Coordinator keeps a steady
+pipeline of small maintenance PRs (bugs and issues, dependency and security alerts,
+CI failures and flaky tests), each reviewed and green; it never merges without the
+user's explicit permission. A new harness version
 applies to new sessions; existing sessions keep their captured behavior, and
 custom specialist instructions can override the defaults.
 
-<!-- Sources: packages/intentd/crates/intent-services/resources/specialists/{v3.8,v3.9}/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_8.rs,harness/v3_9.rs}. -->
+<!-- Sources: packages/intentd/crates/intent-services/resources/specialists/{v3.8,v3.9,v3.10}/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_8.rs,harness/v3_9.rs,harness/v3_10.rs,harness/v3_12.rs}. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/settings/agent-feature-definitions.ts; src/lib/components/chat/secrets/SecretRequestCards.svelte. Daemon: packages/intentd/crates/intent-acp/src/mcp_server/bindings/secret.rs. -->
 
@@ -462,6 +469,8 @@ icons. **Add machine** opens the connection form; a remote machine's actions inc
 actions can also include **Let <backend> run agents here**, which asks to confirm with
 **Allow**, and **Stop letting <backend> run agents here**; machines allowed this way are
 listed under **Machines <backend> can run agents on**.
+Running agents on those machines is experimental. Agents see each machine's name and
+platform, and look up its providers, sign-in status and models when they need them.
 An agent running on one of those machines uses that machine's skills (its
 `~/.agents/skills` and `~/.claude/skills`, plus the project's), and its **/** menu lists
 them; to give it a skill, add the skill there. A **/name** it lacks still sends, with a

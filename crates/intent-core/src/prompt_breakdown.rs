@@ -10,12 +10,13 @@ use serde_json::{json, Value};
 /// The first harness version whose spawns record a breakdown.
 pub const FIRST_BREAKDOWN_HARNESS_VERSION: (u32, u32) = (3, 10);
 
-/// Recording belongs to the staged 3.10 experiment, not every numerically
-/// later harness. Released 3.11 only corrects visual guidance and does not
-/// promote prompt-breakdown recording. Admit future versions explicitly.
+/// Recording belongs to the 3.10 context surfaces, not every numerically
+/// later harness: 3.10 (eval-only) and 3.12, which releases them. Released
+/// 3.11 only corrects visual guidance and records none. Admit future
+/// versions explicitly.
 #[must_use]
 pub fn harness_records_prompt_breakdown(harness_version: &str) -> bool {
-    harness_version == "3.10"
+    matches!(harness_version, "3.10" | "3.12")
 }
 
 /// Display estimate for `chars`: `ceil(chars / 4)`. Not a provider token
@@ -221,14 +222,17 @@ mod tests {
     }
 
     #[test]
-    fn breakdown_is_opt_in_to_the_staged_experiment() {
+    fn breakdown_is_admitted_by_name() {
         assert!(harness_records_prompt_breakdown(&first()));
-        for version in ["3.9", "3.12", "4.0", "garbage", "3", " 3.10", "3.10 "] {
-            assert!(!harness_records_prompt_breakdown(version), "{version}");
-        }
-        assert!(!harness_records_prompt_breakdown(
+        assert!(harness_records_prompt_breakdown("3.12"));
+        assert!(harness_records_prompt_breakdown(
             crate::CURRENT_HARNESS_VERSION
         ));
+        for version in [
+            "3.9", "3.11", "3.13", "4.0", "garbage", "3", " 3.10", "3.12 ",
+        ] {
+            assert!(!harness_records_prompt_breakdown(version), "{version}");
+        }
     }
 
     #[test]

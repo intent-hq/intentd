@@ -1236,6 +1236,23 @@ pub fn fingerprint_diff(before: &[serde_json::Value], after: &[serde_json::Value
     out
 }
 
+/// Whether the `workspace_api` description names `path` (`"agent.retire"`):
+/// as a signature line (`ws.agent.retire(`) or, on harness 3.10's compact
+/// reference, in its namespace's capability-map line (`ws.agent.{…, retire}`).
+pub fn lists_method(desc: &str, path: &str) -> bool {
+    let (ns, name) = path.rsplit_once('.').expect("namespace.method");
+    if desc.contains(&format!("ws.{path}(")) {
+        return true;
+    }
+    let prefix = format!("ws.{ns}.{{");
+    desc.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.split_once('}'))
+            .is_some_and(|(methods, _)| methods.split(", ").any(|m| m == name))
+    })
+}
+
 #[cfg(test)]
 mod exact_test_name_tests {
     use super::exact_test_name;

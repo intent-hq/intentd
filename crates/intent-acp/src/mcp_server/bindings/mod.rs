@@ -362,7 +362,7 @@ async fn dispatch_binding(
         // Live remote-placement discovery on the agent namespace, present
         // only when the daemon has a configured execution node. Remote
         // agents start from a git commit, so plain folders never list it.
-        if !plain_folder && opt_str(args, "namespace").as_deref() == Some("agent") {
+        if !plain_folder && help::wants_placement_help(opt_str(args, "namespace").as_deref()) {
             if let (Value::String(text), Some(extra)) = (
                 &mut help,
                 api.agent_placement_help(workspace_id.clone()).await,

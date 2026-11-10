@@ -224,8 +224,8 @@ pub(crate) fn workspace_api_surfaces_for(
 const V3_10_WORKSPACE_API: &[(&str, usize, &str, usize, &str)] = &[
     (
         "auggie",
-        51_903,
-        "1b20e5fe6a7cd3c5babc6dce327a02d62b3c92a0e03ca034462521c66a69871d",
+        53_014,
+        "a7fa2cc9e7c74cf6e39c9166a6c0d3d10c5b55c6b844a5b63f4198657cb1f0dd",
         12,
         "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
     ),
@@ -233,41 +233,41 @@ const V3_10_WORKSPACE_API: &[(&str, usize, &str, usize, &str)] = &[
         "claude-code",
         4_682,
         "7e0084a973e2675cb00e155af601296de3a1ac373611d5a9b8a7b77146f9a643",
-        48_133,
-        "0ac2877a5de2d1a57d0ecfb18dcf5e8fdd4ef65b501c38e3e5c5198d2fd74888",
+        49_244,
+        "e9cd1397c400b8872282ddf50a718fb9c75faefe02e6f8f112b7ab3855369594",
     ),
     (
         "codex",
-        51_903,
-        "1b20e5fe6a7cd3c5babc6dce327a02d62b3c92a0e03ca034462521c66a69871d",
+        53_014,
+        "a7fa2cc9e7c74cf6e39c9166a6c0d3d10c5b55c6b844a5b63f4198657cb1f0dd",
         12,
         "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
     ),
     (
         "cortex",
-        51_903,
-        "1b20e5fe6a7cd3c5babc6dce327a02d62b3c92a0e03ca034462521c66a69871d",
+        53_014,
+        "a7fa2cc9e7c74cf6e39c9166a6c0d3d10c5b55c6b844a5b63f4198657cb1f0dd",
         12,
         "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
     ),
     (
         "opencode",
-        51_903,
-        "1b20e5fe6a7cd3c5babc6dce327a02d62b3c92a0e03ca034462521c66a69871d",
+        53_014,
+        "a7fa2cc9e7c74cf6e39c9166a6c0d3d10c5b55c6b844a5b63f4198657cb1f0dd",
         12,
         "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
     ),
     (
         "unsloth",
-        51_903,
-        "1b20e5fe6a7cd3c5babc6dce327a02d62b3c92a0e03ca034462521c66a69871d",
+        53_014,
+        "a7fa2cc9e7c74cf6e39c9166a6c0d3d10c5b55c6b844a5b63f4198657cb1f0dd",
         12,
         "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
     ),
     (
         "pi",
-        51_903,
-        "1b20e5fe6a7cd3c5babc6dce327a02d62b3c92a0e03ca034462521c66a69871d",
+        53_014,
+        "a7fa2cc9e7c74cf6e39c9166a6c0d3d10c5b55c6b844a5b63f4198657cb1f0dd",
         12,
         "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
     ),
@@ -275,34 +275,34 @@ const V3_10_WORKSPACE_API: &[(&str, usize, &str, usize, &str)] = &[
         "droid",
         4_682,
         "7e0084a973e2675cb00e155af601296de3a1ac373611d5a9b8a7b77146f9a643",
-        48_133,
-        "0ac2877a5de2d1a57d0ecfb18dcf5e8fdd4ef65b501c38e3e5c5198d2fd74888",
+        49_244,
+        "e9cd1397c400b8872282ddf50a718fb9c75faefe02e6f8f112b7ab3855369594",
     ),
     (
         "grok",
         4_682,
         "7e0084a973e2675cb00e155af601296de3a1ac373611d5a9b8a7b77146f9a643",
-        48_133,
-        "0ac2877a5de2d1a57d0ecfb18dcf5e8fdd4ef65b501c38e3e5c5198d2fd74888",
+        49_244,
+        "e9cd1397c400b8872282ddf50a718fb9c75faefe02e6f8f112b7ab3855369594",
     ),
     (
         "antigravity",
-        51_903,
-        "1b20e5fe6a7cd3c5babc6dce327a02d62b3c92a0e03ca034462521c66a69871d",
+        53_014,
+        "a7fa2cc9e7c74cf6e39c9166a6c0d3d10c5b55c6b844a5b63f4198657cb1f0dd",
         12,
         "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
     ),
     (
         "cursor",
-        51_903,
-        "1b20e5fe6a7cd3c5babc6dce327a02d62b3c92a0e03ca034462521c66a69871d",
+        53_014,
+        "a7fa2cc9e7c74cf6e39c9166a6c0d3d10c5b55c6b844a5b63f4198657cb1f0dd",
         12,
         "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
     ),
     (
         "mock",
-        51_903,
-        "1b20e5fe6a7cd3c5babc6dce327a02d62b3c92a0e03ca034462521c66a69871d",
+        53_014,
+        "a7fa2cc9e7c74cf6e39c9166a6c0d3d10c5b55c6b844a5b63f4198657cb1f0dd",
         12,
         "f7d22e953339e7f028ddc4032d85b654a7f5318c291240414f24c4ac1bc147d4",
     ),
@@ -347,8 +347,9 @@ async fn v3_10_workspace_api_surfaces() {
     }
     assert!(
         mismatches.is_empty() && V3_10_WORKSPACE_API.len() == actual.len(),
-        "harness 3.10 workspace_api surfaces changed for {mismatches:?}. Review the text \
-         (it is staged, so no session carries it yet), then paste the rows into \
+        "harness 3.10 workspace_api surfaces changed for {mismatches:?}. 3.12 reuses these \
+         surfaces, so live sessions carry this text: change it only as a deliberate all-session fix \
+         or move the change to a new harness version, then paste the rows into \
          `V3_10_WORKSPACE_API`:\n{}",
         actual.join("\n")
     );

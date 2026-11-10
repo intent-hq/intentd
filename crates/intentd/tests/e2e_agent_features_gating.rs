@@ -594,9 +594,11 @@ async fn agent_features_gate_new_sessions_only() {
     let prompt_a = session_a["result"]["session"]["systemPrompt"]
         .as_str()
         .expect("systemPrompt populated for A");
+    // Harness 3.10 moved the backgroundHooks guidance into the ws.* routing
+    // table (the bridge description, checked below), out of the doctrine.
     assert!(
-        prompt_a.contains("## Waiting on External Conditions"),
-        "full prompt must contain the backgroundHooks section"
+        !prompt_a.contains("## Waiting on External Conditions"),
+        "3.10 doctrine has no backgroundHooks section"
     );
     assert!(
         prompt_a.contains("## Rich Chat Rendering"),
@@ -609,11 +611,9 @@ async fn agent_features_gate_new_sessions_only() {
     for guidance in [
         "ordinary conversation or the normal question flow",
         "back-and-forth, routine clarification, and plan approval",
-        "concrete assigned work",
-        "an issue encountered during that work",
+        "concrete assigned work (direct or delegated; no task note needed)",
         "a user or coordinator decision before continuing",
-        "direct user assignments and delegated work",
-        "a formal task note is not required",
+        "State the issue and the decision needed",
     ] {
         assert!(
             prompt_a.contains(guidance),
@@ -656,25 +656,29 @@ async fn agent_features_gate_new_sessions_only() {
     let mut bridge_a = BridgeClient::connect(&addr_a).await;
 
     let desc_a = bridge_a.workspace_api_description().await;
-    assert!(desc_a.contains("only when concrete assigned work encounters an issue"));
+    // Harness 3.10's compact description names every method; the full
+    // docs (including the attention-request rules) come from ws.help.
     let (err, agent_help) = bridge_a.call_js("return ws.help('agent')").await;
     assert!(!err, "agent help must succeed: {agent_help}");
     assert!(agent_help.contains("only when concrete assigned work encounters an issue"));
     assert!(agent_help.contains("back-and-forth, routine clarification, and plan approval"));
     for marker in [
-        "ws.host.exec(",
-        "ws.hook.schedule(",
-        "ws.terminal.list()",
-        "ws.terminal.readOutput(",
-        "ws.browser.exec(",
-        "ws.script.run(",
-        "ws.agent.reportBlocker(",
-        "ws.agent.requestDiscussion(",
-        "ws.pr.monitor(",
-        "ws.pr.unmonitor(",
-        "ws.pr.monitors()",
+        "host.exec",
+        "hook.schedule",
+        "terminal.list",
+        "terminal.readOutput",
+        "browser.exec",
+        "script.run",
+        "agent.reportBlocker",
+        "agent.requestDiscussion",
+        "pr.monitor",
+        "pr.unmonitor",
+        "pr.monitors",
     ] {
-        assert!(desc_a.contains(marker), "full description missing {marker}");
+        assert!(
+            common::lists_method(&desc_a, marker),
+            "full description missing {marker}"
+        );
     }
 
     let (err, text) = bridge_a.call_js("return await ws.hook.list()").await;
@@ -815,28 +819,30 @@ async fn agent_features_gate_new_sessions_only() {
     let mut bridge_b = BridgeClient::connect(&addr_b).await;
 
     let desc_b = bridge_b.workspace_api_description().await;
-    for gated in [
-        "ws.host.",
-        "ws.hook.",
-        "ws.terminal.",
-        "ws.agent.reportBlocker",
-        "ws.agent.requestDiscussion",
-        "pr.monitor",
-    ] {
+    for gated in ["ws.host.", "ws.hook.", "ws.terminal.", "pr.monitor"] {
         assert!(
             !desc_b.contains(gated),
             "gated description must not mention {gated}"
         );
     }
+    for gated in ["agent.reportBlocker", "agent.requestDiscussion"] {
+        assert!(
+            !common::lists_method(&desc_b, gated),
+            "gated description must not list {gated}"
+        );
+    }
     for kept in [
-        "ws.browser.exec(",
-        "ws.script.run(",
-        "ws.note.read(",
-        "ws.agent.reportToParent(",
+        "browser.exec",
+        "script.run",
+        "note.read",
+        "agent.reportToParent",
         // `prMonitor` is method-level: `ws.pr.snapshot` survives it.
-        "ws.pr.snapshot(",
+        "pr.snapshot",
     ] {
-        assert!(desc_b.contains(kept), "gated description missing {kept}");
+        assert!(
+            common::lists_method(&desc_b, kept),
+            "gated description missing {kept}"
+        );
     }
 
     // B's JS prelude: the gated `ws.*` namespaces are not even defined, and
@@ -997,9 +1003,7 @@ async fn agent_features_gate_new_sessions_only() {
         "the existing session keeps its guidance"
     );
     assert!(
-        prompt_a2.contains("## Waiting on External Conditions")
-            && prompt_a2.contains("## Rich Chat Rendering")
-            && prompt_a2.contains("## Raising Attention"),
+        prompt_a2.contains("## Rich Chat Rendering") && prompt_a2.contains("## Raising Attention"),
         "A's persisted prompt must keep the gated sections after the flip"
     );
 }
@@ -1116,18 +1120,12 @@ async fn specialist_model_options_surface_in_bridge_description() {
         !desc.contains("plain:"),
         "specialists without options must not be listed"
     );
-    // The block reads as part of the delegate entry: between the
-    // `ws.agent.delegate` doc line and the next method line.
-    let delegate_idx = desc.find("ws.agent.delegate(").expect("delegate line");
+    // Harness 3.10's compact reference lists `delegate` in the capability
+    // map and carries the block after the common signatures.
+    assert!(common::lists_method(&desc, "agent.delegate"), "{desc}");
+    let map_idx = desc.find("Capability map").expect("capability map");
     let block_idx = desc.find("Specialist model options").expect("block");
-    let send_idx = desc[delegate_idx..]
-        .find("ws.agent.send(")
-        .map(|i| i + delegate_idx)
-        .expect("send line after delegate");
-    assert!(
-        delegate_idx < block_idx && block_idx < send_idx,
-        "options block must sit inside the delegate docs"
-    );
+    assert!(map_idx < block_idx, "options block follows the map");
 }
 
 // ---------------------------------------------------------------------------
@@ -1224,10 +1222,10 @@ async fn peer_agents_default_creation_retirement_and_opt_out_over_wss() {
     let configs_a = mcp_config_files(&data_dir);
     assert_eq!(configs_a.len(), 1, "one agent → one config: {configs_a:?}");
     let mut bridge_a = BridgeClient::connect(&bridge_addr_from_config(&configs_a[0])).await;
-    assert!(bridge_a
-        .workspace_api_description()
-        .await
-        .contains("ws.agent.retire"));
+    assert!(common::lists_method(
+        &bridge_a.workspace_api_description().await,
+        "agent.retire"
+    ));
 
     // The MCP front door: A creates an independent top-level agent. The tool
     // result carries `sponsorAgentId` and — the no-watch seam — NO
@@ -1408,10 +1406,10 @@ async fn peer_agents_default_creation_retirement_and_opt_out_over_wss() {
         .find(|p| !configs_before_b.contains(p))
         .expect("new config for B");
     let mut bridge_b = BridgeClient::connect(&bridge_addr_from_config(config_b)).await;
-    assert!(!bridge_b
-        .workspace_api_description()
-        .await
-        .contains("ws.agent.retire"));
+    assert!(!common::lists_method(
+        &bridge_b.workspace_api_description().await,
+        "agent.retire"
+    ));
     let (err, text) = bridge_b.call_js("return typeof ws.agent.retire;").await;
     assert!(!err, "binding probe succeeds: {text}");
     assert_eq!(text, "\"undefined\"");

@@ -36,29 +36,53 @@ use crate::Services;
 /// The release the cut is measured against.
 const BASELINE: &str = "3.9";
 /// The harness under test.
-const CANDIDATE: &str = "3.10";
+const CANDIDATE: &str = intent_core::CURRENT_HARNESS_VERSION;
+/// The release the candidate replaces, reported for reference only (3.11:
+/// 3.9 plus released inline visuals). The gate stays on [`BASELINE`].
+const PREVIOUS: &str = "3.11";
 /// The newest harness may carry at most this share of the baseline on the
 /// realistic fixture.
 const REALISTIC_MAX_RATIO: f64 = 0.5;
 
+/// Documented exception to the realistic 50% gate (user decision,
+/// 2026-11-10): providers that already got the short 3.9 reference but
+/// still need the fixture's AGENTS.md injected, because Intent cannot
+/// confirm they load it themselves:
+/// - Grok Build's folder-trust gate covers AGENTS.md and fails closed under
+///   the ACP stdio transport (no prompt), so a fresh, untrusted worktree
+///   does not load it (xai-org/grok-build `agent/folder_trust.rs`).
+/// - Droid documents native AGENTS.md loading, but neither its headless
+///   `droid exec` mode nor a minimum version is documented, and the CLI is
+///   closed source; an unknown version injects (`native_rules`).
+///
+/// For these, Intent-owned text must still halve, and the total may not grow
+/// past the measured value: `(provider, top-level chars, sub-agent chars)`.
+/// Measured on 3.12, which carries the released inline-visuals block from
+/// 3.11 (intentd #3240, 1,946 chars) and the `ws.agent.delegate` occupancy
+/// entry (#3248) on top of the 3.10 cuts. Revisit if
+/// either CLI's native load can be confirmed: add it to `native_rules` and
+/// drop its row.
+const REALISTIC_INJECTED_RULES_CEILING: &[(&str, usize, usize)] =
+    &[("droid", 58_009, 56_147), ("grok", 58_009, 56_147)];
+
 /// Clean-fixture ceiling per provider: `(provider, top-level chars,
-/// sub-agent chars)`. Measured on harness 3.10 with the compact ws.*
-/// reference, the trimmed doctrine and the skills cut (2026-11-09), plus
-/// the `ws.agent.delegate` occupancy entry (2026-11-10); lower each row
-/// again as further cuts land.
+/// sub-agent chars)`. Measured on harness 3.12: the 3.10 compact ws.*
+/// reference (with the `ws.agent.delegate` occupancy entry), trimmed
+/// doctrine and skills cut, the eval-driven hot-set notes, and 3.11's
+/// released visuals (2026-11-10). Lower each row again as further cuts land.
 const CLEAN_CEILING: &[(&str, usize, usize)] = &[
-    ("auggie", 25_447, 23_807),
-    ("claude-code", 25_726, 24_086),
-    ("codex", 25_447, 23_807),
-    ("cortex", 25_447, 23_807),
-    ("opencode", 25_447, 23_807),
-    ("unsloth", 25_447, 23_807),
-    ("pi", 25_447, 23_807),
-    ("droid", 25_726, 24_086),
-    ("grok", 25_726, 24_086),
-    ("antigravity", 25_447, 23_807),
-    ("cursor", 25_675, 24_035),
-    ("mock", 25_447, 23_807),
+    ("auggie", 27_393, 25_531),
+    ("claude-code", 27_672, 25_810),
+    ("codex", 27_393, 25_531),
+    ("cortex", 27_393, 25_531),
+    ("opencode", 27_393, 25_531),
+    ("unsloth", 27_393, 25_531),
+    ("pi", 27_393, 25_531),
+    ("droid", 27_672, 25_810),
+    ("grok", 27_672, 25_810),
+    ("antigravity", 27_393, 25_531),
+    ("cursor", 27_621, 25_759),
+    ("mock", 27_393, 25_531),
 ];
 
 /// Where the fixtures' paths appear to live, so sizes do not depend on the
@@ -84,16 +108,21 @@ struct Fixture {
     /// The local Claude Code CLI's `--version` (`None`: unknown, so every
     /// rule file stays injected).
     claude_cli_version: Option<&'static str>,
+    /// The local Codex's effective `project_doc_max_bytes` (`None`: unknown,
+    /// so every rule file stays injected).
+    codex_doc_cap: Option<usize>,
 }
 
-/// The developer runs a Claude Code CLI that loads AGENTS.md by itself, so
-/// the newest harness does not inject it for claude-code.
+/// The developer runs a Claude Code CLI that loads AGENTS.md by itself and
+/// a Codex with the default doc cap (the 27.7k AGENTS.md fits), so the
+/// newest harness injects it for neither. Other providers still get it.
 const REALISTIC: Fixture = Fixture {
     name: "realistic",
     repo_rules: true,
     skills: None,
     remote_machine: true,
     claude_cli_version: Some(crate::native_rules::test_versions::FIRST),
+    codex_doc_cap: Some(crate::native_rules::CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES),
 };
 
 const CLEAN: Fixture = Fixture {
@@ -102,6 +131,7 @@ const CLEAN: Fixture = Fixture {
     skills: Some(&["docx", "pdf", "xlsx"]),
     remote_machine: false,
     claude_cli_version: None,
+    codex_doc_cap: None,
 };
 
 fn fixture_dir() -> PathBuf {
@@ -112,6 +142,7 @@ fn fixture_dir() -> PathBuf {
 struct Materialized {
     _dir: tempfile::TempDir,
     claude_cli_version: Option<&'static str>,
+    codex_doc_cap: Option<usize>,
     root: PathBuf,
     repo: PathBuf,
     skills: Vec<SkillMetadata>,
@@ -123,6 +154,9 @@ fn materialize(fixture: &Fixture) -> Materialized {
     let root = dir.path().join("home").join("dev");
     let repo = root.join(REPO_DIR);
     std::fs::create_dir_all(&repo).expect("repo dir");
+    // A workspace is a git checkout: Codex treats the folder as its
+    // project root.
+    std::fs::create_dir_all(repo.join(".git")).expect(".git dir");
     let source = fixture_dir();
     if fixture.repo_rules {
         std::fs::copy(source.join("monorepo-AGENTS.md"), repo.join("AGENTS.md"))
@@ -178,6 +212,7 @@ fn materialize(fixture: &Fixture) -> Materialized {
     Materialized {
         _dir: dir,
         claude_cli_version: fixture.claude_cli_version,
+        codex_doc_cap: fixture.codex_doc_cap,
         root,
         repo,
         skills,
@@ -317,11 +352,19 @@ async fn measure(
             .with_remote_placement_help(placement),
     );
     let docs = server.workspace_api_prompt_reference();
-    let executor = (provider.id == "claude-code").then(|| crate::native_rules::RuleExecutor {
-        provider_id: provider.id.to_owned(),
-        cli_version: fixture.claude_cli_version.map(str::to_owned),
-        codex_doc_cap: None,
-    });
+    let executor = match provider.id {
+        "claude-code" => Some(crate::native_rules::RuleExecutor {
+            provider_id: provider.id.to_owned(),
+            cli_version: fixture.claude_cli_version.map(str::to_owned),
+            codex_doc_cap: None,
+        }),
+        "codex" => Some(crate::native_rules::RuleExecutor {
+            provider_id: provider.id.to_owned(),
+            cli_version: None,
+            codex_doc_cap: fixture.codex_doc_cap,
+        }),
+        _ => None,
+    };
     let prompt = crate::rules::assemble_agent_system_prompt(
         services.store(),
         Some(&fixture.repo),
@@ -525,6 +568,8 @@ const MIN_ROW_CHARS: usize = 400;
 /// One fixture's measurements: `(provider, role) → (baseline, candidate)`.
 struct Measured {
     rows: BTreeMap<(String, Role), (Surfaces, Surfaces)>,
+    /// [`PREVIOUS`]'s total chars per row, for the report only.
+    previous: BTreeMap<(String, Role), usize>,
     placement: (Option<String>, Option<String>),
 }
 
@@ -532,6 +577,7 @@ async fn measure_fixture(fixture: &Fixture) -> (Measured, Materialized) {
     let (_db, services, session) = services().await;
     let materialized = materialize(fixture);
     let mut rows = BTreeMap::new();
+    let mut previous = BTreeMap::new();
     for provider in intent_providers::config::ACP_PROVIDERS {
         for role in Role::ALL {
             let baseline =
@@ -545,6 +591,11 @@ async fn measure_fixture(fixture: &Fixture) -> (Measured, Materialized) {
                 role,
             )
             .await;
+            let previous_total =
+                measure(&services, &materialized, &session, PREVIOUS, provider, role)
+                    .await
+                    .chars();
+            previous.insert((provider.id.to_owned(), role), previous_total);
             rows.insert((provider.id.to_owned(), role), (baseline, candidate));
         }
     }
@@ -557,7 +608,14 @@ async fn measure_fixture(fixture: &Fixture) -> (Measured, Materialized) {
         ))
     };
     let placement = (placement(BASELINE), placement(CANDIDATE));
-    (Measured { rows, placement }, materialized)
+    (
+        Measured {
+            rows,
+            previous,
+            placement,
+        },
+        materialized,
+    )
 }
 
 async fn services() -> (TempDb, Services, AgentSession) {
@@ -604,12 +662,13 @@ fn report(fixture: &Fixture, measured: &Measured, skills: usize) -> String {
     );
     let _ = writeln!(
         out,
-        "| provider | role | {BASELINE} prompt | {BASELINE} tool | {BASELINE} total | {CANDIDATE} prompt | {CANDIDATE} tool | {CANDIDATE} total | ratio |\n|---|---|---:|---:|---:|---:|---:|---:|---:|"
+        "| provider | role | {BASELINE} prompt | {BASELINE} tool | {BASELINE} total | {CANDIDATE} prompt | {CANDIDATE} tool | {CANDIDATE} total | ratio | {PREVIOUS} total | vs {PREVIOUS} |\n|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     );
     for ((provider, role), (baseline, candidate)) in &measured.rows {
+        let previous = measured.previous[&(provider.clone(), *role)];
         let _ = writeln!(
             out,
-            "| {provider} | {} | {} | {} | {} (~{}k tok) | {} | {} | {} (~{}k tok) | {:.0}% |",
+            "| {provider} | {} | {} | {} | {} (~{}k tok) | {} | {} | {} (~{}k tok) | {:.0}% | {previous} | {:.0}% |",
             role.label(),
             baseline.prompt.chars().count(),
             baseline.tool.chars().count(),
@@ -620,6 +679,7 @@ fn report(fixture: &Fixture, measured: &Measured, skills: usize) -> String {
             candidate.chars(),
             tokens(candidate.chars()) / 1000,
             100.0 * ratio(baseline.chars(), candidate.chars()),
+            100.0 * ratio(previous, candidate.chars()),
         );
     }
     let mut groups: Vec<(Role, Vec<&str>, &Surfaces, &Surfaces)> = Vec::new();
@@ -735,12 +795,12 @@ fn assert_realistic_baseline(measured: &Measured, fixture: &Materialized) {
     }
 }
 
-/// On the newest harness, claude-code (whose CLI loads AGENTS.md by itself)
-/// gets no injected copy; every other provider still gets one.
+/// On the newest harness, claude-code and codex (whose CLIs load AGENTS.md
+/// by themselves) get no injected copy; every other provider still gets one.
 fn assert_native_rules_skipped(measured: &Measured) {
     let rules = std::fs::read_to_string(fixture_dir().join("monorepo-AGENTS.md")).expect("rules");
     for ((provider, role), (_, candidate)) in &measured.rows {
-        let expected = usize::from(provider != "claude-code");
+        let expected = usize::from(!matches!(provider.as_str(), "claude-code" | "codex"));
         assert_eq!(
             candidate.prompt.matches(rules.trim()).count(),
             expected,
@@ -786,28 +846,72 @@ async fn context_budget_report() {
     );
 }
 
+/// Intent-owned chars of `surfaces`.
+fn intent_chars(surfaces: &Surfaces, placement: Option<&str>) -> usize {
+    breakdown(surfaces, placement)
+        .iter()
+        .filter(|(key, _)| key.1 == Owner::Intent)
+        .map(|(_, chars)| chars)
+        .sum()
+}
+
 /// The newest harness carries at most half the baseline on the realistic
-/// fixture, for every provider, top-level and sub-agent.
+/// fixture, for every provider, top-level and sub-agent; the providers in
+/// [`REALISTIC_INJECTED_RULES_CEILING`] halve Intent's own text and stay
+/// under their total ceiling instead.
 #[tokio::test]
-#[ignore = "fails until the harness 3.10 cuts land (T3, T5–T8); T13 removes this ignore"]
 async fn realistic_fixture_halves_context() {
     let (measured, fixture) = measure_fixture(&REALISTIC).await;
-    let over: Vec<String> = measured
-        .rows
-        .iter()
-        .filter(|(_, (baseline, candidate))| {
-            ratio(baseline.chars(), candidate.chars()) > REALISTIC_MAX_RATIO
-        })
-        .map(|((provider, role), (baseline, candidate))| {
-            format!(
-                "{provider} {}: {} > {:.0}% of {}",
+    for row in REALISTIC_INJECTED_RULES_CEILING {
+        assert!(
+            measured
+                .rows
+                .contains_key(&(row.0.to_owned(), Role::TopLevel)),
+            "exception row {} names no registered provider",
+            row.0
+        );
+    }
+    let mut over = Vec::new();
+    for ((provider, role), (baseline, candidate)) in &measured.rows {
+        let exception = REALISTIC_INJECTED_RULES_CEILING
+            .iter()
+            .find(|row| row.0 == provider.as_str());
+        let Some(&(_, top_max, sub_max)) = exception else {
+            if ratio(baseline.chars(), candidate.chars()) > REALISTIC_MAX_RATIO {
+                over.push(format!(
+                    "{provider} {}: {} > {:.0}% of {}",
+                    role.label(),
+                    candidate.chars(),
+                    100.0 * REALISTIC_MAX_RATIO,
+                    baseline.chars()
+                ));
+            }
+            continue;
+        };
+        let (old, new) = (
+            intent_chars(baseline, measured.placement.0.as_deref()),
+            intent_chars(candidate, measured.placement.1.as_deref()),
+        );
+        if ratio(old, new) > REALISTIC_MAX_RATIO {
+            over.push(format!(
+                "{provider} {}: Intent-owned {new} > {:.0}% of {old}",
+                role.label(),
+                100.0 * REALISTIC_MAX_RATIO,
+            ));
+        }
+        let max = if *role == Role::SubAgent {
+            sub_max
+        } else {
+            top_max
+        };
+        if candidate.chars() > max {
+            over.push(format!(
+                "{provider} {}: {} > ceiling {max} (REALISTIC_INJECTED_RULES_CEILING)",
                 role.label(),
                 candidate.chars(),
-                100.0 * REALISTIC_MAX_RATIO,
-                baseline.chars()
-            )
-        })
-        .collect();
+            ));
+        }
+    }
     assert!(
         over.is_empty(),
         "harness {CANDIDATE} is over budget on the realistic fixture:\n{}\n{}",
