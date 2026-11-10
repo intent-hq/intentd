@@ -196,6 +196,11 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          bound to this installation's owner, not workspace state; a target must mint its own",
     ),
     (
+        "node_invite",
+        "node invites this machine minted are its owner's consent to lend it to a backend; \
+         they follow the executor credentials they mint, which never transfer",
+    ),
+    (
         "executor_binding",
         "per-credential link bindings and generations of this machine's executor credentials; \
          they follow the credentials, which never transfer",

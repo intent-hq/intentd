@@ -54,6 +54,7 @@ mod mcp_oauth_repo;
 mod message_payload;
 mod message_thumbnails;
 mod metrics_repo;
+mod node_invite_repo;
 mod node_repo;
 mod note_line_attribution_repo;
 pub mod note_paging_cleanup;
@@ -129,6 +130,7 @@ pub use host_membership_repo::{
     OwnerQueuePermit,
 };
 pub use metrics_repo::{AgentMetricsRow, WorkspaceMetricsRow};
+pub use node_invite_repo::{NodeInvite, NodeInviteRefusal, NodeInviteRevocation};
 pub use note_search_repo::{NoteFtsCursor, NoteFtsMatch, NoteFtsOptions};
 #[cfg(test)]
 pub(crate) use note_version_repo::MAX_NOTE_VERSIONS;

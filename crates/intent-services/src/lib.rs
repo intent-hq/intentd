@@ -66,6 +66,7 @@ mod auto_retire;
 mod executor_capabilities;
 mod executor_ops;
 mod link_traffic_ops;
+mod node_invite_ops;
 mod plain_folder;
 mod remote_machine_ops;
 mod remote_skills;
@@ -34561,6 +34562,27 @@ impl WorkspaceApi for Services {
 
     fn executor_revoke(&self, credential_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move { self.executor_revoke_op(&credential_id).await })
+    }
+
+    fn executor_invite_create(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.executor_invite_create_op(params))
+    }
+
+    fn executor_invite_revoke(
+        &self,
+        invite_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.executor_invite_revoke_op(&invite_id).await })
+    }
+
+    fn claim_node_invite(
+        &self,
+        frame: intent_core::node_invite::ClaimFrame,
+    ) -> BoxFuture<'_, Result<intent_core::node_invite::ClaimReply>> {
+        Box::pin(self.claim_node_invite_op(frame))
     }
 
     fn remote_machines(

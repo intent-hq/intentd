@@ -40,9 +40,9 @@
 # Before the service question it asks how the computer will be used: run
 # Intent here (the default) or as a node that only runs agents for another
 # Intent. A node install sets daemon.mode=node and turns the Tailcat tunnel
-# on, restarts the daemon, then runs `intentd pair --tunnel` — the interface
+# on, restarts the daemon, then runs `intentd pair --node --tunnel` — the interface
 # picker on a terminal, a tunnel-only link without one — and ends with the QR
-# code and the intent:// link. An unattended node install sets the service up
+# code and the intent://node link. An unattended node install sets the service up
 # unless told not to. Force an answer:
 #
 #   INTENTD_DAEMON_MODE=full|node  (or --daemon-mode=<value>, on direct runs)
@@ -422,7 +422,7 @@ To finish setting up this computer as a node, once the daemon is running:
   intentd settings daemon.mode node
   intentd settings server.tunnel.enabled true
   intentd restart
-  intentd pair --tunnel"
+  intentd pair --node --tunnel"
 }
 
 # Apply the daemon-mode answer once the daemon is up (runs after
@@ -469,11 +469,11 @@ apply_daemon_mode() {
   fi
   info "node mode on — pair this computer with the Intent that will run agents here"
   if (exec </dev/tty) 2>/dev/null; then
-    "$install_dir/intentd" pair --tunnel </dev/tty \
-      || warn "pairing did not finish — run it again with: intentd pair --tunnel"
+    "$install_dir/intentd" pair --node --tunnel </dev/tty \
+      || warn "pairing did not finish — run it again with: intentd pair --node --tunnel"
   else
-    "$install_dir/intentd" pair --tunnel --yes \
-      || warn "pairing did not finish — run it again with: intentd pair --tunnel"
+    "$install_dir/intentd" pair --node --tunnel --yes \
+      || warn "pairing did not finish — run it again with: intentd pair --node --tunnel"
   fi
 }
 
@@ -1222,7 +1222,7 @@ main() {
     printf '%s\n' "
 Next steps for a node:
   intentd serve --node    # start the daemon in node mode in the foreground
-  intentd pair --tunnel   # in another terminal: the QR code and intent:// link to pair it
+  intentd pair --node --tunnel   # in another terminal: the QR code and intent://node link for the other Intent
 
 To keep node mode across restarts, set it once the daemon runs:
   intentd settings daemon.mode node

@@ -13,8 +13,10 @@ fn node_link(stdout: &str) -> String {
     stdout
         .lines()
         .find_map(|line| line.strip_prefix("URL:"))
-        .map(|rest| rest.trim().to_owned())
-        .unwrap_or_else(|| panic!("no URL line: {stdout}"))
+        .map_or_else(
+            || panic!("no URL line: {stdout}"),
+            |rest| rest.trim().to_owned(),
+        )
 }
 
 /// Run `intentd pair --node` against the daemon in `data_dir`, retrying
@@ -97,7 +99,10 @@ async fn a_node_invite_is_claimed_once_and_runs_agents() {
         uri.starts_with("intent://node?v=1&host=127.0.0.1&"),
         "{uri}"
     );
-    assert!(uri.contains("&invite=") && uri.contains("&secret="), "{uri}");
+    assert!(
+        uri.contains("&invite=") && uri.contains("&secret="),
+        "{uri}"
+    );
     assert!(
         !stdout.contains(TOKEN) && !uri.contains("token="),
         "the node link must not carry the owner token: {stdout}"
@@ -112,23 +117,49 @@ async fn a_node_invite_is_claimed_once_and_runs_agents() {
     let mut machine_ws = connect(machine_port, client_config(&fingerprint)).await;
     let listed = ok(&mut machine_ws, 2, "executor.list", json!({})).await;
     assert_eq!(listed["invites"].as_array().unwrap().len(), 1, "{listed}");
-    assert!(listed["backends"].as_array().unwrap().is_empty(), "{listed}");
-    let invite_id = listed["invites"][0]["inviteId"].as_str().unwrap().to_owned();
+    assert!(
+        listed["backends"].as_array().unwrap().is_empty(),
+        "{listed}"
+    );
+    let invite_id = listed["invites"][0]["inviteId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert!(!listed.to_string().contains(&secret), "{listed}");
 
-    let claimed = ok(&mut rpc_ws, 3, "remoteMachines.claim", json!({ "uri": uri })).await;
+    let claimed = ok(
+        &mut rpc_ws,
+        3,
+        "remoteMachines.claim",
+        json!({ "uri": uri }),
+    )
+    .await;
     let node_id = claimed["machine"]["id"].as_str().unwrap().to_owned();
     assert!(!claimed.to_string().contains(&secret), "{claimed}");
     let machines = ok(&mut rpc_ws, 4, "remoteMachines.list", json!({})).await;
-    assert_eq!(machines["machines"][0]["id"], node_id.as_str(), "{machines}");
+    assert_eq!(
+        machines["machines"][0]["id"],
+        node_id.as_str(),
+        "{machines}"
+    );
 
     // Spent: no open invite, one credential that names it.
     let listed = ok(&mut machine_ws, 5, "executor.list", json!({})).await;
     assert!(listed["invites"].as_array().unwrap().is_empty(), "{listed}");
     assert_eq!(listed["backends"].as_array().unwrap().len(), 1, "{listed}");
-    assert_eq!(listed["backends"][0]["inviteId"], invite_id.as_str(), "{listed}");
+    assert_eq!(
+        listed["backends"][0]["inviteId"],
+        invite_id.as_str(),
+        "{listed}"
+    );
 
-    let again = rpc(&mut rpc_ws, 6, "remoteMachines.claim", json!({ "uri": uri })).await;
+    let again = rpc(
+        &mut rpc_ws,
+        6,
+        "remoteMachines.claim",
+        json!({ "uri": uri }),
+    )
+    .await;
     claim_error(&again, "node-invite-used");
     assert!(!again.to_string().contains(&secret), "{again}");
     let listed = ok(&mut machine_ws, 7, "executor.list", json!({})).await;
@@ -144,7 +175,14 @@ async fn a_node_invite_is_claimed_once_and_runs_agents() {
     )
     .await;
     let agent_id = super::secrets::create_agent(&mut rpc_ws, &ws_id, "Invited", 10).await;
-    let reply = turn(&mut rpc_ws, &mut events, (&ws_id, &agent_id), "echo hello", 100).await;
+    let reply = turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        "echo hello",
+        100,
+    )
+    .await;
     assert!(!reply.is_empty(), "the remote agent never answered");
 
     // ...but is no owner token: the machine's JSON-RPC socket refuses it.
@@ -152,7 +190,10 @@ async fn a_node_invite_is_claimed_once_and_runs_agents() {
         .expect("the backend keeps the claimed executor token");
     let url = format!("wss://localhost:{machine_port}/ws?token={token}");
     let refused = common::try_wss_connect(machine_port, client_config(&fingerprint), &url).await;
-    assert!(refused.is_err(), "an executor token opened the owner socket");
+    assert!(
+        refused.is_err(),
+        "an executor token opened the owner socket"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -174,7 +215,10 @@ async fn revoked_expired_tampered_and_self_invites_are_refused() {
     let expired = ok(&mut machine_ws, 3, "executor.invite.create", mint.clone()).await;
     let tampered = ok(&mut machine_ws, 4, "executor.invite.create", mint.clone()).await;
     assert_eq!(revoked["invite"]["label"], "e2e", "{revoked}");
-    assert!(!revoked["uri"].as_str().unwrap().contains("token="), "{revoked}");
+    assert!(
+        !revoked["uri"].as_str().unwrap().contains("token="),
+        "{revoked}"
+    );
     let listed = ok(&mut machine_ws, 5, "executor.list", json!({})).await;
     assert_eq!(listed["invites"].as_array().unwrap().len(), 3, "{listed}");
 
@@ -224,9 +268,19 @@ async fn revoked_expired_tampered_and_self_invites_are_refused() {
         .as_str()
         .unwrap()
         .replace(secret, &"0".repeat(secret.len()));
-    let response = rpc(&mut rpc_ws, 9, "remoteMachines.claim", json!({ "uri": wrong })).await;
+    let response = rpc(
+        &mut rpc_ws,
+        9,
+        "remoteMachines.claim",
+        json!({ "uri": wrong }),
+    )
+    .await;
     claim_error(&response, "node-invite-invalid");
-    assert_eq!(response["error"]["data"]["inviteSpent"], Value::Null, "{response}");
+    assert_eq!(
+        response["error"]["data"]["inviteSpent"],
+        Value::Null,
+        "{response}"
+    );
 
     let response = rpc(
         &mut rpc_ws,
@@ -239,11 +293,26 @@ async fn revoked_expired_tampered_and_self_invites_are_refused() {
 
     // Nothing was minted, and the tampered invite is still open.
     let listed = ok(&mut machine_ws, 11, "executor.list", json!({})).await;
-    assert!(listed["backends"].as_array().unwrap().is_empty(), "{listed}");
+    assert!(
+        listed["backends"].as_array().unwrap().is_empty(),
+        "{listed}"
+    );
     assert_eq!(listed["invites"].as_array().unwrap().len(), 1, "{listed}");
 
     // The backend's own invite.
-    let own = ok(&mut rpc_ws, 12, "executor.invite.create", json!({ "host": "127.0.0.1" })).await;
-    let response = rpc(&mut rpc_ws, 13, "remoteMachines.claim", json!({ "uri": own["uri"] })).await;
+    let own = ok(
+        &mut rpc_ws,
+        12,
+        "executor.invite.create",
+        json!({ "host": "127.0.0.1" }),
+    )
+    .await;
+    let response = rpc(
+        &mut rpc_ws,
+        13,
+        "remoteMachines.claim",
+        json!({ "uri": own["uri"] }),
+    )
+    .await;
     claim_error(&response, "node-invite-self");
 }

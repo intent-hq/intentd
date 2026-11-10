@@ -110,6 +110,7 @@ fn node_mode_list_is_the_documented_list() {
         listed,
         [
             "client.hello",
+            "executor.invite.create",
             "executor.list",
             "executor.mint",
             "executor.revoke",
@@ -183,6 +184,7 @@ fn node_mode_http_paths_keep_rpc_health_and_executor_link() {
         "/ws",
         crate::node_link::LINK_PATH,
         crate::node_link::GIT_PATH,
+        intent_core::node_invite::CLAIM_PATH,
     ] {
         assert!(node_mode_serves_path(path), "{path} must be served");
     }

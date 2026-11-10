@@ -135,6 +135,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "event.agentActivity",
     "event.query",
     "event.workspaceSummary",
+    "executor.invite.create",
     "executor.list",
     "executor.mint",
     "executor.revoke",
@@ -308,6 +309,7 @@ pub const ROUTER_METHODS: &[&str] = &[
     "remoteLinkTraffic.stop",
     "remoteMachines.add",
     "remoteMachines.backendInfo",
+    "remoteMachines.claim",
     "remoteMachines.list",
     "remoteMachines.models",
     "remoteMachines.refresh",
@@ -1077,6 +1079,10 @@ pub const NODE_MODE_METHODS: &[(&str, &str)] = &[
         "Session handshake; every client sends it first.",
     ),
     (
+        "executor.invite.create",
+        "Owner: mint a single-use node invite (`intentd pair --node`).",
+    ),
+    (
         "executor.list",
         "Owner: the backends with access to this machine.",
     ),
@@ -1147,11 +1153,12 @@ pub fn node_mode_may_call(method: &str) -> bool {
 }
 
 /// The HTTP paths of the WSS listener a daemon in node mode serves: health,
-/// the JSON-RPC socket (gated by [`NODE_MODE_METHODS`]) and the executor
-/// link. The guest invite endpoint and the loopback preview tunnel belong to
+/// the JSON-RPC socket (gated by [`NODE_MODE_METHODS`]), the executor link
+/// and the node invite claim. The guest invite endpoint and the loopback preview tunnel belong to
 /// the orchestration that node mode turns off and are refused with `403`.
 pub const NODE_MODE_HTTP_PATHS: &[&str] = &[
     "/health",
+    intent_core::node_invite::CLAIM_PATH,
     crate::node_link::GIT_PATH,
     crate::node_link::LINK_PATH,
     "/ws",
@@ -1387,6 +1394,7 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     subscription("events.fence", "Event-stream barrier on the connection."),
     subscription("events.subscribe", "Registers an event-stream subscription; it sends no seq-0 snapshot."),
     subscription("events.unsubscribe", "Drops an event-stream subscription."),
+    mutation("executor.invite.create", "Mints a single-use node invite for another backend."),
     bounded("executor.list", "Backends with access to this machine (active executor credentials)."),
     mutation("executor.mint", "Mints an executor credential for a backend."),
     mutation("executor.revoke", "Revokes an executor credential."),
@@ -1595,6 +1603,7 @@ pub const PAYLOAD_CLASSES: &[PayloadBudget] = &[
     mutation("remoteLinkTraffic.stop", "Stops and clears the executor-link traffic capture."),
     mutation("remoteMachines.add", "Adds an exposed machine after probing it."),
     bounded("remoteMachines.backendInfo", "This backend's id, name and certificate pin."),
+    mutation("remoteMachines.claim", "Claims a node invite link and adds the machine."),
     bounded("remoteMachines.list", "Machines exposed to this backend."),
     bounded("remoteMachines.models", "Exposed machines' providers, sign-in status and model lists."),
     mutation("remoteMachines.refresh", "Dials a machine and refreshes its capabilities report."),

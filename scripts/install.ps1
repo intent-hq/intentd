@@ -35,7 +35,7 @@
 # Before the task question it asks how the computer will be used: run Intent
 # here (the default) or as a node that only runs agents for another Intent. A
 # node install sets daemon.mode=node and turns the Tailcat tunnel on, restarts
-# the daemon, then runs `intentd pair --tunnel` (the interface picker on a
+# the daemon, then runs `intentd pair --node --tunnel` (the interface picker on a
 # console, a tunnel-only link without one) and ends with the QR code and the
 # intent:// link. A non-interactive node install sets the task up unless told
 # not to. $env:INTENTD_DAEMON_MODE = 'full'|'node' (or -DaemonMode <value>, on
@@ -667,7 +667,7 @@ if ($serviceMode -eq 'yes') {
     # then the normal pairing flow, which prints the QR code and the link. An
     # explicit full answer switches a node back; the unasked default writes
     # nothing. Failures are warnings naming the commands to finish by hand.
-    $nodeSetupHint = "`nTo finish setting up this computer as a node, once the daemon is running:`n  intentd settings daemon.mode node`n  intentd settings server.tunnel.enabled true`n  intentd restart`n  intentd pair --tunnel"
+    $nodeSetupHint = "`nTo finish setting up this computer as a node, once the daemon is running:`n  intentd settings daemon.mode node`n  intentd settings server.tunnel.enabled true`n  intentd restart`n  intentd pair --node --tunnel"
     if ($installMode -eq 'node' -and $verdict -ne 'up') {
         Write-Warning "install.ps1: node setup did not run because the daemon is not up yet.$nodeSetupHint"
     } elseif ($installMode -eq 'node') {
@@ -685,9 +685,9 @@ if ($serviceMode -eq 'yes') {
                 Write-Warning "install.ps1: the daemon did not come back in node mode - check it with: intentd status$nodeSetupHint"
             } else {
                 Write-Host 'install.ps1: node mode on - pair this computer with the Intent that will run agents here'
-                if ($interactive) { & $dest pair --tunnel } else { & $dest pair --tunnel --yes }
+                if ($interactive) { & $dest pair --node --tunnel } else { & $dest pair --node --tunnel --yes }
                 if ($LASTEXITCODE -ne 0) {
-                    Write-Warning 'install.ps1: pairing did not finish - run it again with: intentd pair --tunnel'
+                    Write-Warning 'install.ps1: pairing did not finish - run it again with: intentd pair --node --tunnel'
                 }
             }
         }
@@ -722,7 +722,7 @@ if ($serviceMode -eq 'yes') {
     if ($installMode -eq 'node') {
         Write-Host 'Next steps for a node:'
         Write-Host '  intentd serve --node    # start the daemon in node mode in the foreground'
-        Write-Host '  intentd pair --tunnel   # in another terminal: the QR code and intent:// link to pair it'
+        Write-Host '  intentd pair --node --tunnel   # in another terminal: the QR code and intent://node link for the other Intent'
         Write-Host ''
         Write-Host 'To keep node mode across restarts, set it once the daemon runs:'
         Write-Host '  intentd settings daemon.mode node'

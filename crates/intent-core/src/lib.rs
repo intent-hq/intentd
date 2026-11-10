@@ -41,6 +41,7 @@ pub mod machines;
 pub mod message_block_page;
 pub mod model;
 pub mod native_review;
+pub mod node_invite;
 pub mod node_link;
 pub mod nodes;
 pub mod note_read_bounds;

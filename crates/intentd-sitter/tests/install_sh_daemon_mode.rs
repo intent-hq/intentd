@@ -53,7 +53,7 @@ case "$1" in
         read -r selection || selection=EOF
         printf '%s\n' "$selection" >"$state/pair-selection" ;;
     esac
-    printf '%s\n' 'URL:         intent://pair?v=1&host=&port=5181&fp=FP&token=fake&mode=node&tc=tc-fake' ;;
+    printf '%s\n' 'URL:         intent://node?v=1&host=&port=5181&fp=FP&invite=ni-1&secret=s&tc=tc-fake' ;;
 esac
 exit 0
 "#;
@@ -314,7 +314,7 @@ fn interactive_node_install_restarts_then_pairs_through_the_picker() {
     let node = run.position("settings daemon.mode node");
     let tunnel = run.position("settings server.tunnel.enabled true");
     let restart = run.position("restart");
-    let pair = run.position("pair --tunnel");
+    let pair = run.position("pair --node --tunnel");
     assert!(
         node < restart && tunnel < restart && restart < pair,
         "{}",
@@ -335,7 +335,7 @@ fn interactive_node_install_restarts_then_pairs_through_the_picker() {
         run.describe()
     );
     assert!(
-        stdout.contains("intent://pair?") && stdout.contains("mode=node"),
+        stdout.contains("intent://node?") && !stdout.contains("token="),
         "{}",
         run.describe()
     );
@@ -380,9 +380,13 @@ fn scripted_node_install_sets_up_the_service_and_pairs_unattended() {
         run.describe()
     );
     let restart = run.position("restart");
-    let pair = run.position("pair --tunnel --yes");
+    let pair = run.position("pair --node --tunnel --yes");
     assert!(run.position("settings daemon.mode node") < restart && restart < pair);
-    assert!(run.stdout().contains("mode=node"), "{}", run.describe());
+    assert!(
+        run.stdout().contains("intent://node?"),
+        "{}",
+        run.describe()
+    );
 }
 
 #[test]
@@ -400,7 +404,9 @@ fn scripted_node_flag_beats_the_env_var() {
         "{}",
         run.describe()
     );
-    assert!(stdout.contains("intentd serve --node") && stdout.contains("intentd pair --tunnel"));
+    assert!(
+        stdout.contains("intentd serve --node") && stdout.contains("intentd pair --node --tunnel")
+    );
     assert!(
         !run.called("status") && mode_writes(&run).is_empty(),
         "{}",

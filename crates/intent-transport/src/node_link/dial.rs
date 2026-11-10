@@ -258,10 +258,77 @@ pub(super) fn decode_rejection(reason: &str) -> Error {
     }
 }
 
+/// How a claim on `/node/claim` failed: `sent` once the `claim` frame was
+/// written, after which the invite may be spent.
+#[derive(Debug)]
+pub struct ClaimDialError {
+    pub sent: bool,
+    pub error: Error,
+}
+
+/// Claim a node invite on `endpoint`'s `/node/claim`: pinned TLS, the
+/// upgrade (no bearer token), one `claim` frame and its reply. The pin is
+/// checked before the secret is written. A `404` upgrade is
+/// `node-link-version-mismatch` (the machine predates node invites).
+///
+/// # Errors
+///
+/// [`ClaimDialError`], with the link code of what failed.
+pub async fn dial_claim(
+    endpoint: &NodeEndpoint,
+    frame: &intent_core::node_invite::ClaimFrame,
+) -> std::result::Result<intent_core::node_invite::ClaimReply, ClaimDialError> {
+    let unsent = |error| ClaimDialError { sent: false, error };
+    let mut socket = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        connect_with(endpoint, intent_core::node_invite::CLAIM_PATH, &[], false),
+    )
+    .await
+    .map_err(|_| unsent(super::unavailable()))?
+    .map_err(|error| match error {
+        Error::NotFound(_) => unsent(Error::InvalidParams(format!(
+            "{}: the machine does not serve node invites",
+            codes::VERSION_MISMATCH
+        ))),
+        other => unsent(other),
+    })?;
+    let text = frame
+        .encode()
+        .map_err(|_| unsent(super::protocol("claim frame")))?;
+    let sent = |error| ClaimDialError { sent: true, error };
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        socket
+            .send(Message::Text(text.into()))
+            .await
+            .map_err(|_| sent(super::unavailable()))?;
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(reply))) => {
+                    return serde_json::from_str(&reply)
+                        .map_err(|_| sent(super::protocol("expected a claim reply")));
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                _ => return Err(sent(super::unavailable())),
+            }
+        }
+    })
+    .await
+    .map_err(|_| sent(super::unavailable()))?
+}
+
 async fn connect(
     endpoint: &NodeEndpoint,
     path: &str,
     headers: &[(&'static str, &str)],
+) -> Result<Socket> {
+    connect_with(endpoint, path, headers, true).await
+}
+
+async fn connect_with(
+    endpoint: &NodeEndpoint,
+    path: &str,
+    headers: &[(&'static str, &str)],
+    bearer: bool,
 ) -> Result<Socket> {
     let base = endpoint.url.trim_end_matches('/');
     let mut request = format!("{base}{path}")
@@ -302,12 +369,14 @@ async fn connect(
         .await
         .map_err(|e| tls_error(&e))?;
 
-    let auth = format!("Bearer {}", endpoint.token.expose());
     let headers_mut = request.headers_mut();
-    headers_mut.insert(
-        http::header::AUTHORIZATION,
-        http::HeaderValue::from_str(&auth).map_err(|_| super::config("invalid lease token"))?,
-    );
+    if bearer {
+        let auth = format!("Bearer {}", endpoint.token.expose());
+        headers_mut.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(&auth).map_err(|_| super::config("invalid lease token"))?,
+        );
+    }
     for (name, value) in headers {
         headers_mut.insert(
             *name,
@@ -318,7 +387,15 @@ async fn connect(
     let (socket, _) =
         tokio_tungstenite::client_async_with_config(request, stream, Some(socket_config()))
             .await
-            .map_err(|e| upgrade_error(&e))?;
+            .map_err(|e| match &e {
+                // Only the claim path is new enough for a 404 to mean "older machine".
+                tungstenite::Error::Http(response)
+                    if !bearer && response.status() == http::StatusCode::NOT_FOUND =>
+                {
+                    Error::NotFound("node path".into())
+                }
+                _ => upgrade_error(&e),
+            })?;
     Ok(socket)
 }
 

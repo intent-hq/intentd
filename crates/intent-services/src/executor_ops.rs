@@ -26,7 +26,11 @@ fn forbidden(what: &str) -> Error {
     Error::Forbidden(format!("{what} requires the machine owner"))
 }
 
-fn text_param<'a>(params: &'a Value, name: &str, required: bool) -> Result<Option<&'a str>> {
+pub(crate) fn text_param<'a>(
+    params: &'a Value,
+    name: &str,
+    required: bool,
+) -> Result<Option<&'a str>> {
     let value = match params.get(name) {
         None | Some(Value::Null) if !required => return Ok(None),
         None | Some(Value::Null) => {
@@ -45,7 +49,7 @@ fn text_param<'a>(params: &'a Value, name: &str, required: bool) -> Result<Optio
     Ok(Some(text))
 }
 
-fn random_token() -> Result<String> {
+pub(crate) fn random_token() -> Result<String> {
     use std::fmt::Write as _;
     let mut bytes = [0_u8; TOKEN_BYTES];
     getrandom::fill(&mut bytes)
@@ -170,14 +174,33 @@ impl Services {
     /// `executor.list`: see [`intent_core::WorkspaceApi::executor_list`].
     pub(crate) async fn executor_list_op(&self) -> Result<Value> {
         self.require_machine_owner("executor.list").await?;
+        let claimed: std::collections::HashMap<String, String> = self
+            .store
+            .claimed_node_invites()
+            .await?
+            .into_iter()
+            .collect();
         let backends: Vec<Value> = self
             .store
             .list_active_executor_credentials()
             .await?
             .iter()
-            .map(|credential| backend_row(credential, self.executor_live_status(&credential.id)))
+            .map(|credential| {
+                let mut row = backend_row(credential, self.executor_live_status(&credential.id));
+                if let Some(invite_id) = claimed.get(credential.id.as_str()) {
+                    row["inviteId"] = json!(invite_id);
+                }
+                row
+            })
             .collect();
-        Ok(json!({ "backends": backends }))
+        let invites: Vec<Value> = self
+            .store
+            .list_open_node_invites()
+            .await?
+            .iter()
+            .map(crate::node_invite_ops::invite_json)
+            .collect();
+        Ok(json!({ "backends": backends, "invites": invites }))
     }
 
     /// `executor.revoke`: see [`intent_core::WorkspaceApi::executor_revoke`].

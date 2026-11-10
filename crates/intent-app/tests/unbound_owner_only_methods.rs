@@ -209,6 +209,7 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
             "desktop.setPermission",
             json!({ "workspaceId": ws, "agentId": "a1", "computerId": "physical", "allowed": true }),
         ),
+        ("executor.invite.create", json!({})),
         ("executor.list", json!({})),
         (
             "executor.mint",
@@ -354,6 +355,10 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
         ("remoteLinkTraffic.start", json!({})),
         ("remoteLinkTraffic.stop", json!({})),
         ("remoteMachines.backendInfo", json!({})),
+        (
+            "remoteMachines.claim",
+            json!({ "uri": "intent://node?v=1&host=127.0.0.1&port=9&fp=AB&invite=i&secret=s" }),
+        ),
         (
             "cloudMachines.configure",
             json!({ "provider": "e2b", "apiKey": "k" }),

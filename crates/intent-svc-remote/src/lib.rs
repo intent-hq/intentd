@@ -40,6 +40,7 @@ use intent_core::{Error, Result};
 use intent_services::feature_api::Services;
 
 mod agents;
+mod claim;
 mod cloud;
 mod connect;
 mod connector;
