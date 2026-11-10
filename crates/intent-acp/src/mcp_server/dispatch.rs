@@ -1292,3 +1292,7 @@ mod timeout_override_tests {
 #[cfg(test)]
 #[path = "dispatch_owner_scope_tests.rs"]
 mod owner_scope_tests;
+
+#[cfg(test)]
+#[path = "dispatch_toon_golden_tests.rs"]
+mod toon_golden_tests;
