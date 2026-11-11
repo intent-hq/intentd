@@ -648,13 +648,21 @@ available. The footer shows specialist and harness metadata when present; select
 the harness version for details. **Move panel** opens the pane movement controls.
 Other panel menus place **Rename** under **Actions** when renaming is available.
 
+Agents started on harness 3.12 or later show a small ring with their approximate
+starting context size (in tokens) beside the **More** menu. The ring is split by
+owner: Intent, the repository, and the user. Select it to list each part of the
+starting context, largest first, with its owner and size. Repo rules that the
+provider loads by itself are listed but not counted in the total. Skills that were
+left out of the agent, and how to enable them, appear under **Hidden skills**.
+Older agents do not show the ring. Sizes are estimates, not provider token counts.
+
 When an agent shows a browser tab while its chat is on screen, the tab opens in the
 column next to that chat (right first, then left). It never covers the column you
 are working in; if no other neighbor is free, the view splits beside the chat.
 Keyboard focus stays where it was. When the chat is not on screen,
 Intent picks a panel for the tab without moving focus.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/layout/tab-types/{AgentTabType,AgentViewSettingsDropdown}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/store/renderer/slices/panel-layout/panel-layout-slice.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/layout/tab-types/{AgentTabType,AgentViewSettingsDropdown}.svelte; src/features/agent/prompt-breakdown/PromptBreakdownIndicator.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/store/renderer/slices/panel-layout/panel-layout-slice.ts. -->
 
 **Retire Agent** stops an agent and keeps its conversation so it can be restored later.
 You can retire any agent, including a workspace's last top-level agent. An agent
