@@ -776,14 +776,14 @@ repositories.
 
 To continue a session you started in a provider's own CLI, choose **Import a
 session** in **New workspace**. It lists sessions from your enabled providers
-whose adapters support it (Claude Code today), newest first, with search; a
+whose adapters support it (such as Claude Code and Codex), newest first, with search; a
 provider that fails to list shows an error without hiding the others. Only
 sessions on the machine Intent runs on are listed: for a remote daemon, sessions
 on your Mac do not appear. Pick the session's repository, and usually its last
 branch. The session becomes the workspace's first agent with its history in the
 chat, and your next message continues it with the full context. Intent copies
 the session into the workspace (the original stays untouched); when a provider
-cannot copy, the original continues in Intent and the form says so. Uncommitted
+cannot copy, the original continues in Intent and a notice says so. Uncommitted
 changes from where the session ran are not carried over.
 
 
