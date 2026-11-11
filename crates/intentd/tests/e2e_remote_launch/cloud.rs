@@ -1437,7 +1437,11 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
     .await;
     assert!(lost.get("nodeId").is_none(), "{lost}");
     let after = ok(&mut rpc_ws, 403, "cloudMachines.list", json!({})).await;
-    assert_eq!(after, json!({ "providers": [], "machines": [], "providerKinds": ["e2b", "northflank"] }), "{after}");
+    assert_eq!(
+        after,
+        json!({ "providers": [], "machines": [], "providerKinds": ["e2b", "northflank"] }),
+        "{after}"
+    );
 
     // No secret anywhere the backend writes or answers.
     let mut secrets = vec![E2B_KEY.to_owned(), PROFILE_SECRET.to_owned()];
