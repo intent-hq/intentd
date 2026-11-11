@@ -41,6 +41,7 @@ async fn ensure_current_with(binary: &Path, update_timeout: Duration) -> Result<
     // budget (a background catalog refresh) cannot kill it or skip recording
     // a failure. Dropping the handle does not abort the task.
     let binary = binary.to_path_buf();
+    // caller-binding: allow — runs only `agy` subprocesses, never a service-layer capability gate
     tokio::spawn(async move { update_single_flight(&binary, update_timeout).await })
         .await
         .unwrap_or_else(|err| Err(format!("agy update task failed: {err}")))
