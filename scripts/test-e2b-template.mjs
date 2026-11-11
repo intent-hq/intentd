@@ -206,6 +206,7 @@ describe('container image', () => {
     assert.match(runs[0], /apt-get update/);
     for (const pkg of APT_PACKAGES) assert.match(runs[0], new RegExp(` ${pkg.replace(/[.+]/g, '\\$&')}( |$)`), pkg);
     assert.match(runs[0], /rm -rf \/var\/lib\/apt\/lists/);
+    assert.doesNotMatch(runs[0], /no-install-recommends/, 'E2B aptInstall keeps recommended packages');
     const { calls, Template } = recorder();
     defineTemplate(Template, { version: '0.11.139', sha256: SHA });
     const commands = calls.filter(([name]) => name === 'runCmd').map(([, command]) => command);

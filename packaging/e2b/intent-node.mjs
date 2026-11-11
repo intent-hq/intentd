@@ -284,7 +284,7 @@ export function dockerfile({ version, sha256 }) {
       return builder;
     },
     aptInstall(packages) {
-      lines.push(`RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${packages.join(' ')} && rm -rf /var/lib/apt/lists/*`);
+      lines.push(`RUN apt-get update && DEBIAN_FRONTEND=noninteractive DEBCONF_NOWARNINGS=yes apt-get install -y ${packages.join(' ')} && rm -rf /var/lib/apt/lists/*`);
       return builder;
     },
     runCmd(command, { user } = {}) {
