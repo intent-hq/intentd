@@ -568,6 +568,7 @@ async fn help_text(
         disabled: &disabled,
         profiles: &facts.profiles,
         incompatible_defaults: &facts.incompatible_defaults,
+        remote_profile_bases: &facts.remote_profile_bases,
     })
 }
 

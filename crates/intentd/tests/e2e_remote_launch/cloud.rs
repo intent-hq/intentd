@@ -1006,7 +1006,10 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
         "profile-not-remote-compatible"
     );
     assert_eq!(bare["error"]["data"]["reason"], "not-marked");
-    assert_eq!(bare["error"]["data"]["machineSignIn"], true);
+    assert!(
+        bare["error"]["data"].get("machineSignIn").is_none(),
+        "{bare}"
+    );
     assert_eq!(bare["error"]["data"]["providerRef"], "codex");
     let tied = rpc(&mut rpc_ws, 10, "agent.create", create(&folder_ref, "Tied")).await;
     assert_eq!(tied["error"]["code"], -32602, "{tied}");

@@ -634,6 +634,8 @@ pub struct PlacementBackendFacts {
     pub profiles: Vec<PlacementProfile>,
     pub incompatible_defaults: Vec<(String, ProfileRemote)>,
     pub disabled_providers: Vec<String>,
+    /// Base providers this backend can send a remote-compatible profile for.
+    pub remote_profile_bases: Vec<String>,
 }
 
 /// What the remote-placement text is rendered from.
@@ -648,6 +650,9 @@ pub struct PlacementHelpInputs<'a> {
     /// Base providers whose Default configuration is not remote-compatible
     /// (or could not be read).
     pub incompatible_defaults: &'a [(String, ProfileRemote)],
+    /// Base providers this backend can send a remote-compatible profile for:
+    /// a machine signed out of one still offers it.
+    pub remote_profile_bases: &'a [String],
 }
 
 impl<'a> PlacementHelpInputs<'a> {
@@ -660,14 +665,15 @@ impl<'a> PlacementHelpInputs<'a> {
             disabled: &|_| false,
             profiles: &[],
             incompatible_defaults: &[],
+            remote_profile_bases: &[],
         }
     }
 }
 
 /// How to place an agent on an exposed machine: the end of the 1.0–3.9
 /// prompt text, and of the 3.10 `ws.help("agent")` text.
-const PLACEMENT_HOW_TO: &str = "To run an agent on one, pass `placement: { target: \"remote\" }` (optionally `nodeId`, `os`, `arch`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, { create: { placement } })`. Without `nodeId` the backend picks a machine that runs the platform, has the provider signed in (or unknown) and the model listed, with free capacity. When none lists the model the call fails with `model-unavailable`; other refusals are `placement-unavailable` or `machine-update-required`. A remote agent's own sub-agents (`ws.agent.create`, `ws.agent.delegate`, `ws.agent.wakeOrCreate`) run on its machine when no `placement` is given, with the same checks and no fallback; pass `placement: { target: \"local\" }` to run one on the backend. A batch `ws.agent.delegate({ tasks })` takes one `placement` for all its tasks, and an object entry `{ taskNoteId, placement }` its own.\n\
-         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment, or the provider's Default configuration settings when no profile is selected, only when the user marked that configuration for remote machines (an unmarked profile, or one that sets an account folder such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR`, is refused with `profile-not-remote-compatible` and a message saying how to fix it), uses the machine's own provider sign-in when the Default sends nothing (refused when that machine is not signed in), and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree): right after each `ws.git.commit` (its result has `pushed`) and before each `ws.agent.reportToParent` is delivered, and at the end of each turn, which is when a plain `git commit` reaches the backend. `ws.agent.setModel` can switch it to another model or marked profile its machine offers; its next turn relaunches it there with the conversation history.\n";
+const PLACEMENT_HOW_TO: &str = "To run an agent on one, pass `placement: { target: \"remote\" }` (optionally `nodeId`, `os`, `arch`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, { create: { placement } })`. Without `nodeId` the backend picks a machine that runs the platform, offers the provider (the machine's own sign-in, signed in or unknown, for the Default; the provider installed, for a profile marked for remote machines) and lists the model, with free capacity. When none lists the model the call fails with `model-unavailable`; other refusals are `placement-unavailable` or `machine-update-required`. A remote agent's own sub-agents (`ws.agent.create`, `ws.agent.delegate`, `ws.agent.wakeOrCreate`) run on its machine when no `placement` is given, with the same checks and no fallback; pass `placement: { target: \"local\" }` to run one on the backend. A batch `ws.agent.delegate({ tasks })` takes one `placement` for all its tasks, and an object entry `{ taskNoteId, placement }` its own.\n\
+         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment, or the provider's Default configuration settings when no profile is selected, only when the user marked that configuration for remote machines (an unmarked profile, or one that sets an account folder such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR`, is refused with `profile-not-remote-compatible` and a message saying how to fix it), uses the machine's own provider sign-in when the Default sends nothing (refused when that machine is not signed in; pick a marked profile instead), and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree): right after each `ws.git.commit` (its result has `pushed`) and before each `ws.agent.reportToParent` is delivered, and at the end of each turn, which is when a plain `git commit` reaches the backend. `ws.agent.setModel` can switch it to another model or marked profile its machine offers; its next turn relaunches it there with the conversation history.\n";
 
 /// Renders the remote-placement text. Each harness version picks one;
 /// [`exposed_machines_help`] is the renderer of harness 1.0 through 3.9.
@@ -699,7 +705,12 @@ pub fn exposed_machines_help(inputs: &PlacementHelpInputs<'_>) -> Option<String>
     let mut lines = String::new();
     let mut shown = 0;
     for row in &listed {
-        let line = help_line(row, (inputs.connected)(&row.id), inputs.disabled);
+        let line = help_line(
+            row,
+            (inputs.connected)(&row.id),
+            inputs.disabled,
+            inputs.remote_profile_bases,
+        );
         if shown == HELP_MAX_MACHINES || lines.len() + line.len() > HELP_MAX_BYTES {
             break;
         }
@@ -848,7 +859,16 @@ fn identity_list(machines: &[ExposedMachine]) -> Option<String> {
     Some(text)
 }
 
-fn help_line(row: &ExposedMachine, connected: bool, disabled: &dyn Fn(&str) -> bool) -> String {
+/// One machine's line. A provider shows only when the machine's own sign-in
+/// can run it (signed in or unknown), or when this backend can send a
+/// remote-compatible profile for it (`remote_profile_bases`) and its CLI is
+/// installed there.
+fn help_line(
+    row: &ExposedMachine,
+    connected: bool,
+    disabled: &dyn Fn(&str) -> bool,
+    remote_profile_bases: &[String],
+) -> String {
     let platform = row
         .platform
         .map_or_else(|| "platform unknown".to_owned(), |p| p.to_string());
@@ -875,10 +895,15 @@ fn help_line(row: &ExposedMachine, connected: bool, disabled: &dyn Fn(&str) -> b
         .flat_map(|caps| caps.providers.iter())
         .filter(|provider| {
             provider.visible
-                && !matches!(
-                    provider.status,
-                    ProviderStatus::CliMissing | ProviderStatus::PrerequisiteMissing
-                )
+                && match provider.status {
+                    ProviderStatus::CliMissing
+                    | ProviderStatus::PrerequisiteMissing
+                    | ProviderStatus::Disabled => false,
+                    ProviderStatus::SignedOut | ProviderStatus::AuthFailed => {
+                        remote_profile_bases.iter().any(|b| *b == provider.id)
+                    }
+                    ProviderStatus::SignedIn | ProviderStatus::Unknown => true,
+                }
         })
         .map(|provider| {
             let shown = provider.models.len().min(HELP_MAX_MODELS);
@@ -894,6 +919,12 @@ fn help_line(row: &ExposedMachine, connected: bool, disabled: &dyn Fn(&str) -> b
                 provider.id,
                 crate::machines::status_name(provider.status)
             );
+            if matches!(
+                provider.status,
+                ProviderStatus::SignedOut | ProviderStatus::AuthFailed
+            ) {
+                shown.push_str(", with a profile marked for remote machines");
+            }
             if disabled(&provider.id) {
                 shown.push_str(", not enabled on this backend (Settings → Providers)");
             }

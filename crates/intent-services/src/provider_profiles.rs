@@ -1903,8 +1903,7 @@ impl Services {
             }
             rows.push(row);
         }
-        let (launch, refused) = self.default_remote_catalog().await;
-        (rows, launch, refused)
+        (rows, self.default_remote_catalog().await, None)
     }
 
     /// The backend's part of the remote-placement text for `workspace_id`:
@@ -1979,18 +1978,19 @@ impl Services {
                 None => Some(EnvDoc::default()),
                 Some(env_id) => cached(env_id.clone()).await,
             };
-            let compat = match env {
-                None => ProfileRemote::Unknown,
-                // An unmarked Default runs through machine sign-in, as the
-                // placement how-to says; only a refused one is listed.
-                Some(_) if self.machine_sign_in_on(base) => ProfileRemote::Compatible,
-                Some(env) => remote(classify(store.default_choice(base), &env.entries, true)),
+            // On a machine every Default runs (machine sign-in when it is not
+            // marked); only one whose settings cannot be read is listed.
+            let compat = if env.is_some() {
+                ProfileRemote::Compatible
+            } else {
+                ProfileRemote::Unknown
             };
             let base = (*base).to_owned();
             if compat != ProfileRemote::Compatible {
                 facts.incompatible_defaults.push((base.clone(), compat));
             }
         }
+        facts.remote_profile_bases = self.remote_profile_bases().await;
         let settings = self.effective_settings();
         facts.disabled_providers = intent_providers::ACP_PROVIDERS
             .iter()

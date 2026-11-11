@@ -1787,13 +1787,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(json!({})),
         ),
         object(
-            "providers.remoteMachineSignIn",
-            "Machine sign-in on remote machines",
-            "Per provider: when nothing here is marked for remote use, a remote machine runs the provider with its own sign-in (missing means on)",
-            "providers",
-            Some(json!({})),
-        ),
-        object(
             "providers.paths",
             "Provider paths",
             "Per-provider CLI path overrides",
@@ -4460,7 +4453,6 @@ mod tests {
         let expected: &[&str] = &[
             "providers.enabled",
             "providers.fastMode",
-            "providers.remoteMachineSignIn",
             "model.default",
             "model.defaultProvider",
             "model.providerDefaults",

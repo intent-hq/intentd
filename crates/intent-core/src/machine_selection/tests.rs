@@ -794,6 +794,8 @@ fn help_lists_machines_providers_and_sign_in_without_routes() {
     let mut revoked = machine("d-gone", None);
     revoked.state = RemoteMachineState::Revoked;
     let rows = [mac, linux, revoked];
+    // codex is signed out there and this backend has no profile for it, so
+    // it is not offered on that machine.
     let text =
         exposed_machines_help(&PlacementHelpInputs::new(&rows, &|id| id == "d-mac")).unwrap();
     let lines: Vec<&str> = text.lines().collect();
@@ -804,7 +806,7 @@ fn help_lists_machines_providers_and_sign_in_without_routes() {
     assert_eq!(
         lines[1],
         format!(
-            "- \"Mac mini\" (nodeId `d-mac`, macos/aarch64, connected, report {FRESH}): claude-code signed-in [opus, sonnet]; codex signed-out [no models listed]"
+            "- \"Mac mini\" (nodeId `d-mac`, macos/aarch64, connected, report {FRESH}): claude-code signed-in [opus, sonnet]"
         )
     );
     assert_eq!(
@@ -1510,4 +1512,36 @@ fn a_machine_sign_in_switch_on_a_signed_out_machine_is_machine_not_signed_in() {
     ));
     assert_eq!(data["code"], "machine-not-signed-in");
     assert_eq!(data["machines"][0]["name"], "mac-name");
+}
+
+/// A provider shows for a machine only when the machine's own sign-in can
+/// run it (signed in or unknown), or when this backend can send a
+/// remote-compatible profile for it and its CLI is installed there.
+#[test]
+fn help_hides_a_signed_out_provider_without_a_remote_compatible_profile() {
+    let rows = [machine(
+        "d-mac",
+        Some(report(
+            MAC,
+            FRESH,
+            vec![
+                provider("claude-code", ProviderStatus::Unknown, &["opus"]),
+                provider("codex", ProviderStatus::SignedOut, &["gpt-5"]),
+            ],
+        )),
+    )];
+    let hidden = exposed_machines_help(&PlacementHelpInputs::new(&rows, &|_| true)).unwrap();
+    assert!(hidden.contains("claude-code unknown [opus]"), "{hidden}");
+    assert!(!hidden.contains("codex"), "{hidden}");
+
+    let bases = ["codex".to_owned()];
+    let shown = exposed_machines_help(&PlacementHelpInputs {
+        remote_profile_bases: &bases,
+        ..PlacementHelpInputs::new(&rows, &|_| true)
+    })
+    .unwrap();
+    assert!(
+        shown.contains("codex signed-out [gpt-5], with a profile marked for remote machines"),
+        "{shown}"
+    );
 }

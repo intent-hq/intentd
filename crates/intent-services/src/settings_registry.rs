@@ -55,7 +55,6 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "providers.enabled",
     "providers.paths",
     "providers.fastMode",
-    "providers.remoteMachineSignIn",
     "model.default",
     "model.defaultProvider",
     "model.providerDefaults",

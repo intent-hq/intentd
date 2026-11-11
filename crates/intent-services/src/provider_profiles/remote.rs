@@ -9,8 +9,9 @@
 //!   the migration rule: today's behaviour. Startup writes the rule into the
 //!   file once ([`Services::migrate_remote_choices`]).
 //! - A configuration that sets an account folder is never marked.
-//! - `providers.remoteMachineSignIn` lets an unmarked Default run with the
-//!   machine's own sign-in, sending nothing.
+//! - A machine uses its own sign-in when it has one: an unmarked Default
+//!   sends nothing there. Otherwise a remote-compatible profile from this
+//!   backend is sent. E2B has no sign-in, so only a sent profile runs there.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,10 +21,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{
-    default_changed_event, is_folder_path_key, is_qualified_ref, load_env, may_have_overlay,
-    parse_profile_ref, unreadable, write_atomic, FieldError, ProviderProfileStore,
-    RemoteCompatibility, StoredEnv, DEFAULT_NAME, PROFILE_BASE_PROVIDERS,
-    PROFILE_NOT_REMOTE_COMPATIBLE, REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER,
+    is_folder_path_key, is_qualified_ref, load_env, may_have_overlay, parse_profile_ref,
+    unreadable, write_atomic, FieldError, ProviderProfileStore, RemoteCompatibility, StoredEnv,
+    DEFAULT_NAME, PROFILE_BASE_PROVIDERS, PROFILE_NOT_REMOTE_COMPATIBLE,
+    REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER,
 };
 use crate::Services;
 
@@ -76,11 +77,10 @@ impl std::fmt::Debug for RemoteLaunchPlan {
 }
 
 /// `DefaultConfig.remoteLaunch` and the catalog's `defaultRemoteLaunch`.
-fn default_remote_launch(compat: &RemoteCompatibility, machine_sign_in: bool) -> &'static str {
+fn default_remote_launch(compat: &RemoteCompatibility) -> &'static str {
     match compat {
         RemoteCompatibility::Compatible => "send",
-        RemoteCompatibility::NotRemoteCompatible { .. } if machine_sign_in => "machine-sign-in",
-        RemoteCompatibility::NotRemoteCompatible { .. } => "refused",
+        RemoteCompatibility::NotRemoteCompatible { .. } => "machine-sign-in",
     }
 }
 
@@ -329,64 +329,46 @@ fn base_display(base: &str) -> &str {
 
 /// `profile-not-remote-compatible` (nodes.md "Remote machine errors"):
 /// names the configuration, says why and how to fix it. `-32602`, with the
-/// variable names but never their values.
+/// variable names but never their values. A Default is refused only on
+/// E2B, which has no sign-in of its own.
 pub(crate) fn not_remote_compatible_error(
     reference: &str,
     name: &str,
     reason: &str,
     keys: &[String],
-    machine_sign_in: Option<bool>,
-    target: RemoteTarget,
 ) -> Error {
     let base = parse_profile_ref(reference).map_or(reference, |(base, _)| base);
     let provider = base_display(base);
     let folders = keys.join(", ");
     let folder = reason == REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER;
-    let message = match (machine_sign_in.is_some(), target, folder) {
-        (false, _, false) => format!(
+    let message = match (is_qualified_ref(reference), folder) {
+        (true, false) => format!(
             "{name} isn't marked for remote machines. Turn on Use on remote machines for it in Settings → Providers → {provider}, or pick a configuration that is marked."
         ),
-        (false, _, true) => format!(
+        (true, true) => format!(
             "{name} uses an account folder ({folders}) that only exists on this backend, so it can't run on another machine; pick a configuration that uses an API key or token and is marked for remote machines."
         ),
-        (true, RemoteTarget::Cloud, false) => format!(
+        (false, false) => format!(
             "{name} isn't marked for remote machines, and E2B has no sign-in of its own; pick a profile with an API key or token that is marked for remote machines."
         ),
-        (true, RemoteTarget::Cloud, true) => format!(
+        (false, true) => format!(
             "{name} uses an account folder ({folders}) that only exists on this backend, and E2B has no sign-in of its own; pick a profile with an API key or token that is marked for remote machines."
         ),
-        (true, RemoteTarget::Machine, false) => format!(
-            "{name} isn't marked for remote machines, and using the machine's own sign-in is off for {provider}. In Settings → Providers → {provider}, turn on either option on the Default row, or pick a profile marked for remote machines."
-        ),
-        (true, RemoteTarget::Machine, true) => format!(
-            "{name} uses an account folder ({folders}) that only exists on this backend, and using the machine's own sign-in is off for {provider}. Turn that on in Settings → Providers → {provider}, or pick a profile marked for remote machines."
-        ),
     };
-    let mut data = json!({
-        "code": PROFILE_NOT_REMOTE_COMPATIBLE,
-        "providerRef": reference,
-        "name": name,
-        "reason": reason,
-        "keys": keys,
-    });
-    if let Some(on) = machine_sign_in {
-        data["machineSignIn"] = json!(on);
-    }
-    Error::provider_profile(false, message, data)
+    Error::provider_profile(
+        false,
+        message,
+        json!({
+            "code": PROFILE_NOT_REMOTE_COMPATIBLE,
+            "providerRef": reference,
+            "name": name,
+            "reason": reason,
+            "keys": keys,
+        }),
+    )
 }
 
 impl Services {
-    /// Whether an unmarked Default of `base` runs with the machine's own
-    /// sign-in (`providers.remoteMachineSignIn`; missing is on).
-    pub(crate) fn machine_sign_in_on(&self, base: &str) -> bool {
-        self.effective_settings()
-            .providers
-            .remote_machine_sign_in
-            .get(base)
-            .copied()
-            .unwrap_or(true)
-    }
-
     /// The saved choice of `reference` (a profile or a Default).
     fn choice_of(&self, reference: &str) -> Option<bool> {
         match parse_profile_ref(reference) {
@@ -461,21 +443,21 @@ impl Services {
                     machine_sign_in,
                 })
             }
+            // A machine's own sign-in runs an unmarked Default.
+            RemoteCompatibility::NotRemoteCompatible { .. }
+                if default && target == RemoteTarget::Machine =>
+            {
+                Ok(RemoteLaunchPlan {
+                    env: None,
+                    machine_sign_in: true,
+                })
+            }
             RemoteCompatibility::NotRemoteCompatible { reason, keys } => {
-                let sign_in = default.then(|| self.machine_sign_in_on(reference));
-                if target == RemoteTarget::Machine && sign_in == Some(true) {
-                    return Ok(RemoteLaunchPlan {
-                        env: None,
-                        machine_sign_in: true,
-                    });
-                }
                 Err(not_remote_compatible_error(
                     reference,
                     &self.configuration_name(reference),
                     reason,
                     &keys,
-                    sign_in,
-                    target,
                 ))
             }
         }
@@ -485,45 +467,70 @@ impl Services {
     /// `remoteIncompatibility` and `remoteLaunch`.
     pub(super) fn annotate_default(&self, row: &mut Value, base: &str, entries: &[StoredEnv]) {
         let compat = classify(self.provider_profiles.default_choice(base), entries, true);
-        row["remoteLaunch"] = json!(default_remote_launch(
-            &compat,
-            self.machine_sign_in_on(base)
-        ));
+        row["remoteLaunch"] = json!(default_remote_launch(&compat));
         compat.annotate(row);
     }
 
-    /// The catalog's `defaultRemoteLaunch` (every profile-capable base) and
-    /// `defaultRemoteIncompatibility` (only Defaults that cannot run).
-    pub(super) async fn default_remote_catalog(&self) -> (Option<Value>, Option<Value>) {
-        let Ok(saved) = self.provider_profiles.defaults() else {
-            return (None, None);
-        };
+    /// The catalog's `defaultRemoteLaunch`, one entry per profile-capable
+    /// base. On a machine every Default runs (machine sign-in when it is not
+    /// marked), so `defaultRemoteIncompatibility` is omitted.
+    pub(super) async fn default_remote_catalog(&self) -> Option<Value> {
+        let saved = self.provider_profiles.defaults().ok()?;
         let mut launch = serde_json::Map::new();
-        let mut refused = serde_json::Map::new();
         for base in PROFILE_BASE_PROVIDERS {
             let meta = saved.get(*base).cloned().unwrap_or_default();
-            let Ok(env) = self.load_default_env(&meta).await else {
+            let value = match self.load_default_env(&meta).await {
+                Ok(env) => default_remote_launch(&classify(
+                    self.provider_profiles.default_choice(base),
+                    &env.entries,
+                    true,
+                )),
                 // Launches fail closed on an unreadable environment.
-                launch.insert((*base).to_owned(), json!("refused"));
+                Err(_) => "refused",
+            };
+            launch.insert((*base).to_owned(), json!(value));
+        }
+        Some(Value::Object(launch))
+    }
+
+    /// The base providers this backend can send a remote-compatible
+    /// configuration for: a marked profile, or a marked Default with saved
+    /// overrides. A machine whose own sign-in is out still offers these
+    /// (nodes.md "Placement across machines").
+    pub async fn remote_profile_bases(&self) -> Vec<String> {
+        let store = &self.provider_profiles;
+        let mut bases: Vec<String> = Vec::new();
+        for meta in store.profiles().unwrap_or_default().iter() {
+            if bases.contains(&meta.base_provider) {
+                continue;
+            }
+            let Ok(env) = load_env(&self.secrets, &meta.id).await else {
                 continue;
             };
-            let compat = classify(
-                self.provider_profiles.default_choice(base),
-                &env.entries,
-                true,
-            );
-            let value = default_remote_launch(&compat, self.machine_sign_in_on(base));
-            launch.insert((*base).to_owned(), json!(value));
-            if value == "refused" {
-                if let Some(incompatibility) = compat.incompatibility_json() {
-                    refused.insert((*base).to_owned(), incompatibility);
-                }
+            let entries = env.map(|doc| doc.entries).unwrap_or_default();
+            if classify(store.profile_choice(&meta.id), &entries, false)
+                == RemoteCompatibility::Compatible
+            {
+                bases.push(meta.base_provider.clone());
             }
         }
-        (
-            (!launch.is_empty()).then_some(Value::Object(launch)),
-            (!refused.is_empty()).then_some(Value::Object(refused)),
-        )
+        let defaults = store.defaults().unwrap_or_default();
+        for base in PROFILE_BASE_PROVIDERS {
+            if bases.iter().any(|b| b == base) {
+                continue;
+            }
+            let meta = defaults.get(*base).cloned().unwrap_or_default();
+            let Ok(env) = self.load_default_env(&meta).await else {
+                continue;
+            };
+            if !env.entries.is_empty()
+                && classify(store.default_choice(base), &env.entries, true)
+                    == RemoteCompatibility::Compatible
+            {
+                bases.push((*base).to_owned());
+            }
+        }
+        bases
     }
 
     /// Write the migration rule for every profile and Default with no saved
@@ -567,20 +574,6 @@ impl Services {
             if let Err(e) = store.persist_choices(next) {
                 tracing::warn!(error = %e, "remote-compatible choice migration failed; reads keep today's rule");
             }
-        }
-    }
-
-    /// `providers.remoteMachineSignIn` changed: each Default's
-    /// `remoteLaunch` may have moved, so announce a `default-updated` per
-    /// base provider (clients re-list).
-    pub(crate) async fn announce_machine_sign_in_change(&self) {
-        for base in PROFILE_BASE_PROVIDERS {
-            let revision = self.provider_profiles.bump_revision();
-            crate::publish_event(
-                self.event_bus.as_ref(),
-                default_changed_event(revision, "default-updated", base, Some(false)),
-            )
-            .await;
         }
     }
 }

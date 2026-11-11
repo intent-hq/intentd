@@ -15,14 +15,6 @@ impl Fixture {
         self.svc.provider_profiles_create_impl(params).await
     }
 
-    fn machine_sign_in(&self, value: Value) {
-        self.svc
-            .settings_registry()
-            .expect("registry")
-            .apply(&[("providers.remoteMachineSignIn".to_string(), value)])
-            .expect("apply setting");
-    }
-
     async fn plan(&self, reference: &str) -> Result<RemoteLaunchPlan> {
         self.svc
             .remote_launch_plan(reference, RemoteTarget::Machine)
@@ -188,21 +180,11 @@ async fn update_keeps_the_choice_and_adding_a_folder_unmarks() {
 }
 
 #[intent_test_macros::daemon_test]
-async fn default_choice_and_machine_sign_in_decide_remote_launch() {
+async fn the_default_choice_decides_remote_launch() {
     let fx = Fixture::new().await;
     let row = default_row(&fx, "claude-code").await;
     assert_eq!(row["remoteCompatible"], false);
     assert_eq!(row["remoteLaunch"], "machine-sign-in");
-
-    fx.machine_sign_in(json!({ "claude-code": false }));
-    assert_eq!(
-        default_row(&fx, "claude-code").await["remoteLaunch"],
-        "refused"
-    );
-    assert_eq!(
-        default_row(&fx, "codex").await["remoteLaunch"],
-        "machine-sign-in"
-    );
 
     let marked = fx
         .svc
@@ -234,53 +216,20 @@ async fn default_choice_and_machine_sign_in_decide_remote_launch() {
         .await
         .unwrap();
     assert_eq!(folder["defaultConfig"]["remoteCompatible"], false);
-    assert_eq!(folder["defaultConfig"]["remoteLaunch"], "refused");
-}
-
-#[intent_test_macros::daemon_test]
-async fn machine_sign_in_setting_validates_and_announces_the_default_change() {
-    let fx = Fixture::new().await;
-    for invalid in [
-        json!({ "auggie": true }),
-        json!({ "codex@p3k9x2m4q7t1a": true }),
-        json!({ "codex": "yes" }),
-        json!([true]),
-    ] {
-        assert!(
-            fx.svc
-                .settings_registry()
-                .unwrap()
-                .apply(&[("providers.remoteMachineSignIn".into(), invalid.clone())])
-                .is_err(),
-            "{invalid}"
-        );
-    }
-    let mut events = fx.subscribe();
-    fx.svc
-        .settings_update_checking_profiles(json!([
-            { "path": "providers.remoteMachineSignIn", "value": { "codex": false } },
-        ]))
-        .await
-        .unwrap();
-    let mut bases = Vec::new();
-    let event = loop {
-        let event = recv_profiles_event(&mut events).await;
-        bases.push(event["data"]["baseProviderId"].clone());
-        if event["data"]["baseProviderId"] == "codex" {
-            break event;
-        }
-    };
-    assert!(
-        bases.len() <= 2,
-        "one event per profile-capable base: {bases:?}"
+    assert_eq!(
+        folder["defaultConfig"]["remoteLaunch"], "machine-sign-in",
+        "the folder stays here; the machine's own sign-in runs it"
     );
-    assert_eq!(event["data"]["change"], "default-updated");
-    assert_eq!(event["data"]["baseProviderId"], "codex");
-    assert_eq!(event["data"]["envChanged"], false);
+}
+
+/// There is no setting to stop using a machine's own sign-in.
+#[test]
+fn there_is_no_machine_sign_in_setting() {
+    assert!(!crate::KNOWN_PATHS.contains(&"providers.remoteMachineSignIn"));
 }
 
 #[intent_test_macros::daemon_test]
-async fn the_catalog_lists_only_defaults_that_cannot_run() {
+async fn the_catalog_says_every_default_runs_on_a_machine() {
     let fx = Fixture::new().await;
     fx.svc
         .provider_profiles_update_default_impl(json!({
@@ -297,16 +246,6 @@ async fn the_catalog_lists_only_defaults_that_cannot_run() {
         catalog.get("defaultRemoteIncompatibility").is_none(),
         "an unmarked Default still runs through machine sign-in"
     );
-    fx.machine_sign_in(json!({ "claude-code": false, "codex": false }));
-    let catalog = fx.svc.providers_catalog().await.unwrap();
-    assert_eq!(
-        catalog["defaultRemoteIncompatibility"],
-        json!({
-            "claude-code": { "reason": "account-folder", "keys": ["CLAUDE_CONFIG_DIR"] },
-            "codex": { "reason": "not-marked", "keys": [] },
-        })
-    );
-    assert_eq!(catalog["defaultRemoteLaunch"]["codex"], "refused");
 }
 
 // --- Migration and storage --------------------------------------------------
@@ -470,20 +409,7 @@ async fn launch_rules_for_the_default() {
     );
     assert!(plan.machine_sign_in);
 
-    // Not marked, machine sign-in off: refused.
-    fx.machine_sign_in(json!({ "claude-code": false }));
-    let err = fx.plan("claude-code").await.unwrap_err();
-    let data = refusal(&err);
-    assert_eq!(data["reason"], "not-marked");
-    assert_eq!(data["machineSignIn"], false);
-    assert_eq!(data["name"], "Default");
-    assert!(
-        err.to_string()
-            .contains("using the machine's own sign-in is off for Claude Code"),
-        "{err}"
-    );
-
-    // Marked: its overrides are sent, whatever machine sign-in says.
+    // Marked: its overrides are sent.
     fx.svc
         .provider_profiles_update_default_impl(json!({
             "baseProviderId": "claude-code", "remoteCompatible": true,
@@ -501,7 +427,6 @@ async fn launch_rules_for_the_default() {
         }))
         .await
         .unwrap();
-    fx.machine_sign_in(json!({ "codex": false }));
     let plan = fx.plan("codex").await.unwrap();
     assert!(plan.env.is_none());
     assert!(plan.machine_sign_in);
@@ -523,7 +448,8 @@ async fn launch_rules_on_e2b_never_use_machine_sign_in() {
     let err = fx.cloud_plan("claude-code").await.unwrap_err();
     let data = refusal(&err);
     assert_eq!(data["reason"], "not-marked");
-    assert_eq!(data["machineSignIn"], true);
+    assert_eq!(data["name"], "Default");
+    assert!(data.get("machineSignIn").is_none(), "{data}");
     assert!(
         err.to_string().contains("E2B has no sign-in of its own"),
         "{err}"
