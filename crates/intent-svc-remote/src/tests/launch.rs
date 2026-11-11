@@ -435,7 +435,6 @@ async fn a_profile_agent_launches_with_the_profiles_environment() {
             "baseProviderId": "codex",
             "name": "Work",
             "env": [
-                { "key": "CODEX_HOME", "kind": "set", "value": "~/.codex-work" },
                 { "key": "CODEX_ACCESS_TOKEN", "kind": "set", "value": "canary-head-secret" },
                 { "key": "OPENAI_BASE_URL", "kind": "unset" },
             ],
@@ -470,12 +469,73 @@ async fn a_profile_agent_launches_with_the_profiles_environment() {
     assert_eq!(
         wire["env"],
         json!([
-            { "key": "CODEX_HOME", "value": "~/.codex-work" },
             { "key": "CODEX_ACCESS_TOKEN", "value": "canary-head-secret" },
             { "key": "OPENAI_BASE_URL", "value": null },
         ])
     );
     assert!(runtime.is_alive());
+    f.node.shutdown();
+}
+
+/// A profile unmarked for remote machines after placement fails the next
+/// start: its settings are not sent, and the node never runs it on its own
+/// login.
+#[tokio::test]
+async fn a_profile_unmarked_after_placement_fails_the_start() {
+    let (f, mut link, _machine) = fixture().await;
+    let created = intent_core::caller::with_caller(
+        intent_core::caller::Caller::Daemon,
+        f.services.provider_profiles_create(json!({
+            "baseProviderId": "codex",
+            "name": "Work",
+            "env": [{ "key": "CODEX_ACCESS_TOKEN", "kind": "set", "value": "canary-head-secret" }],
+        })),
+    )
+    .await
+    .expect("create profile");
+    let reference = created["profile"]["providerRef"].as_str().unwrap();
+    let id = created["profile"]["id"].as_str().unwrap().to_owned();
+    let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+    let agent = f.agent_with(&view, reference).await;
+    intent_core::caller::with_caller(
+        intent_core::caller::Caller::Daemon,
+        f.services
+            .provider_profiles_update(id, json!({ "remoteCompatible": false })),
+    )
+    .await
+    .expect("unmark");
+    f.port()
+        .launch(
+            &f.services,
+            RemoteLaunchRequest {
+                workspace_id: workspace(),
+                agent_id: agent.clone(),
+                view,
+            },
+        )
+        .await
+        .unwrap();
+    let Err(error) = f.port().runtime(&f.services, &agent).await else {
+        panic!("an unmarked profile must fail the start");
+    };
+    assert!(
+        matches!(&error, Error::ProviderProfile(failure)
+            if failure.data["code"] == "profile-not-remote-compatible"
+                && failure.data["reason"] == "not-marked"),
+        "{error:?}"
+    );
+    assert!(
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            link.expect(|frame| match frame {
+                LinkFrame::Launch(command) => Some(command),
+                _ => None,
+            })
+        )
+        .await
+        .is_err(),
+        "no launch is sent for an unmarked profile"
+    );
     f.node.shutdown();
 }
 

@@ -2538,6 +2538,7 @@ async fn cmd_serve_owned(
         .with_node_mode(node_mode);
     // Remove secrets journaled by an interrupted profile create/delete.
     services.sweep_provider_profile_secrets().await;
+    services.migrate_remote_choices().await;
     #[cfg(feature = "repository-test-fixtures")]
     let fixture_installed = match initialize_gitlab_test_transports(&services).await {
         Ok(installed) => installed,

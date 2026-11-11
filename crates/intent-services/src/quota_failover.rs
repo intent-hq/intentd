@@ -541,7 +541,7 @@ impl Services {
         let remote = intent_core::remote_launch::RemotePlacementView::from_metadata(
             session.metadata.as_ref(),
         );
-        let mut passed_over: Option<String> = None;
+        let mut passed_over: Option<(String, String)> = None;
         let target = loop {
             let candidate = {
                 let mut chains = self.quota_failover_chains.lock().unwrap();
@@ -568,9 +568,11 @@ impl Services {
             let Some(candidate) = candidate else {
                 break None;
             };
-            if remote.is_some() && !self.runs_remotely(agent_id, &candidate).await {
-                passed_over.get_or_insert(candidate);
-                continue;
+            if remote.is_some() {
+                if let Some(why) = self.remote_refusal(agent_id, &candidate).await {
+                    passed_over.get_or_insert((candidate, why));
+                    continue;
+                }
             }
             break Some(candidate);
         };
@@ -593,10 +595,11 @@ impl Services {
                 .await;
             }
             return match (remote, passed_over) {
-                (Some(view), Some(backup)) => QuotaFailoverOutcome::Refused(
+                (Some(view), Some((backup, why))) => QuotaFailoverOutcome::Refused(
                     intent_core::Error::InvalidParams(remote_backup_incompatible_text(
                         &from_selection,
                         &backup,
+                        &why,
                         &view.node_name,
                         &profiles,
                     )),
@@ -623,20 +626,43 @@ impl Services {
         }
     }
 
-    /// Whether `reference` can run on a remote agent's machine. An
-    /// unresolvable reference cannot run anywhere, so it is passed over too.
+    /// Whether `reference` can run on a remote agent's machine.
     async fn runs_remotely(&self, agent_id: &AgentId, reference: &str) -> bool {
-        match self.remote_compatibility(reference).await {
-            Ok(crate::RemoteCompatibility::Compatible) => true,
-            Ok(crate::RemoteCompatibility::NotRemoteCompatible { reason, keys }) => {
-                tracing::info!(agent = %agent_id, provider = %reference, reason, ?keys, "backup cannot run on the remote agent's machine; passed over");
-                false
+        self.remote_refusal(agent_id, reference).await.is_none()
+    }
+
+    /// Why `reference` cannot run on a remote agent's machine under the
+    /// launch rules for where it runs (`None` when it can): a sandbox has no
+    /// sign-in, so there a candidate must send a set variable. An
+    /// unresolvable reference cannot run anywhere, so it is refused too.
+    async fn remote_refusal(&self, agent_id: &AgentId, reference: &str) -> Option<String> {
+        let cloud = match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => intent_core::remote_launch::RemotePlacementView::from_metadata(
+                session.metadata.as_ref(),
+            )
+            .is_some_and(|view| view.is_cloud()),
+            Err(e) => return Some(format!("the agent could not be read: {e}")),
+        };
+        let target = if cloud {
+            crate::RemoteTarget::Cloud
+        } else {
+            crate::RemoteTarget::Machine
+        };
+        let why = match self.remote_launch_plan(reference, target).await {
+            Ok(plan)
+                if cloud
+                    && !plan
+                        .env
+                        .as_ref()
+                        .is_some_and(|env| env.entries().any(|(_, value)| value.is_some())) =>
+            {
+                "It sends no sign-in, and a sandbox has none of its own.".to_owned()
             }
-            Err(e) => {
-                tracing::warn!(agent = %agent_id, provider = %reference, error = %e, "backup unresolvable for a remote agent; passed over");
-                false
-            }
-        }
+            Ok(_) => return None,
+            Err(e) => e.to_string(),
+        };
+        tracing::info!(agent = %agent_id, provider = %reference, why = %why, "backup the launch rules refuse on the remote agent's machine; passed over");
+        Some(why)
     }
 
     /// Move the agent from its current configuration (`session.provider`)
@@ -1099,10 +1125,11 @@ fn failed_attempt_selection(
 }
 
 /// The error a remote agent fails with when its only backups cannot run on
-/// its machine (an account folder ties them to this backend).
+/// its machine: `why` is the launch rules' refusal, which names the fix.
 fn remote_backup_incompatible_text(
     from: &str,
     backup: &str,
+    why: &str,
     machine: &str,
     profiles: &[ProfileMeta],
 ) -> String {
@@ -1110,8 +1137,7 @@ fn remote_backup_incompatible_text(
     let backup = provider_profiles::readable_selection(backup, Some(profiles));
     format!(
         "{REMOTE_FAILOVER_UNAVAILABLE} {from} ran out of quota on {machine}. The backup {backup} \
-         uses an account folder on this backend, so it can't run on other machines. Create a new \
-         agent with an API-key profile or the machine's own sign-in."
+         can't run there: {why}"
     )
 }
 
@@ -1137,8 +1163,9 @@ fn remote_backup_failed_text(
         not_sign_in(cause)
     } else if has(provider_profiles::PROFILE_NOT_REMOTE_COMPATIBLE) {
         format!(
-            "{backup} uses an account folder on this backend, so it can't run on other \
-             machines. Create a new agent with an API-key profile or the machine's own sign-in."
+            "{backup} can't run on other machines: it isn't marked for remote machines, or it \
+             uses an account folder on this backend. Turn on Use on remote machines for it in \
+             Settings → Providers, or create a new agent with a configuration that is marked."
         )
     } else if has("request `initialize` timed out") {
         not_sign_in(format!(

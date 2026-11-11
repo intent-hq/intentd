@@ -811,9 +811,9 @@ fn each_provider_start_failure_names_its_own_cause() {
         (
             "profile-not-remote-compatible: claude-code@pb1 sets CLAUDE_CONFIG_DIR",
             &[
-                "claude-code (PB1) uses an account folder on this backend, so it can't run on \
-                 other machines",
-                "API-key profile",
+                "claude-code (PB1) can't run on other machines: it isn't marked for remote \
+                 machines, or it uses an account folder on this backend",
+                "Turn on Use on remote machines",
             ][..],
         ),
         (

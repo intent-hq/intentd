@@ -471,6 +471,12 @@ actions can also include **Let <backend> run agents here**, which asks to confir
 listed under **Machines <backend> can run agents on**.
 Running agents on those machines is experimental. Agents see each machine's name and
 platform, and look up its providers, sign-in status and models when they need them.
+A machine uses its own provider sign-in when it has one. Otherwise only a provider
+profile (or Default) with **Use on remote machines** turned on in **Settings →
+Providers** is sent there; a profile that sets a sign-in folder can't be turned on, and
+adding an API key to a Default turns it on. A provider that is neither signed in on a
+machine nor covered by such a profile isn't offered for that machine. A refused choice
+says why and how to fix it.
 An agent running on one of those machines uses that machine's skills (its
 `~/.agents/skills` and `~/.claude/skills`, plus the project's), and its **/** menu lists
 them; to give it a skill, add the skill there. A **/name** it lacks still sends, with a

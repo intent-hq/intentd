@@ -747,3 +747,50 @@ pub trait ExecutorLiveness: Send + Sync {
 
 #[cfg(test)]
 mod tests;
+
+/// `data.code` of [`machine_not_signed_in`].
+pub const MACHINE_NOT_SIGNED_IN_CODE: &str = "machine-not-signed-in";
+
+/// One machine whose report says the provider is not signed in.
+#[derive(Debug, Clone)]
+pub struct SignedOutMachine {
+    pub node_id: String,
+    pub name: String,
+    pub status: ProviderStatus,
+    pub observed_at: String,
+}
+
+/// `machine-not-signed-in` (`-32602`): a machine sign-in launch (the
+/// Default configuration sending nothing) would run on machines whose
+/// report says `provider` is signed out there.
+#[must_use]
+pub fn machine_not_signed_in(
+    provider: &str,
+    machines: &[SignedOutMachine],
+    retryable: bool,
+) -> crate::Error {
+    let display = match provider {
+        "claude-code" => "Claude Code",
+        "codex" => "Codex",
+        other => other,
+    };
+    let names: Vec<&str> = machines.iter().map(|m| m.name.as_str()).collect();
+    let on = names.join(", ");
+    crate::Error::remote_machine(
+        retryable,
+        format!(
+            "{display} isn't signed in on {on}, and Default sends no sign-in of its own. Sign in to {display} on {on}, or pick a profile with an API key or token that is marked for remote machines."
+        ),
+        serde_json::json!({
+            "code": MACHINE_NOT_SIGNED_IN_CODE,
+            "providerRef": provider,
+            "machines": machines.iter().map(|m| serde_json::json!({
+                "nodeId": m.node_id,
+                "name": m.name,
+                "status": status_name(m.status),
+                "observedAt": m.observed_at,
+            })).collect::<Vec<_>>(),
+            "retryable": retryable,
+        }),
+    )
+}

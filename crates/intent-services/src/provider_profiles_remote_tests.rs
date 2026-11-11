@@ -244,11 +244,21 @@ async fn only_a_set_account_folder_makes_a_configuration_backend_only() {
             keys: vec!["codex_home".into()],
         }
     );
-    for compatible in [api_key.as_str(), unset.as_str(), "claude-code", "codex"] {
+    for compatible in [api_key.as_str(), unset.as_str(), "unsloth"] {
         assert_eq!(
             fx.svc.remote_compatibility(compatible).await.unwrap(),
             RemoteCompatibility::Compatible,
             "{compatible}"
+        );
+    }
+    for default in ["claude-code", "codex"] {
+        assert_eq!(
+            fx.svc.remote_compatibility(default).await.unwrap(),
+            RemoteCompatibility::NotRemoteCompatible {
+                reason: REMOTE_INCOMPATIBLE_NOT_MARKED,
+                keys: vec![],
+            },
+            "{default}: a Default with no overrides starts unmarked"
         );
     }
     assert!(
@@ -275,10 +285,13 @@ async fn default_overrides_with_an_account_folder_are_backend_only() {
         fx.svc.remote_compatibility("claude-code").await.unwrap(),
         RemoteCompatibility::NotRemoteCompatible { .. }
     ));
-    assert_eq!(
+    assert!(matches!(
         fx.svc.remote_compatibility("codex").await.unwrap(),
-        RemoteCompatibility::Compatible
-    );
+        RemoteCompatibility::NotRemoteCompatible {
+            reason: REMOTE_INCOMPATIBLE_NOT_MARKED,
+            ..
+        }
+    ));
 }
 
 /// The account-folder refusal a read row carries.
@@ -355,12 +368,17 @@ async fn profile_reads_say_whether_the_configuration_runs_on_another_machine() {
     }
     for row in list["defaults"].as_array().unwrap() {
         let base = row["baseProviderId"].as_str().unwrap();
-        assert_eq!(row["remoteCompatible"], base != "codex", "{base}");
+        assert_eq!(row["remoteCompatible"], false, "{base}");
         assert_eq!(
-            row.get("remoteIncompatibility").is_some(),
-            base == "codex",
+            row["remoteIncompatibility"]["reason"],
+            if base == "codex" {
+                "account-folder"
+            } else {
+                "not-marked"
+            },
             "{base}"
         );
+        assert_eq!(row["remoteLaunch"], "machine-sign-in", "{base}");
     }
 
     let reordered = fx
@@ -420,9 +438,9 @@ async fn the_catalog_marks_configurations_that_cannot_run_on_another_machine() {
     let api_key = by_name("API key");
     assert_eq!(api_key["remoteCompatible"], true);
     assert!(api_key.get("remoteIncompatibility").is_none());
-    assert_eq!(
-        catalog["defaultRemoteIncompatibility"],
-        json!({ "claude-code": folder_refusal("CLAUDE_CONFIG_DIR") })
+    assert!(
+        catalog.get("defaultRemoteIncompatibility").is_none(),
+        "the folder Default runs through machine sign-in, sending nothing"
     );
     let text = catalog.to_string();
     assert!(!text.contains(SECRET));

@@ -24,6 +24,8 @@ mod default_overrides;
 mod guest_catalog;
 #[path = "provider_profiles_quota_tests.rs"]
 mod quota_state;
+#[path = "provider_profiles_remote_choice_tests.rs"]
+mod remote_choice;
 #[path = "provider_profiles_remote_tests.rs"]
 mod remote_launch;
 

@@ -48,6 +48,11 @@ use crate::profile_activation::SettingsRead;
 use crate::settings::AsyncSecretStore;
 use crate::Services;
 
+mod remote;
+pub(crate) use remote::REMOTE_CHOICES_FILE;
+use remote::{adds_credential, classify, migration_rule, resolve_choice, ChoiceKey, RemoteChoices};
+pub use remote::{RemoteLaunchPlan, RemoteTarget, REMOTE_INCOMPATIBLE_NOT_MARKED};
+
 /// File name of the metadata document inside the daemon data dir.
 pub(crate) const PROFILES_FILE: &str = "provider-profiles.json";
 /// The only metadata file version this daemon reads or writes.
@@ -533,7 +538,8 @@ pub enum RemoteCompatibility {
     Compatible,
     /// Tied to this backend.
     NotRemoteCompatible {
-        /// Why; [`REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER`] today.
+        /// Why: [`REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER`] or
+        /// [`REMOTE_INCOMPATIBLE_NOT_MARKED`].
         reason: &'static str,
         /// The variables that tie it here, as saved.
         keys: Vec<String>,
@@ -546,43 +552,6 @@ pub enum RemoteCompatibility {
 /// different account under the same path, so such a configuration never
 /// runs remotely, whether or not the folder exists there.
 pub const REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER: &str = "account-folder";
-
-/// [`RemoteCompatibility`] of a resolved overlay (`None` = no overrides).
-/// Only a set account folder counts; unsetting one keeps the machine's own
-/// sign-in.
-#[must_use]
-pub fn remote_compatibility_of(env: Option<&intent_acp::ProfileEnv>) -> RemoteCompatibility {
-    classify_set_keys(
-        env.into_iter()
-            .flat_map(intent_acp::ProfileEnv::entries)
-            .filter(|(_, value)| value.is_some())
-            .map(|(key, _)| key),
-    )
-}
-
-/// [`RemoteCompatibility`] of a saved environment document, for reads.
-fn remote_compatibility_of_doc(env: &EnvDoc) -> RemoteCompatibility {
-    classify_set_keys(env.entries.iter().filter_map(|entry| match entry {
-        StoredEnv::Set { key, .. } => Some(key.as_str()),
-        StoredEnv::Unset { .. } => None,
-    }))
-}
-
-/// The one rule: a configuration that sets an account folder is tied here.
-fn classify_set_keys<'a>(set_keys: impl Iterator<Item = &'a str>) -> RemoteCompatibility {
-    let keys: Vec<String> = set_keys
-        .filter(|key| is_folder_path_key(key))
-        .map(str::to_owned)
-        .collect();
-    if keys.is_empty() {
-        RemoteCompatibility::Compatible
-    } else {
-        RemoteCompatibility::NotRemoteCompatible {
-            reason: REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER,
-            keys,
-        }
-    }
-}
 
 impl RemoteCompatibility {
     /// The wire `RemoteIncompatibility` (§5.54 "Remote compatibility"):
@@ -605,33 +574,6 @@ impl RemoteCompatibility {
             row["remoteIncompatibility"] = incompatibility;
         }
     }
-}
-
-/// `profile-not-remote-compatible` (§5.54, nodes.md remote machine errors):
-/// `reference` (as given; `display` is its readable name) sets an account
-/// folder, so it cannot run an agent on another machine. `-32602`, with the
-/// variable names but never their values.
-pub(crate) fn not_remote_compatible_error(
-    reference: &str,
-    display: &str,
-    reason: &str,
-    keys: &[String],
-) -> Error {
-    Error::provider_profile(
-        false,
-        format!(
-            "{display} uses an account folder ({}) that only exists on this backend, so it \
-             can't run on another machine. Pick a profile that uses the machine's own sign-in \
-             or an API key.",
-            keys.join(", ")
-        ),
-        json!({
-            "code": PROFILE_NOT_REMOTE_COMPATIBLE,
-            "providerRef": reference,
-            "reason": reason,
-            "keys": keys,
-        }),
-    )
 }
 
 /// `data.code` of [`not_remote_compatible_error`].
@@ -876,6 +818,10 @@ pub(crate) struct ProviderProfileStore {
     /// `None` keeps metadata in memory only (unit/read-only wiring).
     path: Option<PathBuf>,
     loaded: RwLock<Loaded>,
+    /// The saved remote-compatible choices (`None` while unreadable).
+    choices: RwLock<Option<RemoteChoices>>,
+    /// `None` keeps the choices in memory only.
+    choices_path: Option<PathBuf>,
     mutation: tokio::sync::Mutex<()>,
     revision: AtomicU64,
 }
@@ -895,6 +841,8 @@ impl ProviderProfileStore {
                 defaults: Arc::default(),
                 pending: Vec::new(),
             }),
+            choices: RwLock::new(Some(RemoteChoices::default())),
+            choices_path: None,
             mutation: tokio::sync::Mutex::new(()),
             revision: AtomicU64::new(0),
         }
@@ -936,9 +884,12 @@ impl ProviderProfileStore {
                 }
             }
         };
+        let choices_path = data_dir.join(REMOTE_CHOICES_FILE);
         Self {
             path: Some(path),
             loaded: RwLock::new(loaded),
+            choices: RwLock::new(remote::load_choices(&choices_path)),
+            choices_path: Some(choices_path),
             mutation: tokio::sync::Mutex::new(()),
             revision: AtomicU64::new(0),
         }
@@ -1104,7 +1055,12 @@ async fn load_env(secrets: &AsyncSecretStore, profile_id: &str) -> Result<Option
     }
 }
 
-fn profile_json(meta: &ProfileMeta, env: &EnvDoc, running_processes: usize) -> Value {
+fn profile_json(
+    meta: &ProfileMeta,
+    env: &EnvDoc,
+    running_processes: usize,
+    choice: Option<bool>,
+) -> Value {
     let mut row = json!({
         "id": meta.id,
         "providerRef": meta.provider_ref(),
@@ -1117,22 +1073,30 @@ fn profile_json(meta: &ProfileMeta, env: &EnvDoc, running_processes: usize) -> V
         "updatedAt": meta.updated_at,
         "activation": { "runningProcesses": running_processes },
     });
-    remote_compatibility_of_doc(env).annotate(&mut row);
+    classify(choice, &env.entries, false).annotate(&mut row);
     row
 }
 
 /// The wire `DefaultConfig` of one base provider (masked except folder paths).
+impl Services {
+    /// The wire `DefaultConfig` with its remote-compatible choice and
+    /// `remoteLaunch`.
+    fn default_row(&self, base: &str, name: Option<&str>, env: &EnvDoc, running: usize) -> Value {
+        let mut row = default_config_json(base, name, env, running);
+        self.annotate_default(&mut row, base, &env.entries);
+        row
+    }
+}
+
 fn default_config_json(base: &str, name: Option<&str>, env: &EnvDoc, running: usize) -> Value {
-    let mut row = json!({
+    json!({
         "baseProviderId": base,
         "providerRef": base,
         "name": name.unwrap_or(DEFAULT_NAME),
         "env": env.entries.iter().map(StoredEnv::masked_json).collect::<Vec<_>>(),
         "settingsFingerprint": env.fingerprint,
         "activation": { "runningProcesses": running },
-    });
-    remote_compatibility_of_doc(env).annotate(&mut row);
-    row
+    })
 }
 
 /// Prefix of a Default configuration's activation-registry key. The `:`
@@ -1565,47 +1529,6 @@ impl Services {
         self.resolve_profile_env_for(reference, None).await
     }
 
-    /// Whether `reference` (a bare base id for its Default configuration,
-    /// overrides included, or a profile reference) can run on another
-    /// machine: [`remote_compatibility_of`] its saved overlay.
-    ///
-    /// # Errors
-    /// As [`Self::resolve_remote_profile_env`]: an unknown or unselectable
-    /// reference, or an unreadable environment document.
-    pub async fn remote_compatibility(&self, reference: &str) -> Result<RemoteCompatibility> {
-        let env = self.resolve_remote_profile_env(reference).await?;
-        Ok(remote_compatibility_of(env.as_ref()))
-    }
-
-    /// [`Self::resolve_remote_profile_env`] for a configuration about to run
-    /// an agent on another machine (placement, or a remote agent's
-    /// `agent.setModel`): refused with [`not_remote_compatible_error`] when
-    /// it sets an account folder. Returns the overlay the machine would get.
-    ///
-    /// # Errors
-    /// `profile-not-remote-compatible`, or as
-    /// [`Self::resolve_remote_profile_env`].
-    pub(crate) async fn resolve_remote_compatible_env(
-        &self,
-        reference: &str,
-    ) -> Result<Option<intent_acp::ProfileEnv>> {
-        let env = self.resolve_remote_profile_env(reference).await?;
-        if let RemoteCompatibility::NotRemoteCompatible { reason, keys } =
-            remote_compatibility_of(env.as_ref())
-        {
-            let display = if is_qualified_ref(reference) {
-                let profiles = self.provider_profiles.profiles().ok();
-                readable_selection(reference, profiles.as_ref().map(|p| p.as_slice()))
-            } else {
-                format!("The {reference} Default configuration")
-            };
-            return Err(not_remote_compatible_error(
-                reference, &display, reason, &keys,
-            ));
-        }
-        Ok(env)
-    }
-
     async fn resolve_profile_env_for(
         &self,
         reference: &str,
@@ -1954,38 +1877,33 @@ impl Services {
 
     /// `providers.catalog` `profiles`: one summary per saved profile (no env
     /// values and no counts; an unreadable profile file yields an empty
-    /// list) with its remote compatibility, plus `defaultRemoteIncompatibility`: the Default
-    /// configurations that cannot run on another machine, `None` when none
-    /// (§5.54 "Remote compatibility in the catalog"). A row whose saved
-    /// environment cannot be read carries neither field (clients then treat
-    /// it as compatible and placement decides).
-    pub(crate) async fn provider_profile_catalog(&self) -> (Vec<Value>, Option<Value>) {
-        let profiles = self.provider_profiles.profiles().unwrap_or_default();
+    /// list) with its remote compatibility, plus `defaultRemoteLaunch` and
+    /// `defaultRemoteIncompatibility` (only the Defaults that cannot run on
+    /// another machine; §5.54 "Remote compatibility in the catalog"). A row
+    /// whose saved environment cannot be read carries neither field (clients
+    /// then treat it as compatible and placement decides).
+    pub(crate) async fn provider_profile_catalog(
+        &self,
+    ) -> (Vec<Value>, Option<Value>, Option<Value>) {
+        let store = &self.provider_profiles;
+        let profiles = store.profiles().unwrap_or_default();
         let mut rows = Vec::with_capacity(profiles.len());
         for meta in profiles.iter() {
             let mut row = meta.summary_json();
             match load_env(&self.secrets, &meta.id).await {
-                Ok(env) => remote_compatibility_of_doc(&env.unwrap_or_default()).annotate(&mut row),
+                Ok(env) => classify(
+                    store.profile_choice(&meta.id),
+                    &env.unwrap_or_default().entries,
+                    false,
+                )
+                .annotate(&mut row),
                 Err(e) => {
                     tracing::warn!(profile = %meta.id, error = %e, "catalog: profile environment unreadable; remote compatibility omitted");
                 }
             }
             rows.push(row);
         }
-        let mut defaults = serde_json::Map::new();
-        for (base, saved) in self.provider_profiles.defaults().unwrap_or_default().iter() {
-            let Ok(env) = self.load_default_env(saved).await else {
-                continue;
-            };
-            if let Some(incompatibility) = remote_compatibility_of_doc(&env).incompatibility_json()
-            {
-                defaults.insert(base.clone(), incompatibility);
-            }
-        }
-        (
-            rows,
-            (!defaults.is_empty()).then_some(Value::Object(defaults)),
-        )
+        (rows, self.default_remote_catalog().await, None)
     }
 
     /// The backend's part of the remote-placement text for `workspace_id`:
@@ -2005,10 +1923,14 @@ impl Services {
         use intent_core::machine_selection::{PlacementProfile, ProfileRemote};
         let remote = |compat: RemoteCompatibility| match compat {
             RemoteCompatibility::Compatible => ProfileRemote::Compatible,
-            RemoteCompatibility::NotRemoteCompatible { keys, .. } => {
+            RemoteCompatibility::NotRemoteCompatible { reason, keys }
+                if reason == REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER =>
+            {
                 ProfileRemote::Incompatible { keys }
             }
+            RemoteCompatibility::NotRemoteCompatible { .. } => ProfileRemote::NotMarked,
         };
+        let store = &self.provider_profiles;
         let cached = |id: String| async move {
             let raw = self.secrets.load(&env_account(&id)).await.ok()?;
             match raw {
@@ -2033,7 +1955,11 @@ impl Services {
         if !guest && !shared {
             for meta in self.provider_profiles.profiles().unwrap_or_default().iter() {
                 let compat = match cached(meta.id.clone()).await {
-                    Some(env) => remote(remote_compatibility_of_doc(&env)),
+                    Some(env) => remote(classify(
+                        store.profile_choice(&meta.id),
+                        &env.entries,
+                        false,
+                    )),
                     None => ProfileRemote::Unknown,
                 };
                 facts.profiles.push(PlacementProfile {
@@ -2045,18 +1971,26 @@ impl Services {
                 });
             }
         }
-        for (base, saved) in self.provider_profiles.defaults().unwrap_or_default().iter() {
-            let compat = match &saved.env_id {
-                None => ProfileRemote::Compatible,
-                Some(env_id) => match cached(env_id.clone()).await {
-                    Some(env) => remote(remote_compatibility_of_doc(&env)),
-                    None => ProfileRemote::Unknown,
-                },
+        let saved_defaults = store.defaults().unwrap_or_default();
+        for base in PROFILE_BASE_PROVIDERS {
+            let saved = saved_defaults.get(*base).cloned().unwrap_or_default();
+            let env = match &saved.env_id {
+                None => Some(EnvDoc::default()),
+                Some(env_id) => cached(env_id.clone()).await,
             };
+            // On a machine every Default runs (machine sign-in when it is not
+            // marked); only one whose settings cannot be read is listed.
+            let compat = if env.is_some() {
+                ProfileRemote::Compatible
+            } else {
+                ProfileRemote::Unknown
+            };
+            let base = (*base).to_owned();
             if compat != ProfileRemote::Compatible {
                 facts.incompatible_defaults.push((base.clone(), compat));
             }
         }
+        facts.remote_profile_bases = self.remote_profile_bases().await;
         let settings = self.effective_settings();
         facts.disabled_providers = intent_providers::ACP_PROVIDERS
             .iter()
@@ -2320,7 +2254,12 @@ impl Services {
         }) {
             let env = load_env(&self.secrets, &meta.id).await?.unwrap_or_default();
             let running = self.profile_activation.running_processes(&meta.id);
-            rows.push(profile_json(meta, &env, running));
+            rows.push(profile_json(
+                meta,
+                &env,
+                running,
+                store.profile_choice(&meta.id),
+            ));
         }
         let saved_defaults = store.defaults()?;
         let mut defaults = Vec::new();
@@ -2334,12 +2273,7 @@ impl Services {
             let running = self
                 .profile_activation
                 .running_processes(&default_activation_key(base));
-            defaults.push(default_config_json(
-                base,
-                saved.name.as_deref(),
-                &env,
-                running,
-            ));
+            defaults.push(self.default_row(base, saved.name.as_deref(), &env, running));
         }
         Ok(json!({ "profiles": rows, "defaults": defaults, "revision": store.revision() }))
     }
@@ -2410,6 +2344,7 @@ impl Services {
             .ok_or_else(|| Error::InvalidParams("missing required param: baseProviderId".into()))?;
         let raw_name = opt_string(&params, "name")?;
         let writes = opt_env(&params)?;
+        let remote_requested = opt_bool(&params, "remoteCompatible")?;
 
         let store = &self.provider_profiles;
         let _guard = store.lock().await;
@@ -2434,9 +2369,38 @@ impl Services {
         let entries = writes
             .as_ref()
             .map(|writes| validate_env(writes, base, Some(&saved_doc.entries), &mut errors));
+        // An explicit choice needs a readable choices file (§5.54).
+        if remote_requested.is_some() {
+            store.choices()?;
+        }
+        let current_marked = store
+            .default_choice(base)
+            .unwrap_or_else(|| migration_rule(&saved_doc.entries, true));
+        // Adding an API key or token marks the Default unless the write
+        // says otherwise or the Default sets an account folder (§5.54
+        // "Credential auto-mark").
+        let next_entries = entries.as_deref().unwrap_or(&saved_doc.entries);
+        let auto_mark = remote_requested.is_none()
+            && adds_credential(&saved_doc.entries, next_entries)
+            && classify(Some(true), next_entries, true) == RemoteCompatibility::Compatible
+            && store.choices().is_ok();
+        let marked = resolve_choice(
+            remote_requested.or(auto_mark.then_some(true)),
+            Some(current_marked),
+            entries.as_deref().unwrap_or(&saved_doc.entries),
+            true,
+            &mut errors,
+        );
         if !errors.is_empty() {
             return Err(field_errors(&errors));
         }
+        // A missing entry is saved only when the migration rule would now
+        // read otherwise, so a write that changes nothing saves nothing.
+        let final_entries = entries.as_deref().unwrap_or(&saved_doc.entries);
+        let remote_changed = store
+            .default_choice(base)
+            .unwrap_or_else(|| migration_rule(final_entries, true))
+            != marked;
 
         // A recorded environment whose document is missing reads empty
         // (with no fingerprint); any env write replaces or clears it.
@@ -2446,10 +2410,10 @@ impl Services {
             .is_some_and(|entries| *entries != saved_doc.entries || saved_missing);
         let name_changed = name.as_ref().is_some_and(|n| *n != current.name);
         let key = default_activation_key(base);
-        if !env_changed && !name_changed {
+        if !env_changed && !name_changed && !remote_changed {
             let running = self.profile_activation.running_processes(&key);
             return Ok(json!({
-                "defaultConfig": default_config_json(base, current.name.as_deref(), &saved_doc, running),
+                "defaultConfig": self.default_row(base, current.name.as_deref(), &saved_doc, running),
                 "revision": store.revision(),
                 "activation": { "envChanged": false, "runningProcesses": running },
             }));
@@ -2508,11 +2472,27 @@ impl Services {
             }
         }
         defaults.insert(base.to_owned(), next.clone());
+        let previous_choices = if remote_changed {
+            match store.save_choice(ChoiceKey::Default(base), marked) {
+                Ok(previous) => previous,
+                Err(e) => {
+                    if let Some(id) = &new_secret {
+                        if let Err(cleanup) = self.secrets.delete(&env_account(id)).await {
+                            tracing::warn!(error = %cleanup, "provider default secret rollback failed; it is removed at next start");
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
         if let Err(e) = store.persist_with_defaults(
             profiles.as_ref().clone(),
             defaults.clone(),
             journal.clone(),
         ) {
+            store.restore_choices(previous_choices);
             if let Some(id) = &new_secret {
                 if let Err(cleanup) = self.secrets.delete(&env_account(id)).await {
                     tracing::warn!(error = %cleanup, "provider default secret rollback failed; it is removed at next start");
@@ -2560,7 +2540,7 @@ impl Services {
         }
         let running = self.profile_activation.running_processes(&key);
         Ok(json!({
-            "defaultConfig": default_config_json(base, next.name.as_deref(), &env, running),
+            "defaultConfig": self.default_row(base, next.name.as_deref(), &env, running),
             "revision": revision,
             "activation": { "envChanged": env_changed, "runningProcesses": running },
         }))
@@ -2656,7 +2636,12 @@ impl Services {
         for meta in after.iter().filter(|p| p.base_provider == base) {
             let env = load_env(&self.secrets, &meta.id).await?.unwrap_or_default();
             let running = self.profile_activation.running_processes(&meta.id);
-            rows.push(profile_json(meta, &env, running));
+            rows.push(profile_json(
+                meta,
+                &env,
+                running,
+                store.profile_choice(&meta.id),
+            ));
         }
         store.persist(after, store.pending())?;
         let revision = store.bump_revision();
@@ -2675,6 +2660,7 @@ impl Services {
             .ok_or_else(|| Error::InvalidParams("missing required param: name".into()))?;
         let writes = opt_env(&params)?.unwrap_or_default();
         let backup = opt_bool(&params, "backup")?.unwrap_or(false);
+        let remote_requested = opt_bool(&params, "remoteCompatible")?;
 
         let store = &self.provider_profiles;
         let _guard = store.lock().await;
@@ -2698,6 +2684,7 @@ impl Services {
         let name = validate_name(&raw_name, &base, &profiles, None, &mut errors);
         check_default_name_conflict(&name, store.default_name(&base).as_deref(), &mut errors);
         let entries = validate_env(&writes, &base, None, &mut errors);
+        let marked = resolve_choice(remote_requested, None, &entries, false, &mut errors);
         if !errors.is_empty() {
             return Err(field_errors(&errors));
         }
@@ -2720,6 +2707,14 @@ impl Services {
         };
         let env = EnvDoc::fresh(entries);
         let account = env_account(&id);
+
+        // The choice first: an entry with no metadata is inert and pruned.
+        // While the choices file is unreadable, only an explicit choice fails.
+        if let Err(e) = store.save_choice(ChoiceKey::Profile(&id), marked) {
+            if remote_requested.is_some() {
+                return Err(e);
+            }
+        }
 
         // Journal → secret → metadata (see module docs).
         let before = profiles.as_ref().clone();
@@ -2750,7 +2745,9 @@ impl Services {
         )
         .await;
         let running = self.profile_activation.running_processes(&meta.id);
-        Ok(json!({ "profile": profile_json(&meta, &env, running), "revision": revision }))
+        Ok(
+            json!({ "profile": profile_json(&meta, &env, running, store.profile_choice(&id)), "revision": revision }),
+        )
     }
 
     async fn provider_profiles_update_owned(
@@ -2761,6 +2758,7 @@ impl Services {
         let raw_name = opt_string(&params, "name")?;
         let writes = opt_env(&params)?;
         let backup = opt_bool(&params, "backup")?;
+        let remote_requested = opt_bool(&params, "remoteCompatible")?;
 
         let store = &self.provider_profiles;
         let _guard = store.lock().await;
@@ -2797,28 +2795,55 @@ impl Services {
                 &mut errors,
             )
         });
+        // An explicit choice needs a readable choices file (§5.54).
+        if remote_requested.is_some() {
+            store.choices()?;
+        }
+        let current_marked = store
+            .profile_choice(&profile_id)
+            .unwrap_or_else(|| migration_rule(&saved_doc.entries, false));
+        let marked = resolve_choice(
+            remote_requested,
+            Some(current_marked),
+            entries.as_deref().unwrap_or(&saved_doc.entries),
+            false,
+            &mut errors,
+        );
         if !errors.is_empty() {
             return Err(field_errors(&errors));
         }
+        let final_entries = entries.as_deref().unwrap_or(&saved_doc.entries);
+        let remote_changed = store
+            .profile_choice(&profile_id)
+            .unwrap_or_else(|| migration_rule(final_entries, false))
+            != marked;
 
         let env_changed = entries
             .as_ref()
             .is_some_and(|entries| *entries != saved_doc.entries || saved.is_none());
         let name_changed = name.as_ref().is_some_and(|n| *n != current.name);
         let backup_changed = backup.is_some_and(|b| b != current.backup);
-        if !env_changed && !name_changed && !backup_changed {
+        if !env_changed && !name_changed && !backup_changed && !remote_changed {
             let running = self.profile_activation.running_processes(&profile_id);
             return Ok(json!({
-                "profile": profile_json(&current, &saved_doc, running),
+                "profile": profile_json(&current, &saved_doc, running, store.profile_choice(&profile_id)),
                 "revision": store.revision(),
                 "activation": { "envChanged": false, "runningProcesses": running },
             }));
         }
 
         let account = env_account(&profile_id);
+        let previous_choices = if remote_changed {
+            store.save_choice(ChoiceKey::Profile(&profile_id), marked)?
+        } else {
+            None
+        };
         let env = if env_changed {
             let next = EnvDoc::fresh(entries.unwrap_or_default());
-            self.secrets.store(&account, &next.encode()?).await?;
+            if let Err(e) = async { self.secrets.store(&account, &next.encode()?).await }.await {
+                store.restore_choices(previous_choices);
+                return Err(e);
+            }
             next
         } else {
             saved_doc
@@ -2834,6 +2859,7 @@ impl Services {
         let mut after = profiles.as_ref().clone();
         after[index] = meta.clone();
         if let Err(e) = store.persist(after, store.pending()) {
+            store.restore_choices(previous_choices);
             if env_changed {
                 let restored = match &saved {
                     Some(previous) => match previous.encode() {
@@ -2877,7 +2903,7 @@ impl Services {
         }
         let running = self.profile_activation.running_processes(&profile_id);
         Ok(json!({
-            "profile": profile_json(&meta, &env, running),
+            "profile": profile_json(&meta, &env, running, store.profile_choice(&profile_id)),
             "revision": revision,
             "activation": { "envChanged": env_changed, "runningProcesses": running },
         }))
@@ -2940,6 +2966,7 @@ impl Services {
                 tracing::warn!(profile_id = %profile_id, error = %e, "provider profile secret delete failed; it is removed at next start");
             }
         }
+        store.forget_choice(&profile_id);
 
         // An in-progress turn finishes on its process; later turns need a
         // replacement (`providerReplacementRequired`), not earlier settings.

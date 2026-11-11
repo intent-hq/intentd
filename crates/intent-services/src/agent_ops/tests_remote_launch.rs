@@ -29,6 +29,9 @@ struct FakeRemote {
     fail_launch: bool,
     /// A `nodeId` admission refuses with `placement-unavailable`.
     refuse_node: Option<&'static str>,
+    /// The node's own sign-in is out: a machine sign-in launch is refused
+    /// with `machine-not-signed-in`, as placement would.
+    signed_out: bool,
     /// Each final stop recorded, and whether the agent's script-stop wait
     /// (`end_agent_machine_runs`) had already run then.
     final_stops: Mutex<Vec<(AgentId, bool)>>,
@@ -99,6 +102,23 @@ impl RemoteLaunchPort for FakeRemote {
         needs: &'a RemoteLaunchNeeds,
     ) -> BoxFuture<'a, intent_core::Result<RemotePlacementView>> {
         self.needs.lock().unwrap().push(needs.clone());
+        if self.signed_out
+            && needs.machine_sign_in
+            && !needs.profile_fallback
+            && !placement.is_e2b()
+        {
+            let error = intent_core::machines::machine_not_signed_in(
+                &needs.provider,
+                &[intent_core::machines::SignedOutMachine {
+                    node_id: "node-1".into(),
+                    name: "Mac Studio".into(),
+                    status: intent_core::node_link::ProviderStatus::SignedOut,
+                    observed_at: intent_core::now_iso(),
+                }],
+                false,
+            );
+            return Box::pin(async move { Err(error) });
+        }
         if placement.node_id.is_some() && placement.node_id.as_deref() == self.refuse_node {
             let failure =
                 PlatformAvailability::none(intent_core::now_iso()).unavailable(placement.clone());
@@ -199,6 +219,8 @@ async fn a_placed_create_persists_its_node_and_reports_what_it_starts_from() {
             sets_profile_env: false,
             provider_ref: "auggie".into(),
             inherited: false,
+            machine_sign_in: false,
+            profile_fallback: false,
         }]
     );
 
@@ -403,7 +425,7 @@ async fn a_saved_profile_is_admitted_for_a_remote_agent() {
     .await
     .expect("create profile");
     let reference = created["profile"]["providerRef"].as_str().unwrap();
-    let view = svc
+    let (view, _) = svc
         .admit_remote_agent(
             &ws,
             reference,
@@ -425,6 +447,8 @@ async fn a_saved_profile_is_admitted_for_a_remote_agent() {
             sets_profile_env: true,
             provider_ref: reference.into(),
             inherited: false,
+            machine_sign_in: false,
+            profile_fallback: false,
         }]
     );
 }
@@ -643,15 +667,11 @@ fn assert_not_remote_compatible(
         panic!("expected profile-not-remote-compatible, got {result:?}");
     };
     assert!(!failure.internal);
-    assert_eq!(
-        failure.data,
-        json!({
-            "code": "profile-not-remote-compatible",
-            "providerRef": reference,
-            "reason": "account-folder",
-            "keys": [key],
-        })
-    );
+    assert_eq!(failure.data["code"], "profile-not-remote-compatible");
+    assert_eq!(failure.data["providerRef"], reference);
+    assert_eq!(failure.data["reason"], "account-folder");
+    assert_eq!(failure.data["keys"], json!([key]));
+    assert!(failure.data["name"].is_string(), "{}", failure.data);
     assert!(
         failure.message.contains("account folder") && failure.message.contains(key),
         "{}",
@@ -659,10 +679,11 @@ fn assert_not_remote_compatible(
     );
 }
 
-/// A configuration that sets an account folder never runs on another
-/// machine, so placement refuses it before asking any machine (§5.54
-/// "Remote compatibility"): a profile, or a bare base whose Default
-/// overrides set one.
+/// A profile that sets an account folder never runs on another machine, so
+/// placement refuses it before asking any machine (§5.54 "Remote
+/// compatibility"). A Default that sets one is never marked: with machine
+/// sign-in on (the default) it sends nothing and the machine's own sign-in
+/// runs it.
 #[tokio::test]
 async fn placement_refuses_a_configuration_tied_to_this_backend() {
     let (_t, svc, ws) = setup().await;
@@ -695,20 +716,26 @@ async fn placement_refuses_a_configuration_tied_to_this_backend() {
     )
     .await
     .unwrap();
-    let result = svc
-        .admit_remote_agent(
-            &ws,
-            "claude-code",
-            None,
-            &placement(json!({"target": "remote"})),
-            false,
-        )
-        .await;
-    assert_not_remote_compatible(&result, "claude-code", "CLAUDE_CONFIG_DIR");
     assert!(
         remote.needs.lock().unwrap().is_empty(),
-        "no machine was asked"
+        "no machine was asked for the folder profile"
     );
+    svc.admit_remote_agent(
+        &ws,
+        "claude-code",
+        None,
+        &placement(json!({"target": "remote"})),
+        false,
+    )
+    .await
+    .expect("an unmarked Default runs through machine sign-in");
+    let needs = remote.needs.lock().unwrap().clone();
+    assert_eq!(needs.len(), 1);
+    assert!(
+        !needs[0].with_profile,
+        "the folder never leaves the backend"
+    );
+    assert!(needs[0].machine_sign_in);
 }
 
 /// A remote agent switches to another model its machine offers: saved, and
@@ -757,20 +784,28 @@ async fn a_remote_agent_cannot_switch_to_what_its_machine_does_not_offer() {
     )
     .await;
     let id = remote_agent(&svc, &ws).await;
-    for (model, provider) in [("opus4.5", None), ("opus", Some("claude-code"))] {
-        let result = svc
-            .agent_set_model_op(id.clone(), model.into(), provider.map(str::to_owned))
-            .await;
-        let Err(Error::ModelUnavailable(failure)) = &result else {
-            panic!("{model}: expected model-unavailable, got {result:?}");
-        };
-        let data = failure.data();
-        assert_eq!(data["code"], "model-unavailable");
-        assert_eq!(data["model"], model);
-        let machines = data["machines"].as_array().unwrap();
-        assert_eq!(machines.len(), 1, "{data}");
-        assert_eq!(machines[0]["nodeId"], "node-1");
-    }
+    let result = svc
+        .agent_set_model_op(id.clone(), "opus4.5".into(), None)
+        .await;
+    let Err(Error::ModelUnavailable(failure)) = &result else {
+        panic!("expected model-unavailable, got {result:?}");
+    };
+    let data = failure.data();
+    assert_eq!(data["code"], "model-unavailable");
+    assert_eq!(data["model"], "opus4.5");
+    let machines = data["machines"].as_array().unwrap();
+    assert_eq!(machines.len(), 1, "{data}");
+    assert_eq!(machines[0]["nodeId"], "node-1");
+    // The Default sends nothing, and the machine is signed out there.
+    let result = svc
+        .agent_set_model_op(id.clone(), "opus".into(), Some("claude-code".into()))
+        .await;
+    let Err(Error::RemoteMachine(failure)) = &result else {
+        panic!("expected machine-not-signed-in, got {result:?}");
+    };
+    assert_eq!(failure.data["code"], "machine-not-signed-in");
+    assert_eq!(failure.data["machines"][0]["nodeId"], "node-1");
+    assert_eq!(failure.data["machines"][0]["status"], "signed-out");
     let session = svc
         .store
         .get_agent_session_with_transcript(&id)
@@ -1545,4 +1580,248 @@ async fn only_an_ancestor_may_stop_or_delete_an_agent() {
         assert!(row.retired_at.is_none(), "{id} changed");
     }
     assert_eq!(unsettled(&svc, &parent).await, 2);
+}
+
+// --- Auto-pick on a signed-out machine ---------------------------------------
+
+use intent_core::node_link::ProviderStatus;
+
+async fn marked_profile(svc: &Services, base: &str, name: &str) -> String {
+    let key = if base == "codex" {
+        "OPENAI_API_KEY"
+    } else {
+        "ANTHROPIC_API_KEY"
+    };
+    daemon_profile(
+        svc,
+        base,
+        name,
+        json!([{ "key": key, "kind": "set", "value": "sk-remote-pick" }]),
+    )
+    .await
+}
+
+async fn unmarked_profile(svc: &Services, base: &str, name: &str) -> String {
+    let reference = marked_profile(svc, base, name).await;
+    let id = reference.split_once('@').unwrap().1.to_owned();
+    intent_core::caller::with_caller(
+        intent_core::caller::Caller::Daemon,
+        svc.provider_profiles_update_impl(id, json!({ "remoteCompatible": false })),
+    )
+    .await
+    .expect("unmark");
+    reference
+}
+
+/// The plain Default on a machine signed out of the provider sends the
+/// first profile marked for remote machines, in the saved profile order.
+#[tokio::test]
+async fn a_plain_default_on_a_signed_out_machine_sends_the_first_marked_profile() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote {
+        signed_out: true,
+        ..FakeRemote::default()
+    });
+    let svc = svc.with_remote_launch_port(remote.clone());
+    expose_node(
+        &svc,
+        vec![offered("claude-code", ProviderStatus::SignedOut, &["opus"])],
+    )
+    .await;
+    unmarked_profile(&svc, "claude-code", "Personal").await;
+    let first = marked_profile(&svc, "claude-code", "Work").await;
+    marked_profile(&svc, "claude-code", "Team").await;
+    let (view, picked) = svc
+        .admit_remote_agent(
+            &ws,
+            "claude-code",
+            None,
+            &placement(json!({"target": "remote"})),
+            false,
+        )
+        .await
+        .expect("a marked profile is sent instead");
+    assert_eq!(view.node_id, "node-1");
+    let picked = picked.expect("a profile was picked");
+    assert_eq!(picked.provider_ref, first);
+    assert_eq!(picked.reason, "machine-signed-out");
+    assert_eq!(picked.machine, "Mac Studio");
+    // The machine is chosen first, with signed-out machines kept as
+    // candidates; the profile is picked for the machine that was chosen.
+    let needs = remote.needs.lock().unwrap().clone();
+    assert_eq!(needs.len(), 1, "{needs:?}");
+    assert!(needs[0].machine_sign_in && needs[0].profile_fallback);
+}
+
+#[tokio::test]
+async fn a_plain_default_with_no_marked_profile_is_machine_not_signed_in() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote {
+        signed_out: true,
+        ..FakeRemote::default()
+    }));
+    unmarked_profile(&svc, "claude-code", "Personal").await;
+    marked_profile(&svc, "codex", "Other provider").await;
+    let result = svc
+        .admit_remote_agent(
+            &ws,
+            "claude-code",
+            None,
+            &placement(json!({"target": "remote"})),
+            false,
+        )
+        .await;
+    let Err(Error::RemoteMachine(failure)) = &result else {
+        panic!("expected machine-not-signed-in, got {result:?}");
+    };
+    assert_eq!(failure.data["code"], "machine-not-signed-in");
+}
+
+/// A profile picked explicitly is never replaced, even by a marked one.
+#[tokio::test]
+async fn an_explicit_profile_is_never_swapped() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote {
+        signed_out: true,
+        ..FakeRemote::default()
+    }));
+    let unmarked = unmarked_profile(&svc, "claude-code", "Personal").await;
+    marked_profile(&svc, "claude-code", "Work").await;
+    let result = svc
+        .admit_remote_agent(
+            &ws,
+            &unmarked,
+            None,
+            &placement(json!({"target": "remote"})),
+            false,
+        )
+        .await;
+    let Err(Error::ProviderProfile(failure)) = &result else {
+        panic!("expected profile-not-remote-compatible, got {result:?}");
+    };
+    assert_eq!(failure.data["reason"], "not-marked");
+}
+
+/// A machine whose sign-in is unknown (or signed in) runs the plain Default
+/// on its own sign-in; nothing is picked.
+#[tokio::test]
+async fn an_unknown_sign_in_tries_the_machines_own_sign_in() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    expose_node(
+        &svc,
+        vec![offered("claude-code", ProviderStatus::Unknown, &["opus"])],
+    )
+    .await;
+    marked_profile(&svc, "claude-code", "Work").await;
+    let (_view, picked) = svc
+        .admit_remote_agent(
+            &ws,
+            "claude-code",
+            None,
+            &placement(json!({"target": "remote"})),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(picked.is_none());
+    let needs = remote.needs.lock().unwrap().clone();
+    assert_eq!(needs.len(), 1);
+    assert!(needs[0].machine_sign_in);
+}
+
+/// E2B has no sign-in: the plain Default sends the first marked profile
+/// that sends a sign-in, instead of being refused.
+#[tokio::test]
+async fn a_plain_default_on_e2b_sends_the_first_marked_profile() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    // Marked but sends nothing: a sandbox cannot use it.
+    daemon_profile(
+        &svc,
+        "claude-code",
+        "Empty",
+        json!([{ "key": "ANTHROPIC_BASE_URL", "kind": "unset" }]),
+    )
+    .await;
+    let token = marked_profile(&svc, "claude-code", "Token").await;
+    let (_view, picked) = svc
+        .admit_remote_agent(
+            &ws,
+            "claude-code",
+            None,
+            &placement(json!({"target": "e2b"})),
+            false,
+        )
+        .await
+        .expect("a marked token profile is sent");
+    let picked = picked.expect("picked");
+    assert_eq!(picked.provider_ref, token);
+    assert_eq!(picked.reason, "sandbox-no-sign-in");
+
+    // With no marked profile the refusal stays.
+    let (_t2, svc2, ws2) = setup().await;
+    let svc2 = svc2.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    let result = svc2
+        .admit_remote_agent(
+            &ws2,
+            "claude-code",
+            None,
+            &placement(json!({"target": "e2b"})),
+            false,
+        )
+        .await;
+    assert!(result.is_err(), "{result:?}");
+}
+
+/// The created agent runs on the picked profile, and its transcript says so
+/// the way a failover switch is reported.
+#[tokio::test]
+async fn the_agent_shows_which_profile_ran() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote {
+        signed_out: true,
+        ..FakeRemote::default()
+    }));
+    expose_node(
+        &svc,
+        vec![offered("claude-code", ProviderStatus::SignedOut, &["opus"])],
+    )
+    .await;
+    let work = marked_profile(&svc, "claude-code", "Work").await;
+    let created = svc
+        .agent_create_op(
+            ws.clone(),
+            Some("Remote".into()),
+            Some("opus".into()),
+            None,
+            None,
+            None,
+            false,
+            AgentCreateExtra {
+                provider: Some("claude-code".into()),
+                placement: Some(placement(json!({"target": "remote"}))),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("created on the picked profile");
+    assert_eq!(created["agent"]["provider"], work.as_str());
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let messages = svc.store.get_agent_messages(&id, None).await.unwrap();
+    let notice = messages
+        .iter()
+        .find_map(|m| {
+            m.metadata
+                .as_ref()
+                .filter(|meta| meta["type"] == "provider_auto_selected")
+                .cloned()
+        })
+        .expect("an auto-selection notice");
+    assert_eq!(notice["fromProvider"], "claude-code");
+    assert_eq!(notice["toProvider"], work.as_str());
+    assert_eq!(notice["reason"], "machine-signed-out");
+    assert_eq!(notice["machine"], "Mac Studio");
 }

@@ -48,7 +48,9 @@ async fn list_reports_every_unrenamed_default_with_no_entries() {
                 "env": [],
                 "settingsFingerprint": "",
                 "activation": { "runningProcesses": 0 },
-                "remoteCompatible": true,
+                "remoteCompatible": false,
+                "remoteIncompatibility": { "reason": "not-marked", "keys": [] },
+                "remoteLaunch": "machine-sign-in",
             })
         })
         .collect();

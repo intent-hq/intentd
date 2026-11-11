@@ -236,6 +236,10 @@ impl PlacementError {
 /// What a remote launch needs from the machine it is placed on, for
 /// placement across exposed machines.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent facts placement reads, not a state machine"
+)]
 pub struct RemoteLaunchNeeds {
     /// The base provider id the machines report (`claude-code`, `codex`),
     /// without a profile suffix.
@@ -256,6 +260,13 @@ pub struct RemoteLaunchNeeds {
     /// with none: from an agent on a cloud machine it means that sandbox.
     /// An explicit `target: "e2b"` always means a new sandbox.
     pub inherited: bool,
+    /// A machine sign-in launch: the Default configuration sending nothing,
+    /// so a signed-out machine is `machine-not-signed-in`.
+    pub machine_sign_in: bool,
+    /// A machine sign-in launch with a marked profile to fall back on: a
+    /// signed-out machine stays a candidate, and the profile is sent if one
+    /// is chosen.
+    pub profile_fallback: bool,
 }
 
 /// The [`REMOTE_PLACEMENT_METADATA_KEY`] value: the projection fields of an
