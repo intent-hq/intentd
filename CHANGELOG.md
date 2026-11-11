@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.180] - 2026-11-11
+
+### 🚀 Features
+
+- Let agents rename a titled workspace on explicit user request ([#3265](https://github.com/intent-hq/intentd/pull/3265))
+
+
 ## [0.11.179] - 2026-11-11
 
 ### ⚙️ Miscellaneous Tasks
