@@ -2382,9 +2382,13 @@ impl Services {
         if !errors.is_empty() {
             return Err(field_errors(&errors));
         }
-        // A missing entry is saved too, so the choice no longer follows
-        // the migration rule once written.
-        let remote_changed = store.default_choice(base) != Some(marked);
+        // A missing entry is saved only when the migration rule would now
+        // read otherwise, so a write that changes nothing saves nothing.
+        let final_entries = entries.as_deref().unwrap_or(&saved_doc.entries);
+        let remote_changed = store
+            .default_choice(base)
+            .unwrap_or_else(|| migration_rule(final_entries, true))
+            != marked;
 
         // A recorded environment whose document is missing reads empty
         // (with no fingerprint); any env write replaces or clears it.
@@ -2792,7 +2796,11 @@ impl Services {
         if !errors.is_empty() {
             return Err(field_errors(&errors));
         }
-        let remote_changed = store.profile_choice(&profile_id) != Some(marked);
+        let final_entries = entries.as_deref().unwrap_or(&saved_doc.entries);
+        let remote_changed = store
+            .profile_choice(&profile_id)
+            .unwrap_or_else(|| migration_rule(final_entries, false))
+            != marked;
 
         let env_changed = entries
             .as_ref()

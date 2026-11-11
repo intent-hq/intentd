@@ -236,6 +236,10 @@ impl PlacementError {
 /// What a remote launch needs from the machine it is placed on, for
 /// placement across exposed machines.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent facts placement reads, not a state machine"
+)]
 pub struct RemoteLaunchNeeds {
     /// The base provider id the machines report (`claude-code`, `codex`),
     /// without a profile suffix.

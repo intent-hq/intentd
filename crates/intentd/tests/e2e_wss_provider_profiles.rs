@@ -1035,7 +1035,11 @@ async fn provider_default_overrides_contract_over_wss() {
                 ],
                 "settingsFingerprint": fingerprint,
                 "activation": { "runningProcesses": 0 },
-                "remoteCompatible": true,
+                // Saving overrides never marks the Default for remote
+                // machines; it still runs there through machine sign-in.
+                "remoteCompatible": false,
+                "remoteIncompatibility": { "reason": "not-marked", "keys": [] },
+                "remoteLaunch": "machine-sign-in",
             },
             "revision": 1,
             "activation": { "envChanged": true, "runningProcesses": 0 },
