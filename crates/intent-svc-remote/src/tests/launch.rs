@@ -1701,7 +1701,13 @@ async fn held_proxy(
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_start_during_a_credential_replacement_waits_and_is_refused() {
-    let (f, _link, machine) = fixture().await;
+    // The proxy holds the probe's dial on purpose, so one connect attempt
+    // must outlast the hold plus a slow runner's handshake.
+    let mut tuning = super::tuning();
+    tuning.connect.attempt = wait();
+    let backend = Backend::with_tuning(tuning).await;
+    let mut machine = backend.machine().await;
+    let (f, _link) = Fixture::start_on(backend, &mut machine).await;
     let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
     let agent = f.agent(&view).await;
     f.port()

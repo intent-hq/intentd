@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use intent_core::machines::cloud_machine_unavailable;
 use intent_core::{Error, Result};
-use intent_nodes::e2b::{E2bClient, ProcessSpec, Sandbox, SecretString};
+use intent_nodes::cloud::{CloudInstance, CloudProvider, ProcessSpec, SecretString};
 
 /// Test seam: dial the sandbox daemon at this host (its WSS port) instead of
 /// its tailcat address, for a fake E2B that runs the sandbox locally.
@@ -168,12 +168,16 @@ fn tail(stderr: &[u8]) -> String {
 ///
 /// `cloud-machine-unavailable` `bootstrap-failed` when a step fails, or the
 /// E2B error of a failed call.
-pub(crate) async fn run(client: &E2bClient, sandbox: &Sandbox, backend: &Value) -> Result<Minted> {
+pub(crate) async fn run(
+    client: &dyn CloudProvider,
+    sandbox: &CloudInstance,
+    backend: &Value,
+) -> Result<Minted> {
     let mut start = ProcessSpec::new("/bin/sh");
     start.args = vec!["-c".into(), START_SCRIPT.into()];
     start.timeout = Some(Duration::from_secs(60));
     let started = client
-        .run_process(sandbox, &start)
+        .run_command(sandbox, &start)
         .await
         .map_err(|error| super::config::to_error(&error, super::config::Phase::Other))?;
     if !started.success() {
@@ -209,7 +213,7 @@ pub(crate) async fn run(client: &E2bClient, sandbox: &Sandbox, backend: &Value) 
     }
     mint.envs = envs;
     let minted = client
-        .run_process(sandbox, &mint)
+        .run_command(sandbox, &mint)
         .await
         .map_err(|error| super::config::to_error(&error, super::config::Phase::Other))?;
     if !minted.success() {

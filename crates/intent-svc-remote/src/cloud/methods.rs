@@ -10,7 +10,7 @@ use intent_core::machines::{
 };
 use intent_core::machines::{CloudMachineSize, ExposedMachine, CLOUD_PROVIDER_E2B};
 use intent_core::{now_iso, Error, Result, WorkspaceId};
-use intent_nodes::e2b::SecretString;
+use intent_nodes::cloud::SecretString;
 use intent_services::feature_api::Services;
 
 use super::config::{self, ProviderConfig};
@@ -507,10 +507,7 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     // 5. Forget the key; when E2B kept one of the entry's sandboxes, keep
     //    it hidden for the reaper.
     // Other entries, their sandboxes and their starts are untouched.
-    let client = config::saved_client(svc, &id)
-        .await
-        .ok()
-        .map(std::sync::Arc::new);
+    let client = config::saved_client(svc, &id).await.ok();
     svc.store().delete_cloud_machine_provider(&id).await?;
     let deadline = tokio::time::Instant::now() + super::start::START_WAIT;
     for mut start in feature.cloud.starts_in_flight(&id) {
@@ -538,7 +535,7 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     }
     forget_entry_on_agents(svc, &id).await?;
     let left = match &client {
-        Some(client) => super::lifecycle::entry_sandboxes_left(svc, client, &id).await,
+        Some(client) => super::lifecycle::entry_sandboxes_left(svc, &**client, &id).await,
         None => false,
     };
     if left {
@@ -648,7 +645,7 @@ async fn paused(feature: &RemoteFeature, svc: &Services, row: &ExposedMachine) -
         }
     }
     let client = config::saved_client(svc, entry).await?;
-    let paused = super::lifecycle::pause(svc, feature, &client, &row.id).await?;
+    let paused = super::lifecycle::pause(svc, feature, &*client, &row.id).await?;
     let live = feature.running_node(&paused.id);
     Ok(json!({
         "machine": crate::methods::machine_json(&paused, live.as_ref().map(crate::RemoteNode::shared_ref)),
@@ -660,6 +657,6 @@ async fn kill(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result
     // Without a working key the records still go; the reaper deletes the
     // sandbox once a working key is saved.
     let client = config::saved_client(svc, row_entry(&row)).await.ok();
-    let unconfirmed = super::start::delete_machine(feature, svc, &row, client.as_ref()).await;
+    let unconfirmed = super::start::delete_machine(feature, svc, &row, client.as_deref()).await;
     Ok(json!({ "ok": true, "unconfirmedStops": unconfirmed }))
 }

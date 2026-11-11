@@ -1,5 +1,7 @@
 //! Client for the E2B sandbox REST API and the in-sandbox envd process API.
 //!
+//! [`E2bClient`] is also the E2B adapter of [`crate::cloud::CloudProvider`].
+//!
 //! This is transport only: it creates, resumes, pauses and deletes sandboxes,
 //! lists them by metadata, and runs commands inside them. Placement and
 //! bootstrap logic live elsewhere.
@@ -12,15 +14,15 @@ mod client;
 mod envd;
 mod error;
 mod manifest;
+mod provider;
 mod secret;
 
+pub use crate::cloud::{ProcessExit, ProcessOutput, ProcessSpec};
 pub use client::{
     ConnectedSandbox, CreateSandbox, E2bClient, E2bConfig, ListSandboxes, ListedSandbox, Sandbox,
     SandboxState, DEFAULT_API_URL, DEFAULT_ENVD_URL,
 };
-pub use envd::{
-    OutputChunk, ProcessEvent, ProcessExit, ProcessOutput, ProcessSpec, ProcessStream, ENVD_PORT,
-};
+pub use envd::{OutputChunk, ProcessEvent, ProcessStream, ENVD_PORT};
 pub use error::{E2bError, QuotaLimit};
 pub use manifest::{
     fetch_template_manifest, manifest_url, TemplateManifest, DEFAULT_MANIFEST_BASE_URL,
@@ -32,5 +34,7 @@ pub use secret::{load_api_key, SecretString, API_KEY_ACCOUNT};
 mod fake;
 #[cfg(test)]
 mod live_tests;
+#[cfg(test)]
+mod provider_tests;
 #[cfg(test)]
 mod tests;

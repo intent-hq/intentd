@@ -1336,7 +1336,7 @@ async fn final_stop_placed(
                     return;
                 };
                 let client = crate::cloud::saved_client(&svc, &row).await;
-                crate::cloud::delete_machine(feature, &svc, &row, client.as_ref()).await;
+                crate::cloud::delete_machine(feature, &svc, &row, client.as_deref()).await;
             });
         }
     }

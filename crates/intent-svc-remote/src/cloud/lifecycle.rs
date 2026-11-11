@@ -22,10 +22,10 @@ use intent_core::machines::{
 };
 use intent_core::remote_launch::PlacementError;
 use intent_core::{now_iso, Error, Result};
-use intent_nodes::e2b::{E2bClient, E2bError, ListSandboxes, SandboxState};
+use intent_nodes::cloud::{CloudProvider, InstanceState, ListInstances};
 use intent_services::feature_api::Services;
 
-use super::config;
+use super::config::{self, Provider};
 use super::start::Removal;
 use crate::connect::ConnectFailure;
 use crate::connector::Shared;
@@ -206,7 +206,7 @@ impl CloudGate {
         else {
             return Ok(pauses);
         };
-        match resume(&self.svc, feature, &client, &row).await {
+        match resume(&self.svc, feature, &*client, &row).await {
             Ok(()) => Ok(pauses),
             Err(Resumed::Lost) => {
                 sandbox_lost(&self.svc, feature, Some(shared), &row);
@@ -269,7 +269,7 @@ enum Resumed {
 async fn resume(
     svc: &Services,
     feature: &RemoteFeature,
-    client: &E2bClient,
+    client: &dyn CloudProvider,
     row: &ExposedMachine,
 ) -> std::result::Result<(), Resumed> {
     let Some(cloud) = &row.cloud else {
@@ -292,7 +292,7 @@ async fn resume(
             feature.cloud.touch(&row.id);
             Ok(())
         }
-        Err(E2bError::NotFound(_)) => Err(Resumed::Lost),
+        Err(error) if error.is_not_found() => Err(Resumed::Lost),
         Err(error) => {
             tracing::warn!(machine = %row.id, %error, "cloud machine: E2B refused the resume");
             if paused {
@@ -431,7 +431,7 @@ fn sandbox_outdated(svc: &Services, feature: &RemoteFeature, shared: &Shared, ma
         let client = config::saved_client(&svc, super::methods::row_entry(&row))
             .await
             .ok();
-        super::start::remove_machine(feature, &svc, &row, client.as_ref(), Removal::Unlinkable)
+        super::start::remove_machine(feature, &svc, &row, client.as_deref(), Removal::Unlinkable)
             .await;
     });
 }
@@ -446,7 +446,7 @@ fn sandbox_outdated(svc: &Services, feature: &RemoteFeature, shared: &Shared, ma
 pub(crate) async fn pause(
     svc: &Services,
     feature: &RemoteFeature,
-    client: &E2bClient,
+    client: &dyn CloudProvider,
     machine_id: &str,
 ) -> Result<ExposedMachine> {
     let _lifecycle = feature.lifecycle(machine_id).await;
@@ -484,12 +484,13 @@ pub(crate) async fn pause(
     let paused = match client.pause(&cloud.sandbox_id).await {
         Ok(()) => Ok(()),
         // E2B may have paused it already (its timeout ran out).
-        Err(E2bError::Conflict(_))
-            if lookup(svc, client, &cloud).await == Ok(Some(SandboxState::Paused)) =>
+        Err(error)
+            if error.is_conflict()
+                && lookup(svc, client, &cloud).await == Ok(Some(InstanceState::Paused)) =>
         {
             Ok(())
         }
-        Err(E2bError::NotFound(_)) => {
+        Err(error) if error.is_not_found() => {
             sandbox_lost(svc, feature, None, &row);
             return Err(sandbox_lost_error());
         }
@@ -524,23 +525,23 @@ pub(crate) async fn pause(
 /// in no state, `Err(())` when that cannot be known (the list failed).
 async fn lookup(
     svc: &Services,
-    client: &E2bClient,
+    client: &dyn CloudProvider,
     cloud: &CloudMachine,
-) -> std::result::Result<Option<SandboxState>, ()> {
+) -> std::result::Result<Option<InstanceState>, ()> {
     let backend = svc.store().daemon_id().await.map_err(drop)?;
     let mut metadata = BTreeMap::new();
     metadata.insert("intentBackendId".to_owned(), backend);
     metadata.insert("agentId".to_owned(), cloud.agent_id.clone());
     client
-        .list(&ListSandboxes {
-            metadata,
-            states: vec![SandboxState::Running, SandboxState::Paused],
+        .list(&ListInstances {
+            tags: metadata,
+            states: vec![InstanceState::Running, InstanceState::Paused],
         })
         .await
         .map(|listed| {
             listed
                 .into_iter()
-                .find(|listed| listed.sandbox_id == cloud.sandbox_id)
+                .find(|listed| listed.id == cloud.sandbox_id)
                 .map(|listed| listed.state)
         })
         .map_err(|error| {
@@ -552,7 +553,7 @@ async fn lookup(
 /// when not, the removal deletes it without a final stop.
 pub(crate) async fn resume_for_stop(
     feature: &RemoteFeature,
-    client: &E2bClient,
+    client: &dyn CloudProvider,
     row: &ExposedMachine,
 ) -> bool {
     let _transition = feature.cloud.transition(&row.id).await;
@@ -632,7 +633,7 @@ async fn tick(
     }
     for (id, saved) in &entries {
         let client = match config::saved_client(svc, id).await {
-            Ok(client) => Arc::new(client),
+            Ok(client) => client,
             Err(error) => {
                 tracing::debug!(entry = %id, %error, "cloud machines: no client for an E2B entry");
                 note(None);
@@ -647,7 +648,7 @@ async fn tick(
         }
         // Every row counts as known: entries may share an E2B project.
         if reap_due {
-            note(reap(svc, feature, &client, clock, &rows).await);
+            note(reap(svc, feature, &*client, clock, &rows).await);
         }
     }
     if let (true, Some(listed)) = (reap_due, listed) {
@@ -664,7 +665,7 @@ async fn tick(
 async fn check(
     svc: &Services,
     feature: &RemoteFeature,
-    client: &Arc<E2bClient>,
+    client: &Provider,
     saved: &config::ProviderConfig,
     clock: Clock,
     row: &ExposedMachine,
@@ -683,7 +684,7 @@ async fn check(
                 .last_renew
                 .is_none_or(|at| at.elapsed() >= clock.minutes(RENEW_MINUTES))
             {
-                renew(svc, feature, client, row, cloud).await;
+                renew(svc, feature, &**client, row, cloud).await;
             }
             if busy || !settled {
                 return;
@@ -715,19 +716,19 @@ async fn check(
 async fn renew(
     svc: &Services,
     feature: &RemoteFeature,
-    client: &E2bClient,
+    client: &dyn CloudProvider,
     row: &ExposedMachine,
     cloud: &CloudMachine,
 ) {
     match client
-        .set_timeout(&cloud.sandbox_id, SANDBOX_TIMEOUT_SECS)
+        .keep_alive(&cloud.sandbox_id, SANDBOX_TIMEOUT_SECS)
         .await
     {
         Ok(()) => feature.cloud.renewed(&row.id),
-        Err(E2bError::NotFound(_)) => match lookup(svc, client, cloud).await {
+        Err(error) if error.is_not_found() => match lookup(svc, client, cloud).await {
             // E2B paused it itself (its timeout ran out while this backend
             // was away): a demand resumes it.
-            Ok(Some(SandboxState::Paused)) => {
+            Ok(Some(InstanceState::Paused)) => {
                 feature.cloud.park(&row.id);
                 set_state(svc, feature, &row.id, CloudSandboxState::Paused).await;
             }
@@ -744,7 +745,7 @@ async fn renew(
 
 /// Pause in the background; `planned` (the run cap) resumes at once when
 /// the link is still wanted, so the cap resets without a visible pause.
-fn spawn_pause(svc: &Services, client: &Arc<E2bClient>, machine_id: &str, planned: bool) {
+fn spawn_pause(svc: &Services, client: &Provider, machine_id: &str, planned: bool) {
     let svc = svc.clone();
     let client = client.clone();
     let machine_id = machine_id.to_owned();
@@ -752,7 +753,7 @@ fn spawn_pause(svc: &Services, client: &Arc<E2bClient>, machine_id: &str, planne
         let Ok(feature) = super::feature(&svc) else {
             return;
         };
-        if let Err(error) = pause(&svc, feature, &client, &machine_id).await {
+        if let Err(error) = pause(&svc, feature, &*client, &machine_id).await {
             tracing::debug!(machine = %machine_id, %error, "cloud machine: not paused");
             return;
         }
@@ -770,12 +771,7 @@ fn spawn_pause(svc: &Services, client: &Arc<E2bClient>, machine_id: &str, planne
 }
 
 /// Delete a machine in the background (resume, final stops, delete).
-fn spawn_kill(
-    svc: &Services,
-    feature: &RemoteFeature,
-    client: &Arc<E2bClient>,
-    row: &ExposedMachine,
-) {
+fn spawn_kill(svc: &Services, feature: &RemoteFeature, client: &Provider, row: &ExposedMachine) {
     if !feature.cloud.begin_kill(&row.id) {
         return;
     }
@@ -786,7 +782,7 @@ fn spawn_kill(
         let Ok(feature) = super::feature(&svc) else {
             return;
         };
-        super::start::delete_machine(feature, &svc, &row, Some(&client)).await;
+        super::start::delete_machine(feature, &svc, &row, Some(&*client)).await;
         feature.cloud.end_kill(&row.id);
     });
 }
@@ -818,8 +814,8 @@ async fn reap_retired(
     let Ok(client) = config::client(key) else {
         return None;
     };
-    let listed = reap(svc, feature, &client, clock, rows).await;
-    if entry_sandboxes_left(svc, &client, from).await {
+    let listed = reap(svc, feature, &*client, clock, rows).await;
+    if entry_sandboxes_left(svc, &*client, from).await {
         return listed;
     }
     if let Err(error) = svc.delete_cloud_machine_key(row_id).await {
@@ -837,22 +833,26 @@ async fn reap_retired(
 /// Whether E2B still lists a sandbox of this backend started with entry
 /// `id` (one from before entries counts for `"e2b"`). `true` when E2B cannot
 /// answer, so a key is never dropped too soon.
-pub(crate) async fn entry_sandboxes_left(svc: &Services, client: &E2bClient, id: &str) -> bool {
+pub(crate) async fn entry_sandboxes_left(
+    svc: &Services,
+    client: &dyn CloudProvider,
+    id: &str,
+) -> bool {
     let Ok(backend) = svc.store().daemon_id().await else {
         return true;
     };
     let mut metadata = BTreeMap::new();
     metadata.insert("intentBackendId".to_owned(), backend);
     match client
-        .list(&ListSandboxes {
-            metadata,
-            states: vec![SandboxState::Running, SandboxState::Paused],
+        .list(&ListInstances {
+            tags: metadata,
+            states: vec![InstanceState::Running, InstanceState::Paused],
         })
         .await
     {
         Ok(listed) => listed.iter().any(|sandbox| {
             sandbox
-                .metadata
+                .tags
                 .get("intentEntryId")
                 .map_or(id == config::legacy_entry(), |entry| entry == id)
         }),
@@ -868,7 +868,7 @@ pub(crate) async fn entry_sandboxes_left(svc: &Services, client: &E2bClient, id:
 async fn reap(
     svc: &Services,
     feature: &RemoteFeature,
-    client: &E2bClient,
+    client: &dyn CloudProvider,
     clock: Clock,
     rows: &[ExposedMachine],
 ) -> Option<Vec<String>> {
@@ -878,9 +878,9 @@ async fn reap(
     let mut metadata = BTreeMap::new();
     metadata.insert("intentBackendId".to_owned(), backend);
     let listed = match client
-        .list(&ListSandboxes {
-            metadata,
-            states: vec![SandboxState::Running, SandboxState::Paused],
+        .list(&ListInstances {
+            tags: metadata,
+            states: vec![InstanceState::Running, InstanceState::Paused],
         })
         .await
     {
@@ -895,14 +895,11 @@ async fn reap(
         .filter_map(|row| row.cloud.as_ref().map(|c| c.sandbox_id.as_str()))
         .collect();
     let starting = feature.cloud.starting_agents();
-    let ids = listed
-        .iter()
-        .map(|sandbox| sandbox.sandbox_id.clone())
-        .collect();
+    let ids = listed.iter().map(|sandbox| sandbox.id.clone()).collect();
     for sandbox in listed {
-        if known.contains(sandbox.sandbox_id.as_str())
+        if known.contains(sandbox.id.as_str())
             || sandbox
-                .metadata
+                .tags
                 .get("agentId")
                 .is_some_and(|agent| starting.contains(agent))
         {
@@ -911,12 +908,7 @@ async fn reap(
         // An unreadable start time counts from when the reaper first saw
         // the sandbox, so it still gets the whole grace.
         let age = parse_rfc3339(&sandbox.started_at).map_or_else(
-            || {
-                feature
-                    .cloud
-                    .first_seen_orphan(&sandbox.sandbox_id)
-                    .elapsed()
-            },
+            || feature.cloud.first_seen_orphan(&sandbox.id).elapsed(),
             |at| {
                 (time::OffsetDateTime::now_utc() - at)
                     .try_into()
@@ -926,13 +918,13 @@ async fn reap(
         if age < clock.minutes(REAP_GRACE_MINUTES) {
             continue;
         }
-        match client.delete(&sandbox.sandbox_id).await {
+        match client.delete(&sandbox.id).await {
             Ok(_) => {
-                feature.cloud.forget_orphan(&sandbox.sandbox_id);
-                tracing::info!(sandbox = %sandbox.sandbox_id, "cloud machines: deleted a sandbox no machine knows");
+                feature.cloud.forget_orphan(&sandbox.id);
+                tracing::info!(sandbox = %sandbox.id, "cloud machines: deleted a sandbox no machine knows");
             }
             Err(error) => {
-                tracing::warn!(sandbox = %sandbox.sandbox_id, %error, "cloud machines: could not delete an orphan sandbox");
+                tracing::warn!(sandbox = %sandbox.id, %error, "cloud machines: could not delete an orphan sandbox");
             }
         }
     }

@@ -15,7 +15,8 @@ use intent_core::machines::{
     CLOUD_E2B_LEGACY_ENTRY, CLOUD_PROVIDER_E2B, CLOUD_PROVIDER_E2B_NAME,
 };
 use intent_core::{now_iso, Error, Result};
-use intent_nodes::e2b::{E2bClient, E2bConfig, E2bError, QuotaLimit, SecretString};
+use intent_nodes::cloud::{CloudError, CloudErrorKind, CloudProvider, QuotaLimit, SecretString};
+use intent_nodes::e2b::{E2bClient, E2bConfig};
 use intent_services::feature_api::Services;
 
 /// The E2B project that publishes the intent-node templates (Intent's).
@@ -478,8 +479,11 @@ pub(crate) async fn migrate(svc: &Services) -> Result<()> {
     Ok(())
 }
 
-/// A client for `key`.
-pub(crate) fn client(key: SecretString) -> Result<E2bClient> {
+/// One provider account, shared by the calls that use its saved key.
+pub(crate) type Provider = std::sync::Arc<dyn CloudProvider>;
+
+/// A provider for `key`.
+pub(crate) fn client(key: SecretString) -> Result<Provider> {
     let mut config = E2bConfig::default();
     if let Ok(url) = std::env::var(API_URL_ENV) {
         if !url.is_empty() {
@@ -491,15 +495,18 @@ pub(crate) fn client(key: SecretString) -> Result<E2bClient> {
             config.envd_url = url;
         }
     }
-    E2bClient::new(key, config).map_err(|error| to_error(&error, Phase::Other))
+    match E2bClient::new(key, config) {
+        Ok(client) => Ok(std::sync::Arc::new(client)),
+        Err(error) => Err(to_error(&error.into(), Phase::Other)),
+    }
 }
 
-/// A client for entry `id`'s saved key.
+/// A provider for entry `id`'s saved key.
 ///
 /// # Errors
 ///
 /// `cloud-machine-unavailable` `not-configured` without a saved key.
-pub(crate) async fn saved_client(svc: &Services, id: &str) -> Result<E2bClient> {
+pub(crate) async fn saved_client(svc: &Services, id: &str) -> Result<Provider> {
     let key = saved_key(svc, id).await?.ok_or_else(not_configured)?;
     client(key)
 }
@@ -542,12 +549,9 @@ pub(crate) enum Phase {
 
 /// The documented error for an E2B failure. Messages are E2B's own, which
 /// the client already scrubbed of the key and tokens.
-pub(crate) fn to_error(error: &E2bError, phase: Phase) -> Error {
+pub(crate) fn to_error(error: &CloudError, phase: Phase) -> Error {
     if let Some(limit) = error.quota_limit() {
-        let retry_after = match error {
-            E2bError::RateLimited { retry_after, .. } => retry_after.map(|d| d.as_secs()),
-            _ => None,
-        };
+        let retry_after = error.retry_after().map(|d| d.as_secs());
         let message = match limit {
             QuotaLimit::Plan => "E2B refused this sandbox size for the project's plan or limits: pick a smaller size in Settings → Nodes, or use E2B Pro and ask E2B support to raise the project's limits.",
             QuotaLimit::Concurrency => "E2B's limit on running sandboxes for this project is reached: stop or pause another sandbox, or raise the plan's limit.",
@@ -555,11 +559,11 @@ pub(crate) fn to_error(error: &E2bError, phase: Phase) -> Error {
         };
         return cloud_quota(limit.as_str(), retry_after, message);
     }
-    match error {
-        E2bError::NotConfigured => not_configured(),
+    match error.kind() {
+        CloudErrorKind::NotConfigured => not_configured(),
         // A create E2B forbids is about the template (another project's,
         // not public), not the key: a rejected key fails with 401.
-        E2bError::Unauthorized { status: 403 } if phase == Phase::Create => {
+        CloudErrorKind::Unauthorized if error.status() == Some(403) && phase == Phase::Create => {
             cloud_machine_unavailable(
                 "template-missing",
                 false,
@@ -567,23 +571,23 @@ pub(crate) fn to_error(error: &E2bError, phase: Phase) -> Error {
                 "E2B does not let this project use the Intent template for this backend's version and size; no sandbox was left behind.",
             )
         }
-        E2bError::Unauthorized { status } => key_rejected(Some(*status)),
-        E2bError::NotFound(_) if phase == Phase::Create => cloud_machine_unavailable(
+        CloudErrorKind::Unauthorized => key_rejected(error.status()),
+        CloudErrorKind::NotFound if phase == Phase::Create => cloud_machine_unavailable(
             "template-missing",
             false,
             Some(404),
             "E2B has no template for this backend's Intent version and size; no sandbox was left behind.",
         ),
-        other => {
-            let status = match other {
-                E2bError::Api { status, .. } => Some(*status),
+        kind => {
+            let status = match kind {
+                CloudErrorKind::Api => error.status(),
                 _ => None,
             };
             cloud_machine_unavailable(
                 "api-error",
-                other.is_retryable(),
+                error.is_retryable(),
                 status,
-                format!("E2B failed: {other}"),
+                format!("E2B failed: {error}"),
             )
         }
     }
