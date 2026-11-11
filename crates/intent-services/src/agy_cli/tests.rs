@@ -1,7 +1,8 @@
 //! Failure modes: an unparseable version must not update; a current agy must
 //! not update; an old agy updates once, even with concurrent callers; a failed
 //! update or one that leaves agy old returns an actionable error and is not
-//! retried at once; a hanging update times out.
+//! retried at once; a hanging update times out; a cancelled caller does not
+//! stop the update or lose its recorded failure.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -91,4 +92,47 @@ async fn hanging_update_times_out() {
         .await
         .unwrap_err();
     assert!(error.contains("timed out"), "{error}");
+}
+
+#[tokio::test]
+async fn cancelled_caller_does_not_stop_the_update_or_its_failure_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("agy");
+    let started = dir.path().join("started");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo 1.3.4 ;;\nupdate) : > '{}'; sleep 1; echo x >> '{}/updates'; exit 3 ;;\nesac\n",
+            started.display(),
+            dir.path().display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let error = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            let caller = {
+                let bin = bin.clone();
+                tokio::spawn(
+                    async move { ensure_current_with(&bin, Duration::from_secs(60)).await },
+                )
+            };
+            // Cancel the caller once `agy update` is running.
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            caller.abort();
+            loop {
+                if let Some(reason) = super::recent_failure(&bin) {
+                    break reason;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        },
+    )
+    .await
+    .expect("the detached update records its failure");
+    assert!(error.contains("exited with"), "{error}");
+    assert_eq!(updates(dir.path()), 1);
 }

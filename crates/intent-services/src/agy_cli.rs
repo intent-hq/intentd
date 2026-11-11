@@ -37,6 +37,16 @@ async fn ensure_current_with(binary: &Path, update_timeout: Duration) -> Result<
     if found >= MIN_VERSION_TRIPLE {
         return Ok(());
     }
+    // A detached task owns the update, so a caller cancelled by its own
+    // budget (a background catalog refresh) cannot kill it or skip recording
+    // a failure. Dropping the handle does not abort the task.
+    let binary = binary.to_path_buf();
+    tokio::spawn(async move { update_single_flight(&binary, update_timeout).await })
+        .await
+        .unwrap_or_else(|err| Err(format!("agy update task failed: {err}")))
+}
+
+async fn update_single_flight(binary: &Path, update_timeout: Duration) -> Result<(), String> {
     let lock = update_lock(binary);
     let _guard = lock.lock().await;
     // A concurrent caller may have finished the update while this one waited.

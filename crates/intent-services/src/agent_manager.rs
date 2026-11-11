@@ -5463,15 +5463,16 @@ impl AgentManager {
                     return Ok(Some(response));
                 }
                 Err(e) => {
-                    // Codex is the only production provider with this
-                    // capability. Its explicit selection must succeed before
-                    // any prompt (or successful model-change notice) is sent.
-                    if provider.config_option_model_strips_effort {
+                    // Codex and Antigravity: an explicit selection must
+                    // succeed before any prompt (or successful model-change
+                    // notice) is sent.
+                    if provider.config_option_model_required {
                         self.kill_child_only(agent_id).await;
                         return Err(match &e {
                             intent_acp::AcpError::Rpc(rpc) if rpc.code == -32602 => {
                                 Error::InvalidParams(format!(
-                                    "Could not apply Codex model '{model_id}': {e}. Select a supported model and retry."
+                                    "Could not apply {} model '{model_id}': {e}. Select a supported model and retry.",
+                                    provider.short_name
                                 ))
                             }
                             // Preserve the ACP detail for the existing spawn
@@ -14650,6 +14651,7 @@ fn resolve_spawn(
             supports_session_mcp_servers: session_mcp,
             supports_config_option_model: config_option_model,
             config_option_model_strips_effort: config_option_model && strips_effort,
+            config_option_model_required: config_option_model && strips_effort,
             supports_set_model: set_model,
             ..*base
         };
