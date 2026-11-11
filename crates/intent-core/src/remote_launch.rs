@@ -263,6 +263,10 @@ pub struct RemoteLaunchNeeds {
     /// A machine sign-in launch: the Default configuration sending nothing,
     /// so a signed-out machine is `machine-not-signed-in`.
     pub machine_sign_in: bool,
+    /// A machine sign-in launch with a marked profile to fall back on: a
+    /// signed-out machine stays a candidate, and the profile is sent if one
+    /// is chosen.
+    pub profile_fallback: bool,
 }
 
 /// The [`REMOTE_PLACEMENT_METADATA_KEY`] value: the projection fields of an

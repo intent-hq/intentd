@@ -152,6 +152,7 @@ fn request<'a>(placement: &'a AgentPlacement, model: Option<&'a str>) -> Placeme
         model,
         with_profile: false,
         machine_sign_in: false,
+        profile_fallback: false,
     }
 }
 
@@ -1284,6 +1285,7 @@ fn switch_check(
             model,
             with_profile,
             machine_sign_in: false,
+            profile_fallback: false,
         },
         now(),
     )
@@ -1507,6 +1509,7 @@ fn a_machine_sign_in_switch_on_a_signed_out_machine_is_machine_not_signed_in() {
             model: Some("gpt-5"),
             with_profile: false,
             machine_sign_in: true,
+            profile_fallback: false,
         },
         now(),
     ));
@@ -1544,4 +1547,25 @@ fn help_hides_a_signed_out_provider_without_a_remote_compatible_profile() {
         shown.contains("codex signed-out [gpt-5], with a profile marked for remote machines"),
         "{shown}"
     );
+}
+
+/// A plain Default with a marked profile to fall back on keeps a machine
+/// signed out of the provider as a candidate (its CLI installed); the
+/// backend sends the profile after choosing it. Without one it does not.
+#[tokio::test]
+async fn a_profile_fallback_keeps_signed_out_machines_as_candidates() {
+    let fake = signed_out_fleet();
+    let placement = remote();
+    let mut chosen = select(
+        &fake,
+        PlacementRequest {
+            machine_sign_in: true,
+            profile_fallback: true,
+            ..request(&placement, Some("opus"))
+        },
+    )
+    .await
+    .unwrap();
+    chosen.sort();
+    assert_eq!(chosen, ["failed", "out"], "a missing CLI is still out");
 }

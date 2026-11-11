@@ -6224,11 +6224,12 @@ impl Services {
         intent_core::remote_launch::RemotePlacementView,
         Option<RemoteAutoSelection>,
     )> {
-        let admit = |reference: String| async move {
+        let admit = |reference: String, profile_fallback: bool| async move {
             let mut needs = self
                 .remote_launch_needs(&reference, model, placement)
                 .await?;
             needs.inherited = inherited;
+            needs.profile_fallback = profile_fallback && needs.machine_sign_in;
             self.ports
                 .remote_launch()
                 .admit(self, workspace_id, placement, &needs)
@@ -6237,11 +6238,18 @@ impl Services {
         self.admit_with_auto_pick(provider, placement, admit).await
     }
 
-    /// Admit `provider`; when it is a plain Default that the machine's own
-    /// sign-in cannot run (`machine-not-signed-in`, or any refusal on E2B,
-    /// which has no sign-in), admit the first profile marked for remote
-    /// machines instead and say which. Only if there is none does the
-    /// original refusal stand. A profile is never replaced.
+    /// Admit `provider`, auto-picking a profile for a plain Default the
+    /// chosen machine cannot sign in (nodes.md "Placement across machines"):
+    ///
+    /// 1. A plain Default with a profile marked for remote machines to fall
+    ///    back on keeps machines signed out of the provider as candidates.
+    /// 2. After the machine is chosen, a machine signed out of the provider
+    ///    runs that profile (the first marked one, in profile order).
+    /// 3. On E2B, which has no sign-in, a plain Default the launch rules
+    ///    refuse runs that profile (it must send a set variable).
+    ///
+    /// With no profile to fall back on, the plain Default's own result
+    /// stands. A profile chosen explicitly is never replaced.
     async fn admit_with_auto_pick<F, Fut>(
         &self,
         provider: &str,
@@ -6252,64 +6260,86 @@ impl Services {
         Option<RemoteAutoSelection>,
     )>
     where
-        F: Fn(String) -> Fut,
+        F: Fn(String, bool) -> Fut,
         Fut: std::future::Future<Output = Result<intent_core::remote_launch::RemotePlacementView>>,
     {
-        let error = match admit(provider.to_owned()).await {
-            Ok(view) => return Ok((view, None)),
-            Err(error) => error,
-        };
         if !crate::provider_profiles::is_default_config_ref(provider) {
-            return Err(error);
+            return admit(provider.to_owned(), false)
+                .await
+                .map(|view| (view, None));
         }
         let cloud = placement.is_e2b();
-        let signed_out = matches!(&error, Error::RemoteMachine(failure)
-            if failure.data["code"] == intent_core::machines::MACHINE_NOT_SIGNED_IN_CODE);
-        let no_sign_in = cloud
-            && match &error {
-                Error::ProviderProfile(failure) => {
-                    failure.data["code"] == crate::provider_profiles::PROFILE_NOT_REMOTE_COMPATIBLE
-                }
-                Error::RemoteMachine(failure) => {
-                    failure.data["code"] == intent_core::machines::CLOUD_PROFILE_REQUIRED_CODE
-                }
-                _ => false,
-            };
-        if !signed_out && !no_sign_in {
-            return Err(error);
-        }
         let target = if cloud {
             crate::RemoteTarget::Cloud
         } else {
             crate::RemoteTarget::Machine
         };
-        let Some(picked) = self.first_remote_profile(provider, target).await else {
-            return Err(error);
-        };
-        let view = admit(picked.clone()).await?;
-        let machine = if signed_out {
-            match &error {
-                Error::RemoteMachine(failure) => failure.data["machines"][0]["name"]
-                    .as_str()
-                    .map_or_else(|| view.node_name.clone(), str::to_owned),
-                _ => view.node_name.clone(),
-            }
-        } else {
-            "E2B".to_owned()
-        };
-        Ok((
-            view,
-            Some(RemoteAutoSelection {
+        let fallback = self.first_remote_profile(provider, target).await;
+        let selection =
+            |picked: String, reason: &'static str, machine: String| RemoteAutoSelection {
                 from: provider.to_owned(),
                 provider_ref: picked,
-                reason: if signed_out {
-                    "machine-signed-out"
-                } else {
-                    "sandbox-no-sign-in"
-                },
+                reason,
                 machine,
-            }),
-        ))
+            };
+        match admit(provider.to_owned(), fallback.is_some() && !cloud).await {
+            Ok(view) => {
+                let Some(picked) = fallback.filter(|_| !cloud) else {
+                    return Ok((view, None));
+                };
+                let sends_nothing = self
+                    .remote_launch_plan(provider, crate::RemoteTarget::Machine)
+                    .await
+                    .is_ok_and(|plan| plan.machine_sign_in);
+                if sends_nothing && self.machine_signed_out(&view.node_id, provider).await {
+                    let machine = view.node_name.clone();
+                    return Ok((view, Some(selection(picked, "machine-signed-out", machine))));
+                }
+                Ok((view, None))
+            }
+            Err(error) => {
+                let no_sign_in = cloud
+                    && match &error {
+                        Error::ProviderProfile(failure) => {
+                            failure.data["code"]
+                                == crate::provider_profiles::PROFILE_NOT_REMOTE_COMPATIBLE
+                        }
+                        Error::RemoteMachine(failure) => {
+                            failure.data["code"]
+                                == intent_core::machines::CLOUD_PROFILE_REQUIRED_CODE
+                        }
+                        _ => false,
+                    };
+                match fallback {
+                    Some(picked) if no_sign_in => {
+                        let view = admit(picked.clone(), false).await?;
+                        Ok((
+                            view,
+                            Some(selection(picked, "sandbox-no-sign-in", "E2B".to_owned())),
+                        ))
+                    }
+                    _ => Err(error),
+                }
+            }
+        }
+    }
+
+    /// Whether the exposed machine `node_id` last reported `base` as signed
+    /// out (`signed-out` or `auth-failed`).
+    async fn machine_signed_out(&self, node_id: &str, base: &str) -> bool {
+        use intent_core::node_link::ProviderStatus;
+        let Ok(Some(row)) = self.store.get_exposed_machine(node_id).await else {
+            return false;
+        };
+        row.capabilities.as_ref().is_some_and(|caps| {
+            caps.providers.iter().any(|p| {
+                p.id == base
+                    && matches!(
+                        p.status,
+                        ProviderStatus::SignedOut | ProviderStatus::AuthFailed
+                    )
+            })
+        })
     }
 
     /// [`Self::admit_remote_agent`] for `workspace.create`'s initial agent,
@@ -6327,13 +6357,14 @@ impl Services {
             return Ok(());
         }
         let model = plan.model.clone();
-        let admit = |reference: String| {
+        let admit = |reference: String, profile_fallback: bool| {
             let placement = &placement;
             let model = model.as_deref();
             async move {
-                let needs = self
+                let mut needs = self
                     .remote_launch_needs(&reference, model, placement)
                     .await?;
+                needs.profile_fallback = profile_fallback && needs.machine_sign_in;
                 self.ports
                     .remote_launch()
                     .admit_new_workspace(self, placement, &needs)
@@ -6393,6 +6424,7 @@ impl Services {
             provider_ref: provider.to_owned(),
             inherited: false,
             machine_sign_in: plan.machine_sign_in,
+            profile_fallback: false,
         })
     }
 
@@ -7504,6 +7536,7 @@ impl Services {
                 model: Some(model).filter(|model| *model != "default"),
                 with_profile: profile.is_some(),
                 machine_sign_in: plan.machine_sign_in,
+                profile_fallback: false,
             },
             time::OffsetDateTime::now_utc(),
         )

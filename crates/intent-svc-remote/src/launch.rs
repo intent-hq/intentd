@@ -763,6 +763,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                 model: needs.model.as_deref(),
                 with_profile: needs.with_profile,
                 machine_sign_in: needs.machine_sign_in,
+                profile_fallback: needs.profile_fallback,
             };
             let candidates =
                 select_machines(&source, request, time::OffsetDateTime::now_utc()).await?;

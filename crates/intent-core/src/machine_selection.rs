@@ -65,6 +65,11 @@ pub struct PlacementRequest<'a> {
     /// A machine sign-in launch: the Default configuration sending nothing.
     /// Signed-out machines are then `machine-not-signed-in`.
     pub machine_sign_in: bool,
+    /// A machine sign-in launch that has a profile marked for remote
+    /// machines to fall back on: a machine signed out of the provider stays
+    /// a candidate (its CLI must be installed), and the backend sends that
+    /// profile if it is chosen.
+    pub profile_fallback: bool,
 }
 
 /// Whether `report` is missing, unreadable or older than
@@ -474,13 +479,15 @@ fn not_signed_in(
 
 fn offers(row: &ExposedMachine, request: &PlacementRequest<'_>) -> bool {
     provider_of(row, request.provider).is_some_and(|provider| {
-        provider_usable(provider.status, request.with_profile)
-            && request.model.is_none_or(|model| {
-                provider
-                    .models
-                    .iter()
-                    .any(|listed| model_listed(listed, model))
-            })
+        provider_usable(
+            provider.status,
+            request.with_profile || request.profile_fallback,
+        ) && request.model.is_none_or(|model| {
+            provider
+                .models
+                .iter()
+                .any(|listed| model_listed(listed, model))
+        })
     })
 }
 

@@ -102,7 +102,11 @@ impl RemoteLaunchPort for FakeRemote {
         needs: &'a RemoteLaunchNeeds,
     ) -> BoxFuture<'a, intent_core::Result<RemotePlacementView>> {
         self.needs.lock().unwrap().push(needs.clone());
-        if self.signed_out && needs.machine_sign_in && !placement.is_e2b() {
+        if self.signed_out
+            && needs.machine_sign_in
+            && !needs.profile_fallback
+            && !placement.is_e2b()
+        {
             let error = intent_core::machines::machine_not_signed_in(
                 &needs.provider,
                 &[intent_core::machines::SignedOutMachine {
@@ -216,6 +220,7 @@ async fn a_placed_create_persists_its_node_and_reports_what_it_starts_from() {
             provider_ref: "auggie".into(),
             inherited: false,
             machine_sign_in: false,
+            profile_fallback: false,
         }]
     );
 
@@ -443,6 +448,7 @@ async fn a_saved_profile_is_admitted_for_a_remote_agent() {
             provider_ref: reference.into(),
             inherited: false,
             machine_sign_in: false,
+            profile_fallback: false,
         }]
     );
 }
@@ -1578,6 +1584,8 @@ async fn only_an_ancestor_may_stop_or_delete_an_agent() {
 
 // --- Auto-pick on a signed-out machine ---------------------------------------
 
+use intent_core::node_link::ProviderStatus;
+
 async fn marked_profile(svc: &Services, base: &str, name: &str) -> String {
     let key = if base == "codex" {
         "OPENAI_API_KEY"
@@ -1615,6 +1623,11 @@ async fn a_plain_default_on_a_signed_out_machine_sends_the_first_marked_profile(
         ..FakeRemote::default()
     });
     let svc = svc.with_remote_launch_port(remote.clone());
+    expose_node(
+        &svc,
+        vec![offered("claude-code", ProviderStatus::SignedOut, &["opus"])],
+    )
+    .await;
     unmarked_profile(&svc, "claude-code", "Personal").await;
     let first = marked_profile(&svc, "claude-code", "Work").await;
     marked_profile(&svc, "claude-code", "Team").await;
@@ -1633,11 +1646,11 @@ async fn a_plain_default_on_a_signed_out_machine_sends_the_first_marked_profile(
     assert_eq!(picked.provider_ref, first);
     assert_eq!(picked.reason, "machine-signed-out");
     assert_eq!(picked.machine, "Mac Studio");
+    // The machine is chosen first, with signed-out machines kept as
+    // candidates; the profile is picked for the machine that was chosen.
     let needs = remote.needs.lock().unwrap().clone();
-    assert_eq!(needs.len(), 2, "{needs:?}");
-    assert!(needs[0].machine_sign_in, "the machine's own sign-in first");
-    assert!(needs[1].with_profile && !needs[1].machine_sign_in);
-    assert_eq!(needs[1].provider_ref, first);
+    assert_eq!(needs.len(), 1, "{needs:?}");
+    assert!(needs[0].machine_sign_in && needs[0].profile_fallback);
 }
 
 #[tokio::test]
@@ -1696,6 +1709,11 @@ async fn an_unknown_sign_in_tries_the_machines_own_sign_in() {
     let (_t, svc, ws) = setup().await;
     let remote = Arc::new(FakeRemote::default());
     let svc = svc.with_remote_launch_port(remote.clone());
+    expose_node(
+        &svc,
+        vec![offered("claude-code", ProviderStatus::Unknown, &["opus"])],
+    )
+    .await;
     marked_profile(&svc, "claude-code", "Work").await;
     let (_view, picked) = svc
         .admit_remote_agent(
@@ -1767,6 +1785,11 @@ async fn the_agent_shows_which_profile_ran() {
         signed_out: true,
         ..FakeRemote::default()
     }));
+    expose_node(
+        &svc,
+        vec![offered("claude-code", ProviderStatus::SignedOut, &["opus"])],
+    )
+    .await;
     let work = marked_profile(&svc, "claude-code", "Work").await;
     let created = svc
         .agent_create_op(
