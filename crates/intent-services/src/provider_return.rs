@@ -674,6 +674,10 @@ impl Services {
         let Some(until) = self.provider_quota_cache.exhausted_until(current, now) else {
             return;
         };
+        if self.runs_on_machine_sign_in(session, current).await {
+            tracing::debug!(agent = %agent_id, provider = %current, "marked out of quota on this backend, but the remote launch uses the machine's own sign-in; not moved");
+            return;
+        }
         let Ok(profiles) = self.provider_profiles.profiles() else {
             return;
         };
@@ -700,6 +704,26 @@ impl Services {
             false,
         )
         .await;
+    }
+
+    /// Whether a remote agent's launch of `reference` sends nothing, so it
+    /// runs on its machine's own sign-in: an account other than this
+    /// backend's, which this backend's quota marks say nothing about
+    /// (intent-hq/intent#9100).
+    async fn runs_on_machine_sign_in(&self, session: &AgentSession, reference: &str) -> bool {
+        let Some(view) = intent_core::remote_launch::RemotePlacementView::from_metadata(
+            session.metadata.as_ref(),
+        ) else {
+            return false;
+        };
+        let target = if view.is_cloud() {
+            crate::RemoteTarget::Cloud
+        } else {
+            crate::RemoteTarget::Machine
+        };
+        self.remote_launch_plan(reference, target)
+            .await
+            .is_ok_and(|plan| plan.machine_sign_in)
     }
 
     /// Re-arm the first-output acceptance of a return attempt already

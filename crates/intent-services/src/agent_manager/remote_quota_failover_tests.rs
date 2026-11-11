@@ -287,11 +287,25 @@ async fn a_remote_backup_the_node_cannot_start_fails_with_an_actionable_message(
     );
 }
 
+/// Mark the Default for remote machines with an override, so a remote
+/// launch of plain `claude-code` sends this backend's account.
+async fn send_the_default_remotely(mgr: &AgentManager) {
+    mgr.services
+        .provider_profiles_update_default_impl(json!({
+            "baseProviderId": "claude-code",
+            "env": [{ "key": "CLAUDE_CODE_OAUTH_TOKEN", "kind": "set", "value": "tok-default" }],
+            "remoteCompatible": true,
+        }))
+        .await
+        .expect("mark the Default with overrides");
+}
+
 /// A remote agent whose configuration the shared quota cache marks out of
 /// quota at the start of a turn moves to the backup the same way, even with
 /// its previous run still live: failover is the one provider switch a
 /// remote agent allows, so the run is replaced instead of the turn being
-/// refused as `remote-model-change-unsupported`.
+/// refused as `remote-model-change-unsupported`. The mark applies because a
+/// marked Default with overrides sends this backend's account.
 #[intent_test_macros::daemon_test]
 async fn a_remote_agent_skips_a_marked_configuration_onto_a_backup_its_node_starts() {
     let ws = WorkspaceId::from("ws-remote-failover-skip");
@@ -303,6 +317,7 @@ async fn a_remote_agent_skips_a_marked_configuration_onto_a_backup_its_node_star
         Launch::Runs(backup_run.clone()),
     ]);
     let (_tmp, mgr, backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    send_the_default_remotely(&mgr).await;
 
     send(&mgr, &id, &ws, "first").await;
     primary.wait_prompts(1).await;
@@ -339,6 +354,53 @@ async fn a_remote_agent_skips_a_marked_configuration_onto_a_backup_its_node_star
         .await
         .unwrap();
     assert_eq!(failover_rows(&messages).len(), 1, "{messages:#?}");
+}
+
+/// A remote launch of a Default that sends nothing runs on the machine's own
+/// sign-in, another account than this backend's: the backend's out-of-quota
+/// mark on `claude-code` never moves it (intent-hq/intent#9100). The turn
+/// starts on the plain reference, on the same run, with no failover row.
+#[intent_test_macros::daemon_test]
+async fn a_machine_sign_in_launch_ignores_the_backends_quota_mark() {
+    let ws = WorkspaceId::from("ws-remote-failover-machine-sign-in");
+    let id = AgentId::from("agent-remote-failover-machine-sign-in");
+    let primary = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![Launch::Runs(primary.clone())]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    let plan = mgr
+        .services
+        .remote_launch_plan("claude-code", crate::RemoteTarget::Machine)
+        .await
+        .unwrap();
+    assert!(plan.machine_sign_in, "{plan:?}");
+
+    mgr.services.provider_quota_cache.mark_exhausted(
+        &crate::profile_activation::SettingsRead::elsewhere("claude-code"),
+        None,
+        chrono::Utc::now(),
+    );
+    send(&mgr, &id, &ws, "hello").await;
+    primary.wait_prompts(1).await;
+    primary.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(port.asked.load(Ordering::SeqCst), 1);
+    assert_eq!(primary.stops.load(Ordering::SeqCst), 0);
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert_eq!(session.provider.as_deref(), Some("claude-code"));
+    assert_ne!(session.status, AgentStatus::Error);
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert!(failover_rows(&messages).is_empty(), "{messages:#?}");
 }
 
 /// A remote agent out of quota whose only backup uses an account folder on
