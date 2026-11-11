@@ -3051,6 +3051,10 @@ pub struct AgentManager {
     /// `<supervisor>` XML so the fresh session has context, then clears the flag
     /// (parity: TS `sessionWasRecreated`).
     recreated: Arc<Mutex<HashSet<AgentId>>>,
+    /// Whether each remote agent's live run launched on its machine's own
+    /// sign-in. A turn that reuses the run keeps that account, whatever the
+    /// settings say now (intent-hq/intent#9100).
+    remote_machine_sign_in: Arc<Mutex<HashMap<AgentId, bool>>>,
     /// Agents already told that their workspace's setup script `failed`
     /// (§6.5): the failure notice is prepended to exactly one turn per agent,
     /// the first that starts after the failure. In-memory like the setup
@@ -3306,6 +3310,7 @@ impl AgentManager {
             workers: Arc::new(Mutex::new(HashMap::new())),
             finishing_workers: Mutex::new(Vec::new()),
             recreated: Arc::new(Mutex::new(HashSet::new())),
+            remote_machine_sign_in: Arc::new(Mutex::new(HashMap::new())),
             setup_failure_notified: Arc::new(Mutex::new(HashSet::new())),
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
             stale_cancels: Arc::new(Mutex::new(HashMap::new())),
@@ -12361,6 +12366,16 @@ impl AgentManager {
             }
         }
         if self.handle_is_live(agent_id) {
+            let live = self
+                .remote_machine_sign_in
+                .lock()
+                .unwrap()
+                .get(agent_id)
+                .copied();
+            if let Some(live) = live {
+                self.services
+                    .set_quota_failover_attempt_machine_sign_in(agent_id, live);
+            }
             return Ok(StartedSession {
                 session_id,
                 turn: self.capture_turn(agent_id)?,
@@ -12450,6 +12465,10 @@ impl AgentManager {
                 "agent session {agent_id} is being deleted"
             )));
         }
+        self.remote_machine_sign_in
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), machine_sign_in);
         // Output the node streams between turns becomes implicit turns, as
         // for a local agent.
         let listener = self.spawn_wake_listener(agent_id.clone(), workspace_id.clone());

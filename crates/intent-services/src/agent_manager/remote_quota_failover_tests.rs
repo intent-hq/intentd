@@ -515,6 +515,48 @@ async fn a_machine_sign_in_turn_does_not_clear_the_backends_mark() {
     );
 }
 
+/// The Default marked to be sent while a machine sign-in run is live does
+/// not change that run's account: its next turn still runs on the machine's
+/// own sign-in, so its quota failure does not mark this backend's account.
+#[intent_test_macros::daemon_test]
+async fn a_live_machine_sign_in_run_keeps_its_account_after_the_default_is_sent() {
+    let ws = WorkspaceId::from("ws-remote-quota-live");
+    let id = AgentId::from("agent-remote-quota-live");
+    let primary = FakeRuntime::new();
+    let backup_run = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    send(&mgr, &id, &ws, "first").await;
+    primary.wait_prompts(1).await;
+    primary.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    send_the_default_remotely(&mgr).await;
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    send(&mgr, &id, &ws, "second").await;
+    backup_run.wait_prompts(1).await;
+    backup_run.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    let provider = mgr
+        .services
+        .store
+        .get_agent_session_without_messages(&id)
+        .await
+        .unwrap()
+        .provider
+        .unwrap_or_default();
+    assert_eq!(provider, backup, "the remote agent still fails over");
+    assert!(
+        mgr.services.exhausted_providers().is_empty(),
+        "{:?}",
+        mgr.services.exhausted_providers()
+    );
+}
+
 /// A remote agent out of quota whose only backup uses an account folder on
 /// this backend never switches to it (strict: whether or not the machine
 /// has the folder): it stays on its configuration and fails with what to do,

@@ -313,6 +313,25 @@ impl Services {
         }
     }
 
+    /// Correct the recorded attempt's machine sign-in answer to the one of
+    /// the live remote run it reuses (see
+    /// [`Self::note_quota_failover_attempt`]).
+    pub(crate) fn set_quota_failover_attempt_machine_sign_in(
+        &self,
+        agent_id: &AgentId,
+        machine_sign_in: bool,
+    ) {
+        if let Some(attempt) = self
+            .quota_failover_chains
+            .lock()
+            .unwrap()
+            .get_mut(agent_id)
+            .and_then(|c| c.attempt.as_mut())
+        {
+            attempt.machine_sign_in = machine_sign_in;
+        }
+    }
+
     /// The armed attempt produced output (or completed without any): its
     /// configuration has quota right now, so the shared cache marks it
     /// working for every conversation (see
