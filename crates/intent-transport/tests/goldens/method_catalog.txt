@@ -95,6 +95,8 @@ router agent.getQueue
 router agent.getSession
 router agent.getSessionStats
 router agent.getSubscriptions
+router agent.importSession
+router agent.importableSessions.list
 router agent.list
 router agent.listActive
 router agent.listInterrupted

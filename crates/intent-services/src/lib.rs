@@ -72,6 +72,7 @@ mod plain_folder;
 mod remote_machine_ops;
 mod remote_skills;
 mod retire;
+pub mod session_import;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;
 pub(crate) use retire::UnarchiveOutcome;
@@ -30486,6 +30487,42 @@ impl WorkspaceApi for Services {
                     .await
                 },
             )
+            .await
+        })
+    }
+
+    fn agent_importable_sessions_list(
+        &self,
+        provider: Option<String>,
+        query: Option<String>,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.agent_importable_sessions_list_op(session_import::ImportableListParams {
+                provider,
+                query,
+                cursor,
+                limit,
+            })
+            .await
+        })
+    }
+
+    fn agent_import_session(
+        &self,
+        workspace_id: WorkspaceId,
+        provider: String,
+        session_id: String,
+        name: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        self.execution_call(async move {
+            self.agent_import_session_op(session_import::ImportSessionParams {
+                workspace_id,
+                provider,
+                session_id,
+                name,
+            })
             .await
         })
     }

@@ -655,6 +655,8 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.getSession",
     "agent.getSessionStats",
     "agent.getSubscriptions",
+    "agent.importSession",
+    "agent.importableSessions.list",
     "agent.list",
     "agent.listActive",
     "agent.listInterrupted",
@@ -1380,6 +1382,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "agent.delete",
     "agent.diagnostics",
     "agent.enhancePrompt",
+    "agent.importSession",
+    "agent.importableSessions.list",
     "agent.memoryUsage",
     "agent.replaceMessages",
     "agent.reportToParent",
@@ -1835,6 +1839,8 @@ fn reverse_methods_are_never_on_the_collaborator_allowlist() {
 #[test]
 fn member_methods_and_administrator_remainder_are_classified() {
     const REFUSED: &[&str] = &[
+        "agent.importSession",
+        "agent.importableSessions.list",
         "agent.memoryUsage",
         "agent.replaceMessages",
         "agent.reportToParent",

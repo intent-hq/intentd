@@ -108,6 +108,7 @@ impl OriginalTurn {
 
 mod monitor_wake;
 mod repository_origin;
+pub(crate) mod scratch_adapter;
 use crate::repository_admission::lifecycle::physical_owner::RepositoryCreationIntent;
 pub(crate) use monitor_wake::QueuedMonitorTurn;
 pub(crate) use repository_origin::callback_delivery::RepositoryPromptInput;
@@ -14602,7 +14603,27 @@ fn resolve_spawn(
                 .filter(|p| p.is_dir())
         })
         .unwrap_or_else(std::env::temp_dir);
+    resolve_spawn_parts(
+        &provider_id,
+        selection,
+        model,
+        reasoning_effort.as_deref(),
+        cwd,
+        settings,
+    )
+}
 
+/// The provider half of [`resolve_spawn`]: launch configuration and binaries
+/// for `provider_id` (a base id), shared with the scratch adapter that
+/// lists and imports sessions without an agent.
+fn resolve_spawn_parts(
+    provider_id: &str,
+    selection: String,
+    model: Option<String>,
+    reasoning_effort: Option<&str>,
+    cwd: PathBuf,
+    settings: &intent_core::settings_file::SettingsFile,
+) -> Result<ResolvedSpawn> {
     let mut extra_env = BTreeMap::new();
     if provider_id == "mock" {
         let script = std::env::var("MOCK_AGENT_SCRIPT_PATH").map_err(|_| {
@@ -14671,12 +14692,9 @@ fn resolve_spawn(
         });
     }
 
-    let provider = *intent_providers::provider_config(&provider_id);
-    let reasoning_effort = AgentManager::session_model_effort(
-        &provider,
-        model.as_deref(),
-        reasoning_effort.as_deref(),
-    );
+    let provider = *intent_providers::provider_config(provider_id);
+    let reasoning_effort =
+        AgentManager::session_model_effort(&provider, model.as_deref(), reasoning_effort);
     let model = model.map(|model| {
         if provider.config_option_model_strips_effort {
             AgentManager::split_codex_model_effort(&model).0.to_string()
@@ -14715,7 +14733,7 @@ fn resolve_spawn(
     }
 
     let (provider_binary, npx_fallback_binary, npx_fallback_package) =
-        resolve_launch_binaries(&provider, &provider_id, settings)?;
+        resolve_launch_binaries(&provider, provider_id, settings)?;
     Ok(ResolvedSpawn {
         provider,
         selection,
