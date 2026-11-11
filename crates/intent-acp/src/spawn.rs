@@ -1812,7 +1812,10 @@ mod build_command_tests {
         for (policy, expected) in [
             (None, "agent-full-access"),
             (Some(crate::PermissionPolicy::AllowAll), "agent-full-access"),
-            (Some(crate::PermissionPolicy::Interactive), "workspace-write"),
+            (
+                Some(crate::PermissionPolicy::Interactive),
+                "workspace-write",
+            ),
             (Some(crate::PermissionPolicy::AutoByRisk), "workspace-write"),
             (Some(crate::PermissionPolicy::DenyAll), "workspace-write"),
         ] {
@@ -1834,7 +1837,10 @@ mod build_command_tests {
         let mock = intent_providers::find_provider("claude-code").unwrap();
         let mut other = SpawnOptions::new(mock);
         other.permission_policy = Some(crate::PermissionPolicy::Interactive);
-        assert_eq!(env_value(&build_command(&other), "INITIAL_AGENT_MODE"), None);
+        assert_eq!(
+            env_value(&build_command(&other), "INITIAL_AGENT_MODE"),
+            None
+        );
     }
 
     #[test]

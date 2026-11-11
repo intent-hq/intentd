@@ -116,7 +116,10 @@ async fn agent_permission_policy_applies_on_next_turn_over_wss() {
         json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "permissionPolicy": "deny" } }),
     )
     .await;
-    assert_eq!(denied["agent"]["effectivePermissionPolicy"], "deny", "{denied}");
+    assert_eq!(
+        denied["agent"]["effectivePermissionPolicy"], "deny",
+        "{denied}"
+    );
     assert_eq!(
         denied["agent"]["updatedAt"], created["agent"]["updatedAt"],
         "a policy change is not activity"
