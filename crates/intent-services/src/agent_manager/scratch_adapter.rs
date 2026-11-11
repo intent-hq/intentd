@@ -18,16 +18,74 @@ use tokio::sync::mpsc;
 
 use super::{prepare_installed_launch, resolve_spawn_parts, AgentManager};
 
+/// The adapter's process tree with what must outlive it: the npx launch dir
+/// and the daemon-wide ephemeral-adapter slot (`agents.maxConcurrentAdapters`).
+///
+/// Cancellation-safe: dropping it without [`ProcessGuard::kill`] (a listing
+/// timeout, a dropped RPC future) hands the tree to a background task that
+/// runs the same process-group kill and descendant sweep
+/// ([`SpawnedAgent::kill`]) and only then releases the dir and the slot.
+struct ProcessGuard {
+    spawned: Option<SpawnedAgent>,
+    launch_root: Option<tempfile::TempDir>,
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl ProcessGuard {
+    fn connection(&self) -> &Connection {
+        self.spawned
+            .as_ref()
+            .expect("scratch adapter process is live until killed")
+            .connection()
+    }
+
+    async fn kill(mut self) {
+        Self::reap(
+            self.spawned.take(),
+            self.launch_root.take(),
+            self.slot.take(),
+        )
+        .await;
+    }
+
+    async fn reap(
+        spawned: Option<SpawnedAgent>,
+        launch_root: Option<tempfile::TempDir>,
+        slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
+        if let Some(mut spawned) = spawned {
+            if let Err(error) = spawned.kill().await {
+                tracing::debug!(%error, "scratch adapter kill failed");
+            }
+        }
+        drop(launch_root);
+        drop(slot);
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        let (spawned, launch_root, slot) = (
+            self.spawned.take(),
+            self.launch_root.take(),
+            self.slot.take(),
+        );
+        if spawned.is_none() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                intent_core::spawn_daemon(Self::reap(spawned, launch_root, slot));
+            }
+            // No runtime: the child's kill-on-drop still ends the adapter.
+            Err(_) => drop((spawned, launch_root, slot)),
+        }
+    }
+}
+
 /// A live adapter process with its handshake done.
 pub(crate) struct ScratchAdapter {
-    spawned: SpawnedAgent,
-    /// The npx launch dir; removed after the process tree, on drop.
-    #[expect(dead_code, reason = "held for its drop")]
-    launch_root: Option<tempfile::TempDir>,
-    /// The daemon-wide ephemeral-adapter slot (`agents.maxConcurrentAdapters`),
-    /// returned when the adapter is dropped.
-    #[expect(dead_code, reason = "held for its drop")]
-    slot: tokio::sync::OwnedSemaphorePermit,
+    process: ProcessGuard,
     /// Every `session/update` (and other notification) the adapter sends,
     /// in order — the replay of a `session/load`.
     pub(crate) notifications: mpsc::UnboundedReceiver<IncomingNotification>,
@@ -42,14 +100,13 @@ pub(crate) struct ScratchAdapter {
 
 impl ScratchAdapter {
     pub(crate) fn connection(&self) -> &Connection {
-        self.spawned.connection()
+        self.process.connection()
     }
 
-    /// Kill the adapter's process group and reap it.
-    pub(crate) async fn close(mut self) {
-        if let Err(error) = self.spawned.kill().await {
-            tracing::debug!(%error, "scratch adapter kill failed");
-        }
+    /// Kill the adapter's process group and reap it. Dropping the adapter
+    /// instead does the same in the background.
+    pub(crate) async fn close(self) {
+        self.process.kill().await;
     }
 }
 
@@ -133,7 +190,7 @@ impl AgentManager {
                 .unwrap_or_default(),
             ..ConnectionHooks::default()
         };
-        let mut spawned = if let Some(cli) =
+        let spawned = if let Some(cli) =
             intent_providers::installed_cli::InstalledCli::for_provider(opts.provider.id)
         {
             let mut context =
@@ -151,19 +208,24 @@ impl AgentManager {
             spawn_provider(&opts, hooks)
         }
         .map_err(|e| Error::Internal(format!("spawn provider failed: {e}")))?;
+        // From here on the guard owns the tree, so a cancelled handshake
+        // still kills it.
+        let process = ProcessGuard {
+            spawned: Some(spawned),
+            launch_root,
+            slot: Some(slot),
+        };
         let handshake =
-            intent_acp::handshake::handshake_raw(spawned.connection(), &resolved.provider).await;
+            intent_acp::handshake::handshake_raw(process.connection(), &resolved.provider).await;
         let (_, initialize) = match handshake {
             Ok(done) => done,
             Err(error) => {
-                let _ = spawned.kill().await;
+                process.kill().await;
                 return Err(Error::Internal(format!("{provider_id}: {error}")));
             }
         };
         Ok(ScratchAdapter {
-            spawned,
-            launch_root,
-            slot,
+            process,
             notifications: note_rx,
             capabilities: ImportCapabilities::from_initialize(&initialize),
             fingerprint,
