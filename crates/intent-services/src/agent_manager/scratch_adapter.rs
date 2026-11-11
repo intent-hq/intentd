@@ -39,13 +39,19 @@ impl ProcessGuard {
             .connection()
     }
 
+    /// Kill the tree and release the dir and the slot in an independently
+    /// owned task, then wait for it. Everything moves into the task before
+    /// the first await, so cancelling the caller (a listing timeout firing
+    /// during close) cannot interrupt the reap or release anything early.
     async fn kill(mut self) {
-        Self::reap(
+        let reap = intent_core::spawn_daemon(Self::reap(
             self.spawned.take(),
             self.launch_root.take(),
             self.slot.take(),
-        )
-        .await;
+        ));
+        if let Err(error) = reap.await {
+            tracing::debug!(%error, "scratch adapter reap task failed");
+        }
     }
 
     async fn reap(
