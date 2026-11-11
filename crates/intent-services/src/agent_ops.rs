@@ -20932,7 +20932,7 @@ fn parse_permission_policy_change(session: &AgentSession, value: &Value) -> Resu
         Value::Null => Ok(None),
         Value::String(raw) => intent_acp::PermissionPolicy::from_wire(raw)
             .map(|policy| Some(policy.as_wire().to_string()))
-            .ok_or_else(|| invalid_permission_policy()),
+            .ok_or_else(invalid_permission_policy),
         _ => Err(invalid_permission_policy()),
     }
 }

@@ -167,6 +167,7 @@ impl PermissionPolicy {
     pub const WIRE_VALUES: [&'static str; 4] = ["interactive", "allow", "auto", "deny"];
 
     /// Parse a wire value (case-insensitive, trimmed); `None` when unknown.
+    #[must_use]
     pub fn from_wire(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "interactive" => Some(Self::Interactive),
@@ -178,6 +179,7 @@ impl PermissionPolicy {
     }
 
     /// The canonical wire value.
+    #[must_use]
     pub const fn as_wire(self) -> &'static str {
         match self {
             Self::Interactive => "interactive",
