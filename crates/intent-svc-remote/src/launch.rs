@@ -810,6 +810,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                 shared_checkout_of: None,
                 parent_work: None,
                 launched_on: None,
+                launched_machine_sign_in: None,
                 cloud_start: None,
             })
         })
@@ -1155,9 +1156,9 @@ impl RemoteLaunchPort for RemoteLaunch {
             };
             // The launch rules again: a configuration unmarked since
             // placement is refused, and an unmarked Default sends nothing.
-            let profile_env = svc
-                .remote_launch_plan(&provider, target)
-                .await?
+            let plan = svc.remote_launch_plan(&provider, target).await?;
+            let machine_sign_in = plan.machine_sign_in;
+            let profile_env = plan
                 .env
                 .map(|profile| LaunchProfileEnv(profile.to_node_wire()));
             let agent_features = serde_json::to_value(svc.session_agent_features(&session))
@@ -1249,6 +1250,10 @@ impl RemoteLaunchPort for RemoteLaunch {
                 .await
                 .ok()
                 .map(|workspace| workspace.title);
+            // A run the machine kept across a restart keeps the account it
+            // launched with: only a fresh launch records this one's.
+            let reattach = node.shared_ref().reattaches(agent_id);
+            let workspace_id = record.workspace_id.clone();
             let runtime = node
                 .launch(LaunchCommand {
                     agent_id: agent_id.clone(),
@@ -1282,6 +1287,16 @@ impl RemoteLaunchPort for RemoteLaunch {
                     )),
                 })
                 .await?;
+            if !reattach {
+                if let Err(error) =
+                    crate::view::update(svc.store(), &workspace_id, agent_id, |view| {
+                        view.launched_machine_sign_in = Some(machine_sign_in);
+                    })
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, %error, "remote launch: could not record its sign-in");
+                }
+            }
             Ok(runtime as Arc<RemoteRuntime>)
         })
     }

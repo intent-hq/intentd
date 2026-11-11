@@ -557,6 +557,47 @@ async fn a_live_machine_sign_in_run_keeps_its_account_after_the_default_is_sent(
     );
 }
 
+/// A run this daemon reattaches to after a restart keeps the account its
+/// placement says it launched with, even when the Default is sent now: its
+/// quota failure does not mark this backend's account.
+#[intent_test_macros::daemon_test]
+async fn a_reattached_run_keeps_the_account_it_launched_with() {
+    let ws = WorkspaceId::from("ws-remote-quota-reattach");
+    let id = AgentId::from("agent-remote-quota-reattach");
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let backup_run = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    let mut view = serde_json::to_value(remote_view()).unwrap();
+    view["launchedMachineSignIn"] = json!(true);
+    mgr.services
+        .store
+        .set_agent_session_metadata_key_json(
+            &ws,
+            &id,
+            intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+            &view.to_string(),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    send_the_default_remotely(&mgr).await;
+    send(&mgr, &id, &ws, "hello").await;
+    backup_run.wait_prompts(1).await;
+    backup_run.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    assert!(
+        mgr.services.exhausted_providers().is_empty(),
+        "{:?}",
+        mgr.services.exhausted_providers()
+    );
+}
+
 /// A remote agent out of quota whose only backup uses an account folder on
 /// this backend never switches to it (strict: whether or not the machine
 /// has the folder): it stays on its configuration and fails with what to do,

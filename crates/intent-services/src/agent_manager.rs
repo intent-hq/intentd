@@ -12465,10 +12465,25 @@ impl AgentManager {
                 "agent session {agent_id} is being deleted"
             )));
         }
+        // The account the run really uses: the one its launch recorded,
+        // which a run reattached after a restart keeps.
+        let launched = self
+            .services
+            .store
+            .get_agent_session_summary(agent_id)
+            .await
+            .ok()
+            .and_then(|s| {
+                intent_core::remote_launch::RemotePlacementView::from_metadata(s.metadata.as_ref())
+            })
+            .and_then(|view| view.launched_machine_sign_in)
+            .unwrap_or(machine_sign_in);
+        self.services
+            .set_quota_failover_attempt_machine_sign_in(agent_id, launched);
         self.remote_machine_sign_in
             .lock()
             .unwrap()
-            .insert(agent_id.clone(), machine_sign_in);
+            .insert(agent_id.clone(), launched);
         // Output the node streams between turns becomes implicit turns, as
         // for a local agent.
         let listener = self.spawn_wake_listener(agent_id.clone(), workspace_id.clone());

@@ -402,6 +402,16 @@ impl Shared {
         lock(&self.parked).contains_key(agent_id)
     }
 
+    /// Whether a launch for `agent_id` now reattaches to the run the
+    /// machine kept across a restart rather than starting one (see
+    /// [`RemoteNode::launch`]).
+    pub(crate) fn reattaches(&self, agent_id: &AgentId) -> bool {
+        lock(&self.parked)
+            .get(agent_id)
+            .is_some_and(|runtime| runtime.is_running())
+            && !self.stop_queued(agent_id)
+    }
+
     /// Whether the current link's machine confirmed holding the GitHub
     /// token (nodeProtocol 15).
     #[cfg(test)]

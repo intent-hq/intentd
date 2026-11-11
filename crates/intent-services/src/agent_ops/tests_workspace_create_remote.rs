@@ -86,6 +86,7 @@ impl RemoteLaunchPort for FakeRemote {
                 shared_checkout_of: None,
                 parent_work: None,
                 launched_on: None,
+                launched_machine_sign_in: None,
                 cloud_start: None,
             })
         })
