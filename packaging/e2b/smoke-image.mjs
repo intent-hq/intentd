@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Smoke-tests a local intent-node image: start it with its default command,
-// check intentd, the promised tools and the gh version, check no intentd runs,
-// then remove the container.
+// check intentd, the promised tools and the gh version, check no intentd runs
+// and that it runs as `user`, then remove the container.
 // Usage: node smoke-image.mjs <image-ref> <intentd-version>
 import { execFileSync } from 'node:child_process';
 import { parseVersion, smokeChecks, verifyImageSmoke } from './intent-node.mjs';
@@ -29,6 +29,7 @@ function main() {
       version: run(container, checks.version),
       idle: run(container, checks.idle),
       gh: run(container, checks.gh),
+      user: run(container, checks.user),
     };
     run(container, `set -e; for tool in ${checks.tools.join(' ')}; do printf '%s: ' "$tool"; command -v "$tool"; done`);
     run(container, 'git --version; git lfs version; rg --version | head -1; node --version; pnpm --version; python3 --version; claude --version; codex --version');

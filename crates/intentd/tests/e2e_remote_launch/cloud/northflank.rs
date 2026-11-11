@@ -56,8 +56,8 @@ struct FakeState {
     creates: Vec<(String, Value)>,
     /// Every lifecycle call: (method, path).
     calls: Vec<(String, String)>,
-    /// Every exec init frame's argv.
-    execs: Vec<Vec<String>>,
+    /// Every exec init frame's user and argv.
+    execs: Vec<(String, Vec<String>)>,
     /// Every stdout a command printed, to look for the executor token.
     outputs: Vec<String>,
     /// While set, exec answers this init auth instead of "successful".
@@ -456,12 +456,27 @@ impl FakeNorthflank {
         }
         let argv: Vec<String> =
             serde_json::from_value(init["data"]["context"]["command"].clone()).unwrap();
-        self.state().execs.push(argv.clone());
+        let user = init["data"]["context"]["user"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        self.state().execs.push((user.clone(), argv.clone()));
         let _ = ws
             .send(send(
                 json!({ "type": "init", "data": { "auth": "successful" } }),
             ))
             .await;
+        // The test cannot become root: the root setup step is recorded and
+        // answered without running.
+        if user == "root" {
+            let _ = ws
+                .send(send(
+                    json!({ "type": "completion", "data": { "exitCode": 0, "status": "Success" } }),
+                ))
+                .await;
+            let _ = ws.close(None).await;
+            return;
+        }
         let Some((home, env, group)) = self
             .state()
             .services
@@ -565,6 +580,15 @@ impl FakeNorthflank {
             .port();
         env.push(("INTENTD_TCP_PORT".into(), port.to_string()));
         env
+    }
+
+    /// How many root setup steps ran so far.
+    fn root_setups(&self) -> usize {
+        self.state()
+            .execs
+            .iter()
+            .filter(|(user, _)| user == "root")
+            .count()
     }
 
     fn executor_tokens(&self) -> Vec<String> {
@@ -807,6 +831,9 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
         );
     }
 
+    let setups = fake.root_setups();
+    assert!(setups >= 1, "the volume is handed to the user at create");
+
     // Paused (scaled to 0) and resumed: the same machine, one notice.
     let paused = ok(
         &mut rpc_ws,
@@ -832,6 +859,11 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
         machine_id.as_str(),
         "the identity is kept on the disk"
     );
+    assert!(
+        fake.root_setups() > setups,
+        "the volume is handed to the user again after a resume"
+    );
+    let setups = fake.root_setups();
     let later = echoed(&mut rpc_ws, agent, "a later turn", 90).await;
     assert!(!later.contains(DISK_NOTICE), "{later}");
 
@@ -843,6 +875,20 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
         .await
         .unwrap();
     assert_eq!(same["id"], machine_id.as_str());
+    assert!(
+        fake.root_setups() > setups,
+        "the volume is handed to the user again after a restart"
+    );
+    for (user, argv) in &fake.state().execs {
+        assert!(
+            !argv.iter().any(|arg| arg.starts_with("IS_SANDBOX")),
+            "{argv:?}"
+        );
+        let setup = argv
+            .last()
+            .is_some_and(|script| script.contains("chown -R"));
+        assert_eq!(user, if setup { "root" } else { "user" }, "{argv:?}");
+    }
 
     // Killed: the service and its volume go.
     ok(

@@ -231,6 +231,7 @@ export function smokeChecks() {
     version: 'intentd --version',
     gh: 'gh --version',
     idle: 'pgrep -x intentd || true',
+    user: 'id -un; echo "$HOME"',
     cpus: 'nproc',
     memKb: "awk '/^MemTotal:/ { print $2 }' /proc/meminfo",
   };
@@ -240,7 +241,7 @@ export function smokeChecks() {
 // allocation; 85% still tells the sizes apart.
 export function verifySmoke(version, sizeId, outputs) {
   const size = parseSize(sizeId);
-  const problems = verifyImageSmoke(version, outputs);
+  const problems = commonSmoke(version, outputs);
   const cpus = Number(outputs.cpus.trim());
   if (cpus !== size.cpuCount) problems.push(`the sandbox has ${cpus} vCPU, expected ${size.cpuCount}`);
   const memMiB = Math.round(Number(outputs.memKb.trim()) / 1024);
@@ -249,13 +250,22 @@ export function verifySmoke(version, sizeId, outputs) {
 }
 
 // The size-independent checks, shared by the E2B sandbox and the container image.
-export function verifyImageSmoke(version, outputs) {
+function commonSmoke(version, outputs) {
   const problems = [];
   const reported = outputs.version.trim();
   if (reported !== `intentd ${version}`) problems.push(`intentd --version printed ${JSON.stringify(reported)}, expected "intentd ${version}"`);
   const gh = String(outputs.gh ?? '').split('\n')[0].trim();
   if (!gh.startsWith(`gh version ${GH.version} `)) problems.push(`gh --version printed ${JSON.stringify(gh)}, expected "gh version ${GH.version}"`);
   if (outputs.idle.trim()) problems.push(`intentd is already running in a fresh sandbox (pid ${outputs.idle.trim()}); the template must not start it`);
+  return problems;
+}
+
+// The container image also runs as the unprivileged `user`; E2B sandboxes
+// pick their own user, so only the image checks it.
+export function verifyImageSmoke(version, outputs) {
+  const problems = commonSmoke(version, outputs);
+  const user = String(outputs.user ?? '').trim();
+  if (user !== 'user\n/home/user') problems.push(`the container runs as ${JSON.stringify(user)}, expected "user" with home /home/user`);
   return problems;
 }
 
@@ -271,9 +281,17 @@ export function imagePlan(env) {
   return { version: target.version, tags: target.tags.map(tag => `${IMAGE_REPO}:${tag}`), push: target.publish };
 }
 
+// The base image's `node` account (uid 1000) renamed to `user`, with its home
+// where the backend mounts the machine's volume. Container images only: E2B
+// sandboxes bring their own `user`.
+export function addUserCommand() {
+  return 'groupmod -n user node && usermod -l user -d /home/user -m node';
+}
+
 // Renders defineTemplate() as a Dockerfile, so both builds run the same steps.
-// Every step runs as root, like the template's. The container idles: the
-// backend starts intentd itself, as in an E2B sandbox.
+// Every template step runs as root, like the template's; the container then
+// runs as the unprivileged `user`. It idles: the backend starts intentd
+// itself, as in an E2B sandbox.
 export function dockerfile({ version, sha256 }) {
   const v = parseVersion(version);
   parseSha256(sha256);
@@ -294,7 +312,7 @@ export function dockerfile({ version, sha256 }) {
     },
   };
   defineTemplate(() => builder, { version: v, sha256 });
-  lines.push('CMD ["sleep", "infinity"]');
+  lines.push(`RUN ${addUserCommand()}`, 'USER user', 'WORKDIR /home/user', 'CMD ["sleep", "infinity"]');
   return `${lines.join('\n')}\n`;
 }
 
