@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.183] - 2026-11-11
+
+### 📚 Documentation
+
+- *(guide)* Describe Shift-click range selection on Home ([#3273](https://github.com/intent-hq/intentd/pull/3273))
+
+
 ## [0.11.182] - 2026-11-11
 
 ### 📚 Documentation
