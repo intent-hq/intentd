@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.182] - 2026-11-11
+
+### 📚 Documentation
+
+- *(app-guide)* Describe starting context in the harness dialog ([#3268](https://github.com/intent-hq/intentd/pull/3268))
+- *(guide)* Describe Home multi-select and bulk workspace actions ([#3270](https://github.com/intent-hq/intentd/pull/3270))
+
+
 ## [0.11.181] - 2026-11-11
 
 ### 🚀 Features
