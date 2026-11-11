@@ -804,7 +804,28 @@ pub(crate) struct AgentCreatePlan {
     /// For a backend sub-agent of a remote agent: where the parent's work
     /// is, persisted as its daemon-owned `backendParentWork` metadata.
     pub(crate) backend_parent_work: Option<intent_core::remote_launch::BackendParentWork>,
+    /// The profile admission sent instead of the plain Default, announced
+    /// in the transcript once the agent exists.
+    pub(crate) auto_selected: Option<RemoteAutoSelection>,
 }
+
+/// A plain Default replaced at admission by the first profile marked for
+/// remote machines, because the machine's own sign-in was out (or, on E2B,
+/// there is none). A profile picked explicitly is never replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteAutoSelection {
+    /// The bare Default reference that was asked for.
+    pub(crate) from: String,
+    /// The profile reference that runs instead.
+    pub(crate) provider_ref: String,
+    /// `machine-signed-out` or `sandbox-no-sign-in`.
+    pub(crate) reason: &'static str,
+    /// The machine's display name.
+    pub(crate) machine: String,
+}
+
+/// `metadata.type` of the transcript row announcing a [`RemoteAutoSelection`].
+pub(crate) const PROVIDER_AUTO_SELECTED_NOTICE_TYPE: &str = "provider_auto_selected";
 
 /// Why [`Services::persist_agent_create`] could not persist a planned session.
 /// Deliberately narrow — infrastructure only — so the persist half cannot
@@ -6025,7 +6046,13 @@ impl Services {
                 )
                 .await;
             let mut view = match (admitted, inherited_from) {
-                (Ok(view), _) => view,
+                (Ok((view, picked)), _) => {
+                    if let Some(picked) = picked {
+                        plan.provider = picked.provider_ref.clone();
+                        plan.auto_selected = Some(picked);
+                    }
+                    view
+                }
                 (Err(error), Some(node_name)) => {
                     return Err(error.with_hint(&inherited_placement_hint(&node_name)))
                 }
@@ -6193,13 +6220,96 @@ impl Services {
         model: Option<&str>,
         placement: &intent_core::placement::AgentPlacement,
         inherited: bool,
-    ) -> Result<intent_core::remote_launch::RemotePlacementView> {
-        let mut needs = self.remote_launch_needs(provider, model, placement).await?;
-        needs.inherited = inherited;
-        self.ports
-            .remote_launch()
-            .admit(self, workspace_id, placement, &needs)
-            .await
+    ) -> Result<(
+        intent_core::remote_launch::RemotePlacementView,
+        Option<RemoteAutoSelection>,
+    )> {
+        let admit = |reference: String| async move {
+            let mut needs = self
+                .remote_launch_needs(&reference, model, placement)
+                .await?;
+            needs.inherited = inherited;
+            self.ports
+                .remote_launch()
+                .admit(self, workspace_id, placement, &needs)
+                .await
+        };
+        self.admit_with_auto_pick(provider, placement, admit).await
+    }
+
+    /// Admit `provider`; when it is a plain Default that the machine's own
+    /// sign-in cannot run (`machine-not-signed-in`, or any refusal on E2B,
+    /// which has no sign-in), admit the first profile marked for remote
+    /// machines instead and say which. Only if there is none does the
+    /// original refusal stand. A profile is never replaced.
+    async fn admit_with_auto_pick<F, Fut>(
+        &self,
+        provider: &str,
+        placement: &intent_core::placement::AgentPlacement,
+        admit: F,
+    ) -> Result<(
+        intent_core::remote_launch::RemotePlacementView,
+        Option<RemoteAutoSelection>,
+    )>
+    where
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = Result<intent_core::remote_launch::RemotePlacementView>>,
+    {
+        let error = match admit(provider.to_owned()).await {
+            Ok(view) => return Ok((view, None)),
+            Err(error) => error,
+        };
+        if !crate::provider_profiles::is_default_config_ref(provider) {
+            return Err(error);
+        }
+        let cloud = placement.is_e2b();
+        let signed_out = matches!(&error, Error::RemoteMachine(failure)
+            if failure.data["code"] == intent_core::machines::MACHINE_NOT_SIGNED_IN_CODE);
+        let no_sign_in = cloud
+            && match &error {
+                Error::ProviderProfile(failure) => {
+                    failure.data["code"] == crate::provider_profiles::PROFILE_NOT_REMOTE_COMPATIBLE
+                }
+                Error::RemoteMachine(failure) => {
+                    failure.data["code"] == intent_core::machines::CLOUD_PROFILE_REQUIRED_CODE
+                }
+                _ => false,
+            };
+        if !signed_out && !no_sign_in {
+            return Err(error);
+        }
+        let target = if cloud {
+            crate::RemoteTarget::Cloud
+        } else {
+            crate::RemoteTarget::Machine
+        };
+        let Some(picked) = self.first_remote_profile(provider, target).await else {
+            return Err(error);
+        };
+        let view = admit(picked.clone()).await?;
+        let machine = if signed_out {
+            match &error {
+                Error::RemoteMachine(failure) => failure.data["machines"][0]["name"]
+                    .as_str()
+                    .map_or_else(|| view.node_name.clone(), str::to_owned),
+                _ => view.node_name.clone(),
+            }
+        } else {
+            "E2B".to_owned()
+        };
+        Ok((
+            view,
+            Some(RemoteAutoSelection {
+                from: provider.to_owned(),
+                provider_ref: picked,
+                reason: if signed_out {
+                    "machine-signed-out"
+                } else {
+                    "sandbox-no-sign-in"
+                },
+                machine,
+            }),
+        ))
     }
 
     /// [`Self::admit_remote_agent`] for `workspace.create`'s initial agent,
@@ -6216,15 +6326,28 @@ impl Services {
         if placement.runs_on_backend()? {
             return Ok(());
         }
-        let needs = self
-            .remote_launch_needs(&plan.provider, plan.model.as_deref(), &placement)
+        let model = plan.model.clone();
+        let admit = |reference: String| {
+            let placement = &placement;
+            let model = model.as_deref();
+            async move {
+                let needs = self
+                    .remote_launch_needs(&reference, model, placement)
+                    .await?;
+                self.ports
+                    .remote_launch()
+                    .admit_new_workspace(self, placement, &needs)
+                    .await
+            }
+        };
+        let (view, picked) = self
+            .admit_with_auto_pick(&plan.provider.clone(), &placement, admit)
             .await?;
-        plan.remote = Some(
-            self.ports
-                .remote_launch()
-                .admit_new_workspace(self, &placement, &needs)
-                .await?,
-        );
+        if let Some(picked) = picked {
+            plan.provider = picked.provider_ref.clone();
+            plan.auto_selected = Some(picked);
+        }
+        plan.remote = Some(view);
         self.ensure_fits_planned_prompt("workspace.create", plan)
             .await
     }
@@ -6702,6 +6825,7 @@ impl Services {
             placement,
             remote: None,
             backend_parent_work: None,
+            auto_selected: None,
         })
     }
 
@@ -6756,6 +6880,7 @@ impl Services {
             placement: _,
             remote,
             backend_parent_work,
+            auto_selected,
         } = plan;
         let now = now_iso();
         let id = AgentId(format!("agent-{}", Uuid::new_v4()));
@@ -7027,8 +7152,73 @@ impl Services {
         // (superset of `{ id, name }`). A fresh session has no messages, so the
         // derived counts/last-* fields are `None`/0; runtime activity flags stay
         // at their `AgentLite::from_session` defaults (no live runtime state).
+        if let Some(selection) = &auto_selected {
+            self.persist_auto_selected_notice(
+                &session.workspace_id,
+                &session.id,
+                selection,
+                session.model.as_deref(),
+            )
+            .await;
+        }
         let lite = AgentLite::from_session(session, 0, None, None, None, None, None);
         Ok(json!({ "agent": lite }))
+    }
+
+    /// Announce a [`RemoteAutoSelection`] in the agent's transcript, as a
+    /// failover switch is: one system row with `provider_auto_selected`
+    /// metadata and the standard `agent:message` event. Best-effort: the
+    /// agent already runs on the picked profile.
+    async fn persist_auto_selected_notice(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        selection: &RemoteAutoSelection,
+        model: Option<&str>,
+    ) {
+        let profiles = self.provider_profiles.profiles().ok();
+        let to = crate::provider_profiles::readable_selection(
+            &selection.provider_ref,
+            profiles.as_ref().map(|p| p.as_slice()),
+        );
+        let why = if selection.reason == "sandbox-no-sign-in" {
+            format!("{} has no sign-in of its own", selection.machine)
+        } else {
+            format!(
+                "{} isn't signed in on {}",
+                selection.from, selection.machine
+            )
+        };
+        let text = format!("{why}, so this agent runs with {to}, marked for remote machines.");
+        let content = json!([{ "type": "text", "text": text }]);
+        let metadata = json!({
+            "type": PROVIDER_AUTO_SELECTED_NOTICE_TYPE,
+            "fromProvider": selection.from,
+            "toProvider": selection.provider_ref,
+            "model": model,
+            "reason": selection.reason,
+            "machine": selection.machine,
+        });
+        match self
+            .store
+            .append_agent_message_with_metadata(
+                agent_id,
+                "system",
+                &content,
+                Some(&metadata),
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(message) => {
+                self.invalidate_agent_list_cache(workspace_id);
+                self.publish_agent_message_events(workspace_id, agent_id, &message, None)
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "failed to persist the auto-selected profile notice");
+            }
+        }
     }
 
     /// `agent.rename` (PROTOCOL §5.5). A missing agent surfaces as `-32603`

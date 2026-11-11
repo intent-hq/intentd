@@ -420,7 +420,7 @@ async fn a_saved_profile_is_admitted_for_a_remote_agent() {
     .await
     .expect("create profile");
     let reference = created["profile"]["providerRef"].as_str().unwrap();
-    let view = svc
+    let (view, _) = svc
         .admit_remote_agent(
             &ws,
             reference,
@@ -1576,11 +1576,14 @@ async fn only_an_ancestor_may_stop_or_delete_an_agent() {
     assert_eq!(unsettled(&svc, &parent).await, 2);
 }
 
-
 // --- Auto-pick on a signed-out machine ---------------------------------------
 
 async fn marked_profile(svc: &Services, base: &str, name: &str) -> String {
-    let key = if base == "codex" { "OPENAI_API_KEY" } else { "ANTHROPIC_API_KEY" };
+    let key = if base == "codex" {
+        "OPENAI_API_KEY"
+    } else {
+        "ANTHROPIC_API_KEY"
+    };
     daemon_profile(
         svc,
         base,

@@ -463,6 +463,32 @@ impl Services {
         }
     }
 
+    /// The first profile of `base`, in the saved profile order, that the
+    /// launch rules let run on `target`; on E2B it must also send a set
+    /// variable. A plain Default sends it when the machine's own sign-in is
+    /// out (nodes.md "Placement across machines").
+    pub(crate) async fn first_remote_profile(
+        &self,
+        base: &str,
+        target: RemoteTarget,
+    ) -> Option<String> {
+        let profiles = self.provider_profiles.profiles().ok()?;
+        for meta in profiles.iter().filter(|p| p.base_provider == base) {
+            let reference = meta.provider_ref();
+            let Ok(plan) = self.remote_launch_plan(&reference, target).await else {
+                continue;
+            };
+            let sends = plan
+                .env
+                .as_ref()
+                .is_some_and(|env| env.entries().any(|(_, value)| value.is_some()));
+            if target == RemoteTarget::Machine || sends {
+                return Some(reference);
+            }
+        }
+        None
+    }
+
     /// Annotate a Default row with `remoteCompatible`,
     /// `remoteIncompatibility` and `remoteLaunch`.
     pub(super) fn annotate_default(&self, row: &mut Value, base: &str, entries: &[StoredEnv]) {
