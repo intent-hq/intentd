@@ -649,13 +649,14 @@ the harness version for details. **Move panel** opens the pane movement controls
 Other panel menus place **Rename** under **Actions** when renaming is available.
 
 The harness details list the agent's features as **On** or **Off**; hover or focus
-a feature to read its description. For agents started on harness 3.12 or later, the
-details first show the agent's **Starting context**: the approximate size in tokens,
-split by owner (Intent, the repository, and the user), and each part listed largest
-first with its owner and size. Repo rules that the provider loads by itself are listed
-but not counted in the total. Skills that were left out of the agent, and how to enable
-them, appear under **Hidden skills**. Older agents show only the features. Sizes are
-estimates, not provider token counts.
+a feature to read its description. When the agent's harness records it, the details
+first show **Starting context**: the approximate size in tokens and each part listed
+largest first, with its owner (**Intent** for text Intent writes, **User** for text
+from the user's own files and settings, such as repo rules and skills) and size. Repo
+rules that the provider loads by itself are marked **Not in total**. Skills that were
+left out of the agent, and how to enable them, appear under **Hidden skills**. Agents
+on older harnesses, and agents that have not started yet, show only the features.
+Sizes are estimates, not provider token counts.
 
 When an agent shows a browser tab while its chat is on screen, the tab opens in the
 column next to that chat (right first, then left). It never covers the column you
