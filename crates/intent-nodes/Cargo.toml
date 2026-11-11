@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
-description = "Node provider contracts, static host adapter and E2B sandbox client"
+description = "Node provider contracts, static host adapter, E2B sandbox client and Northflank adapter"
 
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.11.186" }
@@ -15,6 +15,14 @@ reqwest = { workspace = true }
 tokio = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = "1"
+webpki-roots = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+sha2 = "0.11"
+uuid = { workspace = true }
 
 [dev-dependencies]
 intentd-test-support = { path = "../intentd-test-support" }
