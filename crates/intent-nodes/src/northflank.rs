@@ -33,6 +33,10 @@ pub const NODE_TAG: &str = "intent-node";
 /// The home folder the machine's volume is mounted at.
 pub const HOME: &str = "/home/user";
 
+/// The image's unprivileged account: every command runs as it unless its
+/// spec names another user.
+pub const RUN_AS: &str = "user";
+
 /// Disk of a new machine when the request does not say.
 pub const DEFAULT_DISK_GIB: u32 = 20;
 

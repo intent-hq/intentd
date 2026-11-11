@@ -231,6 +231,7 @@ export function smokeChecks() {
     version: 'intentd --version',
     gh: 'gh --version',
     idle: 'pgrep -x intentd || true',
+    user: 'id -un; echo "$HOME"',
     cpus: 'nproc',
     memKb: "awk '/^MemTotal:/ { print $2 }' /proc/meminfo",
   };
@@ -256,6 +257,7 @@ export function verifyImageSmoke(version, outputs) {
   const gh = String(outputs.gh ?? '').split('\n')[0].trim();
   if (!gh.startsWith(`gh version ${GH.version} `)) problems.push(`gh --version printed ${JSON.stringify(gh)}, expected "gh version ${GH.version}"`);
   if (outputs.idle.trim()) problems.push(`intentd is already running in a fresh sandbox (pid ${outputs.idle.trim()}); the template must not start it`);
+  if (outputs.user !== undefined && outputs.user.trim() !== 'user\n/home/user') problems.push(`the container runs as ${JSON.stringify(outputs.user.trim())}, expected "user" with home /home/user`);
   return problems;
 }
 
@@ -271,9 +273,17 @@ export function imagePlan(env) {
   return { version: target.version, tags: target.tags.map(tag => `${IMAGE_REPO}:${tag}`), push: target.publish };
 }
 
+// The base image's `node` account (uid 1000) renamed to `user`, with its home
+// where the backend mounts the machine's volume. Container images only: E2B
+// sandboxes bring their own `user`.
+export function addUserCommand() {
+  return 'groupmod -n user node && usermod -l user -d /home/user -m node';
+}
+
 // Renders defineTemplate() as a Dockerfile, so both builds run the same steps.
-// Every step runs as root, like the template's. The container idles: the
-// backend starts intentd itself, as in an E2B sandbox.
+// Every template step runs as root, like the template's; the container then
+// runs as the unprivileged `user`. It idles: the backend starts intentd
+// itself, as in an E2B sandbox.
 export function dockerfile({ version, sha256 }) {
   const v = parseVersion(version);
   parseSha256(sha256);
@@ -294,7 +304,7 @@ export function dockerfile({ version, sha256 }) {
     },
   };
   defineTemplate(() => builder, { version: v, sha256 });
-  lines.push('CMD ["sleep", "infinity"]');
+  lines.push(`RUN ${addUserCommand()}`, 'USER user', 'WORKDIR /home/user', 'CMD ["sleep", "infinity"]');
   return `${lines.join('\n')}\n`;
 }
 

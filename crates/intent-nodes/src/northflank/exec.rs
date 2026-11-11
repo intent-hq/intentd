@@ -23,7 +23,7 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::WebSocketStream;
 
 use super::client::{error_message, scrub, validate_id};
-use super::{NorthflankClient, HOME};
+use super::{NorthflankClient, HOME, RUN_AS};
 use crate::cloud::{
     CloudError, CloudErrorKind, CloudInstance, ProcessExit, ProcessOutput, ProcessSpec,
     SecretString,
@@ -63,11 +63,6 @@ pub(super) fn argv(spec: &ProcessSpec) -> Vec<String> {
     }
     if !spec.envs.contains_key("HOME") {
         argv.push(format!("HOME={HOME}"));
-    }
-    // The image runs everything as root; Claude Code refuses its
-    // bypass-permissions mode as root outside a declared sandbox.
-    if !spec.envs.contains_key("IS_SANDBOX") {
-        argv.push("IS_SANDBOX=1".into());
     }
     for (key, value) in &spec.envs {
         argv.push(format!("{key}={}", value.expose()));
@@ -151,10 +146,8 @@ impl NorthflankClient {
                     "the Northflank command stream did not open in time",
                 )
             })??;
-        let mut context = json!({ "command": argv(spec), "shell": "none" });
-        if let Some(user) = &spec.user {
-            context["user"] = json!(user);
-        }
+        let user = spec.user.as_deref().unwrap_or(RUN_AS);
+        let context = json!({ "command": argv(spec), "shell": "none", "user": user });
         let init = json!({
             "type": "init",
             "data": {

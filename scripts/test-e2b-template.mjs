@@ -16,6 +16,7 @@ import {
   archiveUrl,
   builtSizes,
   defineTemplate,
+  addUserCommand,
   dockerfile,
   enabledSizes,
   imagePlan,
@@ -210,9 +211,25 @@ describe('container image', () => {
     const { calls, Template } = recorder();
     defineTemplate(Template, { version: '0.11.139', sha256: SHA });
     const commands = calls.filter(([name]) => name === 'runCmd').map(([, command]) => command);
-    assert.deepEqual(runs.slice(1).map(line => line.slice(4)), commands);
-    assert.ok(!lines.some(line => line.startsWith('USER ')), 'every step runs as root');
+    assert.deepEqual(runs.slice(1, 1 + commands.length).map(line => line.slice(4)), commands);
+    const firstUser = lines.findIndex(line => line.startsWith('USER '));
+    assert.ok(firstUser > lines.lastIndexOf(runs[commands.length]), 'every template step runs as root');
     assert.ok(text.includes(archiveUrl('0.11.139')));
+  });
+  it('runs containers as the unprivileged user, with its home where the volume mounts', () => {
+    const lines = dockerfile({ version: '0.11.139', sha256: SHA }).trim().split('\n');
+    assert.ok(lines.includes(`RUN ${addUserCommand()}`));
+    assert.match(addUserCommand(), /usermod .*-l user .*node/);
+    assert.match(addUserCommand(), /-d \/home\/user/);
+    assert.match(addUserCommand(), /groupmod -n user node/);
+    assert.deepEqual(lines.filter(line => line.startsWith('USER ')), ['USER user']);
+    assert.ok(lines.indexOf('USER user') > lines.indexOf(`RUN ${addUserCommand()}`));
+    assert.ok(lines.includes('WORKDIR /home/user'));
+  });
+  it('leaves the E2B template without the user step', () => {
+    const { calls, Template } = recorder();
+    defineTemplate(Template, { version: '0.11.139', sha256: SHA });
+    assert.ok(!calls.some(([, command]) => String(command).includes('usermod')));
   });
   it('labels the image with its source and version', () => {
     const text = dockerfile({ version: '0.11.139', sha256: SHA });
@@ -236,6 +253,14 @@ describe('container image', () => {
     assert.match(problems.join('\n'), /0\.11\.138/);
     assert.match(problems.join('\n'), /running/);
     assert.match(problems.join('\n'), /2\.23\.0/);
+  });
+  it('smoke-checks that the container runs as user, when the image smoke asks', () => {
+    const outputs = { version: 'intentd 0.11.139\n', idle: '', gh: `gh version ${GH.version} (2026-10-26)\n` };
+    assert.equal(smokeChecks().user, 'id -un; echo "$HOME"');
+    assert.deepEqual(verifyImageSmoke('0.11.139', { ...outputs, user: 'user\n/home/user\n' }), []);
+    const problems = verifyImageSmoke('0.11.139', { ...outputs, user: 'root\n/root\n' });
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /root/);
   });
 });
 

@@ -239,18 +239,21 @@ async fn check_services_needs_the_list_permission() {
 
 #[tokio::test]
 async fn create_makes_tags_volume_then_service_and_waits_until_ready() {
-    let server = FakeServer::start(vec![
-        tag_list(&["other"]),
-        Reply::data(&json!({"id": "intent-node", "name": NODE_TAG})),
-        Reply::data(&json!({"id": "b", "name": BACKEND_TAG})),
-        Reply::data(&json!({"id": "vol-1", "name": "intent-x"})),
-        Reply::data(&json!({"id": "svc-1", "name": "intent-x"})),
-        Reply::data(&service("svc-1", "IN_PROGRESS", 1, &tags())),
-        Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
-        containers(&["TASK_STARTING"]),
-        Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
-        containers(&["TASK_RUNNING"]),
-    ])
+    let server = FakeServer::start_with(
+        vec![
+            tag_list(&["other"]),
+            Reply::data(&json!({"id": "intent-node", "name": NODE_TAG})),
+            Reply::data(&json!({"id": "b", "name": BACKEND_TAG})),
+            Reply::data(&json!({"id": "vol-1", "name": "intent-x"})),
+            Reply::data(&json!({"id": "svc-1", "name": "intent-x"})),
+            Reply::data(&service("svc-1", "IN_PROGRESS", 1, &tags())),
+            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+            containers(&["TASK_STARTING"]),
+            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+            containers(&["TASK_RUNNING"]),
+        ],
+        vec![setup_ok()],
+    )
     .await;
     let client = client(&server);
     let created = client.create(&create_request()).await.unwrap();
@@ -274,9 +277,14 @@ async fn create_makes_tags_volume_then_service_and_waits_until_ready() {
             "GET /projects/p1/services/svc-1/containers",
             "GET /projects/p1/services/svc-1",
             "GET /projects/p1/services/svc-1/containers",
+            "GET /command-exec/projects/p1/services/svc-1",
         ]
     );
-    for req in &requests {
+    assert_setup_ran(&server);
+    for req in requests
+        .iter()
+        .filter(|r| !r.target.starts_with("/command-exec"))
+    {
         assert_eq!(
             req.header("authorization"),
             Some(format!("Bearer {TOKEN}").as_str())
@@ -325,13 +333,16 @@ async fn create_makes_tags_volume_then_service_and_waits_until_ready() {
 
 #[tokio::test]
 async fn create_reuses_existing_tags_and_defaults_the_disk() {
-    let server = FakeServer::start(vec![
-        tag_list(&[NODE_TAG, BACKEND_TAG]),
-        Reply::data(&json!({"id": "vol-1"})),
-        Reply::data(&json!({"id": "svc-1"})),
-        Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
-        containers(&["TASK_RUNNING"]),
-    ])
+    let server = FakeServer::start_with(
+        vec![
+            tag_list(&[NODE_TAG, BACKEND_TAG]),
+            Reply::data(&json!({"id": "vol-1"})),
+            Reply::data(&json!({"id": "svc-1"})),
+            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+            containers(&["TASK_RUNNING"]),
+        ],
+        vec![setup_ok()],
+    )
     .await;
     let mut request = create_request();
     request.disk_gib = None;
@@ -343,18 +354,21 @@ async fn create_reuses_existing_tags_and_defaults_the_disk() {
 
 #[tokio::test]
 async fn create_follows_tag_pages() {
-    let server = FakeServer::start(vec![
-        Reply::json(
-            200,
-            &json!({"data": {"tags": [{"id": "a", "name": NODE_TAG}]},
+    let server = FakeServer::start_with(
+        vec![
+            Reply::json(
+                200,
+                &json!({"data": {"tags": [{"id": "a", "name": NODE_TAG}]},
             "pagination": {"hasNextPage": true, "cursor": "c2", "count": 1}}),
-        ),
-        tag_list(&[BACKEND_TAG]),
-        Reply::data(&json!({"id": "vol-1"})),
-        Reply::data(&json!({"id": "svc-1"})),
-        Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
-        containers(&["TASK_RUNNING"]),
-    ])
+            ),
+            tag_list(&[BACKEND_TAG]),
+            Reply::data(&json!({"id": "vol-1"})),
+            Reply::data(&json!({"id": "svc-1"})),
+            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+            containers(&["TASK_RUNNING"]),
+        ],
+        vec![setup_ok()],
+    )
     .await;
     client(&server).create(&create_request()).await.unwrap();
     let lines = server.lines();
@@ -499,11 +513,14 @@ async fn tags_that_cannot_be_stored_are_refused() {
 
 #[tokio::test]
 async fn connect_to_a_running_service_waits_and_does_not_resume() {
-    let server = FakeServer::start(vec![
-        Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
-        Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
-        containers(&["TASK_RUNNING"]),
-    ])
+    let server = FakeServer::start_with(
+        vec![
+            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+            containers(&["TASK_RUNNING"]),
+        ],
+        vec![setup_ok()],
+    )
     .await;
     let connected = client(&server).connect("svc-1", 600).await.unwrap();
     assert!(!connected.resumed);
@@ -513,19 +530,23 @@ async fn connect_to_a_running_service_waits_and_does_not_resume() {
         "ghcr.io/intent-hq/intent-node:0.11.184"
     );
     assert!(!server.lines().iter().any(|l| l.contains("resume")));
+    assert_setup_ran(&server);
 }
 
 #[tokio::test]
 async fn connect_resumes_a_paused_service() {
-    let server = FakeServer::start(vec![
-        Reply::data(&service("svc-1", "COMPLETED", 0, &tags())),
-        Reply::data(&json!({})),
-        Reply::data(&service("svc-1", "IN_PROGRESS", 1, &tags())),
-        Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
-        containers(&[]),
-        Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
-        containers(&["TASK_RUNNING"]),
-    ])
+    let server = FakeServer::start_with(
+        vec![
+            Reply::data(&service("svc-1", "COMPLETED", 0, &tags())),
+            Reply::data(&json!({})),
+            Reply::data(&service("svc-1", "IN_PROGRESS", 1, &tags())),
+            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+            containers(&[]),
+            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+            containers(&["TASK_RUNNING"]),
+        ],
+        vec![setup_ok()],
+    )
     .await;
     let connected = client(&server).connect("svc-1", 600).await.unwrap();
     assert!(connected.resumed);
@@ -535,6 +556,8 @@ async fn connect_resumes_a_paused_service() {
         "POST /projects/p1/services/svc-1/resume"
     );
     assert_eq!(requests[1].json(), json!({"instances": 1}));
+    // After a resume the volume may come back root-owned: set up again.
+    assert_setup_ran(&server);
 }
 
 #[tokio::test]
@@ -912,6 +935,33 @@ async fn exec_server(steps: Vec<WsStep>) -> FakeServer {
     FakeServer::start_with(vec![], vec![WsSession::Steps(steps)]).await
 }
 
+/// The root setup step: it answers success.
+fn setup_ok() -> WsSession {
+    WsSession::Steps(vec![
+        WsStep::Receive,
+        init_ok(),
+        completion(0, "Success"),
+        WsStep::Close,
+    ])
+}
+
+/// The last command was the root setup step that hands the volume to `user`.
+fn assert_setup_ran(server: &FakeServer) {
+    let frames = server.frames();
+    let init: Value = serde_json::from_str(frames.last().unwrap()).unwrap();
+    let context = &init["data"]["context"];
+    assert_eq!(context["user"], json!("root"), "{context}");
+    let argv: Vec<String> = serde_json::from_value(context["command"].clone()).unwrap();
+    assert!(argv.contains(&"HOME=/home/user".to_string()), "{argv:?}");
+    let script = argv.last().unwrap();
+    assert!(script.contains("chown -R"), "{script}");
+    assert!(script.contains("id -u user"), "{script}");
+    assert!(
+        !argv.iter().any(|a| a.starts_with("IS_SANDBOX")),
+        "{argv:?}"
+    );
+}
+
 fn shell(script: &str) -> ProcessSpec {
     let mut spec = ProcessSpec::new("/bin/sh");
     spec.args = vec!["-c".into(), script.into()];
@@ -953,8 +1003,9 @@ async fn exec_collects_output_and_the_exit_code() {
         json!({"type": "init", "data": {
             "auth": {"type": "apiToken", "apiToken": TOKEN},
             "context": {
-                "command": ["env", "HOME=/home/user", "IS_SANDBOX=1", "/bin/sh", "-c", "echo out; echo err >&2; exit 3"],
-                "shell": "none"
+                "command": ["env", "HOME=/home/user", "/bin/sh", "-c", "echo out; echo err >&2; exit 3"],
+                "shell": "none",
+                "user": "user"
             }
         }})
     );
@@ -1002,12 +1053,78 @@ async fn exec_builds_the_argv_with_cwd_env_home_and_user() {
     assert_eq!(
         init["data"]["context"],
         json!({
-            "command": ["env", "-C", "/home/user/work", "IS_SANDBOX=1", "HOME=/root", "SECRET=s3cr3t", "intentd", "executor", "mint"],
+            "command": ["env", "-C", "/home/user/work", "HOME=/root", "SECRET=s3cr3t", "intentd", "executor", "mint"],
             "shell": "none",
             "user": "user"
         })
     );
     assert!(!format!("{spec:?}").contains("s3cr3t"));
+}
+
+#[tokio::test]
+async fn exec_runs_as_the_unprivileged_user_unless_the_spec_names_one() {
+    let session = || {
+        WsSession::Steps(vec![
+            WsStep::Receive,
+            init_ok(),
+            completion(0, "Success"),
+            WsStep::Close,
+        ])
+    };
+    let server = FakeServer::start_with(vec![], vec![session(), session()]).await;
+    let client = client(&server);
+    client
+        .run_command(&instance("svc-1"), &ProcessSpec::new("id"))
+        .await
+        .unwrap();
+    let mut root = ProcessSpec::new("id");
+    root.user = Some("root".into());
+    client.run_command(&instance("svc-1"), &root).await.unwrap();
+    let users: Vec<Value> = server
+        .frames()
+        .iter()
+        .map(|f| serde_json::from_str::<Value>(f).unwrap()["data"]["context"]["user"].clone())
+        .collect();
+    assert_eq!(users, [json!("user"), json!("root")]);
+}
+
+#[tokio::test]
+async fn a_failed_setup_is_an_error_and_removes_the_machine() {
+    let server = FakeServer::start_with(
+        vec![
+            tag_list(&[NODE_TAG, BACKEND_TAG]),
+            Reply::data(&json!({"id": "vol-1"})),
+            Reply::data(&json!({"id": "svc-1"})),
+            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+            containers(&["TASK_RUNNING"]),
+            Reply::data(&json!({})),
+            Reply::data(&json!({})),
+        ],
+        vec![WsSession::Steps(vec![
+            WsStep::Receive,
+            init_ok(),
+            out("stdErr", "id: 'user': no such user\n"),
+            completion(1, "Failure"),
+            WsStep::Close,
+        ])],
+    )
+    .await;
+    let err = client(&server).create(&create_request()).await.unwrap_err();
+    assert_eq!(err.kind(), CloudErrorKind::Other);
+    assert!(err.to_string().contains("no such user"), "{err}");
+    let lines = server.lines();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "DELETE /projects/p1/services/svc-1?delete_child_objects=true"),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "DELETE /projects/p1/volumes/vol-1"),
+        "{lines:?}"
+    );
 }
 
 #[tokio::test]

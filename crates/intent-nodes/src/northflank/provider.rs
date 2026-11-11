@@ -12,6 +12,7 @@ use tokio::time::Instant;
 use super::client::{validate_id, Call, MAX_TAGS_JSON};
 use super::{
     backend_tag, NorthflankClient, CLOUD_PROVIDER_NORTHFLANK, DEFAULT_DISK_GIB, HOME, NODE_TAG,
+    RUN_AS,
 };
 use crate::cloud::{
     CloudError, CloudErrorKind, CloudFuture, CloudInstance, CloudProvider, Connected,
@@ -118,6 +119,18 @@ fn random_name() -> String {
     format!("intent-{}", &hex[..12])
 }
 
+/// Idempotent: `chown -R` only when the home folder's owner differs, so a
+/// resume of a large disk costs one `stat`.
+const PREPARE_HOME: &str = r#"set -eu
+u=$(id -u user)
+g=$(id -g user)
+if [ "$(stat -c %u:%g "$HOME")" != "$u:$g" ]; then
+  chown -R "$u:$g" "$HOME"
+fi
+"#;
+
+const PREPARE_HOME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn invalid(message: impl Into<String>) -> CloudError {
     CloudError::new(CloudErrorKind::InvalidArgument, message)
 }
@@ -194,16 +207,23 @@ impl NorthflankClient {
             }
         };
         let _ = volume.name;
-        if let Err(error) = self.wait_ready(&service.id).await {
-            let _ = self.delete_machine(&service.id, Some(&volume.id)).await;
-            return Err(error);
-        }
-        Ok(CloudInstance {
+        let instance = CloudInstance {
             id: service.id,
             image: request.image.clone(),
             access_token: None,
             volume_id: Some(volume.id),
-        })
+        };
+        let ready = match self.wait_ready(&instance.id).await {
+            Ok(_) => self.prepare_home(&instance).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = ready {
+            let _ = self
+                .delete_machine(&instance.id, instance.volume_id.as_deref())
+                .await;
+            return Err(error);
+        }
+        Ok(instance)
     }
 
     /// Add each team tag that does not exist yet: Northflank applies only
@@ -298,15 +318,36 @@ impl NorthflankClient {
             .await?;
         }
         let ready = self.wait_ready(id).await?;
-        Ok(Connected {
-            instance: CloudInstance {
-                id: id.to_string(),
-                image: ready.image,
-                access_token: None,
-                volume_id: None,
-            },
-            resumed,
-        })
+        let instance = CloudInstance {
+            id: id.to_string(),
+            image: ready.image,
+            access_token: None,
+            volume_id: None,
+        };
+        self.prepare_home(&instance).await?;
+        Ok(Connected { instance, resumed })
+    }
+
+    /// As root, hand the volume to [`RUN_AS`] unless it already owns it: a
+    /// new volume mounts root-owned. Runs at create and on every connect.
+    async fn prepare_home(&self, instance: &CloudInstance) -> Result<(), CloudError> {
+        let mut setup = ProcessSpec::new("/bin/sh");
+        setup.args = vec!["-c".into(), PREPARE_HOME.into()];
+        setup.user = Some("root".into());
+        setup.timeout = Some(PREPARE_HOME_TIMEOUT);
+        let output = self.exec(instance, &setup).await?;
+        if output.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(CloudError::new(
+            CloudErrorKind::Other,
+            format!(
+                "the Northflank machine's home folder could not be handed to {RUN_AS:?} (exit {}): {}",
+                output.exit.exit_code,
+                stderr.trim()
+            ),
+        ))
     }
 
     async fn pause_machine(&self, id: &str) -> Result<(), CloudError> {
