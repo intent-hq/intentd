@@ -469,6 +469,10 @@ icons. **Add machine** opens the connection form; a remote machine's actions inc
 actions can also include **Let <backend> run agents here**, which asks to confirm with
 **Allow**, and **Stop letting <backend> run agents here**; machines allowed this way are
 listed under **Machines <backend> can run agents on**.
+The rail on the window's left edge shows one icon per machine; hover an icon for its
+name. Select an icon to switch the window to that machine, like switching organizations
+in Slack. Machines you switch away from stay connected and keep updating, so switching
+back is instant. **+** at the end of the rail opens the same connection form.
 Running agents on those machines is experimental. Agents see each machine's name and
 platform, and look up its providers, sign-in status and models when they need them.
 An agent running on one of those machines uses that machine's skills (its
