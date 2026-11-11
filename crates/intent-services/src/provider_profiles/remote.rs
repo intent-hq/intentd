@@ -13,8 +13,19 @@
 //!   machine's own sign-in, sending nothing.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
-use super::*;
+use intent_core::{Error, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use super::{
+    default_changed_event, is_folder_path_key, is_qualified_ref, load_env, may_have_overlay,
+    parse_profile_ref, unreadable, write_atomic, FieldError, ProviderProfileStore,
+    RemoteCompatibility, StoredEnv, DEFAULT_NAME, PROFILE_BASE_PROVIDERS,
+    PROFILE_NOT_REMOTE_COMPATIBLE, REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER,
+};
+use crate::Services;
 
 /// File name of the remote-compatible choices inside the daemon data dir.
 pub(crate) const REMOTE_CHOICES_FILE: &str = "provider-remote-compatible.json";
