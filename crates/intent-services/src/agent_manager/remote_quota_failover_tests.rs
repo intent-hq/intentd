@@ -9,7 +9,11 @@ use std::collections::VecDeque;
 
 /// What one `runtime()` call of [`ScriptedRemote`] hands out.
 enum Launch {
+    /// A fresh launch: records its sign-in on the placement, as the real
+    /// port does.
     Runs(Arc<FakeRuntime>),
+    /// A run the machine kept across a restart: records nothing.
+    Reattaches(Arc<FakeRuntime>),
     Fails(&'static str),
 }
 
@@ -74,8 +78,13 @@ impl crate::feature_ports::RemoteLaunchPort for ScriptedRemote {
                 .lock()
                 .unwrap()
                 .push(failover_rows(&messages).len());
-            match self.launches.lock().unwrap().pop_front() {
+            let next = self.launches.lock().unwrap().pop_front();
+            match next {
                 Some(Launch::Runs(runtime)) => {
+                    record_launched_sign_in(svc, agent_id).await;
+                    Ok(runtime as Arc<crate::feature_ports::RemoteRuntime>)
+                }
+                Some(Launch::Reattaches(runtime)) => {
                     Ok(runtime as Arc<crate::feature_ports::RemoteRuntime>)
                 }
                 Some(Launch::Fails(reason)) => Err(Error::Internal(reason.into())),
@@ -85,6 +94,28 @@ impl crate::feature_ports::RemoteLaunchPort for ScriptedRemote {
             }
         })
     }
+}
+
+/// What the real port records at a fresh launch: whether it runs on the
+/// machine's own sign-in.
+async fn record_launched_sign_in(svc: &Services, agent_id: &AgentId) {
+    let session = svc.store.get_agent_session_summary(agent_id).await.unwrap();
+    let provider = session.provider.clone().unwrap_or_default();
+    let machine_sign_in = svc.runs_on_machine_sign_in(&session, &provider).await;
+    let mut view =
+        intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .unwrap();
+    view.launched_machine_sign_in = Some(machine_sign_in);
+    svc.store
+        .set_agent_session_metadata_key_json(
+            &session.workspace_id,
+            agent_id,
+            intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+            &serde_json::to_string(&view).unwrap(),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
 }
 
 fn failover_rows(messages: &[intent_core::AgentMessage]) -> Vec<&intent_core::AgentMessage> {
@@ -401,6 +432,240 @@ async fn a_machine_sign_in_launch_ignores_the_backends_quota_mark() {
         .await
         .unwrap();
     assert!(failover_rows(&messages).is_empty(), "{messages:#?}");
+}
+
+/// A remote agent's real quota failure (the backup starts on its node), then
+/// a turn start of a local `claude-code` agent on this backend: whether the
+/// local agent moved to the backup, the remote agent's provider, and the
+/// backup's reference.
+async fn remote_quota_failure_then_local_turn_start(
+    ws: &WorkspaceId,
+    id: &AgentId,
+    send_default: bool,
+) -> (bool, String, String) {
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let backup_run = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, backup) = remote_agent_with_backup(port.clone(), id, ws).await;
+    if send_default {
+        send_the_default_remotely(&mgr).await;
+    }
+    send(&mgr, id, ws, "hello").await;
+    backup_run.wait_prompts(1).await;
+    backup_run.finish.add_permits(1);
+    wait_idle(&mgr, id).await;
+    let remote = mgr
+        .services
+        .store
+        .get_agent_session_without_messages(id)
+        .await
+        .unwrap();
+
+    let local = AgentId::from(format!("{}-local", id.0));
+    let mut local_session = crate::test_support::fixtures::session(&local, ws);
+    local_session.provider = Some("claude-code".to_owned());
+    local_session.model = Some("opus".to_owned());
+    mgr.services
+        .store
+        .insert_agent_session(&local_session)
+        .await
+        .unwrap();
+    mgr.services.avoid_exhausted_provider(ws, &local).await;
+    let local_provider = mgr
+        .services
+        .store
+        .get_agent_session_without_messages(&local)
+        .await
+        .unwrap()
+        .provider
+        .unwrap_or_default();
+    (
+        local_provider == backup,
+        remote.provider.unwrap_or_default(),
+        backup,
+    )
+}
+
+/// A remote agent on the machine's own sign-in that really runs out of quota
+/// still fails over, but marks nothing on this backend: that account is not
+/// this backend's, so a local agent on `claude-code` is not moved
+/// (intent-hq/intent#9100).
+#[intent_test_macros::daemon_test]
+async fn a_machine_sign_in_quota_failure_does_not_mark_the_backends_account() {
+    let ws = WorkspaceId::from("ws-remote-quota-no-mark");
+    let id = AgentId::from("agent-remote-quota-no-mark");
+    let (local_moved, remote_provider, backup) =
+        remote_quota_failure_then_local_turn_start(&ws, &id, false).await;
+
+    assert_eq!(remote_provider, backup, "the remote agent still fails over");
+    assert!(!local_moved, "the local agent stays on claude-code");
+}
+
+/// A marked Default with overrides sends this backend's account, so its
+/// quota failure on a remote agent marks it as before, and a local agent on
+/// `claude-code` is moved to the backup at its next turn start.
+#[intent_test_macros::daemon_test]
+async fn a_sent_default_quota_failure_marks_the_backends_account() {
+    let ws = WorkspaceId::from("ws-remote-quota-mark");
+    let id = AgentId::from("agent-remote-quota-mark");
+    let (local_moved, remote_provider, backup) =
+        remote_quota_failure_then_local_turn_start(&ws, &id, true).await;
+
+    assert_eq!(remote_provider, backup);
+    assert!(local_moved, "the local agent leaves the marked claude-code");
+}
+
+/// A remote agent's turn on the machine's own sign-in says nothing about
+/// this backend's account, so it never clears that account's quota mark
+/// (intent-hq/intent#9100).
+#[intent_test_macros::daemon_test]
+async fn a_machine_sign_in_turn_does_not_clear_the_backends_mark() {
+    let ws = WorkspaceId::from("ws-remote-quota-keep");
+    let id = AgentId::from("agent-remote-quota-keep");
+    let primary = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![Launch::Runs(primary.clone())]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    mgr.services.provider_quota_cache.mark_exhausted(
+        &crate::profile_activation::SettingsRead::elsewhere("claude-code"),
+        None,
+        chrono::Utc::now(),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    send(&mgr, &id, &ws, "hello").await;
+    primary.wait_prompts(1).await;
+    primary.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(
+        mgr.services.exhausted_providers(),
+        vec!["claude-code".to_owned()]
+    );
+}
+
+/// The Default marked to be sent while a machine sign-in run is live does
+/// not change that run's account: its next turn still runs on the machine's
+/// own sign-in, so its quota failure does not mark this backend's account.
+#[intent_test_macros::daemon_test]
+async fn a_live_machine_sign_in_run_keeps_its_account_after_the_default_is_sent() {
+    let ws = WorkspaceId::from("ws-remote-quota-live");
+    let id = AgentId::from("agent-remote-quota-live");
+    let primary = FakeRuntime::new();
+    let backup_run = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    send(&mgr, &id, &ws, "first").await;
+    primary.wait_prompts(1).await;
+    primary.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    send_the_default_remotely(&mgr).await;
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    send(&mgr, &id, &ws, "second").await;
+    backup_run.wait_prompts(1).await;
+    backup_run.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    let provider = mgr
+        .services
+        .store
+        .get_agent_session_without_messages(&id)
+        .await
+        .unwrap()
+        .provider
+        .unwrap_or_default();
+    assert_eq!(provider, backup, "the remote agent still fails over");
+    assert!(
+        mgr.services.exhausted_providers().is_empty(),
+        "{:?}",
+        mgr.services.exhausted_providers()
+    );
+}
+
+/// A run this daemon reattaches to after a restart keeps the account its
+/// placement says it launched with, even when the Default is sent now: its
+/// quota failure does not mark this backend's account.
+#[intent_test_macros::daemon_test]
+async fn a_reattached_run_keeps_the_account_it_launched_with() {
+    let ws = WorkspaceId::from("ws-remote-quota-reattach");
+    let id = AgentId::from("agent-remote-quota-reattach");
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let backup_run = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Reattaches(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    let view = intent_core::remote_launch::RemotePlacementView {
+        launched_machine_sign_in: Some(true),
+        ..remote_view()
+    };
+    mgr.services
+        .store
+        .set_agent_session_metadata_key_json(
+            &ws,
+            &id,
+            intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+            &serde_json::to_string(&view).unwrap(),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    send_the_default_remotely(&mgr).await;
+    send(&mgr, &id, &ws, "hello").await;
+    backup_run.wait_prompts(1).await;
+    backup_run.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    assert!(
+        mgr.services.exhausted_providers().is_empty(),
+        "{:?}",
+        mgr.services.exhausted_providers()
+    );
+}
+
+/// A run reattached after a restart with no recorded sign-in (launched by
+/// an older daemon) runs on an unknown account: it neither marks nor
+/// clears this backend's account, whatever the settings say now.
+#[intent_test_macros::daemon_test]
+async fn a_reattached_run_of_unknown_sign_in_leaves_the_backends_marks_alone() {
+    let ws = WorkspaceId::from("ws-remote-quota-unknown");
+    let id = AgentId::from("agent-remote-quota-unknown");
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let backup_run = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Reattaches(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    send_the_default_remotely(&mgr).await;
+    send(&mgr, &id, &ws, "hello").await;
+    backup_run.wait_prompts(1).await;
+    backup_run.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    let provider = mgr
+        .services
+        .store
+        .get_agent_session_without_messages(&id)
+        .await
+        .unwrap()
+        .provider
+        .unwrap_or_default();
+    assert_eq!(provider, backup, "the remote agent still fails over");
+    assert!(
+        mgr.services.exhausted_providers().is_empty(),
+        "{:?}",
+        mgr.services.exhausted_providers()
+    );
 }
 
 /// A remote agent out of quota whose only backup uses an account folder on

@@ -3051,6 +3051,10 @@ pub struct AgentManager {
     /// `<supervisor>` XML so the fresh session has context, then clears the flag
     /// (parity: TS `sessionWasRecreated`).
     recreated: Arc<Mutex<HashSet<AgentId>>>,
+    /// Whether each remote agent's live run launched on its machine's own
+    /// sign-in. A turn that reuses the run keeps that account, whatever the
+    /// settings say now (intent-hq/intent#9100).
+    remote_machine_sign_in: Arc<Mutex<HashMap<AgentId, bool>>>,
     /// Agents already told that their workspace's setup script `failed`
     /// (§6.5): the failure notice is prepended to exactly one turn per agent,
     /// the first that starts after the failure. In-memory like the setup
@@ -3306,6 +3310,7 @@ impl AgentManager {
             workers: Arc::new(Mutex::new(HashMap::new())),
             finishing_workers: Mutex::new(Vec::new()),
             recreated: Arc::new(Mutex::new(HashSet::new())),
+            remote_machine_sign_in: Arc::new(Mutex::new(HashMap::new())),
             setup_failure_notified: Arc::new(Mutex::new(HashSet::new())),
             prepend_pending: Arc::new(Mutex::new(HashSet::new())),
             stale_cancels: Arc::new(Mutex::new(HashMap::new())),
@@ -11898,6 +11903,7 @@ impl AgentManager {
             agent_id,
             &resolved.selection,
             session.model.as_deref(),
+            false,
         );
 
         // Check if the agent's model/provider has changed (via agent.setModel).
@@ -12322,12 +12328,18 @@ impl AgentManager {
         // Backup failover (PROTOCOL §5.54): the identity this attempt starts
         // with — a quota failure only fails over while the session still
         // carries it.
+        let selection = crate::provider_profiles::canonical_selection(
+            session.provider.as_deref().unwrap_or_default(),
+        );
+        let machine_sign_in = self
+            .services
+            .runs_on_machine_sign_in(session, &selection)
+            .await;
         self.services.note_quota_failover_attempt(
             agent_id,
-            &crate::provider_profiles::canonical_selection(
-                session.provider.as_deref().unwrap_or_default(),
-            ),
+            &selection,
             session.model.as_deref(),
+            machine_sign_in,
         );
         // The node runs the identity the agent was launched with. A switch
         // `agent.setModel` accepted (checked against the machine's report)
@@ -12354,6 +12366,16 @@ impl AgentManager {
             }
         }
         if self.handle_is_live(agent_id) {
+            let live = self
+                .remote_machine_sign_in
+                .lock()
+                .unwrap()
+                .get(agent_id)
+                .copied();
+            if let Some(live) = live {
+                self.services
+                    .set_quota_failover_attempt_machine_sign_in(agent_id, live);
+            }
             return Ok(StartedSession {
                 session_id,
                 turn: self.capture_turn(agent_id)?,
@@ -12443,6 +12465,27 @@ impl AgentManager {
                 "agent session {agent_id} is being deleted"
             )));
         }
+        // The account the run really uses: the one its launch recorded,
+        // which a run reattached after a restart keeps. A run with none
+        // recorded (launched by an older daemon) runs on an unknown account,
+        // so it leaves this backend's quota marks alone.
+        let launched = self
+            .services
+            .store
+            .get_agent_session_summary(agent_id)
+            .await
+            .ok()
+            .and_then(|s| {
+                intent_core::remote_launch::RemotePlacementView::from_metadata(s.metadata.as_ref())
+            })
+            .and_then(|view| view.launched_machine_sign_in)
+            .unwrap_or(true);
+        self.services
+            .set_quota_failover_attempt_machine_sign_in(agent_id, launched);
+        self.remote_machine_sign_in
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), launched);
         // Output the node streams between turns becomes implicit turns, as
         // for a local agent.
         let listener = self.spawn_wake_listener(agent_id.clone(), workspace_id.clone());

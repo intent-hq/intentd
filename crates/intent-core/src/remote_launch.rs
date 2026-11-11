@@ -315,6 +315,11 @@ pub struct RemotePlacementView {
     /// machine, so a launch on another one tells the agent; never projected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launched_on: Option<String>,
+    /// Whether the agent's last launch ran on its machine's own sign-in
+    /// (sent nothing), kept so a run reattached after a restart keeps that
+    /// account (intent-hq/intent#9100); never projected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched_machine_sign_in: Option<bool>,
     /// While the agent's cloud machine starts (`AgentLite.cloudStart`).
     /// `node_id` and `lease_id` stay empty until its link binds.
     #[serde(default, skip_serializing_if = "Option::is_none")]

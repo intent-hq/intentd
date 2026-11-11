@@ -443,6 +443,7 @@ async fn remote_manager(
         shared_checkout_of: None,
         parent_work: None,
         launched_on: None,
+        launched_machine_sign_in: None,
         cloud_start: None,
     };
     mgr.services
@@ -476,6 +477,7 @@ fn remote_view() -> intent_core::remote_launch::RemotePlacementView {
         shared_checkout_of: None,
         parent_work: None,
         launched_on: None,
+        launched_machine_sign_in: None,
         cloud_start: None,
     }
 }
