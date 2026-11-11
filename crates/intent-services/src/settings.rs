@@ -2504,7 +2504,9 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
              in the chat, allow approves every request, auto approves reads and denies the rest, \
              deny refuses every request. A chat's own setting overrides it, and the \
              INTENTD_PERMISSION_POLICY environment variable overrides this setting. Applies at \
-             each agent's next turn; agents on remote machines use remoteAgents.permission",
+             each agent's next turn; agents on remote machines use remoteAgents.permission. \
+             Except under allow, Codex runs in its workspace-write sandbox and asks only to \
+             write outside the workspace or use the network",
             "agents",
             &["interactive", "allow", "auto", "deny"],
             "allow",

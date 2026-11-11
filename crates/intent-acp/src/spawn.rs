@@ -725,7 +725,7 @@ fn build_command_in(
     // An npx spawn (fallback or npx-only) always runs a Node child, so env
     // assembly applies the V8 heap cap regardless of its declared runtime.
     let via_npx = opts.via_npx();
-    let provider_env = build_provider_env_for_spawn(
+    let mut provider_env = build_provider_env_for_spawn(
         opts.provider,
         opts.model,
         opts.rules_file,
@@ -734,6 +734,17 @@ fn build_command_in(
         via_npx,
         opts.node_max_old_space_mb,
     );
+    // Codex's full-access default never sends `session/request_permission`,
+    // so a stricter policy starts it in a mode that asks before escalating.
+    if opts.provider.id == "codex"
+        && opts
+            .permission_policy
+            .is_some_and(|policy| policy != crate::PermissionPolicy::AllowAll)
+    {
+        if let Some(mode) = provider_env.get_mut(intent_providers::CODEX_INITIAL_AGENT_MODE_ENV) {
+            "workspace-write".clone_into(mode);
+        }
+    }
     // A named profile's overlay beats the inherited and captured environment
     // but never Intent's own wiring: provider env and extra_env are applied
     // after it (an unset never removes them), and the enforced config, npm
@@ -1783,6 +1794,47 @@ mod build_command_tests {
                 Some(explicit)
             );
         }
+    }
+
+    /// Codex in full access never asks, so any policy other than allow-all
+    /// starts it in `workspace-write`, which asks before escalating. An
+    /// explicit operator value still wins.
+    #[test]
+    fn build_command_codex_initial_mode_follows_permission_policy() {
+        if std::env::var_os("INITIAL_AGENT_MODE").is_some() {
+            return;
+        }
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let npx = Path::new("/usr/local/bin/npx");
+        let mut opts = SpawnOptions::new(provider);
+        opts.npx_fallback_binary = Some(npx);
+        opts.npx_fallback_package = provider.npx_only_package;
+        for (policy, expected) in [
+            (None, "agent-full-access"),
+            (Some(crate::PermissionPolicy::AllowAll), "agent-full-access"),
+            (Some(crate::PermissionPolicy::Interactive), "workspace-write"),
+            (Some(crate::PermissionPolicy::AutoByRisk), "workspace-write"),
+            (Some(crate::PermissionPolicy::DenyAll), "workspace-write"),
+        ] {
+            opts.permission_policy = policy;
+            let cmd = build_command(&opts);
+            assert_eq!(
+                env_value(&cmd, "INITIAL_AGENT_MODE").as_deref(),
+                Some(expected),
+                "{policy:?}"
+            );
+        }
+        opts.extra_env
+            .insert("INITIAL_AGENT_MODE".to_string(), "agent-full-access".into());
+        assert_eq!(
+            env_value(&build_command(&opts), "INITIAL_AGENT_MODE").as_deref(),
+            Some("agent-full-access")
+        );
+
+        let mock = intent_providers::find_provider("claude-code").unwrap();
+        let mut other = SpawnOptions::new(mock);
+        other.permission_policy = Some(crate::PermissionPolicy::Interactive);
+        assert_eq!(env_value(&build_command(&other), "INITIAL_AGENT_MODE"), None);
     }
 
     #[test]

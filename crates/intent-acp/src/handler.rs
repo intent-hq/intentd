@@ -270,7 +270,10 @@ impl ClientRequestHandler {
             &parsed,
         );
 
-        let policy = if crate::codex_sandbox::restricted(conn, parsed.session_id.0.as_ref())
+        // A restricted Codex sandbox never escalates silently; an interactive
+        // chat leaves that decision to the user.
+        let policy = if self.policy != PermissionPolicy::Interactive
+            && crate::codex_sandbox::restricted(conn, parsed.session_id.0.as_ref())
             && !crate::codex_sandbox::is_plan_approval(&parsed)
         {
             PermissionPolicy::DenyAll
