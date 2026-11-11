@@ -108,6 +108,29 @@ async fn agent_permission_policy_applies_on_next_turn_over_wss() {
         assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
     }
 
+    // Before any turn nothing else writes the row, so updatedAt is stable.
+    let denied = wss_rpc(
+        &mut rpc,
+        40,
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "permissionPolicy": "deny" } }),
+    )
+    .await;
+    assert_eq!(denied["agent"]["effectivePermissionPolicy"], "deny", "{denied}");
+    assert_eq!(
+        denied["agent"]["updatedAt"], created["agent"]["updatedAt"],
+        "a policy change is not activity"
+    );
+    let cleared = wss_rpc(
+        &mut rpc,
+        41,
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "changes": { "permissionPolicy": null } }),
+    )
+    .await;
+    assert!(cleared["agent"]["permissionPolicy"].is_null(), "{cleared}");
+    assert_eq!(cleared["agent"]["effectivePermissionPolicy"], "allow");
+
     // Default policy: the prompt is answered without a client.
     wss_rpc(
         &mut rpc,
@@ -121,13 +144,6 @@ async fn agent_permission_policy_applies_on_next_turn_over_wss() {
     let first_pids = spawned_pids(&session_log);
     assert_eq!(first_pids.len(), 1, "one child: {first_pids:?}");
 
-    let before = wss_rpc(
-        &mut rpc,
-        6,
-        "agent.get",
-        json!({ "workspaceId": ws_id, "agentId": agent_id }),
-    )
-    .await;
     let updated = wss_rpc(
         &mut rpc,
         7,
@@ -140,14 +156,13 @@ async fn agent_permission_policy_applies_on_next_turn_over_wss() {
         "{updated}"
     );
     assert_eq!(updated["agent"]["effectivePermissionPolicy"], "interactive");
-    assert_eq!(
-        updated["agent"]["updatedAt"], before["agent"]["updatedAt"],
-        "a policy change is not activity"
-    );
     loop {
         let frame = wss_event(&mut sub, 30).await;
         let ev = &frame["params"]["event"];
-        if ev["type"] == "agent:updated" && ev["data"]["agentId"] == agent_id {
+        if ev["type"] == "agent:updated"
+            && ev["data"]["agentId"] == agent_id
+            && ev["data"].get("permissionPolicy").is_some()
+        {
             assert_eq!(ev["data"]["permissionPolicy"], "interactive", "{ev}");
             break;
         }
