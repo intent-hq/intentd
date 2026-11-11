@@ -592,3 +592,150 @@ async fn an_unreadable_choices_file_reads_not_marked_and_refuses_choices() {
         .await
         .expect("a write without a choice still works");
 }
+
+async fn default_marked(fx: &Fixture, base: &str) -> bool {
+    default_row(fx, base).await["remoteCompatible"] == true
+}
+
+/// A Default write that adds a credential marks it for remote machines
+/// (§5.54 "Credential auto-mark"), for every client.
+#[intent_test_macros::daemon_test]
+async fn adding_a_credential_marks_the_default() {
+    let fx = Fixture::new().await;
+    assert!(!default_marked(&fx, "claude-code").await);
+    let saved = fx
+        .svc
+        .provider_profiles_update_default_impl(json!({
+            "baseProviderId": "claude-code",
+            "env": [{ "key": "anthropic_api_key", "kind": "set", "value": SECRET }],
+        }))
+        .await
+        .unwrap();
+    assert_eq!(saved["defaultConfig"]["remoteCompatible"], true);
+    assert_eq!(saved["defaultConfig"]["remoteLaunch"], "send");
+    for (base, key) in [
+        ("codex", "CODEX_API_KEY"),
+        ("codex", "OPENAI_API_KEY"),
+        ("codex", "CODEX_ACCESS_TOKEN"),
+        ("claude-code", "ANTHROPIC_AUTH_TOKEN"),
+        ("claude-code", "CLAUDE_CODE_OAUTH_TOKEN"),
+    ] {
+        fx.svc
+            .provider_profiles_update_default_impl(json!({
+                "baseProviderId": base, "env": [], "remoteCompatible": false,
+            }))
+            .await
+            .unwrap();
+        fx.svc
+            .provider_profiles_update_default_impl(json!({
+                "baseProviderId": base,
+                "env": [{ "key": key, "kind": "set", "value": SECRET }],
+            }))
+            .await
+            .unwrap();
+        assert!(default_marked(&fx, base).await, "{base} {key}");
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn an_explicit_choice_in_the_same_write_wins_over_the_auto_mark() {
+    let fx = Fixture::new().await;
+    let saved = fx
+        .svc
+        .provider_profiles_update_default_impl(json!({
+            "baseProviderId": "codex",
+            "env": [{ "key": "OPENAI_API_KEY", "kind": "set", "value": SECRET }],
+            "remoteCompatible": false,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(saved["defaultConfig"]["remoteCompatible"], false);
+}
+
+#[intent_test_macros::daemon_test]
+async fn a_default_with_an_account_folder_stays_unmarked_when_a_credential_is_added() {
+    let fx = Fixture::new().await;
+    let saved = fx
+        .svc
+        .provider_profiles_update_default_impl(json!({
+            "baseProviderId": "claude-code",
+            "env": [
+                { "key": "CLAUDE_CONFIG_DIR", "kind": "set", "value": "~/.claude-a" },
+                { "key": TOKEN, "kind": "set", "value": SECRET },
+            ],
+        }))
+        .await
+        .expect("no field error: the auto-mark never asks for a folder");
+    assert_eq!(saved["defaultConfig"]["remoteCompatible"], false);
+    assert_eq!(
+        saved["defaultConfig"]["remoteIncompatibility"]["reason"],
+        "account-folder"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn removing_the_credential_keeps_the_mark() {
+    let fx = Fixture::new().await;
+    fx.svc
+        .provider_profiles_update_default_impl(json!({
+            "baseProviderId": "claude-code", "env": token_env(),
+        }))
+        .await
+        .unwrap();
+    assert!(default_marked(&fx, "claude-code").await);
+    fx.svc
+        .provider_profiles_update_default_impl(json!({
+            "baseProviderId": "claude-code", "env": [],
+        }))
+        .await
+        .unwrap();
+    assert!(default_marked(&fx, "claude-code").await);
+}
+
+#[intent_test_macros::daemon_test]
+async fn a_write_that_adds_no_credential_does_not_mark() {
+    let fx = Fixture::new().await;
+    // An unmarked Default that already holds a credential.
+    fx.svc
+        .provider_profiles_update_default_impl(json!({
+            "baseProviderId": "claude-code", "env": token_env(), "remoteCompatible": false,
+        }))
+        .await
+        .unwrap();
+    for params in [
+        json!({ "baseProviderId": "claude-code", "name": "Work" }),
+        json!({ "baseProviderId": "claude-code", "env": [
+            { "key": TOKEN, "kind": "keep" },
+            { "key": "ANTHROPIC_BASE_URL", "kind": "set", "value": "https://proxy.example" },
+        ] }),
+        json!({ "baseProviderId": "claude-code", "env": [
+            { "key": TOKEN, "kind": "set", "value": "rotated-value" },
+        ] }),
+        json!({ "baseProviderId": "claude-code", "env": [
+            { "key": TOKEN, "kind": "keep" },
+            { "key": "OPENAI_API_KEY", "kind": "unset" },
+        ] }),
+    ] {
+        fx.svc
+            .provider_profiles_update_default_impl(params.clone())
+            .await
+            .unwrap();
+        assert!(!default_marked(&fx, "claude-code").await, "{params}");
+    }
+    // Profiles never auto-mark.
+    let profile = fx
+        .create_with(json!({
+            "baseProviderId": "codex", "name": "Off", "remoteCompatible": false,
+        }))
+        .await
+        .unwrap();
+    let updated = fx
+        .svc
+        .provider_profiles_update_impl(
+            id_of(&profile),
+            json!({ "env": [{ "key": "OPENAI_API_KEY", "kind": "set", "value": SECRET }] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated["profile"]["remoteCompatible"], false);
+}
