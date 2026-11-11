@@ -991,6 +991,18 @@ async fn a_lease_agent_sets_the_workspace_title_and_status() {
     assert_eq!(skipped["skipped"], json!(true), "{skipped}");
     let details = answered(forward(&link, &agent, "workspace.details", json!({})).await);
     assert_eq!(details["title"], json!("Remote naming"), "{details}");
+    // An explicit user request reaches head and replaces the title.
+    let renamed = answered(
+        forward(
+            &link,
+            &agent,
+            "workspace.setTitle",
+            json!({ "title": "Asked for", "userRequested": true }),
+        )
+        .await,
+    );
+    assert_eq!(renamed.get("skipped"), None, "{renamed}");
+    assert_eq!(renamed["title"], json!("Asked for"), "{renamed}");
     f.node.shutdown();
 }
 

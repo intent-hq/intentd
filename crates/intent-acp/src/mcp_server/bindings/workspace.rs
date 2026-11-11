@@ -17,14 +17,15 @@ use intent_core::{
 use serde_json::{json, Value};
 
 use super::app::proposal::PROPOSAL_RESOURCE_MIME_TYPE;
-use super::{map_err, req_str, strip_agent_hidden_fields};
+use super::{map_err, opt_strict_bool, req_str, strip_agent_hidden_fields};
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.workspace = {
         info: () => host({ method: 'workspace.info' }),
         details: () => host({ method: 'workspace.details' }),
-        setTitle: (title) => host({ method: 'workspace.setTitle', args: { title } }),
+        setTitle: (title, opts) =>
+            host({ method: 'workspace.setTitle', args: { ...(opts || {}), title } }),
         setStatusMessage: (statusMessage) =>
             host({ method: 'workspace.setStatusMessage', args: { statusMessage } }),
         setStatusImage: (image) =>
@@ -809,6 +810,9 @@ async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value,
     }
 }
 
+const SET_TITLE_ALLOWED_KEYS: &[&str] = &["title", "userRequested"];
+const SET_TITLE_SKIPPED_HINT: &str = "The workspace already has a title. Only if the user explicitly asked to rename it, call setTitle(title, { userRequested: true }).";
+
 async fn set_title(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -819,14 +823,28 @@ async fn set_title(
     if trimmed.is_empty() {
         return Err("title is required".to_string());
     }
+    // `userRequested: true` attests that the user explicitly asked for this
+    // rename (the `ws.git.commit` convention). Without it a named workspace
+    // keeps its title, so first-turn auto-naming never overwrites one. An
+    // unknown key (a `userRequest` typo) is refused rather than ignored.
+    if let Some(key) = args.as_object().and_then(|o| {
+        o.keys()
+            .find(|k| !SET_TITLE_ALLOWED_KEYS.contains(&k.as_str()))
+    }) {
+        return Err(format!(
+            "unknown setTitle option `{key}`; the only option is userRequested"
+        ));
+    }
+    let user_requested = opt_strict_bool(args, "userRequested")?.unwrap_or(false);
     let existing = api.get_workspace(ws.clone()).await.map_err(map_err)?;
     let existing_title = existing.title.trim();
-    if !existing_title.is_empty() && existing_title != existing.id.as_str() {
+    if !user_requested && !existing_title.is_empty() && existing_title != existing.id.as_str() {
         return Ok(json!({
             "ok": true,
             "skipped": true,
             "title": existing_title,
             "branch": existing.branch,
+            "hint": SET_TITLE_SKIPPED_HINT,
         }));
     }
     let update = WorkspaceUpdate {

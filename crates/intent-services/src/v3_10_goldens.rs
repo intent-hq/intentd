@@ -1,4 +1,4 @@
-//! Harness 3.10 and 3.12 doctrine goldens: the composed bundled rules are
+//! Harness 3.10, 3.12 and 3.13 doctrine goldens: the composed bundled rules are
 //! pinned per agent type and feature/plain-folder variant, the cut sections
 //! stay out, and every feature gate and plain-folder rewrite still bites.
 
@@ -45,6 +45,42 @@ const GOLDEN: &[(&str, usize, &str)] = &[
         "chat",
         38_959,
         "77cf8da8259d6942950891f8a85f270713a14586249a50cabd1e760c4f8aeb20",
+    ),
+    (
+        "code-review",
+        14_393,
+        "c530af1e49d099ffd8e067fb97edd8aa2e0f3b114bb68e063ec6a81ab709b45f",
+    ),
+];
+
+/// 3.13's composed doctrine (3.12's with the explicit-rename Workspace Title
+/// rule), in the same layout as [`GOLDEN`]. Change it only through a new
+/// harness version once released.
+const GOLDEN_V3_13: &[(&str, usize, &str)] = &[
+    (
+        "interactive",
+        41_029,
+        "1383d070df264ab3fef94de49e5fad74608f6eca66c4ac2947586e98e2f37eb6",
+    ),
+    (
+        "workspace",
+        41_029,
+        "1383d070df264ab3fef94de49e5fad74608f6eca66c4ac2947586e98e2f37eb6",
+    ),
+    (
+        "workspace-agent",
+        55_785,
+        "04e43b4529a80ce73b66fb4faf8095f770eae6b773904afead5490f857f06041",
+    ),
+    (
+        "task-breakdown",
+        75_152,
+        "3dfff186ef838c76ef87eaf9f2066b8b644e3d8cbdfceed2d8bef4c4f3806041",
+    ),
+    (
+        "chat",
+        42_525,
+        "7797f046d953815eb62b7c096dab895d0ab826278bb29a9923af154a5f3149f6",
     ),
     (
         "code-review",
@@ -286,6 +322,33 @@ fn golden_v3_12_composed_doctrine() {
         "harness 3.12 doctrine changed. 3.12 is released, so live sessions carry it: \
          gate the change on a new harness version, or for a deliberate all-session fix \
          paste the rows below into GOLDEN_V3_12:\n{}",
+        actual
+            .iter()
+            .map(|(t, len, sha)| format!("    (\"{t}\", {len}, \"{sha}\"),"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn golden_v3_13_composed_doctrine() {
+    let set = &crate::instructions::V3_13;
+    let actual: Vec<(&str, usize, String)> = AGENT_TYPES
+        .iter()
+        .map(|agent_type| {
+            let text = composed_in(set, agent_type);
+            (*agent_type, text.len(), sha256_hex(&text))
+        })
+        .collect();
+    let matches = actual.len() == GOLDEN_V3_13.len()
+        && actual
+            .iter()
+            .zip(GOLDEN_V3_13)
+            .all(|(a, g)| a.0 == g.0 && a.1 == g.1 && a.2 == g.2);
+    assert!(
+        matches,
+        "harness 3.13 doctrine changed. Gate the change on a new harness version, or \
+         for a deliberate all-session fix paste the rows below into GOLDEN_V3_13:\n{}",
         actual
             .iter()
             .map(|(t, len, sha)| format!("    (\"{t}\", {len}, \"{sha}\"),"))

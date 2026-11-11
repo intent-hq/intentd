@@ -4132,7 +4132,7 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "3.12";
+pub const CURRENT_HARNESS_VERSION: &str = "3.13";
 
 /// A harness experiment while it is built: registered and admitted
 /// like a released one, but stamped only through the eval-only override
@@ -4177,13 +4177,14 @@ const fn version_is_newer(a: &str, b: &str) -> bool {
 /// malformed or unknown stamps are never admitted.
 pub const REPOSITORY_GUIDANCE_HARNESS_VERSIONS: &[&str] = &[
     "3.0", "3.1", "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10", "3.11", "3.12",
+    "3.13",
 ];
 
 /// Harness versions that receive monitor-style repository guidance and the
 /// repository-callback prompt envelope, oldest first. Always the newest part
 /// of [`REPOSITORY_GUIDANCE_HARNESS_VERSIONS`] (checked at compile time).
 pub const REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS: &[&str] = &[
-    "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10", "3.11", "3.12",
+    "3.2", "3.3", "3.4", "3.5", "3.6", "3.7", "3.8", "3.9", "3.10", "3.11", "3.12", "3.13",
 ];
 
 const fn const_str_eq(a: &str, b: &str) -> bool {

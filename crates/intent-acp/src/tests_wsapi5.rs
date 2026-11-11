@@ -694,6 +694,9 @@ async fn workspace_set_title_skips_when_already_titled() {
     let v = body(&resp);
     assert_eq!(v["skipped"], json!(true));
     assert_eq!(v["title"], json!("Hello"));
+    assert!(v["hint"]
+        .as_str()
+        .is_some_and(|h| h.contains("{ userRequested: true }")));
     assert!(api.update_calls.lock().unwrap().is_empty());
 }
 
@@ -708,6 +711,81 @@ async fn workspace_set_title_updates_when_auto_titled() {
     let calls = api.update_calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].title.as_deref(), Some("New Name"));
+}
+
+#[tokio::test]
+async fn workspace_set_title_user_requested_renames_titled_workspace() {
+    let (srv, api) = server();
+    let resp = call(
+        &srv,
+        "return await ws.workspace.setTitle(' Renamed ', { userRequested: true });",
+    )
+    .await;
+    let v = body(&resp);
+    assert_eq!(v["ok"], json!(true));
+    assert_eq!(v.get("skipped"), None);
+    assert_eq!(v["title"], json!("Renamed"));
+    let calls = api.update_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].title.as_deref(), Some("Renamed"));
+}
+
+/// First-turn auto-naming passes no option (or `userRequested: false`), so a
+/// named workspace keeps its title either way.
+#[tokio::test]
+async fn workspace_set_title_without_user_request_keeps_existing_title() {
+    let (srv, api) = server();
+    for code in [
+        "return await ws.workspace.setTitle('Auto name', {});",
+        "return await ws.workspace.setTitle('Auto name', { userRequested: false });",
+    ] {
+        let v = body(&call(&srv, code).await);
+        assert_eq!(v["skipped"], json!(true), "{code}");
+        assert_eq!(v["title"], json!("Hello"), "{code}");
+    }
+    assert!(api.update_calls.lock().unwrap().is_empty());
+}
+
+/// The options object cannot smuggle a different title past the positional one.
+#[tokio::test]
+async fn workspace_set_title_positional_title_wins_over_options() {
+    let (srv, api) = server();
+    let resp = call(
+        &srv,
+        "return await ws.workspace.setTitle('Real', { userRequested: true, title: 'Other' });",
+    )
+    .await;
+    assert_eq!(body(&resp)["title"], json!("Real"));
+    assert_eq!(
+        api.update_calls.lock().unwrap()[0].title.as_deref(),
+        Some("Real")
+    );
+}
+
+#[tokio::test]
+async fn workspace_set_title_rejects_non_boolean_user_requested() {
+    let (srv, api) = server();
+    let resp = call(
+        &srv,
+        "return await ws.workspace.setTitle('X', { userRequested: 'yes' });",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("`userRequested` must be a boolean"));
+    assert!(api.update_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn workspace_set_title_rejects_unknown_option() {
+    let (srv, api) = server();
+    let resp = call(
+        &srv,
+        "return await ws.workspace.setTitle('X', { userRequest: true });",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("unknown setTitle option `userRequest`"));
+    assert!(api.update_calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
