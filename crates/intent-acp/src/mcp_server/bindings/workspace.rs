@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use intent_core::placement::{AgentPlacement, PlacementTarget};
 use intent_core::{
     AgentId, AgentStatus, ConversationProjection, Error, GitRemoteUrl, RepoRef, WorkspaceApi,
     WorkspaceCreate, WorkspaceCreateOrigin, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
@@ -76,7 +77,7 @@ pub(crate) async fn dispatch(
         "setAgentName" => set_agent_name(api, caller_agent_id, args).await,
         "archive" => archive(api, ws, caller_agent_id).await,
         "unarchive" => unarchive(api, ws).await,
-        "proposeSibling" => propose_sibling(api, ws, args).await,
+        "proposeSibling" => propose_sibling(api, ws, caller_agent_id, args).await,
         "applyProposal" => apply_proposal(api, ws, caller_agent_id, args).await,
         "context" => {
             Err("ws.workspace.context is not yet available in this daemon port".to_string())
@@ -181,9 +182,45 @@ fn github_https_url(repo: &RepoRef) -> String {
     format!("https://github.com/{}/{}", repo.owner, repo.name)
 }
 
+/// Where the caller runs, as the closed placement object a proposal stamps
+/// (PROTOCOL §5.1 "Proposer placement"): the backend, its machine, or a new
+/// sandbox from its E2B entry. `None` without `remoteInitialAgent`, for an
+/// unknown caller, or a remote caller not yet bound to a machine.
+async fn proposer_placement(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace_id: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
+) -> Option<AgentPlacement> {
+    if !api.remote_machines_capability() {
+        return None;
+    }
+    let lite = api
+        .agent_get(caller_agent_id?.clone(), Some(workspace_id.clone()))
+        .await
+        .ok()?;
+    let node_id = lite.node_id.filter(|id| !id.is_empty());
+    match lite.placement {
+        Some(placed) if placed.target == Some(PlacementTarget::E2b) => Some(AgentPlacement {
+            target: Some(PlacementTarget::E2b),
+            cloud_machine_id: placed.cloud_machine_id,
+            ..AgentPlacement::default()
+        }),
+        placed if placed.is_some() || node_id.is_some() => node_id.map(|id| AgentPlacement {
+            target: Some(PlacementTarget::Remote),
+            node_id: Some(id),
+            ..AgentPlacement::default()
+        }),
+        _ => Some(AgentPlacement {
+            target: Some(PlacementTarget::Local),
+            ..AgentPlacement::default()
+        }),
+    }
+}
+
 async fn propose_sibling(
     api: &Arc<dyn WorkspaceApi>,
     workspace_id: &WorkspaceId,
+    caller_agent_id: Option<&AgentId>,
     args: &Value,
 ) -> Result<Value, String> {
     let params = args
@@ -352,7 +389,7 @@ async fn propose_sibling(
     // preview.title`, and a title-keyed card shares its pending entry,
     // resolution and created-workspace link with every same-titled follow-up
     // card this agent proposes.
-    let proposal = json!({
+    let mut proposal = json!({
         "kind": "workspace-create",
         "applyToolCallId": format!("workspace-create-{}", uuid::Uuid::new_v4()),
         "payload": {
@@ -361,6 +398,12 @@ async fn propose_sibling(
         },
         "preview": preview,
     });
+    // Outside `payload.params`, so a client that does not know the stamp
+    // still creates a local initial agent.
+    if let Some(placement) = proposer_placement(api, workspace_id, caller_agent_id).await {
+        proposal["placement"] = serde_json::to_value(placement)
+            .map_err(|error| format!("Could not encode the proposer placement: {error}"))?;
+    }
     let mut result = super::app::workspaces::proposal_result(&proposal)?;
     // Surface the stable handle applyProposal accepts across resolution
     // (additive): the idempotencyKey only addresses the proposal while pending.
@@ -387,6 +430,80 @@ async fn propose_sibling(
         }
     }
     Ok(result)
+}
+
+/// `error.data` of a structured create failure (placement, model, machine
+/// and provider-profile refusals, and the post-commit `launch-failed`).
+fn structured_error_data(error: &Error) -> Option<Value> {
+    match error {
+        Error::PlacementUnavailable(failure) => Some(failure.data()),
+        Error::ModelUnavailable(failure) => Some(failure.data()),
+        Error::MachineUpdateRequired(failure) => Some(failure.data()),
+        Error::RemoteMachine(failure) | Error::ProviderProfile(failure) => {
+            Some(failure.data.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The agent-facing text of a failed `applyProposal` create. A refusal
+/// before any effect leaves the card pending and names its `data.code`. A
+/// `launch-failed` after the workspace committed resolves the proposal
+/// `applied`, since a retry with the same key only replays the error.
+async fn apply_create_failure(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: &AgentId,
+    proposal_id: &str,
+    error: Error,
+) -> String {
+    let data = structured_error_data(&error);
+    let code = data
+        .as_ref()
+        .and_then(|d| d.get("code"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let message = map_err(error);
+    let Some(code) = code else {
+        return message;
+    };
+    let data = data.unwrap_or_default();
+    let workspace_id = data
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    let (Some(workspace_id), "launch-failed") = (workspace_id, code.as_str()) else {
+        return format!("{code}: {message}");
+    };
+    let cause_code = data
+        .pointer("/cause/code")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let cause_message = data
+        .pointer("/cause/message")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let resolved = api
+        .agent_resolve_proposal(
+            ws.clone(),
+            caller.clone(),
+            proposal_id.to_string(),
+            PROPOSAL_OUTCOME_APPLIED.to_string(),
+            Some(format!(
+                "Created workspace {workspace_id}; its first agent failed to start: {cause_code}"
+            )),
+            Some(WorkspaceId::from_string(workspace_id)),
+        )
+        .await;
+    let resolution = match resolved {
+        Ok(_) => "the proposal is marked applied".to_string(),
+        Err(e) => format!("the proposal could not be marked applied: {e}"),
+    };
+    format!(
+        "launch-failed: {message} Workspace {workspace_id} (intent://local/workspace/{workspace_id}) \
+         was created and {resolution}, but its first agent failed to start \
+         ({cause_code}: {cause_message}). Do not apply this proposal again; tell the user."
+    )
 }
 
 const APPLY_PROPOSAL_ALLOWED_KEYS: &[&str] = &["userRequested", "title", "initialPrompt"];
@@ -637,6 +754,14 @@ async fn apply_proposal(
         };
         initial_agent.insert("prompt".to_string(), json!(prompt));
     }
+    if let Some(stamp) = proposal.get("placement").filter(|p| p.is_object()) {
+        if let Some(initial_agent) = params
+            .get_mut("initialAgent")
+            .and_then(Value::as_object_mut)
+        {
+            initial_agent.insert("placement".to_string(), stamp.clone());
+        }
+    }
     if params
         .get("initialAgent")
         .and_then(|a| a.get("agentId"))
@@ -659,10 +784,12 @@ async fn apply_proposal(
         agent_id: caller.clone(),
         source_workspace_id: ws.clone(),
     });
-    let created = api
-        .create_workspace(input, Some(idempotency_key))
-        .await
-        .map_err(map_err)?;
+    let created = match api.create_workspace(input, Some(idempotency_key)).await {
+        Ok(created) => created,
+        Err(error) => {
+            return Err(apply_create_failure(api, ws, &caller, &proposal_id, error).await);
+        }
+    };
 
     let override_note = match (title_override.is_some(), prompt_override.is_some()) {
         (true, true) => " with overridden title and prompt",
