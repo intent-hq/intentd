@@ -5751,9 +5751,10 @@ impl AgentManager {
     /// opened with it. It replaces `prepend` (the ordinary first-turn block,
     /// built from the same persisted prompt) so the turn gets one block.
     ///
-    /// The flag is cleared once the block is built, as
-    /// [`Self::build_first_turn_prepend`] consumes its own; a failed session
-    /// read keeps it armed for the next turn.
+    /// Building never clears the flag: a preparation failure, a deferred
+    /// admission or a retry rebuilds the same single block. It is cleared by
+    /// [`Self::clear_import_handoff`] only once the provider accepted the
+    /// prompt that carried it.
     async fn apply_import_handoff(
         &self,
         agent_id: &AgentId,
@@ -5814,6 +5815,32 @@ impl AgentManager {
             Some(prompt) => format!("{prompt}\n\n{note}"),
             None => note,
         };
+        Some(crate::harness::latest().first_turn_prepend_block(&body))
+    }
+
+    /// Clear `importedSession.handoffPending` after the provider accepted a
+    /// prompt. A no-op unless it is still pending, in which case that prompt
+    /// was built with the handoff block ([`Self::apply_import_handoff`]
+    /// reads the same flag; nothing sets it again after the import).
+    async fn clear_import_handoff(&self, agent_id: &AgentId) {
+        let Ok(session) = self
+            .services
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await
+        else {
+            return;
+        };
+        let pending = session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("importedSession"))
+            .and_then(|i| i.get("handoffPending"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if !pending {
+            return;
+        }
         if let Err(e) = self
             .services
             .store
@@ -5828,7 +5855,6 @@ impl AgentManager {
         {
             tracing::warn!(agent = %agent_id, error = %e, "import handoff: could not clear the pending flag");
         }
-        Some(crate::harness::latest().first_turn_prepend_block(&body))
     }
 
     /// The workspace setup-stage notice for a turn starting now (§6.5),
@@ -15596,6 +15622,9 @@ async fn run_message_worker(
                 .await
                 {
                     Ok(stop_reason) => {
+                        // The provider accepted the prompt: an imported
+                        // session's one-time handoff block was delivered.
+                        boxed_await(|| mgr.clear_import_handoff(&agent_id)).await;
                         mgr.clear_discussion_turn(&agent_id, &options);
                         boxed_await(|| {
                             mgr.services.settle_discussion_options(
@@ -21134,6 +21163,60 @@ mod role_reminder_tests {
             !text.contains("<system>\nYou are helpful."),
             "prepend repeated on second turn: {text:?}"
         );
+    }
+
+    /// An imported session's handoff block survives an undelivered prompt:
+    /// building never clears `handoffPending`, so a retry after a failed
+    /// preparation or deferred admission rebuilds exactly one block (with
+    /// the system prompt even with no armed prepend, since the mock is a
+    /// `FirstTurnPrepend` provider), and only the post-acceptance clear ends it.
+    #[tokio::test]
+    async fn import_handoff_survives_undelivered_prompts_until_accepted() {
+        let (mgr, _first, _db) = manager_with(None, None).await;
+        let agent_id = insert_session_with_metadata(
+            &mgr,
+            "agent-imported",
+            None,
+            serde_json::json!({ "importedSession": {
+                "provider": "mock", "sourceCwd": "/src/app", "handoffPending": true
+            }}),
+        )
+        .await;
+        set_system_prompt(&mgr, &agent_id, "You are helpful.").await;
+        let build = || async {
+            prompt_text(
+                &mgr.build_turn_prompt(
+                    &agent_id,
+                    &WorkspaceId::from("ws-1"),
+                    "continue",
+                    &TurnOptions::default(),
+                )
+                .await
+                .unwrap(),
+            )
+        };
+        for attempt in 0..2 {
+            let text = build().await;
+            assert!(
+                text.starts_with("<system>\nYou are helpful.\n\n"),
+                "attempt {attempt}: {text:?}"
+            );
+            assert_eq!(
+                text.matches("<system>").count(),
+                1,
+                "attempt {attempt}: {text:?}"
+            );
+            assert!(text.contains("has been imported into Intent"), "{text:?}");
+            assert!(text.ends_with("continue"), "{text:?}");
+        }
+        // With the ordinary prepend armed too, still one block.
+        let mock = intent_providers::find_provider("mock").unwrap();
+        mgr.arm_first_turn_prepend(&agent_id, mock);
+        assert_eq!(build().await.matches("<system>").count(), 1);
+        mgr.clear_import_handoff(&agent_id).await;
+        let text = build().await;
+        assert!(!text.contains("<system>"), "{text:?}");
+        assert!(!text.contains("imported into Intent"), "{text:?}");
     }
 
     #[tokio::test]
