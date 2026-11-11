@@ -765,6 +765,13 @@ the top tab strip, and the current workspace stays selected. Once created, the
 card shows **Open workspace**, whoever applied it; if that workspace was deleted,
 a message says it no longer exists.
 
+<!-- Labs (remote agents): describe only when the user asks about remote agents,
+and say it is Labs. The card's **Start on** defaults to where the proposing agent
+runs: the backend, its remote machine, or a new E2B sandbox from the same entry.
+The user can change it before **Create workspace**; an offline machine shows a
+warning. An agent applying its own proposal uses that default, and a machine
+error is reported back with its reason. Sources: packages/intentd/crates/intent-acp/src/mcp_server/bindings/workspace.rs (proposer_placement, apply_create_failure). -->
+
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/workspace/utils/workspace-tab-navigation.ts; src/lib/utils/shortcut-bindings.ts; src/lib/components/terminal/QuakeTerminalOverlay.svelte; messages/en.json. -->
 
 Use **Next Workspace Tab** (defaults **Ctrl+Tab** and **Cmd+Shift+]**) or
