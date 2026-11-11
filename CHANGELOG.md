@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.181] - 2026-11-11
+
+### 🚀 Features
+
+- Run Antigravity through agy acp ([#3267](https://github.com/intent-hq/intentd/pull/3267))
+
+
 ## [0.11.180] - 2026-11-11
 
 ### 🚀 Features
