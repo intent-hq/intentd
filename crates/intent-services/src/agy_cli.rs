@@ -54,6 +54,7 @@ async fn ensure_current_with(binary: &Path, update_timeout: Duration) -> Result<
     let detail = match update(binary, update_timeout).await {
         Ok(()) => match version(binary).await {
             Some(now) if now >= MIN_VERSION_TRIPLE => {
+                failures().lock().unwrap().remove(binary);
                 tracing::info!(path = %binary.display(), version = %format_version(now), "agy updated");
                 return Ok(());
             }
@@ -157,6 +158,18 @@ fn recent_failure(binary: &Path) -> Option<String> {
         }
         None => None,
     }
+}
+
+/// The newest automatic update failure still inside its retry pause, for
+/// discovery to show. Discovery itself never updates.
+pub(crate) fn last_update_failure() -> Option<String> {
+    failures()
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|(at, _)| at.elapsed() < FAILURE_TTL)
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, reason)| reason.clone())
 }
 
 fn remember_failure(binary: &Path, reason: &str) {

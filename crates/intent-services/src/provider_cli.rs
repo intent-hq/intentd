@@ -22,6 +22,12 @@ pub async fn add_installed_cli_versions(discovery: &mut Value) {
         if provider.get("gatedOff").is_some() {
             continue;
         }
+        if id == "antigravity" {
+            if let Some(row) = provider.as_object_mut() {
+                apply_agy_fields(row, crate::agy_cli::last_update_failure());
+            }
+            continue;
+        }
         let Some(requirement) = requirement(id) else {
             continue;
         };
@@ -121,9 +127,71 @@ fn apply_version_fields(
     }
 }
 
+/// agy has no adapter-declared requirement: its minimum is the first release
+/// with `agy acp`. Reuses the display `cliVersion` already on the row. A
+/// confirmed-old agy is updated at the next launch (`agy_cli`);
+/// `cliUpdateError` reports a recent automatic update that failed.
+fn apply_agy_fields(row: &mut Map<String, Value>, update_error: Option<String>) {
+    use intent_providers::antigravity::{COMMAND, MIN_VERSION, MIN_VERSION_TRIPLE};
+    let installed = row.get("installed").and_then(Value::as_bool) == Some(true);
+    let range = format!(">={MIN_VERSION}");
+    row.insert("cliCommand".into(), json!(COMMAND));
+    row.insert("cliResolved".into(), json!(installed));
+    row.insert("cliRequirement".into(), json!(format!("{COMMAND} {range}")));
+    row.insert("cliVersionRange".into(), json!(range));
+    row.insert("cliMinimumVersion".into(), json!(MIN_VERSION));
+    row.remove("cliVersionOk");
+    row.remove("cliUpdateError");
+    if !installed {
+        return;
+    }
+    let found = row
+        .get("cliVersion")
+        .and_then(Value::as_str)
+        .and_then(intent_providers::version_gate::parse_cli_version);
+    if let Some(found) = found {
+        let ok = found >= MIN_VERSION_TRIPLE;
+        row.insert("cliVersionOk".into(), json!(ok));
+        if let (false, Some(error)) = (ok, update_error) {
+            row.insert("cliUpdateError".into(), json!(error));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agy_row_reports_minimum_verdict_and_only_a_relevant_update_error() {
+        let error = Some("agy update exited with 3".to_owned());
+        for (installed, version, ok, shows_error) in [
+            (true, Some("1.5.5"), Some(true), false),
+            (true, Some("1.3.4"), Some(false), true),
+            (true, Some("agy dev build"), None, false),
+            (true, None, None, false),
+            (false, None, None, false),
+        ] {
+            let mut row = Map::new();
+            row.insert("installed".into(), json!(installed));
+            if let Some(version) = version {
+                row.insert("cliVersion".into(), json!(version));
+            }
+            apply_agy_fields(&mut row, error.clone());
+            assert_eq!(row["cliMinimumVersion"], "1.5.0");
+            assert_eq!(row["cliResolved"], installed);
+            assert_eq!(
+                row.get("cliVersionOk").and_then(Value::as_bool),
+                ok,
+                "{version:?}"
+            );
+            assert_eq!(
+                row.contains_key("cliUpdateError"),
+                shows_error,
+                "{version:?}"
+            );
+        }
+    }
 
     #[test]
     fn advisory_fields_preserve_unknown_and_do_not_change_availability() {

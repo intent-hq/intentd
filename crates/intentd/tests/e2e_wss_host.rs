@@ -1804,6 +1804,19 @@ async fn host_provider_discovery_over_wss() {
             }
             continue;
         }
+        // agy's minimum is the first release with `agy acp`; an old agy is
+        // updated at launch, never gated.
+        if p["id"] == "antigravity" {
+            assert_eq!(p["cliCommand"], "agy", "{p}");
+            assert_eq!(
+                p["cliMinimumVersion"],
+                intent_providers::antigravity::MIN_VERSION,
+                "{p}"
+            );
+            assert_eq!(p["cliResolved"], p["installed"], "{p}");
+            assert!(p.get("cliUpdateError").is_none(), "{p}");
+            continue;
+        }
         if let Some(requirement) =
             intent_providers::adapter_cli::requirement(p["id"].as_str().unwrap())
         {
