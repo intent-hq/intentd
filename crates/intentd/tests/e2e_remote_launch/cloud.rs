@@ -997,8 +997,17 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
         "testing a key makes no sandbox"
     );
 
-    // An unmarked Default (no sign-in on a sandbox), or an account folder:
-    // refused, no sandbox.
+    // An unmarked Default (no sign-in on a sandbox) with no marked profile
+    // to auto-pick, or an account folder: refused, no sandbox. The keyed
+    // profile is unmarked for this, then marked again.
+    let keyed_id = keyed["profile"]["id"].as_str().unwrap().to_owned();
+    ok(
+        &mut rpc_ws,
+        90,
+        "providers.profiles.update",
+        json!({ "profileId": keyed_id, "remoteCompatible": false }),
+    )
+    .await;
     let bare = rpc(&mut rpc_ws, 9, "agent.create", create("codex", "Bare")).await;
     assert_eq!(bare["error"]["code"], -32602, "{bare}");
     assert_eq!(
@@ -1018,6 +1027,13 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
         "{tied}"
     );
     assert!(fake.state().creates.is_empty(), "no sandbox for a refusal");
+    ok(
+        &mut rpc_ws,
+        91,
+        "providers.profiles.update",
+        json!({ "profileId": keyed_id, "remoteCompatible": true }),
+    )
+    .await;
 
     // Placed: the reply comes before the sandbox, with cloudStart and no
     // machine yet.

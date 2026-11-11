@@ -907,7 +907,7 @@ fn help_line(
                     | ProviderStatus::PrerequisiteMissing
                     | ProviderStatus::Disabled => false,
                     ProviderStatus::SignedOut | ProviderStatus::AuthFailed => {
-                        remote_profile_bases.iter().any(|b| *b == provider.id)
+                        remote_profile_bases.contains(&provider.id)
                     }
                     ProviderStatus::SignedIn | ProviderStatus::Unknown => true,
                 }
