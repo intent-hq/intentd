@@ -710,7 +710,11 @@ impl Services {
     /// runs on its machine's own sign-in: an account other than this
     /// backend's, which this backend's quota marks say nothing about
     /// (intent-hq/intent#9100).
-    async fn runs_on_machine_sign_in(&self, session: &AgentSession, reference: &str) -> bool {
+    pub(crate) async fn runs_on_machine_sign_in(
+        &self,
+        session: &AgentSession,
+        reference: &str,
+    ) -> bool {
         let Some(view) = intent_core::remote_launch::RemotePlacementView::from_metadata(
             session.metadata.as_ref(),
         ) else {

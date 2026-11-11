@@ -403,6 +403,91 @@ async fn a_machine_sign_in_launch_ignores_the_backends_quota_mark() {
     assert!(failover_rows(&messages).is_empty(), "{messages:#?}");
 }
 
+/// A remote agent's real quota failure (the backup starts on its node), then
+/// a turn start of a local `claude-code` agent on this backend: whether the
+/// local agent moved to the backup, the remote agent's provider, and the
+/// backup's reference.
+async fn remote_quota_failure_then_local_turn_start(
+    ws: &WorkspaceId,
+    id: &AgentId,
+    send_default: bool,
+) -> (bool, String, String) {
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let backup_run = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Runs(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, backup) = remote_agent_with_backup(port.clone(), id, ws).await;
+    if send_default {
+        send_the_default_remotely(&mgr).await;
+    }
+    send(&mgr, id, ws, "hello").await;
+    backup_run.wait_prompts(1).await;
+    backup_run.finish.add_permits(1);
+    wait_idle(&mgr, id).await;
+    let remote = mgr
+        .services
+        .store
+        .get_agent_session_without_messages(id)
+        .await
+        .unwrap();
+
+    let local = AgentId::from(format!("{}-local", id.0));
+    let mut local_session = crate::test_support::fixtures::session(&local, ws);
+    local_session.provider = Some("claude-code".to_owned());
+    local_session.model = Some("opus".to_owned());
+    mgr.services
+        .store
+        .insert_agent_session(&local_session)
+        .await
+        .unwrap();
+    mgr.services.avoid_exhausted_provider(ws, &local).await;
+    let local_provider = mgr
+        .services
+        .store
+        .get_agent_session_without_messages(&local)
+        .await
+        .unwrap()
+        .provider
+        .unwrap_or_default();
+    (
+        local_provider == backup,
+        remote.provider.unwrap_or_default(),
+        backup,
+    )
+}
+
+/// A remote agent on the machine's own sign-in that really runs out of quota
+/// still fails over, but marks nothing on this backend: that account is not
+/// this backend's, so a local agent on `claude-code` is not moved
+/// (intent-hq/intent#9100).
+#[intent_test_macros::daemon_test]
+async fn a_machine_sign_in_quota_failure_does_not_mark_the_backends_account() {
+    let ws = WorkspaceId::from("ws-remote-quota-no-mark");
+    let id = AgentId::from("agent-remote-quota-no-mark");
+    let (local_moved, remote_provider, backup) =
+        remote_quota_failure_then_local_turn_start(&ws, &id, false).await;
+
+    assert_eq!(remote_provider, backup, "the remote agent still fails over");
+    assert!(!local_moved, "the local agent stays on claude-code");
+}
+
+/// A marked Default with overrides sends this backend's account, so its
+/// quota failure on a remote agent marks it as before, and a local agent on
+/// `claude-code` is moved to the backup at its next turn start.
+#[intent_test_macros::daemon_test]
+async fn a_sent_default_quota_failure_marks_the_backends_account() {
+    let ws = WorkspaceId::from("ws-remote-quota-mark");
+    let id = AgentId::from("agent-remote-quota-mark");
+    let (local_moved, remote_provider, backup) =
+        remote_quota_failure_then_local_turn_start(&ws, &id, true).await;
+
+    assert_eq!(remote_provider, backup);
+    assert!(local_moved, "the local agent leaves the marked claude-code");
+}
+
 /// A remote agent out of quota whose only backup uses an account folder on
 /// this backend never switches to it (strict: whether or not the machine
 /// has the folder): it stays on its configuration and fails with what to do,

@@ -346,6 +346,25 @@ impl Services {
             .mark_exhausted(&read, reported, now);
     }
 
+    /// [`Self::note_provider_exhausted`] for a failed attempt, except one a
+    /// remote agent ran on its machine's own sign-in: that account is not
+    /// this backend's, so its quota says nothing about this backend's
+    /// reference (intent-hq/intent#9100).
+    async fn note_provider_exhausted_unless_machine_sign_in(
+        &self,
+        agent_id: &AgentId,
+        session: &intent_core::AgentSession,
+        selection: &str,
+        reported: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        if self.runs_on_machine_sign_in(session, selection).await {
+            tracing::info!(agent = %agent_id, provider = %selection, "quota failure on the machine's own sign-in; this backend's reference not marked");
+            return;
+        }
+        self.note_provider_exhausted(agent_id, selection, reported, now);
+    }
+
     /// Configurations the shared cache marks exhausted right now.
     pub(crate) fn exhausted_providers(&self) -> Vec<String> {
         self.provider_quota_cache.exhausted(chrono::Utc::now())
@@ -506,7 +525,10 @@ impl Services {
         // failed (never a configuration the user switched to meanwhile).
         let recorded = failed_provider.filter(|p| !p.trim().is_empty());
         if let Some(failed) = recorded {
-            self.note_provider_exhausted(agent_id, failed, reported, now);
+            self.note_provider_exhausted_unless_machine_sign_in(
+                agent_id, &session, failed, reported, now,
+            )
+            .await;
         }
         if self
             .chain_for_failed_attempt(agent_id, &session, failed_provider)
@@ -517,7 +539,10 @@ impl Services {
         }
         if recorded.is_none() {
             if let Some(failed) = session.provider.as_deref().filter(|p| !p.trim().is_empty()) {
-                self.note_provider_exhausted(agent_id, failed, reported, now);
+                self.note_provider_exhausted_unless_machine_sign_in(
+                    agent_id, &session, failed, reported, now,
+                )
+                .await;
             }
         }
         let Some(from) = session.provider.clone() else {
