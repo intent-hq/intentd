@@ -26,6 +26,8 @@ mod guest_catalog;
 mod quota_state;
 #[path = "provider_profiles_remote_tests.rs"]
 mod remote_launch;
+#[path = "provider_profiles_remote_choice_tests.rs"]
+mod remote_choice;
 
 struct Fixture {
     _db: TempDb,

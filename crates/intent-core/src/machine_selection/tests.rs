@@ -151,6 +151,7 @@ fn request<'a>(placement: &'a AgentPlacement, model: Option<&'a str>) -> Placeme
         provider: "claude-code",
         model,
         with_profile: false,
+        machine_sign_in: false,
     }
 }
 
@@ -1278,6 +1279,7 @@ fn switch_check(
             provider,
             model,
             with_profile,
+            machine_sign_in: false,
         },
         now(),
     )
@@ -1359,4 +1361,133 @@ fn a_switch_on_a_removed_or_revoked_machine_is_refused() {
     };
     assert_eq!(reason("nope"), PlacementUnavailableReason::MachineUnknown);
     assert_eq!(reason("gone"), PlacementUnavailableReason::MachineRevoked);
+}
+
+fn remote_machine_data(result: Result<()>) -> serde_json::Value {
+    match result {
+        Err(Error::RemoteMachine(failure)) => failure.data.clone(),
+        other => panic!("expected a remote machine error, got {other:?}"),
+    }
+}
+
+fn signed_out_fleet() -> Fake {
+    Fake::new(vec![
+        machine(
+            "out",
+            Some(report(
+                MAC,
+                FRESH,
+                vec![provider("claude-code", ProviderStatus::SignedOut, &["opus"])],
+            )),
+        ),
+        machine(
+            "failed",
+            Some(report(
+                MAC,
+                FRESH,
+                vec![provider("claude-code", ProviderStatus::AuthFailed, &["opus"])],
+            )),
+        ),
+        machine(
+            "missing",
+            Some(report(
+                MAC,
+                FRESH,
+                vec![provider("claude-code", ProviderStatus::CliMissing, &["opus"])],
+            )),
+        ),
+    ])
+}
+
+/// A machine sign-in launch (the Default sending nothing) whose only
+/// obstacle is the machines' sign-in is refused as `machine-not-signed-in`,
+/// naming those machines; other launches keep `model-unavailable`.
+#[tokio::test]
+async fn a_machine_sign_in_launch_on_signed_out_machines_is_machine_not_signed_in() {
+    let fake = signed_out_fleet();
+    let placement = remote();
+    let result = select(
+        &fake,
+        PlacementRequest {
+            machine_sign_in: true,
+            ..request(&placement, Some("opus"))
+        },
+    )
+    .await
+    .map(|_| ());
+    let data = remote_machine_data(result);
+    assert_eq!(data["code"], "machine-not-signed-in");
+    assert_eq!(data["providerRef"], "claude-code");
+    let mut names: Vec<String> = data["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| format!("{}:{}", m["nodeId"].as_str().unwrap(), m["status"].as_str().unwrap()))
+        .collect();
+    names.sort();
+    assert_eq!(names, ["failed:auth-failed", "out:signed-out"]);
+    assert_eq!(data["retryable"], false);
+
+    model_failure(select(&fake, request(&placement, Some("opus"))).await);
+    // A model no machine lists is still model-unavailable.
+    model_failure(
+        select(
+            &fake,
+            PlacementRequest {
+                machine_sign_in: true,
+                ..request(&placement, Some("sonnet"))
+            },
+        )
+        .await,
+    );
+}
+
+#[tokio::test]
+async fn a_machine_sign_in_launch_still_tries_an_unknown_sign_in() {
+    let fake = Fake::new(vec![machine(
+        "unknown",
+        Some(report(
+            MAC,
+            FRESH,
+            vec![provider("claude-code", ProviderStatus::Unknown, &["opus"])],
+        )),
+    )]);
+    let placement = remote();
+    let chosen = select(
+        &fake,
+        PlacementRequest {
+            machine_sign_in: true,
+            ..request(&placement, Some("opus"))
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(chosen, ["unknown"]);
+}
+
+#[test]
+fn a_machine_sign_in_switch_on_a_signed_out_machine_is_machine_not_signed_in() {
+    let rows = vec![machine(
+        "mac",
+        Some(report(
+            MAC,
+            FRESH,
+            vec![provider("codex", ProviderStatus::SignedOut, &["gpt-5"])],
+        )),
+    )];
+    let placement = on(&remote(), "mac");
+    let data = remote_machine_data(check_switch_on_machine(
+        &rows,
+        "mac",
+        PlacementRequest {
+            placement: &placement,
+            provider: "codex",
+            model: Some("gpt-5"),
+            with_profile: false,
+            machine_sign_in: true,
+        },
+        now(),
+    ));
+    assert_eq!(data["code"], "machine-not-signed-in");
+    assert_eq!(data["machines"][0]["name"], "mac-name");
 }
