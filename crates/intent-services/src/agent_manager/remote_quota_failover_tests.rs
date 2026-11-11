@@ -380,9 +380,9 @@ async fn a_remote_agent_never_fails_over_to_an_account_folder_backup() {
     for needle in [
         "ran out of quota on Mac",
         "Backup",
-        "uses an account folder on this backend",
-        "can't run on other machines",
-        "Create a new agent with an API-key profile or the machine's own sign-in",
+        "can't run there",
+        "uses an account folder (CLAUDE_CONFIG_DIR) that only exists on this backend",
+        "marked for remote machines",
     ] {
         assert!(
             reason.contains(needle),
@@ -396,6 +396,57 @@ async fn a_remote_agent_never_fails_over_to_an_account_folder_backup() {
         .await
         .unwrap();
     assert!(failover_rows(&messages).is_empty(), "{messages:#?}");
+}
+
+/// A backup the user has not marked for remote machines is passed over the
+/// same way: the agent stays on its configuration and the message says how
+/// to mark it.
+#[intent_test_macros::daemon_test]
+async fn a_remote_agent_never_fails_over_to_an_unmarked_backup() {
+    let ws = WorkspaceId::from("ws-remote-failover-unmarked");
+    let id = AgentId::from("agent-remote-failover-unmarked");
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let port = ScriptedRemote::new(vec![Launch::Runs(primary.clone())]);
+    let (_tmp, mgr, backup) = remote_agent_with_backup_env(
+        port.clone(),
+        &id,
+        &ws,
+        json!([{ "key": "ANTHROPIC_API_KEY", "kind": "set", "value": "sk-backup" }]),
+    )
+    .await;
+    let profile_id = backup.split_once('@').unwrap().1.to_owned();
+    mgr.services
+        .provider_profiles_update_impl(profile_id, json!({ "remoteCompatible": false }))
+        .await
+        .expect("unmark the backup");
+
+    send(&mgr, &id, &ws, "hello").await;
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(
+        port.asked.load(Ordering::SeqCst),
+        1,
+        "the backup is never started"
+    );
+    let session = mgr
+        .services
+        .store
+        .get_agent_session_with_transcript(&id)
+        .await
+        .unwrap();
+    assert_eq!(session.provider.as_deref(), Some("claude-code"));
+    let reason = session.stop_reason.unwrap_or_default();
+    for needle in [
+        "ran out of quota on Mac",
+        "Backup isn't marked for remote machines",
+    ] {
+        assert!(
+            reason.contains(needle),
+            "{needle:?} missing from {reason:?}"
+        );
+    }
+    assert!(!reason.contains("sk-backup"), "{reason}");
 }
 
 /// Make the agent's recorded return home (after a failover) due now, with

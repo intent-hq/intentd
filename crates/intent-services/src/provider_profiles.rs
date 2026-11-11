@@ -2369,6 +2369,10 @@ impl Services {
         let entries = writes
             .as_ref()
             .map(|writes| validate_env(writes, base, Some(&saved_doc.entries), &mut errors));
+        // An explicit choice needs a readable choices file (§5.54).
+        if remote_requested.is_some() {
+            store.choices()?;
+        }
         let current_marked = store
             .default_choice(base)
             .unwrap_or_else(|| migration_rule(&saved_doc.entries, true));
@@ -2783,6 +2787,10 @@ impl Services {
                 &mut errors,
             )
         });
+        // An explicit choice needs a readable choices file (§5.54).
+        if remote_requested.is_some() {
+            store.choices()?;
+        }
         let current_marked = store
             .profile_choice(&profile_id)
             .unwrap_or_else(|| migration_rule(&saved_doc.entries, false));

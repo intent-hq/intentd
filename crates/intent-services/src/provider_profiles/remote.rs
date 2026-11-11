@@ -151,6 +151,11 @@ impl ProviderProfileStore {
     ) -> Result<Option<RemoteChoices>> {
         let previous = self.choices()?;
         let mut next = previous.clone();
+        // Prune choices of deleted profiles on every write.
+        if let Ok(profiles) = self.profiles() {
+            next.profiles
+                .retain(|id, _| profiles.iter().any(|p| &p.id == id));
+        }
         match key {
             ChoiceKey::Profile(id) => next.profiles.insert(id.to_owned(), marked),
             ChoiceKey::Default(base) => next.defaults.insert(base.to_owned(), marked),
@@ -473,6 +478,8 @@ impl Services {
         for base in PROFILE_BASE_PROVIDERS {
             let meta = saved.get(*base).cloned().unwrap_or_default();
             let Ok(env) = self.load_default_env(&meta).await else {
+                // Launches fail closed on an unreadable environment.
+                launch.insert((*base).to_owned(), json!("refused"));
                 continue;
             };
             let compat = classify(

@@ -608,8 +608,8 @@ async fn node_runner_turn_refusal_carries_the_exit_reason() {
         wait_for(&h.runner, "exit", exited("a1")).await
     };
     let exit = exit_error(find(&all, exited("a1"))).unwrap().to_owned();
-    // A launch without a profile that the provider refuses as signed out.
-    assert!(exit.starts_with(codes::SIGNED_OUT), "{exit}");
+    // A provider without a Default configuration keeps the plain start code.
+    assert!(exit.starts_with(codes::START), "{exit}");
     h.runner
         .prompt(&AgentId::from("a1"), "t2".into(), text("late"))
         .await;
@@ -768,8 +768,7 @@ async fn node_runner_does_not_retry_a_sign_in_failure() {
     h.runner.launch(launch("a1")).await;
     let all = wait_for(&h.runner, "exit", exited("a1")).await;
     let exit = exit_error(find(&all, exited("a1"))).unwrap();
-    assert!(exit.starts_with(codes::SIGNED_OUT), "{exit}");
-    assert!(exit.contains("isn't signed in on this machine"), "{exit}");
+    assert!(exit.starts_with(codes::START), "{exit}");
     assert_eq!(starts(&log), 1);
 }
 
@@ -1699,7 +1698,11 @@ async fn node_runner_reports_default_account_auth_failures_at_setup() {
         };
         h.runner.launch(command).await;
         let all = wait_for(&h.runner, "exit", exited("a1")).await;
-        assert!(exit_error(find(&all, exited("a1"))).is_some(), "{args:?}");
+        let exit = exit_error(find(&all, exited("a1"))).expect("exit error");
+        assert!(
+            !exit.starts_with(codes::SIGNED_OUT),
+            "{args:?}: only a Default launch of codex or claude-code is signed out: {exit}"
+        );
         let expected: Vec<String> = if reported {
             vec![PROVIDER.to_owned()]
         } else {
@@ -2879,4 +2882,23 @@ async fn node_runner_records_setup_for_a_kept_checkout_without_one() {
     for id in ["a1", "a2"] {
         h.runner.stop(&AgentId::from(id));
     }
+}
+
+/// A Default launch of codex or claude-code refused at setup reports
+/// `node-provider-signed-out`, naming the provider and the fix and never
+/// the provider's own error text.
+#[test]
+fn signed_out_applies_only_to_providers_with_a_default_configuration() {
+    assert!(signs_in_on_the_machine("claude-code"));
+    assert!(signs_in_on_the_machine("codex"));
+    assert!(!signs_in_on_the_machine(PROVIDER));
+    assert!(!signs_in_on_the_machine("unsloth"));
+    let error = signed_out_error("claude-code");
+    assert!(error.starts_with(codes::SIGNED_OUT), "{error}");
+    assert!(
+        error.contains("Claude Code isn't signed in on this machine"),
+        "{error}"
+    );
+    assert!(error.contains("marked for remote machines"), "{error}");
+    assert!(exit_detail(None, Some(&error)).starts_with("the provider did not start"));
 }

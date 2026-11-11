@@ -2229,7 +2229,13 @@ impl Runner {
                 Err(error) => {
                     agent.note_auth_failure(&error);
                     if intent_services::provider_auth::is_auth_required(&error) {
-                        if let Some((provider, _)) = &agent.default_account {
+                        // Only a Default can run on the machine's own sign-in
+                        // instead; other providers keep the plain start code.
+                        if let Some((provider, _)) = agent
+                            .default_account
+                            .as_ref()
+                            .filter(|(p, _)| signs_in_on_the_machine(p))
+                        {
                             return Outcome::SignedOut(provider.clone());
                         }
                         return Outcome::StartFailed(error.to_string(), false);
@@ -3005,8 +3011,13 @@ pub(super) fn remote_launch_env(
 /// The most of an exit error [`exit_detail`] keeps.
 const EXIT_DETAIL_MAX: usize = 512;
 
-/// Why an agent exited, as a turn refused after it says: the start failure
-/// or exit error the exit record carries, else the provider's status.
+/// Whether a launch without a profile of `provider` is a Default running on
+/// this machine's own sign-in, which the user can fix by signing in here or
+/// marking a configuration for remote machines.
+pub(super) fn signs_in_on_the_machine(provider: &str) -> bool {
+    matches!(provider, "claude-code" | "codex")
+}
+
 /// The `node-provider-signed-out` start failure: names the provider and the
 /// fix, never the provider's own error text (it can echo a credential).
 fn signed_out_error(provider: &str) -> String {
@@ -3021,6 +3032,8 @@ fn signed_out_error(provider: &str) -> String {
     )
 }
 
+/// Why an agent exited, as a turn refused after it says: the start failure
+/// or exit error the exit record carries, else the provider's status.
 fn exit_detail(exit_code: Option<i32>, error: Option<&str>) -> String {
     let error = error.map(|error| {
         let mut end = error.len().min(EXIT_DETAIL_MAX);

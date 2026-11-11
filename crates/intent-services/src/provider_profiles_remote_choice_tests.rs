@@ -547,3 +547,48 @@ async fn launch_rules_on_e2b_never_use_machine_sign_in() {
     );
     assert!(fx.cloud_plan("unsloth").await.unwrap().env.is_none());
 }
+
+/// A malformed choices file is left untouched: every configuration reads
+/// as not marked (a folder still reads as account-folder), an explicit
+/// choice is refused, and a write without one still works.
+#[intent_test_macros::daemon_test]
+async fn an_unreadable_choices_file_reads_not_marked_and_refuses_choices() {
+    let fx = Fixture::new().await;
+    let id = id_of(&fx.create("claude-code", "API", token_env()).await);
+    std::fs::write(fx.choices_file(), b"{ not json").unwrap();
+    let fx = fx.restart().await;
+    fx.svc.migrate_remote_choices().await;
+    assert_eq!(
+        std::fs::read(fx.choices_file()).unwrap(),
+        b"{ not json",
+        "left untouched"
+    );
+    let list = fx.svc.provider_profiles_list_impl(None).await.unwrap();
+    assert_eq!(
+        list["profiles"][0]["remoteIncompatibility"]["reason"],
+        "not-marked"
+    );
+    for params in [
+        json!({ "remoteCompatible": false }),
+        json!({ "remoteCompatible": true }),
+    ] {
+        let err = fx
+            .svc
+            .provider_profiles_update_impl(id.clone(), params)
+            .await
+            .unwrap_err();
+        assert_eq!(data_code(&err), "provider-profiles-unreadable");
+    }
+    let err = fx
+        .svc
+        .provider_profiles_update_default_impl(json!({
+            "baseProviderId": "codex", "remoteCompatible": false,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(data_code(&err), "provider-profiles-unreadable");
+    fx.svc
+        .provider_profiles_update_impl(id, json!({ "name": "API key" }))
+        .await
+        .expect("a write without a choice still works");
+}
