@@ -810,6 +810,9 @@ async fn details(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value,
     }
 }
 
+const SET_TITLE_ALLOWED_KEYS: &[&str] = &["title", "userRequested"];
+const SET_TITLE_SKIPPED_HINT: &str = "The workspace already has a title. Only if the user explicitly asked to rename it, call setTitle(title, { userRequested: true }).";
+
 async fn set_title(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -822,7 +825,16 @@ async fn set_title(
     }
     // `userRequested: true` attests that the user explicitly asked for this
     // rename (the `ws.git.commit` convention). Without it a named workspace
-    // keeps its title, so first-turn auto-naming never overwrites one.
+    // keeps its title, so first-turn auto-naming never overwrites one. An
+    // unknown key (a `userRequest` typo) is refused rather than ignored.
+    if let Some(key) = args.as_object().and_then(|o| {
+        o.keys()
+            .find(|k| !SET_TITLE_ALLOWED_KEYS.contains(&k.as_str()))
+    }) {
+        return Err(format!(
+            "unknown setTitle option `{key}`; the only option is userRequested"
+        ));
+    }
     let user_requested = opt_strict_bool(args, "userRequested")?.unwrap_or(false);
     let existing = api.get_workspace(ws.clone()).await.map_err(map_err)?;
     let existing_title = existing.title.trim();
@@ -832,6 +844,7 @@ async fn set_title(
             "skipped": true,
             "title": existing_title,
             "branch": existing.branch,
+            "hint": SET_TITLE_SKIPPED_HINT,
         }));
     }
     let update = WorkspaceUpdate {

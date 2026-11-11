@@ -694,6 +694,9 @@ async fn workspace_set_title_skips_when_already_titled() {
     let v = body(&resp);
     assert_eq!(v["skipped"], json!(true));
     assert_eq!(v["title"], json!("Hello"));
+    assert!(v["hint"]
+        .as_str()
+        .is_some_and(|h| h.contains("{ userRequested: true }")));
     assert!(api.update_calls.lock().unwrap().is_empty());
 }
 
@@ -769,6 +772,19 @@ async fn workspace_set_title_rejects_non_boolean_user_requested() {
     .await;
     assert_eq!(resp["result"]["isError"], json!(true));
     assert!(text(&resp).contains("`userRequested` must be a boolean"));
+    assert!(api.update_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn workspace_set_title_rejects_unknown_option() {
+    let (srv, api) = server();
+    let resp = call(
+        &srv,
+        "return await ws.workspace.setTitle('X', { userRequest: true });",
+    )
+    .await;
+    assert_eq!(resp["result"]["isError"], json!(true));
+    assert!(text(&resp).contains("unknown setTitle option `userRequest`"));
     assert!(api.update_calls.lock().unwrap().is_empty());
 }
 

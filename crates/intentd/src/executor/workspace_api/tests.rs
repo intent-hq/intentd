@@ -930,6 +930,11 @@ async fn workspace_setters_are_forwarded_to_head() {
             json!({ "title": "Remote" }),
         ),
         (
+            r#"ws.workspace.setTitle("Remote", { userRequested: true })"#,
+            "workspace.setTitle",
+            json!({ "title": "Remote", "userRequested": true }),
+        ),
+        (
             r#"ws.workspace.setAgentName("Namer")"#,
             "workspace.setAgentName",
             json!({ "name": "Namer" }),

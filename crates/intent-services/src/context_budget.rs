@@ -37,9 +37,10 @@ use crate::Services;
 const BASELINE: &str = "3.9";
 /// The harness under test.
 const CANDIDATE: &str = intent_core::CURRENT_HARNESS_VERSION;
-/// The release the candidate replaces, reported for reference only (3.11:
-/// 3.9 plus released inline visuals). The gate stays on [`BASELINE`].
-const PREVIOUS: &str = "3.11";
+/// The release the candidate replaces, reported for reference only (3.12:
+/// the released 3.10 context cuts plus 3.11's inline visuals). The gate
+/// stays on [`BASELINE`].
+const PREVIOUS: &str = "3.12";
 /// The newest harness may carry at most this share of the baseline on the
 /// realistic fixture.
 const REALISTIC_MAX_RATIO: f64 = 0.5;
