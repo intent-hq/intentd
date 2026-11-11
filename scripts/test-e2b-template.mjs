@@ -10,12 +10,15 @@ import {
   APT_PACKAGES,
   DEFAULT_SIZE,
   GH,
+  IMAGE_REPO,
   MANIFEST_ASSET,
   SIZES,
   archiveUrl,
   builtSizes,
   defineTemplate,
+  dockerfile,
   enabledSizes,
+  imagePlan,
   installGhCommand,
   installIntentdCommand,
   isResourceLimitRefusal,
@@ -28,6 +31,7 @@ import {
   redact,
   smokeChecks,
   templateName,
+  verifyImageSmoke,
   verifySmoke,
 } from '../packaging/e2b/intent-node.mjs';
 
@@ -177,6 +181,63 @@ describe('defineTemplate', () => {
   });
 });
 
+describe('container image', () => {
+  it('publishes ghcr.io/intent-hq/intent-node with the template tags', () => {
+    assert.equal(IMAGE_REPO, 'ghcr.io/intent-hq/intent-node');
+    assert.deepEqual(imagePlan({ EVENT_NAME: 'workflow_run', RUN_CONCLUSION: 'success', RUN_HEAD_BRANCH: 'v0.11.139' }), {
+      version: '0.11.139', tags: ['ghcr.io/intent-hq/intent-node:0.11.139', 'ghcr.io/intent-hq/intent-node:latest'], push: true,
+    });
+    assert.deepEqual(imagePlan({ EVENT_NAME: 'workflow_dispatch', INPUT_VERSION: '0.11.138', INPUT_LATEST: 'false' }).tags,
+      ['ghcr.io/intent-hq/intent-node:0.11.138']);
+  });
+  it('builds a pull request image without pushing it', () => {
+    assert.deepEqual(imagePlan({ EVENT_NAME: 'pull_request', PR_NUMBER: '42', LATEST_RELEASE_TAG: 'v0.11.139' }), {
+      version: '0.11.139', tags: ['ghcr.io/intent-hq/intent-node:pr-42'], push: false,
+    });
+  });
+  it('passes skips through', () => {
+    assert.match(imagePlan({ EVENT_NAME: 'workflow_run', RUN_CONCLUSION: 'failure', RUN_HEAD_BRANCH: 'v0.11.139' }).skip, /failure/);
+  });
+  it('runs the same steps as the E2B template, as root, in order', () => {
+    const text = dockerfile({ version: '0.11.139', sha256: SHA });
+    const lines = text.trim().split('\n');
+    assert.equal(lines[0], 'FROM node:24-bookworm');
+    const runs = lines.filter(line => line.startsWith('RUN '));
+    assert.match(runs[0], /apt-get update/);
+    for (const pkg of APT_PACKAGES) assert.match(runs[0], new RegExp(` ${pkg.replace(/[.+]/g, '\\$&')}( |$)`), pkg);
+    assert.match(runs[0], /rm -rf \/var\/lib\/apt\/lists/);
+    const { calls, Template } = recorder();
+    defineTemplate(Template, { version: '0.11.139', sha256: SHA });
+    const commands = calls.filter(([name]) => name === 'runCmd').map(([, command]) => command);
+    assert.deepEqual(runs.slice(1).map(line => line.slice(4)), commands);
+    assert.ok(!lines.some(line => line.startsWith('USER ')), 'every step runs as root');
+    assert.ok(text.includes(archiveUrl('0.11.139')));
+  });
+  it('labels the image with its source and version', () => {
+    const text = dockerfile({ version: '0.11.139', sha256: SHA });
+    assert.match(text, /^LABEL org\.opencontainers\.image\.source="https:\/\/github\.com\/intent-hq\/intentd"$/m);
+    assert.match(text, /^LABEL org\.opencontainers\.image\.version="0\.11\.139"$/m);
+  });
+  it('idles instead of starting intentd, so the backend starts it with its own identity', () => {
+    const text = dockerfile({ version: '0.11.139', sha256: SHA });
+    assert.match(text, /^CMD \["sleep", "infinity"\]$/m);
+    assert.doesNotMatch(text, /ENTRYPOINT|intentd (serve|start)/);
+  });
+  it('re-validates its inputs', () => {
+    assert.throws(() => dockerfile({ version: '0.1.0\nRUN id', sha256: SHA }), /not an intentd release version/);
+    assert.throws(() => dockerfile({ version: '0.1.0', sha256: 'abc' }), /SHA-256/);
+  });
+  it('smoke-checks the version, gh and an idle default command', () => {
+    const outputs = { version: 'intentd 0.11.139\n', idle: '', gh: `gh version ${GH.version} (2026-10-26)\n` };
+    assert.deepEqual(verifyImageSmoke('0.11.139', outputs), []);
+    const problems = verifyImageSmoke('0.11.139', { ...outputs, version: 'intentd 0.11.138\n', idle: '7\n', gh: 'gh version 2.23.0\n' });
+    assert.equal(problems.length, 3);
+    assert.match(problems.join('\n'), /0\.11\.138/);
+    assert.match(problems.join('\n'), /running/);
+    assert.match(problems.join('\n'), /2\.23\.0/);
+  });
+});
+
 describe('smoke', () => {
   const outputs = {
     version: 'intentd 0.11.139\n', idle: '', cpus: '4\n', memKb: '8000000\n',
@@ -308,5 +369,37 @@ describe('workflow contract', () => {
     assert.match(job('release'), /manifest_only: \$\{\{ inputs\.manifest_only \|\| false \}\}/);
     assert.match(job('release'), /INTENTD_RELEASES_TOKEN: \$\{\{ secrets\.INTENTD_RELEASES_TOKEN \}\}/);
     assert.doesNotMatch(job('pull-request'), /INTENTD_RELEASES_TOKEN/);
+  });
+});
+
+describe('image workflow contract', () => {
+  const workflow = readFileSync(join(ROOT, '.github/workflows/intent-node-image.yml'), 'utf8');
+  const build = readFileSync(join(ROOT, '.github/workflows/intent-node-image-build.yml'), 'utf8');
+  const steps = build.split('\n    steps:\n')[1];
+  const job = name => workflow.split(`\n  ${name}:\n`)[1].split(/\n  [\w-]+:\n/)[0];
+  it('runs after the Release workflow, by hand and on PRs that touch it', () => {
+    assert.match(workflow, /workflow_run:\n\s+workflows: \[Release\]\n\s+types: \[completed\]/);
+    assert.match(workflow, /workflow_dispatch:\n\s+inputs:\n\s+version:/);
+    assert.match(workflow, /pull_request:\n\s+paths:\n\s+- packaging\/e2b\/\*\*\n\s+- \.github\/workflows\/intent-node-image\.yml\n\s+- \.github\/workflows\/intent-node-image-build\.yml/);
+  });
+  it('builds linux/amd64 and smoke-tests before it pushes', () => {
+    assert.match(steps, /node image\.mjs/);
+    assert.match(steps, /docker build --platform linux\/amd64/);
+    assert.ok(steps.indexOf('node smoke-image.mjs') < steps.indexOf('docker push'));
+  });
+  it('grants packages: write only to release and manual runs, which alone push', () => {
+    assert.match(job('release'), /permissions:\n\s+contents: read\n\s+packages: write/);
+    assert.doesNotMatch(job('pull-request'), /packages: write/);
+    assert.match(steps, /if: steps\.plan\.outputs\.push == 'true'/);
+  });
+  it('is fail-soft when GitHub refuses the push', () => {
+    assert.match(steps, /::warning::/);
+    assert.match(steps, /denied\|unauthorized\|403/);
+  });
+  it('queues release runs and cancels superseded PR runs', () => {
+    assert.match(job('release'), /if: github\.event_name != 'pull_request'/);
+    assert.match(job('release'), /cancel-in-progress: false\n\s+queue: max/);
+    assert.match(job('pull-request'), /cancel-in-progress: true/);
+    for (const name of ['release', 'pull-request']) assert.match(job(name), /uses: \.\/\.github\/workflows\/intent-node-image-build\.yml/);
   });
 });

@@ -1,0 +1,97 @@
+# Reusable body of intent-node-image.yml (the github context is the caller's).
+# Split out so release and PR runs can use different concurrency: GitHub
+# rejects `queue: max` together with `cancel-in-progress: true`. No
+# permissions block: the job keeps the caller's grant (packages: write only for
+# release and manual runs), which a nested block could only narrow.
+name: Intent node image build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: false
+        type: string
+      latest:
+        required: false
+        type: boolean
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Find the newest intentd release
+        id: latest
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The mirror also carries sitter-v* releases; take the newest daemon tag.
+          tag=$(gh release list --repo intent-hq/intentd-releases --limit 50 --json tagName \
+            --jq '[.[] | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0].tagName')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Write the Dockerfile
+        id: plan
+        working-directory: packaging/e2b
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_LATEST: ${{ inputs.latest }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          LATEST_RELEASE_TAG: ${{ steps.latest.outputs.tag }}
+        run: node image.mjs
+
+      - name: Build the image
+        if: steps.plan.outputs.skip == 'false'
+        working-directory: packaging/e2b
+        env:
+          TAGS: ${{ steps.plan.outputs.tags }}
+        run: |
+          args=()
+          for tag in $TAGS; do args+=(--tag "$tag"); done
+          docker build --platform linux/amd64 --pull "${args[@]}" .
+
+      - name: Smoke-test the image
+        if: steps.plan.outputs.skip == 'false'
+        working-directory: packaging/e2b
+        env:
+          REF: ${{ steps.plan.outputs.ref }}
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: node smoke-image.mjs "$REF" "$VERSION"
+
+      - name: Push the image
+        if: steps.plan.outputs.push == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          TAGS: ${{ steps.plan.outputs.tags }}
+        run: |
+          log=$(mktemp)
+          refuse() {
+            echo "::warning::GHCR refused the intent-node image push; skipping it. Link the ghcr.io/intent-hq/intent-node package to intent-hq/intentd with write access (package settings, Manage Actions access). $(tail -1 "$log")"
+            exit 0
+          }
+          if ! printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin >"$log" 2>&1; then
+            grep -qiE 'denied|unauthorized|403' "$log" && refuse
+            cat "$log"; exit 1
+          fi
+          echo "### intent-node image (built, smoke-tested, pushed)" >> "$GITHUB_STEP_SUMMARY"
+          for tag in $TAGS; do
+            if ! docker push "$tag" >"$log" 2>&1; then
+              grep -qiE 'denied|unauthorized|403' "$log" && refuse
+              cat "$log"; exit 1
+            fi
+            echo "Pushed $tag"
+            echo "- \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+          done

@@ -14,8 +14,10 @@
 // No toolchains beyond Node, Python and a C compiler are baked in; a
 // repository's workspace setup script installs what it needs.
 //
-// This module has no dependencies so scripts/test-e2b-template.mjs can run it
+// This module has no npm dependencies so scripts/test-e2b-template.mjs can run it
 // offline; build.mjs and smoke.mjs pass in the e2b SDK.
+
+import { appendFileSync } from 'node:fs';
 
 export const TEMPLATE_PREFIX = 'intent-node';
 export const BASE_IMAGE = 'node:24-bookworm';
@@ -106,6 +108,20 @@ export function parseSha256(text) {
 export function archiveUrl(version) {
   const v = parseVersion(version);
   return `https://github.com/${RELEASES_REPO}/releases/download/v${v}/intentd-${ARCHIVE_TARGET}.tar.xz`;
+}
+
+export async function fetchSha256(version, fetch = globalThis.fetch) {
+  const url = `${archiveUrl(version)}.sha256`;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`fetching ${url} failed: HTTP ${response.status}`);
+  return parseSha256(await response.text());
+}
+
+// Writes key=value step outputs to $GITHUB_OUTPUT and the log.
+export function output(values) {
+  const lines = Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n');
+  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${lines}\n`);
+  console.log(lines);
 }
 
 // What to build for one workflow event. Returns { skip } or
@@ -224,17 +240,62 @@ export function smokeChecks() {
 // allocation; 85% still tells the sizes apart.
 export function verifySmoke(version, sizeId, outputs) {
   const size = parseSize(sizeId);
-  const problems = [];
-  const reported = outputs.version.trim();
-  if (reported !== `intentd ${version}`) problems.push(`intentd --version printed ${JSON.stringify(reported)}, expected "intentd ${version}"`);
+  const problems = verifyImageSmoke(version, outputs);
   const cpus = Number(outputs.cpus.trim());
   if (cpus !== size.cpuCount) problems.push(`the sandbox has ${cpus} vCPU, expected ${size.cpuCount}`);
   const memMiB = Math.round(Number(outputs.memKb.trim()) / 1024);
   if (!(memMiB >= size.memoryMB * 0.85)) problems.push(`the sandbox has ${memMiB} MiB of RAM, expected about ${size.memoryMB}`);
+  return problems;
+}
+
+// The size-independent checks, shared by the E2B sandbox and the container image.
+export function verifyImageSmoke(version, outputs) {
+  const problems = [];
+  const reported = outputs.version.trim();
+  if (reported !== `intentd ${version}`) problems.push(`intentd --version printed ${JSON.stringify(reported)}, expected "intentd ${version}"`);
   const gh = String(outputs.gh ?? '').split('\n')[0].trim();
   if (!gh.startsWith(`gh version ${GH.version} `)) problems.push(`gh --version printed ${JSON.stringify(gh)}, expected "gh version ${GH.version}"`);
   if (outputs.idle.trim()) problems.push(`intentd is already running in a fresh sandbox (pid ${outputs.idle.trim()}); the template must not start it`);
   return problems;
+}
+
+// The same machine as a size-independent OCI image, for clouds that run
+// containers (Northflank). Published by intent-node-image.yml.
+export const IMAGE_REPO = 'ghcr.io/intent-hq/intent-node';
+export const IMAGE_SOURCE = 'https://github.com/intent-hq/intentd';
+
+// plan() with full image references; PR images are built and smoke-tested only.
+export function imagePlan(env) {
+  const target = plan(env);
+  if (target.skip) return target;
+  return { version: target.version, tags: target.tags.map(tag => `${IMAGE_REPO}:${tag}`), push: target.publish };
+}
+
+// Renders defineTemplate() as a Dockerfile, so both builds run the same steps.
+// Every step runs as root, like the template's. The container idles: the
+// backend starts intentd itself, as in an E2B sandbox.
+export function dockerfile({ version, sha256 }) {
+  const v = parseVersion(version);
+  parseSha256(sha256);
+  const lines = [];
+  const builder = {
+    fromImage(image) {
+      lines.push(`FROM ${image}`, `LABEL org.opencontainers.image.source="${IMAGE_SOURCE}"`, `LABEL org.opencontainers.image.version="${v}"`);
+      return builder;
+    },
+    aptInstall(packages) {
+      lines.push(`RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ${packages.join(' ')} && rm -rf /var/lib/apt/lists/*`);
+      return builder;
+    },
+    runCmd(command, { user } = {}) {
+      if (user !== 'root') throw new Error(`step ${JSON.stringify(command)} must run as root`);
+      lines.push(`RUN ${command}`);
+      return builder;
+    },
+  };
+  defineTemplate(() => builder, { version: v, sha256 });
+  lines.push('CMD ["sleep", "infinity"]');
+  return `${lines.join('\n')}\n`;
 }
 
 export function redact(text, secret) {

@@ -4,33 +4,19 @@
 // Env: E2B_API_KEY, SIZE, ENABLED_SIZES (optional comma list) plus the plan
 // inputs (EVENT_NAME, RUN_*, INPUT_*, PR_NUMBER, LATEST_RELEASE_TAG).
 // Writes skip/version/ref/names to $GITHUB_OUTPUT.
-import { appendFileSync } from 'node:fs';
 import { Template, defaultBuildLogger } from 'e2b';
 import {
-  archiveUrl,
   defineTemplate,
   enabledSizes,
+  fetchSha256,
+  output,
   isResourceLimitRefusal,
-  parseSha256,
   parseSize,
   plan,
   publishTemplate,
   redact,
   templateName,
 } from './intent-node.mjs';
-
-function output(values) {
-  const lines = Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n');
-  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${lines}\n`);
-  console.log(lines);
-}
-
-async function fetchSha256(version) {
-  const url = `${archiveUrl(version)}.sha256`;
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`fetching ${url} failed: HTTP ${response.status}`);
-  return parseSha256(await response.text());
-}
 
 async function main() {
   const apiKey = process.env.E2B_API_KEY;
