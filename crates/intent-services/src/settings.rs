@@ -1385,6 +1385,7 @@ const PROPOSAL_EXCLUDED_PATHS: &[&str] = &[
     "workspaceInitializer.state",
     "hardwareConsole.state",
     "daemon.mode",
+    "agents.permissionPolicy",
 ];
 
 /// Look up a definition by dotted `path`, or `None` when unknown.
@@ -2495,6 +2496,18 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "agents",
             &["auto", "on", "off"],
             "auto",
+        ),
+        enumerated(
+            "agents.permissionPolicy",
+            "Tool approvals",
+            "How agents' tool permission requests are answered by default: interactive asks you \
+             in the chat, allow approves every request, auto approves reads and denies the rest, \
+             deny refuses every request. A chat's own setting overrides it, and the \
+             INTENTD_PERMISSION_POLICY environment variable overrides this setting. Applies at \
+             each agent's next turn; agents on remote machines use remoteAgents.permission",
+            "agents",
+            &["interactive", "allow", "auto", "deny"],
+            "allow",
         ),
         number(
             "events.streamRetentionHours",
@@ -4574,6 +4587,7 @@ mod tests {
             "linear.token",
             "remoteAgents.permission",
             "daemon.mode",
+            "agents.permissionPolicy",
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.proposable(), "{path} must not be proposable");

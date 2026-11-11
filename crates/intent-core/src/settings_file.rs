@@ -913,6 +913,37 @@ pub struct AgentsSettings {
     /// resumes, `off` never resumes. The `--resume-all` flag forces the
     /// sweep regardless of this setting.
     pub resume_interrupted_on_start: ResumeInterruptedOnStart,
+    /// `agents.permissionPolicy` — how local agents' provider permission
+    /// prompts are answered by default: `interactive` asks the user,
+    /// `allow` approves, `auto` approves reads only, `deny` refuses. A
+    /// chat's `agent.update { permissionPolicy }` overrides it, and the
+    /// `INTENTD_PERMISSION_POLICY` env var overrides this setting. Applies
+    /// at each agent's next turn.
+    pub permission_policy: AgentPermissionPolicy,
+}
+
+/// `agents.permissionPolicy` values (PROTOCOL §8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentPermissionPolicy {
+    Interactive,
+    #[default]
+    Allow,
+    Auto,
+    Deny,
+}
+
+impl AgentPermissionPolicy {
+    /// The wire/TOML string for this value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Allow => "allow",
+            Self::Auto => "auto",
+            Self::Deny => "deny",
+        }
+    }
 }
 
 impl Default for AgentsSettings {
@@ -928,6 +959,7 @@ impl Default for AgentsSettings {
             history_replay_tool_content_chars: DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS,
             tool_payload_retention_days: DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
             resume_interrupted_on_start: ResumeInterruptedOnStart::Auto,
+            permission_policy: AgentPermissionPolicy::Allow,
         }
     }
 }

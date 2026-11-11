@@ -162,6 +162,31 @@ pub enum PermissionPolicy {
 }
 
 impl PermissionPolicy {
+    /// Wire values shared by `INTENTD_PERMISSION_POLICY` and the per-agent
+    /// `agent.update { permissionPolicy }` override (PROTOCOL §8).
+    pub const WIRE_VALUES: [&'static str; 4] = ["interactive", "allow", "auto", "deny"];
+
+    /// Parse a wire value (case-insensitive, trimmed); `None` when unknown.
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "interactive" => Some(Self::Interactive),
+            "allow" => Some(Self::AllowAll),
+            "auto" => Some(Self::AutoByRisk),
+            "deny" => Some(Self::DenyAll),
+            _ => None,
+        }
+    }
+
+    /// The canonical wire value.
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::AllowAll => "allow",
+            Self::AutoByRisk => "auto",
+            Self::DenyAll => "deny",
+        }
+    }
+
     /// The auto-decision for `risk`, or `None` when the prompt must be surfaced
     /// to a client. `true` selects an allow option, `false` a deny option.
     pub(crate) fn auto_allow(self, risk: RiskLevel) -> Option<bool> {

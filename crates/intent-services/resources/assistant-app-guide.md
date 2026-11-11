@@ -800,6 +800,21 @@ the normal order. Pins are saved by Intent, so they appear on every device
 connected to the same Intent. Only foreground agents that were not started by
 another agent can be pinned.
 
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/AgentViewSettingsDropdown.svelte; packages/intentd/crates/intent-services/src/agent_ops.rs (agent.update permissionPolicy); packages/intentd/crates/intent-services/src/agent_manager.rs (permission_policy_for, respawn on change); packages/intentd/crates/intent-services/src/settings.rs (agents.permissionPolicy); packages/intentd/crates/intentd/src/main.rs (INTENTD_PERMISSION_POLICY override); packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte (Agent defaults). -->
+
+By default agents use tools without asking. To approve each tool use in one chat,
+open the chat's settings menu and turn on **Ask before using tools**. The agent then
+pauses at each approval and shows **Allow** / **Deny** in the conversation; an
+unanswered request is cancelled after 5 minutes. The change applies from the next
+message, and a turn already running keeps its setting. Agents this chat starts, and
+agents on remote machines, do not use this setting.
+
+To change the default for every chat, open **Settings → Agent defaults → Tool
+approvals**: **Ask each time**, **Allow all** (the default), **Allow reads only**, or
+**Deny all**. A chat's own setting wins. If the backend was started with the
+`INTENTD_PERMISSION_POLICY` environment variable, that value replaces this default.
+An Assistant settings card cannot change this setting.
+
 <!-- Sources: packages/cloudlands-fe/src/lib/components/chat/MonitoredPrsRow.svelte; packages/intentd/crates/intent-services/src/pr_monitor.rs. -->
 
 When an agent monitors a GitHub pull request, its conversation shows the monitored

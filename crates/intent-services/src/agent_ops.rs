@@ -4639,7 +4639,11 @@ impl Services {
             self.profile_activation().uses_earlier_settings(&session.id);
         let provider_replacement_required =
             self.provider_replacement_required(session.provider.as_deref());
+        let effective_permission_policy = self
+            .effective_permission_policy(&session)
+            .map(|policy| policy.as_wire().to_string());
         let mut lite = project(session);
+        lite.effective_permission_policy = effective_permission_policy;
         lite.using_earlier_profile_settings = using_earlier_profile_settings;
         lite.provider_replacement_required = provider_replacement_required;
         lite.is_responding = is_responding;
@@ -4690,6 +4694,22 @@ impl Services {
             }
         }
         lite
+    }
+
+    /// The permission policy `session`'s next local process start uses
+    /// (PROTOCOL §8): its override, else the daemon default. `None` for a
+    /// remote agent (its machine applies `remoteAgents.permission`) or when
+    /// no runtime manager is attached.
+    pub(crate) fn effective_permission_policy(
+        &self,
+        session: &AgentSession,
+    ) -> Option<intent_acp::PermissionPolicy> {
+        if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+        {
+            return None;
+        }
+        Some(self.agent_manager()?.permission_policy_for(session))
     }
 
     /// Compute the daemon-owned runtime activity flags for `session` — the port
@@ -7144,6 +7164,7 @@ impl Services {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
             harness_version: harness_version.to_string(),
             harness_features: Some(harness_features),
             created_at: now.clone(),
@@ -8590,6 +8611,7 @@ impl Services {
             "isBackground",
             "notificationsMuted",
             "pinned",
+            "permissionPolicy",
         ];
         for key in obj.keys() {
             if !allowed.contains(&key.as_str()) {
@@ -8803,6 +8825,9 @@ impl Services {
                         Error::InvalidParams("agent.update: `pinned` must be a boolean".to_string())
                     })?;
                 }
+                "permissionPolicy" => {
+                    session.permission_policy = parse_permission_policy_change(&session, value)?;
+                }
                 _ => unreachable!("guarded by allow-list above"),
             }
         }
@@ -8850,11 +8875,12 @@ impl Services {
                 metadata.remove(intent_core::CHIEF_PROMPT_VERSION_KEY);
             }
         }
-        // User preferences (mute, sidebar pin) are not agent activity.
+        // User preferences (mute, sidebar pin, permission policy) are not
+        // agent activity.
         let preference_only = !obj.is_empty()
-            && obj
-                .keys()
-                .all(|key| key == "notificationsMuted" || key == "pinned");
+            && obj.keys().all(|key| {
+                key == "notificationsMuted" || key == "pinned" || key == "permissionPolicy"
+            });
         let workspace_id = session.workspace_id.clone();
         // Muting drops the session out of the workspace unread derivation
         // (§5.1), so snapshot the unread state BEFORE the write — the
@@ -8907,6 +8933,17 @@ impl Services {
                     .await?;
             }
         }
+        // The full-row write never carries the override, so both request
+        // shapes persist it through its narrow writer.
+        if obj.contains_key("permissionPolicy") {
+            self.store
+                .set_agent_permission_policy(
+                    &workspace_id,
+                    &agent_id,
+                    session.permission_policy.as_deref(),
+                )
+                .await?;
+        }
         if preference_only {
             // Return current activity and preference state, including any
             // genuine session update that raced the scoped preference write.
@@ -8937,6 +8974,9 @@ impl Services {
         event_data.insert("agentId".into(), json!(agent_id.0));
         for (k, v) in &obj {
             event_data.insert(k.clone(), v.clone());
+        }
+        if obj.contains_key("permissionPolicy") {
+            event_data.insert("permissionPolicy".into(), json!(session.permission_policy));
         }
         // Only a placeholder rename that actually applied reports `name`: the
         // same request can leave the manual-foreground scope (e.g.
@@ -20868,6 +20908,36 @@ fn update_optional_string(value: &Value, field: &str) -> Result<Option<String>> 
             "agent.update: `{field}` must be a string or null"
         ))),
     }
+}
+
+/// Parse `agent.update { permissionPolicy }`: one of
+/// [`intent_acp::PermissionPolicy::WIRE_VALUES`] (stored canonical), or
+/// `null` to follow the daemon default. A remote agent's machine applies
+/// `remoteAgents.permission`, so it refuses any value.
+fn parse_permission_policy_change(session: &AgentSession, value: &Value) -> Result<Option<String>> {
+    if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+        .is_some()
+    {
+        return Err(Error::InvalidParams(
+            "agent.update: `permissionPolicy` is not available for remote agents; their machine's \
+             remoteAgents.permission setting applies"
+                .to_string(),
+        ));
+    }
+    match value {
+        Value::Null => Ok(None),
+        Value::String(raw) => intent_acp::PermissionPolicy::from_wire(raw)
+            .map(|policy| Some(policy.as_wire().to_string()))
+            .ok_or_else(|| invalid_permission_policy()),
+        _ => Err(invalid_permission_policy()),
+    }
+}
+
+fn invalid_permission_policy() -> Error {
+    Error::InvalidParams(format!(
+        "agent.update: `permissionPolicy` must be one of {} or null",
+        intent_acp::PermissionPolicy::WIRE_VALUES.join(", ")
+    ))
 }
 
 /// Reject transcript entries whose `role` is not one of the four wire values

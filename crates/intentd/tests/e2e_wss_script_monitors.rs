@@ -186,6 +186,7 @@ fn agent_session(ws: &WorkspaceId, id: &str) -> AgentSession {
         retired_at: None,
         notifications_muted: false,
         pinned: false,
+        permission_policy: None,
     }
 }
 

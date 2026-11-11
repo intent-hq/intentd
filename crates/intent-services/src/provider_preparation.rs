@@ -283,6 +283,7 @@ process.exit(1);
         agent_tmp_root: None,
         agent_tmp_key: None,
         path_prefix: None,
+        permission_policy: None,
     };
     let prepared = prepare_npx_package(&opts, &script).ok()?;
     let receipt_path = prepared

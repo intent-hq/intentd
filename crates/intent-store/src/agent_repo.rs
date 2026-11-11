@@ -49,7 +49,7 @@ const SESSION_COLUMNS: &str = "id, workspace_id, backend_session_id, acp_session
     attention_request_timestamp, delegation_depth, initial_message, context_references, image_blocks, \
     file_blocks, is_background, metadata, stop_reason, \
     stop_reason_timestamp, reasoning_effort, effort_levels, task_graph_enabled, harness_version, \
-    harness_features, retired_at, notifications_muted, pinned";
+    harness_features, retired_at, notifications_muted, pinned, permission_policy";
 
 /// Session metadata needed by the `AgentLite` summary projection.
 /// `system_prompt`, `image_blocks`, and `initial_message` are intentionally
@@ -62,7 +62,7 @@ pub(crate) const SESSION_SUMMARY_COLUMNS: &str = "id, workspace_id, backend_sess
     attention_request_kind, attention_request_reason, attention_request_timestamp, delegation_depth, \
     context_references, file_blocks, is_background, metadata, \
     stop_reason, stop_reason_timestamp, reasoning_effort, \
-    effort_levels, harness_version, harness_features, retired_at, notifications_muted, pinned";
+    effort_levels, harness_version, harness_features, retired_at, notifications_muted, pinned, permission_policy";
 
 /// Aggregate SQL behind [`Store::get_agent_session_message_stats`], extracted
 /// so tests can run `EXPLAIN QUERY PLAN` on the exact production statement
@@ -1076,7 +1076,7 @@ fn effort_levels_from_db(raw: Option<String>) -> Result<Option<Vec<String>>> {
     .transpose()
 }
 
-/// Bind the full 42-column `agent_session` insert value list onto `query`, in
+/// Bind the full 43-column `agent_session` insert value list onto `query`, in
 /// [`SESSION_COLUMNS`] order. Shared by [`Store::insert_agent_session`] and
 /// [`Store::insert_agent_session_with_messages`] so the column/bind pairing
 /// lives in one place. The harness stamp (`harness_version` /
@@ -1125,7 +1125,8 @@ fn bind_session_insert<'q>(
         .bind(json_col_to_db(s.harness_features.as_ref())?)
         .bind(&s.retired_at)
         .bind(i64::from(s.notifications_muted))
-        .bind(i64::from(s.pinned)))
+        .bind(i64::from(s.pinned))
+        .bind(&s.permission_policy))
 }
 
 /// Per-session boolean user preferences. Each is written only by its narrow
@@ -1211,7 +1212,7 @@ impl Store {
         };
         let sql = format!(
             "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         let query = bind_session_insert(
             sqlx::query(sqlx::AssertSqlSafe(sql.as_str())),
@@ -1294,7 +1295,7 @@ impl Store {
             })?;
             let session_sql = format!(
                 "INSERT INTO agent_session ({SESSION_COLUMNS}) VALUES \
-                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                 (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             );
             bind_session_insert(
                 sqlx::query(sqlx::AssertSqlSafe(session_sql.as_str())),
@@ -3130,7 +3131,8 @@ impl Store {
         // a user toggle changed only by explicit scoped patches, so a
         // concurrent or long-lived in-memory session persisted here without
         // such a patch can never revert the user's mute. `pinned` (0180) is
-        // the same kind of user toggle and is excluded on the same grounds.
+        // the same kind of user toggle and is excluded on the same grounds,
+        // as is `permission_policy` (0190).
         // The creation-only Assistant marker is monotonic: once absent or
         // invalidated, a stale full-row write cannot resurrect it. Evaluate
         // the stored value in this UPDATE, not in the earlier invariant read.
@@ -3316,6 +3318,50 @@ impl Store {
     ) -> Result<bool> {
         self.set_agent_session_preference(workspace_id, id, SessionPreference::Pinned, pinned)
             .await
+    }
+
+    /// Set the session's permission policy override (0190) — the store side
+    /// of `agent.update { permissionPolicy }`. `None` clears the override.
+    /// Same contract as [`Store::set_agent_pinned`]: returns `true` when the
+    /// stored value changed, never advances the activity timestamp, and is
+    /// the only writer of the column.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn set_agent_permission_policy(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        policy: Option<&str>,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET permission_policy=? \
+             WHERE id=? AND workspace_id=? AND permission_policy IS NOT ?",
+        )
+        .bind(policy)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(policy)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("set permission policy failed: {e}")))?
+        .rows_affected();
+        if rows > 0 {
+            return Ok(true);
+        }
+        let exists = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM agent_session WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("verify agent session failed: {e}")))?;
+        if exists.is_none() {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(false)
     }
 
     /// Narrow writer shared by the per-session user-preference flags.
@@ -5251,6 +5297,7 @@ fn map_session_row_with_heavy_cols(
         retired_at: col(row, "retired_at")?,
         notifications_muted: col::<i64>(row, "notifications_muted")? != 0,
         pinned: col::<i64>(row, "pinned")? != 0,
+        permission_policy: col(row, "permission_policy")?,
         harness_version: col(row, "harness_version")?,
         harness_features: json_col_from_db(col(row, "harness_features")?, "harness_features")?,
         created_at: col(row, "created_at")?,
@@ -9437,6 +9484,7 @@ mod tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         };
         store.insert_agent_session(&session).await.expect("insert");
         let err = store
@@ -9520,6 +9568,7 @@ mod tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -10257,6 +10306,7 @@ mod tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         }
     }
 
@@ -14215,6 +14265,7 @@ mod tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         };
         store
             .insert_agent_session(&session)
@@ -14365,6 +14416,7 @@ mod tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
         };
         store.insert_agent_session(&session).await.expect("insert");
 
@@ -15947,6 +15999,7 @@ mod tests {
                 retired_at: None,
                 notifications_muted: false,
                 pinned: false,
+                permission_policy: None,
             };
             store.insert_agent_session(&session).await.expect("insert");
         }
@@ -20815,6 +20868,7 @@ mod tests {
             retired_at: None,
             notifications_muted: false,
             pinned: false,
+            permission_policy: None,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             created_at: ts.clone(),

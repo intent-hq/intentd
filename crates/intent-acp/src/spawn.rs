@@ -111,6 +111,10 @@ pub struct SpawnOptions<'a> {
     /// A directory put first on the child's `PATH`, ahead of the enriched
     /// one (a remote sub-agent's `git-remote-intent` helper).
     pub path_prefix: Option<&'a Path>,
+    /// The agent's own permission policy override (PROTOCOL §8), or `None`
+    /// for the spawning manager's default. Read by the client-request
+    /// handler that answers the child's `session/request_permission`.
+    pub permission_policy: Option<crate::PermissionPolicy>,
 }
 
 impl<'a> SpawnOptions<'a> {
@@ -178,6 +182,7 @@ impl<'a> SpawnOptions<'a> {
             agent_tmp_root: None,
             agent_tmp_key: None,
             path_prefix: None,
+            permission_policy: None,
         }
     }
 }

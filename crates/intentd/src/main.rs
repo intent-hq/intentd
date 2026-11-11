@@ -2585,18 +2585,16 @@ async fn cmd_serve_owned(
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
     // router (M3.4); a global process cap + LRU registry bound concurrency.
-    // The shipped default is `AllowAll` for reference parity with the TS
-    // acp-provider: the manager first tries `session/set_mode bypassPermissions`
-    // on providers that advertise it (auggie today) and then unconditionally
-    // auto-approves any `session/request_permission` the provider still sends.
-    // The previous `AutoByRisk` default silently denied medium/high prompts,
-    // which diverged from the reference. An FE-attached deployment sets
-    // `INTENTD_PERMISSION_POLICY=interactive` to surface every prompt over
-    // `agent.pendingPermissions` and resolve it via `agent.respondPermission`;
-    // `auto` / `deny` remain selectable for headless-with-guardrails deployments
-    // (§6.7/M3.5).
+    // The default permission policy is the live `agents.permissionPolicy`
+    // setting (default `allow`, parity with the TS acp-provider: the manager
+    // tries `session/set_mode bypassPermissions` where advertised and then
+    // auto-approves any prompt). `interactive` surfaces each prompt over
+    // `agent.pendingPermissions` / `agent.respondPermission`; `auto` / `deny`
+    // serve headless-with-guardrails deployments (§6.7/M3.5). A chat's
+    // `agent.update { permissionPolicy }` overrides the default, and a set
+    // `INTENTD_PERMISSION_POLICY` overrides the setting daemon-wide.
     let permission_policy = resolve_permission_policy();
-    tracing::info!(?permission_policy, "agent permission policy");
+    tracing::info!(?permission_policy, "agent permission policy env override");
     // Descendant-tree memory sample shared by `system.status` (intentd#1139) and
     // the optional aggregate spawn budget below (monorepo#2063). Constructed
     // here because the budget is installed on the registry right after the
@@ -2608,7 +2606,7 @@ async fn cmd_serve_owned(
             Arc::new(BusEventSink::new(bus.clone())),
             process_cap,
         )
-        .with_policy(permission_policy)
+        .with_policy_override(permission_policy)
         // STAB-53: capture each spawned child's stderr under
         // `<data_dir>/agent-logs/<agent-id>/<YYYY-MM-DD>.log`.
         .with_agent_log_root(intent_core::agent_logs_root(&config.data_dir))
@@ -5904,25 +5902,17 @@ fn env_flag(name: &str) -> bool {
 }
 
 /// Map the `INTENTD_PERMISSION_POLICY` value to a [`PermissionPolicy`]
-/// (`interactive`|`auto`|`allow`|`deny`, case-insensitive). Absent/blank or an
-/// unrecognized value falls back to `AllowAll` — reference parity with the TS
-/// acp-provider, which unconditionally auto-approves (`AutoByRisk`'s
-/// silent-deny of medium/high prompts diverged from that behavior).
-/// `interactive` remains available via this env var and is what an FE-attached
-/// deployment selects to drive the `agent.respondPermission` /
-/// `agent.pendingPermissions` round-trip.
-fn parse_permission_policy(raw: Option<&str>) -> PermissionPolicy {
-    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("interactive") => PermissionPolicy::Interactive,
-        Some("auto") => PermissionPolicy::AutoByRisk,
-        Some("deny") => PermissionPolicy::DenyAll,
-        _ => PermissionPolicy::AllowAll,
-    }
+/// (`interactive`|`auto`|`allow`|`deny`, case-insensitive). Absent, blank or
+/// unrecognized returns `None`: the `agents.permissionPolicy` setting (default
+/// `allow`, parity with the TS acp-provider's unconditional auto-approve)
+/// applies instead. A set value overrides that setting daemon-wide.
+fn parse_permission_policy(raw: Option<&str>) -> Option<PermissionPolicy> {
+    raw.and_then(PermissionPolicy::from_wire)
 }
 
-/// Resolve the permission policy from `INTENTD_PERMISSION_POLICY`, defaulting to
-/// `AllowAll` when unset or unrecognized (see [`parse_permission_policy`]).
-fn resolve_permission_policy() -> PermissionPolicy {
+/// The `INTENTD_PERMISSION_POLICY` override, if set (see
+/// [`parse_permission_policy`]).
+fn resolve_permission_policy() -> Option<PermissionPolicy> {
     parse_permission_policy(std::env::var("INTENTD_PERMISSION_POLICY").ok().as_deref())
 }
 
@@ -11670,37 +11660,24 @@ for line in sys.stdin:
 
     #[test]
     fn permission_policy_parses_each_keyword_case_insensitively() {
-        assert_eq!(
-            parse_permission_policy(Some("interactive")),
-            PermissionPolicy::Interactive
-        );
-        assert_eq!(
-            parse_permission_policy(Some("  AUTO ")),
-            PermissionPolicy::AutoByRisk
-        );
-        assert_eq!(
-            parse_permission_policy(Some("Allow")),
-            PermissionPolicy::AllowAll
-        );
-        assert_eq!(
-            parse_permission_policy(Some("deny")),
-            PermissionPolicy::DenyAll
-        );
+        for (raw, expected) in [
+            ("interactive", PermissionPolicy::Interactive),
+            ("  AUTO ", PermissionPolicy::AutoByRisk),
+            ("Allow", PermissionPolicy::AllowAll),
+            ("deny", PermissionPolicy::DenyAll),
+        ] {
+            assert_eq!(parse_permission_policy(Some(raw)), Some(expected), "{raw}");
+        }
     }
 
     #[test]
-    fn permission_policy_defaults_to_allow_all() {
-        // Absent, blank, and unrecognized values all fall back to the reference
-        // default (AllowAll) rather than failing startup or silently denying.
-        assert_eq!(parse_permission_policy(None), PermissionPolicy::AllowAll);
-        assert_eq!(
-            parse_permission_policy(Some("   ")),
-            PermissionPolicy::AllowAll
-        );
-        assert_eq!(
-            parse_permission_policy(Some("bogus")),
-            PermissionPolicy::AllowAll
-        );
+    fn permission_policy_env_absent_defers_to_the_setting() {
+        // Absent, blank, and unrecognized values never override the
+        // `agents.permissionPolicy` setting, so startup neither fails nor
+        // silently denies.
+        for raw in [None, Some("   "), Some("bogus")] {
+            assert_eq!(parse_permission_policy(raw), None, "{raw:?}");
+        }
     }
 
     /// A [`TreeWalk`] with buckets but no rows, for the `store()` tests that

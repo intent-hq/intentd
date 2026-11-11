@@ -185,6 +185,7 @@ async fn install_fake(mgr: &Arc<AgentManager>, id: &AgentId, ws: &WorkspaceId) -
             session_open_filled_model: None,
             spawned_provider: "node".into(),
             spawned_selection: crate::agent_manager::test_selection_for_command("node"),
+            spawned_policy: intent_acp::PermissionPolicy::AllowAll,
             _activation: None,
             thought_level: None,
             config_options: None,
