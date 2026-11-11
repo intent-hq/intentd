@@ -15150,6 +15150,12 @@ mod workspace_apply_proposal_tests {
         resolve_persisted_outcome: Mutex<Option<String>>,
         /// `created_workspace_id` of each resolve call, in call order.
         resolve_created: Mutex<Vec<Option<String>>>,
+        /// What `remote_machines_capability` answers.
+        remote_machines: Mutex<bool>,
+        /// The caller's `nodeId` and resolved `placement` on `agent_get`.
+        caller_location: Mutex<(Option<String>, Option<intent_core::placement::AgentPlacement>)>,
+        /// `repositoryPath` served on `get_workspace` (proposeSibling tests).
+        repository_path: Mutex<Option<String>>,
     }
 
     fn workspace(id: &str, title: &str) -> Workspace {
@@ -15270,7 +15276,16 @@ mod workspace_apply_proposal_tests {
         }
 
         fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
-            Box::pin(async move { Ok(workspace(id.as_str(), "Amber Forest")) })
+            let repository_path = self.repository_path.lock().unwrap().clone();
+            Box::pin(async move {
+                let mut row = workspace(id.as_str(), "Amber Forest");
+                row.repository_path = repository_path;
+                Ok(row)
+            })
+        }
+
+        fn remote_machines_capability(&self) -> bool {
+            *self.remote_machines.lock().unwrap()
         }
 
         fn agent_get(
@@ -15280,6 +15295,7 @@ mod workspace_apply_proposal_tests {
         ) -> BoxFuture<'_, Result<AgentLite>> {
             let pending = self.pending.lock().unwrap().clone();
             let resolutions = self.resolutions.lock().unwrap().clone();
+            let (node_id, placement) = self.caller_location.lock().unwrap().clone();
             Box::pin(async move {
                 assert_eq!(agent_id.as_str(), CALLER, "lookup is scoped to the caller");
                 assert_eq!(
@@ -15287,7 +15303,10 @@ mod workspace_apply_proposal_tests {
                     Some(WS),
                     "lookup is workspace-scoped"
                 );
-                Ok(caller_lite(pending, resolutions))
+                let mut lite = caller_lite(pending, resolutions);
+                lite.node_id = node_id;
+                lite.placement = placement;
+                Ok(lite)
             })
         }
 
@@ -15479,6 +15498,173 @@ mod workspace_apply_proposal_tests {
             tool_text(resp).contains(needle),
             "expected `{needle}` in `{}`",
             tool_text(resp)
+        );
+    }
+
+    fn git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        repo.set_head("refs/heads/main").unwrap();
+        std::fs::write(dir.path().join("README.md"), "test\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("README.md")).unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .unwrap();
+        dir
+    }
+
+    fn placement(value: Value) -> intent_core::placement::AgentPlacement {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// The proposal `proposeSibling` emits for a caller at `location`
+    /// (`nodeId`, resolved `placement`) on a backend whose
+    /// `remoteMachines` capability is `remote`.
+    async fn proposal_from(
+        remote: bool,
+        location: (Option<&str>, Option<Value>),
+    ) -> Value {
+        let repo = git_repo();
+        let api = Arc::new(FakeApi::default());
+        *api.repository_path.lock().unwrap() = Some(repo.path().to_string_lossy().into_owned());
+        *api.remote_machines.lock().unwrap() = remote;
+        *api.caller_location.lock().unwrap() =
+            (location.0.map(str::to_string), location.1.map(placement));
+        let resp = call(
+            &server(api),
+            "return await ws.workspace.proposeSibling({ title: 'Follow up', initialPrompt: 'Do it.' });",
+        )
+        .await;
+        assert_ne!(resp["result"]["isError"], true, "{resp}");
+        tool_json(&resp)["proposal"].clone()
+    }
+
+    #[tokio::test]
+    async fn propose_sibling_stamps_the_backend_for_a_local_proposer() {
+        let proposal = proposal_from(true, (None, None)).await;
+        assert_eq!(proposal["placement"], json!({ "target": "local" }));
+        assert!(
+            proposal["payload"]["params"]["initialAgent"]
+                .get("placement")
+                .is_none(),
+            "the stamp stays outside the create params: {proposal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn propose_sibling_stamps_the_machine_of_a_remote_proposer() {
+        let proposal = proposal_from(
+            true,
+            (
+                Some("node-studio"),
+                Some(json!({ "target": "remote", "checkout": "isolated", "os": "macos" })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            proposal["placement"],
+            json!({ "target": "remote", "nodeId": "node-studio" })
+        );
+    }
+
+    #[tokio::test]
+    async fn propose_sibling_stamps_a_new_sandbox_from_the_e2b_proposers_entry() {
+        let proposal = proposal_from(
+            true,
+            (
+                Some("sandbox-node-1"),
+                Some(json!({ "target": "e2b", "checkout": "isolated", "cloudMachineId": "team-e2b" })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            proposal["placement"],
+            json!({ "target": "e2b", "cloudMachineId": "team-e2b" })
+        );
+    }
+
+    #[tokio::test]
+    async fn propose_sibling_does_not_stamp_without_remote_initial_agent() {
+        let proposal = proposal_from(false, (Some("node-studio"), None)).await;
+        assert!(proposal.get("placement").is_none(), "{proposal}");
+    }
+
+    fn stamped_proposal(stamp: Value) -> Value {
+        let mut proposal = sibling_proposal();
+        proposal["placement"] = stamp;
+        proposal
+    }
+
+    const APPLY: &str = "return await ws.workspace.applyProposal('Create workspace: Follow up', { userRequested: true });";
+
+    #[tokio::test]
+    async fn apply_sends_the_stamp_as_the_initial_agent_placement() {
+        let stamp = json!({ "target": "remote", "nodeId": "node-studio" });
+        let api = api_with_pending(&stamped_proposal(stamp.clone()));
+        let resp = call(&server(api.clone()), APPLY).await;
+        assert_eq!(tool_json(&resp)["ok"], true, "{resp}");
+        let calls = api.create_calls.lock().unwrap();
+        let sent = calls[0].0.initial_agent.as_ref().unwrap().placement.clone();
+        assert_eq!(sent, Some(placement(stamp)));
+    }
+
+    #[tokio::test]
+    async fn apply_without_a_stamp_sends_no_placement() {
+        let api = api_with_pending(&sibling_proposal());
+        let resp = call(&server(api.clone()), APPLY).await;
+        assert_eq!(tool_json(&resp)["ok"], true, "{resp}");
+        let calls = api.create_calls.lock().unwrap();
+        assert_eq!(calls[0].0.initial_agent.as_ref().unwrap().placement, None);
+    }
+
+    #[tokio::test]
+    async fn apply_reports_an_admission_refusal_with_its_code_and_records_nothing() {
+        let api = api_with_pending(&stamped_proposal(
+            json!({ "target": "remote", "nodeId": "node-gone" }),
+        ));
+        *api.create_error.lock().unwrap() = Some(Error::remote_machine(
+            false,
+            "The machine node-gone is offline",
+            json!({ "code": "machine-unreachable", "nodeId": "node-gone" }),
+        ));
+        let resp = call(&server(api.clone()), APPLY).await;
+        assert_error_contains(&resp, "machine-unreachable");
+        assert_error_contains(&resp, "The machine node-gone is offline");
+        assert!(api.resolve_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_resolves_applied_when_the_first_agent_fails_after_the_workspace_commits() {
+        let api = api_with_pending(&stamped_proposal(
+            json!({ "target": "remote", "nodeId": "node-studio" }),
+        ));
+        *api.create_error.lock().unwrap() = Some(Error::remote_machine(
+            true,
+            "The first agent could not start on Studio",
+            json!({
+                "code": "launch-failed",
+                "retryable": false,
+                "workspaceId": "ws-new",
+                "launch": { "agentId": "agent-new", "state": "failed" },
+                "cause": { "code": "remote-launch-failed", "message": "checkout failed" },
+            }),
+        ));
+        let resp = call(&server(api.clone()), APPLY).await;
+        assert_error_contains(&resp, "launch-failed");
+        assert_error_contains(&resp, "ws-new");
+        assert_error_contains(&resp, "remote-launch-failed");
+        let resolves = api.resolve_calls.lock().unwrap();
+        assert_eq!(resolves.len(), 1);
+        assert_eq!(resolves[0].3, "applied");
+        assert_eq!(
+            resolves[0].4.as_deref(),
+            Some("Created workspace ws-new; its first agent failed to start: remote-launch-failed")
+        );
+        assert_eq!(
+            api.resolve_created.lock().unwrap()[0].as_deref(),
+            Some("ws-new")
         );
     }
 
