@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.179] - 2026-11-11
+
+### ⚙️ Miscellaneous Tasks
+
+- *(deps)* Bump toon-format from 0.5.0 to 0.6.1 ([#3258](https://github.com/intent-hq/intentd/pull/3258))
+- Update Cargo.lock dependencies
+
+
 ## [0.11.178] - 2026-11-10
 
 ### 📚 Documentation
