@@ -31,6 +31,11 @@ pub enum CloudErrorKind {
     Conflict,
     /// The provider rejected the key, or forbade the call.
     Unauthorized,
+    /// The key is valid but lacks a permission; [`CloudError::action`]
+    /// names the refused call.
+    PermissionDenied,
+    /// The project the entry names does not exist, or the key cannot see it.
+    ProjectMissing,
     /// Any other HTTP refusal; [`CloudError::status`] says which.
     Api,
     Other,
@@ -45,6 +50,7 @@ pub struct CloudError {
     status: Option<u16>,
     retry_after: Option<Duration>,
     retryable: bool,
+    action: Option<String>,
     message: String,
 }
 
@@ -56,6 +62,7 @@ impl CloudError {
             status: None,
             retry_after: None,
             retryable: false,
+            action: None,
             message: message.into(),
         }
     }
@@ -76,6 +83,19 @@ impl CloudError {
     pub fn retryable(mut self, retryable: bool) -> Self {
         self.retryable = retryable;
         self
+    }
+
+    /// The refused call of a [`CloudErrorKind::PermissionDenied`], for
+    /// example `create-service`.
+    #[must_use]
+    pub fn with_action(mut self, action: impl Into<String>) -> Self {
+        self.action = Some(action.into());
+        self
+    }
+
+    #[must_use]
+    pub fn action(&self) -> Option<&str> {
+        self.action.as_deref()
     }
 
     #[must_use]

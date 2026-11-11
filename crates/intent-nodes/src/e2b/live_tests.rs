@@ -111,6 +111,7 @@ async fn live_e2b_provider_round_trip() {
             pause_on_timeout: Some(false),
             tags: tags.clone(),
             idempotency_key: Some(format!("intent-live-provider-{run}")),
+            ..CreateInstance::default()
         })
         .await
         .unwrap();

@@ -613,6 +613,7 @@ async fn start(
             pause_on_timeout: Some(true),
             tags: metadata,
             idempotency_key: Some(idempotency_key(agent_id)),
+            ..CreateInstance::default()
         })
         .await
         .map_err(|error| config::to_error(&error, config::Phase::Create));
