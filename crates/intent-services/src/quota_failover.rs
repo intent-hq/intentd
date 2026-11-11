@@ -63,8 +63,9 @@ struct FailoverAttempt {
     /// Whether this attempt already reported working to the shared cache.
     working_noted: bool,
     /// Whether a remote agent runs this attempt on its machine's own
-    /// sign-in: another account, so the attempt never marks or clears this
-    /// backend's reference in the shared cache (intent-hq/intent#9100).
+    /// sign-in, or on an account not known: not this backend's, so the
+    /// attempt never marks or clears this backend's reference in the shared
+    /// cache (intent-hq/intent#9100).
     machine_sign_in: bool,
 }
 

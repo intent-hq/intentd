@@ -9,7 +9,11 @@ use std::collections::VecDeque;
 
 /// What one `runtime()` call of [`ScriptedRemote`] hands out.
 enum Launch {
+    /// A fresh launch: records its sign-in on the placement, as the real
+    /// port does.
     Runs(Arc<FakeRuntime>),
+    /// A run the machine kept across a restart: records nothing.
+    Reattaches(Arc<FakeRuntime>),
     Fails(&'static str),
 }
 
@@ -74,8 +78,13 @@ impl crate::feature_ports::RemoteLaunchPort for ScriptedRemote {
                 .lock()
                 .unwrap()
                 .push(failover_rows(&messages).len());
-            match self.launches.lock().unwrap().pop_front() {
+            let next = self.launches.lock().unwrap().pop_front();
+            match next {
                 Some(Launch::Runs(runtime)) => {
+                    record_launched_sign_in(svc, agent_id).await;
+                    Ok(runtime as Arc<crate::feature_ports::RemoteRuntime>)
+                }
+                Some(Launch::Reattaches(runtime)) => {
                     Ok(runtime as Arc<crate::feature_ports::RemoteRuntime>)
                 }
                 Some(Launch::Fails(reason)) => Err(Error::Internal(reason.into())),
@@ -85,6 +94,28 @@ impl crate::feature_ports::RemoteLaunchPort for ScriptedRemote {
             }
         })
     }
+}
+
+/// What the real port records at a fresh launch: whether it runs on the
+/// machine's own sign-in.
+async fn record_launched_sign_in(svc: &Services, agent_id: &AgentId) {
+    let session = svc.store.get_agent_session_summary(agent_id).await.unwrap();
+    let provider = session.provider.clone().unwrap_or_default();
+    let machine_sign_in = svc.runs_on_machine_sign_in(&session, &provider).await;
+    let mut view =
+        intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .unwrap();
+    view.launched_machine_sign_in = Some(machine_sign_in);
+    svc.store
+        .set_agent_session_metadata_key_json(
+            &session.workspace_id,
+            agent_id,
+            intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+            &serde_json::to_string(&view).unwrap(),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
 }
 
 fn failover_rows(messages: &[intent_core::AgentMessage]) -> Vec<&intent_core::AgentMessage> {
@@ -568,19 +599,21 @@ async fn a_reattached_run_keeps_the_account_it_launched_with() {
     primary.quota_failures.store(1, Ordering::SeqCst);
     let backup_run = FakeRuntime::new();
     let port = ScriptedRemote::new(vec![
-        Launch::Runs(primary.clone()),
+        Launch::Reattaches(primary.clone()),
         Launch::Runs(backup_run.clone()),
     ]);
     let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
-    let mut view = serde_json::to_value(remote_view()).unwrap();
-    view["launchedMachineSignIn"] = json!(true);
+    let view = intent_core::remote_launch::RemotePlacementView {
+        launched_machine_sign_in: Some(true),
+        ..remote_view()
+    };
     mgr.services
         .store
         .set_agent_session_metadata_key_json(
             &ws,
             &id,
             intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
-            &view.to_string(),
+            &serde_json::to_string(&view).unwrap(),
             &now_iso(),
         )
         .await
@@ -591,6 +624,43 @@ async fn a_reattached_run_keeps_the_account_it_launched_with() {
     backup_run.finish.add_permits(1);
     wait_idle(&mgr, &id).await;
 
+    assert!(
+        mgr.services.exhausted_providers().is_empty(),
+        "{:?}",
+        mgr.services.exhausted_providers()
+    );
+}
+
+/// A run reattached after a restart with no recorded sign-in (launched by
+/// an older daemon) runs on an unknown account: it neither marks nor
+/// clears this backend's account, whatever the settings say now.
+#[intent_test_macros::daemon_test]
+async fn a_reattached_run_of_unknown_sign_in_leaves_the_backends_marks_alone() {
+    let ws = WorkspaceId::from("ws-remote-quota-unknown");
+    let id = AgentId::from("agent-remote-quota-unknown");
+    let primary = FakeRuntime::new();
+    primary.quota_failures.store(1, Ordering::SeqCst);
+    let backup_run = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![
+        Launch::Reattaches(primary.clone()),
+        Launch::Runs(backup_run.clone()),
+    ]);
+    let (_tmp, mgr, backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    send_the_default_remotely(&mgr).await;
+    send(&mgr, &id, &ws, "hello").await;
+    backup_run.wait_prompts(1).await;
+    backup_run.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    let provider = mgr
+        .services
+        .store
+        .get_agent_session_without_messages(&id)
+        .await
+        .unwrap()
+        .provider
+        .unwrap_or_default();
+    assert_eq!(provider, backup, "the remote agent still fails over");
     assert!(
         mgr.services.exhausted_providers().is_empty(),
         "{:?}",

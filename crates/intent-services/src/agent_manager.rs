@@ -12466,7 +12466,9 @@ impl AgentManager {
             )));
         }
         // The account the run really uses: the one its launch recorded,
-        // which a run reattached after a restart keeps.
+        // which a run reattached after a restart keeps. A run with none
+        // recorded (launched by an older daemon) runs on an unknown account,
+        // so it leaves this backend's quota marks alone.
         let launched = self
             .services
             .store
@@ -12477,7 +12479,7 @@ impl AgentManager {
                 intent_core::remote_launch::RemotePlacementView::from_metadata(s.metadata.as_ref())
             })
             .and_then(|view| view.launched_machine_sign_in)
-            .unwrap_or(machine_sign_in);
+            .unwrap_or(true);
         self.services
             .set_quota_failover_attempt_machine_sign_in(agent_id, launched);
         self.remote_machine_sign_in
