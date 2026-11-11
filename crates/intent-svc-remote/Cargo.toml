@@ -1,6 +1,6 @@
 [package]
 name = "intent-svc-remote"
-version = "0.11.183"
+version = "0.11.184"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,14 +8,14 @@ license.workspace = true
 description = "Remote agent runtime for intentd: the backend connector to exposed machines and journal ingestion"
 
 [dependencies]
-intent-services = { path = "../intent-services", version = "0.11.183" }
-intent-core = { path = "../intent-core", version = "0.11.183" }
-intent-store = { path = "../intent-store", version = "0.11.183" }
-intent-transport = { path = "../intent-transport", version = "0.11.183" }
-intent-acp = { path = "../intent-acp", version = "0.11.183" }
-intent-git = { path = "../intent-git", version = "0.11.183" }
-intent-providers = { path = "../intent-providers", version = "0.11.183" }
-intent-nodes = { path = "../intent-nodes", version = "0.11.183" }
+intent-services = { path = "../intent-services", version = "0.11.184" }
+intent-core = { path = "../intent-core", version = "0.11.184" }
+intent-store = { path = "../intent-store", version = "0.11.184" }
+intent-transport = { path = "../intent-transport", version = "0.11.184" }
+intent-acp = { path = "../intent-acp", version = "0.11.184" }
+intent-git = { path = "../intent-git", version = "0.11.184" }
+intent-providers = { path = "../intent-providers", version = "0.11.184" }
+intent-nodes = { path = "../intent-nodes", version = "0.11.184" }
 serde = { workspace = true }
 git2 = { workspace = true }
 serde_json = { workspace = true }
@@ -31,7 +31,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
-intent-services = { path = "../intent-services", version = "0.11.183", features = ["test-hooks"] }
+intent-services = { path = "../intent-services", version = "0.11.184", features = ["test-hooks"] }
 intentd-test-support = { path = "../intentd-test-support" }
 socket2 = "0.6"
 sqlx = { workspace = true }

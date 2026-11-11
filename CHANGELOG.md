@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.184] - 2026-11-11
+
+### 🚀 Features
+
+- Stamp the proposer's placement on workspace proposals ([#3276](https://github.com/intent-hq/intentd/pull/3276))
+- Remote-compatible profiles as a saved choice, machine sign-in first, auto-pick ([#3272](https://github.com/intent-hq/intentd/pull/3272))
+
+### 🐛 Bug Fixes
+
+- *(breakdown)* Say which rule files a section includes; drop the specialist hint ([#3274](https://github.com/intent-hq/intentd/pull/3274))
+
+
 ## [0.11.183] - 2026-11-11
 
 ### 📚 Documentation
