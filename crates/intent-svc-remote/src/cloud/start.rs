@@ -238,7 +238,9 @@ pub(crate) async fn admit(
             .map(Some);
     }
     let chain = match intent_core::current_caller() {
-        Some(Caller::Agent { agent_id }) => chain_entry(svc, Some(agent_id)).await?,
+        Some(Caller::Agent { agent_id }) => {
+            chain_entry(svc, Some(agent_id), placement.any_provider()).await?
+        }
         _ => None,
     };
     let (cloud_machine_id, saved) = config::resolve(
@@ -284,8 +286,13 @@ fn admit_entry(saved: &config::ProviderConfig, needs: &RemoteLaunchNeeds) -> Res
 }
 
 /// The entry of the nearest agent from `from` up its parents whose
-/// placement names an entry that still exists.
-async fn chain_entry(svc: &Services, from: Option<AgentId>) -> Result<Option<String>> {
+/// placement names an entry that still exists; unless `any_provider`, only
+/// an E2B entry counts, and agents on another provider's entry are skipped.
+pub(crate) async fn chain_entry(
+    svc: &Services,
+    from: Option<AgentId>,
+    any_provider: bool,
+) -> Result<Option<String>> {
     let mut current = from;
     for _ in 0..64 {
         let Some(id) = current.take() else { break };
@@ -297,8 +304,10 @@ async fn chain_entry(svc: &Services, from: Option<AgentId>) -> Result<Option<Str
         let named = RemotePlacementView::from_metadata(session.metadata.as_ref())
             .and_then(|view| view.placement.cloud_machine_id);
         if let Some(entry) = named {
-            if config::load(svc, &entry).await?.is_some() {
-                return Ok(Some(entry));
+            if let Some(saved) = config::load(svc, &entry).await? {
+                if any_provider || !saved.is_northflank() {
+                    return Ok(Some(entry));
+                }
             }
         }
         current.clone_from(&session.parent_agent_id);
@@ -324,7 +333,7 @@ async fn agent_entry(
         .await?
         .parent_agent_id
         .clone();
-    let chain = chain_entry(svc, parent).await?;
+    let chain = chain_entry(svc, parent, false).await?;
     let (id, saved) = config::resolve(svc, None, chain.as_deref(), false).await?;
     let entry = EntryRef {
         id,
@@ -873,6 +882,7 @@ pub(crate) async fn remove_machine(
         svc.delete_remote_machine_token(&row.id).await?;
         store.end_machine_leases(&row.id, &head_id).await?;
         for agent in agents {
+            feature.cloud.take_disk_resumed(agent.agent_id.as_str());
             store.remove_remote_agent(&agent.agent_id).await?;
             let lost_error = lost_error.clone();
             let _ = crate::view::update(store, &agent.workspace_id, &agent.agent_id, |view| {

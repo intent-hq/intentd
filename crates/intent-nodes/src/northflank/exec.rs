@@ -64,6 +64,11 @@ pub(super) fn argv(spec: &ProcessSpec) -> Vec<String> {
     if !spec.envs.contains_key("HOME") {
         argv.push(format!("HOME={HOME}"));
     }
+    // The image runs everything as root; Claude Code refuses its
+    // bypass-permissions mode as root outside a declared sandbox.
+    if !spec.envs.contains_key("IS_SANDBOX") {
+        argv.push("IS_SANDBOX=1".into());
+    }
     for (key, value) in &spec.envs {
         argv.push(format!("{key}={}", value.expose()));
     }
@@ -167,15 +172,16 @@ impl NorthflankClient {
             truncated: false,
         };
         let mut completion: Option<Completion> = None;
+        // After `completion`, counted from the last output frame: control
+        // frames (pings) never extend it.
+        let mut drain: Option<Instant> = None;
         loop {
-            let next = if completion.is_none() {
-                ws.next().await
-            } else {
-                let deadline = Instant::now() + self.config.exec_drain_timeout;
-                match tokio::time::timeout_at(deadline, ws.next()).await {
+            let next = match drain {
+                None => ws.next().await,
+                Some(deadline) => match tokio::time::timeout_at(deadline, ws.next()).await {
                     Ok(next) => next,
                     Err(_) => break,
-                }
+                },
             };
             let text = match next {
                 Some(Ok(Message::Text(text))) => text.to_string(),
@@ -200,9 +206,14 @@ impl NorthflankClient {
                 Some("init") if data.get("auth").and_then(Value::as_str) != Some("successful") => {
                     return Err(init_refused(&data, secrets));
                 }
-                Some("stdOut") => collected.push(false, data.as_str().unwrap_or("")),
-                Some("stdErr") => collected.push(true, data.as_str().unwrap_or("")),
+                Some(kind @ ("stdOut" | "stdErr")) => {
+                    collected.push(kind == "stdErr", data.as_str().unwrap_or(""));
+                    if drain.is_some() {
+                        drain = Some(Instant::now() + self.config.exec_drain_timeout);
+                    }
+                }
                 Some("completion") if completion.is_none() => {
+                    drain = Some(Instant::now() + self.config.exec_drain_timeout);
                     completion = Some(serde_json::from_value(data).unwrap_or(Completion {
                         exit_code: None,
                         status: None,

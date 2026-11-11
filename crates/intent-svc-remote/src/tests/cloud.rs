@@ -412,6 +412,136 @@ mod entries {
         );
     }
 
+    /// With `target: "e2b"`, the chain walk skips an agent on a Northflank
+    /// entry and keeps going up to an E2B one; with `"cloud"` it stops at
+    /// the nearest entry of any provider.
+    #[tokio::test]
+    async fn the_chain_walk_skips_other_providers_for_target_e2b() {
+        let backend = Backend::new().await;
+        let svc = &backend.services;
+        save_entry(&backend, "e2b-aaaaaaaaaaaa", "Alpha").await;
+        let northflank = "northflank-bbbbbbbbbbbb";
+        config::save(
+            svc,
+            northflank,
+            &ProviderConfig::new_northflank("Nf", "proj-1"),
+        )
+        .await
+        .unwrap();
+        let grandparent = cloud_agent(&backend, Some("e2b-aaaaaaaaaaaa")).await;
+        let parent = cloud_agent(&backend, Some(northflank)).await;
+        sqlx::query("UPDATE agent_session SET parent_agent_id = ? WHERE id = ?")
+            .bind(grandparent.as_str())
+            .bind(parent.as_str())
+            .execute(backend.store().write_pool())
+            .await
+            .unwrap();
+        let e2b = crate::cloud::chain_entry(svc, Some(parent.clone()), false)
+            .await
+            .unwrap();
+        assert_eq!(e2b.as_deref(), Some("e2b-aaaaaaaaaaaa"));
+        let any = crate::cloud::chain_entry(svc, Some(parent), true)
+            .await
+            .unwrap();
+        assert_eq!(any.as_deref(), Some(northflank));
+    }
+
+    /// A provider that lists `listed` and does nothing else.
+    #[derive(Debug)]
+    struct Listing {
+        kind: &'static str,
+        listed: Vec<intent_nodes::cloud::ListedInstance>,
+    }
+
+    impl intent_nodes::cloud::CloudProvider for Listing {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+        fn create<'a>(
+            &'a self,
+            _: &'a intent_nodes::cloud::CreateInstance,
+        ) -> intent_nodes::cloud::CloudFuture<'a, intent_nodes::cloud::CloudInstance> {
+            unimplemented!()
+        }
+        fn connect<'a>(
+            &'a self,
+            _: &'a str,
+            _: u32,
+        ) -> intent_nodes::cloud::CloudFuture<'a, intent_nodes::cloud::Connected> {
+            unimplemented!()
+        }
+        fn run_command<'a>(
+            &'a self,
+            _: &'a intent_nodes::cloud::CloudInstance,
+            _: &'a intent_nodes::cloud::ProcessSpec,
+        ) -> intent_nodes::cloud::CloudFuture<'a, intent_nodes::cloud::ProcessOutput> {
+            unimplemented!()
+        }
+        fn pause<'a>(&'a self, _: &'a str) -> intent_nodes::cloud::CloudFuture<'a, ()> {
+            unimplemented!()
+        }
+        fn keep_alive<'a>(
+            &'a self,
+            _: &'a str,
+            _: u32,
+        ) -> intent_nodes::cloud::CloudFuture<'a, ()> {
+            unimplemented!()
+        }
+        fn delete<'a>(&'a self, _: &'a str) -> intent_nodes::cloud::CloudFuture<'a, bool> {
+            unimplemented!()
+        }
+        fn list<'a>(
+            &'a self,
+            _: &'a intent_nodes::cloud::ListInstances,
+        ) -> intent_nodes::cloud::CloudFuture<'a, Vec<intent_nodes::cloud::ListedInstance>>
+        {
+            let listed = self.listed.clone();
+            Box::pin(async move { Ok(listed) })
+        }
+        fn check_key(&self) -> intent_nodes::cloud::CloudFuture<'_, ()> {
+            unimplemented!()
+        }
+        fn image_ready<'a>(&'a self, _: &'a str) -> intent_nodes::cloud::CloudFuture<'a, bool> {
+            unimplemented!()
+        }
+    }
+
+    /// A leftover Northflank volume names no entry: it keeps every
+    /// Northflank entry's key for the reaper. On E2B, a sandbox without an
+    /// entry is the legacy entry's only.
+    #[tokio::test]
+    async fn a_leftover_without_an_entry_keeps_a_northflank_key() {
+        let backend = Backend::new().await;
+        let svc = &backend.services;
+        let backend_id = backend.store().daemon_id().await.unwrap();
+        let orphan = intent_nodes::cloud::ListedInstance {
+            id: "volume:intent-0123456789ab".into(),
+            state: intent_nodes::cloud::InstanceState::Paused,
+            tags: std::collections::BTreeMap::from([("intentBackendId".into(), backend_id)]),
+            started_at: String::new(),
+        };
+        let northflank = Listing {
+            kind: "northflank",
+            listed: vec![orphan.clone()],
+        };
+        assert!(
+            crate::cloud::lifecycle::entry_sandboxes_left(
+                svc,
+                &northflank,
+                "northflank-aaaaaaaaaaaa"
+            )
+            .await
+        );
+        let e2b = Listing {
+            kind: "e2b",
+            listed: vec![orphan],
+        };
+        assert!(
+            !crate::cloud::lifecycle::entry_sandboxes_left(svc, &e2b, "e2b-aaaaaaaaaaaa").await
+        );
+        assert!(crate::cloud::lifecycle::entry_sandboxes_left(svc, &e2b, "e2b").await);
+    }
+
     async fn configure(backend: &Backend, params: Value) -> intent_core::Result<Value> {
         let owner = backend.store().get_primary_principal().await.unwrap().id;
         with_caller(

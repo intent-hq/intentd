@@ -1238,8 +1238,12 @@ impl RemoteLaunchPort for RemoteLaunch {
                 .then(|| Box::new(MachineName(status.node_name.clone())));
             // A machine that keeps only its disk started again since this
             // agent last ran there (a Northflank resume or restart).
-            let resumed_from_disk =
-                new_machine.is_none() && feature.cloud.take_disk_resumed(agent_id.as_str());
+            // Taken on every launch, so a mark never outlives the machine.
+            let disk_resumed = feature.cloud.take_disk_resumed(agent_id.as_str());
+            let resumed_from_disk = new_machine.is_none() && disk_resumed;
+            // A launch of a new process: a later not-running stop answer
+            // owes its exit record again.
+            node.shared_ref().launching(agent_id);
             // A sub-agent reaches GitHub through this backend (nodeProtocol
             // 17); the connector drops it on an older link.
             let forge_fetch = if is_sub_agent || checkout_of.is_some() {

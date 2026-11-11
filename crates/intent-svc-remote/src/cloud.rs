@@ -18,7 +18,7 @@
 
 mod bootstrap;
 pub(crate) mod config;
-mod lifecycle;
+pub(crate) mod lifecycle;
 mod methods;
 mod start;
 
@@ -33,6 +33,8 @@ use tokio::sync::watch;
 
 pub(crate) use lifecycle::{spawn_supervisor, CloudGate};
 pub(crate) use methods::call;
+#[cfg(test)]
+pub(crate) use start::chain_entry;
 pub(crate) use start::{admit, begin_start, delete_machine, wait_linked};
 
 /// A finished start that failed: the error's message and data (with its

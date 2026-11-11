@@ -240,7 +240,9 @@ pub(crate) async fn start_daemon(
 ) -> Result<bool> {
     let mut start = ProcessSpec::new("/bin/sh");
     start.args = vec!["-c".into(), START_SCRIPT.into()];
-    start.timeout = Some(Duration::from_secs(60));
+    // Up to 50 s of waiting for the new daemon, plus a provider's output
+    // drain.
+    start.timeout = Some(Duration::from_secs(120));
     let started = client.run_command(sandbox, &start).await.map_err(|error| {
         super::config::to_error(&error, super::config::Phase::Other, client.kind())
     })?;

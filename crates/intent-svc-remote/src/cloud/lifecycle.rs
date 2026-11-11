@@ -904,11 +904,15 @@ pub(crate) async fn entry_sandboxes_left(
         })
         .await
     {
+        // A sandbox without an entry is one from before entries (E2B), or a
+        // leftover that names none (a Northflank volume): it keeps the key
+        // of the legacy entry, or of every entry of a provider other than E2B.
         Ok(listed) => listed.iter().any(|sandbox| {
-            sandbox
-                .tags
-                .get("intentEntryId")
-                .map_or(id == config::legacy_entry(), |entry| entry == id)
+            sandbox.tags.get("intentEntryId").map_or(
+                id == config::legacy_entry()
+                    || client.kind() != intent_core::machines::CLOUD_PROVIDER_E2B,
+                |entry| entry == id,
+            )
         }),
         Err(error) => {
             tracing::warn!(%error, "cloud machines: could not list an entry's sandboxes");

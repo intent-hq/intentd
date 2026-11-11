@@ -953,7 +953,7 @@ async fn exec_collects_output_and_the_exit_code() {
         json!({"type": "init", "data": {
             "auth": {"type": "apiToken", "apiToken": TOKEN},
             "context": {
-                "command": ["env", "HOME=/home/user", "/bin/sh", "-c", "echo out; echo err >&2; exit 3"],
+                "command": ["env", "HOME=/home/user", "IS_SANDBOX=1", "/bin/sh", "-c", "echo out; echo err >&2; exit 3"],
                 "shell": "none"
             }
         }})
@@ -1002,7 +1002,7 @@ async fn exec_builds_the_argv_with_cwd_env_home_and_user() {
     assert_eq!(
         init["data"]["context"],
         json!({
-            "command": ["env", "-C", "/home/user/work", "HOME=/root", "SECRET=s3cr3t", "intentd", "executor", "mint"],
+            "command": ["env", "-C", "/home/user/work", "IS_SANDBOX=1", "HOME=/root", "SECRET=s3cr3t", "intentd", "executor", "mint"],
             "shell": "none",
             "user": "user"
         })
@@ -1029,6 +1029,30 @@ async fn exec_keeps_reading_after_completion_until_close() {
         .unwrap();
     assert_eq!(output.stdout, b"ab");
     assert_eq!(output.stderr, b"late");
+}
+
+/// Pings after `completion` do not extend the drain: it counts from the
+/// last output frame, so output after the drain is not waited for.
+#[tokio::test]
+async fn exec_pings_do_not_extend_the_drain() {
+    let mut steps = vec![
+        WsStep::Receive,
+        init_ok(),
+        out("stdOut", "early"),
+        completion(0, "Success"),
+    ];
+    for _ in 0..10 {
+        steps.push(WsStep::Sleep(Duration::from_millis(100)));
+        steps.push(WsStep::Ping);
+    }
+    steps.push(out("stdOut", "late"));
+    steps.push(WsStep::Sleep(Duration::from_secs(30)));
+    let server = exec_server(steps).await;
+    let output = client(&server)
+        .run_command(&instance("svc-1"), &ProcessSpec::new("x"))
+        .await
+        .unwrap();
+    assert_eq!(output.stdout, b"early");
 }
 
 #[tokio::test]

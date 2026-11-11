@@ -95,6 +95,7 @@ pub enum WsStep {
     Send(serde_json::Value),
     SendText(String),
     Sleep(Duration),
+    Ping,
     /// A normal close (1000).
     Close,
     /// Drop the TCP connection without a close frame.
@@ -254,6 +255,9 @@ impl FakeServer {
                     let _ = ws.send(Message::text(text)).await;
                 }
                 WsStep::Sleep(d) => tokio::time::sleep(d).await,
+                WsStep::Ping => {
+                    let _ = ws.send(Message::Ping(Vec::new().into())).await;
+                }
                 WsStep::Close => {
                     let _ = ws
                         .close(Some(CloseFrame {

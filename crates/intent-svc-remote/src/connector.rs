@@ -1317,6 +1317,12 @@ impl Shared {
         self.agents.end_all(error);
     }
 
+    /// A new process of `agent_id` is launched here: the mark of one lost
+    /// in a disk resume no longer applies.
+    pub(crate) fn launching(&self, agent_id: &AgentId) {
+        lock(&self.lost_processes).remove(agent_id);
+    }
+
     /// Wait until `agent_id` owes no exit record, or until `deadline`.
     /// A record still owed then (lost on the machine, or its link is
     /// down) is given up on, so it never holds back a later relaunch.
