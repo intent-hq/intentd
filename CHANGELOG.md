@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.185] - 2026-11-11
+
+### 🔧 Refactor
+
+- Put cloud machines behind a provider interface with E2B as its adapter ([#3279](https://github.com/intent-hq/intentd/pull/3279))
+
+
 ## [0.11.184] - 2026-11-11
 
 ### 🚀 Features
