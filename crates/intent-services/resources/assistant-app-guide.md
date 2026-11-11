@@ -959,8 +959,11 @@ In **Home → Workspaces**, click a list row or board card to select it and show
 preview. Double-click it, or press Cmd+Enter (Ctrl+Enter on Windows and Linux) on a
 focused row or card, to open the workspace directly.
 
-To select several workspaces, Cmd-click (Ctrl-click on Windows and Linux) each one,
-or Shift-click to select every workspace between the last one you clicked and this one.
+To select several workspaces, Cmd-click (Ctrl-click on Windows and Linux) each one.
+Shift-click selects every workspace between the last workspace you plain-clicked or
+Cmd/Ctrl-clicked and the one you Shift-click; further Shift-clicks keep that starting
+point (click A, Shift-click C, then Shift-click E selects A to E). With nothing
+selected, Shift-click selects just that workspace.
 A bar at the bottom shows the count with **Archive**, **Purge folders** and
 **Delete**; right-clicking a selected workspace offers the same actions. Each action
 applies only to the selected workspaces it fits (Archive to active ones, Purge folders
