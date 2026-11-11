@@ -466,7 +466,7 @@ async fn runs_on(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId, agent_id: &str) 
         .as_ref()
         .filter(|p| !p.runs_on_backend().unwrap_or(false));
     let target = match placed {
-        Some(p) if p.is_e2b() => "e2b",
+        Some(p) if p.is_cloud() => "e2b",
         Some(_) => "remote",
         None if agent.node_id.is_some() => "remote",
         None => return Some(json!({ "target": "local" })),

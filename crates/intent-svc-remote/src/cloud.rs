@@ -1,8 +1,8 @@
-//! E2B cloud machines on the backend (monorepo
-//! `docs/protocol/methods/nodes.md`, "Cloud machines (E2B)"): the provider
-//! settings behind `cloudMachines.configure` / `list` / `remove`, admission
-//! of `placement.target: "e2b"`, and the start of a new sandbox for a
-//! top-level agent.
+//! Cloud machines on the backend, on E2B or Northflank (monorepo
+//! `docs/protocol/methods/nodes.md`, "Cloud machines"): the entries behind
+//! `cloudMachines.configure` / `list` / `remove`, admission of
+//! `placement.target: "e2b"` and `"cloud"`, and the start of a new sandbox
+//! for an agent.
 //!
 //! A start creates the sandbox from the intent-node template of this
 //! backend's exact version, starts `intentd serve` with its tunnel in it,
@@ -92,6 +92,9 @@ pub(crate) struct CloudState {
     pauses: Mutex<HashMap<String, u64>>,
     /// When the reaper first saw each orphan whose start time it cannot read.
     orphans: Mutex<HashMap<String, tokio::time::Instant>>,
+    /// Agents whose machine started again from its disk since they last
+    /// ran there; their next launch says so.
+    disk_resumed: Mutex<HashSet<String>>,
 }
 
 impl CloudState {
@@ -114,6 +117,16 @@ impl CloudState {
             .get(machine_id)
             .copied()
             .unwrap_or_default()
+    }
+
+    fn mark_disk_resumed(&self, agent_id: &str) {
+        crate::lock(&self.disk_resumed).insert(agent_id.to_owned());
+    }
+
+    /// Whether agent `agent_id`'s machine started again from its disk since
+    /// it last ran there; answers `true` once.
+    pub(crate) fn take_disk_resumed(&self, agent_id: &str) -> bool {
+        crate::lock(&self.disk_resumed).remove(agent_id)
     }
 
     pub(crate) fn unpark(&self, machine_id: &str) {

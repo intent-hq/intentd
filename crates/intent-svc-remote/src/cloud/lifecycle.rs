@@ -52,11 +52,11 @@ const MINUTE_MS_ENV: &str = "INTENTD_E2B_MINUTE_MS";
 const DAY_MS_ENV: &str = "INTENTD_E2B_DAY_MS";
 
 /// The turn error of an agent whose sandbox E2B removed.
-pub(crate) const SANDBOX_LOST_MESSAGE: &str = "E2B removed this agent's sandbox, so its turn was interrupted. Work it pushed is kept; work it did not push is lost. The next message starts a new sandbox.";
+pub(crate) const SANDBOX_LOST_MESSAGE: &str = "The cloud provider removed this agent's sandbox, so its turn was interrupted. Work it pushed is kept; work it did not push is lost. The next message starts a new sandbox.";
 
 /// The turn error of an agent whose sandbox could not link to this backend
 /// (`machine-update-required`) and was deleted.
-pub(crate) const SANDBOX_OUTDATED_MESSAGE: &str = "This agent's E2B sandbox runs an Intent version this backend can no longer link to, so the sandbox was deleted. Work it pushed is kept; work it did not push is lost. The next message starts a new sandbox.";
+pub(crate) const SANDBOX_OUTDATED_MESSAGE: &str = "This agent's cloud sandbox runs an Intent version this backend can no longer link to, so the sandbox was deleted. Work it pushed is kept; work it did not push is lost. The next message starts a new sandbox.";
 
 /// Why a machine's sandbox is gone or unusable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +284,24 @@ async fn resume(
         .await
     {
         Ok(connected) => {
+            // A machine that keeps only its disk runs no intentd after a
+            // resume or a container restart: start it, and tell each agent
+            // that ran there what it lost at its next launch.
+            if !client.keeps_memory() {
+                match super::bootstrap::start_daemon(client, &connected.instance).await {
+                    Ok(true) => {
+                        tracing::info!(machine = %row.id, "cloud machine: intentd started again from the machine's disk");
+                        disk_resumed(svc, feature, &row.id).await;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        if paused {
+                            set_state(svc, feature, &row.id, CloudSandboxState::Paused).await;
+                        }
+                        return Err(Resumed::Refused(error));
+                    }
+                }
+            }
             if paused || connected.resumed {
                 tracing::info!(machine = %row.id, sandbox = %cloud.sandbox_id, "cloud machine: sandbox resumed");
                 set_state(svc, feature, &row.id, CloudSandboxState::Running).await;
@@ -294,13 +312,14 @@ async fn resume(
         }
         Err(error) if error.is_not_found() => Err(Resumed::Lost),
         Err(error) => {
-            tracing::warn!(machine = %row.id, %error, "cloud machine: E2B refused the resume");
+            tracing::warn!(machine = %row.id, %error, "cloud machine: the provider refused the resume");
             if paused {
                 set_state(svc, feature, &row.id, CloudSandboxState::Paused).await;
             }
             Err(Resumed::Refused(config::to_error(
                 &error,
                 config::Phase::Other,
+                client.kind(),
             )))
         }
     }
@@ -516,7 +535,27 @@ pub(crate) async fn pause(
                     node.shared_ref().wake();
                 }
             }
-            Err(config::to_error(&error, config::Phase::Other))
+            Err(config::to_error(
+                &error,
+                config::Phase::Other,
+                client.kind(),
+            ))
+        }
+    }
+}
+
+/// Machine `machine_id` started again from its disk: each agent recorded
+/// on it gets [`resumedFromDisk`](intent_core::node_link::LaunchCommand::resumed_from_disk)
+/// at its next launch there.
+async fn disk_resumed(svc: &Services, feature: &RemoteFeature, machine_id: &str) {
+    match super::start::placed_agents(svc.store(), machine_id).await {
+        Ok(agents) => {
+            for agent in agents {
+                feature.cloud.mark_disk_resumed(agent.agent_id.as_str());
+            }
+        }
+        Err(error) => {
+            tracing::warn!(machine = %machine_id, %error, "cloud machine: could not read the agents to tell about the disk resume");
         }
     }
 }
@@ -627,8 +666,8 @@ async fn tick(
     };
     if reap_due {
         *last_reap = Some(Instant::now());
-        for (row_id, from) in &retired {
-            note(reap_retired(svc, feature, clock, &rows, row_id, from).await);
+        for (row_id, from, saved) in &retired {
+            note(reap_retired(svc, feature, clock, &rows, (row_id, from), saved).await);
         }
     }
     for (id, saved) in &entries {
@@ -680,9 +719,13 @@ async fn check(
         CloudSandboxState::Running => {
             let busy = node.as_ref().is_some_and(|node| node.shared_ref().busy());
             let activity = feature.cloud.activity(&row.id, busy);
-            if activity
-                .last_renew
-                .is_none_or(|at| at.elapsed() >= clock.minutes(RENEW_MINUTES))
+            // A provider without a lease has nothing to renew and no
+            // continuous-run cap: only the idle pause below stops it.
+            let lease = client.has_lease();
+            if lease
+                && activity
+                    .last_renew
+                    .is_none_or(|at| at.elapsed() >= clock.minutes(RENEW_MINUTES))
             {
                 renew(svc, feature, &**client, row, cloud).await;
             }
@@ -690,7 +733,8 @@ async fn check(
                 return;
             }
             let idle = activity.last_busy.elapsed() >= clock.minutes(saved.idle_pause_minutes);
-            let capped = since(cloud.running_since.as_deref()) >= clock.minutes(RUN_CAP_MINUTES);
+            let capped =
+                lease && since(cloud.running_since.as_deref()) >= clock.minutes(RUN_CAP_MINUTES);
             if idle || capped {
                 spawn_pause(svc, client, &row.id, !idle);
             }
@@ -795,8 +839,8 @@ async fn reap_retired(
     feature: &RemoteFeature,
     clock: Clock,
     rows: &[ExposedMachine],
-    row_id: &str,
-    from: &str,
+    (row_id, from): (&str, &str),
+    saved: &config::ProviderConfig,
 ) -> Option<Vec<String>> {
     let key = match config::saved_key(svc, row_id).await {
         Ok(Some(key)) => key,
@@ -811,7 +855,7 @@ async fn reap_retired(
             return None;
         }
     };
-    let Ok(client) = config::client(key) else {
+    let Ok(client) = config::client(saved, key) else {
         return None;
     };
     let listed = reap(svc, feature, &*client, clock, rows).await;

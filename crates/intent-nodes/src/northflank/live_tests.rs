@@ -1,12 +1,14 @@
 //! Opt-in round trip against the real Northflank API. It starts a small
 //! service for a few minutes and does nothing unless both
-//! `NORTHFLANK_API_TOKEN` and `NORTHFLANK_PROJECT_ID` are set, so CI skips it.
+//! a token (`NORTHFLANK_API_TOKEN`, or a file holding it in
+//! `NORTHFLANK_API_TOKEN_FILE`) and `NORTHFLANK_PROJECT_ID` are set. No CI
+//! job sets them: it runs by hand only.
 //! It also runs a command over the command execution WebSocket, whose
 //! protocol is not in Northflank's REST reference, so a change there
 //! fails here first.
 //!
 //! ```sh
-//! NORTHFLANK_API_TOKEN=... NORTHFLANK_PROJECT_ID=... \
+//! NORTHFLANK_API_TOKEN_FILE=~/.northflank-token NORTHFLANK_PROJECT_ID=... \
 //!   [NORTHFLANK_LIVE_IMAGE=ghcr.io/intent-hq/intent-node:latest] \
 //!   [NORTHFLANK_LIVE_PLAN=nf-compute-200] \
 //!   cargo nextest run -p intent-nodes live_northflank --no-capture
@@ -21,6 +23,7 @@ use crate::cloud::{
 };
 
 const TOKEN_ENV: &str = "NORTHFLANK_API_TOKEN";
+const TOKEN_FILE_ENV: &str = "NORTHFLANK_API_TOKEN_FILE";
 const PROJECT_ENV: &str = "NORTHFLANK_PROJECT_ID";
 const IMAGE_ENV: &str = "NORTHFLANK_LIVE_IMAGE";
 const PLAN_ENV: &str = "NORTHFLANK_LIVE_PLAN";
@@ -33,10 +36,19 @@ fn shell(script: &str) -> ProcessSpec {
 
 #[tokio::test]
 async fn live_northflank_round_trip() {
-    let token = std::env::var(TOKEN_ENV).ok().filter(|v| !v.is_empty());
+    let token = std::env::var(TOKEN_ENV)
+        .ok()
+        .or_else(|| {
+            let path = std::env::var(TOKEN_FILE_ENV).ok()?;
+            std::fs::read_to_string(path).ok()
+        })
+        .map(|token| token.trim().to_owned())
+        .filter(|v| !v.is_empty());
     let project = std::env::var(PROJECT_ENV).ok().filter(|v| !v.is_empty());
     let (Some(token), Some(project)) = (token, project) else {
-        eprintln!("skipped: set {TOKEN_ENV} and {PROJECT_ENV} to run the live Northflank test");
+        eprintln!(
+            "skipped: set {TOKEN_ENV} (or {TOKEN_FILE_ENV}) and {PROJECT_ENV} to run the live Northflank test"
+        );
         return;
     };
     let image =

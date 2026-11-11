@@ -470,6 +470,7 @@ fn every_frame() -> Vec<LinkFrame> {
             forge_fetch: None,
             git_identity: None,
             new_machine: None,
+            resumed_from_disk: false,
             harness_version: None,
             labels: Box::default(),
         }),
@@ -915,6 +916,7 @@ fn launch_profile_env_never_debug_renders_its_values() {
         forge_fetch: None,
         git_identity: None,
         new_machine: None,
+        resumed_from_disk: false,
         harness_version: None,
         labels: Box::default(),
     };
@@ -948,6 +950,7 @@ fn launch_without_a_profile_omits_profile_env() {
         forge_fetch: None,
         git_identity: None,
         new_machine: None,
+        resumed_from_disk: false,
         harness_version: None,
         labels: Box::default(),
     };
@@ -1294,6 +1297,7 @@ fn a_launch_with_a_checkout_needs_protocol_10() {
             forge_fetch: None,
             git_identity: None,
             new_machine: None,
+            resumed_from_disk: false,
             harness_version: None,
             labels: Box::default(),
         })
@@ -1329,6 +1333,7 @@ fn a_launch_with_mcp_proxies_needs_protocol_11_and_carries_names_only() {
             forge_fetch: None,
             git_identity: None,
             new_machine: None,
+            resumed_from_disk: false,
             harness_version: None,
             labels: Box::default(),
         };
@@ -1385,6 +1390,7 @@ fn a_launch_carries_the_harness_version_on_any_protocol() {
         forge_fetch: None,
         git_identity: None,
         new_machine: None,
+        resumed_from_disk: false,
         harness_version,
         labels: Box::default(),
     };
@@ -1423,6 +1429,7 @@ fn a_launch_into_another_agents_checkout_needs_protocol_13() {
         forge_fetch: None,
         git_identity: None,
         new_machine: None,
+        resumed_from_disk: false,
         harness_version: None,
         labels: Box::default(),
         mcp_proxies: Vec::new(),
@@ -1789,6 +1796,7 @@ fn a_launchs_git_identity_is_optional_and_closed() {
         forge_fetch: None,
         git_identity: None,
         new_machine: None,
+        resumed_from_disk: false,
         harness_version: None,
         labels: Box::default(),
         mcp_proxies: Vec::new(),
@@ -1811,6 +1819,7 @@ fn a_launchs_git_identity_is_optional_and_closed() {
         LinkFrame::Launch(LaunchCommand {
             git_identity: None,
             new_machine: None,
+            resumed_from_disk: false,
             harness_version: None,
             labels: Box::default(),
             ..command.clone()
@@ -1861,6 +1870,7 @@ fn labelled_launch(labels: LaunchLabels) -> LaunchCommand {
         forge_fetch: None,
         git_identity: None,
         new_machine: None,
+        resumed_from_disk: false,
         harness_version: None,
         labels: Box::new(labels),
     }

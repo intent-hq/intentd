@@ -506,6 +506,12 @@ pub struct LaunchCommand {
     /// from before ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_machine: Option<Box<MachineName>>,
+    /// The machine was stopped and started again from its disk (a
+    /// Northflank resume or container restart) since this agent last ran
+    /// there: its first turn is told what was kept and lost. Needs no
+    /// protocol: a machine from before ignores it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resumed_from_disk: bool,
     /// The session's stamped harness version (`MAJOR.MINOR`): the machine
     /// builds the agent's `workspace_api` description for it. Absent (an
     /// older backend): the legacy description. Needs no protocol: a

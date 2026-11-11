@@ -1236,6 +1236,10 @@ impl RemoteLaunchPort for RemoteLaunch {
                 .as_deref()
                 .is_some_and(|last| last != record.node_id)
                 .then(|| Box::new(MachineName(status.node_name.clone())));
+            // A machine that keeps only its disk started again since this
+            // agent last ran there (a Northflank resume or restart).
+            let resumed_from_disk =
+                new_machine.is_none() && feature.cloud.take_disk_resumed(agent_id.as_str());
             // A sub-agent reaches GitHub through this backend (nodeProtocol
             // 17); the connector drops it on an older link.
             let forge_fetch = if is_sub_agent || checkout_of.is_some() {
@@ -1268,6 +1272,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                     forge_fetch,
                     git_identity,
                     new_machine,
+                    resumed_from_disk,
                     // Every launch, relaunches included: the machine builds
                     // the agent's `workspace_api` description for the version
                     // the local path would serve this stamp.

@@ -25,6 +25,7 @@ use tokio::net::TcpListener;
 use super::*;
 
 mod entries;
+mod northflank;
 mod sub_agents;
 mod teardown;
 
