@@ -15153,7 +15153,10 @@ mod workspace_apply_proposal_tests {
         /// What `remote_machines_capability` answers.
         remote_machines: Mutex<bool>,
         /// The caller's `nodeId` and resolved `placement` on `agent_get`.
-        caller_location: Mutex<(Option<String>, Option<intent_core::placement::AgentPlacement>)>,
+        caller_location: Mutex<(
+            Option<String>,
+            Option<intent_core::placement::AgentPlacement>,
+        )>,
         /// `repositoryPath` served on `get_workspace` (proposeSibling tests).
         repository_path: Mutex<Option<String>>,
     }
@@ -15522,10 +15525,7 @@ mod workspace_apply_proposal_tests {
     /// The proposal `proposeSibling` emits for a caller at `location`
     /// (`nodeId`, resolved `placement`) on a backend whose
     /// `remoteMachines` capability is `remote`.
-    async fn proposal_from(
-        remote: bool,
-        location: (Option<&str>, Option<Value>),
-    ) -> Value {
+    async fn proposal_from(remote: bool, location: (Option<&str>, Option<Value>)) -> Value {
         let repo = git_repo();
         let api = Arc::new(FakeApi::default());
         *api.repository_path.lock().unwrap() = Some(repo.path().to_string_lossy().into_owned());
