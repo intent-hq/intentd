@@ -15159,6 +15159,8 @@ mod workspace_apply_proposal_tests {
         )>,
         /// `repositoryPath` served on `get_workspace` (proposeSibling tests).
         repository_path: Mutex<Option<String>>,
+        /// When set, `agent_get` fails.
+        agent_get_fails: Mutex<bool>,
     }
 
     fn workspace(id: &str, title: &str) -> Workspace {
@@ -15299,7 +15301,11 @@ mod workspace_apply_proposal_tests {
             let pending = self.pending.lock().unwrap().clone();
             let resolutions = self.resolutions.lock().unwrap().clone();
             let (node_id, placement) = self.caller_location.lock().unwrap().clone();
+            let fails = *self.agent_get_fails.lock().unwrap();
             Box::pin(async move {
+                if fails {
+                    return Err(Error::Internal("agent store unavailable".to_string()));
+                }
                 assert_eq!(agent_id.as_str(), CALLER, "lookup is scoped to the caller");
                 assert_eq!(
                     workspace_id.as_ref().map(WorkspaceId::as_str),
@@ -15526,8 +15532,15 @@ mod workspace_apply_proposal_tests {
     /// (`nodeId`, resolved `placement`) on a backend whose
     /// `remoteMachines` capability is `remote`.
     async fn proposal_from(remote: bool, location: (Option<&str>, Option<Value>)) -> Value {
+        proposal_from_api(Arc::new(FakeApi::default()), remote, location).await
+    }
+
+    async fn proposal_from_api(
+        api: Arc<FakeApi>,
+        remote: bool,
+        location: (Option<&str>, Option<Value>),
+    ) -> Value {
         let repo = git_repo();
-        let api = Arc::new(FakeApi::default());
         *api.repository_path.lock().unwrap() = Some(repo.path().to_string_lossy().into_owned());
         *api.remote_machines.lock().unwrap() = remote;
         *api.caller_location.lock().unwrap() =
@@ -15586,6 +15599,56 @@ mod workspace_apply_proposal_tests {
     }
 
     #[tokio::test]
+    async fn propose_sibling_stamps_an_e2b_proposer_without_an_entry_as_bare_e2b() {
+        let proposal = proposal_from(
+            true,
+            (
+                Some("sandbox-node-1"),
+                Some(json!({ "target": "e2b", "checkout": "isolated" })),
+            ),
+        )
+        .await;
+        assert_eq!(proposal["placement"], json!({ "target": "e2b" }));
+    }
+
+    #[tokio::test]
+    async fn propose_sibling_stamps_an_e2b_proposer_still_waiting_for_its_sandbox() {
+        let proposal = proposal_from(
+            true,
+            (
+                Some(""),
+                Some(json!({ "target": "e2b", "checkout": "isolated", "cloudMachineId": "team-e2b" })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            proposal["placement"],
+            json!({ "target": "e2b", "cloudMachineId": "team-e2b" })
+        );
+    }
+
+    #[tokio::test]
+    async fn propose_sibling_does_not_stamp_a_remote_proposer_not_yet_on_a_machine() {
+        let proposal = proposal_from(
+            true,
+            (
+                Some(""),
+                Some(json!({ "target": "remote", "checkout": "isolated" })),
+            ),
+        )
+        .await;
+        assert!(proposal.get("placement").is_none(), "{proposal}");
+    }
+
+    #[tokio::test]
+    async fn propose_sibling_does_not_stamp_when_the_proposer_cannot_be_read() {
+        let api = Arc::new(FakeApi::default());
+        *api.agent_get_fails.lock().unwrap() = true;
+        let proposal = proposal_from_api(api, true, (None, None)).await;
+        assert!(proposal.get("placement").is_none(), "{proposal}");
+    }
+
+    #[tokio::test]
     async fn propose_sibling_does_not_stamp_without_remote_initial_agent() {
         let proposal = proposal_from(false, (Some("node-studio"), None)).await;
         assert!(proposal.get("placement").is_none(), "{proposal}");
@@ -15624,14 +15687,45 @@ mod workspace_apply_proposal_tests {
         let api = api_with_pending(&stamped_proposal(
             json!({ "target": "remote", "nodeId": "node-gone" }),
         ));
-        *api.create_error.lock().unwrap() = Some(Error::remote_machine(
+        let requested = placement(json!({ "target": "remote", "nodeId": "node-gone" }));
+        *api.create_error.lock().unwrap() = Some(Error::PlacementUnavailable(Box::new(
+            intent_core::placement::PlacementUnavailable {
+                requested,
+                reason: intent_core::placement::PlacementUnavailableReason::MachineUnreachable,
+                availability: intent_core::placement::PlatformAvailability {
+                    available_platforms: vec![],
+                    supported_platforms: vec![],
+                    available_os: vec![],
+                    observed_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+                machine: Some(intent_core::placement::MachineRef {
+                    node_id: "node-gone".to_string(),
+                    name: "Studio".to_string(),
+                }),
+                capacity: None,
+                machines: vec![],
+                hint: None,
+            },
+        )));
+        let resp = call(&server(api.clone()), APPLY).await;
+        assert_error_contains(&resp, "placement-unavailable (machine-unreachable):");
+        assert_error_contains(&resp, "Studio is unreachable");
+        assert!(api.resolve_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_reports_a_removed_e2b_entry_with_its_reason() {
+        let api = api_with_pending(&stamped_proposal(
+            json!({ "target": "e2b", "cloudMachineId": "team-e2b" }),
+        ));
+        *api.create_error.lock().unwrap() = Some(intent_core::machines::cloud_machine_unavailable(
+            "not-configured",
             false,
-            "The machine node-gone is offline",
-            json!({ "code": "machine-unreachable", "nodeId": "node-gone" }),
+            None,
+            "E2B is not set up.",
         ));
         let resp = call(&server(api.clone()), APPLY).await;
-        assert_error_contains(&resp, "machine-unreachable");
-        assert_error_contains(&resp, "The machine node-gone is offline");
+        assert_error_contains(&resp, "cloud-machine-unavailable (not-configured):");
         assert!(api.resolve_calls.lock().unwrap().is_empty());
     }
 
@@ -15652,9 +15746,8 @@ mod workspace_apply_proposal_tests {
             }),
         ));
         let resp = call(&server(api.clone()), APPLY).await;
-        assert_error_contains(&resp, "launch-failed");
-        assert_error_contains(&resp, "ws-new");
-        assert_error_contains(&resp, "remote-launch-failed");
+        assert_error_contains(&resp, "launch-failed (remote-launch-failed):");
+        assert_error_contains(&resp, "[Follow up](intent://local/workspace/ws-new)");
         let resolves = api.resolve_calls.lock().unwrap();
         assert_eq!(resolves.len(), 1);
         assert_eq!(resolves[0].3, "applied");

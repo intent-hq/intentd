@@ -455,6 +455,7 @@ async fn apply_create_failure(
     ws: &WorkspaceId,
     caller: &AgentId,
     proposal_id: &str,
+    title: &str,
     error: Error,
 ) -> String {
     let data = structured_error_data(&error);
@@ -473,16 +474,15 @@ async fn apply_create_failure(
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty());
     let (Some(workspace_id), "launch-failed") = (workspace_id, code.as_str()) else {
-        return format!("{code}: {message}");
+        return match data.get("reason").and_then(Value::as_str) {
+            Some(reason) => format!("{code} ({reason}): {message}"),
+            None => format!("{code}: {message}"),
+        };
     };
     let cause_code = data
         .pointer("/cause/code")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let cause_message = data
-        .pointer("/cause/message")
-        .and_then(Value::as_str)
-        .unwrap_or("");
     let resolved = api
         .agent_resolve_proposal(
             ws.clone(),
@@ -499,10 +499,11 @@ async fn apply_create_failure(
         Ok(_) => "the proposal is marked applied".to_string(),
         Err(e) => format!("the proposal could not be marked applied: {e}"),
     };
+    let (_, markdown_link) = super::workspace_links(workspace_id, title);
     format!(
-        "launch-failed: {message} Workspace {workspace_id} (intent://local/workspace/{workspace_id}) \
-         was created and {resolution}, but its first agent failed to start \
-         ({cause_code}: {cause_message}). Do not apply this proposal again; tell the user."
+        "launch-failed ({cause_code}): {message} Workspace {workspace_id} was created and \
+         {resolution}, but its first agent did not start. Do not apply this proposal again; \
+         tell the user and link the workspace as {markdown_link}."
     )
 }
 
@@ -784,10 +785,11 @@ async fn apply_proposal(
         agent_id: caller.clone(),
         source_workspace_id: ws.clone(),
     });
+    let title = input.title.clone().unwrap_or_default();
     let created = match api.create_workspace(input, Some(idempotency_key)).await {
         Ok(created) => created,
         Err(error) => {
-            return Err(apply_create_failure(api, ws, &caller, &proposal_id, error).await);
+            return Err(apply_create_failure(api, ws, &caller, &proposal_id, &title, error).await);
         }
     };
 
