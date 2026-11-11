@@ -406,6 +406,18 @@ mod tests {
                 if specialist.is_some() {
                     assert!(has("specialist-prompt") && has("role-reminder"), "{label}");
                 }
+                let hint = |id: &str| {
+                    b.sections
+                        .iter()
+                        .find(|s| s.id == id)
+                        .and_then(|s| s.control_hint.as_ref())
+                        .map(|h| h.text.clone())
+                };
+                assert_eq!(hint("specialist-prompt"), None, "{label}");
+                assert_eq!(hint("role-reminder"), None, "{label}");
+                if let Some(text) = hint("repo-rules") {
+                    assert!(text.starts_with("Includes "), "{label}: {text}");
+                }
                 if placement.is_some_and(|help| tool.contains(help)) {
                     assert!(has("remote-machines"), "{label}");
                 }

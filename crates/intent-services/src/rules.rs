@@ -415,7 +415,10 @@ impl SpecializationSource {
                 LayerTag::user("agent-rules-override", "Agent instructions override")
             }
             Self::WorkspaceFile => LayerTag::user("agent-rules-file", "Agent instructions file")
-                .hint(ControlHintKind::EditRepoRules, "Edit .intent/agent-rules"),
+                .hint(
+                    ControlHintKind::EditRepoRules,
+                    "Includes .intent/agent-rules",
+                ),
             Self::Bundled => LayerTag::intent("doctrine", "Intent instructions"),
         }
     }
@@ -822,8 +825,10 @@ async fn assemble_system_prompt_layers(
                     if !instructions.trim().is_empty() {
                         let source = format!("{}/.intent/config.json", repo_path.display());
                         parts.push((
-                            LayerTag::user("repo-config", "Repo config instructions")
-                                .hint(ControlHintKind::EditRepoRules, "Edit .intent/config.json"),
+                            LayerTag::user("repo-config", "Repo config instructions").hint(
+                                ControlHintKind::EditRepoRules,
+                                "Includes .intent/config.json",
+                            ),
                             harness.user_rules_wrapper(&instructions, &source),
                         ));
                     }
@@ -894,8 +899,7 @@ async fn assemble_system_prompt_layers(
         .filter(|s| !s.is_empty())
     {
         parts.push((
-            LayerTag::user("specialist-prompt", "Specialist prompt")
-                .hint(ControlHintKind::ChangeSpecialist, "Change the specialist"),
+            LayerTag::user("specialist-prompt", "Specialist prompt"),
             harness.specialist_role_section(bp),
         ));
     }
@@ -927,8 +931,7 @@ async fn assemble_system_prompt_layers(
             .map(str::trim)
             .filter(|s| !s.is_empty());
         parts.push((
-            LayerTag::intent("role-reminder", "Role reminder")
-                .hint(ControlHintKind::ChangeSpecialist, "Change the specialist"),
+            LayerTag::intent("role-reminder", "Role reminder"),
             harness.role_reminder_footer(name, reminder),
         ));
     }
@@ -1011,7 +1014,7 @@ pub(crate) fn native_repo_rule_sections(
             let tag = LayerTag::user("repo-rules", &format!("Repo rules: {}", loading.describe()))
                 .hint(
                     ControlHintKind::EditRepoRules,
-                    format!("Edit {}", sources.join(", ")),
+                    format!("Includes {}", sources.join(", ")),
                 );
             crate::prompt_sections::provider_section(&tag, chars)
         })
@@ -1026,7 +1029,7 @@ fn repo_rules_tag(source: &str, workspace_path: &Path) -> LayerTag {
         .filter(|rel| !rel.as_os_str().is_empty())
         .or_else(|| path.file_name().map(Path::new))
         .map_or_else(|| source.to_string(), |p| p.to_string_lossy().into_owned());
-    let text = format!("Edit {shown}");
+    let text = format!("Includes {shown}");
     LayerTag::user("repo-rules", "Repo rules").hint(ControlHintKind::EditRepoRules, text)
 }
 
@@ -2335,7 +2338,7 @@ This is a test skill.
                     "Repo rules: loaded natively by Claude Code",
                     SectionLocation::Provider,
                     utf16_len(CLAUDE),
-                    Some("Edit CLAUDE.md"),
+                    Some("Includes CLAUDE.md"),
                 )]
             );
             assert!(!a.sections.iter().any(|s| s.id == "repo-rules"));
