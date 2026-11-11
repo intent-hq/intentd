@@ -5741,6 +5741,96 @@ impl AgentManager {
         Some(crate::harness::latest().first_turn_prepend_block(prompt))
     }
 
+    /// The one-time handoff for an agent created by `agent.importSession`
+    /// (`metadata.importedSession.handoffPending`): a `<system>` block that
+    /// tells the agent its session was moved into Intent (provider CLI,
+    /// source folder → checkout, workspace, Intent instructions win, `ws.*`
+    /// tools, uncommitted changes not copied) and, for a provider that
+    /// delivers the system prompt on the first turn (`FirstTurnPrepend`),
+    /// carries the assembled system prompt too: a resumed session never
+    /// opened with it. It replaces `prepend` (the ordinary first-turn block,
+    /// built from the same persisted prompt) so the turn gets one block.
+    ///
+    /// The flag is cleared once the block is built, as
+    /// [`Self::build_first_turn_prepend`] consumes its own; a failed session
+    /// read keeps it armed for the next turn.
+    async fn apply_import_handoff(
+        &self,
+        agent_id: &AgentId,
+        prepend: Option<String>,
+    ) -> Option<String> {
+        let session = match self
+            .services
+            .store
+            .get_agent_session_without_messages(agent_id)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "import handoff: session lookup failed");
+                return prepend;
+            }
+        };
+        let imported = session
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("importedSession"))
+            .filter(|i| i.get("handoffPending").and_then(Value::as_bool) == Some(true))?
+            .clone();
+        let workspace = self
+            .services
+            .store
+            .get_workspace(&session.workspace_id)
+            .await
+            .ok();
+        let checkout = workspace
+            .as_ref()
+            .and_then(crate::git_ops::worktree_path)
+            .map(|p| p.display().to_string());
+        let provider_id = imported
+            .get("provider")
+            .and_then(Value::as_str)
+            .or(session.provider.as_deref())
+            .unwrap_or_default()
+            .to_owned();
+        let provider =
+            intent_providers::provider_config(intent_providers::base_provider_id(&provider_id));
+        let note = crate::session_import::import_handoff_note(
+            provider.display_name,
+            imported.get("sourceCwd").and_then(Value::as_str),
+            checkout.as_deref(),
+            workspace.as_ref().map(|w| w.title.as_str()),
+        );
+        let system_prompt = session
+            .system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .filter(|_| {
+                prepend.is_some()
+                    || provider.injection_mechanism == InjectionMechanism::FirstTurnPrepend
+            });
+        let body = match system_prompt {
+            Some(prompt) => format!("{prompt}\n\n{note}"),
+            None => note,
+        };
+        if let Err(e) = self
+            .services
+            .store
+            .set_agent_session_metadata_key_json(
+                &session.workspace_id,
+                agent_id,
+                "importedSession.handoffPending",
+                "false",
+                &session.updated_at,
+            )
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "import handoff: could not clear the pending flag");
+        }
+        Some(crate::harness::latest().first_turn_prepend_block(&body))
+    }
+
     /// The workspace setup-stage notice for a turn starting now (§6.5),
     /// prompt-only: while the setup script is `pending` / `running` every
     /// turn carries the in-progress notice (the worktree is provisional until
@@ -6085,6 +6175,12 @@ impl AgentManager {
         // `session/new` (brand-new or recreate, never `session/load` resume)
         // and consumed here so it fires exactly once per fresh session.
         let prepend = self.build_first_turn_prepend(agent_id).await;
+        // An imported session's first turn: one block with the import note
+        // (and the system prompt the resumed session never received).
+        let prepend = match self.apply_import_handoff(agent_id, prepend.clone()).await {
+            Some(handoff) => Some(handoff),
+            None => prepend,
+        };
         let prompt_text =
             crate::harness::latest().compose_turn_prompt(&crate::harness::TurnEnvelopeParams {
                 first_turn_prepend: prepend.as_deref(),

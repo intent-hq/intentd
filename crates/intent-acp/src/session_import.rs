@@ -38,11 +38,14 @@ impl ImportCapabilities {
         }
     }
 
-    /// Whether sessions can be listed and then brought into Intent: listed,
-    /// and either loaded or forked.
+    /// Whether sessions can be listed and then brought into Intent: listed
+    /// and loaded. Fork is optional: it keeps the original session, but only
+    /// a `session/load` replays the history Intent stores, and a forked id
+    /// an adapter cannot load would be replaced by a fresh session on the
+    /// agent's first turn, losing the imported context.
     #[must_use]
     pub fn importable(self) -> bool {
-        self.list && (self.load || self.fork)
+        self.list && self.load
     }
 }
 
@@ -134,8 +137,13 @@ mod tests {
     }
 
     #[test]
-    fn list_without_load_or_fork_is_not_importable() {
+    fn list_without_load_is_not_importable() {
         let raw = json!({ "agentCapabilities": { "sessionCapabilities": { "list": {} } } });
+        assert!(!ImportCapabilities::from_initialize(&raw).importable());
+        // Fork alone cannot replay the history or be resumed.
+        let raw = json!({ "agentCapabilities": {
+            "sessionCapabilities": { "list": {}, "fork": {} }
+        }});
         assert!(!ImportCapabilities::from_initialize(&raw).importable());
         let raw = json!({ "agentCapabilities": { "loadSession": true } });
         assert!(!ImportCapabilities::from_initialize(&raw).importable());

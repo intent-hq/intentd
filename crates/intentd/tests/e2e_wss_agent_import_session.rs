@@ -155,7 +155,13 @@ fn at(seconds: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
 }
 
-fn spawn_serve(data_dir: &Path, home: &Path, script: &str, session_log: &Path) -> Daemon {
+fn spawn_serve(
+    data_dir: &Path,
+    home: &Path,
+    script: &str,
+    session_log: &Path,
+    rpc_log: &Path,
+) -> Daemon {
     common::enable_ws_api(data_dir);
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir workspaces dir");
@@ -173,6 +179,7 @@ fn spawn_serve(data_dir: &Path, home: &Path, script: &str, session_log: &Path) -
         .env("MOCK_AGENT_BEHAVIOR", behavior.to_string())
         .env("MOCK_AGENT_SESSION_STORE", "claude")
         .env("MOCK_AGENT_SESSION_LOG", session_log)
+        .env("MOCK_AGENT_RPC_LOG", rpc_log)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     common::hermetic_fixture_identity(&mut command, data_dir);
@@ -252,6 +259,7 @@ async fn lists_and_imports_a_claude_session_over_real_wss() {
     let worktree = data_dir.join("worktree");
     std::fs::create_dir_all(&worktree).expect("mkdir worktree");
     let session_log = data_dir.join("sessions.log");
+    let rpc_log = data_dir.join("rpc.log");
 
     let fixture = std::fs::read(format!(
         "{}/tests/fixtures/session-import/claude-session.jsonl",
@@ -274,7 +282,7 @@ async fn lists_and_imports_a_claude_session_over_real_wss() {
     );
 
     let workspace_id = seed_workspace(&data_dir, &worktree).await;
-    let _daemon = spawn_serve(&data_dir, &home, &script, &session_log);
+    let _daemon = spawn_serve(&data_dir, &home, &script, &session_log, &rpc_log);
     let status = common::await_wss_status_logged(
         &data_dir.join("intentd.sock"),
         &data_dir.join("daemon.log"),
@@ -287,6 +295,10 @@ async fn lists_and_imports_a_claude_session_over_real_wss() {
         .expect("fingerprint");
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
     let mut ws = common::wss_connect_with_retry(port, client_config(fingerprint), &url).await;
+
+    // Support detection: `sessionImport: 1` on system.capabilities.
+    let caps = rpc_envelope(&mut ws, 0, "system.capabilities", json!({})).await;
+    assert_eq!(caps["result"]["sessionImport"], 1, "{caps}");
 
     // List: merged across the adapter's pages, newest first, exact shape.
     let listed = rpc_envelope(
@@ -472,6 +484,103 @@ async fn lists_and_imports_a_claude_session_over_real_wss() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "turn never resumed the imported session: {loads:?}"
+        );
+        // timing-guard: polls a file the mock child appends to; no event marks it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The first prompt after the import carries one hidden <system> block
+    // with the system prompt (the mock is a FirstTurnPrepend provider whose
+    // resumed session never got it) and the import note; the next does not.
+    let first = wait_for_prompts(&rpc_log, 1).await;
+    assert!(first[0].starts_with("<system>"), "{}", first[0]);
+    assert_eq!(first[0].matches("<system>").count(), 1, "{}", first[0]);
+    assert!(
+        first[0].contains("has been imported into Intent"),
+        "{}",
+        first[0]
+    );
+    assert!(
+        first[0].contains(&format!("under {SOURCE_CWD} now live under {worktree_str}")),
+        "{}",
+        first[0]
+    );
+    assert!(first[0].contains("Session Import E2E"), "{}", first[0]);
+    let system_prompt = rpc_envelope(
+        &mut ws,
+        9,
+        "agent.getSession",
+        json!({ "agentId": agent_id, "workspaceId": workspace_id }),
+    )
+    .await;
+    let system_prompt = system_prompt["result"]["systemPrompt"]
+        .as_str()
+        .or_else(|| system_prompt["result"]["session"]["systemPrompt"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !system_prompt.is_empty(),
+        "the turn persisted a system prompt"
+    );
+    assert!(
+        first[0].contains(system_prompt.trim()),
+        "first prompt carries the system prompt"
+    );
+    let sent = rpc_envelope(
+        &mut ws,
+        10,
+        "agent.sendMessage",
+        json!({ "workspaceId": workspace_id, "agentId": agent_id, "content": "and again" }),
+    )
+    .await;
+    assert_eq!(sent["result"]["success"], true, "send: {sent}");
+    let prompts = wait_for_prompts(&rpc_log, 2).await;
+    assert!(!prompts[1].contains("<system>"), "{}", prompts[1]);
+    assert!(
+        !prompts[1].contains("imported into Intent"),
+        "{}",
+        prompts[1]
+    );
+
+    // The user-visible rows never show the hidden block.
+    let convo = rpc_envelope(
+        &mut ws,
+        11,
+        "agent.getConversation",
+        json!({ "agentId": agent_id, "workspaceId": workspace_id }),
+    )
+    .await;
+    let rendered = convo["result"]["messages"].to_string();
+    assert!(!rendered.contains("<system>"), "{convo}");
+    assert!(rendered.contains("\"continue\""), "{convo}");
+}
+
+/// The text of every `session/prompt` the mock received, in order, once at
+/// least `count` arrived.
+async fn wait_for_prompts(rpc_log: &Path, count: usize) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(60));
+    loop {
+        let prompts: Vec<String> = std::fs::read_to_string(rpc_log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|e| e["method"] == "session/prompt")
+            .map(|e| {
+                e["params"]["prompt"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
+        if prompts.len() >= count {
+            return prompts;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected {count} prompts, got {prompts:?}"
         );
         // timing-guard: polls a file the mock child appends to; no event marks it.
         tokio::time::sleep(Duration::from_millis(100)).await;

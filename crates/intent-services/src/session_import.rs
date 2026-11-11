@@ -5,7 +5,8 @@
 //! process ([`crate::agent_manager::scratch_adapter`]), never to an agent:
 //!
 //! - a provider is importable when its `initialize` advertises
-//!   `sessionCapabilities.list` and `loadSession` or `sessionCapabilities.fork`;
+//!   `sessionCapabilities.list` and `loadSession` (`sessionCapabilities.fork`
+//!   is optional);
 //! - the list is `session/list` on every importable, enabled provider in
 //!   parallel (each bounded by a timeout), merged newest first;
 //! - the import brings the session into the workspace's checkout, then loads
@@ -495,6 +496,10 @@ impl Services {
                         "sourceSessionId": session_id,
                         "sessionId": imported.session_id,
                         "forked": imported.forked,
+                        "sourceCwd": imported.source_cwd,
+                        // The first turn tells the agent it was moved into
+                        // Intent (`AgentManager::apply_import_handoff`).
+                        "handoffPending": true,
                     }})),
                     ..AgentCreateExtra::default()
                 },
@@ -554,23 +559,29 @@ impl Services {
         worktree: &Path,
     ) -> Result<Imported> {
         let caps = adapter.capabilities;
-        if !caps.load && !caps.fork {
+        // Only a loadable session can be replayed into the chat and resumed
+        // by the agent's first turn (`session/load` of the stored id).
+        if !caps.load {
             return Err(Error::InvalidParams(format!(
-                "provider: \"{provider}\" cannot load or fork its sessions"
+                "provider: \"{provider}\" cannot load its sessions"
             )));
         }
-        let title = find_title(adapter, source_id).await;
+        let (title, listed_cwd) = find_listed(adapter, source_id).await;
+        let mut source_cwd = listed_cwd;
         let timeout = provider_timeout().max(Duration::from_secs(60));
         let mut relocated: Option<PathBuf> = None;
         let (session_id, forked) = match store_layout(provider) {
-            Some(StoreLayout::Claude) if caps.load => {
+            Some(StoreLayout::Claude) => {
                 if !safe_session_id(source_id) {
                     return Err(Error::NotFound(format!("session {source_id}")));
                 }
                 let projects = claude_config_dir(adapter.overlay.as_deref()).join("projects");
                 let source = find_claude_session(&projects, source_id)
                     .ok_or_else(|| Error::NotFound(format!("session {source_id}")))?;
-                let source_cwd = claude_session_cwd(&source).unwrap_or_default();
+                let first_cwd = claude_session_cwd(&source).unwrap_or_default();
+                if !first_cwd.is_empty() {
+                    source_cwd = Some(first_cwd.clone());
+                }
                 let new_id = Uuid::new_v4().to_string();
                 let target_cwd = worktree.to_string_lossy().into_owned();
                 let target = projects
@@ -578,7 +589,7 @@ impl Services {
                     .join(format!("{new_id}.jsonl"));
                 let (src, dst, id) = (source.clone(), target.clone(), new_id.clone());
                 tokio::task::spawn_blocking(move || {
-                    fork_claude_transcript(&src, &dst, &id, &source_cwd, &target_cwd)
+                    fork_claude_transcript(&src, &dst, &id, &first_cwd, &target_cwd)
                 })
                 .await
                 .map_err(|e| Error::Internal(format!("session copy task failed: {e}")))?
@@ -599,16 +610,6 @@ impl Services {
             }
             _ => (source_id.to_owned(), false),
         };
-        if !caps.load {
-            // Forked with no way to replay it: resume works, history stays empty.
-            return Ok(Imported {
-                session_id,
-                forked,
-                title,
-                messages: Vec::new(),
-                fingerprint: adapter.fingerprint.clone(),
-            });
-        }
         drain_now(&mut adapter.notifications);
         let loaded = intent_acp::session::load_session(
             adapter.connection(),
@@ -631,6 +632,7 @@ impl Services {
             .collect();
         Ok(Imported {
             session_id,
+            source_cwd,
             forked,
             title,
             messages,
@@ -639,9 +641,43 @@ impl Services {
     }
 }
 
+/// The import note an imported agent's first turn carries
+/// (`AgentManager::apply_import_handoff`).
+pub(crate) fn import_handoff_note(
+    provider: &str,
+    source_cwd: Option<&str>,
+    checkout: Option<&str>,
+    workspace_title: Option<&str>,
+) -> String {
+    let mut lines = vec![format!(
+        "This conversation was started in the {provider} CLI and has been imported into Intent. \
+         You are now an agent in an Intent workspace{}.",
+        workspace_title
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| format!(" (\"{t}\")"))
+            .unwrap_or_default()
+    )];
+    match (source_cwd.filter(|c| !c.is_empty()), checkout) {
+        (Some(from), Some(to)) if from != to => lines.push(format!(
+            "Paths in the earlier conversation under {from} now live under {to}; work in {to}."
+        )),
+        (_, Some(to)) => lines.push(format!("Work in {to}.")),
+        _ => {}
+    }
+    lines.push(
+        "Follow Intent's instructions where they conflict with earlier ones. Use the ws.* tools \
+         for notes, tasks, other agents and pull requests. Tools named earlier in the \
+         conversation may not exist here. Uncommitted changes from the original folder were \
+         not copied."
+            .to_owned(),
+    );
+    lines.join("\n")
+}
+
 /// What the adapter step produced for the agent.
 struct Imported {
     session_id: String,
+    source_cwd: Option<String>,
     forked: bool,
     title: Option<String>,
     messages: Vec<(String, Value)>,
@@ -728,34 +764,48 @@ async fn list_one_provider(
     listing
 }
 
-/// The listed title of `session_id`, best effort (a few pages at most).
-async fn find_title(adapter: &ScratchAdapter, session_id: &str) -> Option<String> {
+/// The listed title and folder of `session_id`, best effort (a few pages
+/// at most).
+async fn find_listed(
+    adapter: &ScratchAdapter,
+    session_id: &str,
+) -> (Option<String>, Option<String>) {
     if !adapter.capabilities.list {
-        return None;
+        return (None, None);
     }
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_PAGES_PER_PROVIDER {
-        let page = intent_acp::session_import::list_sessions(
+        let Ok(page) = intent_acp::session_import::list_sessions(
             adapter.connection(),
             cursor.as_deref(),
             provider_timeout(),
         )
         .await
-        .ok()?;
+        else {
+            break;
+        };
         if let Some(found) = page
             .sessions
             .iter()
             .find(|s| s["sessionId"].as_str() == Some(session_id))
         {
-            return found["title"]
+            let title = found["title"]
                 .as_str()
                 .map(str::trim)
                 .filter(|t| !t.is_empty())
                 .map(str::to_owned);
+            let cwd = found["cwd"]
+                .as_str()
+                .filter(|c| !c.is_empty())
+                .map(str::to_owned);
+            return (title, cwd);
         }
-        cursor = Some(page.next_cursor?);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
     }
-    None
+    (None, None)
 }
 
 fn drain_now(rx: &mut mpsc::UnboundedReceiver<IncomingNotification>) {

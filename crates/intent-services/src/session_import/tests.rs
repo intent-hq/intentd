@@ -164,3 +164,21 @@ fn replay_becomes_user_and_assistant_messages() {
     assert_eq!(messages[1].blocks[3]["tool_use_id"], "t1");
     assert_eq!(messages[2].role, "user");
 }
+
+#[test]
+fn handoff_note_maps_the_folder_and_names_the_workspace() {
+    let note = import_handoff_note(
+        "Anthropic Claude Code",
+        Some("/src/app"),
+        Some("/wt"),
+        Some("Demo"),
+    );
+    assert!(note.contains("started in the Anthropic Claude Code CLI"));
+    assert!(note.contains("(\"Demo\")"));
+    assert!(note.contains("under /src/app now live under /wt"));
+    assert!(note.contains("ws.* tools"));
+    assert!(note.contains("Uncommitted changes"));
+    let same = import_handoff_note("Codex", Some("/wt"), Some("/wt"), None);
+    assert!(same.contains("Work in /wt."));
+    assert!(!same.contains("now live under"));
+}
