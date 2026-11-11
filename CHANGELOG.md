@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.187] - 2026-11-11
+
+### 🚀 Features
+
+- Northflank cloud machines with disk-only resume ([#3283](https://github.com/intent-hq/intentd/pull/3283))
+
+### 🐛 Bug Fixes
+
+- *(quota)* Machine sign-in remote launches ignore this backend's quota mark ([#3285](https://github.com/intent-hq/intentd/pull/3285))
+
+### 📚 Documentation
+
+- Say a marked Default is always sent to remote machines ([#3282](https://github.com/intent-hq/intentd/pull/3282))
+
+
 ## [0.11.186] - 2026-11-11
 
 ### 📚 Documentation
