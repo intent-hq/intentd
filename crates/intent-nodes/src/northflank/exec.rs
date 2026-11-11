@@ -146,6 +146,8 @@ impl NorthflankClient {
                     "the Northflank command stream did not open in time",
                 )
             })??;
+        // Only the root setup step names root; an agent run as root would
+        // need IS_SANDBOX for Claude Code's bypass-permissions mode.
         let user = spec.user.as_deref().unwrap_or(RUN_AS);
         let context = json!({ "command": argv(spec), "shell": "none", "user": user });
         let init = json!({

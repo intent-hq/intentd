@@ -246,7 +246,7 @@ describe('container image', () => {
     assert.throws(() => dockerfile({ version: '0.1.0', sha256: 'abc' }), /SHA-256/);
   });
   it('smoke-checks the version, gh and an idle default command', () => {
-    const outputs = { version: 'intentd 0.11.139\n', idle: '', gh: `gh version ${GH.version} (2026-10-26)\n` };
+    const outputs = { version: 'intentd 0.11.139\n', idle: '', gh: `gh version ${GH.version} (2026-10-26)\n`, user: 'user\n/home/user\n' };
     assert.deepEqual(verifyImageSmoke('0.11.139', outputs), []);
     const problems = verifyImageSmoke('0.11.139', { ...outputs, version: 'intentd 0.11.138\n', idle: '7\n', gh: 'gh version 2.23.0\n' });
     assert.equal(problems.length, 3);
@@ -254,13 +254,14 @@ describe('container image', () => {
     assert.match(problems.join('\n'), /running/);
     assert.match(problems.join('\n'), /2\.23\.0/);
   });
-  it('smoke-checks that the container runs as user, when the image smoke asks', () => {
+  it('smoke-checks that the container runs as user', () => {
     const outputs = { version: 'intentd 0.11.139\n', idle: '', gh: `gh version ${GH.version} (2026-10-26)\n` };
     assert.equal(smokeChecks().user, 'id -un; echo "$HOME"');
     assert.deepEqual(verifyImageSmoke('0.11.139', { ...outputs, user: 'user\n/home/user\n' }), []);
     const problems = verifyImageSmoke('0.11.139', { ...outputs, user: 'root\n/root\n' });
     assert.equal(problems.length, 1);
     assert.match(problems[0], /root/);
+    assert.match(verifyImageSmoke('0.11.139', outputs).join('\n'), /runs as/, 'the image smoke must collect the user');
   });
 });
 

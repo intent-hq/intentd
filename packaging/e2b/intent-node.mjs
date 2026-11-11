@@ -241,7 +241,7 @@ export function smokeChecks() {
 // allocation; 85% still tells the sizes apart.
 export function verifySmoke(version, sizeId, outputs) {
   const size = parseSize(sizeId);
-  const problems = verifyImageSmoke(version, outputs);
+  const problems = commonSmoke(version, outputs);
   const cpus = Number(outputs.cpus.trim());
   if (cpus !== size.cpuCount) problems.push(`the sandbox has ${cpus} vCPU, expected ${size.cpuCount}`);
   const memMiB = Math.round(Number(outputs.memKb.trim()) / 1024);
@@ -250,14 +250,22 @@ export function verifySmoke(version, sizeId, outputs) {
 }
 
 // The size-independent checks, shared by the E2B sandbox and the container image.
-export function verifyImageSmoke(version, outputs) {
+function commonSmoke(version, outputs) {
   const problems = [];
   const reported = outputs.version.trim();
   if (reported !== `intentd ${version}`) problems.push(`intentd --version printed ${JSON.stringify(reported)}, expected "intentd ${version}"`);
   const gh = String(outputs.gh ?? '').split('\n')[0].trim();
   if (!gh.startsWith(`gh version ${GH.version} `)) problems.push(`gh --version printed ${JSON.stringify(gh)}, expected "gh version ${GH.version}"`);
   if (outputs.idle.trim()) problems.push(`intentd is already running in a fresh sandbox (pid ${outputs.idle.trim()}); the template must not start it`);
-  if (outputs.user !== undefined && outputs.user.trim() !== 'user\n/home/user') problems.push(`the container runs as ${JSON.stringify(outputs.user.trim())}, expected "user" with home /home/user`);
+  return problems;
+}
+
+// The container image also runs as the unprivileged `user`; E2B sandboxes
+// pick their own user, so only the image checks it.
+export function verifyImageSmoke(version, outputs) {
+  const problems = commonSmoke(version, outputs);
+  const user = String(outputs.user ?? '').trim();
+  if (user !== 'user\n/home/user') problems.push(`the container runs as ${JSON.stringify(user)}, expected "user" with home /home/user`);
   return problems;
 }
 

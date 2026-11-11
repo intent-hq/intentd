@@ -955,7 +955,7 @@ fn assert_setup_ran(server: &FakeServer) {
     assert!(argv.contains(&"HOME=/home/user".to_string()), "{argv:?}");
     let script = argv.last().unwrap();
     assert!(script.contains("chown -R"), "{script}");
-    assert!(script.contains("id -u user"), "{script}");
+    assert!(script.contains("id -u 'user'"), "{script}");
     assert!(
         !argv.iter().any(|a| a.starts_with("IS_SANDBOX")),
         "{argv:?}"
@@ -1124,6 +1124,87 @@ async fn a_failed_setup_is_an_error_and_removes_the_machine() {
             .iter()
             .any(|l| l == "DELETE /projects/p1/volumes/vol-1"),
         "{lines:?}"
+    );
+}
+
+/// Run the setup script against `home` with fake `id` (answering `uid:gid`,
+/// or failing when `None`) and a `chown` that only logs its arguments.
+fn run_prepare_home(
+    home: &std::path::Path,
+    owner: Option<(u32, u32)>,
+) -> (std::process::Output, String) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let shims = tempfile::tempdir().unwrap();
+    let log = shims.path().join("chown.log");
+    let id = match owner {
+        Some((u, g)) => format!("#!/bin/sh\n[ \"$2\" = user ] || exit 1\ncase \"$1\" in -u) echo {u};; -g) echo {g};; esac\n"),
+        None => "#!/bin/sh\necho \"id: 'user': no such user\" >&2\nexit 1\n".into(),
+    };
+    let chown = format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display());
+    for (name, body) in [("id", id), ("chown", chown)] {
+        let path = shims.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let script = super::provider::prepare_home_script(home.to_str().unwrap(), "user");
+    let output = std::process::Command::new("/bin/sh")
+        .args(["-c", &script])
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", shims.path().display()))
+        .output()
+        .unwrap();
+    (output, std::fs::read_to_string(&log).unwrap_or_default())
+}
+
+#[test]
+fn prepare_home_hands_the_home_over_only_when_the_owner_differs() {
+    use std::os::unix::fs::MetadataExt as _;
+    let home = tempfile::tempdir().unwrap();
+    let meta = std::fs::metadata(home.path()).unwrap();
+    let (uid, gid) = (meta.uid(), meta.gid());
+
+    let (owned, log) = run_prepare_home(home.path(), Some((uid, gid)));
+    assert!(owned.status.success(), "{owned:?}");
+    assert_eq!(log, "", "an owned home is left alone");
+
+    let (other, log) = run_prepare_home(home.path(), Some((uid + 1, gid)));
+    assert!(other.status.success(), "{other:?}");
+    assert_eq!(
+        log,
+        format!("-R {}:{gid} {}\n", uid + 1, home.path().display())
+    );
+
+    let (missing, log) = run_prepare_home(home.path(), None);
+    assert_eq!(missing.status.code(), Some(super::provider::NO_USER_EXIT));
+    assert_eq!(log, "");
+}
+
+#[tokio::test]
+async fn a_failed_setup_on_connect_is_an_error_and_keeps_the_machine() {
+    let server = FakeServer::start_with(
+        vec![
+            Reply::data(&service("svc-1", "COMPLETED", 0, &tags())),
+            Reply::data(&json!({})),
+            Reply::data(&service("svc-1", "COMPLETED", 1, &tags())),
+            containers(&["TASK_RUNNING"]),
+        ],
+        vec![WsSession::Steps(vec![
+            WsStep::Receive,
+            init_ok(),
+            completion(super::provider::NO_USER_EXIT, "Failure"),
+            WsStep::Close,
+        ])],
+    )
+    .await;
+    let err = client(&server).connect("svc-1", 600).await.unwrap_err();
+    assert_eq!(err.kind(), CloudErrorKind::Other);
+    assert!(
+        err.to_string().contains("predates") && err.to_string().contains("start a new one"),
+        "an old image says what to do: {err}"
+    );
+    assert!(
+        !server.lines().iter().any(|l| l.starts_with("DELETE")),
+        "connect never deletes the machine"
     );
 }
 
