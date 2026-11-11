@@ -983,10 +983,10 @@ choose whether to restart in-flight agents on the destination and whether to arc
 the transferred workspaces here (on by default). One progress bar covers the whole
 run; workspaces go one at a time, a failed one does not stop the rest, and **Stop**
 skips the remaining ones. The result lists each workspace as transferred, failed (with
-the reason) or not transferred. Workspaces that were not transferred stay usable here;
-if a failed one already reached the destination, its row says so. **Stop** is
-unavailable while the destination is importing. Bulk transfer does not download to a
-file.
+the reason) or not transferred. Workspaces that were not transferred stay usable here.
+**Stop** is unavailable once the destination starts importing, and if a failed or
+stopped workspace already reached the destination, its row says so. Bulk transfer does
+not download to a file.
 Press Escape, choose **Clear selection**, or click one workspace to end the selection;
 changing the filter, repository or tab also clears it.
 
