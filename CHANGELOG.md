@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.186] - 2026-11-11
+
+### 📚 Documentation
+
+- *(guide)* Describe bulk transfer from Home ([#3280](https://github.com/intent-hq/intentd/pull/3280))
+
+
 ## [0.11.185] - 2026-11-11
 
 ### 🔧 Refactor
