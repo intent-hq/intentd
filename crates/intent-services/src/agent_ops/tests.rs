@@ -10682,6 +10682,7 @@ async fn worst_case_agent_list_row(
     row.turn_in_flight = true;
     row.last_stream_activity_at = Some(ts.clone());
     row.session_corrupted = true;
+    row.effective_permission_policy = Some("interactive".into());
     row.retired_at = Some(ts);
     row.cap_list_previews();
     (id, row)
