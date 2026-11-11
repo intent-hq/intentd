@@ -26,11 +26,14 @@ pub type CloudFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, CloudError>>
 pub struct CreateInstance {
     /// The image (E2B template) to start, as the provider names it.
     pub image: String,
-    /// Seconds until the provider stops the machine unless kept alive.
+    /// Seconds until the provider stops the machine unless kept alive
+    /// (see [`CloudProvider::keep_alive`]).
     pub timeout_secs: Option<u32>,
     /// Pause instead of delete when the timeout runs out.
     pub pause_on_timeout: Option<bool>,
-    /// Labels the machine is listed by.
+    /// Labels the machine is listed by. An adapter may encode them in the
+    /// provider's own tag format, but [`CloudProvider::list`] must return
+    /// them exactly as given: the reaper reads them back.
     pub tags: BTreeMap<String, String>,
     /// Makes a retried create return the first machine. Reuse it on every retry.
     pub idempotency_key: Option<String>,
@@ -87,7 +90,8 @@ pub trait CloudProvider: Send + Sync + fmt::Debug {
     fn create<'a>(&'a self, request: &'a CreateInstance) -> CloudFuture<'a, CloudInstance>;
 
     /// Connect to machine `id`, resuming it when paused, and keep it alive
-    /// for at least `timeout_secs`.
+    /// for at least `timeout_secs`. Returns only once
+    /// [`Self::run_command`] can succeed.
     fn connect<'a>(&'a self, id: &'a str, timeout_secs: u32) -> CloudFuture<'a, Connected>;
 
     /// Run a command in the machine and wait for it to finish.
@@ -100,7 +104,9 @@ pub trait CloudProvider: Send + Sync + fmt::Debug {
     /// Pause a running machine.
     fn pause<'a>(&'a self, id: &'a str) -> CloudFuture<'a, ()>;
 
-    /// Keep machine `id` alive for `timeout_secs` from now.
+    /// Keep machine `id` alive for `timeout_secs` from now. With E2B this is
+    /// a lease: when the backend stops renewing it, the provider pauses
+    /// the machine itself.
     fn keep_alive<'a>(&'a self, id: &'a str, timeout_secs: u32) -> CloudFuture<'a, ()>;
 
     /// Delete a machine. `false` when it was already gone.
@@ -112,6 +118,7 @@ pub trait CloudProvider: Send + Sync + fmt::Debug {
     /// Test the key with one cheap read.
     fn check_key(&self) -> CloudFuture<'_, ()>;
 
-    /// Whether `image` (`<name>:<tag>`) is ready to start, as this key sees it.
+    /// Whether `image` is ready to start, as this key sees it. The format
+    /// is the provider's (E2B: `<template>:<tag>`).
     fn image_ready<'a>(&'a self, image: &'a str) -> CloudFuture<'a, bool>;
 }

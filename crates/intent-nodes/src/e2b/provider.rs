@@ -60,7 +60,8 @@ fn instance(sandbox: Sandbox) -> CloudInstance {
     }
 }
 
-/// The parts of a sandbox envd needs.
+/// The parts of a sandbox envd reads: its id and access token. The
+/// other fields are not kept on a [`CloudInstance`].
 fn sandbox(instance: &CloudInstance) -> Sandbox {
     Sandbox {
         sandbox_id: instance.id.clone(),
