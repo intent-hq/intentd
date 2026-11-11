@@ -972,18 +972,23 @@ Cmd/Ctrl-clicked and the one you Shift-click; further Shift-clicks keep that sta
 point (click A, Shift-click C, then Shift-click E selects A to E). With nothing
 selected, Shift-click selects just that workspace.
 A bar at the bottom shows the count with **Archive**, **Transfer…**, **Purge folders**
-and **Delete**; right-clicking a selected workspace offers the same actions. Each action
-applies only to the selected workspaces it fits (Archive to active ones, Transfer to
-ones with a git folder, Purge folders to archived ones that still have a folder, all
-four to workspaces you own) and asks for confirmation first.
+and **Delete**; right-clicking a selected workspace offers the same actions. Each
+action applies only to the selected workspaces it fits (Archive to active ones,
+Transfer to ones that still have a git folder, including archived ones, Purge folders
+to archived ones that still have a folder, all four to workspaces you own) and asks
+for confirmation first.
 **Transfer…** sends the selection to another connected machine. Before it starts, pick
 the destination, review each workspace's estimated size and the estimated total, and
 choose whether to restart in-flight agents on the destination and whether to archive
-the transferred workspaces here (on by default). One progress bar covers the whole run;
-workspaces go one at a time, a failed one does not stop the rest, and **Stop** skips the
-remaining ones. The result lists each workspace as transferred, failed (with the reason)
-or not transferred; those stay usable here. Bulk transfer does not download to a file. Press Escape, choose **Clear selection**, or click one
-workspace to end the selection; changing the filter, repository or tab also clears it.
+the transferred workspaces here (on by default). One progress bar covers the whole
+run; workspaces go one at a time, a failed one does not stop the rest, and **Stop**
+skips the remaining ones. The result lists each workspace as transferred, failed (with
+the reason) or not transferred. Workspaces that were not transferred stay usable here;
+if a failed one already reached the destination, its row says so. **Stop** is
+unavailable while the destination is importing. Bulk transfer does not download to a
+file.
+Press Escape, choose **Clear selection**, or click one workspace to end the selection;
+changing the filter, repository or tab also clears it.
 
 Right-click a repository or local folder in the Home sidebar and choose **New
 workspace** to start one there, or **Hide** to remove it from the sidebar. A hidden
