@@ -953,11 +953,19 @@ workspace; ask a new agent or edit the title yourself.
 
 ## Home Workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence,home-workspace-menu,home-workspace-labels,home-hidden-repos}.ts. Daemon: workspace.update `label`, packages/intentd/crates/intent-core/src/model.rs (normalize_workspace_label). -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard,HomeSelectionBar}.svelte; src/features/home/{home-workspace-opening,home-multi-select,home-workspace-status-groups,home-workspaces-persistence,home-workspace-menu,home-workspace-labels,home-hidden-repos}.ts; src/lib/components/modals/WorkspaceWarningDialogs.svelte. Daemon: workspace.update `label`, packages/intentd/crates/intent-core/src/model.rs (normalize_workspace_label). -->
 
 In **Home → Workspaces**, click a list row or board card to select it and show its
-preview. Double-click it, or Cmd-click (Ctrl-click on Windows and Linux), to open the
-workspace directly.
+preview. Double-click it, or press Cmd+Enter (Ctrl+Enter on Windows and Linux) on a
+focused row or card, to open the workspace directly.
+
+To select several workspaces, Cmd-click (Ctrl-click on Windows and Linux) each one.
+A bar at the bottom shows the count with **Archive**, **Purge folders** and
+**Delete**; right-clicking a selected workspace offers the same actions. Each action
+applies only to the selected workspaces it fits (Archive to active ones, Purge folders
+to archived ones that still have a folder, all three to workspaces you own) and asks
+for confirmation first. Press Escape, choose **Clear selection**, or click one
+workspace to end the selection; changing the filter, repository or tab also clears it.
 
 Right-click a repository or local folder in the Home sidebar and choose **New
 workspace** to start one there, or **Hide** to remove it from the sidebar. A hidden
@@ -1019,7 +1027,9 @@ not hide the workspace for collaborators or mark its work complete.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, workspace.update `autoArchiveDisabled`, packages/intentd/crates/intent-services/src/{archive_script,auto_archive,retire,auto_retire,local_work}.rs. -->
 
-In **Home → Workspaces**, right-click a workspace and choose **Archive**.
+In **Home → Workspaces**, right-click a workspace and choose **Archive**. To archive,
+purge or delete several at once, Cmd-click (Ctrl-click) them first (see
+**Home Workspaces**).
 Archiving stops its agents, hooks and PR monitors and keeps its folder. Archived
 workspaces appear under the **Archived** filter. Choose **Unarchive**, or send an
 agent a message, to continue.
