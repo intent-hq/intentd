@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::client::{scrub, validate_sandbox_id, E2bClient, Op};
 use super::{E2bError, Sandbox, SecretString};
+use crate::cloud::{ProcessExit, ProcessOutput, ProcessSpec};
 
 /// Port envd listens on inside every sandbox.
 pub const ENVD_PORT: u16 = 49983;
@@ -22,47 +23,6 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_COLLECTED: usize = 16 * 1024 * 1024;
 /// Extra time on top of the process timeout before the HTTP call gives up.
 const STREAM_GRACE: Duration = Duration::from_secs(10);
-
-/// A command to start in a sandbox.
-#[derive(Clone)]
-pub struct ProcessSpec {
-    pub cmd: String,
-    pub args: Vec<String>,
-    pub envs: BTreeMap<String, SecretString>,
-    pub cwd: Option<String>,
-    /// System user for envd (HTTP Basic, no password). `None` lets envd choose.
-    pub user: Option<String>,
-    /// Ends the process after this time (`Connect-Timeout-Ms`).
-    pub timeout: Option<Duration>,
-}
-
-impl ProcessSpec {
-    /// A spec for `cmd` that runs as the sandbox's default user.
-    #[must_use]
-    pub fn new(cmd: impl Into<String>) -> Self {
-        Self {
-            cmd: cmd.into(),
-            args: Vec::new(),
-            envs: BTreeMap::new(),
-            cwd: None,
-            user: None,
-            timeout: None,
-        }
-    }
-}
-
-impl fmt::Debug for ProcessSpec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProcessSpec")
-            .field("cmd", &self.cmd)
-            .field("args", &self.args)
-            .field("envs", &self.envs.keys().collect::<Vec<_>>())
-            .field("cwd", &self.cwd)
-            .field("user", &self.user)
-            .field("timeout", &self.timeout)
-            .finish()
-    }
-}
 
 /// Process output bytes. `Debug` shows only the length: output can carry
 /// tokens (for example `executor.mint`).
@@ -88,50 +48,11 @@ impl fmt::Debug for OutputChunk {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProcessExit {
-    pub exit_code: i32,
-    pub exited: bool,
-    /// envd's text, for example `exit status 1` or `signal: killed`.
-    pub status: String,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessEvent {
     Started { pid: u32 },
     Stdout(OutputChunk),
     Stderr(OutputChunk),
     Exited(ProcessExit),
-}
-
-/// Everything a finished process wrote.
-#[derive(Clone)]
-pub struct ProcessOutput {
-    pub pid: Option<u32>,
-    pub exit: ProcessExit,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    /// Output past the collection cap was dropped.
-    pub truncated: bool,
-}
-
-impl ProcessOutput {
-    #[must_use]
-    pub fn success(&self) -> bool {
-        self.exit.exited && self.exit.exit_code == 0 && self.exit.error.is_none()
-    }
-}
-
-impl fmt::Debug for ProcessOutput {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProcessOutput")
-            .field("pid", &self.pid)
-            .field("exit", &self.exit)
-            .field("stdout_len", &self.stdout.len())
-            .field("stderr_len", &self.stderr.len())
-            .field("truncated", &self.truncated)
-            .finish()
-    }
 }
 
 /// Server stream of one started process.

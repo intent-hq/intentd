@@ -312,12 +312,12 @@ async fn agent_person(svc: &Services, agent_id: &AgentId) -> Option<intent_core:
     creator
 }
 
-/// A client for the saved key of cloud machine `row`'s E2B entry, if one
+/// A provider for the saved key of cloud machine `row`'s E2B entry, if one
 /// is saved.
 pub(crate) async fn saved_client(
     svc: &Services,
     row: &intent_core::machines::ExposedMachine,
-) -> Option<intent_nodes::e2b::E2bClient> {
+) -> Option<config::Provider> {
     config::saved_client(svc, methods::row_entry(row))
         .await
         .ok()

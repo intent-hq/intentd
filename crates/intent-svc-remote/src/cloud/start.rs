@@ -9,7 +9,7 @@ use tokio::sync::watch;
 
 use intent_core::machines::{
     cloud_profile_required, CloudMachine, CloudSandboxState, CloudStart, CloudStartStep,
-    ExposedMachine, ModelUnavailable, CLOUD_PROVIDER_E2B, CLOUD_PROVIDER_E2B_NAME,
+    ExposedMachine, ModelUnavailable, CLOUD_PROVIDER_E2B_NAME,
 };
 use intent_core::placement::{
     AgentPlacement, PlacementCheckout, PlacementTarget, PlacementUnavailableReason,
@@ -19,7 +19,7 @@ use intent_core::remote_launch::{
     EffectiveIsolation, PlacementError, RemoteLaunchNeeds, RemoteLaunchRequest, RemotePlacementView,
 };
 use intent_core::{now_iso, AgentId, Caller, Error, Result, WorkspaceId};
-use intent_nodes::e2b::{CreateSandbox, E2bClient};
+use intent_nodes::cloud::{CloudProvider, CreateInstance};
 use intent_services::feature_api::Services;
 
 use super::config::{self, ProviderState};
@@ -607,11 +607,11 @@ async fn start(
         config::intentd_version().to_owned(),
     );
     let created = client
-        .create(&CreateSandbox {
-            template_id: template.clone(),
+        .create(&CreateInstance {
+            image: template.clone(),
             timeout_secs: Some(super::lifecycle::SANDBOX_TIMEOUT_SECS),
-            auto_pause: Some(true),
-            metadata,
+            pause_on_timeout: Some(true),
+            tags: metadata,
             idempotency_key: Some(idempotency_key(agent_id)),
         })
         .await
@@ -625,7 +625,7 @@ async fn start(
             return Err(error);
         }
     };
-    let sandbox_id = created.sandbox_id.clone();
+    let sandbox_id = created.id.clone();
     let linked = async {
         let backend_name = crate::methods::backend_name(svc).await;
         let fingerprint = svc
@@ -634,10 +634,10 @@ async fn start(
             .map(|routes| routes.fingerprint);
         let params = bootstrap::mint_params(&backend_id, &backend_name, fingerprint.as_deref());
         step(svc, workspace_id, agent_id, CloudStartStep::StartingDaemon).await;
-        let minted = bootstrap::run(&client, &created, &params).await?;
+        let minted = bootstrap::run(&*client, &created, &params).await?;
         step(svc, workspace_id, agent_id, CloudStartStep::Connecting).await;
         let cloud = CloudMachine {
-            provider: CLOUD_PROVIDER_E2B.to_owned(),
+            provider: client.kind().to_owned(),
             cloud_machine_id: cloud_machine_id.to_owned(),
             sandbox_id: sandbox_id.clone(),
             state: CloudSandboxState::Running,
@@ -748,7 +748,7 @@ pub(crate) async fn delete_machine(
     feature: &RemoteFeature,
     svc: &Services,
     row: &ExposedMachine,
-    client: Option<&E2bClient>,
+    client: Option<&dyn CloudProvider>,
 ) -> Vec<String> {
     remove_machine(feature, svc, row, client, Removal::Stop).await
 }
@@ -771,7 +771,7 @@ pub(crate) async fn remove_machine(
     feature: &RemoteFeature,
     svc: &Services,
     row: &ExposedMachine,
-    client: Option<&E2bClient>,
+    client: Option<&dyn CloudProvider>,
     removal: Removal<'_>,
 ) -> Vec<String> {
     let lost = match removal {

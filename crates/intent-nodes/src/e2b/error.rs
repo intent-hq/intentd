@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+pub use crate::cloud::QuotaLimit;
+
 /// Errors from the E2B API and envd. No variant holds a key or token.
 #[derive(Debug, thiserror::Error)]
 pub enum E2bError {
@@ -74,25 +76,6 @@ pub enum E2bError {
     /// The envd stream ended with a Connect error.
     #[error("E2B process failed ({code}): {message}")]
     Process { code: String, message: String },
-}
-
-/// Which E2B plan limit refused a call (`CloudQuotaData.limit`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuotaLimit {
-    Concurrency,
-    Rate,
-    Plan,
-}
-
-impl QuotaLimit {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Concurrency => "concurrency",
-            Self::Rate => "rate",
-            Self::Plan => "plan",
-        }
-    }
 }
 
 impl E2bError {
