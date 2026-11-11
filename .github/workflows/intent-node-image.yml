@@ -1,0 +1,69 @@
+# Builds, smoke-tests and publishes the intent-node container image
+# (ghcr.io/intent-hq/intent-node, linux/amd64), the size-independent twin of
+# the E2B templates for clouds that run containers (Northflank). The
+# Dockerfile is rendered from the template definition in packaging/e2b, so
+# both carry the same tools. The steps live in intent-node-image-build.yml.
+#
+# - After each successful Release run (the alpha publish, including the
+#   intentd-releases mirror the image downloads from): build
+#   intent-node:<version>, smoke-test it, then push it and move `latest`.
+# - By hand (workflow_dispatch): the same for any published version; `latest`
+#   moves only when asked.
+# - On pull requests that touch the image: build and smoke-test a local
+#   intent-node:pr-<number> from the newest release. Nothing is pushed.
+#
+# Pushes use the workflow's GITHUB_TOKEN (packages: write). Fail-soft: when
+# GHCR refuses the token (the package is not linked to this repository, or the
+# organization blocks it), the run logs a warning and succeeds. GHCR creates the
+# package private; an organization owner makes it public once (see
+# docs/RELEASING.md in intent-hq/intent).
+name: Intent node image
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: intentd version to package (for example 0.11.139); its release must be published
+        required: true
+        type: string
+      latest:
+        description: Also move the latest tag
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+    paths:
+      - packaging/e2b/**
+      - .github/workflows/intent-node-image.yml
+      - .github/workflows/intent-node-image-build.yml
+
+permissions:
+  contents: read
+
+jobs:
+  # One writer for release and manual pushes, so `latest` moves in order;
+  # `queue: max` keeps every pending release run instead of only the newest.
+  release:
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: intent-node-image-release
+      cancel-in-progress: false
+      queue: max
+    uses: ./.github/workflows/intent-node-image-build.yml
+    with:
+      version: ${{ inputs.version }}
+      latest: ${{ inputs.latest || false }}
+
+  # A new push supersedes the PR's image, so it cancels the older run.
+  pull-request:
+    if: github.event_name == 'pull_request'
+    concurrency:
+      group: intent-node-image-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    uses: ./.github/workflows/intent-node-image-build.yml

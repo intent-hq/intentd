@@ -5,15 +5,9 @@
 // intentd-releases release, where backends read it without a key.
 // Env: E2B_API_KEY, PROJECT, plus the plan inputs (EVENT_NAME, RUN_*,
 // INPUT_VERSION). Writes skip/version/path to $GITHUB_OUTPUT.
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { Template } from 'e2b';
-import { MANIFEST_ASSET, builtSizes, manifestFor, plan, redact } from './intent-node.mjs';
-
-function output(values) {
-  const lines = Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n');
-  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${lines}\n`);
-  console.log(lines);
-}
+import { MANIFEST_ASSET, builtSizes, manifestFor, output, plan, redact } from './intent-node.mjs';
 
 async function main() {
   const apiKey = process.env.E2B_API_KEY;
