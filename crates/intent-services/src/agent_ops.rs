@@ -6048,7 +6048,7 @@ impl Services {
             let mut view = match (admitted, inherited_from) {
                 (Ok((view, picked)), _) => {
                     if let Some(picked) = picked {
-                        plan.provider = picked.provider_ref.clone();
+                        plan.provider.clone_from(&picked.provider_ref);
                         plan.auto_selected = Some(picked);
                     }
                     view
@@ -6375,7 +6375,7 @@ impl Services {
             .admit_with_auto_pick(&plan.provider.clone(), &placement, admit)
             .await?;
         if let Some(picked) = picked {
-            plan.provider = picked.provider_ref.clone();
+            plan.provider.clone_from(&picked.provider_ref);
             plan.auto_selected = Some(picked);
         }
         plan.remote = Some(view);
