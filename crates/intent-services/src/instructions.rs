@@ -318,6 +318,15 @@ pub(crate) static V3_12: InstructionSet = InstructionSet {
     ..V3_10
 };
 
+/// Harness 3.13 keeps 3.12's bodies except the workspace layer, whose
+/// Workspace Title rule now lets an agent rename a titled workspace when the
+/// user explicitly asks, via `ws.workspace.setTitle(title, { userRequested:
+/// true })`.
+pub(crate) static V3_13: InstructionSet = InstructionSet {
+    workspace: instr!("v3.13", "workspace"),
+    ..V3_12
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
@@ -714,10 +723,11 @@ mod tests {
         (set.common, set.workspace)
     }
 
-    /// The current common body: harness 3.12's trimmed doctrine (3.10's cuts:
-    /// no Note Editing, Waiting on External Conditions or Long-running
-    /// Processes prose; plus 3.11's released inline-visuals guidance).
-    const COMMON_LATEST: &str = V3_12.common;
+    /// The current common body: harness 3.13 keeps 3.12's trimmed doctrine
+    /// (3.10's cuts: no Note Editing, Waiting on External Conditions or
+    /// Long-running Processes prose; plus 3.11's released inline-visuals
+    /// guidance).
+    const COMMON_LATEST: &str = V3_13.common;
 
     #[test]
     fn discussion_guidance_reaches_interactive_roles_and_respects_attention_gate() {
@@ -749,7 +759,7 @@ mod tests {
             "ws.agent.reportBlocker(reason)",
         ];
         let latest = crate::harness::latest_entry().doctrine.instructions;
-        assert!(std::ptr::eq(latest, &raw const V3_12));
+        assert!(std::ptr::eq(latest, &raw const V3_13));
         for (set, guidance_list, waiting) in [
             (&V3_8, V3_8_GUIDANCE, true),
             (latest, V3_10_GUIDANCE, false),

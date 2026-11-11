@@ -59,30 +59,32 @@ const REALISTIC_MAX_RATIO: f64 = 0.5;
 /// past the measured value: `(provider, top-level chars, sub-agent chars)`.
 /// Measured on 3.12, which carries the released inline-visuals block from
 /// 3.11 (intentd #3240, 1,946 chars) and the `ws.agent.delegate` occupancy
-/// entry (#3248) on top of the 3.10 cuts. Revisit if
+/// entry (#3248) on top of the 3.10 cuts, plus 3.13's explicit-rename
+/// Workspace Title rule (+51 chars). Revisit if
 /// either CLI's native load can be confirmed: add it to `native_rules` and
 /// drop its row.
 const REALISTIC_INJECTED_RULES_CEILING: &[(&str, usize, usize)] =
-    &[("droid", 58_009, 56_147), ("grok", 58_009, 56_147)];
+    &[("droid", 58_060, 56_198), ("grok", 58_060, 56_198)];
 
 /// Clean-fixture ceiling per provider: `(provider, top-level chars,
 /// sub-agent chars)`. Measured on harness 3.12: the 3.10 compact ws.*
 /// reference (with the `ws.agent.delegate` occupancy entry), trimmed
 /// doctrine and skills cut, the eval-driven hot-set notes, and 3.11's
-/// released visuals (2026-11-10). Lower each row again as further cuts land.
+/// released visuals (2026-11-10), plus 3.13's explicit-rename Workspace
+/// Title rule (+51 chars). Lower each row again as further cuts land.
 const CLEAN_CEILING: &[(&str, usize, usize)] = &[
-    ("auggie", 27_393, 25_531),
-    ("claude-code", 27_672, 25_810),
-    ("codex", 27_393, 25_531),
-    ("cortex", 27_393, 25_531),
-    ("opencode", 27_393, 25_531),
-    ("unsloth", 27_393, 25_531),
-    ("pi", 27_393, 25_531),
-    ("droid", 27_672, 25_810),
-    ("grok", 27_672, 25_810),
-    ("antigravity", 27_393, 25_531),
-    ("cursor", 27_621, 25_759),
-    ("mock", 27_393, 25_531),
+    ("auggie", 27_444, 25_582),
+    ("claude-code", 27_723, 25_861),
+    ("codex", 27_444, 25_582),
+    ("cortex", 27_444, 25_582),
+    ("opencode", 27_444, 25_582),
+    ("unsloth", 27_444, 25_582),
+    ("pi", 27_444, 25_582),
+    ("droid", 27_723, 25_861),
+    ("grok", 27_723, 25_861),
+    ("antigravity", 27_444, 25_582),
+    ("cursor", 27_672, 25_810),
+    ("mock", 27_444, 25_582),
 ];
 
 /// Where the fixtures' paths appear to live, so sizes do not depend on the

@@ -917,6 +917,16 @@ links a PR to a workspace when it discovers the PR on that workspace's branch or
 one of its submodules; PRs seen only before this feature shipped are not linked
 until Intent sees them again.
 
+## Rename a workspace
+
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/WorkspaceSidebarHeader.svelte; packages/intentd/crates/intent-acp/src/mcp_server/bindings/workspace.rs (set_title, userRequested); packages/intentd/crates/intent-services/resources/agent-instructions/v3.13/workspace.md. -->
+
+The workspace agent names a new workspace on its first turn and does not change an
+existing name on its own. To rename one, click its title at the top of the workspace
+sidebar and edit it, or ask the agent in chat (for example "Rename this workspace to
+Docs refresh"). Agents created before this change may decline to rename a named
+workspace; ask a new agent or edit the title yourself.
+
 ## Home Workspaces
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence,home-workspace-menu,home-workspace-labels,home-hidden-repos}.ts. Daemon: workspace.update `label`, packages/intentd/crates/intent-core/src/model.rs (normalize_workspace_label). -->

@@ -28,8 +28,7 @@ mod tests {
     fn v3_12_is_3_10_context_with_3_11_visuals() {
         let current = super::super::resolve_entry("3.12");
         let cuts = super::super::resolve_entry("3.10");
-        assert_eq!(current.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(intent_core::STAGED_HARNESS_VERSION, None);
+        assert_eq!(current.version, "3.12");
         assert!(std::ptr::eq(current.context, cuts.context));
         assert!(std::ptr::addr_eq(current.harness, cuts.harness));
         assert_eq!(current.doctrine.specialists, cuts.doctrine.specialists);
