@@ -57,6 +57,7 @@ fn instance(sandbox: Sandbox) -> CloudInstance {
         id: sandbox.sandbox_id,
         image: sandbox.template_id,
         access_token: sandbox.envd_access_token,
+        volume_id: None,
     }
 }
 

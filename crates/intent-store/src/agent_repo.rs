@@ -17109,7 +17109,7 @@ mod tests {
     /// A summary omits `system_prompt` (and the other heavy columns), and the
     /// only way to persist a change found through one is to re-read the full
     /// row: `AgentSessionSummary` cannot reach `update_agent_session` (pinned
-    /// at compile time by `tests/agent_session_summary_api.rs`). This guards
+    /// at compile time by `tests/compile_fail.rs`). This guards
     /// the runtime half: the full-row re-read keeps `system_prompt`, so the
     /// write-back cannot clear it.
     #[tokio::test]

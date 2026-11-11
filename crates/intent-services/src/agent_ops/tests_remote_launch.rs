@@ -105,7 +105,7 @@ impl RemoteLaunchPort for FakeRemote {
         if self.signed_out
             && needs.machine_sign_in
             && !needs.profile_fallback
-            && !placement.is_e2b()
+            && !placement.is_cloud()
         {
             let error = intent_core::machines::machine_not_signed_in(
                 &needs.provider,

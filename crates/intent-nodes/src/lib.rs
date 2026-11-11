@@ -5,6 +5,7 @@ use intent_core::{nodes::LeaseOwner, Error, Result};
 pub mod cloud;
 pub mod e2b;
 pub mod journal;
+pub mod northflank;
 use std::{future::Future, pin::Pin};
 
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;

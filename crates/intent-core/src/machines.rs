@@ -425,10 +425,25 @@ impl ExposedMachine {
     }
 }
 
-/// The only cloud machine provider: E2B.
+/// The E2B cloud machine provider (`CloudProviderKind`).
 pub const CLOUD_PROVIDER_E2B: &str = "e2b";
 /// Its display name, also every cloud agent's `nodeName`.
 pub const CLOUD_PROVIDER_E2B_NAME: &str = "E2B";
+/// The Northflank cloud machine provider (`cloudMachineProviders: 1`).
+pub const CLOUD_PROVIDER_NORTHFLANK: &str = "northflank";
+pub const CLOUD_PROVIDER_NORTHFLANK_NAME: &str = "Northflank";
+/// The providers this backend can configure, in the order clients offer
+/// them (`cloudMachines.list` `providerKinds`).
+pub const CLOUD_PROVIDER_KINDS: [&str; 2] = [CLOUD_PROVIDER_E2B, CLOUD_PROVIDER_NORTHFLANK];
+
+/// The display name of cloud provider `kind`, for messages.
+#[must_use]
+pub fn cloud_provider_name(kind: &str) -> &'static str {
+    match kind {
+        CLOUD_PROVIDER_NORTHFLANK => CLOUD_PROVIDER_NORTHFLANK_NAME,
+        _ => CLOUD_PROVIDER_E2B_NAME,
+    }
+}
 /// The id of the E2B entry a single-provider setup migrates to (named
 /// [`CLOUD_PROVIDER_E2B_NAME`]); also the entry of a cloud machine row or
 /// placement saved before entries existed.
@@ -502,6 +517,33 @@ impl CloudMachineSize {
         }
     }
 
+    /// The sizes a Northflank entry offers, smallest first.
+    pub const NORTHFLANK: [Self; 3] = [Self::S2x4, Self::S4x8, Self::S8x16];
+
+    /// The Northflank deployment plan a Northflank entry uses for the size
+    /// unless the owner sets another; `None` for a size it does not offer.
+    #[must_use]
+    pub fn default_deployment_plan(self) -> Option<&'static str> {
+        match self {
+            Self::S2x4 => Some("nf-compute-200"),
+            Self::S4x8 => Some("nf-compute-400"),
+            Self::S8x16 => Some("nf-compute-800-16"),
+            Self::S16x32 => None,
+        }
+    }
+
+    /// `CloudMachineSizeInfo` of a Northflank entry: its deployment plan,
+    /// no E2B `plan`.
+    #[must_use]
+    pub fn deployment_info_json(self, deployment_plan: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id(),
+            "vcpu": self.vcpu(),
+            "memoryMiB": self.memory_mib(),
+            "deploymentPlan": deployment_plan,
+        })
+    }
+
     /// `CloudMachineSizeInfo` on the wire.
     #[must_use]
     pub fn info_json(self) -> serde_json::Value {
@@ -543,6 +585,9 @@ pub struct CloudMachine {
     #[serde(default = "legacy_entry")]
     pub cloud_machine_id: String,
     pub sandbox_id: String,
+    /// Northflank only: the service's volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_id: Option<String>,
     pub state: CloudSandboxState,
     pub template: String,
     pub size: CloudMachineSize,
@@ -623,9 +668,11 @@ pub const CLOUD_PROFILE_REQUIRED_CODE: &str = "cloud-profile-required";
 /// `error.data.code` when E2B refused for a plan limit.
 pub const CLOUD_QUOTA_CODE: &str = "cloud-quota";
 
-/// `cloud-machine-unavailable`: E2B cannot start or keep a sandbox.
-/// `not-configured` and `key-rejected` are `-32602`; every other reason is
-/// `-32603`. Never carries the key.
+/// `cloud-machine-unavailable`: the provider cannot start or keep a
+/// sandbox. `not-configured`, `key-rejected`, `entry-required`,
+/// `project-missing` and `permission-denied` are `-32602`; every other
+/// reason is `-32603`. `provider` is E2B until [`with_cloud_provider`]
+/// names another. Never carries the key.
 #[must_use]
 pub fn cloud_machine_unavailable(
     reason: &str,
@@ -633,7 +680,14 @@ pub fn cloud_machine_unavailable(
     status: Option<u16>,
     message: impl Into<String>,
 ) -> crate::Error {
-    let internal = !matches!(reason, "not-configured" | "key-rejected" | "entry-required");
+    let internal = !matches!(
+        reason,
+        "not-configured"
+            | "key-rejected"
+            | "entry-required"
+            | "project-missing"
+            | "permission-denied"
+    );
     let mut data = serde_json::json!({
         "code": CLOUD_MACHINE_UNAVAILABLE_CODE,
         "provider": CLOUD_PROVIDER_E2B,
@@ -670,6 +724,26 @@ pub fn with_cloud_machine_id(error: crate::Error, id: &str) -> crate::Error {
     }
 }
 
+/// `error` with `data.provider` set to cloud provider `kind`, when it is
+/// one of the three cloud errors.
+#[must_use]
+pub fn with_cloud_provider(error: crate::Error, kind: &str) -> crate::Error {
+    match error {
+        crate::Error::RemoteMachine(mut failure)
+            if matches!(
+                failure.data["code"].as_str(),
+                Some(
+                    CLOUD_MACHINE_UNAVAILABLE_CODE | CLOUD_PROFILE_REQUIRED_CODE | CLOUD_QUOTA_CODE
+                )
+            ) =>
+        {
+            failure.data["provider"] = serde_json::json!(kind);
+            crate::Error::RemoteMachine(failure)
+        }
+        other => other,
+    }
+}
+
 /// `cloud-profile-required` (`-32602`): the launch would send no profile
 /// environment, and a sandbox has no sign-in of its own.
 #[must_use]
@@ -677,7 +751,7 @@ pub fn cloud_profile_required(provider_ref: &str) -> crate::Error {
     crate::Error::remote_machine(
         false,
         format!(
-            "\"{provider_ref}\" uses this backend's own sign-in, which E2B can't use; pick a profile with an API key or token."
+            "\"{provider_ref}\" uses this backend's own sign-in, which a cloud machine can't use; pick a profile with an API key or token."
         ),
         serde_json::json!({
             "code": CLOUD_PROFILE_REQUIRED_CODE,

@@ -30,8 +30,11 @@ const MAX_TAIL_CHARS: usize = 600;
 
 /// Write the daemon's first settings (external listener and tunnel on)
 /// unless the sandbox has some, then start it in the background unless it
-/// already answers. The template never runs intentd, so this first start
-/// makes the sandbox's own daemon id, certificate and tailcat key.
+/// already answers, printing [`STARTED`] when it did and waiting (up to
+/// 50 s) until it answers. The template never
+/// runs intentd, so this first start makes the sandbox's own daemon id,
+/// certificate and tailcat key; on a machine that keeps only its disk, a
+/// later start finds them on the disk.
 ///
 /// Every `intentd` here and in [`MINT_SCRIPT`] runs with the same explicit
 /// data dir: without it the daemon uses its platform default
@@ -50,8 +53,20 @@ if ! intentd call system.status >/dev/null 2>&1; then
   else
     nohup intentd serve >"$dir/serve.log" 2>&1 </dev/null &
   fi
+  echo started
+  # A dial right after must find it listening; a start that runs meanwhile
+  # must find it answering, not start a second one.
+  i=0
+  until intentd call system.status >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -ge 50 ] && break
+    sleep 1
+  done
 fi
 "#;
+
+/// What [`START_SCRIPT`] prints when it started intentd.
+const STARTED: &str = "started";
 
 /// Wait for the daemon (and its tunnel address unless a direct route is
 /// used), then mint. A mint that fails (listener not up yet) is retried; a
@@ -173,20 +188,7 @@ pub(crate) async fn run(
     sandbox: &CloudInstance,
     backend: &Value,
 ) -> Result<Minted> {
-    let mut start = ProcessSpec::new("/bin/sh");
-    start.args = vec!["-c".into(), START_SCRIPT.into()];
-    start.timeout = Some(Duration::from_secs(60));
-    let started = client
-        .run_command(sandbox, &start)
-        .await
-        .map_err(|error| super::config::to_error(&error, super::config::Phase::Other))?;
-    if !started.success() {
-        return Err(failed(format!(
-            "intentd could not start in the sandbox (exit {}): {}",
-            started.exit.exit_code,
-            tail(&started.stderr)
-        )));
-    }
+    start_daemon(client, sandbox).await?;
 
     let direct = std::env::var(DIRECT_HOST_ENV)
         .ok()
@@ -212,10 +214,9 @@ pub(crate) async fn run(
         envs.insert("INTENT_DIRECT_ROUTE".to_owned(), SecretString::new("1"));
     }
     mint.envs = envs;
-    let minted = client
-        .run_command(sandbox, &mint)
-        .await
-        .map_err(|error| super::config::to_error(&error, super::config::Phase::Other))?;
+    let minted = client.run_command(sandbox, &mint).await.map_err(|error| {
+        super::config::to_error(&error, super::config::Phase::Other, client.kind())
+    })?;
     if !minted.success() {
         return Err(failed(format!(
             "the sandbox's intentd did not mint a credential (exit {}): {}",
@@ -224,6 +225,37 @@ pub(crate) async fn run(
         )));
     }
     parse(&minted.stdout, direct)
+}
+
+/// Start intentd in `sandbox` unless it already answers. Returns whether
+/// it started it.
+///
+/// # Errors
+///
+/// `cloud-machine-unavailable` `bootstrap-failed` when the start fails, or
+/// the provider error of a failed call.
+pub(crate) async fn start_daemon(
+    client: &dyn CloudProvider,
+    sandbox: &CloudInstance,
+) -> Result<bool> {
+    let mut start = ProcessSpec::new("/bin/sh");
+    start.args = vec!["-c".into(), START_SCRIPT.into()];
+    // Up to 50 s of waiting for the new daemon, plus a provider's output
+    // drain.
+    start.timeout = Some(Duration::from_secs(120));
+    let started = client.run_command(sandbox, &start).await.map_err(|error| {
+        super::config::to_error(&error, super::config::Phase::Other, client.kind())
+    })?;
+    if !started.success() {
+        return Err(failed(format!(
+            "intentd could not start in the sandbox (exit {}): {}",
+            started.exit.exit_code,
+            tail(&started.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&started.stdout)
+        .lines()
+        .any(|line| line.trim() == STARTED))
 }
 
 /// Read the mint result (`{ credentialId, token, machine }`).

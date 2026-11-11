@@ -22,9 +22,14 @@ pub const MAX_NODE_ID_BYTES: usize = 128;
 pub enum PlacementTarget {
     Local,
     Remote,
-    /// A new E2B cloud machine (`cloudMachines: 1`), or the parent's when
-    /// the caller already runs on one.
+    /// A new cloud machine from an E2B entry (`cloudMachines: 1`); with a
+    /// `cloudMachineId`, from that entry of any provider. Also every
+    /// resolved cloud placement, whatever the provider.
     E2b,
+    /// A request value only (`cloudMachineProviders: 1`): a new cloud
+    /// machine from an entry of any provider. Admission resolves it to
+    /// [`Self::E2b`].
+    Cloud,
 }
 
 /// `placement.checkout`. Absent on a placement object means `isolated`.
@@ -155,8 +160,8 @@ impl AgentPlacement {
             return Err("placement.nodeId must contain 1-128 UTF-8 bytes");
         }
         if let Some(entry) = &self.cloud_machine_id {
-            if self.target != Some(PlacementTarget::E2b) {
-                return Err("placement.cloudMachineId needs placement.target \"e2b\"");
+            if !self.is_cloud() {
+                return Err("placement.cloudMachineId needs placement.target \"e2b\" or \"cloud\"");
             }
             if entry.len() > crate::machines::MAX_CLOUD_MACHINE_ID_BYTES {
                 return Err("placement.cloudMachineId must contain at most 64 UTF-8 bytes");
@@ -167,12 +172,12 @@ impl AgentPlacement {
         {
             return Err("remote placement requires isolated checkout");
         }
-        if self.target == Some(PlacementTarget::E2b) {
+        if self.is_cloud() {
             if self.os.is_some() || self.arch.is_some() || self.node_id.is_some() {
-                return Err("placement.target \"e2b\" takes no os, arch or nodeId");
+                return Err("a cloud placement takes no os, arch or nodeId");
             }
             if self.exclusive.is_some() {
-                return Err("placement.target \"e2b\" takes no exclusive");
+                return Err("a cloud placement takes no exclusive");
             }
             if self.effective_checkout() != PlacementCheckout::Isolated {
                 return Err("remote placement requires isolated checkout");
@@ -187,10 +192,21 @@ impl AgentPlacement {
         Ok(())
     }
 
-    /// Whether this placement asks for an E2B cloud machine.
+    /// Whether this placement asks for a cloud machine (`target` `"e2b"`
+    /// or `"cloud"`).
     #[must_use]
-    pub fn is_e2b(&self) -> bool {
-        self.target == Some(PlacementTarget::E2b)
+    pub fn is_cloud(&self) -> bool {
+        matches!(
+            self.target,
+            Some(PlacementTarget::E2b | PlacementTarget::Cloud)
+        )
+    }
+
+    /// Whether an omitted `cloudMachineId` picks among the entries of
+    /// every provider (`target: "cloud"`), not only E2B's.
+    #[must_use]
+    pub fn any_provider(&self) -> bool {
+        self.target == Some(PlacementTarget::Cloud)
     }
 
     /// The checkout this placement asks for: `isolated` when absent.

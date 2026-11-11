@@ -482,6 +482,18 @@ An agent running on one of those machines uses that machine's skills (its
 `~/.agents/skills` and `~/.claude/skills`, plus the project's), and its **/** menu lists
 them; to give it a skill, add the skill there. A **/name** it lacks still sends, with a
 notice in the chat.
+<!-- Labs (remote agents): describe only when the user asks about cloud machines,
+and say it is Labs. The backend can start its own machines from a saved cloud entry:
+an E2B entry (API key) starts a sandbox, a Northflank entry (API token and project id)
+starts a Northflank service with its own disk. Northflank machines offer sizes 2x4,
+4x8 and 8x16; the region is the project's. Cloud machines have no sign-in, so only a
+profile or Default marked for remote machines that sends an API key runs there. An
+idle cloud machine pauses. A paused E2B sandbox resumes with its memory; a paused
+Northflank machine resumes from its disk only: the checkout, uncommitted changes and
+home folder stay, while running processes, terminals and scripts stop, and software
+installed outside the home folder may be gone. The agent is told this at its next turn.
+Sources: packages/intentd/crates/intent-svc-remote/src/cloud/ (config.rs, lifecycle.rs),
+packages/intentd/crates/intentd/src/executor/checkout.rs (first_turn_notice). -->
 Workspaces and agents belong to a host, so identify the intended device before
 explaining missing work or changing host settings. **Mobile** follows the active
 connection and its permissions; do not describe a remote connection's QR as belonging
@@ -774,7 +786,8 @@ a message says it no longer exists.
 
 <!-- Labs (remote agents): describe only when the user asks about remote agents,
 and say it is Labs. The card's **Start on** defaults to where the proposing agent
-runs: the backend, its remote machine, or a new E2B sandbox from the same entry.
+runs: the backend, its remote machine, or a new cloud machine (E2B or Northflank)
+from the same entry.
 The user can change it before **Create workspace**; an offline machine shows a
 warning. An agent applying its own proposal uses that default, and a machine
 error is reported back with its reason. Sources: packages/intentd/crates/intent-acp/src/mcp_server/bindings/workspace.rs (proposer_placement, apply_create_failure). -->

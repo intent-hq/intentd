@@ -8,8 +8,7 @@ license.workspace = true
 description = "SQLite + file-tree persistence (repositories, migrations, locking)"
 
 [package.metadata.cargo-shear]
-# Compiled separately by tests/store_pool_api.rs, tests/note_write_lock_api.rs
-# and tests/agent_session_summary_api.rs to assert rejected pool,
+# Compiled separately by tests/compile_fail.rs to assert rejected pool,
 # note-write-lock and summary write-back APIs.
 ignored-paths = [
     "tests/ui/store_pool_*.rs",

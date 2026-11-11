@@ -515,7 +515,7 @@ impl RemotePlacementView {
     /// Whether the agent was placed on a cloud machine (`target: "e2b"`).
     #[must_use]
     pub fn is_cloud(&self) -> bool {
-        self.placement.is_e2b()
+        self.placement.is_cloud()
     }
 
     /// Whether the agent runs on no machine yet: a cloud agent whose

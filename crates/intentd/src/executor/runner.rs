@@ -500,6 +500,9 @@ struct Agent {
     /// The machine's name, when head says the agent's last run was on
     /// another machine: its first turn's notice says so.
     new_machine: Option<String>,
+    /// Head says the machine resumed from its disk since this agent last
+    /// ran here: its first turn's notice says what was kept and lost.
+    resumed_from_disk: bool,
     /// The machine's skills catalog block, added to the agent's first turn.
     skills_catalog: Mutex<Option<String>>,
     /// The owner of the checkout the agent works in, when it is not its own
@@ -1302,6 +1305,7 @@ impl Runner {
             forge_fetch,
             git_identity,
             new_machine,
+            resumed_from_disk,
             harness_version,
             labels,
         } = command;
@@ -1430,6 +1434,7 @@ impl Runner {
             worktree: Mutex::new(None),
             notice: Mutex::new(None),
             new_machine: new_machine.map(|machine| machine.0),
+            resumed_from_disk,
             skills_catalog: Mutex::new(None),
             wip: self.push_lock(checkout_of.as_ref().unwrap_or(&agent_id)),
             checkout_of: checkout_of.clone(),
@@ -1692,6 +1697,7 @@ impl Runner {
                     let forge_notice = self.forge_notice(&agent);
                     let notice = super::checkout::first_turn_notice(
                         agent.new_machine.as_deref(),
+                        agent.resumed_from_disk,
                         &unrestored,
                         agent.setup.is_some(),
                     );

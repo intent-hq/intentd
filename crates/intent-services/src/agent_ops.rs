@@ -6268,7 +6268,7 @@ impl Services {
                 .await
                 .map(|view| (view, None));
         }
-        let cloud = placement.is_e2b();
+        let cloud = placement.is_cloud();
         let target = if cloud {
             crate::RemoteTarget::Cloud
         } else {
@@ -6404,7 +6404,7 @@ impl Services {
         placement: &intent_core::placement::AgentPlacement,
     ) -> Result<intent_core::remote_launch::RemoteLaunchNeeds> {
         placement.check_remote_supported()?;
-        let target = if placement.is_e2b() {
+        let target = if placement.is_cloud() {
             crate::RemoteTarget::Cloud
         } else {
             crate::RemoteTarget::Machine

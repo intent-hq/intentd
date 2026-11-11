@@ -15,7 +15,7 @@
 //! sequence, then sends it, at most every [`Tuning::ack_interval`] or
 //! [`Tuning::ack_batch`] records, and right after the machine's replay.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -322,6 +322,10 @@ pub(crate) struct Shared {
     /// A relaunch waits out [`StopExit::Owed`], so the stopped process's
     /// exit never reaches the new runtime (intent-hq/intent#8457).
     stop_exits: Mutex<HashMap<AgentId, StopExit>>,
+    /// Agents whose process ended when the machine started again from its
+    /// disk: a `not-running` stop answer for one is final, no exit record
+    /// is coming.
+    lost_processes: Mutex<HashSet<AgentId>>,
     /// Agents whose machine runs an acknowledged final stop settled.
     #[cfg(test)]
     final_settles: Mutex<Vec<AgentId>>,
@@ -1286,13 +1290,37 @@ impl Shared {
     /// `not-running` until its exit is journaled), so its record is owed
     /// too. A first stop answered `not-running` owes nothing.
     fn stop_exit_acked(&self, agent_id: &AgentId, outcome: StopOutcome, resent: bool) {
-        let owed = outcome == StopOutcome::Stopped || resent;
+        let lost = lock(&self.lost_processes).remove(agent_id);
+        let owed = outcome == StopOutcome::Stopped || (resent && !lost);
         let mut exits = lock(&self.stop_exits);
         if owed && matches!(exits.get(agent_id), Some(StopExit::Pending { .. })) {
             exits.insert(agent_id.clone(), StopExit::Owed);
         } else if exits.get(agent_id) != Some(&StopExit::Owed) {
             exits.remove(agent_id);
         }
+    }
+
+    /// The machine started again from its disk: `agents`' processes are
+    /// gone, so no exit record of theirs is coming, and their runtimes here
+    /// end with `error` (a waiting prompt is redriven on a relaunch).
+    pub(crate) fn processes_lost(&self, agents: &[AgentId], error: &str) {
+        lock(&self.lost_processes).extend(agents.iter().cloned());
+        {
+            let mut exits = lock(&self.stop_exits);
+            for agent_id in agents {
+                if exits.get(agent_id) == Some(&StopExit::Owed) {
+                    exits.remove(agent_id);
+                }
+            }
+        }
+        self.stops_changed.send_modify(|n| *n += 1);
+        self.agents.end_all(error);
+    }
+
+    /// A new process of `agent_id` is launched here: the mark of one lost
+    /// in a disk resume no longer applies.
+    pub(crate) fn launching(&self, agent_id: &AgentId) {
+        lock(&self.lost_processes).remove(agent_id);
     }
 
     /// Wait until `agent_id` owes no exit record, or until `deadline`.
@@ -1638,6 +1666,7 @@ impl RemoteNode {
             stops_changed: watch::channel(0).0,
             resending: Mutex::new(HashMap::new()),
             stop_exits: Mutex::new(HashMap::new()),
+            lost_processes: Mutex::default(),
             #[cfg(test)]
             final_settles: Mutex::default(),
             #[cfg(test)]

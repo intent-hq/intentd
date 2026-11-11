@@ -37,6 +37,11 @@ pub struct CreateInstance {
     pub tags: BTreeMap<String, String>,
     /// Makes a retried create return the first machine. Reuse it on every retry.
     pub idempotency_key: Option<String>,
+    /// The provider's compute plan for the size (Northflank: the deployment
+    /// plan). E2B ignores it: its size is in the template.
+    pub plan: Option<String>,
+    /// Disk of a new machine, in GiB, for a provider that makes one.
+    pub disk_gib: Option<u32>,
 }
 
 /// A machine the backend can run commands in.
@@ -47,6 +52,8 @@ pub struct CloudInstance {
     /// Authenticates [`CloudProvider::run_command`], when the provider
     /// issues one per machine.
     pub access_token: Option<SecretString>,
+    /// The machine's own volume, for a provider that makes one.
+    pub volume_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,4 +128,17 @@ pub trait CloudProvider: Send + Sync + fmt::Debug {
     /// Whether `image` is ready to start, as this key sees it. The format
     /// is the provider's (E2B: `<template>:<tag>`).
     fn image_ready<'a>(&'a self, image: &'a str) -> CloudFuture<'a, bool>;
+
+    /// Whether the provider pauses a machine itself once
+    /// [`Self::keep_alive`] stops being renewed. Without such a lease, the
+    /// backend's idle pause is the only one, and `keep_alive` does nothing.
+    fn has_lease(&self) -> bool {
+        true
+    }
+
+    /// Whether a paused machine resumes with its memory and processes.
+    /// `false`: only its disk is kept, and the daemon must be started again.
+    fn keeps_memory(&self) -> bool {
+        true
+    }
 }

@@ -161,6 +161,7 @@ fn launch(id: &str) -> LaunchCommand {
         forge_fetch: None,
         git_identity: None,
         new_machine: None,
+        resumed_from_disk: false,
         harness_version: None,
         labels: Box::default(),
     }
@@ -2287,6 +2288,49 @@ async fn node_runner_prepends_the_checkout_notice_to_the_first_turn_only() {
     assert!(!echoed(&all, "t2", "wip-not-restored"), "{all:#?}");
     h.runner.stop(&AgentId::from("a1"));
     wait_for(&h.runner, "exit", exited("a1")).await;
+}
+
+/// A launch after a disk-only resume (Northflank) tells the agent's first
+/// turn, in the same notice as an unrestored wip, what the machine kept and
+/// lost; later turns and plain launches say nothing about it.
+#[tokio::test]
+async fn node_runner_tells_the_first_turn_after_a_disk_resume() {
+    let Some(h) = harness(2, &[]) else { return };
+    *h.checkouts.notice.lock().unwrap() = Some("wip-not-restored.".into());
+    let mut resumed = launch("a1");
+    resumed.resumed_from_disk = true;
+    h.runner.launch(resumed).await;
+    h.runner.launch(launch("a2")).await;
+    let echoed = |all: &[JournalRecord], turn: &str, expected: &str| {
+        all.iter().any(|r| {
+            r.turn_id.as_deref() == Some(turn)
+                && matches!(&r.body, JournalBody::Notification { notification }
+                    if notification.to_string().contains(expected))
+        })
+    };
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hello"))
+        .await;
+    let all = wait_for(&h.runner, "first turn end", turn_ended("a1", "t1")).await;
+    assert!(
+        echoed(&all, "t1", "stopped and started again from its disk"),
+        "{all:#?}"
+    );
+    assert!(echoed(&all, "t1", "wip-not-restored."), "{all:#?}");
+    h.runner
+        .prompt(&AgentId::from("a1"), "t2".into(), text("again"))
+        .await;
+    let all = wait_for(&h.runner, "second turn end", turn_ended("a1", "t2")).await;
+    assert!(!echoed(&all, "t2", "from its disk"), "{all:#?}");
+    h.runner
+        .prompt(&AgentId::from("a2"), "t3".into(), text("hello"))
+        .await;
+    let all = wait_for(&h.runner, "other agent's turn end", turn_ended("a2", "t3")).await;
+    assert!(!echoed(&all, "t3", "from its disk"), "{all:#?}");
+    for id in ["a1", "a2"] {
+        h.runner.stop(&AgentId::from(id));
+        wait_for(&h.runner, "exit", exited(id)).await;
+    }
 }
 
 /// Every remote agent's first turn on the machine opens with the

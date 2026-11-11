@@ -340,15 +340,26 @@ const NOTE: &str = "Note from Intent: ";
 
 /// What the agent's first turn is told about its checkout, as one notice:
 /// that it runs on `new_machine` (head says its last run was on another
-/// machine), and each saved `wip` that could not be restored (`unrestored`,
+/// machine), that the machine resumed from its disk (`resumed_from_disk`),
+/// and each saved `wip` that could not be restored (`unrestored`,
 /// from [`Prepared::unrestored`]). `setup` is whether a setup script ran for
 /// the checkout. `None` when there is nothing to tell.
 pub(super) fn first_turn_notice(
     new_machine: Option<&str>,
+    resumed_from_disk: bool,
     unrestored: &[String],
     setup: bool,
 ) -> Option<String> {
     let mut parts = Vec::new();
+    if resumed_from_disk && new_machine.is_none() {
+        parts.push(
+            "This machine was stopped and started again from its disk. Your checkout, its \
+             uncommitted changes and your home folder were kept. Running processes, terminals \
+             and scripts stopped: start again the ones you still need. Software installed \
+             outside your home folder may be gone."
+                .to_owned(),
+        );
+    }
     if let Some(machine) = new_machine {
         let restored = if unrestored.is_empty() {
             "Your conversation and your saved work (commits and uncommitted changes from your \

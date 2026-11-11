@@ -49,6 +49,7 @@ async fn cloud_row(backend: &Backend, id: &str, starter: &PrincipalId) {
                 provider: "e2b".into(),
                 cloud_machine_id: "e2b".into(),
                 sandbox_id: format!("sbx-{id}"),
+                volume_id: None,
                 state: CloudSandboxState::Running,
                 template: "intent/intent-node-4x8:0".into(),
                 size: CloudMachineSize::S4x8,
@@ -309,47 +310,236 @@ mod entries {
     async fn a_placement_picks_its_entry_in_the_documented_order() {
         let backend = Backend::new().await;
         let svc = &backend.services;
-        let none = config::resolve(svc, None, None).await;
+        let none = config::resolve(svc, None, None, false).await;
         assert_eq!(reason(none)["reason"], "not-configured");
-        let unknown = reason(config::resolve(svc, Some("e2b-ffffffffffff"), None).await);
+        let unknown = reason(config::resolve(svc, Some("e2b-ffffffffffff"), None, false).await);
         assert_eq!(unknown["reason"], "not-configured");
         assert_eq!(unknown["cloudMachineId"], "e2b-ffffffffffff");
 
         save_entry(&backend, "e2b-aaaaaaaaaaaa", "Alpha").await;
-        let (only, _) = config::resolve(svc, None, None).await.unwrap();
+        let (only, _) = config::resolve(svc, None, None, false).await.unwrap();
         assert_eq!(only, "e2b-aaaaaaaaaaaa", "the only entry");
 
         save_entry(&backend, "e2b-bbbbbbbbbbbb", "Beta").await;
-        let required = reason(config::resolve(svc, None, None).await);
+        let required = reason(config::resolve(svc, None, None, false).await);
         assert_eq!(required["reason"], "entry-required");
         assert_eq!(required["retryable"], false);
         assert_eq!(
             required["entries"],
             json!([
-                { "cloudMachineId": "e2b-aaaaaaaaaaaa", "name": "Alpha" },
-                { "cloudMachineId": "e2b-bbbbbbbbbbbb", "name": "Beta" },
+                { "cloudMachineId": "e2b-aaaaaaaaaaaa", "name": "Alpha", "provider": "e2b" },
+                { "cloudMachineId": "e2b-bbbbbbbbbbbb", "name": "Beta", "provider": "e2b" },
             ])
         );
-        let (chained, _) = config::resolve(svc, None, Some("e2b-bbbbbbbbbbbb"))
+        let (chained, _) = config::resolve(svc, None, Some("e2b-bbbbbbbbbbbb"), false)
             .await
             .unwrap();
         assert_eq!(chained, "e2b-bbbbbbbbbbbb", "the creating chain's entry");
-        let gone = reason(config::resolve(svc, None, Some("e2b-cccccccccccc")).await);
+        let gone = reason(config::resolve(svc, None, Some("e2b-cccccccccccc"), false).await);
         assert_eq!(
             gone["reason"], "entry-required",
             "a removed chain entry is skipped"
         );
 
         save_entry(&backend, "e2b", "Legacy").await;
-        let (legacy, _) = config::resolve(svc, None, None).await.unwrap();
+        let (legacy, _) = config::resolve(svc, None, None, false).await.unwrap();
         assert_eq!(
             legacy, "e2b",
             "an older client's placement falls back to e2b"
         );
-        let (named, _) = config::resolve(svc, Some("e2b-aaaaaaaaaaaa"), Some("e2b"))
+        let (named, _) = config::resolve(svc, Some("e2b-aaaaaaaaaaaa"), Some("e2b"), false)
             .await
             .unwrap();
         assert_eq!(named, "e2b-aaaaaaaaaaaa", "a named entry wins");
+    }
+
+    /// `target: "e2b"` without `cloudMachineId` picks among the E2B entries
+    /// only, with the fallback to `"e2b"`; `target: "cloud"` among every
+    /// entry, with no fallback. A named entry of any provider is used for
+    /// both, and the chain's entry only when it is a candidate.
+    #[tokio::test]
+    async fn a_cloud_placement_picks_among_every_provider() {
+        let backend = Backend::new().await;
+        let svc = &backend.services;
+        let northflank = "northflank-aaaaaaaaaaaa";
+        config::save(
+            svc,
+            northflank,
+            &ProviderConfig::new_northflank("Nf", "proj-1"),
+        )
+        .await
+        .unwrap();
+        let only_nf = reason(config::resolve(svc, None, None, false).await);
+        assert_eq!(
+            only_nf["reason"], "not-configured",
+            "no E2B candidate for target e2b"
+        );
+        let (picked, saved) = config::resolve(svc, None, None, true).await.unwrap();
+        assert_eq!(picked, northflank, "the only entry of any provider");
+        assert!(saved.is_northflank());
+        let (named, _) = config::resolve(svc, Some(northflank), None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            named, northflank,
+            "target e2b accepts a named Northflank entry"
+        );
+
+        save_entry(&backend, "e2b", "Legacy").await;
+        let (legacy, _) = config::resolve(svc, None, None, false).await.unwrap();
+        assert_eq!(legacy, "e2b", "target e2b sees only the E2B entry");
+        let (skipped, _) = config::resolve(svc, None, Some(northflank), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            skipped, "e2b",
+            "a Northflank chain entry is not an E2B candidate"
+        );
+        let (chained, _) = config::resolve(svc, None, Some(northflank), true)
+            .await
+            .unwrap();
+        assert_eq!(chained, northflank, "the chain's entry, of any provider");
+        let required = reason(config::resolve(svc, None, None, true).await);
+        assert_eq!(required["reason"], "entry-required", "no fallback to e2b");
+        let mut entries = required["entries"].as_array().unwrap().clone();
+        entries.sort_by_key(|entry| entry["cloudMachineId"].to_string());
+        assert_eq!(
+            entries,
+            vec![
+                json!({ "cloudMachineId": "e2b", "name": "Legacy", "provider": "e2b" }),
+                json!({ "cloudMachineId": northflank, "name": "Nf", "provider": "northflank" }),
+            ]
+        );
+    }
+
+    /// With `target: "e2b"`, the chain walk skips an agent on a Northflank
+    /// entry and keeps going up to an E2B one; with `"cloud"` it stops at
+    /// the nearest entry of any provider.
+    #[tokio::test]
+    async fn the_chain_walk_skips_other_providers_for_target_e2b() {
+        let backend = Backend::new().await;
+        let svc = &backend.services;
+        save_entry(&backend, "e2b-aaaaaaaaaaaa", "Alpha").await;
+        let northflank = "northflank-bbbbbbbbbbbb";
+        config::save(
+            svc,
+            northflank,
+            &ProviderConfig::new_northflank("Nf", "proj-1"),
+        )
+        .await
+        .unwrap();
+        let grandparent = cloud_agent(&backend, Some("e2b-aaaaaaaaaaaa")).await;
+        let parent = cloud_agent(&backend, Some(northflank)).await;
+        sqlx::query("UPDATE agent_session SET parent_agent_id = ? WHERE id = ?")
+            .bind(grandparent.as_str())
+            .bind(parent.as_str())
+            .execute(backend.store().write_pool())
+            .await
+            .unwrap();
+        let e2b = crate::cloud::chain_entry(svc, Some(parent.clone()), false)
+            .await
+            .unwrap();
+        assert_eq!(e2b.as_deref(), Some("e2b-aaaaaaaaaaaa"));
+        let any = crate::cloud::chain_entry(svc, Some(parent), true)
+            .await
+            .unwrap();
+        assert_eq!(any.as_deref(), Some(northflank));
+    }
+
+    /// A provider that lists `listed` and does nothing else.
+    #[derive(Debug)]
+    struct Listing {
+        kind: &'static str,
+        listed: Vec<intent_nodes::cloud::ListedInstance>,
+    }
+
+    impl intent_nodes::cloud::CloudProvider for Listing {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+        fn create<'a>(
+            &'a self,
+            _: &'a intent_nodes::cloud::CreateInstance,
+        ) -> intent_nodes::cloud::CloudFuture<'a, intent_nodes::cloud::CloudInstance> {
+            unimplemented!()
+        }
+        fn connect<'a>(
+            &'a self,
+            _: &'a str,
+            _: u32,
+        ) -> intent_nodes::cloud::CloudFuture<'a, intent_nodes::cloud::Connected> {
+            unimplemented!()
+        }
+        fn run_command<'a>(
+            &'a self,
+            _: &'a intent_nodes::cloud::CloudInstance,
+            _: &'a intent_nodes::cloud::ProcessSpec,
+        ) -> intent_nodes::cloud::CloudFuture<'a, intent_nodes::cloud::ProcessOutput> {
+            unimplemented!()
+        }
+        fn pause<'a>(&'a self, _: &'a str) -> intent_nodes::cloud::CloudFuture<'a, ()> {
+            unimplemented!()
+        }
+        fn keep_alive<'a>(
+            &'a self,
+            _: &'a str,
+            _: u32,
+        ) -> intent_nodes::cloud::CloudFuture<'a, ()> {
+            unimplemented!()
+        }
+        fn delete<'a>(&'a self, _: &'a str) -> intent_nodes::cloud::CloudFuture<'a, bool> {
+            unimplemented!()
+        }
+        fn list<'a>(
+            &'a self,
+            _: &'a intent_nodes::cloud::ListInstances,
+        ) -> intent_nodes::cloud::CloudFuture<'a, Vec<intent_nodes::cloud::ListedInstance>>
+        {
+            let listed = self.listed.clone();
+            Box::pin(async move { Ok(listed) })
+        }
+        fn check_key(&self) -> intent_nodes::cloud::CloudFuture<'_, ()> {
+            unimplemented!()
+        }
+        fn image_ready<'a>(&'a self, _: &'a str) -> intent_nodes::cloud::CloudFuture<'a, bool> {
+            unimplemented!()
+        }
+    }
+
+    /// A leftover Northflank volume names no entry: it keeps every
+    /// Northflank entry's key for the reaper. On E2B, a sandbox without an
+    /// entry is the legacy entry's only.
+    #[tokio::test]
+    async fn a_leftover_without_an_entry_keeps_a_northflank_key() {
+        let backend = Backend::new().await;
+        let svc = &backend.services;
+        let backend_id = backend.store().daemon_id().await.unwrap();
+        let orphan = intent_nodes::cloud::ListedInstance {
+            id: "volume:intent-0123456789ab".into(),
+            state: intent_nodes::cloud::InstanceState::Paused,
+            tags: std::collections::BTreeMap::from([("intentBackendId".into(), backend_id)]),
+            started_at: String::new(),
+        };
+        let northflank = Listing {
+            kind: "northflank",
+            listed: vec![orphan.clone()],
+        };
+        assert!(
+            crate::cloud::lifecycle::entry_sandboxes_left(
+                svc,
+                &northflank,
+                "northflank-aaaaaaaaaaaa"
+            )
+            .await
+        );
+        let e2b = Listing {
+            kind: "e2b",
+            listed: vec![orphan],
+        };
+        assert!(
+            !crate::cloud::lifecycle::entry_sandboxes_left(svc, &e2b, "e2b-aaaaaaaaaaaa").await
+        );
+        assert!(crate::cloud::lifecycle::entry_sandboxes_left(svc, &e2b, "e2b").await);
     }
 
     async fn configure(backend: &Backend, params: Value) -> intent_core::Result<Value> {
@@ -480,10 +670,10 @@ mod entries {
             .await
             .unwrap()
             .is_none());
-        let none = config::resolve(svc, None, None).await;
+        let none = config::resolve(svc, None, None, false).await;
         assert_eq!(reason(none)["reason"], "not-configured");
         assert_ne!(
-            config::new_cloud_machine_id(svc).await.unwrap(),
+            config::new_cloud_machine_id(svc, "e2b").await.unwrap(),
             "e2b",
             "a new entry does not reuse the id the reaper still holds a key for"
         );
@@ -495,7 +685,12 @@ mod entries {
         .unwrap();
         assert_eq!(noop, json!({ "ok": true, "unconfirmedStops": [] }));
         assert_eq!(
-            config::load_retired(svc).await.unwrap(),
+            config::load_retired(svc)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(row, from, _)| (row, from))
+                .collect::<Vec<_>>(),
             vec![("retired-e2b-0123456789ab".to_owned(), "e2b".to_owned())],
             "remove leaves the reaper's key alone"
         );

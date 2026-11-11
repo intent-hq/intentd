@@ -75,6 +75,7 @@ async fn create_sends_the_image_tags_and_key_and_keeps_the_access_token() {
             pause_on_timeout: Some(true),
             tags: BTreeMap::from([("agentId".into(), "a1".into())]),
             idempotency_key: Some("intent-a1-x".into()),
+            ..CreateInstance::default()
         })
         .await
         .unwrap();
@@ -105,6 +106,7 @@ async fn run_command_reaches_envd_with_the_instance_token() {
         id: "sbx1".into(),
         image: "base".into(),
         access_token: Some(SecretString::new(ENVD_TOKEN)),
+        volume_id: None,
     };
     let mut spec = ProcessSpec::new("/bin/sh");
     spec.args = vec!["-c".into(), "echo hi; exit 3".into()];

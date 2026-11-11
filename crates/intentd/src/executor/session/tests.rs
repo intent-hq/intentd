@@ -102,6 +102,7 @@ fn launch(id: &str) -> LinkFrame {
         forge_fetch: None,
         git_identity: None,
         new_machine: None,
+        resumed_from_disk: false,
         harness_version: None,
         labels: Box::default(),
     })

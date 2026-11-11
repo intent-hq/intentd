@@ -95,6 +95,8 @@ crates/intent-svc-remote/src/*                       intentd::suite_e2e        e
 crates/intent-git/src/node_git.rs                    intentd::suite_e2e        e2e_remote_launch
 crates/intent-transport/src/node_link/*              intentd::suite_e2e        e2e_remote_launch
 crates/intent-core/src/remote_launch.rs              intentd::suite_e2e        e2e_remote_launch
+crates/intent-nodes/src/northflank*                  intentd::suite_e2e        e2e_remote_launch::cloud::northflank
+crates/intent-nodes/src/cloud*                       intentd::suite_e2e        e2e_remote_launch::cloud
 
 # The shared agent egress registry and the secret / exec bindings are proved
 # by the secret-value egress contract in intent-services.
