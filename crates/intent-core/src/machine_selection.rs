@@ -610,9 +610,6 @@ pub enum ProfileRemote {
     },
     /// The user has not marked it for remote machines, so it is refused.
     NotMarked,
-    /// A Default that is not marked: nothing is sent and the machine's own
-    /// sign-in runs it.
-    MachineSignIn,
     /// Its saved settings could not be read; placement decides.
     Unknown,
 }
@@ -670,7 +667,7 @@ impl<'a> PlacementHelpInputs<'a> {
 /// How to place an agent on an exposed machine: the end of the 1.0–3.9
 /// prompt text, and of the 3.10 `ws.help("agent")` text.
 const PLACEMENT_HOW_TO: &str = "To run an agent on one, pass `placement: { target: \"remote\" }` (optionally `nodeId`, `os`, `arch`) in the options of `ws.agent.create` or `ws.agent.delegate`, or as `ws.agent.wakeOrCreate(taskNoteId, contextMessage, model, messageMetadata, reasoningEffort, { create: { placement } })`. Without `nodeId` the backend picks a machine that runs the platform, has the provider signed in (or unknown) and the model listed, with free capacity. When none lists the model the call fails with `model-unavailable`; other refusals are `placement-unavailable` or `machine-update-required`. A remote agent's own sub-agents (`ws.agent.create`, `ws.agent.delegate`, `ws.agent.wakeOrCreate`) run on its machine when no `placement` is given, with the same checks and no fallback; pass `placement: { target: \"local\" }` to run one on the backend. A batch `ws.agent.delegate({ tasks })` takes one `placement` for all its tasks, and an object entry `{ taskNoteId, placement }` its own.\n\
-         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment, or the provider's Default configuration settings when no profile is selected, only when the user marked that configuration for remote machines (an unmarked profile, or one that sets an account folder such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR`, is refused with `profile-not-remote-compatible` and a message saying how to fix it), uses the machine's own provider sign-in when the Default sends nothing (`machine-not-signed-in` when that machine is signed out), and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree): right after each `ws.git.commit` (its result has `pushed`) and before each `ws.agent.reportToParent` is delivered, and at the end of each turn, which is when a plain `git commit` reaches the backend. `ws.agent.setModel` can switch it to another model or marked profile its machine offers; its next turn relaunches it there with the conversation history.\n";
+         A remote agent starts from the workspace's last commit (uncommitted changes are not carried), runs with the selected provider profile's environment, or the provider's Default configuration settings when no profile is selected, only when the user marked that configuration for remote machines (an unmarked profile, or one that sets an account folder such as `CODEX_HOME` / `CLAUDE_CONFIG_DIR`, is refused with `profile-not-remote-compatible` and a message saying how to fix it), uses the machine's own provider sign-in when the Default sends nothing (refused when that machine is not signed in), and pushes its work to `refs/intent/ws/<workspaceId>/agents/<agentId>/head` (commits) and `.../wip` (its working tree): right after each `ws.git.commit` (its result has `pushed`) and before each `ws.agent.reportToParent` is delivered, and at the end of each turn, which is when a plain `git commit` reaches the backend. `ws.agent.setModel` can switch it to another model or marked profile its machine offers; its next turn relaunches it there with the conversation history.\n";
 
 /// Renders the remote-placement text. Each harness version picks one;
 /// [`exposed_machines_help`] is the renderer of harness 1.0 through 3.9.
@@ -791,9 +788,6 @@ fn push_remote(text: &mut String, remote: &ProfileRemote) {
         }
         ProfileRemote::NotMarked => {
             text.push_str(": not marked for remote machines, so it is refused there");
-        }
-        ProfileRemote::MachineSignIn => {
-            text.push_str(": not marked for remote machines; sends nothing and runs with the machine's own sign-in");
         }
         ProfileRemote::Unknown => {
             text.push_str(": remote compatibility unknown (settings unreadable)");

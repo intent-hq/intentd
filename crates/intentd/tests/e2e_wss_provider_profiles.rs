@@ -955,7 +955,9 @@ async fn provider_default_overrides_contract_over_wss() {
             "env": [],
             "settingsFingerprint": "",
             "activation": { "runningProcesses": 0 },
-            "remoteCompatible": true,
+            "remoteCompatible": false,
+            "remoteIncompatibility": { "reason": "not-marked", "keys": [] },
+            "remoteLaunch": "machine-sign-in",
         })
     };
     let list = ok(&mut ws, 1, "providers.profiles.list", json!({})).await;

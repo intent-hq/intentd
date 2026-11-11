@@ -113,7 +113,11 @@ async fn create_saves_the_choice_and_defaults_to_the_migration_rule() {
         field_codes(&err),
         vec![("remoteCompatible".into(), "remote-account-folder".into())]
     );
-    assert!(err.to_string().contains("CLAUDE_CONFIG_DIR"), "{err}");
+    let Error::ProviderProfile(failure) = &err else {
+        panic!("{err:?}");
+    };
+    let message = failure.data["fieldErrors"][0]["message"].as_str().unwrap();
+    assert!(message.contains("CLAUDE_CONFIG_DIR"), "{message}");
     let err = fx
         .create_with(json!({
             "baseProviderId": "codex", "name": "Bad", "remoteCompatible": "yes",
@@ -148,7 +152,10 @@ async fn update_keeps_the_choice_and_adding_a_folder_unmarks() {
         .provider_profiles_update_impl(id.clone(), json!({ "name": "API key" }))
         .await
         .unwrap();
-    assert_eq!(renamed["profile"]["remoteCompatible"], true, "omitted keeps it");
+    assert_eq!(
+        renamed["profile"]["remoteCompatible"], true,
+        "omitted keeps it"
+    );
 
     let err = fx
         .svc
@@ -175,8 +182,7 @@ async fn update_keeps_the_choice_and_adding_a_folder_unmarks() {
         .await
         .unwrap();
     assert_eq!(
-        cleared["profile"]["remoteIncompatibility"]["reason"],
-        "not-marked",
+        cleared["profile"]["remoteIncompatibility"]["reason"], "not-marked",
         "removing the folder never marks it again"
     );
 }
@@ -189,8 +195,14 @@ async fn default_choice_and_machine_sign_in_decide_remote_launch() {
     assert_eq!(row["remoteLaunch"], "machine-sign-in");
 
     fx.machine_sign_in(json!({ "claude-code": false }));
-    assert_eq!(default_row(&fx, "claude-code").await["remoteLaunch"], "refused");
-    assert_eq!(default_row(&fx, "codex").await["remoteLaunch"], "machine-sign-in");
+    assert_eq!(
+        default_row(&fx, "claude-code").await["remoteLaunch"],
+        "refused"
+    );
+    assert_eq!(
+        default_row(&fx, "codex").await["remoteLaunch"],
+        "machine-sign-in"
+    );
 
     let marked = fx
         .svc
@@ -258,7 +270,10 @@ async fn machine_sign_in_setting_validates_and_announces_the_default_change() {
             break event;
         }
     };
-    assert!(bases.len() <= 2, "one event per profile-capable base: {bases:?}");
+    assert!(
+        bases.len() <= 2,
+        "one event per profile-capable base: {bases:?}"
+    );
     assert_eq!(event["data"]["change"], "default-updated");
     assert_eq!(event["data"]["baseProviderId"], "codex");
     assert_eq!(event["data"]["envChanged"], false);
@@ -327,8 +342,14 @@ async fn migration_keeps_todays_behaviour_and_writes_the_choices_once() {
     assert_eq!(saved["version"], 1);
     assert_eq!(saved["profiles"][&api], true);
     assert_eq!(saved["profiles"][&login], false);
-    assert_eq!(saved["profiles"][&unset], true, "an unset folder is not a folder");
-    assert_eq!(saved["defaults"]["codex"], true, "overrides without a folder");
+    assert_eq!(
+        saved["profiles"][&unset], true,
+        "an unset folder is not a folder"
+    );
+    assert_eq!(
+        saved["defaults"]["codex"], true,
+        "overrides without a folder"
+    );
     assert_eq!(saved["defaults"]["claude-code"], false, "no overrides");
     assert!(!saved.to_string().contains(SECRET));
 
@@ -344,7 +365,10 @@ async fn migration_keeps_todays_behaviour_and_writes_the_choices_once() {
             .unwrap()
     };
     assert_eq!(row(&api)["remoteCompatible"], true);
-    assert_eq!(row(&login)["remoteIncompatibility"]["reason"], "account-folder");
+    assert_eq!(
+        row(&login)["remoteIncompatibility"]["reason"],
+        "account-folder"
+    );
 }
 
 /// The choices live outside the profile file, which an older daemon
@@ -375,9 +399,11 @@ async fn an_older_daemon_rewriting_the_profile_file_keeps_the_choices() {
 async fn deleting_a_profile_drops_its_choice() {
     let fx = Fixture::new().await;
     let id = id_of(&fx.create("codex", "API", json!([])).await);
-    fx.svc.provider_profiles_delete_impl(id.clone()).await.unwrap();
-    let saved: Value =
-        serde_json::from_slice(&std::fs::read(fx.choices_file()).unwrap()).unwrap();
+    fx.svc
+        .provider_profiles_delete_impl(id.clone())
+        .await
+        .unwrap();
+    let saved: Value = serde_json::from_slice(&std::fs::read(fx.choices_file()).unwrap()).unwrap();
     assert!(saved["profiles"].get(&id).is_none(), "{saved}");
 }
 
@@ -407,8 +433,14 @@ async fn launch_rules_for_profiles() {
     assert_eq!(data["keys"], json!([]));
     assert!(data.get("machineSignIn").is_none(), "{data}");
     let message = err.to_string();
-    assert!(message.contains("Personal isn't marked for remote machines"), "{message}");
-    assert!(message.contains("Settings → Providers → Claude Code"), "{message}");
+    assert!(
+        message.contains("Personal isn't marked for remote machines"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Settings → Providers → Claude Code"),
+        "{message}"
+    );
 
     let folder = reference_of(&fx.create("claude-code", "Login", folder_env()).await);
     let data = refusal(&fx.plan(&folder).await.unwrap_err());
@@ -432,7 +464,10 @@ async fn launch_rules_for_the_default() {
         .await
         .unwrap();
     let plan = fx.plan("claude-code").await.unwrap();
-    assert!(plan.env.is_none(), "an unmarked Default's overrides stay here");
+    assert!(
+        plan.env.is_none(),
+        "an unmarked Default's overrides stay here"
+    );
     assert!(plan.machine_sign_in);
 
     // Not marked, machine sign-in off: refused.
@@ -489,7 +524,10 @@ async fn launch_rules_on_e2b_never_use_machine_sign_in() {
     let data = refusal(&err);
     assert_eq!(data["reason"], "not-marked");
     assert_eq!(data["machineSignIn"], true);
-    assert!(err.to_string().contains("E2B has no sign-in of its own"), "{err}");
+    assert!(
+        err.to_string().contains("E2B has no sign-in of its own"),
+        "{err}"
+    );
 
     let marked = reference_of(&fx.create("claude-code", "Token", token_env()).await);
     let plan = fx.cloud_plan(&marked).await.unwrap();

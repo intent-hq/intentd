@@ -608,7 +608,8 @@ async fn node_runner_turn_refusal_carries_the_exit_reason() {
         wait_for(&h.runner, "exit", exited("a1")).await
     };
     let exit = exit_error(find(&all, exited("a1"))).unwrap().to_owned();
-    assert!(exit.starts_with(codes::START), "{exit}");
+    // A launch without a profile that the provider refuses as signed out.
+    assert!(exit.starts_with(codes::SIGNED_OUT), "{exit}");
     h.runner
         .prompt(&AgentId::from("a1"), "t2".into(), text("late"))
         .await;
@@ -767,7 +768,8 @@ async fn node_runner_does_not_retry_a_sign_in_failure() {
     h.runner.launch(launch("a1")).await;
     let all = wait_for(&h.runner, "exit", exited("a1")).await;
     let exit = exit_error(find(&all, exited("a1"))).unwrap();
-    assert!(exit.starts_with(codes::START), "{exit}");
+    assert!(exit.starts_with(codes::SIGNED_OUT), "{exit}");
+    assert!(exit.contains("isn't signed in on this machine"), "{exit}");
     assert_eq!(starts(&log), 1);
 }
 

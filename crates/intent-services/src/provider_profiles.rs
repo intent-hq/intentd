@@ -50,8 +50,8 @@ use crate::Services;
 
 mod remote;
 pub(crate) use remote::REMOTE_CHOICES_FILE;
-pub use remote::{RemoteLaunchPlan, RemoteTarget, REMOTE_INCOMPATIBLE_NOT_MARKED};
 use remote::{classify, migration_rule, resolve_choice, ChoiceKey, RemoteChoices};
+pub use remote::{RemoteLaunchPlan, RemoteTarget, REMOTE_INCOMPATIBLE_NOT_MARKED};
 
 /// File name of the metadata document inside the daemon data dir.
 pub(crate) const PROFILES_FILE: &str = "provider-profiles.json";
@@ -1882,7 +1882,9 @@ impl Services {
     /// another machine; §5.54 "Remote compatibility in the catalog"). A row
     /// whose saved environment cannot be read carries neither field (clients
     /// then treat it as compatible and placement decides).
-    pub(crate) async fn provider_profile_catalog(&self) -> (Vec<Value>, Option<Value>, Option<Value>) {
+    pub(crate) async fn provider_profile_catalog(
+        &self,
+    ) -> (Vec<Value>, Option<Value>, Option<Value>) {
         let store = &self.provider_profiles;
         let profiles = store.profiles().unwrap_or_default();
         let mut rows = Vec::with_capacity(profiles.len());
@@ -1979,11 +1981,10 @@ impl Services {
             };
             let compat = match env {
                 None => ProfileRemote::Unknown,
-                Some(env) => match remote(classify(store.default_choice(base), &env.entries, true)) {
-                    ProfileRemote::Compatible => ProfileRemote::Compatible,
-                    _ if self.machine_sign_in_on(base) => ProfileRemote::MachineSignIn,
-                    other => other,
-                },
+                // An unmarked Default runs through machine sign-in, as the
+                // placement how-to says; only a refused one is listed.
+                Some(_) if self.machine_sign_in_on(base) => ProfileRemote::Compatible,
+                Some(env) => remote(classify(store.default_choice(base), &env.entries, true)),
             };
             let base = (*base).to_owned();
             if compat != ProfileRemote::Compatible {
@@ -2253,7 +2254,12 @@ impl Services {
         }) {
             let env = load_env(&self.secrets, &meta.id).await?.unwrap_or_default();
             let running = self.profile_activation.running_processes(&meta.id);
-            rows.push(profile_json(meta, &env, running, store.profile_choice(&meta.id)));
+            rows.push(profile_json(
+                meta,
+                &env,
+                running,
+                store.profile_choice(&meta.id),
+            ));
         }
         let saved_defaults = store.defaults()?;
         let mut defaults = Vec::new();
@@ -2267,12 +2273,7 @@ impl Services {
             let running = self
                 .profile_activation
                 .running_processes(&default_activation_key(base));
-            defaults.push(self.default_row(
-                base,
-                saved.name.as_deref(),
-                &env,
-                running,
-            ));
+            defaults.push(self.default_row(base, saved.name.as_deref(), &env, running));
         }
         Ok(json!({ "profiles": rows, "defaults": defaults, "revision": store.revision() }))
     }
@@ -2381,7 +2382,9 @@ impl Services {
         if !errors.is_empty() {
             return Err(field_errors(&errors));
         }
-        let remote_changed = marked != current_marked;
+        // A missing entry is saved too, so the choice no longer follows
+        // the migration rule once written.
+        let remote_changed = store.default_choice(base) != Some(marked);
 
         // A recorded environment whose document is missing reads empty
         // (with no fingerprint); any env write replaces or clears it.
@@ -2617,7 +2620,12 @@ impl Services {
         for meta in after.iter().filter(|p| p.base_provider == base) {
             let env = load_env(&self.secrets, &meta.id).await?.unwrap_or_default();
             let running = self.profile_activation.running_processes(&meta.id);
-            rows.push(profile_json(meta, &env, running, store.profile_choice(&meta.id)));
+            rows.push(profile_json(
+                meta,
+                &env,
+                running,
+                store.profile_choice(&meta.id),
+            ));
         }
         store.persist(after, store.pending())?;
         let revision = store.bump_revision();
@@ -2721,7 +2729,9 @@ impl Services {
         )
         .await;
         let running = self.profile_activation.running_processes(&meta.id);
-        Ok(json!({ "profile": profile_json(&meta, &env, running, store.profile_choice(&id)), "revision": revision }))
+        Ok(
+            json!({ "profile": profile_json(&meta, &env, running, store.profile_choice(&id)), "revision": revision }),
+        )
     }
 
     async fn provider_profiles_update_owned(
@@ -2782,7 +2792,7 @@ impl Services {
         if !errors.is_empty() {
             return Err(field_errors(&errors));
         }
-        let remote_changed = marked != current_marked;
+        let remote_changed = store.profile_choice(&profile_id) != Some(marked);
 
         let env_changed = entries
             .as_ref()

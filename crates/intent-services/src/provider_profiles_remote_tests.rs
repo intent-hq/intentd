@@ -371,7 +371,11 @@ async fn profile_reads_say_whether_the_configuration_runs_on_another_machine() {
         assert_eq!(row["remoteCompatible"], false, "{base}");
         assert_eq!(
             row["remoteIncompatibility"]["reason"],
-            if base == "codex" { "account-folder" } else { "not-marked" },
+            if base == "codex" {
+                "account-folder"
+            } else {
+                "not-marked"
+            },
             "{base}"
         );
         assert_eq!(row["remoteLaunch"], "machine-sign-in", "{base}");

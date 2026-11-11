@@ -3030,7 +3030,9 @@ fn exit_detail(exit_code: Option<i32>, error: Option<&str>) -> String {
         &error[..end]
     });
     match (error, exit_code) {
-        (Some(error), _) if error.starts_with(codes::START) || error.starts_with(codes::SIGNED_OUT) => {
+        (Some(error), _)
+            if error.starts_with(codes::START) || error.starts_with(codes::SIGNED_OUT) =>
+        {
             format!("the provider did not start ({error})")
         }
         (Some(error), _) => format!("the agent has exited ({error})"),

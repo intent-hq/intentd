@@ -997,10 +997,16 @@ async fn an_agent_placed_on_e2b_runs_on_its_own_sandbox() {
         "testing a key makes no sandbox"
     );
 
-    // No profile environment, or an account folder: refused, no sandbox.
+    // An unmarked Default (no sign-in on a sandbox), or an account folder:
+    // refused, no sandbox.
     let bare = rpc(&mut rpc_ws, 9, "agent.create", create("codex", "Bare")).await;
     assert_eq!(bare["error"]["code"], -32602, "{bare}");
-    assert_eq!(bare["error"]["data"]["code"], "cloud-profile-required");
+    assert_eq!(
+        bare["error"]["data"]["code"],
+        "profile-not-remote-compatible"
+    );
+    assert_eq!(bare["error"]["data"]["reason"], "not-marked");
+    assert_eq!(bare["error"]["data"]["machineSignIn"], true);
     assert_eq!(bare["error"]["data"]["providerRef"], "codex");
     let tied = rpc(&mut rpc_ws, 10, "agent.create", create(&folder_ref, "Tied")).await;
     assert_eq!(tied["error"]["code"], -32602, "{tied}");

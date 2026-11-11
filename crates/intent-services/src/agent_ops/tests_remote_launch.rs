@@ -645,15 +645,11 @@ fn assert_not_remote_compatible(
         panic!("expected profile-not-remote-compatible, got {result:?}");
     };
     assert!(!failure.internal);
-    assert_eq!(
-        failure.data,
-        json!({
-            "code": "profile-not-remote-compatible",
-            "providerRef": reference,
-            "reason": "account-folder",
-            "keys": [key],
-        })
-    );
+    assert_eq!(failure.data["code"], "profile-not-remote-compatible");
+    assert_eq!(failure.data["providerRef"], reference);
+    assert_eq!(failure.data["reason"], "account-folder");
+    assert_eq!(failure.data["keys"], json!([key]));
+    assert!(failure.data["name"].is_string(), "{}", failure.data);
     assert!(
         failure.message.contains("account folder") && failure.message.contains(key),
         "{}",
@@ -661,10 +657,11 @@ fn assert_not_remote_compatible(
     );
 }
 
-/// A configuration that sets an account folder never runs on another
-/// machine, so placement refuses it before asking any machine (§5.54
-/// "Remote compatibility"): a profile, or a bare base whose Default
-/// overrides set one.
+/// A profile that sets an account folder never runs on another machine, so
+/// placement refuses it before asking any machine (§5.54 "Remote
+/// compatibility"). A Default that sets one is never marked: with machine
+/// sign-in on (the default) it sends nothing and the machine's own sign-in
+/// runs it.
 #[tokio::test]
 async fn placement_refuses_a_configuration_tied_to_this_backend() {
     let (_t, svc, ws) = setup().await;
@@ -697,20 +694,26 @@ async fn placement_refuses_a_configuration_tied_to_this_backend() {
     )
     .await
     .unwrap();
-    let result = svc
-        .admit_remote_agent(
-            &ws,
-            "claude-code",
-            None,
-            &placement(json!({"target": "remote"})),
-            false,
-        )
-        .await;
-    assert_not_remote_compatible(&result, "claude-code", "CLAUDE_CONFIG_DIR");
     assert!(
         remote.needs.lock().unwrap().is_empty(),
-        "no machine was asked"
+        "no machine was asked for the folder profile"
     );
+    svc.admit_remote_agent(
+        &ws,
+        "claude-code",
+        None,
+        &placement(json!({"target": "remote"})),
+        false,
+    )
+    .await
+    .expect("an unmarked Default runs through machine sign-in");
+    let needs = remote.needs.lock().unwrap().clone();
+    assert_eq!(needs.len(), 1);
+    assert!(
+        !needs[0].with_profile,
+        "the folder never leaves the backend"
+    );
+    assert!(needs[0].machine_sign_in);
 }
 
 /// A remote agent switches to another model its machine offers: saved, and
@@ -759,20 +762,28 @@ async fn a_remote_agent_cannot_switch_to_what_its_machine_does_not_offer() {
     )
     .await;
     let id = remote_agent(&svc, &ws).await;
-    for (model, provider) in [("opus4.5", None), ("opus", Some("claude-code"))] {
-        let result = svc
-            .agent_set_model_op(id.clone(), model.into(), provider.map(str::to_owned))
-            .await;
-        let Err(Error::ModelUnavailable(failure)) = &result else {
-            panic!("{model}: expected model-unavailable, got {result:?}");
-        };
-        let data = failure.data();
-        assert_eq!(data["code"], "model-unavailable");
-        assert_eq!(data["model"], model);
-        let machines = data["machines"].as_array().unwrap();
-        assert_eq!(machines.len(), 1, "{data}");
-        assert_eq!(machines[0]["nodeId"], "node-1");
-    }
+    let result = svc
+        .agent_set_model_op(id.clone(), "opus4.5".into(), None)
+        .await;
+    let Err(Error::ModelUnavailable(failure)) = &result else {
+        panic!("expected model-unavailable, got {result:?}");
+    };
+    let data = failure.data();
+    assert_eq!(data["code"], "model-unavailable");
+    assert_eq!(data["model"], "opus4.5");
+    let machines = data["machines"].as_array().unwrap();
+    assert_eq!(machines.len(), 1, "{data}");
+    assert_eq!(machines[0]["nodeId"], "node-1");
+    // The Default sends nothing, and the machine is signed out there.
+    let result = svc
+        .agent_set_model_op(id.clone(), "opus".into(), Some("claude-code".into()))
+        .await;
+    let Err(Error::RemoteMachine(failure)) = &result else {
+        panic!("expected machine-not-signed-in, got {result:?}");
+    };
+    assert_eq!(failure.data["code"], "machine-not-signed-in");
+    assert_eq!(failure.data["machines"][0]["nodeId"], "node-1");
+    assert_eq!(failure.data["machines"][0]["status"], "signed-out");
     let session = svc
         .store
         .get_agent_session_with_transcript(&id)

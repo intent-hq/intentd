@@ -1015,9 +1015,11 @@ fn help_says_the_default_configuration_travels_before_the_machine_login() {
         "{text}"
     );
     assert!(
-        text.contains(
-            "uses the machine's own provider login only when that configuration sets nothing"
-        ),
+        text.contains("only when the user marked that configuration for remote machines"),
+        "{text}"
+    );
+    assert!(
+        text.contains("uses the machine's own provider sign-in when the Default sends nothing"),
         "{text}"
     );
     assert!(!text.contains("or with the machine's own provider login when no profile is selected"));
@@ -1377,7 +1379,11 @@ fn signed_out_fleet() -> Fake {
             Some(report(
                 MAC,
                 FRESH,
-                vec![provider("claude-code", ProviderStatus::SignedOut, &["opus"])],
+                vec![provider(
+                    "claude-code",
+                    ProviderStatus::SignedOut,
+                    &["opus"],
+                )],
             )),
         ),
         machine(
@@ -1385,7 +1391,11 @@ fn signed_out_fleet() -> Fake {
             Some(report(
                 MAC,
                 FRESH,
-                vec![provider("claude-code", ProviderStatus::AuthFailed, &["opus"])],
+                vec![provider(
+                    "claude-code",
+                    ProviderStatus::AuthFailed,
+                    &["opus"],
+                )],
             )),
         ),
         machine(
@@ -1393,7 +1403,11 @@ fn signed_out_fleet() -> Fake {
             Some(report(
                 MAC,
                 FRESH,
-                vec![provider("claude-code", ProviderStatus::CliMissing, &["opus"])],
+                vec![provider(
+                    "claude-code",
+                    ProviderStatus::CliMissing,
+                    &["opus"],
+                )],
             )),
         ),
     ])
@@ -1422,7 +1436,13 @@ async fn a_machine_sign_in_launch_on_signed_out_machines_is_machine_not_signed_i
         .as_array()
         .unwrap()
         .iter()
-        .map(|m| format!("{}:{}", m["nodeId"].as_str().unwrap(), m["status"].as_str().unwrap()))
+        .map(|m| {
+            format!(
+                "{}:{}",
+                m["nodeId"].as_str().unwrap(),
+                m["status"].as_str().unwrap()
+            )
+        })
         .collect();
     names.sort();
     assert_eq!(names, ["failed:auth-failed", "out:signed-out"]);

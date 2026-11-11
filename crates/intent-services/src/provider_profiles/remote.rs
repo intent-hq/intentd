@@ -204,7 +204,11 @@ pub(super) fn migration_rule(entries: &[StoredEnv], default: bool) -> bool {
 }
 
 /// The read classification of a saved configuration.
-pub(super) fn classify(choice: Option<bool>, entries: &[StoredEnv], default: bool) -> RemoteCompatibility {
+pub(super) fn classify(
+    choice: Option<bool>,
+    entries: &[StoredEnv],
+    default: bool,
+) -> RemoteCompatibility {
     let keys = doc_folder_keys(entries);
     if !keys.is_empty() {
         return RemoteCompatibility::NotRemoteCompatible {
@@ -236,7 +240,9 @@ fn classify_overlay(
                 key: key.to_owned(),
                 value: String::new(),
             },
-            None => StoredEnv::Unset { key: key.to_owned() },
+            None => StoredEnv::Unset {
+                key: key.to_owned(),
+            },
         })
         .collect();
     classify(choice, &entries, default)
@@ -438,7 +444,10 @@ impl Services {
     /// `remoteIncompatibility` and `remoteLaunch`.
     pub(super) fn annotate_default(&self, row: &mut Value, base: &str, entries: &[StoredEnv]) {
         let compat = classify(self.provider_profiles.default_choice(base), entries, true);
-        row["remoteLaunch"] = json!(default_remote_launch(&compat, self.machine_sign_in_on(base)));
+        row["remoteLaunch"] = json!(default_remote_launch(
+            &compat,
+            self.machine_sign_in_on(base)
+        ));
         compat.annotate(row);
     }
 
@@ -455,7 +464,11 @@ impl Services {
             let Ok(env) = self.load_default_env(&meta).await else {
                 continue;
             };
-            let compat = classify(self.provider_profiles.default_choice(base), &env.entries, true);
+            let compat = classify(
+                self.provider_profiles.default_choice(base),
+                &env.entries,
+                true,
+            );
             let value = default_remote_launch(&compat, self.machine_sign_in_on(base));
             launch.insert((*base).to_owned(), json!(value));
             if value == "refused" {
