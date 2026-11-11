@@ -1129,6 +1129,7 @@ async fn a_failed_setup_is_an_error_and_removes_the_machine() {
 
 /// Run the setup script against `home` with fake `id` (answering `uid:gid`,
 /// or failing when `None`) and a `chown` that only logs its arguments.
+#[cfg(unix)]
 fn run_prepare_home(
     home: &std::path::Path,
     owner: Option<(u32, u32)>,
@@ -1156,6 +1157,7 @@ fn run_prepare_home(
     (output, std::fs::read_to_string(&log).unwrap_or_default())
 }
 
+#[cfg(unix)]
 #[test]
 fn prepare_home_hands_the_home_over_only_when_the_owner_differs() {
     use std::os::unix::fs::MetadataExt as _;
