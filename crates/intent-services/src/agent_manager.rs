@@ -11898,6 +11898,7 @@ impl AgentManager {
             agent_id,
             &resolved.selection,
             session.model.as_deref(),
+            false,
         );
 
         // Check if the agent's model/provider has changed (via agent.setModel).
@@ -12322,12 +12323,18 @@ impl AgentManager {
         // Backup failover (PROTOCOL §5.54): the identity this attempt starts
         // with — a quota failure only fails over while the session still
         // carries it.
+        let selection = crate::provider_profiles::canonical_selection(
+            session.provider.as_deref().unwrap_or_default(),
+        );
+        let machine_sign_in = self
+            .services
+            .runs_on_machine_sign_in(session, &selection)
+            .await;
         self.services.note_quota_failover_attempt(
             agent_id,
-            &crate::provider_profiles::canonical_selection(
-                session.provider.as_deref().unwrap_or_default(),
-            ),
+            &selection,
             session.model.as_deref(),
+            machine_sign_in,
         );
         // The node runs the identity the agent was launched with. A switch
         // `agent.setModel` accepted (checked against the machine's report)

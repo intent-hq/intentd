@@ -40,7 +40,8 @@ impl Fixture {
     /// `agent`'s process produced output on an attempt on `reference`.
     fn report_output(&self, agent: &AgentId, reference: &str) {
         self.svc.arm_quota_failover(agent, false);
-        self.svc.note_quota_failover_attempt(agent, reference, None);
+        self.svc
+            .note_quota_failover_attempt(agent, reference, None, false);
         self.svc.note_provider_working(agent);
     }
 

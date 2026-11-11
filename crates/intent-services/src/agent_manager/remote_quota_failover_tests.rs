@@ -488,6 +488,33 @@ async fn a_sent_default_quota_failure_marks_the_backends_account() {
     assert!(local_moved, "the local agent leaves the marked claude-code");
 }
 
+/// A remote agent's turn on the machine's own sign-in says nothing about
+/// this backend's account, so it never clears that account's quota mark
+/// (intent-hq/intent#9100).
+#[intent_test_macros::daemon_test]
+async fn a_machine_sign_in_turn_does_not_clear_the_backends_mark() {
+    let ws = WorkspaceId::from("ws-remote-quota-keep");
+    let id = AgentId::from("agent-remote-quota-keep");
+    let primary = FakeRuntime::new();
+    let port = ScriptedRemote::new(vec![Launch::Runs(primary.clone())]);
+    let (_tmp, mgr, _backup) = remote_agent_with_backup(port.clone(), &id, &ws).await;
+    mgr.services.provider_quota_cache.mark_exhausted(
+        &crate::profile_activation::SettingsRead::elsewhere("claude-code"),
+        None,
+        chrono::Utc::now(),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    send(&mgr, &id, &ws, "hello").await;
+    primary.wait_prompts(1).await;
+    primary.finish.add_permits(1);
+    wait_idle(&mgr, &id).await;
+
+    assert_eq!(
+        mgr.services.exhausted_providers(),
+        vec!["claude-code".to_owned()]
+    );
+}
+
 /// A remote agent out of quota whose only backup uses an account folder on
 /// this backend never switches to it (strict: whether or not the machine
 /// has the folder): it stays on its configuration and fails with what to do,

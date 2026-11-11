@@ -713,7 +713,7 @@ async fn a_user_switch_during_the_failing_attempt_is_never_overridden() {
     fx.mgr.services.arm_quota_failover(&fx.agent, false);
     fx.mgr
         .services
-        .note_quota_failover_attempt(&fx.agent, "claude-code", Some("opus"));
+        .note_quota_failover_attempt(&fx.agent, "claude-code", Some("opus"), false);
 
     assert!(
         !fx.mgr

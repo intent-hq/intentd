@@ -62,6 +62,10 @@ struct FailoverAttempt {
     started_at: chrono::DateTime<chrono::Utc>,
     /// Whether this attempt already reported working to the shared cache.
     working_noted: bool,
+    /// Whether a remote agent runs this attempt on its machine's own
+    /// sign-in: another account, so the attempt never marks or clears this
+    /// backend's reference in the shared cache (intent-hq/intent#9100).
+    machine_sign_in: bool,
 }
 
 /// Agents whose current message is a turn a quota failover cut short (set
@@ -296,6 +300,7 @@ impl Services {
         agent_id: &AgentId,
         selection: &str,
         model: Option<&str>,
+        machine_sign_in: bool,
     ) {
         if let Some(chain) = self.quota_failover_chains.lock().unwrap().get_mut(agent_id) {
             chain.attempt = Some(FailoverAttempt {
@@ -303,6 +308,7 @@ impl Services {
                 model: model.map(str::to_owned),
                 started_at: chrono::Utc::now(),
                 working_noted: false,
+                machine_sign_in,
             });
         }
     }
@@ -318,7 +324,7 @@ impl Services {
             let Some(attempt) = chains.get_mut(agent_id).and_then(|c| c.attempt.as_mut()) else {
                 return;
             };
-            if attempt.working_noted {
+            if attempt.working_noted || attempt.machine_sign_in {
                 return;
             }
             attempt.working_noted = true;
@@ -349,16 +355,26 @@ impl Services {
     /// [`Self::note_provider_exhausted`] for a failed attempt, except one a
     /// remote agent ran on its machine's own sign-in: that account is not
     /// this backend's, so its quota says nothing about this backend's
-    /// reference (intent-hq/intent#9100).
-    async fn note_provider_exhausted_unless_machine_sign_in(
+    /// reference (intent-hq/intent#9100). Uses the answer recorded when the
+    /// attempt started, so a settings change during the turn cannot flip it.
+    fn note_provider_exhausted_unless_machine_sign_in(
         &self,
         agent_id: &AgentId,
-        session: &intent_core::AgentSession,
         selection: &str,
         reported: Option<chrono::DateTime<chrono::Utc>>,
         now: chrono::DateTime<chrono::Utc>,
     ) {
-        if self.runs_on_machine_sign_in(session, selection).await {
+        let machine_sign_in = self
+            .quota_failover_chains
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .and_then(|c| c.attempt.as_ref())
+            .is_some_and(|a| {
+                a.machine_sign_in
+                    && a.selection == provider_profiles::canonical_selection(selection)
+            });
+        if machine_sign_in {
             tracing::info!(agent = %agent_id, provider = %selection, "quota failure on the machine's own sign-in; this backend's reference not marked");
             return;
         }
@@ -525,10 +541,7 @@ impl Services {
         // failed (never a configuration the user switched to meanwhile).
         let recorded = failed_provider.filter(|p| !p.trim().is_empty());
         if let Some(failed) = recorded {
-            self.note_provider_exhausted_unless_machine_sign_in(
-                agent_id, &session, failed, reported, now,
-            )
-            .await;
+            self.note_provider_exhausted_unless_machine_sign_in(agent_id, failed, reported, now);
         }
         if self
             .chain_for_failed_attempt(agent_id, &session, failed_provider)
@@ -540,9 +553,8 @@ impl Services {
         if recorded.is_none() {
             if let Some(failed) = session.provider.as_deref().filter(|p| !p.trim().is_empty()) {
                 self.note_provider_exhausted_unless_machine_sign_in(
-                    agent_id, &session, failed, reported, now,
-                )
-                .await;
+                    agent_id, failed, reported, now,
+                );
             }
         }
         let Some(from) = session.provider.clone() else {
