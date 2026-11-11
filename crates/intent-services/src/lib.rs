@@ -336,7 +336,8 @@ pub use auto_retire::AutoRetireReport;
 pub use config_watcher::{ConfigWatcher, PreparedReloadAdmission};
 pub(crate) use mcp_servers::McpHub;
 pub use provider_profiles::{
-    remote_compatibility_of, RemoteCompatibility, REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER,
+    RemoteCompatibility, RemoteLaunchPlan, RemoteTarget, REMOTE_INCOMPATIBLE_ACCOUNT_FOLDER,
+    REMOTE_INCOMPATIBLE_NOT_MARKED,
 };
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
@@ -18649,11 +18650,16 @@ impl WorkspaceApi for Services {
             // Profile and Default names are host settings: a guest's read
             // keeps the shape but names none of them (§5.54 "Guest reads").
             let guest = self.catalog_caller_is_guest().await?;
-            let (profiles, default_remote_incompatibility) = self.provider_profile_catalog().await;
+            let (profiles, default_remote_launch, default_remote_incompatibility) =
+                self.provider_profile_catalog().await;
             catalog["profiles"] =
                 serde_json::Value::Array(if guest { Vec::new() } else { profiles });
-            // Default configurations that cannot run on another machine
-            // (§5.54 "Remote compatibility"); omitted when none.
+            // What a remote launch of each Default does, and the Defaults
+            // that cannot run on another machine (§5.54 "Remote
+            // compatibility in the catalog"); the second is omitted when none.
+            if let Some(launch) = default_remote_launch {
+                catalog["defaultRemoteLaunch"] = launch;
+            }
             if let Some(defaults) = default_remote_incompatibility {
                 catalog["defaultRemoteIncompatibility"] = defaults;
             }

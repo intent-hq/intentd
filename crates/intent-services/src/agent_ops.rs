@@ -6250,7 +6250,13 @@ impl Services {
         placement: &intent_core::placement::AgentPlacement,
     ) -> Result<intent_core::remote_launch::RemoteLaunchNeeds> {
         placement.check_remote_supported()?;
-        let profile = self.resolve_remote_compatible_env(provider).await?;
+        let target = if placement.is_e2b() {
+            crate::RemoteTarget::Cloud
+        } else {
+            crate::RemoteTarget::Machine
+        };
+        let plan = self.remote_launch_plan(provider, target).await?;
+        let profile = plan.env;
         Ok(intent_core::remote_launch::RemoteLaunchNeeds {
             provider: crate::provider_profiles::parse_profile_ref(provider)
                 .map_or(provider, |(base, _)| base)
@@ -6263,6 +6269,7 @@ impl Services {
                 .is_some_and(|env| env.entries().any(|(_, value)| value.is_some())),
             provider_ref: provider.to_owned(),
             inherited: false,
+            machine_sign_in: plan.machine_sign_in,
         })
     }
 
@@ -7272,7 +7279,13 @@ impl Services {
         reference: &str,
         model: &str,
     ) -> Result<()> {
-        let profile = self.resolve_remote_compatible_env(reference).await?;
+        let target = if view.is_cloud() {
+            crate::RemoteTarget::Cloud
+        } else {
+            crate::RemoteTarget::Machine
+        };
+        let plan = self.remote_launch_plan(reference, target).await?;
+        let profile = plan.env;
         let mut rows = self.store.list_exposed_machines().await?;
         if view.is_cloud() {
             let sets_env = profile
@@ -7300,6 +7313,7 @@ impl Services {
                 provider,
                 model: Some(model).filter(|model| *model != "default"),
                 with_profile: profile.is_some(),
+                machine_sign_in: plan.machine_sign_in,
             },
             time::OffsetDateTime::now_utc(),
         )

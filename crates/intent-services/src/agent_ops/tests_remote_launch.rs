@@ -199,6 +199,7 @@ async fn a_placed_create_persists_its_node_and_reports_what_it_starts_from() {
             sets_profile_env: false,
             provider_ref: "auggie".into(),
             inherited: false,
+            machine_sign_in: false,
         }]
     );
 
@@ -425,6 +426,7 @@ async fn a_saved_profile_is_admitted_for_a_remote_agent() {
             sets_profile_env: true,
             provider_ref: reference.into(),
             inherited: false,
+            machine_sign_in: false,
         }]
     );
 }

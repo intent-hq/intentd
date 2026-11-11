@@ -256,6 +256,9 @@ pub struct RemoteLaunchNeeds {
     /// with none: from an agent on a cloud machine it means that sandbox.
     /// An explicit `target: "e2b"` always means a new sandbox.
     pub inherited: bool,
+    /// A machine sign-in launch: the Default configuration sending nothing,
+    /// so a signed-out machine is `machine-not-signed-in`.
+    pub machine_sign_in: bool,
 }
 
 /// The [`REMOTE_PLACEMENT_METADATA_KEY`] value: the projection fields of an

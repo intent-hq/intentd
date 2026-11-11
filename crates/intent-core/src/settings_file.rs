@@ -114,6 +114,11 @@ pub struct ProvidersSettings {
     /// its own setting: an absent key is off, and a profile never reads its
     /// base provider's entry.
     pub fast_mode: BTreeMap<String, bool>,
+    /// `providers.remoteMachineSignIn` — per base provider (`claude-code`,
+    /// `codex`) on this backend: whether an unmarked Default configuration
+    /// chosen for a remote agent runs with the machine's own sign-in. A
+    /// missing entry is on.
+    pub remote_machine_sign_in: BTreeMap<String, bool>,
 }
 
 /// `[model]` — model defaults (`model.*`). The per-workspace override layer
@@ -1416,6 +1421,10 @@ pub const LEGACY_SETTINGS_PATHS: &[&str] = &[
     "workspace.cowIsolation",
 ];
 
+/// The keys `providers.remoteMachineSignIn` accepts: the base providers
+/// with a Default configuration (`supportsProfiles`).
+const MACHINE_SIGN_IN_PROVIDERS: [&str; 2] = ["claude-code", "codex"];
+
 /// Whether `key` is a valid `providers.fastMode` key: a Fast mode capable
 /// base provider id, or a well-formed profile reference of one
 /// (`<base>@<id>`, id matching `^[a-z0-9][a-z0-9-]{0,31}$`). Existence of
@@ -1589,6 +1598,17 @@ impl SettingsFile {
             return Err(bad(
                 "providers.fastMode",
                 "only claude-code and codex (or one of their named profiles) support Fast mode",
+            ));
+        }
+        if self
+            .providers
+            .remote_machine_sign_in
+            .keys()
+            .any(|id| !MACHINE_SIGN_IN_PROVIDERS.contains(&id.as_str()))
+        {
+            return Err(bad(
+                "providers.remoteMachineSignIn",
+                "only claude-code and codex have a Default configuration to run with the machine's own sign-in",
             ));
         }
         let v = self.notifications.volume;

@@ -626,14 +626,13 @@ impl Services {
     /// Whether `reference` can run on a remote agent's machine. An
     /// unresolvable reference cannot run anywhere, so it is passed over too.
     async fn runs_remotely(&self, agent_id: &AgentId, reference: &str) -> bool {
-        match self.remote_compatibility(reference).await {
-            Ok(crate::RemoteCompatibility::Compatible) => true,
-            Ok(crate::RemoteCompatibility::NotRemoteCompatible { reason, keys }) => {
-                tracing::info!(agent = %agent_id, provider = %reference, reason, ?keys, "backup cannot run on the remote agent's machine; passed over");
-                false
-            }
+        match self
+            .remote_launch_plan(reference, crate::RemoteTarget::Machine)
+            .await
+        {
+            Ok(_) => true,
             Err(e) => {
-                tracing::warn!(agent = %agent_id, provider = %reference, error = %e, "backup unresolvable for a remote agent; passed over");
+                tracing::info!(agent = %agent_id, provider = %reference, error = %e, "backup the launch rules refuse on the remote agent's machine; passed over");
                 false
             }
         }

@@ -52,6 +52,9 @@ pub(super) mod codes {
     pub const PROVIDER: &str = "node-provider-unavailable";
     /// The provider process could not be started or set up.
     pub const START: &str = "node-agent-start-failed";
+    /// A launch without a profile failed because the provider is not signed
+    /// in on this machine.
+    pub const SIGNED_OUT: &str = "node-provider-signed-out";
     /// The selected provider profile cannot be used on this node (a missing
     /// account folder, or an overlay the node cannot read). Nothing falls
     /// back to the node's own login.
@@ -1772,6 +1775,7 @@ impl Runner {
                         Outcome::StartFailed(error, _) => {
                             (None, Some(format!("{}: {error}", codes::START)))
                         }
+                        Outcome::SignedOut(provider) => (None, Some(signed_out_error(&provider))),
                     };
                 };
                 // The agent's workspace API stops with its provider.
@@ -2225,6 +2229,9 @@ impl Runner {
                 Err(error) => {
                     agent.note_auth_failure(&error);
                     if intent_services::provider_auth::is_auth_required(&error) {
+                        if let Some((provider, _)) = &agent.default_account {
+                            return Outcome::SignedOut(provider.clone());
+                        }
                         return Outcome::StartFailed(error.to_string(), false);
                     }
                     // A provider that exits at start often closes its output
@@ -2961,6 +2968,9 @@ enum Outcome {
     Stopped,
     /// Its setup failed; `true` when `initialize` timed out.
     StartFailed(String, bool),
+    /// A launch without a profile was refused as not signed in: the
+    /// provider id.
+    SignedOut(String),
 }
 
 impl Outcome {
@@ -2997,6 +3007,20 @@ const EXIT_DETAIL_MAX: usize = 512;
 
 /// Why an agent exited, as a turn refused after it says: the start failure
 /// or exit error the exit record carries, else the provider's status.
+/// The `node-provider-signed-out` start failure: names the provider and the
+/// fix, never the provider's own error text (it can echo a credential).
+fn signed_out_error(provider: &str) -> String {
+    let name = match provider {
+        "claude-code" => "Claude Code",
+        "codex" => "Codex",
+        other => other,
+    };
+    format!(
+        "{}: {name} isn't signed in on this machine, and Default sends no sign-in of its own. Sign in to {name} on this machine, or pick a profile with an API key or token that is marked for remote machines.",
+        codes::SIGNED_OUT
+    )
+}
+
 fn exit_detail(exit_code: Option<i32>, error: Option<&str>) -> String {
     let error = error.map(|error| {
         let mut end = error.len().min(EXIT_DETAIL_MAX);
@@ -3006,7 +3030,7 @@ fn exit_detail(exit_code: Option<i32>, error: Option<&str>) -> String {
         &error[..end]
     });
     match (error, exit_code) {
-        (Some(error), _) if error.starts_with(codes::START) => {
+        (Some(error), _) if error.starts_with(codes::START) || error.starts_with(codes::SIGNED_OUT) => {
             format!("the provider did not start ({error})")
         }
         (Some(error), _) => format!("the agent has exited ({error})"),

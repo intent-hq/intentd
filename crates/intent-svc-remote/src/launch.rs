@@ -761,6 +761,7 @@ impl RemoteLaunchPort for RemoteLaunch {
                 provider: &needs.provider,
                 model: needs.model.as_deref(),
                 with_profile: needs.with_profile,
+                machine_sign_in: needs.machine_sign_in,
             };
             let candidates =
                 select_machines(&source, request, time::OffsetDateTime::now_utc()).await?;
@@ -1145,9 +1146,17 @@ impl RemoteLaunchPort for RemoteLaunch {
             let provider = session.provider.clone().unwrap_or_default();
             // Resolved at every start, so the node runs with the profile's
             // current values; an unresolvable profile fails the start.
+            let target = if view.is_cloud() {
+                intent_services::RemoteTarget::Cloud
+            } else {
+                intent_services::RemoteTarget::Machine
+            };
+            // The launch rules again: a configuration unmarked since
+            // placement is refused, and an unmarked Default sends nothing.
             let profile_env = svc
-                .resolve_remote_profile_env(&provider)
+                .remote_launch_plan(&provider, target)
                 .await?
+                .env
                 .map(|profile| LaunchProfileEnv(profile.to_node_wire()));
             let agent_features = serde_json::to_value(svc.session_agent_features(&session))
                 .map_err(|e| Error::Internal(format!("encode the agent's features: {e}")))?;

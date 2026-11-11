@@ -1139,6 +1139,15 @@ impl Services {
     /// as is; retry the explicit choice once it becomes reachable).
     pub(crate) fn on_settings_applied(&self, applied: &[Value]) {
         if applied.iter().any(|c| {
+            c.get("path").and_then(Value::as_str) == Some("providers.remoteMachineSignIn")
+        }) {
+            // Each Default's `remoteLaunch` may have moved (§5.54).
+            let this = self.clone();
+            let _ = self.settings_tasks.spawn_draining(async move {
+                this.announce_machine_sign_in_change().await;
+            });
+        }
+        if applied.iter().any(|c| {
             c.get("path").and_then(Value::as_str).is_some_and(|p| {
                 p.starts_with("sourceControl.github.") || p == "sourceControl.activeProvider"
             })
