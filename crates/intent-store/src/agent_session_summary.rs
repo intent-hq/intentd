@@ -23,7 +23,7 @@
 //! [`Store::get_agent_session_without_messages`] (or uses a narrow column
 //! writer such as [`Store::set_agent_session_status`]).
 //!
-//! `tests/agent_session_summary_api.rs` pins these rejections with trybuild
+//! `tests/compile_fail.rs` pins these rejections with trybuild
 //! compile-fail cases.
 //!
 //! [`Store::get_agent_session_summary`]: crate::Store::get_agent_session_summary
