@@ -555,6 +555,15 @@ impl FakeNorthflank {
             dir.join("workspaces").to_string_lossy().into_owned(),
         ));
         env.push(("INTENTD_AUTH_TOKEN".into(), TOKEN.into()));
+        // One port for the container's life, as its settings would fix one:
+        // a restarted daemon must listen where the machine row dials.
+        env.retain(|(key, _)| key != "INTENTD_TCP_PORT");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        env.push(("INTENTD_TCP_PORT".into(), port.to_string()));
         env
     }
 
@@ -862,8 +871,8 @@ async fn an_agent_runs_on_a_northflank_machine_that_resumes_from_its_disk() {
         json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "no exec" }),
     )
     .await;
-    let failed = failure_containing(&mut events, &agent_id, "permission-denied").await;
-    assert!(failed.contains("exec"), "{failed}");
+    let failed = failure_containing(&mut events, &agent_id, "lacks the permission for exec").await;
+    assert!(failed.contains("Northflank token"), "{failed}");
     fake.state().exec_refusal = None;
 
     let log = std::fs::read_to_string(head_dir.join("head.log")).unwrap_or_default();

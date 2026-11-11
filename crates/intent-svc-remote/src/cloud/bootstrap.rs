@@ -30,7 +30,8 @@ const MAX_TAIL_CHARS: usize = 600;
 
 /// Write the daemon's first settings (external listener and tunnel on)
 /// unless the sandbox has some, then start it in the background unless it
-/// already answers, printing [`STARTED`] when it did. The template never
+/// already answers, printing [`STARTED`] when it did and waiting (up to
+/// 50 s) until it answers. The template never
 /// runs intentd, so this first start makes the sandbox's own daemon id,
 /// certificate and tailcat key; on a machine that keeps only its disk, a
 /// later start finds them on the disk.
@@ -53,6 +54,14 @@ if ! intentd call system.status >/dev/null 2>&1; then
     nohup intentd serve >"$dir/serve.log" 2>&1 </dev/null &
   fi
   echo started
+  # A dial right after must find it listening; a start that runs meanwhile
+  # must find it answering, not start a second one.
+  i=0
+  until intentd call system.status >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -ge 50 ] && break
+    sleep 1
+  done
 fi
 "#;
 

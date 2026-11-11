@@ -550,8 +550,18 @@ pub(crate) async fn pause(
 async fn disk_resumed(svc: &Services, feature: &RemoteFeature, machine_id: &str) {
     match super::start::placed_agents(svc.store(), machine_id).await {
         Ok(agents) => {
-            for agent in agents {
+            for agent in &agents {
                 feature.cloud.mark_disk_resumed(agent.agent_id.as_str());
+            }
+            // The new daemon runs none of them: their runtimes here end, so
+            // a waiting prompt is redriven on a relaunch instead of reaching
+            // an agent the machine does not know.
+            if let Some(node) = feature.running_node(machine_id) {
+                let ids: Vec<_> = agents.into_iter().map(|agent| agent.agent_id).collect();
+                node.shared_ref().processes_lost(
+                    &ids,
+                    "transport closed: the machine started again from its disk",
+                );
             }
         }
         Err(error) => {
