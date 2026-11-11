@@ -7214,7 +7214,11 @@ impl Services {
             )
             .await;
         }
-        let lite = AgentLite::from_session(session, 0, None, None, None, None, None);
+        let effective_permission_policy = self
+            .effective_permission_policy(&session)
+            .map(|policy| policy.as_wire().to_string());
+        let mut lite = AgentLite::from_session(session, 0, None, None, None, None, None);
+        lite.effective_permission_policy = effective_permission_policy;
         Ok(json!({ "agent": lite }))
     }
 
