@@ -662,13 +662,23 @@ available. The footer shows specialist and harness metadata when present; select
 the harness version for details. **Move panel** opens the pane movement controls.
 Other panel menus place **Rename** under **Actions** when renaming is available.
 
+The harness details list the agent's features as **On** or **Off**; hover or focus
+a feature to read its description. When the agent's harness records it, the details
+first show **Starting context**: the approximate size in tokens and each part listed
+largest first, with its owner (**Intent** for text Intent writes, **User** for text
+from the user's own files and settings, such as repo rules and skills) and size. Repo
+rules that the provider loads by itself are marked **Not in total**. Skills that were
+left out of the agent, and how to enable them, appear under **Hidden skills**. Agents
+on older harnesses, and agents that have not started yet, show only the features.
+Sizes are estimates, not provider token counts.
+
 When an agent shows a browser tab while its chat is on screen, the tab opens in the
 column next to that chat (right first, then left). It never covers the column you
 are working in; if no other neighbor is free, the view splits beside the chat.
 Keyboard focus stays where it was. When the chat is not on screen,
 Intent picks a panel for the tab without moving focus.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/layout/tab-types/{AgentTabType,AgentViewSettingsDropdown}.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/store/renderer/slices/panel-layout/panel-layout-slice.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/layout/tab-types/{AgentTabType,AgentViewSettingsDropdown}.svelte; src/lib/components/chat/HarnessFeaturesModal.svelte; src/features/agent/prompt-breakdown/PromptBreakdownPanel.svelte; src/lib/components/layout/panel-system/PanelTabBar.svelte; src/store/renderer/slices/panel-layout/panel-layout-slice.ts. -->
 
 **Retire Agent** stops an agent and keeps its conversation so it can be restored later.
 You can retire any agent, including a workspace's last top-level agent. An agent
