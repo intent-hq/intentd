@@ -472,7 +472,7 @@ listed under **Machines <backend> can run agents on**.
 Running agents on those machines is experimental. Agents see each machine's name and
 platform, and look up its providers, sign-in status and models when they need them.
 A Default with **Use on remote machines** turned on in **Settings → Providers** is
-always sent, even to a machine signed in to that provider. Otherwise a machine uses its
+always sent when it has saved settings, even to a machine signed in to that provider. Otherwise a machine uses its
 own provider sign-in when it has one, or a profile with that option turned on is sent
 there; a profile that sets a sign-in folder can't be turned on, and adding an API key to
 a Default turns it on. A provider that is neither signed in on a
