@@ -1186,7 +1186,7 @@ mod emit_path_taxonomy {
         // delivers to the parent agent; never published on the bus.
         "agent:reportToParent",
         // model_catalog.rs — models-cache version key.
-        "antigravity-executable-v1:missing",
+        "antigravity-agy-v1:missing",
     ];
 
     /// `ns:name`, `ns:name:sub`, … — segments of `[A-Za-z0-9._-]`, each

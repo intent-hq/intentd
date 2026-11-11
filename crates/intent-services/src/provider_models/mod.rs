@@ -167,7 +167,14 @@ pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFe
     match provider_id {
         "claude-code" => fetch_claude_code_models().await,
         "codex" => fetch_codex_models().await,
-        "antigravity" => fetch_antigravity_models(None).await,
+        "antigravity" => {
+            fetch_antigravity_models_at(find_provider_binary(
+                "antigravity",
+                intent_providers::antigravity::COMMAND,
+                None,
+            ))
+            .await
+        }
         "pi" => fetch_pi_models().await,
         "droid" => fetch_droid_models().await,
         "opencode" => fetch_opencode_models().await,
@@ -178,34 +185,26 @@ pub(crate) async fn fetch_provider_models(provider_id: &str) -> ProviderModelsFe
     }
 }
 
-/// Native official ACP discovery. No generic authenticate call, prompt,
-/// global configuration, npm fallback, or automatic browser login.
-pub(crate) async fn fetch_antigravity_models(explicit_path: Option<&str>) -> ProviderModelsFetch {
-    fetch_antigravity_models_at(find_provider_binary(
-        "antigravity",
-        "antigravity-acp",
-        explicit_path,
-    ))
-    .await
-}
-
-/// Probe the executable already resolved for this request's cache identity.
+/// `agy acp` catalog: the base models of `configOptions[id="model"]` with the
+/// `thought_level` efforts. The probe never sends `authenticate` or a prompt.
 pub(crate) async fn fetch_antigravity_models_at(binary: Option<PathBuf>) -> ProviderModelsFetch {
     let Some(bin) = binary else {
-        return ProviderModelsFetch::unavailable("antigravity", "antigravity-acp binary not found");
+        return ProviderModelsFetch::unavailable("antigravity", "agy binary not found");
     };
-    finish(
-        "antigravity",
-        antigravity_probe(bin, false, |value| {
-            parse::parse_acp_models(value, "antigravity")
-        })
-        .await,
-    )
+    match antigravity_probe(bin, false, |value| {
+        parse::parse_acp_config_option_models(value, "antigravity")
+    })
+    .await
+    {
+        Err(ProbeError::Rpc(err)) if parse::is_auth_required_error(err.code, &err.message) => {
+            ProviderModelsFetch::unavailable("antigravity", "authentication required")
+        }
+        other => finish("antigravity", other),
+    }
 }
 
+/// A valid `session/new` proves authentication, even with an empty catalog.
 pub(crate) async fn probe_antigravity_auth(bin: PathBuf) -> Option<bool> {
-    // A valid session proves authentication even when its catalog is empty.
-    // Ignore notifications: they cannot prove a successful session/new.
     antigravity_auth_outcome(
         antigravity_probe(bin, true, |value| {
             value
@@ -237,24 +236,24 @@ async fn antigravity_probe<F>(
 where
     F: Fn(&Value) -> Vec<Value>,
 {
-    let helper = std::env::current_exe().map_err(|err| ProbeError::Spawn(err.to_string()))?;
-    let profile = crate::antigravity::probe_profile(&helper)
-        .map_err(|err| ProbeError::Spawn(format!("isolated Antigravity configuration: {err}")))?;
-    let mut cmd = AcpProbeCommand::binary(bin, Vec::new())
-        .cwd(profile.path().to_path_buf())
-        .auth_required_marker(crate::antigravity::AUTH_REQUIRED_MARKER);
-    for (key, value) in crate::antigravity::unattended_env(profile.path(), &helper)
-        .map_err(|err| ProbeError::Spawn(err.to_string()))?
-    {
-        cmd = cmd.env(key, value);
+    let args = [
+        "acp",
+        "--app-data-dir",
+        intent_providers::antigravity::PROBE_APP_DATA_DIR,
+    ]
+    .map(String::from)
+    .to_vec();
+    if !session_only {
+        crate::agy_cli::ensure_current(&bin)
+            .await
+            .map_err(ProbeError::Spawn)?;
     }
-    let outcome = if session_only {
+    let cmd = AcpProbeCommand::binary(bin, args);
+    if session_only {
         probe::run_acp_session_probe(cmd, extract).await
     } else {
         run_acp_probe(cmd, extract).await
-    };
-    drop(profile);
-    outcome
+    }
 }
 
 /// claude-code: ACP probe via the pinned npx adapter. Models arrive in the

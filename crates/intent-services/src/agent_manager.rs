@@ -2799,7 +2799,6 @@ struct AppliedEffort {
 struct AgentHandle {
     execution: RuntimeHandle,
     repository_origin: Arc<RepositoryOrigin>,
-    antigravity_profile: Option<crate::antigravity::SessionProfile>,
     /// MCP servers (workspace bridge + user servers) delivered via the ACP
     /// `session/new` / `session/load` `mcpServers` field for providers that
     /// consume them there (claude-code, codex, droid, grok). Empty for providers
@@ -3001,8 +3000,6 @@ pub struct AgentManager {
     /// sweeps it at startup; `None` (tests / bare wiring) leaves the child's
     /// temp variables as inherited.
     agent_tmp_root: Option<PathBuf>,
-    /// Persistent Antigravity conversation profiles, never startup-swept.
-    antigravity_state_root: Option<PathBuf>,
     /// Dedicated, daemon-owned, empty spawn cwd for chief provider children
     /// (STAB-50). The composition root wires `<data_dir>/chief-cwd`; `None`
     /// (tests / bare wiring) falls back to the temp dir.
@@ -3295,7 +3292,6 @@ impl AgentManager {
             agent_log_root: None,
             agent_config_root: None,
             agent_tmp_root: None,
-            antigravity_state_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
             admission_closed: Mutex::new(false),
@@ -3447,13 +3443,6 @@ impl AgentManager {
         if let Err(e) = removed {
             tracing::warn!(error = %e, "agent temp folder removal task failed");
         }
-    }
-
-    /// Set the private persistent root for Antigravity conversation state.
-    #[must_use]
-    pub fn with_antigravity_state_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.antigravity_state_root = Some(root.into());
-        self
     }
 
     /// Set the dedicated spawn cwd for chief provider children (STAB-50).
@@ -3793,30 +3782,6 @@ impl AgentManager {
             server = server.with_request_context(Arc::new(context));
         }
         let server = Arc::new(server);
-        let antigravity_profile = if opts.provider.id == "antigravity" {
-            let root = self.antigravity_state_root.as_deref().ok_or_else(|| {
-                Error::InvalidInput(
-                    "Antigravity persistent state directory is not configured on this daemon"
-                        .into(),
-                )
-            })?;
-            Some(
-                crate::antigravity::SessionProfile::new(
-                    root,
-                    &format!("{}\0{}", workspace_id.0, agent_id.0),
-                    &self.mcp_bridge_exe,
-                    server.available_tool_names().into_iter().map(str::to_owned),
-                    &opts.tools_to_remove,
-                )
-                .map_err(|err| {
-                    Error::InvalidInput(format!(
-                        "Cannot prepare private Antigravity configuration: {err}"
-                    ))
-                })?,
-            )
-        } else {
-            None
-        };
         let bridge = serve_workspace_mcp_tcp(Arc::clone(&server))
             .await
             .map_err(|e| Error::Internal(format!("mcp bridge bind failed: {e}")))?;
@@ -4072,14 +4037,6 @@ impl AgentManager {
                 bridge.auth_token(),
             );
         }
-        if let Some(profile) = &antigravity_profile {
-            spawn_opts.extra_env.extend(profile.env().map_err(|err| {
-                Error::InvalidInput(format!(
-                    "Cannot configure unattended Antigravity launch: {err}"
-                ))
-            })?);
-        }
-
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<IncomingRequest>();
         let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
         // §5.5b: worker reports bypass the turn router (and the idle wake
@@ -4087,8 +4044,6 @@ impl AgentManager {
         let (worker_tx, worker_rx) = mpsc::unbounded_channel::<intent_acp::workers::WorkerFrame>();
         let hooks = ConnectionHooks {
             workers: Some(worker_tx),
-            auth_required_stdout_marker: (opts.provider.id == "antigravity")
-                .then_some(crate::antigravity::AUTH_REQUIRED_MARKER),
             requests: Some(req_tx),
             notifications: Some(note_tx),
             auth_error_patterns: opts
@@ -4242,7 +4197,6 @@ impl AgentManager {
                 #[cfg(test)]
                 cleanup_services: Some(self.services.clone()),
             }),
-            antigravity_profile,
             session_mcp_servers,
             spawned_model: opts.model.map(std::string::ToString::to_string),
             spawned_provider: opts.provider.command.to_string(),
@@ -4686,15 +4640,7 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<StartedSession> {
-        let (
-            conn,
-            runtime,
-            notes,
-            repository_origin,
-            session_mcp_servers,
-            wake_gate,
-            antigravity_profile,
-        ) = {
+        let (conn, runtime, notes, repository_origin, session_mcp_servers, wake_gate) = {
             let map = self.handles.lock().unwrap();
             let handle = map
                 .get(agent_id)
@@ -4708,7 +4654,6 @@ impl AgentManager {
                 handle.repository_origin.clone(),
                 handle.session_mcp_servers.clone(),
                 handle.wake_gate.clone(),
-                handle.antigravity_profile.clone(),
             )
         };
         // Pause the idle wake listener for the whole session-open (monorepo#855):
@@ -4795,23 +4740,6 @@ impl AgentManager {
                 _ => false,
             })
             .collect();
-
-        if let Some(profile) = &antigravity_profile {
-            let names = session_mcp_servers
-                .iter()
-                .filter_map(|server| match server {
-                    McpServer::Stdio(server) => Some(server.name.clone()),
-                    McpServer::Http(server) => Some(server.name.clone()),
-                    McpServer::Sse(server) => Some(server.name.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            profile.configure_servers(&names).map_err(|err| {
-                Error::InvalidInput(format!(
-                    "Cannot enforce Antigravity MCP restrictions: {err}"
-                ))
-            })?;
-        }
 
         // The persisted model (a bare id) feeds the post-session model
         // application for providers whose adapter takes the model over ACP —
@@ -4981,112 +4909,6 @@ impl AgentManager {
             Err(e) => {
                 tracing::warn!(agent = %agent_id, error = %e, "session/load failed; recreating");
             }
-        }
-
-        // Antigravity requires mode/model confirmation before a candidate
-        // becomes resumable. A failed attempt leaves the prior stored ID and
-        // transcript intact, including across a daemon restart.
-        if provider.id == "antigravity" {
-            let creation = repository_origin.begin_session(RepositoryCreationIntent::Replace {
-                // Preserve the legacy first-set empty expectation without
-                // claiming that it was a strict NULL-to-value winner.
-                expected: Some(stored_id.clone().unwrap_or_default()),
-            });
-            let prepare = || async {
-                let prepared = self
-                    .services
-                    .prepare_acp_session_with_callbacks(
-                        conn.as_ref(),
-                        callbacks.as_ref(),
-                        agent_id,
-                        cwd,
-                        session_mcp_servers,
-                    )
-                    .await?;
-                let model_response = self
-                    .maybe_apply_session_model(
-                        conn.as_ref(),
-                        agent_id,
-                        provider,
-                        &prepared.response.session_id.0,
-                        stored_model.as_deref(),
-                        None,
-                    )
-                    .await?;
-                let candidate = prepared.response.session_id.0.to_string();
-                if candidate.is_empty() {
-                    return Err(Error::InvalidParams(
-                        "Antigravity returned an empty session ID".into(),
-                    ));
-                }
-                Ok::<_, Error>((candidate, (prepared, model_response)))
-            };
-            let ((opened, delivery), model_response) = if let Some((creation, attempt)) = creation {
-                let outcome = boxed_await(|| creation.initialize_compatible(prepare)).await;
-                let (mut prepared, model_response) = outcome.producer?;
-                let query = prepared.query.take();
-                let canonical = crate::agent_session::compatibility_session_id(outcome.result?);
-                let opened = boxed_await(|| {
-                    self.services.finish_antigravity_acp_session(
-                        prepared,
-                        stored_id.as_deref(),
-                        canonical,
-                    )
-                })
-                .await?;
-                (
-                    repository_origin.accept_session(
-                        attempt,
-                        &conn,
-                        crate::agent_session::RepositorySessionOutcome {
-                            response: opened,
-                            owner: outcome.owner,
-                            query,
-                        },
-                    ),
-                    model_response,
-                )
-            } else {
-                let (_, (prepared, model_response)) = prepare().await?;
-                (
-                    (
-                        boxed_await(|| {
-                            self.services
-                                .commit_antigravity_acp_session(prepared, stored_id.as_deref())
-                        })
-                        .await?,
-                        None,
-                    ),
-                    model_response,
-                )
-            };
-            self.force_recreate.lock().unwrap().remove(agent_id);
-            if stored_id.is_some() {
-                self.recreated.lock().unwrap().insert(agent_id.clone());
-            }
-            self.arm_first_turn_prepend(agent_id, provider);
-            boxed_await(|| {
-                self.install_and_apply_thought_level(
-                    conn.as_ref(),
-                    &session_record,
-                    &opened,
-                    model_response,
-                    stored_effort.as_deref(),
-                    None,
-                )
-            })
-            .await;
-            let captured = boxed_await(|| deliver_captured(delivery)).await;
-            return Ok(StartedSession {
-                session_id: opened.session_id,
-                turn: OriginalTurn {
-                    runtime,
-                    connection: Some(conn),
-                    notifications: notes,
-                    origin: repository_origin,
-                    prompt: captured,
-                },
-            });
         }
 
         // 2) Resume impossible but a session existed → recreate + flag for resend.
@@ -5577,9 +5399,8 @@ impl AgentManager {
     /// provider (a stale id from a pre-spawn provider switch must not be
     /// sent); bare ids are treated as provider-local. The `default` sentinel
     /// and empty ids are no-ops. Codex rejection fails startup and discards
-    /// the child so a retry cannot reuse its default model. Antigravity
-    /// requires default permission mode and exact model confirmation,
-    /// including after cold load. Other providers retain best-effort behavior.
+    /// the child so a retry cannot reuse its default model. Other providers
+    /// retain best-effort behavior.
     /// Retain the config-option response so thinking choices can follow the
     /// selected model before applying the stored reasoning effort.
     async fn maybe_apply_session_model(
@@ -5601,45 +5422,6 @@ impl AgentManager {
                     advertised_options,
                 )
                 .await;
-        }
-        if provider.id == "antigravity" {
-            intent_acp::handshake::set_session_mode(conn, acp_session_id, "default")
-                .await
-                .map_err(|error| {
-                    antigravity_setup_error(
-                        "session/set_mode",
-                        &error,
-                        "Antigravity could not enter default permission mode; no prompt was sent"
-                            .into(),
-                    )
-                })?;
-            let raw = stored_model.unwrap_or_default();
-            let bare = raw.strip_prefix("antigravity:").unwrap_or(raw);
-            if bare.is_empty() || bare.eq_ignore_ascii_case("default") {
-                return Ok(None);
-            }
-            let model = Self::provider_local_model_target(provider, stored_model).ok_or_else(|| {
-                Error::InvalidInput("Invalid Antigravity model ID. Refresh models and select an available Antigravity model.".into())
-            })?;
-            let result = intent_acp::session::set_session_config_option_response(conn, acp_session_id, "model", model)
-                .await.map_err(|error| antigravity_setup_error("session/set_config_option", &error, format!(
-                    "Antigravity rejected model {model}. Refresh models and select an available model; no prompt was sent."
-                )))?;
-            let confirmed = result
-                .get("configOptions")
-                .and_then(Value::as_array)
-                .is_some_and(|options| {
-                    options.iter().any(|option| {
-                        option.get("id").and_then(Value::as_str) == Some("model")
-                            && option.get("currentValue").and_then(Value::as_str) == Some(model)
-                    })
-                });
-            if !confirmed {
-                return Err(Error::InvalidInput(format!(
-                    "Antigravity did not confirm model {model}; no prompt was sent. Refresh models and retry."
-                )));
-            }
-            return Ok(Some(result));
         }
         if let Some(model_id) = Self::set_model_target(provider, stored_model) {
             match intent_acp::session::set_session_model(conn, acp_session_id, model_id).await {
@@ -5681,15 +5463,16 @@ impl AgentManager {
                     return Ok(Some(response));
                 }
                 Err(e) => {
-                    // Codex is the only production provider with this
-                    // capability. Its explicit selection must succeed before
-                    // any prompt (or successful model-change notice) is sent.
-                    if provider.config_option_model_strips_effort {
+                    // Codex and Antigravity: an explicit selection must
+                    // succeed before any prompt (or successful model-change
+                    // notice) is sent.
+                    if provider.config_option_model_required {
                         self.kill_child_only(agent_id).await;
                         return Err(match &e {
                             intent_acp::AcpError::Rpc(rpc) if rpc.code == -32602 => {
                                 Error::InvalidParams(format!(
-                                    "Could not apply Codex model '{model_id}': {e}. Select a supported model and retry."
+                                    "Could not apply {} model '{model_id}': {e}. Select a supported model and retry.",
+                                    provider.short_name
                                 ))
                             }
                             // Preserve the ACP detail for the existing spawn
@@ -12252,6 +12035,15 @@ impl AgentManager {
             .map_err(|e| Error::Internal(format!("auggie version probe task failed: {e}")))??;
             resolved.provider_binary = Some(selected);
         }
+        // `agy acp` needs agy `MIN_VERSION`+; a fresh spawn updates an older
+        // agy first, as the Codex/Claude minimum does at launch.
+        if resolved.provider.id == "antigravity" && !self.contains(agent_id) {
+            if let Some(binary) = resolved.provider_binary.clone() {
+                crate::agy_cli::ensure_current(&binary)
+                    .await
+                    .map_err(Error::InvalidParams)?;
+            }
+        }
         // npx version gate (intent-hq/intent#5725): before a fresh child spawns
         // through npx (npx-only providers and optional npx fallbacks), reject
         // an npm-6 npx with an actionable error instead of three doomed
@@ -12449,11 +12241,6 @@ impl AgentManager {
                     if let Some(original) = &original_attempt {
                         boxed_await(|| self.kill_original_child(agent_id, original)).await;
                     }
-                } else if resolved.provider.id == "antigravity" {
-                    // Never let the next turn reuse an unverified child
-                    // through the fast path. Fresh candidates are not committed
-                    // until confirmation; a failed load keeps its prior ID.
-                    boxed_await(|| self.kill_child_only(agent_id)).await;
                 }
                 return Err(error);
             }
@@ -12611,7 +12398,6 @@ impl AgentManager {
         let handle = AgentHandle {
             execution: RuntimeHandle::custom(runtime),
             repository_origin: origin.clone(),
-            antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: session.model.clone(),
             session_open_filled_model: None,
@@ -14865,6 +14651,7 @@ fn resolve_spawn(
             supports_session_mcp_servers: session_mcp,
             supports_config_option_model: config_option_model,
             config_option_model_strips_effort: config_option_model && strips_effort,
+            config_option_model_required: config_option_model && strips_effort,
             supports_set_model: set_model,
             ..*base
         };
@@ -17470,36 +17257,6 @@ fn persist_retry_backoff_ms() -> Vec<u64> {
     )
 }
 
-fn antigravity_setup_error(method: &str, error: &intent_acp::AcpError, rejection: String) -> Error {
-    use intent_acp::AcpError;
-    // Do not forward provider-controlled error text into logs, public errors,
-    // or the string-based spawn retry classifier.
-    match error {
-        AcpError::Timeout(_) => Error::Internal(format!(
-            "Antigravity {method} timed out; no prompt was sent"
-        )),
-        AcpError::Transport(_) => Error::Internal(format!(
-            "Antigravity setup transport closed: {method}; no prompt was sent"
-        )),
-        // The local ACP reader emits this exact sentinel when stdout closes.
-        AcpError::Rpc(rpc)
-            if rpc.code == 0 && rpc.message == "agent stdout closed" && rpc.data.is_none() =>
-        {
-            Error::Internal(format!(
-                "Antigravity {method}: agent stdout closed; no prompt was sent"
-            ))
-        }
-        AcpError::Auth(_) => crate::execution_call::ai_authorization_error(
-            Error::InvalidParams(crate::provider_auth::not_authenticated_message(
-                "antigravity",
-            )),
-            "antigravity",
-            intent_core::execution::ExecutionAuthorizationReason::Rejected,
-        ),
-        _ => Error::InvalidParams(rejection),
-    }
-}
-
 /// Classify whether an error from `ensure_started` is retryable. Retryable
 /// errors include session/new or session/load timeouts and handshake failures
 /// (e.g., "agent stdout closed" when the child dies immediately). Non-retryable
@@ -17523,7 +17280,6 @@ fn is_retryable_spawn_error(err: &Error) -> bool {
         || msg.contains("handshake failed")
         || msg.contains("agent stdout closed")
         || msg.contains("timed out")
-        || msg.starts_with("internal error: Antigravity setup transport closed:")
     {
         return true;
     }
@@ -21625,226 +21381,6 @@ mod role_reminder_tests {
     }
 
     #[test]
-    fn antigravity_setup_errors_preserve_safe_retry_classification() {
-        use intent_acp::{AcpError, JsonRpcError};
-        for method in ["session/set_mode", "session/set_config_option"] {
-            for (error, retryable) in [
-                (AcpError::Timeout("secret-url".into()), true),
-                (AcpError::Transport("secret-url".into()), true),
-                (
-                    AcpError::Rpc(JsonRpcError {
-                        code: 0,
-                        message: "agent stdout closed".into(),
-                        data: None,
-                    }),
-                    true,
-                ),
-                (
-                    AcpError::Rpc(JsonRpcError {
-                        code: -32602,
-                        message: "secret-url timed out".into(),
-                        data: None,
-                    }),
-                    false,
-                ),
-                (
-                    AcpError::Rpc(JsonRpcError {
-                        code: -32603,
-                        message: "secret-url agent stdout closed".into(),
-                        data: None,
-                    }),
-                    false,
-                ),
-                (AcpError::Auth("secret-url".into()), false),
-                (AcpError::Protocol("secret-url timed out".into()), false),
-            ] {
-                let mapped = antigravity_setup_error(
-                    method,
-                    &error,
-                    "Selection was rejected; no prompt was sent".into(),
-                );
-                assert_eq!(is_retryable_spawn_error(&mapped), retryable, "{mapped}");
-                assert!(!mapped.to_string().contains("secret-url"));
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn antigravity_mode_and_model_connection_timeouts_are_retryable() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let (mgr, agent_id, _db) = manager_with(None, None).await;
-        tokio::time::pause();
-        for stalled_method in ["session/set_mode", "session/set_config_option"] {
-            let (client_write, agent_read) = tokio::io::duplex(4096);
-            let (mut agent_write, client_read) = tokio::io::duplex(4096);
-            let responder = tokio::spawn(async move {
-                let mut lines = BufReader::new(agent_read).lines();
-                while let Some(line) = lines.next_line().await.unwrap() {
-                    let request: Value = serde_json::from_str(&line).unwrap();
-                    if request["method"] == stalled_method {
-                        // Keep stdout open: this must be a timeout, not EOF.
-                        std::future::pending::<()>().await;
-                    }
-                    let response = json!({"jsonrpc":"2.0","id":request["id"],"result":{}});
-                    agent_write
-                        .write_all(format!("{response}\n").as_bytes())
-                        .await
-                        .unwrap();
-                }
-            });
-            let conn = Connection::new(client_write, client_read, None, ConnectionHooks::default());
-            let error = mgr
-                .maybe_apply_session_model(
-                    &conn,
-                    &agent_id,
-                    intent_providers::provider_config("antigravity"),
-                    "candidate",
-                    Some("model-a"),
-                    None,
-                )
-                .await
-                .unwrap_err();
-            assert!(is_retryable_spawn_error(&error));
-            assert!(error
-                .to_string()
-                .contains(&format!("{stalled_method} timed out")));
-            responder.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn antigravity_session_setup_requires_default_mode_and_exact_model_ack() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let (mgr, agent_id, _db) = manager_with(None, None).await;
-        for (provider_id, model, mode_error, model_reply, succeeds, expected_calls) in [
-            (
-                "antigravity",
-                "antigravity:gemini-3.7-flash-low",
-                false,
-                json!({"configOptions":[{"id":"model","currentValue":"gemini-3.7-flash-low"}]}),
-                true,
-                2,
-            ),
-            (
-                "antigravity",
-                "gemini-3.7-flash-low",
-                false,
-                json!({"configOptions":[{"id":"model","currentValue":"different"}]}),
-                false,
-                2,
-            ),
-            (
-                "antigravity",
-                "gemini-3.7-flash-low",
-                false,
-                json!(null),
-                false,
-                2,
-            ),
-            (
-                "antigravity",
-                "gemini-3.7-flash-low",
-                false,
-                json!({}),
-                false,
-                2,
-            ),
-            (
-                "antigravity",
-                "gemini-3.7-flash-low",
-                true,
-                json!({}),
-                false,
-                1,
-            ),
-            ("antigravity", "codex:gpt-5", false, json!({}), false, 1),
-            (
-                "antigravity",
-                "antigravity:Gemini Flash",
-                false,
-                json!({}),
-                false,
-                1,
-            ),
-            (
-                "antigravity",
-                "antigravity:default",
-                false,
-                json!({}),
-                true,
-                1,
-            ),
-            (
-                "claude-code",
-                "claude-code:sonnet",
-                false,
-                json!(null),
-                true,
-                1,
-            ),
-        ] {
-            let (writer, requests) = tokio::io::duplex(4096);
-            let (mut replies, reader) = tokio::io::duplex(4096);
-            let connection = Connection::new(writer, reader, None, ConnectionHooks::default());
-            let responder = tokio::spawn(async move {
-                let mut lines = BufReader::new(requests).lines();
-                let mut calls = Vec::new();
-                for _ in 0..expected_calls {
-                    let line = lines.next_line().await.unwrap().unwrap();
-                    let call: Value = serde_json::from_str(&line).unwrap();
-                    let mode = call["method"] == "session/set_mode";
-                    let mut response = json!({"jsonrpc":"2.0", "id":call["id"]});
-                    if (mode && mode_error) || (!mode && model_reply.is_null()) {
-                        response["error"] =
-                            json!({"code":-32602,"message":"rejected: timed out secret-url"});
-                    } else {
-                        response["result"] = if mode { json!({}) } else { model_reply.clone() };
-                    }
-                    replies
-                        .write_all(format!("{response}\n").as_bytes())
-                        .await
-                        .unwrap();
-                    calls.push(call);
-                }
-                calls
-            });
-            let outcome = tokio::time::timeout(
-                intentd_test_support::test_timeout(Duration::from_secs(2)),
-                mgr.maybe_apply_session_model(
-                    &connection,
-                    &agent_id,
-                    intent_providers::find_provider(provider_id).unwrap(),
-                    "sid",
-                    Some(model),
-                    None,
-                ),
-            )
-            .await
-            .expect("bounded model setup");
-            assert_eq!(
-                outcome.is_ok(),
-                succeeds,
-                "{provider_id}/{model}: {outcome:?}"
-            );
-            if provider_id == "antigravity" {
-                if let Err(error) = &outcome {
-                    assert!(!is_retryable_spawn_error(error));
-                    assert!(!error.to_string().contains("secret-url"));
-                }
-            }
-            let calls = responder.await.unwrap();
-            if provider_id == "antigravity" {
-                assert_eq!(calls[0]["method"], "session/set_mode");
-                assert_eq!(calls[0]["params"]["modeId"], "default");
-                if calls.len() == 2 {
-                    assert_eq!(calls[1]["method"], "session/set_config_option");
-                    assert_eq!(calls[1]["params"]["value"], "gemini-3.7-flash-low");
-                }
-            }
-        }
-    }
-
-    #[test]
     fn set_model_target_gates_provider_sentinel_and_compound_prefix() {
         let grok = intent_providers::find_provider("grok").unwrap();
         let auggie = intent_providers::find_provider("auggie").unwrap();
@@ -22159,7 +21695,6 @@ mod dead_child_respawn_tests {
                 cleanup_lease: None,
                 cleanup_services: None,
             }),
-            antigravity_profile: None,
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "node".to_string(),
@@ -24640,7 +24175,7 @@ mod retry_tests {
     #[test]
     fn provider_not_found_is_not_retryable_and_keeps_its_classification() {
         let spawn = intent_acp::AcpError::ProviderNotFound {
-            command: "antigravity-acp".to_string(),
+            command: "agy".to_string(),
             launch: intent_acp::LaunchMode::BareCommand,
         };
         let err = Error::Internal(format!("spawn provider failed: {spawn}"));

@@ -75,9 +75,7 @@ mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;
 pub(crate) use retire::UnarchiveOutcome;
-pub mod antigravity;
-pub mod antigravity_install;
-pub mod antigravity_setup;
+mod agy_cli;
 mod assistant_context;
 mod attachment_upload;
 mod auggie_cli;

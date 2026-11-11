@@ -284,7 +284,7 @@ mod tests {
     fn supports_test_prompt_present_on_every_row_and_respects_opt_outs() {
         let v = catalog(&|_| false);
         for p in v["providers"].as_array().unwrap() {
-            let expected = p["id"] != "unsloth" && p["id"] != "antigravity";
+            let expected = p["id"] != "unsloth";
             assert_eq!(
                 p["supportsTestPrompt"], expected,
                 "supportsTestPrompt mismatch for {}",

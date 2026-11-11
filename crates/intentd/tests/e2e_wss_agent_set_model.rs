@@ -362,25 +362,20 @@ async fn antigravity_catalog_override_change_and_restart_use_current_executable_
     assert_eq!(created["agent"]["model"], "model-b", "{created}");
 }
 
-#[tokio::test]
-async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss() {
+/// Antigravity launches `agy acp` with the stored model applied through
+/// `session/set_config_option`, never `authenticate` or a mode change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn antigravity_runs_agy_acp_and_applies_the_stored_model_over_wss() {
     use std::os::unix::fs::PermissionsExt;
     let Some(script) = gate() else { return };
     let node = intent_providers::resolve_on_path("node").unwrap();
-    for (load, reject_model, dropped_setups) in [
-        (true, false, 0),
-        (false, false, 0),
-        (true, true, 0),
-        (true, false, 2),
-        (true, false, 9),
-    ] {
-        let should_fail = reject_model || dropped_setups == 9;
+    for load in [true, false] {
         let data_dir_guard = temp_data_dir();
         let data_dir = data_dir_guard.path().to_path_buf();
-        let wrapper = data_dir.join("antigravity-fixture");
+        let wrapper = data_dir.join("agy");
         std::fs::write(
             &wrapper,
-            format!("#!/bin/sh\nexec '{}' '{}'\n", node.display(), script),
+            format!("#!/bin/sh\nexec '{}' '{}' \"$@\"\n", node.display(), script),
         )
         .unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -393,16 +388,18 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
         )
         .unwrap();
         let log = data_dir.join("acp-rpc.jsonl");
-        let attempt_file = data_dir.join("config-attempts");
         let behavior =
-            json!({"advertiseLoadSession":load,"rejectSetConfigOption":reject_model,"exitOnModelConfigForAttempts":dropped_setups,"response":"antigravity fixture complete"})
+            json!({"advertiseLoadSession":load,"response":"antigravity fixture complete"})
                 .to_string();
-        let catalog = json!({"models":{"currentModelId":"gemini-3.7-flash-low","availableModels":[
-            {"modelId":"gemini-3.7-flash-low","name":"Gemini 3.7 Flash (Low)"},
-            {"modelId":"gemini-3.6-flash-medium","name":"Gemini 3.6 Flash (Medium)"}
-        ]},"configOptions":[{"id":"model","category":"model","name":"Model","type":"select","currentValue":"gemini-3.7-flash-low","options":[
-            {"value":"gemini-3.7-flash-low","name":"Gemini 3.7 Flash (Low)"},
-            {"value":"gemini-3.6-flash-medium","name":"Gemini 3.6 Flash (Medium)"}
+        let catalog = json!({"models":{"currentModelId":"gemini-3.8-flash-medium","availableModels":[
+            {"modelId":"gemini-3.8-flash-medium","name":"Gemini 3.8 Flash (Medium)"},
+            {"modelId":"gemini-3.8-flash-low","name":"Gemini 3.8 Flash (Low)"},
+            {"modelId":"gemini-4-carbon-medium","name":"Gemini 4 Carbon (Medium)"}
+        ]},"configOptions":[{"id":"model","category":"model","name":"Model","type":"select","currentValue":"gemini-3.8-flash","options":[
+            {"value":"gemini-3.8-flash","name":"Gemini 3.8 Flash"},
+            {"value":"gemini-4-carbon","name":"Gemini 4 Carbon"}
+        ]},{"id":"thought_level","category":"thought_level","name":"Thinking Level","type":"select","currentValue":"medium","options":[
+            {"value":"low","name":"Low"},{"value":"medium","name":"Medium"},{"value":"high","name":"High"}
         ]}]})
         .to_string();
         let child = spawn_serve(
@@ -413,8 +410,6 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
                 ("MOCK_AGENT_BEHAVIOR", &behavior),
                 ("MOCK_AGENT_SESSION_RESULT", &catalog),
                 ("MOCK_AGENT_RPC_LOG", log.to_str().unwrap()),
-                ("MOCK_AGENT_ATTEMPT_FILE", attempt_file.to_str().unwrap()),
-                ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "1,1"),
             ],
         );
         let _daemon = Daemon { child };
@@ -432,19 +427,25 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
             .find(|row| row["id"] == "antigravity")
             .unwrap();
         assert_eq!(provider["installed"], true);
-        // resolvedPath intentionally reports auto-detection, while installed
-        // and the auth/model/session paths honor the configured override.
-        assert_eq!(provider["command"], "antigravity-acp");
+        assert_eq!(provider["command"], "agy");
         let authenticated = antigravity_auth_status(&mut rpc, 3).await;
         assert_eq!(
             authenticated["providers"],
             json!([{"id":"antigravity","authenticated":true}])
         );
         let models = antigravity_catalog(&mut rpc, 4).await;
-        assert_eq!(models["models"].as_array().unwrap().len(), 2, "{models}");
-        assert_eq!(models["models"][0]["id"], "gemini-3.7-flash-low");
+        let ids: Vec<_> = models["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["gemini-3.8-flash", "gemini-4-carbon"], "{models}");
         assert_eq!(models["models"][0]["isDefault"], true);
-        assert!(models["models"][0].get("effortLevels").is_none());
+        assert_eq!(
+            models["models"][0]["effortLevels"],
+            json!(["low", "medium", "high"])
+        );
         let workspace = wss_rpc(
             &mut rpc,
             10,
@@ -461,10 +462,10 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
             json!({"workspaceId":workspace_id,"eventTypes":["agent:*"]}),
         )
         .await;
-        let created = wss_rpc(&mut rpc, 11, "agent.create", json!({"workspaceId":workspace_id,"name":"Antigravity fixture","provider":"antigravity","model":"gemini-3.7-flash-low"})).await;
+        let created = wss_rpc(&mut rpc, 11, "agent.create", json!({"workspaceId":workspace_id,"name":"Antigravity fixture","provider":"antigravity","model":"gemini-3.8-flash"})).await;
         let agent = created["agent"]["id"].as_str().unwrap();
-        for (turn, model) in [(0, "gemini-3.7-flash-low"), (1, "gemini-3.6-flash-medium")] {
-            if turn == 1 && !should_fail {
+        for (turn, model) in [(0, "gemini-3.8-flash"), (1, "gemini-4-carbon")] {
+            if turn == 1 {
                 wss_rpc(&mut rpc, 12, "agent.setModel", json!({"workspaceId":workspace_id,"agentId":agent,"providerId":"antigravity","modelId":model})).await;
             }
             wss_rpc(&mut rpc, 20 + turn, "agent.sendMessage", json!({"workspaceId":workspace_id,"agentId":agent,"content":format!("test turn {turn}")})).await;
@@ -474,21 +475,8 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
                         let frame: Value = serde_json::from_str(&text).unwrap();
                         let event = &frame["params"]["event"];
                         if event["data"]["agentId"] == agent {
-                            if event["type"] == "agent:failed" {
-                                assert!(should_fail, "session error: {event}");
-                                let expected = if reject_model {
-                                    "rejected model"
-                                } else {
-                                    "stdout closed"
-                                };
-                                assert!(
-                                    event.to_string().contains(expected),
-                                    "expected a {expected:?} failure, got: {event}"
-                                );
-                                break;
-                            }
+                            assert_ne!(event["type"], "agent:failed", "session error: {event}");
                             if event["type"] == "agent:idle" {
-                                assert!(!should_fail, "failed setup must not run a prompt");
                                 break;
                             }
                         }
@@ -503,82 +491,41 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
+        assert!(!calls
+            .iter()
+            .any(|call| call["method"] == "authenticate" || call["method"] == "session/set_mode"));
         let prompts: Vec<_> = calls
             .iter()
             .filter(|call| call["method"] == "session/prompt")
             .collect();
-        if should_fail {
-            assert!(
-                prompts.is_empty(),
-                "a failed setup never reaches session/prompt"
-            );
-            let attempts: Vec<_> = calls
-                .iter()
-                .filter(|call| call["method"] == "session/set_config_option")
-                .collect();
-            assert_eq!(
-                attempts.len(),
-                if reject_model { 2 } else { 6 },
-                "each redrive is terminal or bounded to three attempts"
-            );
-            assert_ne!(
-                attempts[0]["pid"], attempts[1]["pid"],
-                "failed setup is reaped, not cached"
-            );
-            continue;
-        }
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|call| call["method"] == "session/set_config_option")
-                .count(),
-            2 + dropped_setups
-        );
         assert_eq!(prompts.len(), 2, "one prompt per turn: {calls:?}");
         assert_ne!(
             prompts[0]["pid"], prompts[1]["pid"],
             "model change respawns"
         );
-        assert_eq!(
-            prompts[0]["geminiHome"], prompts[1]["geminiHome"],
-            "restore keeps private conversation state"
-        );
-        let home = Path::new(prompts[0]["geminiHome"].as_str().unwrap());
-        assert!(home.starts_with(data_dir.canonicalize().unwrap().join("antigravity")));
-        let hooks = std::fs::read_to_string(home.join("config/hooks.json")).unwrap();
-        assert!(hooks.contains("antigravity-tool-guard"));
-        assert!(!hooks.contains("--allow-tool 'start_subagent'"));
-        assert_eq!(
-            serde_json::from_slice::<Value>(
-                &std::fs::read(home.join("config/mcp_config.json")).unwrap()
-            )
-            .unwrap(),
-            json!({"mcpServers":{}})
-        );
-        for (prompt, model) in prompts
-            .iter()
-            .zip(["gemini-3.7-flash-low", "gemini-3.6-flash-medium"])
-        {
+        for (prompt, model) in prompts.iter().zip(["gemini-3.8-flash", "gemini-4-carbon"]) {
+            assert_eq!(
+                prompt["argv"],
+                json!(["acp"]),
+                "sessions use the default app data"
+            );
             let process: Vec<_> = calls
                 .iter()
                 .filter(|call| call["pid"] == prompt["pid"])
                 .collect();
-            let mode = process
-                .iter()
-                .position(|call| call["method"] == "session/set_mode")
-                .unwrap();
             let selected = process
                 .iter()
-                .position(|call| call["method"] == "session/set_config_option")
+                .position(|call| {
+                    call["method"] == "session/set_config_option"
+                        && call["params"]["configId"] == "model"
+                })
                 .unwrap();
             let sent = process
                 .iter()
                 .position(|call| call["method"] == "session/prompt")
                 .unwrap();
-            assert!(mode < selected && selected < sent);
-            assert_eq!(process[mode]["params"]["modeId"], "default");
+            assert!(selected < sent);
             assert_eq!(process[selected]["params"]["value"], model);
-            assert!(!process.iter().any(|call| call["method"] == "authenticate"));
             let opened = process
                 .iter()
                 .find(|call| call["method"] == "session/new" || call["method"] == "session/load")
@@ -589,6 +536,15 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
                 .iter()
                 .any(|server| server["name"] == "workspace-mcp"));
         }
+        assert!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "session/new")
+                .all(|call| call["argv"] == json!(["acp"])
+                    || call["argv"]
+                        == json!(["acp", "--app-data-dir", "antigravity-intent-probe"])),
+            "probes run in their own app data: {calls:?}"
+        );
         assert!(
             prompts[0]["params"]["prompt"]
                 .to_string()
@@ -607,7 +563,7 @@ async fn antigravity_exact_model_and_isolated_profile_survive_respawn_over_wss()
         )
         .await;
         assert_eq!(agent["agent"]["provider"], "antigravity");
-        assert_eq!(agent["agent"]["model"], "gemini-3.6-flash-medium");
+        assert_eq!(agent["agent"]["model"], "gemini-4-carbon");
     }
 }
 

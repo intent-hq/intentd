@@ -766,9 +766,12 @@ use std::time::{Duration, Instant};
 // system.capabilities.cowSupported, and retires the workspace.cowIsolation setting:
 // local-repository creates always provision a linked worktree, and CoW is used only
 // to hydrate from the repo cache.
+// 18.0 removes guided Antigravity setup: providers.setup.status/start/login/cancel
+// (-32601), the providers.setup.openLogin reverse RPC and the antigravitySetup
+// capability. Antigravity now runs the user's `agy acp`.
 // The 13.9/13.10 note paging, annotation and cancellable deletion surface was
 // later removed without a version bump: no client ever adopted it.
-pub const PROTOCOL_VERSION: &str = "17.0";
+pub const PROTOCOL_VERSION: &str = "18.0";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

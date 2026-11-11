@@ -17,7 +17,6 @@
 //! best-effort: a provider whose adapter cannot complete a bare one-shot
 //! turn surfaces a structured failure, never a wire error. `unsloth` opts
 //! out because its first prompt can trigger a long model download/load cycle.
-//! Antigravity opts out because it requires a private guarded profile.
 //!
 //! Result contract (never a wire error once the provider id is known):
 //! success is `{ ok: true }`; failure is `{ ok: false, reason, message }`
@@ -320,7 +319,7 @@ mod tests {
     #[tokio::test]
     async fn unsupported_provider_returns_structured_unsupported() {
         let paths: HashMap<String, String> = HashMap::new();
-        for provider in ["unsloth", "antigravity"] {
+        for provider in ["unsloth"] {
             let v = provider_test_prompt(None, provider, None, &paths, None)
                 .await
                 .unwrap();

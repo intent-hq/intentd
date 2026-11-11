@@ -567,6 +567,20 @@ Cursor agents to delegate through Intent instead, and such runs show as **Subage
 in the timeline. Cursor also loads your own `~/.cursor/mcp.json` and the project's
 `.cursor/mcp.json` servers.
 
+## Use Antigravity as an agent provider
+
+<!-- Sources: packages/intentd/crates/intent-providers/src/{antigravity,config}.rs; packages/intentd/crates/intent-services/src/{agy_cli.rs,provider_models/mod.rs}. -->
+Antigravity is an opt-in provider: enable it in **Settings → Providers**
+(`/settings?tab=providers#providers`). It needs Google's `agy` CLI, version 1.5.0 or
+later, on the daemon host. When agy is older, Intent runs `agy update` before it
+starts an agent or refreshes models. Sign in once on that host with
+`agy acp --login`. Intent runs `agy acp`; a custom path in **Providers** must point to
+the `agy` executable.
+
+Antigravity agents use the user's own agy settings, hooks, and MCP servers. Model
+lists and sign-in checks run in a separate agy data folder, so they do not appear in
+the user's agy history. Choose the thinking level as the reasoning effort.
+
 ## Run Intent in a browser from a cloud machine
 
 `@intent-hq/web` (command `intent-web`) is a new, separately installed server that

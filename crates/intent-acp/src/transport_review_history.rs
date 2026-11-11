@@ -2,7 +2,7 @@
 //! cannot select another method, rewrite the payload, or fall back to raw load.
 use super::{
     catch_unwind, encode_message, mpsc, oneshot, prompt_response, AcpError, AcpResult, Arc,
-    AssertUnwindSafe, AtomicBool, Connection, Ordering, PendingEntryGuard, PendingRequest, Value,
+    AssertUnwindSafe, Connection, Ordering, PendingEntryGuard, PendingRequest, Value,
 };
 use crate::review_monitoring::{Generation, ReviewMonitoringContext};
 
@@ -66,7 +66,6 @@ pub struct PreparedReviewHistoryLoad<'a> {
     boundary: &'a ReviewHistoryLoadBoundary,
     generation: &'a Arc<Generation>,
     deadline: tokio::time::Instant,
-    auth_required: &'a AtomicBool,
     slot: &'a mut Option<(mpsc::OwnedPermit<String>, String)>,
 }
 impl PreparedReviewHistoryLoad<'_> {
@@ -91,10 +90,7 @@ impl PreparedReviewHistoryLoad<'_> {
         let meta = boundary.params.get("_meta").and_then(Value::as_object);
         let context = ReviewMonitoringContext::parse(meta).ok_or_else(unavailable)?;
         self.generation.transfer_prepared(session, &context, || {
-            if tokio::time::Instant::now() >= self.deadline
-                || boundary.writer.is_closed()
-                || self.auth_required.load(Ordering::SeqCst)
-            {
+            if tokio::time::Instant::now() >= self.deadline || boundary.writer.is_closed() {
                 return Err(unavailable());
             }
             let (permit, line) = self.slot.take().ok_or_else(unavailable)?;
@@ -132,7 +128,7 @@ impl Connection {
             pending: self.pending.clone(),
             id,
         };
-        if self.auth_required.load(Ordering::SeqCst) || !generation.current() {
+        if !generation.current() {
             return Err(unavailable());
         }
         let line = encode_message(Some(id), "session/load", &params)?;
@@ -151,7 +147,6 @@ impl Connection {
             boundary: &boundary,
             generation,
             deadline,
-            auth_required: &self.auth_required,
             slot: &mut slot,
         };
         let result = catch_unwind(AssertUnwindSafe(|| admission.admit(&boundary, packet)));
@@ -171,10 +166,11 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::{
-        mpsc, unavailable, AcpResult, Arc, AtomicBool, Connection, Ordering,
-        PreparedReviewHistoryLoad, ReviewHistoryLoadAdmission, ReviewHistoryLoadBoundary,
-        ReviewHistoryLoadReceipt, Value,
+        mpsc, unavailable, AcpResult, Arc, Connection, Ordering, PreparedReviewHistoryLoad,
+        ReviewHistoryLoadAdmission, ReviewHistoryLoadBoundary, ReviewHistoryLoadReceipt, Value,
     };
     use crate::ConnectionHooks;
     use std::sync::atomic::AtomicUsize;
@@ -220,7 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn history_load_rechecks_original_source_after_waiting_for_writer_capacity() {
-        for retirement in ["source", "generation", "authentication", "caller-drop"] {
+        for retirement in ["source", "generation", "caller-drop"] {
             let (connection, mut queue, _peer, _ordinary_writer) = controlled_queue();
             let generation = connection.review_monitoring.lock().unwrap().begin();
             connection.writer_tx.send("held".into()).await.unwrap();
@@ -255,7 +251,6 @@ mod tests {
             match retirement {
                 "source" => current.store(false, Ordering::SeqCst),
                 "generation" => connection.review_monitoring.lock().unwrap().retire(),
-                "authentication" => connection.auth_required.store(true, Ordering::SeqCst),
                 "caller-drop" => {
                     drop(call);
                     assert!(connection.pending.lock().unwrap().is_empty());

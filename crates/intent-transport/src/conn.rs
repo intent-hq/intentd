@@ -308,7 +308,6 @@ pub(crate) struct ConnSubs {
     pub(crate) pairing: crate::pairing::ConnectionPairing,
     subs: HashMap<String, ConnSub>,
     fences: Vec<JoinHandle<()>>,
-    setup: crate::provider_setup::Connection,
     /// The last successful hello's identity, paired with the reservation
     /// that keeps its `clientId` reported active
     /// ([`crate::reverse::PrimaryReverseRegistry::client_active`]) for the
@@ -771,18 +770,6 @@ async fn process_captured_frame(
                 };
             }
         }
-        if let Some(req) = crate::provider_setup::classify(value) {
-            let frame = panic_guard::guard_frame(
-                &method,
-                rpc_id.clone(),
-                subs.setup.handle(req, api.as_ref(), reverse),
-            )
-            .await;
-            return match frame {
-                Some(frame) => out_tx.send_priority(frame).await.is_ok(),
-                None => true,
-            };
-        }
         if let Some(req) = host::classify(value) {
             // Metadata registration does not install a provider for unrelated
             // host dispatch or invite/alias consumers. Keep their absent path.
@@ -967,15 +954,6 @@ async fn process_captured_frame(
                     None => true,
                 };
             }
-            let setup_requested = req.id_present
-                && req
-                    .capabilities
-                    .as_ref()
-                    .and_then(|v| v.get("antigravitySetup"))
-                    .and_then(Value::as_u64)
-                    == Some(1);
-            // A new hello revokes the previous connection-local operation.
-            subs.setup = crate::provider_setup::Connection::default();
             let mut bound = None;
             let frame = panic_guard::guard_frame(&method, rpc_id.clone(), async {
                 let outcome = client::handle(
@@ -1043,12 +1021,6 @@ async fn process_captured_frame(
                     api.presence_bind_client(subs.presence.id().to_string(), client_id);
                 }
             }
-            subs.setup.authorized = setup_requested
-                && !crate::context::is_tcp_connection()
-                && frame
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                    .is_some_and(|v| v.get("result").is_some());
             return match frame {
                 Some(frame) => {
                     let acknowledged = hello_ok

@@ -28,7 +28,7 @@
 //!
 //! The remaining refused methods — the connection-task fast paths (`host.*`,
 //! `browser.*`, `forward.*`, `system.*`, `pairing.*`, `server.*`,
-//! `providers.setup.*`, `invite.inspect` / `invite.accept` /
+//! `invite.inspect` / `invite.accept` /
 //! `invite.challenge` / `invite.prove`)
 //! and the subscription channels — have
 //! no `WorkspaceApi` method to gate; they are protected only by the

@@ -278,47 +278,6 @@ fn structured_notices_without_description_and_legacy_text_remain_distinct() {
 }
 
 #[tokio::test]
-async fn antigravity_auth_marker_fails_pending_and_future_requests_without_url() {
-    let (client_write, mut agent_read) = tokio::io::duplex(4096);
-    let (mut agent_write, client_read) = tokio::io::duplex(4096);
-    let conn = Connection::new(
-        client_write,
-        client_read,
-        None,
-        ConnectionHooks {
-            auth_required_stdout_marker: Some("INTENT_ACP_AUTH_REQUIRED"),
-            ..Default::default()
-        },
-    );
-    let server = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buffer = [0u8; 4096];
-        assert!(agent_read.read(&mut buffer).await.unwrap() > 0);
-        agent_write
-            .write_all(b"INTENT_ACP_AUTH_REQUIRED\nhttps://accounts.google.com/secret-oauth-url\n")
-            .await
-            .unwrap();
-    });
-    let result = conn
-        .request("session/new", json!({}))
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(result.contains("Authentication required"));
-    assert!(!result.contains("secret-oauth-url"));
-    server.await.unwrap();
-    assert!(conn
-        .request("session/new", json!({}))
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("Authentication required"));
-    assert_eq!(conn.pending_len(), 0);
-}
-
-/// An unparseable stdout line is attributed to its agent and measured, never
-/// echoed: the WARN carries the agent id and the line length only.
-#[tokio::test]
 async fn unparseable_stdout_line_warns_with_agent_and_length_only() {
     let capture = WarnCapture::default();
     let _guard = capture.set_as_default();
@@ -401,7 +360,6 @@ async fn routes_requests_and_notifications() {
         workers: None,
         auth_error_patterns: Vec::new(),
         stderr_log_dir: None,
-        auth_required_stdout_marker: None,
         agent_id: None,
     };
 
@@ -4653,10 +4611,10 @@ mod error_tests {
             ),
             (
                 AcpError::ProviderNotFound {
-                    command: "antigravity-acp".into(),
+                    command: "agy".into(),
                     launch: crate::spawn::LaunchMode::BareCommand,
                 },
-                "provider executable not found: `antigravity-acp` (bare command; no \
+                "provider executable not found: `agy` (bare command; no \
                  providers.paths override or discovered binary resolved, so it was looked up \
                  on the daemon PATH)",
             ),

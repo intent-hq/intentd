@@ -782,7 +782,7 @@ fn resolve_probe_binary(
         "droid" => "droid",
         "grok" => "grok",
         "pi" => "pi",
-        "antigravity" => "antigravity-acp",
+        "antigravity" => intent_providers::antigravity::COMMAND,
         "cursor" => intent_providers::cursor::CURSOR_COMMAND,
         _ => return None,
     };

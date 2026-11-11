@@ -53,7 +53,6 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system"] 
 sha2 = "0.11"
 tar = "0.4.46"
 getrandom = "0.4"
-zip = { version = "9.4.2", default-features = false, features = ["deflate"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 zeroize = "1.9"
 aho-corasick = "1.1"

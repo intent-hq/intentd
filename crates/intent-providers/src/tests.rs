@@ -407,6 +407,11 @@ fn config_option_model_partition() {
             !p.config_option_model_strips_effort || p.supports_config_option_model,
             "{id}: config_option_model_strips_effort requires supports_config_option_model"
         );
+        assert_eq!(
+            p.config_option_model_required,
+            matches!(id, "codex" | "antigravity"),
+            "{id}: only codex and antigravity fail setup on a rejected model"
+        );
     }
     // claude-code and pi additionally have no CLI model flag and no
     // set_model path.

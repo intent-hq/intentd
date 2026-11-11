@@ -189,6 +189,10 @@ pub struct ProviderConfig {
     /// bare base ids, and the effort rides the separate `reasoning_effort`
     /// option). Only meaningful alongside `supports_config_option_model`.
     pub config_option_model_strips_effort: bool,
+    /// Whether a rejected `session/set_config_option` model fails setup and
+    /// discards the child before any prompt, instead of continuing on the
+    /// provider default. Only meaningful alongside `supports_config_option_model`.
+    pub config_option_model_required: bool,
     /// Whether the provider supports MCP server configuration via CLI args.
     pub supports_mcp_config: bool,
     /// Whether the provider consumes MCP servers from the ACP `session/new` /
@@ -316,7 +320,6 @@ pub struct ProviderConfig {
     /// by onboarding to verify the provider actually answers. `false` for
     /// unsloth — its first prompt can trigger a very long model
     /// download/load cycle, so a bounded probe would time out spuriously.
-    /// Antigravity also opts out because it requires a private guarded profile.
     pub supports_test_prompt: bool,
     /// When true, an auto-approved permission prompt (headless `AllowAll` /
     /// `AutoByRisk` policies) selects the provider's `allow_once` option
@@ -368,6 +371,7 @@ impl ProviderConfig {
             supports_set_model: false,
             supports_config_option_model: false,
             config_option_model_strips_effort: false,
+            config_option_model_required: false,
             supports_mcp_config: false,
             supports_session_mcp_servers: false,
             mcp_via_pi_extension: false,
@@ -532,6 +536,7 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // generic `thought_level` option (`reasoning_effort`).
         supports_config_option_model: true,
         config_option_model_strips_effort: true,
+        config_option_model_required: true,
         auth_check_args: Some(&["login", "status"]),
         // The auth-remedy hint must name the real `codex` CLI — the auth
         // probe runs `codex login status` on it — not the adapter `command`
@@ -699,18 +704,32 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
     },
     ProviderConfig {
         short_name: "Antigravity",
+        // `agy acp` (agy >= 1.5.0) is the official ACP server.
+        base_args: &["acp"],
         can_be_disabled: true,
-        // Generic one-shot probes bypass the private Antigravity profile.
-        supports_test_prompt: false,
-        supports_config_option_model: true,
         supports_session_mcp_servers: true,
         injection_mechanism: InjectionMechanism::FirstTurnPrepend,
-        auth_error_patterns: Some(&["authentication required", "intent_acp_auth_required"]),
-        login_command_hint: Some("intentd provider login antigravity"),
-        login_docs_url: Some("https://antigravity.google/docs/ide/extensions"),
-        // Saved personal OAuth is reused by session/new. Do not send the
-        // generic authenticate method "none", or map AllowAll to yolo.
-        ..ProviderConfig::empty("antigravity", "Google Antigravity", "antigravity-acp")
+        // `configOptions[id="model"]` takes the base id ("gemini-3.8-flash")
+        // or an effort variant ("gemini-3.8-flash-low"); `thought_level`
+        // carries the effort. A saved model agy no longer offers fails setup
+        // instead of silently running on the default.
+        supports_config_option_model: true,
+        config_option_model_required: true,
+        // A saved sign-in is reused by `session/new`. `authenticate` starts
+        // a browser login, which a headless daemon must not do.
+        supports_authenticate: false,
+        // `session/new` signed out: "Authentication required".
+        auth_error_patterns: Some(&["authentication required"]),
+        login_command_hint: Some("agy acp --login"),
+        login_docs_url: Some("https://antigravity.google/docs"),
+        // No spawn-time tool removal: `agy acp` has no disable-tool flag.
+        // Role restrictions are prompt-only; MCP-side filtering still covers
+        // workspace tools.
+        ..ProviderConfig::empty(
+            "antigravity",
+            "Google Antigravity",
+            crate::antigravity::COMMAND,
+        )
     },
     ProviderConfig {
         // `cursor-agent` is a bash launcher that runs Cursor's bundled `node`
