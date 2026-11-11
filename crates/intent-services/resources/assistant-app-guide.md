@@ -670,11 +670,12 @@ Other panel menus place **Rename** under **Actions** when renaming is available.
 
 The harness details list the agent's features as **On** or **Off**; hover or focus
 a feature to read its description. When the agent's harness records it, the details
-first show **Starting context**: the approximate size in tokens and each part listed
-largest first, with its owner (**Intent** for text Intent writes, **User** for text
-from the user's own files and settings, such as repo rules and skills) and size. Repo
-rules that the provider loads by itself are marked **Not in total**. Skills that were
-left out of the agent, and how to enable them, appear under **Hidden skills**. Agents
+first show **Starting context**: the approximate size in tokens, then three groups
+with their summed sizes: **Native** (repo rules the provider loads by itself, marked
+**Not in total**), **User** (text from the user's own files and settings, such as
+repo rules and skills) and **Intent** (text Intent writes). Click a group to list its
+parts largest first. Skills that were left out of the agent are counted under
+**Hidden skills**; click it to see each skill and how to enable it. Agents
 on older harnesses, and agents that have not started yet, show only the features.
 Sizes are estimates, not provider token counts.
 
