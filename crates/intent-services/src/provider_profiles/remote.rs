@@ -212,6 +212,31 @@ fn doc_folder_keys(entries: &[StoredEnv]) -> Vec<String> {
     }))
 }
 
+/// The API key and token variables whose addition marks a Default for
+/// remote machines (§5.54 "Credential auto-mark").
+const CREDENTIAL_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CODEX_ACCESS_TOKEN",
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+];
+
+/// Whether `next` sets a credential that `saved` did not set: a Default
+/// write that adds one is marked for remote machines unless it says
+/// otherwise or sets an account folder.
+pub(super) fn adds_credential(saved: &[StoredEnv], next: &[StoredEnv]) -> bool {
+    let sets = |entries: &[StoredEnv], key: &str| {
+        entries.iter().any(
+            |entry| matches!(entry, StoredEnv::Set { key: k, .. } if k.eq_ignore_ascii_case(key)),
+        )
+    };
+    CREDENTIAL_KEYS
+        .iter()
+        .any(|key| sets(next, key) && !sets(saved, key))
+}
+
 /// The migration rule, which is today's behaviour: a profile is marked
 /// unless it sets an account folder; a Default is marked when it has saved
 /// entries and no account folder.

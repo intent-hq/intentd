@@ -50,7 +50,7 @@ use crate::Services;
 
 mod remote;
 pub(crate) use remote::REMOTE_CHOICES_FILE;
-use remote::{classify, migration_rule, resolve_choice, ChoiceKey, RemoteChoices};
+use remote::{adds_credential, classify, migration_rule, resolve_choice, ChoiceKey, RemoteChoices};
 pub use remote::{RemoteLaunchPlan, RemoteTarget, REMOTE_INCOMPATIBLE_NOT_MARKED};
 
 /// File name of the metadata document inside the daemon data dir.
@@ -2376,8 +2376,16 @@ impl Services {
         let current_marked = store
             .default_choice(base)
             .unwrap_or_else(|| migration_rule(&saved_doc.entries, true));
+        // Adding an API key or token marks the Default unless the write
+        // says otherwise or the Default sets an account folder (§5.54
+        // "Credential auto-mark").
+        let next_entries = entries.as_deref().unwrap_or(&saved_doc.entries);
+        let auto_mark = remote_requested.is_none()
+            && adds_credential(&saved_doc.entries, next_entries)
+            && classify(Some(true), next_entries, true) == RemoteCompatibility::Compatible
+            && store.choices().is_ok();
         let marked = resolve_choice(
-            remote_requested,
+            remote_requested.or(auto_mark.then_some(true)),
             Some(current_marked),
             entries.as_deref().unwrap_or(&saved_doc.entries),
             true,
