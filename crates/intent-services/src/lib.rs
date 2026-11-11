@@ -18628,6 +18628,9 @@ impl WorkspaceApi for Services {
             caps.insert("workspaceAutoArchiveOptOut".into(), serde_json::json!(1));
             caps.insert("messageBlockPages".into(), serde_json::json!(1));
             caps.insert("remoteAgentSkills".into(), serde_json::json!(1));
+            // Provider session import (§5.5 agent.importableSessions.list /
+            // agent.importSession).
+            caps.insert("sessionImport".into(), serde_json::json!(1));
             // Reads answer bounded pages by default (default page sizes,
             // maximums and byte budgets), so a new app pages them.
             caps.insert("boundedReads".into(), serde_json::json!(1));

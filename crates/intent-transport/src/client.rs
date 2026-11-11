@@ -119,6 +119,8 @@ pub(crate) fn server_json(
     let mut capabilities = capabilities;
     capabilities["remoteAgentSkills"] = json!(1);
     capabilities["agentPlugins"] = json!(1);
+    // agent.importableSessions.list / agent.importSession (§5.5).
+    capabilities["sessionImport"] = json!(1);
     // Per-agent CoW sandboxes are retired (protocol 16).
     capabilities["agentIsolation"] = json!(2);
     let mut server = json!({
