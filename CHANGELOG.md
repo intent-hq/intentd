@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.188] - 2026-11-11
+
+### 🚀 Features
+
+- Run Northflank agents as an unprivileged user ([#3290](https://github.com/intent-hq/intentd/pull/3290))
+
+
 ## [0.11.187] - 2026-11-11
 
 ### 🚀 Features
