@@ -239,18 +239,19 @@ async fn unplaced_agents_walk_the_users_machine_order() {
         "{created}"
     );
 
-    // The order survives a backend restart.
+    // The order survives a backend restart. B is stopped first, so the
+    // restarted backend has no live link to it: it is offline.
     drop(rpc_ws);
     drop(events);
     drop(head);
+    let b = machines.remove(1);
+    drop(b);
     let (_head, port, cfg) = serve_backend(&head_dir, &[]).await;
     let mut rpc_ws = connect(port, cfg).await;
     let order = ok(&mut rpc_ws, 80, "remoteMachines.order", json!({})).await;
     assert_eq!(keys(&order["order"]), [&b_id, "local", &a_id], "{order}");
 
-    // With B gone, the walk falls through to the next row: the backend.
-    let b = machines.remove(1);
-    drop(b);
+    // With B offline, the walk falls through to the next row: the backend.
     let fallback = create_until_placed(&mut rpc_ws, &ws_id, "Fallback", None, 90).await;
     assert!(fallback.get("nodeId").is_none(), "{fallback}");
 }
