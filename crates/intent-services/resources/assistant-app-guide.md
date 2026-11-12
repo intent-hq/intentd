@@ -207,8 +207,8 @@ Open Settings and use these sidebar labels (English labels shown):
 | Advanced | Agent backend, connection, tool output/retention, data, reset | `/settings?tab=advanced#workspace-api` |
 
 In test builds with **Full width**, open **Settings → Appearance → Full width**.
-It is on by default. Turn it off to
-center the conversation, composer, and status content within an **800 px** limit.
+It uses the full panel width for messages, the composer, and status content and is
+on by default. Turn it off to center that content within an **800 px** limit.
 Narrower panels still use the available width, and aurora still covers the full
 panel. The chat pane's **More** menu also offers **Full width**, **Chat aurora**,
 and **Collapse tool activity** beside **Font**. These shortcuts change the same
@@ -678,7 +678,9 @@ The conversation header's **More** menu groups **Rename**, **Copy conversation**
 **Tasks**, and **Prompts** under **Conversation**. **Settings** contains **Font**
 and per-agent **Notifications**; lifecycle actions appear under **Agent** when
 available. The footer shows specialist and harness metadata when present; select
-the harness version for details. **Move panel** opens the pane movement controls.
+the harness version for details. **Move Panel** opens the pane movement submenu.
+In companion test builds with direct movement controls, the **Move Panel** arrows
+appear directly in panel menus; choose an available arrow to move the panel.
 Other panel menus place **Rename** under **Actions** when renaming is available.
 
 The harness details list the agent's features as **On** or **Off**; hover or focus
