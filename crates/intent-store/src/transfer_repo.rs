@@ -368,8 +368,12 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
 impl Store {
     /// Per-table row count + approximate serialized byte size for one
     /// workspace, over [`TRANSFER_TABLES`]. `approx_bytes` sums
-    /// `LENGTH(CAST(col AS BLOB))` across every column of every scoped row —
+    /// `OCTET_LENGTH(col)` across every column of every scoped row —
     /// an estimate of the payload carried by an export, not on-disk size.
+    /// `OCTET_LENGTH` on a bare column reads the length from the record
+    /// header, so values spilled to overflow pages are never loaded; the
+    /// former `LENGTH(CAST(col AS BLOB))` loaded every value and made a plan
+    /// read roughly the whole export (intent-hq/intent#9144).
     /// Read-only. Tables with zero rows are still listed (count 0), so the
     /// manifest shape is stable across workspaces.
     ///
@@ -425,7 +429,9 @@ impl Store {
                 let size_expr = match columns.get(*table) {
                     Some(cols) if !cols.is_empty() => cols
                         .iter()
-                        .map(|c| format!("COALESCE(LENGTH(CAST(\"{c}\" AS BLOB)), 0)"))
+                        // The argument must stay a bare column: any wrapper
+                        // (CAST, COLLATE, an expression) loads the value again.
+                        .map(|c| format!("COALESCE(OCTET_LENGTH(\"{c}\"), 0)"))
                         .collect::<Vec<_>>()
                         .join(" + "),
                     _ => "0".to_string(),
