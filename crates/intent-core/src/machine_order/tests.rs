@@ -134,3 +134,29 @@ fn keys_use_the_documented_wire_shape() {
     assert!(serde_json::from_str::<MachineOrderKey>(r#"{"kind":"machine"}"#).is_err());
     assert!(parse_saved(Some("not json")).is_empty());
 }
+
+#[test]
+fn one_unreadable_entry_keeps_the_rest_of_the_order() {
+    let saved = parse_saved(Some(
+        r#"[{"kind":"cloud","cloudMachineId":"e2b"},{"kind":"future","x":1},{"kind":"machine","nodeId":"m-b"}]"#,
+    ));
+    assert_eq!(saved, vec![cloud("e2b"), machine("m-b")]);
+}
+
+#[test]
+fn a_removed_key_leaves_the_saved_order() {
+    let saved = vec![machine("m-b"), MachineOrderKey::Local, machine("m-a")];
+    let pruned = without(&saved, &machine("m-b"));
+    assert_eq!(pruned, vec![MachineOrderKey::Local, machine("m-a")]);
+    // Re-added later, it is appended at the end.
+    let list = ordered(&pruned, &rows(true));
+    assert_eq!(
+        keys(&list),
+        vec![
+            MachineOrderKey::Local,
+            machine("m-a"),
+            machine("m-b"),
+            cloud("e2b")
+        ]
+    );
+}

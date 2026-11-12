@@ -204,14 +204,15 @@ async fn list(feature: &RemoteFeature, svc: &Services) -> Result<Value> {
 }
 
 /// `remoteMachines.models`: each exposed machine's state and, from its last
-/// report, its providers' sign-in status and full model lists, in name
-/// order. Reads the saved rows only: no connect, no refresh. `nodeId`,
+/// report, its providers' sign-in status and full model lists, in the
+/// ordered machine list's order, with cloud entries as rows. Reads the saved rows only: no connect, no refresh. `nodeId`,
 /// `provider` and `model` filter by exact match.
 async fn models(feature: &RemoteFeature, svc: &Services, params: &Value) -> Result<Value> {
     let node_id = text(params, "nodeId", false)?;
     let provider = text(params, "provider", false)?;
     let model = text(params, "model", false)?;
-    let mut rows = svc.store().list_exposed_machines().await?;
+    let all_rows = svc.store().list_exposed_machines().await?;
+    let mut rows = all_rows.clone();
     if let Some(node_id) = node_id {
         rows.retain(|row| row.id == node_id);
         if rows.is_empty() {
@@ -233,7 +234,15 @@ async fn models(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         Vec::new()
     };
     let mut machines = Vec::new();
-    let listed_rows = order.iter().filter(|row| row.key != MachineOrderKey::Local);
+    // `rank` numbers the rows the agent-facing list shows, whatever the
+    // filters keep: not "This computer", not a revoked machine.
+    let listed_rows = order.iter().filter(|row| match &row.key {
+        MachineOrderKey::Local => false,
+        MachineOrderKey::Machine { node_id } => all_rows
+            .iter()
+            .any(|machine| &machine.id == node_id && machine.state != RemoteMachineState::Revoked),
+        MachineOrderKey::Cloud { .. } => true,
+    });
     for (at, listed) in listed_rows.enumerate() {
         let rank = at + 1;
         match &listed.key {
@@ -708,7 +717,13 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
         .await?;
     svc.publish_remote_machine_changed(json!({ "machineId": machine_id, "removed": true }))
         .await;
-    crate::order::publish(svc).await;
+    crate::order::forget(
+        svc,
+        &MachineOrderKey::Machine {
+            node_id: machine_id.clone(),
+        },
+    )
+    .await;
     let mut result = json!({ "ok": true });
     if let Some(credential) = credential {
         result["credentialId"] = json!(credential);

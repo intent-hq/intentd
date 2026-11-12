@@ -38,6 +38,8 @@ struct FakeRemote {
     /// The ordered machine list; `None` is the default ("This computer"
     /// only).
     order: Option<Vec<intent_core::machine_order::MachineOrderKey>>,
+    /// A `nodeId` whose admission fails inside the backend (not a refusal).
+    broken_node: Option<&'static str>,
 }
 
 fn view(placement: &AgentPlacement) -> RemotePlacementView {
@@ -133,6 +135,9 @@ impl RemoteLaunchPort for FakeRemote {
                 false,
             );
             return Box::pin(async move { Err(error) });
+        }
+        if placement.node_id.is_some() && placement.node_id.as_deref() == self.broken_node {
+            return Box::pin(async { Err(Error::Internal("store read failed".into())) });
         }
         if placement.node_id.is_some() && placement.node_id.as_deref() == self.refuse_node {
             let failure =
@@ -1970,4 +1975,81 @@ async fn an_empty_or_refusing_machine_order_creates_nothing() {
         "{refused:?}"
     );
     assert_eq!(agent_count(&refusing).await, before, "nothing was created");
+}
+
+/// A delegation with no placement walks the list like a create; with
+/// `isolation` it stays on this backend.
+#[tokio::test]
+async fn an_unplaced_delegation_walks_the_list_unless_isolated() {
+    use intent_core::machine_order::MachineOrderKey;
+    let (_t, svc, ws) = setup().await;
+    let remote = ordered_remote(vec![machine_key("node-1"), MachineOrderKey::Local], None);
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let walked = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                task_text: Some("Do it".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let id = AgentId::from(walked["agentId"].as_str().unwrap());
+    let child = svc
+        .store()
+        .get_agent_session_without_messages(&id)
+        .await
+        .unwrap();
+    assert!(
+        intent_core::remote_launch::RemotePlacementView::from_metadata(child.metadata.as_ref())
+            .is_some(),
+        "the delegation was placed on the machine"
+    );
+    let admitted = remote.admitted.lock().unwrap().len();
+    let isolated = svc
+        .agent_delegate_op(
+            ws.clone(),
+            AgentDelegateInput {
+                task_text: Some("Do it here".into()),
+                isolation: Some("direct".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let id = AgentId::from(isolated["agentId"].as_str().unwrap());
+    let child = svc
+        .store()
+        .get_agent_session_without_messages(&id)
+        .await
+        .unwrap();
+    assert!(
+        intent_core::remote_launch::RemotePlacementView::from_metadata(child.metadata.as_ref())
+            .is_none(),
+        "isolation keeps the delegation on this backend"
+    );
+    assert_eq!(remote.admitted.lock().unwrap().len(), admitted, "no walk");
+}
+
+/// A failure inside the backend on the preferred row stops the walk: the
+/// agent is never quietly placed on a lower row.
+#[tokio::test]
+async fn a_backend_failure_stops_the_walk() {
+    use intent_core::machine_order::MachineOrderKey;
+    let (_t, svc, ws) = setup().await;
+    let before = agent_count(&svc).await;
+    let remote = Arc::new(FakeRemote {
+        order: Some(vec![machine_key("node-x"), MachineOrderKey::Local]),
+        broken_node: Some("node-x"),
+        ..Default::default()
+    });
+    let svc = svc.with_remote_launch_port(remote);
+    let error = create(&svc, &ws, AgentCreateExtra::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Internal(_)), "{error:?}");
+    assert_eq!(agent_count(&svc).await, before);
 }

@@ -566,16 +566,18 @@ async fn help_text(
     render: PlacementHelpRenderer,
 ) -> Option<String> {
     let rows = svc.store().list_exposed_machines().await.ok()?;
+    // A failed read of the order or the entries drops only that part, never
+    // the whole remote-placement text.
     let order: Vec<intent_core::machine_order::MachineOrderKey> = crate::order::current(svc)
         .await
-        .ok()?
+        .unwrap_or_default()
         .into_iter()
         .map(|row| row.key)
         .collect();
     let providers = crate::cloud::config::agent_providers();
     let entries: Vec<HelpCloudEntry> = crate::cloud::entry_names(svc)
         .await
-        .ok()?
+        .unwrap_or_default()
         .into_iter()
         .map(|(id, name)| HelpCloudEntry {
             id,

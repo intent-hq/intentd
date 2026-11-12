@@ -785,7 +785,7 @@ pub fn exposed_machines_help(inputs: &PlacementHelpInputs<'_>) -> Option<String>
         shown += 1;
     }
     let mut text = format!(
-        "Remote placement (experimental): machines exposed to this backend ({}):\n{PREFERENCE_LINE}\n{lines}",
+        "Remote placement (experimental): machines and cloud entries this backend can run agents on ({}):\n{PREFERENCE_LINE}\n{lines}",
         listed.len()
     );
     if shown < listed.len() {

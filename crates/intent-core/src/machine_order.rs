@@ -113,12 +113,31 @@ pub fn names_exactly(order: &[MachineOrderKey], current: &[MachineOrderRow]) -> 
         .all(|key| seen.insert(key) && current.iter().any(|row| &row.key == key))
 }
 
-/// Read the saved order; an unreadable value is no saved order, so the
-/// default list applies.
+/// Read the saved order. An entry that does not parse (for example a kind
+/// a newer build saved) is skipped on its own, so the rest of the user's
+/// order stands; an unreadable value is no saved order.
 #[must_use]
 pub fn parse_saved(raw: Option<&str>) -> Vec<MachineOrderKey> {
-    raw.and_then(|raw| serde_json::from_str(raw).ok())
-        .unwrap_or_default()
+    let Some(entries) =
+        raw.and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok())
+    else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value(entry).ok())
+        .collect()
+}
+
+/// `saved` without `removed`: a removed machine or entry leaves the list,
+/// so re-adding it later appends it at the end.
+#[must_use]
+pub fn without(saved: &[MachineOrderKey], removed: &MachineOrderKey) -> Vec<MachineOrderKey> {
+    saved
+        .iter()
+        .filter(|key| *key != removed)
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]

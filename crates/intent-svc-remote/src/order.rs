@@ -13,8 +13,10 @@ use intent_core::machine_order::{
 use intent_core::{Error, Result};
 use intent_services::feature_api::Services;
 
-/// `setOrder` reads the list, checks the new one against it and saves it
-/// as one step.
+/// Every change of the list takes this lock: `setOrder` reads, checks,
+/// saves and announces as one step, and an add or remove announces the list
+/// read after its own change, so the last event a client receives is never
+/// an older list.
 static ORDER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The ordered list now.
@@ -85,19 +87,50 @@ pub(crate) async fn set_order(svc: &Services, params: &Value) -> Result<Value> {
             json!({ "code": ORDER_STALE_CODE, "order": now }),
         ));
     }
-    let encoded = serde_json::to_string(&order)
-        .map_err(|error| Error::Internal(format!("machine order: {error}")))?;
-    svc.store()
-        .set_setting(MACHINE_ORDER_STATE_KEY, &encoded)
-        .await?;
-    let list = ordered(&order, &rows);
+    save(svc, &order).await?;
+    let list = current(svc).await?;
     publish_list(svc, &list).await;
     Ok(json!({ "order": list }))
 }
 
-/// Announce the list after a machine or entry was added, removed or
-/// renamed.
+async fn save(svc: &Services, order: &[MachineOrderKey]) -> Result<()> {
+    let encoded = serde_json::to_string(order)
+        .map_err(|error| Error::Internal(format!("machine order: {error}")))?;
+    svc.store()
+        .set_setting(MACHINE_ORDER_STATE_KEY, &encoded)
+        .await
+}
+
+/// Drop a removed machine or entry from the saved order, so a later add of
+/// the same id is appended at the end, then announce the list.
+pub(crate) async fn forget(svc: &Services, removed: &MachineOrderKey) {
+    let _turn = ORDER_LOCK.lock().await;
+    let pruned = svc
+        .store()
+        .get_setting(MACHINE_ORDER_STATE_KEY)
+        .await
+        .map(|raw| parse_saved(raw.as_deref()));
+    match pruned {
+        Ok(saved) if saved.contains(removed) => {
+            if let Err(error) =
+                save(svc, &intent_core::machine_order::without(&saved, removed)).await
+            {
+                tracing::warn!(%error, "machine order: could not drop a removed row");
+            }
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "machine order: could not read the saved order"),
+    }
+    announce(svc).await;
+}
+
+/// Announce the list after a machine or entry was added or renamed.
 pub(crate) async fn publish(svc: &Services) {
+    let _turn = ORDER_LOCK.lock().await;
+    announce(svc).await;
+}
+
+async fn announce(svc: &Services) {
     match current(svc).await {
         Ok(list) => publish_list(svc, &list).await,
         Err(error) => {

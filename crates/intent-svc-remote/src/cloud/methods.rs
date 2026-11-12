@@ -851,7 +851,13 @@ async fn remove(feature: &RemoteFeature, svc: &Services, params: &Value) -> Resu
     svc.delete_cloud_machine_key(&id).await?;
     svc.publish_cloud_machine_changed(json!({ "providerId": id, "removed": true }), None)
         .await;
-    crate::order::publish(svc).await;
+    crate::order::forget(
+        svc,
+        &intent_core::machine_order::MachineOrderKey::Cloud {
+            cloud_machine_id: id.clone(),
+        },
+    )
+    .await;
     Ok(json!({ "ok": true, "unconfirmedStops": unconfirmed }))
 }
 

@@ -3305,6 +3305,19 @@ pub(crate) fn reject_self_targeted_send(
 
 /// The sentence a sub-agent's inherited-placement failure ends with: why
 /// it went to `node_name` and how to run it on the backend instead.
+/// Whether `error` is a row refusing a placement (the walk tries the next
+/// row) rather than a failure of the backend itself.
+fn is_placement_refusal(error: &Error) -> bool {
+    match error {
+        Error::PlacementUnavailable(_)
+        | Error::ModelUnavailable(_)
+        | Error::MachineUpdateRequired(_)
+        | Error::InvalidParams(_) => true,
+        Error::ProviderProfile(failure) | Error::RemoteMachine(failure) => !failure.internal,
+        _ => false,
+    }
+}
+
 fn inherited_placement_hint(node_name: &str) -> String {
     format!(
         "The sub-agent defaults to \"{node_name}\" because its parent runs there; pass placement {{ target: \"local\" }} to run it on the backend."
@@ -6240,9 +6253,13 @@ impl Services {
             };
             match admit(placement).await {
                 Ok(admitted) => return Ok(Some(admitted)),
-                Err(error) => {
+                // Only a row that refuses the placement is passed over; a
+                // store or internal failure stops the walk, so it never
+                // quietly lands the agent on a lower row.
+                Err(error) if is_placement_refusal(&error) => {
                     first_refusal.get_or_insert(error);
                 }
+                Err(error) => return Err(error),
             }
         }
         match first_refusal {

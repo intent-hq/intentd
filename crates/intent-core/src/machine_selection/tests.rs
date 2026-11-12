@@ -812,7 +812,7 @@ fn help_lists_machines_providers_and_sign_in_without_routes() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(
         lines[0],
-        "Remote placement (experimental): machines exposed to this backend (2):"
+        "Remote placement (experimental): machines and cloud entries this backend can run agents on (2):"
     );
     assert_eq!(lines[1], PREFERENCE_LINE);
     assert_eq!(
